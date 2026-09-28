@@ -1359,19 +1359,14 @@ fn items_for(
     items
 }
 
-/// This agent's pending messages, in the order they wake. A message is
+/// This agent's unacked messages, in the order they wake. A message is
 /// not repo work — a pending one never hides the queue from the master.
+///
+/// Read from the agent's message LOG, not from a directory of files:
+/// a message is an event like any other, so it is re-presented until it
+/// is acked rather than until a file is deleted.
 fn message_items(repo: &Path, author: &AgentLabel) -> Vec<WaitItem> {
-    crate::inbox::scan(repo, author)
-        .into_iter()
-        .map(|m| WaitItem::Message {
-            handle: m.entry.file_stem(),
-            priority: m.entry.priority,
-            subject: m.subject().to_string(),
-            from: m.from,
-            repo: m.repo.map(|r| r.display().to_string()),
-        })
-        .collect()
+    crate::inbox::pending(repo, author)
 }
 
 /// The master-with-nothing-active outcome: a `PromoteFromQueue` for
@@ -1497,7 +1492,11 @@ pub(crate) enum WaitJsonItem<'a> {
     #[serde(rename = "message")]
     Message {
         handle: &'a str,
-        priority: u16,
+        /// The whole message. The wake shows its first line; an agent
+        /// that wants the rest has it here rather than in a file.
+        body: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         from: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1653,16 +1652,18 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
         },
         WaitItem::Message {
             handle,
-            priority,
             from,
             repo,
             subject,
+            body,
+            selector,
         } => WaitJsonItem::Message {
             handle,
-            priority: *priority,
             from: from.as_deref(),
             repo: repo.as_deref(),
             subject,
+            body,
+            selector: selector.as_deref(),
         },
         WaitItem::GithubEvent {
             repo,

@@ -26,9 +26,9 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 - `clank status` — current plan + gate state
 - `clank auto on|off` — toggle this session's Stop-hook auto-mode
 
-## Inbox (both roles)
+## Messages (both roles)
 
-A `message` item waits in `.clank/agents/<you>/inbox/`:
-`clank inbox show <handle>`, act, then `clank inbox done <handle>` (it
-re-wakes until done). Reply or send, naming the sender and repo it gave:
+A `message` is an event like any other, and its wake names the
+selector: `clank events show <sel>`, act, then `clank events ack <sel>`
+(it re-wakes until you do). Reply naming the sender and repo it gave:
 `clank send [--repo P] (--to <label> | --master) -m "…"`.

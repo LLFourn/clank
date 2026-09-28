@@ -76,7 +76,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   `standby` reviews nothing and is woken for everything else),
   `clank agent remove <name>`, `clank agent list`
 - `clank send (--to <label> | --master) [--repo <path>] -m "…"` —
-  message an agent, here or in another repo (see Inbox).
+  message an agent, here or in another repo (see Messages).
 - `clank block create <name> -m "question"` — ask the human. A block is
   always repo-wide: one pending block parks you entirely until it is
   answered, so raise one only when you genuinely cannot proceed.

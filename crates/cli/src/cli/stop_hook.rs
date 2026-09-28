@@ -2305,7 +2305,7 @@ pub(crate) fn discharge_of(
             "fires until one plan is active — `clank finish` one, or `clank stash push` the rest",
         ),
         K::PromoteFromQueue => Until("fires until the item is promoted or removed from the queue"),
-        K::Message => Until("fires until the message is handled — `clank inbox done <handle>`"),
+        K::Message => Until("fires until the message is acked — `clank events ack`"),
         K::GithubEvent => Until("fires until the event is acked — `clank events ack`"),
         K::AdHocReview => Until("fires until feedback exists for that sha"),
         K::AdHocRevise => Until("fires until you commit the revision"),
@@ -2454,7 +2454,15 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 let handle = item.handle.as_deref().unwrap_or("?");
                 let from = crate::inbox::sender_words(item.from.as_deref(), item.repo.as_deref());
                 let subject = item.subject.as_deref().unwrap_or("");
-                out.push_str(&format!("  - message: {handle} {from}: {subject}\n"));
+                // The SELECTOR, not the handle: the handle names the
+                // message inside its recipient, and `clank events ack`
+                // takes neither it nor nothing.
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
+                out.push_str(&format!("  - message: {handle} {from}: {subject}{ack}\n"));
             }
             K::PromoteFromQueue => {
                 let name = item.name.as_deref().unwrap_or("?");
@@ -4951,27 +4959,32 @@ mod tests {
             serde_json::to_value(crate::cli::wait::render_json(
                 &clank_core::wait::WaitItem::Message {
                     handle: "500-00000001-rebase-please".to_string(),
-                    priority: 500,
                     from: from.map(String::from),
                     repo: repo.map(String::from),
                     subject: "Rebase please".to_string(),
+                    body: "# Rebase please\n\nonto master".to_string(),
+                    selector: Some("messages@1".to_string()),
                 },
             ))
             .unwrap()
         };
         let out = items_text(&[item(Some("claude"), Some("/src/clank")), item(None, None)]);
+        let ack = "— ack `clank events ack messages@1`";
         assert!(
-            out.contains(
-                "  - message: 500-00000001-rebase-please from claude (/src/clank): Rebase please\n"
-            ),
+            out.contains(&format!(
+                "  - message: 500-00000001-rebase-please from claude (/src/clank): \
+                 Rebase please {ack}\n"
+            )),
             "{out}"
         );
         assert!(
-            out.contains("  - message: 500-00000001-rebase-please from a person: Rebase please\n"),
+            out.contains(&format!(
+                "  - message: 500-00000001-rebase-please from a person: Rebase please {ack}\n"
+            )),
             "{out}"
         );
         assert!(
-            out.contains("fires until the message is handled — `clank inbox done <handle>`"),
+            out.contains("fires until the message is acked — `clank events ack`"),
             "{out}"
         );
     }

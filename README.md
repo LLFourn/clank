@@ -288,7 +288,6 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
 | `events` | Github event inbox: `list` / `ack` / `show` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo) |
-| `inbox` | This agent's messages: `list` / `show` / `done` / `reprioritise` |
 | `feedback` | `write` / `read` review feedback via a typed surface |
 | `queue` | `add` / `promote` / `remove` / `reprioritise` queued plans |
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |

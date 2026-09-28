@@ -1235,17 +1235,20 @@ mod tests {
         );
     }
 
-    /// Every role handles its inbox the same way, and the master's
+    /// Every role handles a message the same way, and the master's
     /// command list names the sender (a-message-wakes-its-agent-until-
-    /// it-is-handled).
+    /// it-is-handled). The verbs are the EVENT verbs now: a message is
+    /// an event like any other (a-message-is-an-event-like-any-other),
+    /// so a skill that still taught `clank inbox` would be teaching a
+    /// command that no longer exists.
     #[test]
-    fn both_role_skills_teach_the_inbox_loop() {
+    fn both_role_skills_teach_the_message_loop() {
         for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
             for role in [Role::Master, Role::Reviewer] {
                 let skill = compose_skill(role, tool);
                 for step in [
-                    "clank inbox show",
-                    "clank inbox done",
+                    "clank events show",
+                    "clank events ack",
                     "clank send",
                     "--master",
                 ] {

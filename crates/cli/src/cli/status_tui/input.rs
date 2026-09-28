@@ -137,13 +137,6 @@ pub(super) enum Mode {
     EventDetail { sel: usize },
     /// The open WAIT page: which agent's wait, and the cursor row on it.
     WaitDetail { agent: usize, sel: usize },
-    /// Reading an agent's inbox. `agent` indexes `snapshot.agents`;
-    /// `scroll` is the offset into the rendered document, which shows
-    /// EVERY pending message so none is unreachable.
-    ///
-    /// Read-only: nothing here handles a message or changes whether
-    /// its agent wakes for it.
-    InboxDetail { agent: usize, scroll: usize },
     /// The remote page (Enter on the remote row): the switch, the
     /// links in, and the token and sessions to revoke.
     RemotePage { sel: usize },
@@ -814,13 +807,6 @@ pub(super) enum PanelAnchor {
         task: String,
         at: String,
     },
-    /// That agent's inbox, by the agent's LABEL.
-    ///
-    /// The label alone is right here, unlike a wait: an inbox belongs
-    /// to its agent for as long as the agent exists, and when it
-    /// empties the selection should land back on that agent rather
-    /// than on whoever took its index (codex ed1baf5).
-    Inbox(String),
     Add,
     Remote,
     Stash(String),
@@ -851,12 +837,6 @@ pub(super) fn capture_anchor(
                     at: att.at.clone(),
                 })
             })
-            .unwrap_or(PanelAnchor::Add),
-        // The agent's label alone: the inbox belongs to the agent,
-        // and what is in it changes without the row changing.
-        Some(PanelRow::Inbox(i)) => agents
-            .get(*i)
-            .map(|a| PanelAnchor::Inbox(a.label.clone()))
             .unwrap_or(PanelAnchor::Add),
         Some(PanelRow::Stash(i)) => stash_stems
             .get(*i)
@@ -900,11 +880,6 @@ pub(super) fn rebind_anchor(
                 .flatten()
                 .or_else(|| find(PanelRow::Agent(i)))
         }),
-        // The inbox row if it is still there, else the agent that
-        // owns it: an inbox that empties returns the cursor to its
-        // agent rather than to whoever now holds that index.
-        PanelAnchor::Inbox(label) => by_label(label)
-            .and_then(|i| find(PanelRow::Inbox(i)).or_else(|| find(PanelRow::Agent(i)))),
         PanelAnchor::Stash(name) => stash_stems
             .iter()
             .position(|n| n == name)
@@ -981,24 +956,6 @@ pub(super) fn wait_page_nav(sel: usize, actions: &[WaitAction], key: Key) -> Det
             Some(WaitAction::Kill) => DetailNav::ActivateKill,
             _ => DetailNav::Back,
         },
-        _ => DetailNav::None,
-    }
-}
-
-/// Scrolling the inbox document. It is a READER, not a menu: there is
-/// no cursor over items and nothing to activate, because everything
-/// that would act on a message belongs to `clank inbox`.
-pub(super) fn inbox_page_nav(scroll: usize, lines: usize, rows: usize, key: Key) -> DetailNav {
-    // Normalized BEFORE the delta, through the same helper the reader
-    // uses: a stored offset from a longer document must not be walked
-    // down one press at a time while the page shows something else.
-    let max = crate::cli::status_tui::render::inbox_max_scroll(lines, rows);
-    let scroll = crate::cli::status_tui::render::inbox_scroll_now(scroll, lines, rows);
-    match key {
-        Key::Quit => DetailNav::Quit,
-        Key::Escape | Key::Focus | Key::Enter | Key::Char(b'a') => DetailNav::Back,
-        Key::Up => DetailNav::MoveCursor(scroll.saturating_sub(1)),
-        Key::Down => DetailNav::MoveCursor(scroll.saturating_add(1).min(max)),
         _ => DetailNav::None,
     }
 }
@@ -2106,9 +2063,6 @@ pub(super) enum PanelAction {
     OpenDetail(usize),
     /// Open the wait attended by that agent.
     OpenWait(usize),
-    /// Open that agent's inbox to READ. Reading is not handling: the
-    /// message stays in the inbox and keeps waking its agent.
-    OpenInbox(usize),
     /// Open the add picker (Enter/Space on the "+ add" row).
     OpenPicker,
     /// The remote switch (Space on the remote row).
@@ -2145,10 +2099,6 @@ pub(super) enum PanelRow {
     Agent(usize),
     /// The wait attended by that agent, drawn beneath its row.
     Wait(usize),
-    /// That agent has mail, drawn beneath its row. ONE row however
-    /// many are waiting: the panel is a summary, and an agent with
-    /// eleven messages must not push the rest of the list off screen.
-    Inbox(usize),
     Add,
     /// The remote switch, under the agent list: its state and URL.
     Remote,
@@ -2162,19 +2112,14 @@ pub(super) enum PanelRow {
 pub(super) fn panel_rows(
     agents_len: usize,
     waits: &[usize],
-    inboxes: &[usize],
     stash_len: usize,
     queue_len: usize,
 ) -> Vec<PanelRow> {
-    let mut out =
-        Vec::with_capacity(agents_len + waits.len() + inboxes.len() + 2 + stash_len + queue_len);
+    let mut out = Vec::with_capacity(agents_len + waits.len() + 2 + stash_len + queue_len);
     for i in 0..agents_len {
         out.push(PanelRow::Agent(i));
         if waits.contains(&i) {
             out.push(PanelRow::Wait(i));
-        }
-        if inboxes.contains(&i) {
-            out.push(PanelRow::Inbox(i));
         }
     }
     out.push(PanelRow::Add);
@@ -2219,7 +2164,6 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
             Some(PanelRow::Queue(q)) => PanelAction::OpenQueueItem(q),
             Some(PanelRow::Agent(i)) => PanelAction::OpenDetail(i),
             Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
-            Some(PanelRow::Inbox(i)) => PanelAction::OpenInbox(i),
             Some(PanelRow::Remote) => PanelAction::OpenRemotePage,
             _ => PanelAction::None,
         },
@@ -2401,172 +2345,6 @@ pub(super) fn move_selection(sel: usize, len: usize, down: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
-    /// The inbox row sits under its agent, beside the wait row, and
-    /// the cursor can reach it.
-    #[test]
-    fn an_inbox_row_sits_under_its_agent_and_is_reachable() {
-        // Agent 0 has both a wait and mail; agent 1 has only mail.
-        let rows = panel_rows(2, &[0], &[0, 1], 0, 0);
-        assert_eq!(
-            &rows[..5],
-            &[
-                PanelRow::Agent(0),
-                PanelRow::Wait(0),
-                PanelRow::Inbox(0),
-                PanelRow::Agent(1),
-                PanelRow::Inbox(1),
-            ],
-            "screen order: each agent, then its wait, then its mail",
-        );
-        // Reachable, not merely drawn.
-        assert_eq!(
-            agent_panel_action(2, &rows, Key::Enter),
-            PanelAction::OpenInbox(0),
-        );
-        assert_eq!(
-            agent_panel_action(4, &rows, Key::Enter),
-            PanelAction::OpenInbox(1),
-        );
-    }
-
-    /// An agent with no mail has no row, so nothing can select one.
-    #[test]
-    fn an_empty_inbox_has_no_row() {
-        let rows = panel_rows(2, &[], &[], 0, 0);
-        assert!(!rows.iter().any(|r| matches!(r, PanelRow::Inbox(_))));
-    }
-
-    /// The anchor is the agent's LABEL, so a roster reorder keeps the
-    /// cursor on the same agent's mail rather than on whoever took
-    /// its index.
-    #[test]
-    fn the_inbox_anchor_follows_its_agent_through_a_reorder() {
-        use crate::cli::status_tui::fixtures::agent_row;
-        use crate::cli::teams_config::RosterRole;
-        use clank_core::vocab::AutoMode;
-        let before = vec![
-            agent_row("claude", RosterRole::Master, AutoMode::On),
-            agent_row("codex", RosterRole::Commit, AutoMode::Off),
-        ];
-        let rows = panel_rows(2, &[], &[1], 0, 0);
-        let sel = rows
-            .iter()
-            .position(|r| *r == PanelRow::Inbox(1))
-            .expect("codex has mail");
-        let anchor = capture_anchor(sel, &rows, &before, &[], &[]);
-        assert_eq!(anchor, PanelAnchor::Inbox("codex".to_string()));
-
-        // Reordered: codex is now index 0, and its mail row with it.
-        let after = vec![
-            agent_row("codex", RosterRole::Commit, AutoMode::Off),
-            agent_row("claude", RosterRole::Master, AutoMode::On),
-        ];
-        let rows2 = panel_rows(2, &[], &[0], 0, 0);
-        let at = rebind_anchor(&anchor, &rows2, &after, &[], &[]);
-        assert_eq!(rows2[at], PanelRow::Inbox(0), "still codex's mail");
-    }
-
-    /// When an inbox empties, the cursor falls back to the agent that
-    /// owned it -- not to whoever now sits at that index.
-    #[test]
-    fn an_inbox_that_empties_returns_the_cursor_to_its_agent() {
-        use crate::cli::status_tui::fixtures::agent_row;
-        use crate::cli::teams_config::RosterRole;
-        use clank_core::vocab::AutoMode;
-        let agents = vec![
-            agent_row("claude", RosterRole::Master, AutoMode::On),
-            agent_row("codex", RosterRole::Commit, AutoMode::Off),
-        ];
-        let anchor = PanelAnchor::Inbox("codex".to_string());
-        // codex handled its message: no inbox rows at all now.
-        let rows = panel_rows(2, &[], &[], 0, 0);
-        let at = rebind_anchor(&anchor, &rows, &agents, &[], &[]);
-        assert_eq!(rows[at], PanelRow::Agent(1), "back to codex itself");
-    }
-
-    /// An agent removed from the roster takes its mail row with it,
-    /// and the cursor lands somewhere real.
-    #[test]
-    fn a_removed_agent_leaves_no_inbox_cursor_behind() {
-        use crate::cli::status_tui::fixtures::agent_row;
-        use crate::cli::teams_config::RosterRole;
-        use clank_core::vocab::AutoMode;
-        let agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On)];
-        let anchor = PanelAnchor::Inbox("codex".to_string());
-        let rows = panel_rows(1, &[], &[], 0, 0);
-        let at = rebind_anchor(&anchor, &rows, &agents, &[], &[]);
-        assert!(at < rows.len(), "the cursor must land on a real row");
-        assert_eq!(rows[at], PanelRow::Add, "gone agent drops to `+ add`");
-    }
-
-    /// After the document shrinks, the FIRST Up moves from what the
-    /// page is showing — not from the offset it was stored at.
-    ///
-    /// The exact sequence codex reproduced: stored 100, 12 lines, 10
-    /// rows. The reader draws offset 3; Up used to return 99 and draw
-    /// 3 again, so the page sat frozen for ~97 presses while the user
-    /// pressed a key that plainly did nothing (codex 5addb90).
-    #[test]
-    fn after_the_document_shrinks_the_first_up_moves_the_page() {
-        use crate::cli::status_tui::render::{inbox_max_scroll, inbox_scroll_now};
-        let (stored, lines, rows) = (100, 12, 10);
-        let shown = inbox_scroll_now(stored, lines, rows);
-        assert_eq!(shown, 3, "the reader draws the clamped offset");
-
-        assert_eq!(
-            inbox_page_nav(stored, lines, rows, Key::Up),
-            DetailNav::MoveCursor(2),
-            "one press moves from what is on screen",
-        );
-        // Down from a stale offset stays at the end rather than
-        // climbing back toward the old value.
-        assert_eq!(
-            inbox_page_nav(stored, lines, rows, Key::Down),
-            DetailNav::MoveCursor(inbox_max_scroll(lines, rows)),
-        );
-
-        // The same after a RESIZE that grows the viewport: more lines
-        // fit, so the last offset that still shows text is smaller.
-        let taller = 40;
-        assert_eq!(inbox_max_scroll(lines, taller), 0, "it all fits now");
-        assert_eq!(
-            inbox_page_nav(stored, lines, taller, Key::Up),
-            DetailNav::MoveCursor(0),
-        );
-    }
-
-    /// The page scrolls and leaves; there is nothing on it to activate,
-    /// because handling a message is `clank inbox`'s job.
-    #[test]
-    fn the_inbox_page_scrolls_and_never_activates() {
-        assert_eq!(
-            inbox_page_nav(0, 100, 10, Key::Down),
-            DetailNav::MoveCursor(1)
-        );
-        assert_eq!(
-            inbox_page_nav(5, 100, 10, Key::Up),
-            DetailNav::MoveCursor(4)
-        );
-        assert_eq!(
-            inbox_page_nav(0, 100, 10, Key::Up),
-            DetailNav::MoveCursor(0)
-        );
-        // Never past the last screenful: scrolling into blank space
-        // loses the text.
-        assert_eq!(
-            inbox_page_nav(999, 100, 10, Key::Down),
-            DetailNav::MoveCursor(91),
-        );
-        // A document shorter than the screen does not scroll at all.
-        assert_eq!(
-            inbox_page_nav(0, 3, 40, Key::Down),
-            DetailNav::MoveCursor(0)
-        );
-        for back in [Key::Escape, Key::Enter] {
-            assert_eq!(inbox_page_nav(0, 100, 10, back), DetailNav::Back);
-        }
-    }
-
     #[test]
     fn every_displayed_event_key_activates_the_action_it_names() {
         // Driven from the action list itself, not a hand-written key
@@ -2651,12 +2429,8 @@ mod tests {
         use clank_core::vocab::AutoMode;
         let agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On)];
         assert_eq!(
-            agent_panel_action(
-                0,
-                &panel_rows(agents.len(), &[], &[], 0, 0),
-                Key::Char(b'a')
-            ),
-            agent_panel_action(0, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Focus),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Char(b'a')),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Focus),
             "panel: `a` and Tab both leave focus"
         );
         let acts = [DetailAction::Back];
@@ -3922,7 +3696,7 @@ mod tests {
     /// rows' offsets for exactly that reason.
     #[test]
     fn a_drawable_wait_is_a_cursor_position_between_its_agent_and_the_next() {
-        let rows = panel_rows(2, &[0], &[], 1, 2);
+        let rows = panel_rows(2, &[0], 1, 2);
         assert_eq!(
             rows,
             vec![
@@ -3955,7 +3729,7 @@ mod tests {
     #[test]
     fn an_undrawable_wait_is_not_a_cursor_position() {
         assert_eq!(
-            panel_rows(2, &[], &[], 0, 0),
+            panel_rows(2, &[], 0, 0),
             vec![
                 PanelRow::Agent(0),
                 PanelRow::Agent(1),
@@ -4084,7 +3858,7 @@ mod tests {
     /// rows are adjacent and an off-by-one here opens the wrong page.
     #[test]
     fn enter_on_a_wait_row_opens_the_wait_not_its_agent() {
-        let rows = panel_rows(2, &[1], &[], 0, 0);
+        let rows = panel_rows(2, &[1], 0, 0);
         // [Agent(0), Agent(1), Wait(1), Add]
         assert_eq!(
             agent_panel_action(1, &rows, Key::Enter),
@@ -4107,7 +3881,7 @@ mod tests {
     /// cursor's — they diverge as soon as a wait sits above.
     #[test]
     fn actions_carry_the_agent_index_not_the_cursor_position() {
-        let rows = panel_rows(3, &[0], &[], 0, 0);
+        let rows = panel_rows(3, &[0], 0, 0);
         // [Agent(0), Wait(0), Agent(1), Agent(2), Add]
         assert_eq!(
             agent_panel_action(3, &rows, Key::Enter),
@@ -4160,50 +3934,50 @@ mod tests {
         // "+ add" row is index 2 (== agents.len()): Enter AND Space open
         // the picker.
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Enter),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Enter),
             PanelAction::OpenPicker
         );
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Space),
+            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0), Key::Space),
             PanelAction::OpenPicker
         );
         // Agent rows: Enter opens the detail page; Space toggles auto.
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Enter),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Enter),
             PanelAction::OpenDetail(1)
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Space),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Space),
             PanelAction::ToggleAuto(1)
         );
         // DEL is no longer a panel action (removal lives on the detail page).
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Delete),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Delete),
             PanelAction::None
         );
         // Navigation: Down within the panel moves; Down at the +add row
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
         // q quits.
         assert_eq!(
-            agent_panel_action(0, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Down),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::EnterLog,
             "Down past the remote row, the last, flows into the log"
         );
         assert_eq!(
-            agent_panel_action(0, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Up),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0), Key::Up),
             PanelAction::MoveCursor(0),
             "Up at the top stays put"
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Focus),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Focus),
             PanelAction::LeaveFocus
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Quit),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0), Key::Quit),
             PanelAction::Quit
         );
     }
@@ -4214,7 +3988,7 @@ mod tests {
     /// the URL, and on no other row means that.
     #[test]
     fn the_remote_row_is_under_the_agents_and_is_the_switch() {
-        let rows = panel_rows(2, &[], &[], 1, 1);
+        let rows = panel_rows(2, &[], 1, 1);
         assert_eq!(
             rows,
             vec![
@@ -4270,34 +4044,34 @@ mod tests {
         // there, so `o`, `+`, `-` and Space are inert on the row
         // (a-queued-plan-has-a-page).
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], &[], 0, ql), Key::Enter),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         for key in [Key::Html, Key::Plus, Key::Minus, Key::Space] {
             assert_eq!(
-                agent_panel_action(5, &panel_rows(agents.len(), &[], &[], 0, ql), key),
+                agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql), key),
                 PanelAction::None,
                 "{key:?} does nothing on a queue row"
             );
         }
         // `o` on an agent row is inert too.
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], &[], 0, ql), Key::Html),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, ql), Key::Html),
             PanelAction::None
         );
         // Down from the remote row now enters the queue, not the log;
         // Down from the LAST queue row crosses into the log.
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], &[], 0, ql), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
             PanelAction::MoveCursor(4)
         );
         assert_eq!(
-            agent_panel_action(5, &panel_rows(agents.len(), &[], &[], 0, ql), Key::Down),
+            agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql), Key::Down),
             PanelAction::EnterLog
         );
         // With an empty queue, Down from the remote row still enters the log.
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], &[], 0, 0), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0), Key::Down),
             PanelAction::EnterLog
         );
     }
@@ -4314,26 +4088,26 @@ mod tests {
         // queue row.
         let (sl, ql) = (1, 1);
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], &[], sl, ql), Key::Enter),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
             PanelAction::OpenStashItem(0)
         );
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], &[], sl, ql), Key::Html),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Html),
             PanelAction::OpenStashHtml(0)
         );
         // The queue row sits AFTER the stash segment.
         assert_eq!(
-            agent_panel_action(5, &panel_rows(agents.len(), &[], &[], sl, ql), Key::Enter),
+            agent_panel_action(5, &panel_rows(agents.len(), &[], sl, ql), Key::Enter),
             PanelAction::OpenQueueItem(0)
         );
         // +/- are queue-only; inert on a stash row.
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], &[], sl, ql), Key::Plus),
+            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql), Key::Plus),
             PanelAction::None
         );
         // Down from the LAST row (the queue row) crosses into the log.
         assert_eq!(
-            agent_panel_action(5, &panel_rows(agents.len(), &[], &[], sl, ql), Key::Down),
+            agent_panel_action(5, &panel_rows(agents.len(), &[], sl, ql), Key::Down),
             PanelAction::EnterLog
         );
     }
@@ -4373,7 +4147,7 @@ mod tests {
     #[test]
     fn a_replaced_attendance_does_not_inherit_the_wait_cursor() {
         let before = rows_for(&["claude", "codex"], &[1]);
-        let rows = panel_rows(2, &[1], &[], 0, 0); // [A0, A1, W1, Add]
+        let rows = panel_rows(2, &[1], 0, 0); // [A0, A1, W1, Add]
         let anchor = capture_anchor(2, &rows, &before, &[], &[]);
 
         // Same agent, still attending — but a new instance.
@@ -4401,12 +4175,12 @@ mod tests {
         let queue = labels(&["q1", "q2"]);
 
         // No waits: [A0, A1, Add, R, S0, Q0, Q1]
-        let before = panel_rows(2, &[], &[], 1, 2);
+        let before = panel_rows(2, &[], 1, 2);
         let anchor = capture_anchor(5, &before, &agents, &stash, &queue);
         assert_eq!(anchor, PanelAnchor::Queue("q1".to_string()));
 
         // A wait appears above everything: [A0, W0, A1, Add, R, S0, Q0, Q1]
-        let after = panel_rows(2, &[0], &[], 1, 2);
+        let after = panel_rows(2, &[0], 1, 2);
         assert_eq!(
             rebind_anchor(&anchor, &after, &agents, &stash, &queue),
             6,
@@ -4436,7 +4210,7 @@ mod tests {
     fn a_reordered_queue_item_keeps_the_cursor() {
         let agents = rows_for(&["claude", "codex"], &[]);
         let queue = vec!["a".to_string(), "b".to_string()];
-        let rows = panel_rows(2, &[], &[], 0, 2);
+        let rows = panel_rows(2, &[], 0, 2);
         let anchor = capture_anchor(5, &rows, &agents, &[], &queue);
         assert_eq!(anchor, PanelAnchor::Queue("b".to_string()));
 
@@ -4449,7 +4223,7 @@ mod tests {
 
         // Gone entirely → the add row.
         let without = vec!["a".to_string()];
-        let shorter = panel_rows(2, &[], &[], 0, 1);
+        let shorter = panel_rows(2, &[], 0, 1);
         assert_eq!(
             rebind_anchor(&anchor, &shorter, &agents, &[], &without),
             add_row_index(&shorter)
@@ -4462,7 +4236,7 @@ mod tests {
     #[test]
     fn a_vanished_wait_falls_back_to_its_own_agent() {
         let agents = rows_for(&["claude", "codex"], &[1]);
-        let with = panel_rows(2, &[1], &[], 0, 0); // [A0, A1, W1, Add]
+        let with = panel_rows(2, &[1], 0, 0); // [A0, A1, W1, Add]
         let anchor = capture_anchor(2, &with, &agents, &[], &[]);
         assert_eq!(
             anchor,
@@ -4473,7 +4247,7 @@ mod tests {
             }
         );
 
-        let without = panel_rows(2, &[], &[], 0, 0); // [A0, A1, Add]
+        let without = panel_rows(2, &[], 0, 0); // [A0, A1, Add]
         let no_wait = rows_for(&["claude", "codex"], &[]);
         assert_eq!(
             rebind_anchor(&anchor, &without, &no_wait, &[], &[]),
@@ -4483,7 +4257,7 @@ mod tests {
 
         // The agent left too → the add row.
         let solo = rows_for(&["claude"], &[]);
-        let rows = panel_rows(1, &[], &[], 0, 0);
+        let rows = panel_rows(1, &[], 0, 0);
         assert_eq!(
             rebind_anchor(&anchor, &rows, &solo, &[], &[]),
             add_row_index(&rows)

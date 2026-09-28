@@ -145,23 +145,28 @@ async fn a_standby_agents_messages_and_own_sources_still_wake_it() {
     let env = team_with_standby().await;
     let repo = env.repo();
 
-    clank::inbox::send(
-        repo,
-        &label("sb"),
-        500,
-        None,
-        "2026-09-22T10:15:00Z",
-        "hello",
-    )
-    .unwrap();
-    assert!(
-        peek(repo, "sb")
-            .await
-            .iter()
-            .any(|i| matches!(i, WaitItem::Message { subject, .. } if subject == "hello"))
-    );
-    let handle = clank::inbox::scan(repo, &label("sb"))[0].entry.file_stem();
-    clank::inbox::done(repo, &label("sb"), &handle).unwrap();
+    clank::inbox::deliver(repo, &label("sb"), None, "2026-09-22T10:15:00Z", "hello").unwrap();
+    let items = peek(repo, "sb").await;
+    let selector = items
+        .iter()
+        .find_map(|i| match i {
+            WaitItem::Message {
+                subject, selector, ..
+            } if subject == "hello" => selector.clone(),
+            _ => None,
+        })
+        .expect("the wake names what acks it");
+    // The same command an agent is told to run, with the selector it
+    // was given.
+    clank::cli::events::run(clank::cli::EventsArgs {
+        command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            repo: Some(repo.to_path_buf()),
+            author: Some("sb".to_string()),
+            ids: vec![selector],
+        }),
+    })
+    .await
+    .expect("a standby agent's message acks like any other event");
 
     // A producer that EMITS. `["true"]` used to wake by completing;
     // a source is a long-running producer now and its lines are the
@@ -215,10 +220,9 @@ async fn a_reviewer_switched_to_standby_mid_wait_is_owed_no_review_but_still_get
         "a plan landing after the switch owes the standby agent nothing"
     );
 
-    clank::inbox::send(
+    clank::inbox::deliver(
         repo,
         &label("codex"),
-        500,
         None,
         "2026-09-22T10:15:00Z",
         "still here?",

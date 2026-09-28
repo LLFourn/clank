@@ -99,6 +99,10 @@ pub(crate) fn resolve_content_ref<'a>(
 pub(crate) enum Backend {
     Github,
     Command,
+    /// A message one agent sent another. Its own backend, not
+    /// `Command`: nobody ran it, and a row labelled "command" would
+    /// name a producer that does not exist.
+    Message,
 }
 
 /// One merged timeline entry.
@@ -128,9 +132,12 @@ pub(crate) struct MergedEvent {
     /// The sub-kind within that source.
     pub(crate) kind: String,
     /// The text a reader shows: github's title, a command event's
-    /// content.
+    /// content, a message's subject.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
+    /// The whole text where the row shows only a summary of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) body: Option<String>,
     /// This SOURCE is broken, rather than something it observed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) failure: bool,
@@ -201,6 +208,10 @@ impl Copy {
 /// merge. Corrupt logs are skipped with one stderr notice each —
 /// a viewer degrades, never quarantines (the ingest side owns that).
 pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
+    // Anything still in a file inbox joins the log before it is read,
+    // so a legacy message is in the timeline the first time somebody
+    // LOOKS rather than the next time its recipient waits.
+    crate::inbox::migrate_all(repo);
     let mut copies: Vec<Copy> = Vec::new();
     let mut notices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let agents_root = crate::agent_store::agents_root(repo);
@@ -259,13 +270,20 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                         // cross agents' watches of the SAME repo;
                         // a command source keys on its WAL stem, which
                         // is its durable identity.
-                        let ns = match v.github {
-                            Some(_) => format!("gh:{}", v.source),
-                            None => format!("cmd:{stem}"),
+                        // The TRANSPORT tells a message from a command
+                        // source's line: both lack github's carve-out,
+                        // and calling a message a command would label
+                        // the row with something nobody ran.
+                        let is_message = r.transport == crate::cli::github::log::Transport::Message;
+                        let ns = match (&v.github, is_message) {
+                            (Some(_), _) => format!("gh:{}", v.source),
+                            (None, true) => format!("msg:{stem}"),
+                            (None, false) => format!("cmd:{stem}"),
                         };
-                        let backend = match v.github {
-                            Some(_) => Backend::Github,
-                            None => Backend::Command,
+                        let backend = match (&v.github, is_message) {
+                            (Some(_), _) => Backend::Github,
+                            (None, true) => Backend::Message,
+                            (None, false) => Backend::Command,
                         };
                         // The PRODUCER's time when it gave one: a
                         // command source stores it on the item, and
@@ -457,6 +475,10 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 number,
                 failure,
                 content: first(&|i| i.event_view().and_then(|v| v.content).map(str::to_owned)),
+                // The whole text, when there is more of it than the
+                // row shows. A message's row is its subject; this is
+                // the message.
+                body: first(&|i| i.event_view().and_then(|v| v.body).map(str::to_owned)),
                 actor: first(&|i| {
                     i.event_view()
                         .and_then(|v| v.github?.actor)

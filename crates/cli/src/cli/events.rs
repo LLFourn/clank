@@ -51,6 +51,10 @@ fn events_context(
         }
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
+    // Before the WAL is read, not after: a message still sitting in the
+    // old file inbox belongs in this listing, and the reader is where a
+    // person finds out it exists.
+    let _ = crate::inbox::migrate(&repo, &author);
     let dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");
@@ -518,6 +522,20 @@ fn append_ack_target(t: &AckTarget) -> anyhow::Result<()> {
     } else {
         log.append_ack(t.seq)?;
     }
+    drop(log);
+    // Every other source is compacted by the loop that owns it. The
+    // message source has no such loop, so both of its write paths have
+    // to do it — this is the second one, and without it a backlog that
+    // is sent and then acked with no later send stays in the WAL for
+    // good.
+    if t.source == crate::inbox::MESSAGES_SOURCE
+        && let Some(label) = t.dir.parent().and_then(|p| p.file_name())
+        && let Some(label) = label.to_str()
+        && let Ok(label) = clank_core::ids::AgentLabel::parse(label)
+        && let Some(repo) = t.dir.ancestors().nth(4)
+    {
+        crate::inbox::compact_after_ack(repo, &label);
+    }
     Ok(())
 }
 
@@ -611,6 +629,19 @@ fn show(
     println!("event:     {}", describe(&s.row.item));
     if let Some(url) = s.row.item.event_view().and_then(|v| v.github?.url) {
         println!("url:       {url}");
+    }
+    // The whole text, where the event line is only a summary of it.
+    // `describe` is a LIST line and stays one; this is the surface for
+    // reading what was actually sent, and a message has no other one.
+    if let Some(full) = s
+        .row
+        .item
+        .event_view()
+        .and_then(|v| v.body)
+        .filter(|b| Some(*b) != s.row.item.event_view().and_then(|v| v.content))
+    {
+        let clean = sanitize_multiline(full);
+        println!("body:      {}", clean.replace('\n', "\n           "));
     }
     if let Some(p) = prompts.get(&s.source) {
         // Full text (multi-line preserved), but non-newline control

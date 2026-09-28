@@ -178,21 +178,35 @@ pub enum WaitItem {
         name: String,
         priority: u16,
     },
-    /// A pending message in the agent's own inbox: produced by the CLI,
-    /// which reads the inbox, never by `work_for`. Returned on every
-    /// arm until the message is handled (it leaves the inbox).
+    /// A message someone sent this agent: produced by the CLI from the
+    /// agent's own message log, never by `work_for`. Returned on every
+    /// arm until it is acked, like every other event.
     Message {
-        /// The message's file stem, the handle `clank inbox` takes.
+        /// The message's identity within its recipient — a minted id
+        /// for a new send, the old inbox file's stem for a migrated
+        /// one. Unique per recipient, which is what keeps two agents'
+        /// messages two: the merge groups across agents by source and
+        /// key, so a bare stem would alias them.
         handle: String,
-        priority: u16,
         /// The sending agent and its repo; both absent when a person
         /// sent it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
-        /// The message's first line.
+        /// The message's first line, for the wake's one-line summary.
         subject: String,
+        /// The message ITSELF. `clank send` no longer leaves a file
+        /// anywhere, so this record is the only copy: a body that is
+        /// not here was not sent.
+        body: String,
+        /// What to pass `clank events ack` to finish this one.
+        ///
+        /// Stamped at PRESENTATION time from the row's own sequence,
+        /// exactly as [`WaitItem::CommandEvent`] stamps its own: the
+        /// WAL stores no copy, so appending stays one write.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     /// Extra-wake-source events (extra-wait-events): produced by the
     /// CLI's external source tasks, never by `work_for`. A GitHub
@@ -469,9 +483,15 @@ pub struct EventView<'a> {
     pub source: &'a str,
     /// The sub-kind within that source (`pr_comment`, `deployed`).
     pub kind: &'a str,
-    /// The text a reader shows. Absent rather than empty, so readers
-    /// do not each re-decide what an empty string means.
+    /// The one-line text a LIST row shows. Absent rather than empty,
+    /// so readers do not each re-decide what an empty string means.
     pub content: Option<&'a str>,
+    /// The whole text, when the event carries one and it differs from
+    /// the summary. A row stays one line; this is what a reader opens
+    /// the event to see. Absent where there is nothing more than
+    /// `content` — or where the body lives somewhere else, as
+    /// github's does behind a fetch.
+    pub body: Option<&'a str>,
     /// The producer's own timestamp when it gave one. Github's event
     /// time lives on the WAL row, not the item.
     pub at: Option<u64>,
@@ -553,6 +573,7 @@ impl WaitItem {
                 // Github's displayable text IS the title; `content`
                 // there names an OBJECT, and rides the carve-out.
                 content: title.as_deref().filter(|t| !t.is_empty()),
+                body: None,
                 at: None,
                 instructions: instructions.as_deref(),
                 selector: None,
@@ -577,6 +598,7 @@ impl WaitItem {
                 source: name,
                 kind: event,
                 content: Some(content.as_str()).filter(|c| !c.is_empty()),
+                body: Some(content.as_str()).filter(|c| !c.is_empty()),
                 at: *at,
                 instructions: None,
                 selector: selector.as_deref(),
@@ -592,6 +614,28 @@ impl WaitItem {
                 source: "PR draft",
                 kind: change.wire(),
                 content: path.as_deref(),
+                body: None,
+                at: None,
+                instructions: None,
+                selector: selector.as_deref(),
+                failure: false,
+                github: None,
+            }),
+            // A message is an event like any other, so it has a view
+            // like any other. `source` is the SENDER, because "who
+            // sent it" is the first thing a reader wants and the only
+            // thing telling two messages apart at a glance.
+            WaitItem::Message {
+                from,
+                subject,
+                body,
+                selector,
+                ..
+            } => Some(EventView {
+                source: from.as_deref().unwrap_or("a person"),
+                kind: "message",
+                content: Some(subject.as_str()).filter(|s| !s.is_empty()),
+                body: Some(body.as_str()).filter(|b| !b.is_empty()),
                 at: None,
                 instructions: None,
                 selector: selector.as_deref(),

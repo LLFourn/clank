@@ -12,15 +12,14 @@ pub fn run(args: SendArgs) -> anyhow::Result<()> {
     let to = recipient(&repo, args.to.as_deref(), args.master)?;
     let body = body_of(&args.message, args.file.as_deref())?;
     let from = sender_in(&crate::agent_env::Process);
-    let path = crate::inbox::send(
+    let handle = crate::inbox::deliver(
         &repo,
         &to,
-        args.priority,
         from.as_ref(),
         &crate::cli::stop_hook::now_rfc3339(),
         &body,
     )?;
-    println!("sent to `{to}` in {}: {}", repo.display(), path.display());
+    println!("sent to `{to}` in {}: {handle}", repo.display());
     Ok(())
 }
 
@@ -132,15 +131,7 @@ mod tests {
     fn a_message_sent_to_another_repo_lands_in_its_inbox() {
         let there = repo_with_roster(TEAM);
         let to = recipient(there.path(), None, true).unwrap();
-        crate::inbox::send(
-            there.path(),
-            &to,
-            500,
-            None,
-            "2026-09-22T10:15:00Z",
-            "hello",
-        )
-        .unwrap();
+        crate::inbox::send(there.path(), &to, None, "2026-09-22T10:15:00Z", "hello").unwrap();
         let pending = crate::inbox::scan(there.path(), &to);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].subject(), "hello");
@@ -186,11 +177,6 @@ mod tests {
             !parse(&["send", "--master", "-m", "hi", "-F", "x"]),
             "two bodies"
         );
-        assert!(
-            parse(&["inbox", "done", "x", "--author", "grok"]),
-            "--author after the verb"
-        );
-        assert!(parse(&["inbox", "--author", "grok"]), "list is the default");
     }
 
     #[test]

@@ -407,6 +407,7 @@ pub(crate) fn badge_of(
     glyph.unwrap_or(match backend {
         crate::cli::github::timeline::Backend::Github => "gh",
         crate::cli::github::timeline::Backend::Command => "cmd",
+        crate::cli::github::timeline::Backend::Message => "msg",
     })
 }
 
@@ -1303,6 +1304,19 @@ enum LogJsonRow<'a> {
         unhandled: bool,
         baseline: bool,
     },
+    /// A message one agent sent another. Its own row rather than a
+    /// command's: `source` here is the SENDER, which is a different
+    /// fact from the name of a producer that ran.
+    Message {
+        ts: i64,
+        /// Who sent it.
+        from: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subject: Option<&'a str>,
+        seen_by: &'a [String],
+        unhandled: bool,
+        baseline: bool,
+    },
 }
 
 fn print_json(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
@@ -1358,6 +1372,14 @@ fn json_items<'a>(
                         event: &g.kind,
                         content: g.content.as_deref(),
                         failure: g.failure,
+                        seen_by: &g.seen_by,
+                        unhandled: g.unhandled,
+                        baseline: g.baseline,
+                    },
+                    crate::cli::github::timeline::Backend::Message => LogJsonRow::Message {
+                        ts,
+                        from: &g.source,
+                        subject: g.content.as_deref(),
                         seen_by: &g.seen_by,
                         unhandled: g.unhandled,
                         baseline: g.baseline,
@@ -1460,6 +1482,7 @@ mod json_output_tests {
             source: "o/r".into(),
             kind: "pr_comment".into(),
             content: Some(key_hint.into()),
+            body: None,
             failure: false,
             detail: Some("review".into()),
             number: Some(12),
@@ -1585,6 +1608,7 @@ mod json_output_tests {
                 OnelineRow::Github { backend, .. } => match backend {
                     crate::cli::github::timeline::Backend::Github => "gh",
                     crate::cli::github::timeline::Backend::Command => "cmd",
+                    crate::cli::github::timeline::Backend::Message => "msg",
                 },
                 OnelineRow::Commit { .. } => "commit",
                 _ => "other",
@@ -1633,6 +1657,7 @@ mod json_output_tests {
             source: source.into(),
             kind: "k".into(),
             content: None,
+            body: None,
             failure: false,
             detail: None,
             number: None,
@@ -1679,6 +1704,7 @@ mod json_output_tests {
             source: "deploys".into(),
             kind: "clank.source-failure".into(),
             content: Some("`sh -c ...` has stopped 3 times in a row".into()),
+            body: None,
             failure: true,
             detail: None,
             number: None,
@@ -2005,6 +2031,7 @@ mod tests {
             source: "o/r".into(),
             kind: "pr_comment".into(),
             content: None,
+            body: None,
             failure: false,
             detail: None,
             number: Some(1),

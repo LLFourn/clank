@@ -75,7 +75,10 @@ pub fn resolve(repo: &Path, label: &AgentLabel, handle: &str) -> anyhow::Result<
     let entry = match priority_dir::by_handle(&entries, handle) {
         Lookup::One(e) => e.clone(),
         Lookup::None => {
-            anyhow::bail!("no such message `{handle}` in `{label}`'s inbox (see `clank inbox`)")
+            anyhow::bail!(
+                "no such message `{handle}` in `{label}`'s inbox (it may already \
+                 have migrated into the event log -- see `clank events list`)"
+            )
         }
         Lookup::Many(many) => anyhow::bail!(
             "`{handle}` names {} messages ({}); pass the file stem",
@@ -99,34 +102,20 @@ pub fn done(repo: &Path, label: &AgentLabel, handle: &str) -> anyhow::Result<Pat
     Ok(message.entry.path)
 }
 
-pub fn set_priority(
-    repo: &Path,
-    label: &AgentLabel,
-    handle: &str,
-    priority: u16,
-) -> anyhow::Result<PathBuf> {
-    let message = resolve(repo, label, handle)?;
-    priority_dir::set_priority(&inbox_dir(repo, label), &message.entry, priority)
-}
+/// Every message sits at one priority. Ordering is ARRIVAL order,
+/// which the sequence number in the stem already carries; a per-message
+/// knob for reordering an inbox is what
+/// `a-message-is-an-event-like-any-other` removes.
+pub const SEND_PRIORITY: u16 = 500;
 
-/// Put a message in `label`'s inbox and return its path.
-///
-/// Under the inbox's lock, the next number is reserved in `.seq` —
-/// before publishing, so a send that dies half way skips a number and
-/// never reuses one. The body is written to a staging file created
-/// fresh and exclusively for this send, which the scanner never lists,
-/// then published by hard link: renaming a complete file onto a name
-/// that is taken would delete the message already there, where a link
-/// refuses it.
 pub fn send(
     repo: &Path,
     label: &AgentLabel,
-    priority: u16,
     from: Option<&Sender>,
     sent: &str,
     body: &str,
 ) -> anyhow::Result<PathBuf> {
-    priority_dir::check_priority(priority)?;
+    let priority = SEND_PRIORITY;
     let dir = inbox_dir(repo, label);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
     let _lock = crate::agent_store::exclusive_lock(&dir.join(".lock"))?;
@@ -318,154 +307,369 @@ fn parse(entry: priority_dir::Entry, raw: &str) -> Message {
     whole(entry)
 }
 
+// ── a message is an event (a-message-is-an-event-like-any-other) ──
+// Everything above this line is the FILE inbox, which exists now only
+// so messages written before this change can be migrated out of it.
+
+use crate::cli::github::log::{EventLog, Transport};
+use clank_core::wait::WaitItem;
+
+/// The one source every message in a repo is logged to.
+///
+/// One source, not one per recipient: the log already lives under the
+/// recipient's own directory, so the recipient is the namespace and a
+/// second one would only repeat it.
+pub(crate) const MESSAGES_SOURCE: &str = "messages";
+
+/// Serializes the allocate-then-append that every writer of this log
+/// performs.
+///
+/// The other producers hold their log for the life of a wait, so one
+/// writer per (agent, source) is structural for them. A message has no
+/// such owner: every `clank send` is its own process, and migration is
+/// another, all appending to the same log. `EventLog::load` reads the
+/// next sequence and `append_inbox` writes at it, and two writers that
+/// interleave those two steps both take N -- which would advertise one
+/// selector, `messages@N`, for two different messages and leave
+/// neither separately ackable.
+fn message_writer_lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File> {
+    let dir = crate::agent_store::agents_root(repo)
+        .join(label.as_str())
+        .join("events");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
+    crate::agent_store::exclusive_lock(&dir.join("messages.writer.lock"))
+}
+
+/// This agent's message log.
+fn message_log(repo: &Path, label: &AgentLabel) -> std::io::Result<EventLog> {
+    EventLog::open(
+        &crate::agent_store::agents_root(repo)
+            .join(label.as_str())
+            .join("events"),
+        MESSAGES_SOURCE,
+    )
+}
+
+/// A name no other message will take.
+///
+/// Minted rather than counted: `EventLog` is a handle on one (agent,
+/// source) pair and numbers only within it, so it cannot tell a send to
+/// one agent from a send to another. Random bytes need no allocator and
+/// no cross-agent state on the write path.
+fn mint_id() -> String {
+    let mut bytes = [0u8; 12];
+    getrandom::fill(&mut bytes).expect("the OS can produce random bytes");
+    bytes.iter().fold(String::new(), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// What `clank events ack` takes for a message, namespaced by its
+/// recipient so two agents' messages never merge into one row.
+fn action_key(label: &AgentLabel, handle: &str) -> String {
+    format!("message#{}/{handle}", label.as_str())
+}
+
+/// The same, for a message MIGRATED out of the old file inbox.
+///
+/// A different prefix because it is a different promise: this one's
+/// source file can outlive its append, so its identity is pinned in
+/// the log's dedup horizon and must be recognisable there
+/// (`log::MIGRATED_MESSAGE_PREFIX`). A new send needs no pin, because
+/// nothing replays it.
+fn migrated_action_key(label: &AgentLabel, handle: &str) -> String {
+    format!(
+        "{}{}/{handle}",
+        crate::cli::github::log::MIGRATED_MESSAGE_PREFIX,
+        label.as_str()
+    )
+}
+
+/// Log a message to its recipient. Returns the handle it was filed
+/// under.
+pub fn deliver(
+    repo: &Path,
+    to: &AgentLabel,
+    from: Option<&Sender>,
+    sent: &str,
+    body: &str,
+) -> anyhow::Result<String> {
+    log_message(repo, to, &mint_id(), from, sent, body, None)
+}
+
+/// The shared append, used by a send and by migration. `at` overrides
+/// the event's display time, which migration needs and a send does not.
+fn log_message(
+    repo: &Path,
+    to: &AgentLabel,
+    handle: &str,
+    from: Option<&Sender>,
+    sent: &str,
+    body: &str,
+    at: Option<u64>,
+) -> anyhow::Result<String> {
+    let key = action_key(to, handle);
+    log_message_with_key(repo, to, handle, &key, from, sent, body, at)
+}
+
+/// The same, under a caller-chosen action key. Migration needs its own
+/// so the identity can be pinned; a send takes the ordinary one.
+#[allow(clippy::too_many_arguments)]
+fn log_message_with_key(
+    repo: &Path,
+    to: &AgentLabel,
+    handle: &str,
+    key: &str,
+    from: Option<&Sender>,
+    sent: &str,
+    body: &str,
+    at: Option<u64>,
+) -> anyhow::Result<String> {
+    // Held across BOTH steps: reading the next sequence and writing at
+    // it are one allocation, and a lock around only the write does not
+    // make them one.
+    let _writer = message_writer_lock(repo, to)?;
+    let mut log = message_log(repo, to)?;
+    log.load();
+    let item = WaitItem::Message {
+        handle: handle.to_string(),
+        from: from.map(|s| s.label.clone()),
+        repo: from.map(|s| s.repo.display().to_string()),
+        subject: first_line(body).to_string(),
+        body: body.to_string(),
+        selector: None,
+    };
+    let at = at.or_else(|| parse_rfc3339_secs(sent));
+    log.append_inbox(Transport::Message, None, Some(key), at, &item)
+        .with_context(|| format!("logging a message for `{}`", to.as_str()))?;
+    // Compaction runs HERE, on the write path and under the same
+    // writer lock, because a message log has no coordinator to run it
+    // for it. Every other producer compacts through the loop that owns
+    // its source; a message's writers are separate processes that
+    // append once and exit, so a log nobody compacts grows forever and
+    // the bounded-retention promise -- handled bodies readable until
+    // DISPLAY_CAP newer ones displace them -- never comes true.
+    //
+    // It is cheap when there is nothing to do: `maybe_compact` returns
+    // immediately below COMPACT_AT.
+    if let Err(e) = log.maybe_compact() {
+        eprintln!(
+            "clank: could not compact `{}`'s message log: {e}",
+            to.as_str()
+        );
+    }
+    Ok(handle.to_string())
+}
+
+/// Seconds since the epoch for an RFC3339 stamp, or `None` when it
+/// cannot be read. A message whose time cannot be read still arrives;
+/// the log dates it itself.
+fn parse_rfc3339_secs(s: &str) -> Option<u64> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp().max(0) as u64)
+}
+
+/// Move every message still sitting in this agent's FILE inbox into
+/// its log, oldest first, and take the directory with them.
+///
+/// Called on every read, and free when there is nothing to do: the
+/// inbox directory stops existing once it has been emptied, so its
+/// absence is the record that this has already run.
+///
+/// ORDER is `priority_dir::scan`'s own — the order the inbox has always
+/// read in, and defined for every file it accepts, including one with
+/// no sequence number at all. The event's DATE is the best thing each
+/// file actually has: the time it records, else its modification time
+/// (an observation about the file, not a claim about the message),
+/// else now, which places an undateable file last rather than giving
+/// it an arrival it cannot support.
+///
+/// CUSTODY is append, durable, then delete — never the other order,
+/// which is the one way a message is lost beyond recovery. A crash
+/// between the two leaves the file and the event both, and the next
+/// run finds the ident already in the log and deletes the file without
+/// minting a second message.
+pub fn migrate(repo: &Path, label: &AgentLabel) -> anyhow::Result<usize> {
+    let dir = inbox_dir(repo, label);
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let _lock = crate::agent_store::exclusive_lock(&dir.join(".lock"))?;
+    clear_staging(&dir);
+
+    // The log's own dedup HORIZON, not its rows. Compaction folds an
+    // old handled record into an identity observation and drops the
+    // row, so a reader that asked the rows would stop recognising a
+    // message it had already taken -- and mint a second one from the
+    // file that a crash left behind. Migrated identities are pinned in
+    // that horizon and never age out of it.
+    let taken: std::collections::BTreeSet<String> = match message_log(repo, label) {
+        Ok(mut log) => log.load().action_keys.into_iter().collect(),
+        Err(_) => Default::default(),
+    };
+
+    let mut moved = 0;
+    for entry in priority_dir::scan(&dir) {
+        let path = entry.path.clone();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            // Unreadable now may be readable later; leaving it is the
+            // only answer that cannot lose it.
+            continue;
+        };
+        let at = mtime_secs(&path);
+        let message = parse(entry, &raw);
+        let handle = message.entry.file_stem();
+        let key = migrated_action_key(label, &handle);
+        if !taken.contains(&key) {
+            let sender = message.from.as_ref().map(|label| Sender {
+                label: label.clone(),
+                repo: message.repo.clone().unwrap_or_default(),
+            });
+            let at = message
+                .sent
+                .as_deref()
+                .and_then(parse_rfc3339_secs)
+                .or(at)
+                .or_else(|| parse_rfc3339_secs(&crate::cli::stop_hook::now_rfc3339()));
+            log_message_with_key(
+                repo,
+                label,
+                &handle,
+                &key,
+                sender.as_ref(),
+                "",
+                &message.body,
+                at,
+            )?;
+        }
+        std::fs::remove_file(&path).with_context(|| format!("removing `{}`", path.display()))?;
+        moved += 1;
+    }
+
+    // The directory goes only when every MESSAGE has gone -- a file
+    // left behind unread keeps it, because its presence is the next
+    // run's work list. What remains then is clank's own bookkeeping,
+    // the lock and the sequence counter, which has nothing left to
+    // count. A real inbox always has both, so removing only the lock
+    // left every migrated directory standing and every read repeating
+    // the migration.
+    if priority_dir::scan(&dir).is_empty() {
+        drop(_lock);
+        for name in [".lock", ".seq", ".seq.tmp"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        if let Err(e) = std::fs::remove_dir(&dir) {
+            // Something this does not own is in there. Leave it, and
+            // leave the directory: deleting a stranger's file to tidy
+            // up is not a trade this is allowed to make.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "clank: migrated every message out of `{}`, but it is not empty: {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
+    Ok(moved)
+}
+
+/// Migrate every agent's file inbox in this repo.
+///
+/// The READ boundary. Migration used to hang off `pending`, which is
+/// the WAIT path — so a legacy message reached the timeline only once
+/// its recipient next waited, and until then a person looking at the
+/// TUI or `clank events list` saw no trace of mail that was genuinely
+/// owed. Readers go straight to the WALs, so a reader has to be a
+/// place migration happens too.
+///
+/// Best-effort and free when there is nothing to do: an agent whose
+/// inbox directory is gone costs one failed `is_dir`.
+pub fn migrate_all(repo: &Path) {
+    let Ok(agents) = std::fs::read_dir(crate::agent_store::agents_root(repo)) else {
+        return;
+    };
+    for agent in agents.flatten() {
+        let Some(name) = agent.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(label) = AgentLabel::parse(&name) else {
+            continue;
+        };
+        let _ = migrate(repo, &label);
+    }
+}
+
+/// A file's modification time in epoch seconds, when it can be read.
+fn mtime_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Compact this agent's message log after an ack.
+///
+/// The message source has no coordinator, so it has to compact on
+/// every path that writes it — and an ack is one. A backlog sent, then
+/// acked, with no later send would otherwise sit in the WAL forever:
+/// `deliver` compacts only while sends keep coming, and nothing else
+/// was ever going to.
+///
+/// It does NOT take the writer lock, and that is deliberate rather
+/// than an omission. `maybe_compact` already replaces the file under
+/// the exclusive sidecar lock that appenders hold shared, so no append
+/// can land mid-rewrite; and it groups rows by `(seq, ident)` without
+/// renumbering, so a sequence a sender allocated before the rewrite is
+/// still free after it. A second lock here would serialize an
+/// operation that is already serialized, and would read as though the
+/// first one were insufficient.
+pub(crate) fn compact_after_ack(repo: &Path, label: &AgentLabel) {
+    let Ok(mut log) = message_log(repo, label) else {
+        return;
+    };
+    log.load();
+    if let Err(e) = log.maybe_compact() {
+        eprintln!(
+            "clank: could not compact `{}`'s message log: {e}",
+            label.as_str()
+        );
+    }
+}
+
+/// This agent's unacked messages, oldest first, each stamped with what
+/// acks it.
+pub fn pending(repo: &Path, label: &AgentLabel) -> Vec<WaitItem> {
+    // Anything still in the old file inbox joins the log first, so one
+    // read answers for both.
+    let _ = migrate(repo, label);
+    let Ok(log) = message_log(repo, label) else {
+        return Vec::new();
+    };
+    let Ok(Some(rows)) = log.read_rows() else {
+        return Vec::new();
+    };
+    rows.rows
+        .into_iter()
+        .filter(|r| !r.acked)
+        .filter_map(|row| {
+            let mut item = row.item;
+            let WaitItem::Message { selector, .. } = &mut item else {
+                return None;
+            };
+            *selector =
+                Some(crate::cli::events::Selector::qualified(MESSAGES_SOURCE, row.seq).to_string());
+            Some(item)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    /// The panel's projection reads the inbox and takes nothing.
-    ///
-    /// This is the promise the TUI row rests on: the agent is still
-    /// the recipient, and a human looking over its shoulder must not
-    /// handle its mail by looking. `clank inbox done` is what handles
-    /// a message (a-waiting-message-is-a-line-under-the-name).
-    #[test]
-    fn projecting_an_inbox_for_the_panel_consumes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = AgentLabel::parse("claude").unwrap();
-        send(
-            repo,
-            &label,
-            500,
-            None,
-            "2026-09-24T06:44:34Z",
-            "## A title\n\nbody",
-        )
-        .unwrap();
-        send(
-            repo,
-            &label,
-            500,
-            None,
-            "2026-09-24T07:00:00Z",
-            "plain subject\n\nmore",
-        )
-        .unwrap();
-
-        let before = scan(repo, &label);
-        assert_eq!(before.len(), 2);
-
-        // What the panel does, twice: the projection is a READ.
-        for _ in 0..2 {
-            let view = crate::cli::status::InboxView::read(repo, "claude")
-                .expect("two messages are waiting");
-            assert_eq!(view.messages.len(), 2);
-            // The title is the first non-blank line with the heading
-            // markers stripped -- the thing the row shows.
-            assert_eq!(view.messages[0].subject, "A title");
-            assert_eq!(view.messages[1].subject, "plain subject");
-            assert!(view.messages.iter().all(|m| m.sent_at.is_some()));
-        }
-
-        let after = scan(repo, &label);
-        assert_eq!(after.len(), 2, "looking at the inbox must not empty it",);
-        assert_eq!(
-            before
-                .iter()
-                .map(|m| m.entry.name.clone())
-                .collect::<Vec<_>>(),
-            after
-                .iter()
-                .map(|m| m.entry.name.clone())
-                .collect::<Vec<_>>(),
-            "and must not reorder or rename anything",
-        );
-    }
-
-    /// The handle shown is the handle that resolves to THAT message.
-    ///
-    /// `entry.name` is priority-stripped, so `100-500-note.md` and
-    /// `500-note.md` both carry the name `500-note` — and resolving it
-    /// picks one of them. A row showing that name would offer a handle
-    /// that selects a DIFFERENT message than the one it is describing
-    /// (codex 3bc0d05).
-    #[test]
-    fn the_handle_shown_resolves_to_the_message_it_describes() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = AgentLabel::parse("claude").unwrap();
-        let inbox = inbox_dir(repo, &label);
-        std::fs::create_dir_all(&inbox).unwrap();
-        std::fs::write(inbox.join("100-500-note.md"), "FIRST\n\nbody").unwrap();
-        std::fs::write(inbox.join("500-note.md"), "SECOND\n\nbody").unwrap();
-
-        let view = crate::cli::status::InboxView::read(repo, "claude").expect("two are waiting");
-        assert_eq!(view.messages.len(), 2);
-        for m in &view.messages {
-            let found = resolve(repo, &label, &m.handle)
-                .unwrap_or_else(|e| panic!("`{}` must resolve: {e:#}", m.handle));
-            assert_eq!(
-                found.subject(),
-                m.subject,
-                "handle `{}` is shown for `{}` but resolves to `{}`",
-                m.handle,
-                m.subject,
-                found.subject(),
-            );
-        }
-    }
-
-    /// An agent with an EMPTY inbox projects nothing.
-    ///
-    /// The row exists only where there is mail, and `inbox_rows`
-    /// derives the panel's rows from this projection — so a view
-    /// returned for an empty inbox would grow a row under every agent
-    /// on the roster.
-    #[test]
-    fn an_empty_inbox_projects_no_view_at_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = AgentLabel::parse("claude").unwrap();
-        // Never written to.
-        assert!(crate::cli::status::InboxView::read(repo, "claude").is_none());
-
-        // Written to, then handled: still nothing.
-        send(
-            repo,
-            &label,
-            500,
-            None,
-            "2026-09-24T06:44:34Z",
-            "a note\n\nbody",
-        )
-        .unwrap();
-        assert!(crate::cli::status::InboxView::read(repo, "claude").is_some());
-        let one = scan(repo, &label).pop().expect("it is there");
-        std::fs::remove_file(&one.entry.path).unwrap();
-        assert!(
-            crate::cli::status::InboxView::read(repo, "claude").is_none(),
-            "an inbox that empties loses its row",
-        );
-    }
-
-    /// A message with no `sent:` line still projects, with no age.
-    #[test]
-    fn a_hand_written_message_projects_without_a_stamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let label = AgentLabel::parse("claude").unwrap();
-        let inbox = inbox_dir(repo, &label);
-        std::fs::create_dir_all(&inbox).unwrap();
-        // Written by hand, no metadata at all -- which the inbox takes.
-        std::fs::write(inbox.join("500-00000001-note.md"), "# Just a note\n\nbody").unwrap();
-
-        let view = crate::cli::status::InboxView::read(repo, "claude").expect("it is waiting");
-        assert_eq!(view.messages.len(), 1);
-        assert_eq!(view.messages[0].subject, "Just a note");
-        assert_eq!(
-            view.messages[0].sent_at, None,
-            "no stamp is an absence to report, not an age to invent",
-        );
-    }
-
     use super::*;
 
     const SENT: &str = "2026-09-22T10:15:00Z";
@@ -481,15 +685,883 @@ mod tests {
             .collect()
     }
 
-    fn send_at(repo: &Path, priority: u16, body: &str) -> PathBuf {
-        send(repo, &grok(), priority, None, SENT, body).unwrap()
+    fn send_at(repo: &Path, body: &str) -> PathBuf {
+        send(repo, &grok(), None, SENT, body).unwrap()
+    }
+
+    /// A MESSAGE IS AN EVENT: it is logged, it wakes until acked, and
+    /// acking is what stops it — not the deletion of a file.
+    #[test]
+    fn a_delivered_message_wakes_until_it_is_acked() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let from = Sender {
+            label: "claude".into(),
+            repo: PathBuf::from("/src/clank"),
+        };
+        let handle = deliver(
+            repo.path(),
+            &to,
+            Some(&from),
+            "2026-09-22T10:15:00Z",
+            "# Rebase please\n\nonto master",
+        )
+        .unwrap();
+
+        let woken = pending(repo.path(), &to);
+        assert_eq!(woken.len(), 1, "one message, one wake: {woken:?}");
+        let WaitItem::Message {
+            handle: got,
+            subject,
+            from: sender,
+            selector,
+            ..
+        } = &woken[0]
+        else {
+            panic!("not a message")
+        };
+        assert_eq!(got, &handle);
+        assert_eq!(subject, "Rebase please", "the first line is the subject");
+        assert_eq!(sender.as_deref(), Some("claude"));
+        assert_eq!(
+            selector.as_deref(),
+            Some("messages@1"),
+            "the wake says what acks it",
+        );
+
+        // Reading is not handling: it wakes again.
+        assert_eq!(pending(repo.path(), &to).len(), 1, "still owed");
+
+        // Acking is. Same core as every other event.
+        let key = crate::cli::github::timeline::MemberKey {
+            agent: to.as_str().to_string(),
+            source: MESSAGES_SOURCE.to_string(),
+            seq: 1,
+            // `logical_ident` prefixes an action key with `k:`.
+            ident: format!("k:{}", action_key(&to, &handle)),
+        };
+        crate::cli::events::ack_members(repo.path(), &[key]).unwrap();
+        assert!(
+            pending(repo.path(), &to).is_empty(),
+            "an acked message stops waking",
+        );
+    }
+
+    /// A LEGACY MESSAGE IS VISIBLE TO A READER, without anyone having
+    /// waited first.
+    ///
+    /// Migration used to hang off `pending`, which is the wait path.
+    /// With the old panel gone, that left a person opening the TUI or
+    /// `clank events list` seeing no trace of mail that was genuinely
+    /// owed, until its recipient happened to wait. A reader has to be
+    /// a place migration happens, so this drives the reader and never
+    /// calls `pending` at all.
+    #[test]
+    fn a_reader_sees_a_legacy_message_without_a_wait() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let dir = inbox_dir(repo.path(), &to);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("500-00000001-rebase.md"),
+            "# Rebase please\n\nonto master",
+        )
+        .unwrap();
+
+        // The TIMELINE, which is what the TUI draws.
+        let snap = crate::cli::github::timeline::timeline_snapshot(repo.path());
+        let row = snap
+            .events
+            .iter()
+            .find(|e| e.kind == "message")
+            .expect("a reader migrates before it reads");
+        assert_eq!(row.content.as_deref(), Some("Rebase please"));
+        assert!(row.unhandled, "and it is still owed");
+        assert!(!dir.exists(), "the file moved rather than being copied");
+    }
+
+    /// EVERY FILE THE INBOX ACCEPTS MIGRATES, including the ones it
+    /// accepts without metadata.
+    ///
+    /// `priority_dir::scan` takes any `*.md`, so a hand-dropped
+    /// `500-note.md` with no stamp and no sequence number is a valid
+    /// message. It cannot be dated from its contents and cannot be
+    /// ordered by a sequence it does not have, which is why the rule
+    /// is the scan's own order and the best date each file actually
+    /// has.
+    #[test]
+    fn migration_takes_every_file_the_inbox_accepts() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let dir = inbox_dir(repo.path(), &to);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stamped, as `send` used to write them.
+        std::fs::write(
+            dir.join("500-00000001-stamped.md"),
+            format!("---\nfrom: claude\nrepo: /src/clank\nsent: {SENT}\n---\n\n# Stamped\n\nbody"),
+        )
+        .unwrap();
+        // Hand-written: no metadata at all.
+        std::fs::write(dir.join("500-00000002-plain.md"), "# Plain\n\nbody").unwrap();
+        // Hand-dropped: not even a sequence number.
+        std::fs::write(dir.join("500-note.md"), "# Note\n\nbody").unwrap();
+
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 3, "all three move");
+        assert!(!dir.exists(), "the directory goes with them");
+
+        let woken = pending(repo.path(), &to);
+        let subjects: Vec<&str> = woken
+            .iter()
+            .filter_map(|i| match i {
+                WaitItem::Message { subject, .. } => Some(subject.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            subjects,
+            ["Stamped", "Plain", "Note"],
+            "in the order the inbox read them: {woken:?}",
+        );
+        let bodies: Vec<&str> = woken
+            .iter()
+            .filter_map(|i| match i {
+                WaitItem::Message { body, .. } => Some(body.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            bodies.iter().all(|b| b.contains("body")),
+            "each keeps its text: {bodies:?}",
+        );
+    }
+
+    /// A MESSAGE REACHES THE TIMELINE, as its own kind of row.
+    ///
+    /// The timeline globs every log in an agent's events directory, so
+    /// the message log is picked up without being registered anywhere
+    /// — but only if the item produces an event view at all, which
+    /// `WaitItem` decided by falling through to `None` until now.
+    /// Nothing about "it should just appear" was true before this was
+    /// asserted.
+    #[test]
+    fn a_message_is_a_timeline_row() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let from = Sender {
+            label: "claude".into(),
+            repo: PathBuf::from("/src/clank"),
+        };
+        deliver(
+            repo.path(),
+            &to,
+            Some(&from),
+            SENT,
+            "# Rebase please\n\nonto master",
+        )
+        .unwrap();
+
+        let snap = crate::cli::github::timeline::timeline_snapshot(repo.path());
+        let row = snap
+            .events
+            .iter()
+            .find(|e| e.kind == "message")
+            .expect("the message is in the timeline");
+        assert_eq!(
+            row.backend,
+            crate::cli::github::timeline::Backend::Message,
+            "not a command: nobody ran it",
+        );
+        assert_eq!(row.source, "claude", "the sender is what the row names");
+        assert_eq!(row.content.as_deref(), Some("Rebase please"));
+        assert!(row.unhandled, "and it is owed until somebody acks it");
+    }
+
+    /// Every row of this agent's message log.
+    fn rows_of(repo: &Path, label: &AgentLabel) -> Vec<crate::cli::github::log::EventRow> {
+        message_log(repo, label)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .map(|r| r.rows)
+            .unwrap_or_default()
+    }
+
+    /// CONCURRENT SENDS GET DISTINCT, SEPARATELY ACKABLE SELECTORS.
+    ///
+    /// Every `clank send` is its own process appending to one log, so
+    /// the single-writer assumption the other producers get for free
+    /// does not hold here. Two writers that interleave "read the next
+    /// sequence" and "write at it" both take N, and then one selector
+    /// names two messages and neither can be acked alone.
+    #[test]
+    fn concurrent_sends_are_separately_ackable() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let n = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let (repo, barrier, to) = (repo.path().to_path_buf(), barrier.clone(), to.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    deliver(&repo, &to, None, SENT, &format!("# Ping {i}\n\nbody")).unwrap()
+                })
+            })
+            .collect();
+        let handles: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            handles
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            n,
+            "each send got its own handle",
+        );
+
+        let woken = pending(repo.path(), &to);
+        assert_eq!(woken.len(), n, "all of them are owed: {woken:?}");
+        let selectors: std::collections::BTreeSet<String> = woken
+            .iter()
+            .filter_map(|i| match i {
+                WaitItem::Message { selector, .. } => selector.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            selectors.len(),
+            n,
+            "and each says a DIFFERENT thing acks it: {selectors:?}",
+        );
+
+        // Each really is separately ackable: acking one leaves the rest.
+        let rows = message_log(repo.path(), &to)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .expect("the log reads back");
+        let first = rows.rows.first().expect("a row");
+        crate::cli::events::ack_members(
+            repo.path(),
+            &[crate::cli::github::timeline::MemberKey {
+                agent: to.as_str().to_string(),
+                source: MESSAGES_SOURCE.to_string(),
+                seq: first.seq,
+                ident: first.ident.clone(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            pending(repo.path(), &to).len(),
+            n - 1,
+            "acking one message acks exactly one",
+        );
+    }
+
+    /// A COMPACTION LANDING UNDER A SENDER COSTS NOTHING.
+    ///
+    /// With the log already at the threshold, every ack here rewrites
+    /// the file while sends are in flight. The invariant is that a
+    /// message still lands on a sequence of its own: two on one would
+    /// be a selector naming two things.
+    ///
+    /// It holds because the sidecar lock already keeps a rewrite from
+    /// landing mid-append and compaction never renumbers — not because
+    /// of a second lock, which is why there is not one. This asserts
+    /// the invariant rather than the mechanism, so it stays true if
+    /// either changes.
+    #[test]
+    fn a_compaction_cannot_land_under_a_sender() {
+        use crate::cli::github::log::{EventLog, Transport};
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let events_dir = crate::agent_store::agents_root(repo.path())
+            .join(to.as_str())
+            .join("events");
+
+        // Put the log at the threshold so compaction fires on the acks
+        // below rather than at some later time.
+        let mut log = EventLog::open(&events_dir, MESSAGES_SOURCE).unwrap();
+        log.load();
+        for i in 0..crate::cli::github::log::COMPACT_AT {
+            let seq = log
+                .append_inbox(
+                    Transport::Message,
+                    None,
+                    Some(&format!("old#{i}")),
+                    None,
+                    &WaitItem::Message {
+                        handle: format!("o{i}"),
+                        from: None,
+                        repo: None,
+                        subject: "old".into(),
+                        body: "old".into(),
+                        selector: None,
+                    },
+                )
+                .unwrap();
+            log.append_ack(seq).unwrap();
+        }
+        drop(log);
+
+        let senders = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(senders + 2));
+        let mut threads = Vec::new();
+        for i in 0..senders {
+            let (repo, barrier, to) = (repo.path().to_path_buf(), barrier.clone(), to.clone());
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                Some(deliver(&repo, &to, None, SENT, &format!("# New {i}\n\nbody")).unwrap())
+            }));
+        }
+        for _ in 0..2 {
+            let (repo, barrier, to) = (repo.path().to_path_buf(), barrier.clone(), to.clone());
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..4 {
+                    let keys: Vec<_> = rows_of(&repo, &to)
+                        .into_iter()
+                        .filter(|r| !r.acked)
+                        .map(|r| crate::cli::github::timeline::MemberKey {
+                            agent: to.as_str().to_string(),
+                            source: MESSAGES_SOURCE.to_string(),
+                            seq: r.seq,
+                            ident: r.ident,
+                        })
+                        .collect();
+                    let _ = crate::cli::events::ack_members(&repo, &keys);
+                }
+                None
+            }));
+        }
+        let sent: Vec<String> = threads
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(sent.len(), senders, "every send returned");
+
+        // Every message that was sent is in the log exactly once, and
+        // no two rows share a sequence — which is what a rewrite
+        // landing under an allocation would break.
+        let rows = rows_of(repo.path(), &to);
+        for handle in &sent {
+            let key = format!("k:{}", action_key(&to, handle));
+            assert_eq!(
+                rows.iter().filter(|r| r.ident == key).count(),
+                1,
+                "message {handle} is in the log exactly once",
+            );
+        }
+        let new_seqs: Vec<u64> = rows
+            .iter()
+            .filter(|r| {
+                sent.iter()
+                    .any(|h| r.ident == format!("k:{}", action_key(&to, h)))
+            })
+            .map(|r| r.seq)
+            .collect();
+        let distinct: std::collections::BTreeSet<_> = new_seqs.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            new_seqs.len(),
+            "two messages landed on one sequence: {new_seqs:?}",
+        );
+    }
+
+    /// THE OTHER SEAM: a crash BEFORE the append landed, resumed after
+    /// the horizon has moved on.
+    ///
+    /// The first seam leaves a file whose event exists. This one leaves
+    /// a file whose event does not — the append never got there — and
+    /// the resumed run must produce exactly one message rather than
+    /// none. It is the seam that fails in the opposite direction: an
+    /// over-eager dedup, or an identity recorded before the write it
+    /// stands for, would drop the message entirely.
+    #[test]
+    fn a_migration_that_never_appended_still_delivers_once() {
+        use crate::cli::github::log::{EventLog, Transport};
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let events_dir = crate::agent_store::agents_root(repo.path())
+            .join(to.as_str())
+            .join("events");
+
+        // Unrelated traffic, compacted, so the horizon has moved well
+        // past anything this message could be confused with.
+        let mut noise = EventLog::open(&events_dir, MESSAGES_SOURCE).unwrap();
+        noise.load();
+        for i in 0..crate::cli::github::log::COMPACT_AT {
+            let seq = noise
+                .append_inbox(
+                    Transport::Message,
+                    None,
+                    Some(&format!("noise#{i}")),
+                    None,
+                    &WaitItem::Message {
+                        handle: format!("n{i}"),
+                        from: None,
+                        repo: None,
+                        subject: "noise".into(),
+                        body: "noise".into(),
+                        selector: None,
+                    },
+                )
+                .unwrap();
+            noise.append_ack(seq).unwrap();
+        }
+        noise.maybe_compact().unwrap();
+        drop(noise);
+
+        // The crash: the file is here and its event never was.
+        let dir = inbox_dir(repo.path(), &to);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("500-00000001-late.md"), "# Late\n\nbody").unwrap();
+
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 1, "the file is taken");
+        let owed: Vec<String> = pending(repo.path(), &to)
+            .into_iter()
+            .filter_map(|i| match i {
+                WaitItem::Message { subject, .. } => Some(subject),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            owed.iter().filter(|s| *s == "Late").count(),
+            1,
+            "exactly one -- not none, and not two: {owed:?}",
+        );
+        assert!(!dir.exists(), "and the inbox is gone");
+    }
+
+    /// A BACKLOG SENT AND THEN ACKED, with no later send, still gets
+    /// compacted.
+    ///
+    /// `deliver` compacts only while sends keep coming. An inbox that
+    /// fills up and is then worked through ends on an ACK, and if that
+    /// path does not compact, every body and every ack record stays in
+    /// the WAL for good -- which is the opposite of the bounded
+    /// retention the plan promises.
+    #[test]
+    fn acking_a_backlog_compacts_it() {
+        use crate::cli::github::log::{EventLog, Transport};
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let events_dir = crate::agent_store::agents_root(repo.path())
+            .join(to.as_str())
+            .join("events");
+        let log_path = events_dir.join(format!("{MESSAGES_SOURCE}.jsonl"));
+
+        // A backlog, written directly: driving this many real sends is
+        // quadratic, and what is under test is the ACK path.
+        let mut log = EventLog::open(&events_dir, MESSAGES_SOURCE).unwrap();
+        log.load();
+        let n = crate::cli::github::log::COMPACT_AT / 2;
+        let mut seqs = Vec::new();
+        for i in 0..n {
+            seqs.push(
+                log.append_inbox(
+                    Transport::Message,
+                    None,
+                    Some(&format!("message#{}/{i}", to.as_str())),
+                    None,
+                    &WaitItem::Message {
+                        handle: format!("h{i}"),
+                        from: None,
+                        repo: None,
+                        subject: format!("Ping {i}"),
+                        body: "body".into(),
+                        selector: None,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        // All but one already handled, so the log sits just under the
+        // threshold and ONE ordinary ack crosses it. Resolving 4000
+        // members through the real ack path costs five minutes, and
+        // what is under test is the trigger, not the setup.
+        for seq in &seqs[..seqs.len() - 1] {
+            log.append_ack(*seq).unwrap();
+        }
+        drop(log);
+        let before = std::fs::read_to_string(&log_path).unwrap().lines().count();
+        assert_eq!(
+            pending(repo.path(), &to).len(),
+            1,
+            "one left to work through"
+        );
+
+        // Worked through, and then NOTHING else happens -- no further
+        // send to trigger a compaction on the way in.
+        let last = rows_of(repo.path(), &to)
+            .into_iter()
+            .find(|r| !r.acked)
+            .expect("the last unhandled message");
+        crate::cli::events::ack_members(
+            repo.path(),
+            &[crate::cli::github::timeline::MemberKey {
+                agent: to.as_str().to_string(),
+                source: MESSAGES_SOURCE.to_string(),
+                seq: last.seq,
+                ident: last.ident,
+            }],
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(&log_path).unwrap().lines().count();
+        assert!(
+            after < before,
+            "the ack that cleared the backlog must compact it: {before} -> {after}",
+        );
+        assert!(
+            pending(repo.path(), &to).is_empty(),
+            "and nothing is owed afterwards",
+        );
+    }
+
+    /// THE INTERRUPTION RESUMED ACROSS COMPACTION still mints one
+    /// message.
+    ///
+    /// This is the case the ordinary dedup horizon cannot answer, and
+    /// the reason migrated identities are pinned in it. A crash between
+    /// the durable append and the file's deletion leaves the file to be
+    /// found whenever the next read happens -- and nothing schedules
+    /// that read, so a repo busy with unrelated events can push the
+    /// horizon past the message in between. Driven, not argued: the
+    /// events are actually arrived and the log is actually compacted.
+    #[test]
+    fn a_migration_resumed_after_compaction_mints_one_message() {
+        use crate::cli::github::log::{EventLog, Transport};
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let dir = inbox_dir(repo.path(), &to);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("500-00000001-ping.md");
+        std::fs::write(&file, "# Ping\n\nbody").unwrap();
+
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 1);
+        let ev = crate::cli::github::timeline::timeline_snapshot(repo.path())
+            .events
+            .into_iter()
+            .find(|e| e.kind == "message")
+            .expect("migrated");
+        // Handled, so compaction may fold it away.
+        crate::cli::events::ack_members(repo.path(), &[ev.members[0].key.clone()]).unwrap();
+
+        // Enough unrelated handled events to push the horizon well past
+        // it, and a compaction to act on them.
+        let events_dir = crate::agent_store::agents_root(repo.path())
+            .join(to.as_str())
+            .join("events");
+        // Enough handled noise to put the log over the compaction
+        // threshold. Written directly because driving COMPACT_AT real
+        // sends costs four minutes: every send reads the whole log to
+        // learn its next sequence, so building the backlog that way is
+        // quadratic. The compaction itself is still triggered by a
+        // REAL send below -- that is the path under test.
+        let mut noise = EventLog::open(&events_dir, MESSAGES_SOURCE).unwrap();
+        noise.load();
+        for i in 0..crate::cli::github::log::COMPACT_AT {
+            let item = WaitItem::Message {
+                handle: format!("n{i}"),
+                from: None,
+                repo: None,
+                subject: "noise".into(),
+                body: "noise".into(),
+                selector: None,
+            };
+            let seq = noise
+                .append_inbox(
+                    Transport::Message,
+                    None,
+                    Some(&format!("noise#{i}")),
+                    None,
+                    &item,
+                )
+                .unwrap();
+            noise.append_ack(seq).unwrap();
+        }
+        let log_path = events_dir.join(format!("{MESSAGES_SOURCE}.jsonl"));
+        let lines_before = std::fs::read_to_string(&log_path).unwrap().lines().count();
+
+        // ONE ordinary send, through the path a person uses. Nothing
+        // here calls compaction by hand.
+        deliver(repo.path(), &to, None, SENT, "# Trigger\n\nbody").unwrap();
+        let lines_after = std::fs::read_to_string(&log_path).unwrap().lines().count();
+        assert!(
+            lines_after < lines_before,
+            "an ordinary send must compact a log this size: {lines_before} -> {lines_after}",
+        );
+
+        // The crash window: the file was never deleted.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "# Ping\n\nbody").unwrap();
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 1, "the file is taken");
+
+        // The message was acked before the noise, so compaction has
+        // folded it away -- that is ordinary and fine. What must NOT
+        // happen is a second one appearing, which is what a replay
+        // produces and what an unhandled `Ping` would be.
+        let owed: Vec<String> = pending(repo.path(), &to)
+            .into_iter()
+            .filter_map(|i| match i {
+                WaitItem::Message { subject, .. } => Some(subject),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !owed.iter().any(|s| s == "Ping"),
+            "the crash resumed after compaction minted a second message: {owed:?}",
+        );
+        assert!(!file.exists(), "and the file was taken this time");
+    }
+
+    /// THE WHOLE MESSAGE REACHES THE READER, before and after the ack.
+    ///
+    /// Storing the body in the WAL is not the same as being able to
+    /// read it: the presentation model carried ONE text field, mapped
+    /// to the subject, so every surface showed a first line and the
+    /// message itself was unreachable. The row keeps the subject; the
+    /// body is carried beside it.
+    #[test]
+    fn the_whole_message_reaches_the_reader() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let text = "# Rebase please\n\nonto master, then run the suite.\n\nThanks.";
+        deliver(repo.path(), &to, None, SENT, text).unwrap();
+
+        let message = |repo: &Path| {
+            crate::cli::github::timeline::timeline_snapshot(repo)
+                .events
+                .into_iter()
+                .find(|e| e.kind == "message")
+                .expect("the message is in the timeline")
+        };
+
+        let ev = message(repo.path());
+        assert_eq!(
+            ev.content.as_deref(),
+            Some("Rebase please"),
+            "the row stays one line",
+        );
+        assert_eq!(
+            ev.body.as_deref(),
+            Some(text),
+            "and the whole message rides beside it",
+        );
+
+        // After the ack too, because a handled message staying readable
+        // is the reason for the log.
+        crate::cli::events::ack_members(repo.path(), &[ev.members[0].key.clone()]).unwrap();
+        assert_eq!(
+            message(repo.path()).body.as_deref(),
+            Some(text),
+            "a handled message is still readable whole",
+        );
+    }
+
+    /// A REAL INBOX MIGRATES AWAY COMPLETELY.
+    ///
+    /// Built by the send path rather than by hand, so it has what a
+    /// historical inbox actually has: a `.seq` counter and a `.lock`
+    /// beside the messages. Hand-made fixtures have neither, which is
+    /// how a cleanup that removed only the lock passed while leaving
+    /// every real directory standing and every read re-migrating it.
+    #[test]
+    fn a_real_inbox_leaves_nothing_behind() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let from = Sender {
+            label: "claude".into(),
+            repo: PathBuf::from("/src/clank"),
+        };
+        send(repo.path(), &to, Some(&from), SENT, "# First\n\nbody").unwrap();
+        send(repo.path(), &to, None, SENT, "# Second\n\nbody").unwrap();
+        let dir = inbox_dir(repo.path(), &to);
+        assert!(dir.join(".seq").exists(), "the send path keeps a counter");
+
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 2);
+        assert!(
+            !dir.exists(),
+            "a migrated inbox leaves no directory: {:?}",
+            std::fs::read_dir(&dir)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+
+        let woken = pending(repo.path(), &to);
+        assert_eq!(woken.len(), 2, "both are owed");
+        // And a second read does no work, because there is nothing left
+        // to find.
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 0);
+    }
+
+    /// AN UNREADABLE FILE IS LEFT, not dropped.
+    ///
+    /// Unreadable now may be readable later — a permission fixed, a
+    /// disk that came back — so leaving it is the only answer that
+    /// cannot lose a message. The directory stays with it, which is
+    /// what tells the next run there is still something to do.
+    #[test]
+    fn migration_leaves_a_file_it_cannot_read() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let dir = inbox_dir(repo.path(), &to);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("500-00000001-fine.md"), "# Fine\n\nbody").unwrap();
+        let locked = dir.join("500-00000002-locked.md");
+        std::fs::write(&locked, "# Locked\n\nbody").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let moved = migrate(repo.path(), &to).unwrap();
+        assert_eq!(moved, 1, "only the readable one moved");
+        assert!(locked.exists(), "the unreadable message is still there");
+        assert!(dir.exists(), "and its directory stays, so this runs again");
+        assert!(
+            dir.join(".lock").exists(),
+            "and so does the lock: tearing it down while a message is \
+             still here would leave the next two migrations nothing to \
+             exclude each other with",
+        );
+        assert_eq!(pending(repo.path(), &to).len(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert_eq!(
+            migrate(repo.path(), &to).unwrap(),
+            1,
+            "readable now, taken now"
+        );
+        assert_eq!(pending(repo.path(), &to).len(), 2);
+        assert!(!dir.exists(), "and now the directory goes");
+    }
+
+    /// MIGRATION IS AT-LEAST-ONCE. Run it twice, or interrupt it after
+    /// the append and before the delete, and the message exists once.
+    ///
+    /// The interruption is DRIVEN rather than argued: the file is put
+    /// back after a completed migration, which is exactly the state a
+    /// crash in that window leaves behind.
+    #[test]
+    fn an_interrupted_migration_mints_no_second_message() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let dir = inbox_dir(repo.path(), &to);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("500-00000001-ping.md");
+        std::fs::write(&file, "# Ping\n\nbody").unwrap();
+
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 1);
+        assert_eq!(pending(repo.path(), &to).len(), 1);
+
+        // The crash window: the event is durable, the file never went.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "# Ping\n\nbody").unwrap();
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 1, "the file is taken");
+        assert_eq!(
+            pending(repo.path(), &to).len(),
+            1,
+            "but no second message is minted",
+        );
+        assert!(!dir.exists(), "and the directory goes again");
+
+        // And a run with nothing to do is not an error.
+        assert_eq!(migrate(repo.path(), &to).unwrap(), 0);
+    }
+
+    /// THE MESSAGE SURVIVES BEING SENT.
+    ///
+    /// `clank send` leaves no file anywhere now, so the log record is
+    /// the only copy: a body that is not in it was not sent. Read back
+    /// after the append AND after the ack, because a handled message
+    /// staying readable is the point of moving to a log at all.
+    #[test]
+    fn a_sent_message_can_be_read_back_whole() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let text = "# Rebase please\n\nonto master, then run the suite.\n\nThanks.";
+        let handle = deliver(repo.path(), &to, None, SENT, text).unwrap();
+
+        let body_of = |items: &[WaitItem]| {
+            items.iter().find_map(|i| match i {
+                WaitItem::Message { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            body_of(&pending(repo.path(), &to)).as_deref(),
+            Some(text),
+            "every paragraph of it, not just the first line",
+        );
+
+        let key = crate::cli::github::timeline::MemberKey {
+            agent: to.as_str().to_string(),
+            source: MESSAGES_SOURCE.to_string(),
+            seq: 1,
+            ident: format!("k:{}", action_key(&to, &handle)),
+        };
+        crate::cli::events::ack_members(repo.path(), &[key]).unwrap();
+
+        let log = message_log(repo.path(), &to).unwrap();
+        let rows = log.read_rows().unwrap().expect("the log reads back");
+        let handled = rows
+            .rows
+            .iter()
+            .find(|r| r.acked)
+            .expect("the acked row is still there");
+        let WaitItem::Message { body, .. } = &handled.item else {
+            panic!("not a message")
+        };
+        assert_eq!(body, text, "a handled message is still readable");
+    }
+
+    /// Two recipients holding the same handle are two messages.
+    ///
+    /// The merge groups across agents by source plus key, and every
+    /// message shares the one source, so an un-namespaced handle would
+    /// alias them into a single row with two copies.
+    #[test]
+    fn two_recipients_never_share_a_message() {
+        let repo = tempfile::tempdir().unwrap();
+        let a = AgentLabel::parse("claude").unwrap();
+        let b = AgentLabel::parse("codex").unwrap();
+        log_message(repo.path(), &a, "same", None, SENT, "for claude", None).unwrap();
+        log_message(repo.path(), &b, "same", None, SENT, "for codex", None).unwrap();
+        assert_ne!(
+            action_key(&a, "same"),
+            action_key(&b, "same"),
+            "the recipient is part of the identity",
+        );
+        assert_eq!(pending(repo.path(), &a).len(), 1);
+        assert_eq!(pending(repo.path(), &b).len(), 1);
+    }
+
+    /// Two sends to ONE recipient are two messages.
+    ///
+    /// The handle is minted rather than derived from anything the two
+    /// sends share, so identical text sent twice is still two things
+    /// somebody has to answer.
+    #[test]
+    fn the_same_message_sent_twice_is_two_messages() {
+        let repo = tempfile::tempdir().unwrap();
+        let to = grok();
+        let one = deliver(repo.path(), &to, None, SENT, "ping").unwrap();
+        let two = deliver(repo.path(), &to, None, SENT, "ping").unwrap();
+        assert_ne!(one, two, "each send gets its own handle");
+        assert_eq!(pending(repo.path(), &to).len(), 2, "both are owed");
     }
 
     #[test]
-    fn a_priority_reads_in_send_order() {
+    fn sends_read_in_send_order() {
         let repo = tempfile::tempdir().unwrap();
-        send_at(repo.path(), 500, "z-first");
-        send_at(repo.path(), 500, "a-second");
+        send_at(repo.path(), "z-first");
+        send_at(repo.path(), "a-second");
         assert_eq!(
             names(repo.path()),
             ["500-00000001-z-first", "500-00000002-a-second"],
@@ -501,15 +1573,7 @@ mod tests {
     fn twelve_sends_with_one_subject_read_in_send_order() {
         let repo = tempfile::tempdir().unwrap();
         for i in 0..12 {
-            send(
-                repo.path(),
-                &grok(),
-                500,
-                None,
-                SENT,
-                &format!("review\n\n{i}"),
-            )
-            .unwrap();
+            send(repo.path(), &grok(), None, SENT, &format!("review\n\n{i}")).unwrap();
         }
         let bodies: Vec<String> = scan(repo.path(), &grok())
             .iter()
@@ -519,15 +1583,18 @@ mod tests {
         assert_eq!(bodies, expected, "the tenth after the ninth");
     }
 
+    /// Send order is the only order, now that every message sits at one
+    /// priority — and a hand-dropped file with no sequence at all still
+    /// has a place, which migration depends on.
     #[test]
-    fn priority_outranks_send_order_and_a_bare_file_sorts_last() {
+    fn sends_read_in_order_and_a_bare_file_sorts_last() {
         let repo = tempfile::tempdir().unwrap();
-        send_at(repo.path(), 500, "early");
-        send_at(repo.path(), 100, "urgent");
+        send_at(repo.path(), "early");
+        send_at(repo.path(), "urgent");
         std::fs::write(inbox_dir(repo.path(), &grok()).join("by-hand.md"), "x").unwrap();
         assert_eq!(
             names(repo.path()),
-            ["100-00000002-urgent", "500-00000001-early", "by-hand"]
+            ["500-00000001-early", "500-00000002-urgent", "by-hand"]
         );
     }
 
@@ -537,7 +1604,7 @@ mod tests {
         let dir = inbox_dir(repo.path(), &grok());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".send-1.tmp"), "half a mess").unwrap();
-        send_at(repo.path(), 500, "hello");
+        send_at(repo.path(), "hello");
         assert_eq!(names(repo.path()), ["500-00000001-hello"]);
     }
 
@@ -571,7 +1638,7 @@ mod tests {
                 let (repo, barrier) = (repo.path().to_path_buf(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    send(&repo, &grok(), 500, None, SENT, &format!("from sender {i}")).unwrap();
+                    send(&repo, &grok(), None, SENT, &format!("from sender {i}")).unwrap();
                 })
             })
             .collect();
@@ -591,10 +1658,10 @@ mod tests {
     #[test]
     fn a_handled_name_never_comes_to_mean_a_newer_message() {
         let repo = tempfile::tempdir().unwrap();
-        let a = send_at(repo.path(), 500, "review please");
+        let a = send_at(repo.path(), "review please");
         let a_handle = a.file_stem().unwrap().to_string_lossy().into_owned();
         done(repo.path(), &grok(), &a_handle).unwrap();
-        let b = send_at(repo.path(), 500, "review please");
+        let b = send_at(repo.path(), "review please");
         let b_bytes = std::fs::read(&b).unwrap();
 
         assert_ne!(a, b, "the drained inbox did not reuse A's number");
@@ -609,7 +1676,7 @@ mod tests {
         let dir = inbox_dir(repo.path(), &grok());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".seq"), "not a number").unwrap();
-        assert!(send(repo.path(), &grok(), 500, None, SENT, "hello").is_err());
+        assert!(send(repo.path(), &grok(), None, SENT, "hello").is_err());
         assert!(names(repo.path()).is_empty());
     }
 
@@ -619,7 +1686,7 @@ mod tests {
         let dir = inbox_dir(repo.path(), &grok());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".seq"), format!("{SEQ_MAX}")).unwrap();
-        let err = send(repo.path(), &grok(), 500, None, SENT, "hello").unwrap_err();
+        let err = send(repo.path(), &grok(), None, SENT, "hello").unwrap_err();
         assert!(err.to_string().contains("every message number"), "{err}");
         assert!(names(repo.path()).is_empty());
     }
@@ -634,13 +1701,12 @@ mod tests {
         send(
             repo.path(),
             &grok(),
-            500,
             Some(&claude),
             SENT,
             "# Rebase please\n\nonto master",
         )
         .unwrap();
-        send_at(repo.path(), 500, "from a person");
+        send_at(repo.path(), "from a person");
         let messages = scan(repo.path(), &grok());
 
         assert_eq!(messages[0].from.as_deref(), Some("claude"));
@@ -690,7 +1756,7 @@ mod tests {
     #[test]
     fn a_leftover_staging_file_is_never_written_through() {
         let repo = tempfile::tempdir().unwrap();
-        let a = send_at(repo.path(), 500, "first");
+        let a = send_at(repo.path(), "first");
         let a_bytes = std::fs::read(&a).unwrap();
         let dir = inbox_dir(repo.path(), &grok());
         for leftover in [
@@ -700,34 +1766,9 @@ mod tests {
             std::fs::hard_link(&a, dir.join(leftover)).unwrap();
         }
 
-        send_at(repo.path(), 500, "second");
+        send_at(repo.path(), "second");
 
         assert_eq!(std::fs::read(&a).unwrap(), a_bytes, "A is untouched");
         assert_eq!(names(repo.path()).len(), 2);
-    }
-
-    #[test]
-    fn reprioritising_onto_a_taken_name_keeps_both_messages() {
-        let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("100-note.md"), "first").unwrap();
-        std::fs::write(dir.join("500-note.md"), "second").unwrap();
-
-        assert!(set_priority(repo.path(), &grok(), "500-note", 100).is_err());
-
-        let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
-        assert_eq!(
-            (read("100-note.md"), read("500-note.md")),
-            ("first".into(), "second".into())
-        );
-    }
-
-    #[test]
-    fn reprioritising_keeps_the_name() {
-        let repo = tempfile::tempdir().unwrap();
-        send_at(repo.path(), 500, "hello");
-        set_priority(repo.path(), &grok(), "00000001-hello", 100).unwrap();
-        assert_eq!(names(repo.path()), ["100-00000001-hello"]);
     }
 }

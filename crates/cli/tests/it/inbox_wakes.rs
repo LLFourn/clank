@@ -52,8 +52,47 @@ fn label(s: &str) -> AgentLabel {
     AgentLabel::parse(s).unwrap()
 }
 
-fn send(repo: &Path, to: &str, body: &str) -> std::path::PathBuf {
-    clank::inbox::send(repo, &label(to), 500, None, "2026-09-22T10:15:00Z", body).unwrap()
+/// A message sent the way `clank send` sends one: logged as an event.
+fn send(repo: &Path, to: &str, body: &str) -> String {
+    clank::inbox::deliver(repo, &label(to), None, "2026-09-22T10:15:00Z", body).unwrap()
+}
+
+/// A message dropped into the OLD file inbox, as one sent before this
+/// existed would be. Migration is what brings it into the log.
+fn legacy_file(repo: &Path, to: &str, body: &str) -> std::path::PathBuf {
+    clank::inbox::send(repo, &label(to), None, "2026-09-22T10:15:00Z", body).unwrap()
+}
+
+/// The selector a message's wake names — what `clank events ack`
+/// takes, and the only handle an agent is given.
+fn selector_of(items: &[WaitItem], subject: &str) -> String {
+    items
+        .iter()
+        .find_map(|i| match i {
+            WaitItem::Message {
+                subject: s,
+                selector,
+                ..
+            } if s == subject => selector.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no message {subject:?} naming a selector in {items:?}"))
+}
+
+/// Handle a message the way an agent is told to: run the ack command
+/// with the selector its wake gave it. Not a test-only shortcut --
+/// this is the contract, and a selector the command refuses is a wake
+/// that cannot be discharged.
+async fn ack(repo: &Path, to: &str, selector: &str) {
+    clank::cli::events::run(clank::cli::EventsArgs {
+        command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            repo: Some(repo.to_path_buf()),
+            author: Some(to.to_string()),
+            ids: vec![selector.to_string()],
+        }),
+    })
+    .await
+    .expect("the ack command accepts the selector the wake named");
 }
 
 /// A team with nothing to do: `master` has no plans or queue, `rev`
@@ -130,15 +169,38 @@ async fn a_message_does_not_hide_the_queue_from_the_master() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_message_keeps_waking_until_it_is_handled() {
+async fn a_message_keeps_waking_until_it_is_acked() {
     let env = idle_env();
     let repo = env.repo();
-    let path = send(repo, "rev", "rebase please");
-    let handle = path.file_stem().unwrap().to_string_lossy().into_owned();
+    send(repo, "rev", "rebase please");
 
+    // Reading is not handling: it comes back every time.
+    let items = peek(repo, "rev").await;
+    assert_eq!(subjects(&items), ["rebase please"]);
     assert_eq!(subjects(&peek(repo, "rev").await), ["rebase please"]);
-    assert_eq!(subjects(&peek(repo, "rev").await), ["rebase please"]);
-    clank::inbox::done(repo, &label("rev"), &handle).unwrap();
+    ack(repo, "rev", &selector_of(&items, "rebase please")).await;
+    assert!(peek(repo, "rev").await.is_empty());
+}
+
+/// A message sent BEFORE this existed still wakes its agent: the first
+/// read migrates it into the log, and from there it behaves like any
+/// other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_legacy_file_still_wakes_and_is_acked_like_an_event() {
+    let env = idle_env();
+    let repo = env.repo();
+    legacy_file(repo, "rev", "from before");
+
+    let items = peek(repo, "rev").await;
+    assert_eq!(subjects(&items), ["from before"]);
+    assert_eq!(
+        subjects(&peek(repo, "rev").await),
+        ["from before"],
+        "still owed until it is acked",
+    );
+    // Through the SAME command, with the selector its wake named: a
+    // migrated message is not a second kind of thing.
+    ack(repo, "rev", &selector_of(&items, "from before")).await;
     assert!(peek(repo, "rev").await.is_empty());
 }
 

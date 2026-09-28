@@ -46,8 +46,29 @@ use clank_core::wait::WaitItem;
 /// weight for reconciliation.
 pub(crate) const LOG_IDENTITY_CAP: usize = 1000;
 
+/// Action keys under this prefix are NEVER aged out of the dedup
+/// horizon (`a-message-is-an-event-like-any-other`).
+///
+/// Migration is the one ingest whose source outlives its append: the
+/// old inbox file is deleted only after the event is durable, and a
+/// crash between the two leaves the file to be found again whenever
+/// the next read happens — which nothing schedules. If the horizon has
+/// moved past that message in the meantime, the replay mints a second
+/// copy of something a person wrote.
+///
+/// Every other identity may age out because nothing replays it. This
+/// exemption is bounded by the historical inbox, which is finite and
+/// only ever shrinks: once the last file is migrated there is nothing
+/// left to produce a key under this prefix.
+pub(crate) const MIGRATED_MESSAGE_PREFIX: &str = "migrated-message#";
+
+/// Whether this action key must survive the horizon.
+pub(crate) fn identity_is_pinned(action_key: Option<&str>) -> bool {
+    action_key.is_some_and(|k| k.starts_with(MIGRATED_MESSAGE_PREFIX))
+}
+
 /// Total-line threshold that triggers compaction on ingest appends.
-const COMPACT_AT: usize = 4 * LOG_IDENTITY_CAP;
+pub(crate) const COMPACT_AT: usize = 4 * LOG_IDENTITY_CAP;
 
 /// Presentation retention (log-timeline-github-events): compaction
 /// keeps this many of the NEWEST handled inbox records verbatim —
@@ -72,6 +93,12 @@ pub(crate) enum Transport {
     Draft,
     /// A repo gate transition observed by the master's wait.
     Repo,
+    /// A message one agent sent another
+    /// (`a-message-is-an-event-like-any-other`). Its own transport
+    /// rather than borrowing `Command`'s: nothing produced it by
+    /// running, and a reader asking where a row came from deserves the
+    /// answer "somebody sent it".
+    Message,
 }
 
 impl Transport {
@@ -82,6 +109,7 @@ impl Transport {
             Transport::Command => "command",
             Transport::Draft => "draft",
             Transport::Repo => "repo",
+            Transport::Message => "message",
         }
     }
 }
@@ -691,7 +719,20 @@ impl EventLog {
             }
         };
         cap_tail(&mut feed_ids);
+        // The in-memory horizon caps the same way the file does, and
+        // must make the same exemption, or a pinned identity would
+        // survive compaction and still be forgotten by the reader.
+        let pinned: Vec<String> = action_keys
+            .iter()
+            .filter(|k| identity_is_pinned(Some(k)))
+            .cloned()
+            .collect();
         cap_tail(&mut action_keys);
+        for k in pinned {
+            if !action_keys.contains(&k) {
+                action_keys.push(k);
+            }
+        }
         FoldOut {
             unhandled,
             feed_ids,
@@ -1242,7 +1283,7 @@ impl EventLog {
             for (i, (feed_id, action_key, _, _)) in identities.iter().enumerate().rev() {
                 let want_feed = feed_id.is_some() && feed_seen < LOG_IDENTITY_CAP;
                 let want_key = action_key.is_some() && key_seen < LOG_IDENTITY_CAP;
-                if want_feed || want_key {
+                if want_feed || want_key || identity_is_pinned(action_key.as_deref()) {
                     keep[i] = true;
                     if feed_id.is_some() {
                         feed_seen += 1;
