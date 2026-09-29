@@ -49,6 +49,9 @@ const FOREIGN_IDENTITY_VARS = [
   "CLAUDE_CODE_SESSION_ID",
   "CODEX_THREAD_ID",
   "GROK_AGENT",
+  // Newer grok exports the id alongside the marker; the marker alone
+  // used to be the whole of grok's identity in a tool subprocess.
+  "GROK_SESSION_ID",
   "CLANK_AGENT",
   // The bootstrap ownership token (set only on clank's resumed
   // launches): a fresh/forked child must not inherit its parent's.

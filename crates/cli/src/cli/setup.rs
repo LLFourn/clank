@@ -57,47 +57,77 @@ const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER and STANDBY ro
 
 /// Claude's Stop hook owns its wait and returns the wake as a
 /// continuation. The agent ends its turn; it does not arm a task.
-const WORK_LOOP_CLAUDE: &str = "\
+/// One tool's work-delivery teaching: how work ARRIVES, and the one
+/// thing the agent must never do about it.
+///
+/// Two fields rather than one blob because the second is an invariant
+/// every loop owes and the first is mechanism. A loop written without
+/// a prohibition does not compile. A loop with its prohibition buried
+/// in prose only fails a substring search someone has to remember to
+/// keep in step — which is exactly what happened: `80f01612` rewrote
+/// claude's rule correctly and changed its capitalization in the same
+/// line, and the test had been asserting the capitalization.
+pub(crate) struct WorkLoop {
+    arrival: &'static str,
+    /// The WORDING differs per tool because the mechanism does. Where
+    /// the hook or the plugin owns the wait the rule is "do not arm
+    /// one"; where the agent owns it (grok) the rule is the opposite
+    /// half — arm exactly one, in the background, and do not spin.
+    /// Only the subject is common, so only the subject is asserted.
+    pub(crate) prohibition: &'static str,
+}
+
+const WORK_LOOP_CLAUDE: WorkLoop = WorkLoop {
+    arrival: "\
 - **Act on Stop-hook work immediately, then end your turn.** The Stop
   hook watches for clank work and wakes you with the items. Run
   `clank status` if you need more than the hint carries (short SHAs
   resolve wherever a `<sha>` is wanted).
-  Each item is a one-line hint: kind, plan, short sha.
-- **Never poll.** Do not start a background `clank wait` or re-run
+  Each item is a one-line hint: kind, plan, short sha.",
+    prohibition: "\
+- **NEVER poll.** Do not start a background `clank wait` or re-run
   `clank status` while waiting. End your turn; the Stop hook owns the
-  wait and hands you new work.";
+  wait and hands you new work.",
+};
 
 /// Claude under the ASYNCREWAKE loop (claude-asyncrewake-work-loop):
 /// the Stop hook parks the watcher itself and work arrives as a
 /// system-reminder wake — the agent must never arm anything. The
 /// legacy text below stays for machines whose Claude Code predates
 /// asyncRewake (setup decides per machine).
-const WORK_LOOP_CLAUDE_ASYNC: &str = "\
+const WORK_LOOP_CLAUDE_ASYNC: WorkLoop = WorkLoop {
+    arrival: "\
 - **Work arrives on its own.** When you end a turn, clank parks a
   watcher inside the Stop hook; when work exists you are WOKEN with
   the items as a system reminder (\"Clank wait returned work…\").
   Act on them IMMEDIATELY. Run `clank status` if you need more than
   the hint carries (short SHAs resolve wherever a `<sha>` is wanted).
-  Each item is a one-line hint: kind, plan, short sha.
+  Each item is a one-line hint: kind, plan, short sha.",
+    prohibition: "\
 - **NEVER run `clank wait` yourself**, foreground or background —
   the hook owns the wait and presents pending work. Do not re-run `clank status` waiting for
-  state to change. End your turn; work finds you.";
+  state to change. End your turn; work finds you.",
+};
 
-const WORK_LOOP_CODEX: &str = "\
+const WORK_LOOP_CODEX: WorkLoop = WorkLoop {
+    arrival: "\
 - **Act on Stop-hook work IMMEDIATELY, then YIELD.** When the Stop hook
   hands you work, do it now. codex surfaces this as a
   `Stop hook (blocked) feedback:` message. Run `clank status` if you
   need more than the hint carries (short SHAs resolve wherever a `<sha>`
   is wanted).
-  Each item is a one-line hint: kind, plan, short sha.
+  Each item is a one-line hint: kind, plan, short sha.",
+    prohibition: "\
 - **NEVER poll.** Do not loop on `clank wait` or re-run `clank status`
   waiting for state to change. STOP — the Stop hook re-invokes you when
-  there is work. You WILL be woken; do not spin.";
+  there is work. You WILL be woken; do not spin.",
+};
 
 /// Grok wakes on background-task completion like claude
 /// (grok-first-class P1), but its hooks are passive — no reminder
 /// nudge exists, so the arming discipline is carried entirely here.
-const WORK_LOOP_GROK: &str = "\
+const WORK_LOOP_GROK: WorkLoop = WorkLoop {
+    arrival: "\
 - **Keep a `clank wait` armed.** End every turn with `clank wait`
   running as a background terminal command (`background: true`).
   Its completion wakes you: act on the items it printed IMMEDIATELY,
@@ -105,10 +135,12 @@ const WORK_LOOP_GROK: &str = "\
   you forget — arming the wait is YOUR responsibility, every turn. Run
   `clank status` if you need more than the hint carries (short SHAs
   resolve wherever a `<sha>` is wanted).
-  Each item is a one-line hint: kind, plan, short sha.
+  Each item is a one-line hint: kind, plan, short sha.",
+    prohibition: "\
 - **NEVER poll.** Do not run `clank wait` in the foreground and do not
   re-run `clank status` waiting for state to change. The armed
-  background wait wakes you; do not spin.";
+  background wait wakes you; do not spin.",
+};
 
 /// opencode is plugin-driven (opencode-agent-tool M1/M2): the clank
 /// plugin long-polls `clank stop-hook` on session.idle and INJECTS
@@ -116,17 +148,33 @@ const WORK_LOOP_GROK: &str = "\
 /// arrives. No arming, no reminder; the skill must forbid
 /// self-arming (a parked wait duplicates the plugin's deliveries
 /// and litters processes).
-const WORK_LOOP_OPENCODE: &str = "\
+const WORK_LOOP_OPENCODE: WorkLoop = WorkLoop {
+    arrival: "\
 - **Work arrives on its own.** When you end a turn, clank's opencode
   plugin watches for work and injects it as a new prompt (\"Clank wait
   returned work…\"). Act on the items IMMEDIATELY. Run `clank status`
   if you need more than the hint carries (short SHAs resolve wherever
   a `<sha>` is wanted).
-  Each item is a one-line hint: kind, plan, short sha.
+  Each item is a one-line hint: kind, plan, short sha.",
+    prohibition: "\
 - **NEVER run `clank wait` yourself**, foreground or background — the
   plugin already holds this session's one wait; a second duplicates
   deliveries. Do not re-run `clank status` waiting for state to
-  change. End your turn; work finds you.";
+  change. End your turn; work finds you.",
+};
+
+/// The loop a (tool, mode) pair teaches. Exhaustive over `Tool`, so a
+/// tool added to the vocabulary must state its own discipline here
+/// rather than inheriting someone else's.
+pub(crate) fn work_loop(tool: Tool, claude_async: bool) -> WorkLoop {
+    match tool {
+        Tool::Claude if claude_async => WORK_LOOP_CLAUDE_ASYNC,
+        Tool::Claude => WORK_LOOP_CLAUDE,
+        Tool::Codex => WORK_LOOP_CODEX,
+        Tool::Grok => WORK_LOOP_GROK,
+        Tool::OpenCode => WORK_LOOP_OPENCODE,
+    }
+}
 
 /// Compose a role's `SKILL.md` for a tool from the shared single-source
 /// fragments: frontmatter (role-guarded description) + a role-guard
@@ -188,15 +236,11 @@ pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String 
         Tool::Grok => "run_terminal_command",
         Tool::OpenCode => "bash",
     };
-    let work_loop = match tool {
-        Tool::Claude if claude_async => WORK_LOOP_CLAUDE_ASYNC,
-        Tool::Claude => WORK_LOOP_CLAUDE,
-        Tool::Codex => WORK_LOOP_CODEX,
-        Tool::Grok => WORK_LOOP_GROK,
-        Tool::OpenCode => WORK_LOOP_OPENCODE,
-    };
-    out.replace("{{SHELL}}", shell)
-        .replace("{{WORK_LOOP}}", work_loop)
+    let teaching = work_loop(tool, claude_async);
+    out.replace("{{SHELL}}", shell).replace(
+        "{{WORK_LOOP}}",
+        &format!("{}\n{}", teaching.arrival, teaching.prohibition),
+    )
 }
 
 /// Per-tool hook timeout we write into the agent's hook config.
@@ -1447,8 +1491,64 @@ mod tests {
                     "the guard is generated, not an asset — it must survive composition ({tool:?})"
                 );
                 assert!(
-                    body.contains("NEVER poll"),
-                    "both roles must forbid polling ({tool:?})"
+                    body.contains(work_loop(tool, false).prohibition),
+                    "both roles must carry the work-loop prohibition ({tool:?})"
+                );
+            }
+        }
+    }
+
+    /// EVERY work loop forbids the agent taking the wait into its own
+    /// hands, and the prohibition reaches the reader.
+    ///
+    /// The wording cannot be shared, so it must not be asserted: where
+    /// the hook or the plugin owns the wait the rule is "do not arm
+    /// one", and grok's is the opposite half — arm exactly one, in the
+    /// background, and do not spin. What every loop owes is the
+    /// SUBJECT and a reader who sees it.
+    ///
+    /// This replaces a search for the literal "NEVER poll" over two of
+    /// the five loops. Two of the other three do not contain that
+    /// phrase at all and never could, so the old assertion could not
+    /// have been extended to them; it went red when a rewrite changed
+    /// `NEVER` to `Never` while leaving the rule intact, which is a
+    /// test measuring the wrong thing in both directions at once.
+    #[test]
+    fn every_work_loop_forbids_taking_the_wait_into_its_own_hands() {
+        for (tool, _) in TOOL_SKILL_DIRS {
+            for claude_async in [false, true] {
+                let teaching = work_loop(tool, claude_async);
+                // Naming the subject is also what rules out the empty
+                // prohibition, which every `contains` below would
+                // otherwise accept.
+                assert!(
+                    teaching.prohibition.contains("clank wait"),
+                    "{tool:?} (async={claude_async}) must name the wait it rules on"
+                );
+                for role in [Role::Master, Role::Reviewer, Role::Standby] {
+                    assert!(
+                        compose_skill_with(role, tool, claude_async).contains(teaching.prohibition),
+                        "{role:?}/{tool:?} (async={claude_async}) drops the prohibition in \
+                         composition"
+                    );
+                }
+            }
+        }
+
+        // grok is the only tool whose AGENT owns the wait — nothing
+        // else arms one for it. Handing it another tool's loop would
+        // tell it not to arm, and then nothing would ever wake it, so
+        // its teaching must be no one else's.
+        let grok = work_loop(Tool::Grok, false).arrival;
+        for (tool, _) in TOOL_SKILL_DIRS {
+            if tool == Tool::Grok {
+                continue;
+            }
+            for claude_async in [false, true] {
+                assert_ne!(
+                    work_loop(tool, claude_async).arrival,
+                    grok,
+                    "{tool:?} (async={claude_async}) was handed grok's arming loop"
                 );
             }
         }

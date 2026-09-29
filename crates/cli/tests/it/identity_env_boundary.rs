@@ -14,17 +14,16 @@
 
 use crate::common::{crates_dir, rs_files, strip_test_code};
 
-/// The variables that decide identity. Kept as data, in the order
-/// `SESSION_IDENTITY_VARS` lists them — a seventh variable added to
-/// that list belongs here too.
-const IDENTITY_VARS: &[&str] = &[
-    "CLAUDE_CODE_SESSION_ID",
-    "CODEX_THREAD_ID",
-    "OPENCODE_SESSION_ID",
-    "GROK_AGENT",
-    "CLANK_AGENT",
-    "CLANK_BOOTSTRAP_SESSION_ID",
-];
+/// The variables that decide identity — the production list itself,
+/// not a copy of it.
+///
+/// It WAS a copy, with a comment asking whoever added a variable to
+/// add it here too. `GROK_SESSION_ID` was added to the production
+/// list and not here, and since this gate only guards what it lists,
+/// it quietly stopped guarding reads of the one variable that had
+/// just been added. A list whose correctness depends on someone
+/// remembering is not a gate.
+use clank::agent_env::SESSION_IDENTITY_VARS as IDENTITY_VARS;
 
 /// The one file allowed to read them.
 const OWNER: &str = "agent_env.rs";

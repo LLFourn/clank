@@ -44,7 +44,7 @@ pub(crate) const ENV_CLANK_BOOTSTRAP_SESSION: &str = "CLANK_BOOTSTRAP_SESSION_ID
 /// token). Fresh launches scrub these from the child env so an agent
 /// never inherits its parent's identity; each tool re-exports its
 /// own to its shells.
-pub(crate) const SESSION_IDENTITY_VARS: &[&str] = &[
+pub const SESSION_IDENTITY_VARS: &[&str] = &[
     ENV_CLAUDE_SESSION,
     ENV_CODEX_SESSION,
     ENV_OPENCODE_SESSION,
