@@ -28,6 +28,7 @@ use std::time::Duration;
 use clank_core::agent_config::{GithubEventKind, GithubSource};
 use clank_core::wait::WaitItem;
 
+use super::selection::{Admission, Event, Selection};
 use super::session::{GithubSession, HttpSend};
 
 /// GitHub's `/events` feed caps at ~300 events (3 pages of 100).
@@ -102,22 +103,13 @@ fn webhook_event_at(payload: &serde_json::Value) -> Option<u64> {
 pub(crate) fn classify_event(
     repo: &str,
     event: &serde_json::Value,
-    wanted: &[GithubEventKind],
+    sel: &Selection,
     own_login: Option<&str>,
-    include_own: bool,
-    branches: &[String],
 ) -> Option<Classified> {
     let actor = event
         .get("actor")
         .and_then(|a| a.get("login"))
         .and_then(|l| l.as_str());
-    if !include_own
-        && let (Some(own), Some(actor)) = (own_login, actor)
-        && own == actor
-    {
-        return None;
-    }
-
     let ty = event.get("type").and_then(|t| t.as_str())?;
     let event_at = event
         .get("created_at")
@@ -125,6 +117,8 @@ pub(crate) fn classify_event(
         .and_then(parse_iso8601_epoch);
     let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
     let action = payload.get("action").and_then(|a| a.as_str());
+    let is_own = own_login.is_some() && own_login == actor;
+    let review_state = review_state(payload);
     let pr = || {
         payload
             .get("pull_request")
@@ -143,14 +137,16 @@ pub(crate) fn classify_event(
     // the event-domain boundary, and the branches filter sees only
     // real short branch names (codex 3f04e3d).
     if ty == "PushEvent" {
-        if !wanted.contains(&GithubEventKind::BranchPush) {
-            return None;
-        }
         let full_ref = payload.get("ref").and_then(|r| r.as_str())?;
         let branch = full_ref.strip_prefix("refs/heads/")?;
-        if !branches.is_empty() && !branches.iter().any(|b| b == branch) {
-            return None;
-        }
+        admitted_as(
+            sel,
+            repo,
+            &[(GithubEventKind::BranchPush, None)],
+            None,
+            Some(branch),
+            is_own,
+        )?;
         let size = payload.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
         let url = payload
             .get("before")
@@ -216,9 +212,11 @@ pub(crate) fn classify_event(
         // Events API PullRequestReviewEvent action is `created` (a new
         // submitted review, empty-body approvals included), NOT the
         // webhook `submitted`; accept both for tolerance.
-        "PullRequestReviewEvent" if matches!(action, Some("created") | Some("submitted")) => {
-            (GithubEventKind::PrComment, Some("review"), pr())
-        }
+        "PullRequestReviewEvent" if matches!(action, Some("created") | Some("submitted")) => (
+            GithubEventKind::ReviewSubmitted,
+            review_state.as_deref(),
+            pr(),
+        ),
         // Events API PullRequestReviewCommentEvent action: created.
         "PullRequestReviewCommentEvent" if action == Some("created") => {
             (GithubEventKind::PrComment, Some("review_comment"), pr())
@@ -226,16 +224,15 @@ pub(crate) fn classify_event(
         _ => return None,
     };
 
-    if !wanted.contains(&kind) {
-        return None;
-    }
+    let number = obj.get("number").and_then(|n| n.as_u64());
+    let (kind, detail) = admitted_as(sel, repo, &recordings(kind, detail), number, None, is_own)?;
     let key = action_key(kind, detail, payload, obj);
     Some(Classified {
         item: WaitItem::GithubEvent {
             repo: repo.to_string(),
             event: kind_str(kind).to_string(),
             detail: detail.map(str::to_string),
-            number: obj.get("number").and_then(|n| n.as_u64()),
+            number,
             title: obj
                 .get("title")
                 .and_then(|t| t.as_str())
@@ -250,6 +247,72 @@ pub(crate) fn classify_event(
         feed_id: None,
         event_at,
     })
+}
+
+/// Every classification one action can legitimately be recorded as,
+/// most specific first.
+///
+/// A submitted review is the only action with more than one, and it
+/// has two because `pr_comment` predates `review_submitted` and still
+/// means what it always did. Which one a watch gets is therefore not
+/// a property of the payload — it is whichever the watch admits, and
+/// that cannot be decided before the scope and the actor filter have
+/// had their say. Deciding it from kind membership alone dropped a
+/// review on a PR that a broader `comment` clause covered (codex
+/// 9dc8a13).
+fn recordings(kind: GithubEventKind, detail: Option<&str>) -> Vec<(GithubEventKind, Option<&str>)> {
+    match kind {
+        GithubEventKind::ReviewSubmitted => vec![
+            (kind, detail),
+            // The legacy recording, whose detail is the CONSTANT a
+            // `pr_comment` watch has logged since before the state had
+            // anywhere to go. Second, so a watch that names both kinds
+            // records the specific one.
+            (
+                GithubEventKind::PrComment,
+                Some(clank_core::agent_config::CommentClass::Review.wire()),
+            ),
+        ],
+        _ => vec![(kind, detail)],
+    }
+}
+
+/// Which recording the watch takes this action as, or `None` if it
+/// takes none — plus the one rejection a silent drop would hide.
+///
+/// ONE answer, never one per matching recording: an action the watch
+/// admits twice is still one action, and the row it becomes has one
+/// identity.
+fn admitted_as<'a>(
+    sel: &Selection,
+    repo: &str,
+    recordings: &[(GithubEventKind, Option<&'a str>)],
+    number: Option<u64>,
+    branch: Option<&str>,
+    is_own: bool,
+) -> Option<(GithubEventKind, Option<&'a str>)> {
+    let mut unplaceable = None;
+    for &(kind, detail) in recordings {
+        match sel.admits(&Event {
+            kind,
+            detail,
+            number,
+            branch,
+            is_own,
+        }) {
+            Admission::Admitted => return Some((kind, detail)),
+            Admission::Rejected => {}
+            Admission::Unplaceable => unplaceable = unplaceable.or(Some(kind)),
+        }
+    }
+    if let Some(kind) = unplaceable {
+        eprintln!(
+            "wait: github {repo} — a {} event carried no PR number; \
+             dropped, since `prs` cannot place it",
+            kind_str(kind)
+        );
+    }
+    None
 }
 
 /// The dedup namespace and payload container for a comment-family
@@ -296,6 +359,27 @@ fn subject_url(payload: &serde_json::Value, obj: &serde_json::Value) -> Option<S
         .or_else(|| html_url(obj))
 }
 
+/// A submitted review's state — `approved`, `changes_requested` or
+/// `commented` — which is what a watcher wants beside the kind. It
+/// replaces the constant `review` the kind already says.
+///
+/// Shared by both classifiers, like [`subject_url`]: they read the
+/// same `review` object, and two copies of one payload decision is
+/// how the poll came to record no link for every review comment.
+///
+/// Lowercased because it is rendered. The feed and the webhook both
+/// send it lowercase, but GitHub's reviews endpoint sends `APPROVED`,
+/// and one state an operator has to learn as two words is worse than
+/// a normalization that can only ever be a no-op here.
+fn review_state(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("review")
+        .and_then(|r| r.get("state"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
 /// Which object carries this event's body
 /// (tui-github-event-content). Derived from the payload, never from
 /// `action_key`: the dedup string's shape must not become
@@ -315,6 +399,18 @@ fn content_ref(
         GithubEventKind::IssueOpened | GithubEventKind::IssueClosed => {
             Some(ContentRef::Issue { number: number? })
         }
+        // Its own arm because `detail` now carries the review's
+        // STATE, and the comment-family route below reads `detail` to
+        // find its container. A review is addressed THROUGH its PR,
+        // so a missing number makes it unaddressable — no reference
+        // rather than a wrong one, here and in that arm's `review`.
+        GithubEventKind::ReviewSubmitted => Some(ContentRef::Review {
+            number: number?,
+            id: payload
+                .get("review")
+                .and_then(|r| r.get("id"))
+                .and_then(|i| i.as_u64())?,
+        }),
         GithubEventKind::PrComment | GithubEventKind::IssueComment => {
             let (ns, container) = comment_ns_container(detail);
             let id = payload
@@ -322,9 +418,6 @@ fn content_ref(
                 .and_then(|c| c.get("id"))
                 .and_then(|i| i.as_u64())?;
             Some(match ns {
-                // A review is addressed THROUGH its PR, so a missing
-                // number makes it unaddressable — no reference rather
-                // than a wrong one.
                 "review" => ContentRef::Review {
                     number: number?,
                     id,
@@ -378,6 +471,17 @@ fn action_key(
         // (issue comments, review comments, reviews) — the key is
         // namespaced by the classified subtype so equal numeric ids
         // across families never collide (codex bf1e1ea).
+        // A submitted review is keyed in its own namespace rather than
+        // the `review` comment subtype's: the same review reaching a
+        // watch as both kinds must be two distinct rows, because one
+        // of them can be filtered and the other cannot.
+        GithubEventKind::ReviewSubmitted => {
+            let id = payload
+                .get("review")
+                .and_then(|r| r.get("id"))
+                .and_then(|i| i.as_u64())?;
+            Some(format!("review_submitted#{id}"))
+        }
         GithubEventKind::PrComment | GithubEventKind::IssueComment => {
             let (ns, container) = comment_ns_container(detail);
             let id = payload
@@ -395,6 +499,7 @@ fn action_key(
 
 pub(crate) fn kind_str(kind: GithubEventKind) -> &'static str {
     match kind {
+        GithubEventKind::ReviewSubmitted => "review_submitted",
         GithubEventKind::PrOpened => "pr_opened",
         GithubEventKind::PrUpdated => "pr_updated",
         GithubEventKind::BranchPush => "branch_push",
@@ -413,30 +518,24 @@ pub(crate) fn kind_str(kind: GithubEventKind) -> &'static str {
 /// from the events feed: the event NAME arrives out-of-band (the
 /// `X-GitHub-Event` header), the action vocabulary is the webhook one
 /// (`submitted` reviews, `synchronize`), the actor is `sender.login`,
-/// and a push carries `after`/`ref` with a commits array. Same wanted/
-/// own-actor/branches semantics as [`classify_event`]; tag pushes are
-/// ignored by the same `refs/heads/` gate.
+/// and a push carries `after`/`ref` with a commits array. It asks the
+/// SAME [`Selection`] as [`classify_event`]; tag pushes are ignored by
+/// the same `refs/heads/` gate.
 pub(crate) fn classify_webhook(
     repo: &str,
     event_name: &str,
     payload: &serde_json::Value,
-    wanted: &[GithubEventKind],
+    sel: &Selection,
     own_login: Option<&str>,
-    include_own: bool,
-    branches: &[String],
 ) -> Option<Classified> {
     let event_at = webhook_event_at(payload);
     let actor = payload
         .get("sender")
         .and_then(|a| a.get("login"))
         .and_then(|l| l.as_str());
-    if !include_own
-        && let (Some(own), Some(actor)) = (own_login, actor)
-        && own == actor
-    {
-        return None;
-    }
     let action = payload.get("action").and_then(|a| a.as_str());
+    let is_own = own_login.is_some() && own_login == actor;
+    let review_state = review_state(payload);
     let pr = || {
         payload
             .get("pull_request")
@@ -444,14 +543,16 @@ pub(crate) fn classify_webhook(
     };
 
     if event_name == "push" {
-        if !wanted.contains(&GithubEventKind::BranchPush) {
-            return None;
-        }
         let full_ref = payload.get("ref").and_then(|r| r.as_str())?;
         let branch = full_ref.strip_prefix("refs/heads/")?;
-        if !branches.is_empty() && !branches.iter().any(|b| b == branch) {
-            return None;
-        }
+        admitted_as(
+            sel,
+            repo,
+            &[(GithubEventKind::BranchPush, None)],
+            None,
+            Some(branch),
+            is_own,
+        )?;
         let size = payload
             .get("commits")
             .and_then(|c| c.as_array())
@@ -515,24 +616,25 @@ pub(crate) fn classify_webhook(
             }
         }
         // Webhook vocabulary: a new review is SUBMITTED.
-        "pull_request_review" if action == Some("submitted") => {
-            (GithubEventKind::PrComment, Some("review"), pr())
-        }
+        "pull_request_review" if action == Some("submitted") => (
+            GithubEventKind::ReviewSubmitted,
+            review_state.as_deref(),
+            pr(),
+        ),
         "pull_request_review_comment" if action == Some("created") => {
             (GithubEventKind::PrComment, Some("review_comment"), pr())
         }
         _ => return None,
     };
-    if !wanted.contains(&kind) {
-        return None;
-    }
+    let number = obj.get("number").and_then(|n| n.as_u64());
+    let (kind, detail) = admitted_as(sel, repo, &recordings(kind, detail), number, None, is_own)?;
     let key = action_key(kind, detail, payload, obj);
     Some(Classified {
         item: WaitItem::GithubEvent {
             repo: repo.to_string(),
             event: kind_str(kind).to_string(),
             detail: detail.map(str::to_string),
-            number: obj.get("number").and_then(|n| n.as_u64()),
+            number,
             title: obj
                 .get("title")
                 .and_then(|t| t.as_str())
@@ -557,6 +659,7 @@ pub(super) fn map_page(
     seen: &BTreeSet<String>,
     own_login: Option<&str>,
 ) -> (Vec<Classified>, Vec<String>) {
+    let sel = Selection::of(src);
     let mut items = Vec::new();
     let mut ids = Vec::new();
     for event in events {
@@ -567,15 +670,7 @@ pub(super) fn map_page(
         if seen.contains(id) {
             continue;
         }
-        if let Some(mut classified) = classify_event(
-            &src.repo,
-            event,
-            &src.events,
-            own_login,
-            src.include_own_actions,
-            &src.branches,
-        ) && in_scope(src, &classified.item)
-        {
+        if let Some(mut classified) = classify_event(&src.repo, event, &sel, own_login) {
             classified.feed_id = Some(id.to_string());
             items.push(classified);
         }
@@ -831,51 +926,32 @@ impl<S: HttpSend> EventFetcher for GhFetcher<S> {
     }
 }
 
-/// Is this item in scope for this watch?
+/// Whether a row read back from the log still falls inside the
+/// watch's PR scope.
 ///
-/// ONE rule, applied wherever an item reaches the agent — both
-/// classifiers, the warm backlog replay, and the follower's tail.
-///
-/// Two reasons it cannot live in the classifiers alone. The standing
-/// one: the replay paths never classify anything, they send SAVED
-/// rows, so a rule that only filters arrivals does not govern them
-/// at all. And the one this plan created: a watch whose config did
-/// not change keeps its source key across this upgrade, while its
-/// log holds comments on other PRs that were legitimately accepted
-/// when `prs` scoped CI alone (codex 8043f14).
-///
-/// Editing the list is NOT that case — `source_key` hashes a
-/// non-empty `prs`, so a changed list is a different log.
-///
-/// Works on the ITEM, because a saved row is all the replay paths
-/// have.
-pub(crate) fn in_scope(src: &GithubSource, item: &WaitItem) -> bool {
-    if src.prs.is_empty() {
-        return true;
-    }
+/// Saved rows never pass a classifier, so this is the only place the
+/// scope can govern them — and a log written when `prs` governed
+/// fewer kinds is full of rows a current binary would not have taken.
+pub(crate) fn row_in_scope(src: &GithubSource, item: &WaitItem) -> bool {
     let WaitItem::GithubEvent { event, number, .. } = item else {
         return true;
     };
-    // A kind the scope does not govern — `pr_opened`, the issue
-    // kinds, `branch_push` — passes untouched, as does a kind this
-    // binary does not know.
-    match clank_core::agent_config::GithubEventKind::from_wire(event) {
-        Some(kind) if kind.is_pr_scoped() => match number {
-            Some(n) => src.prs.contains(n),
-            None => {
-                // An eligible event we cannot place. Dropping it
-                // silently is the failure a scope makes hard to
-                // notice, so it goes loudly — unlike an out-of-scope
-                // PR, which is the scope working.
-                eprintln!(
-                    "wait: github {} — a {event} event carried no PR number; \
-                     dropped, since `prs` cannot place it",
-                    src.repo
-                );
-                false
-            }
-        },
-        _ => true,
+    // A kind this binary does not know is a kind no clause names, and
+    // an unnamed kind is not something a scope has an opinion about.
+    let Some(kind) = GithubEventKind::from_wire(event) else {
+        return true;
+    };
+    match Selection::of(src).row_in_scope(kind, *number) {
+        Admission::Admitted => true,
+        Admission::Rejected => false,
+        Admission::Unplaceable => {
+            eprintln!(
+                "wait: github {} — a {event} event carried no PR number; \
+                 dropped, since `prs` cannot place it",
+                src.repo
+            );
+            false
+        }
     }
 }
 
@@ -961,6 +1037,7 @@ pub(super) mod tests {
         GithubSource {
             repo: "o/r".into(),
             events: events.to_vec(),
+            watch: Vec::new(),
             poll_interval: None,
             include_own_actions: include_own,
             branches: Vec::new(),
@@ -968,6 +1045,61 @@ pub(super) mod tests {
             prompt: None,
             delivery: clank_core::agent_config::Delivery::Poll,
         }
+    }
+
+    /// The flat config fields as a [`Selection`], for the tests that
+    /// are ABOUT the flat shape. It goes through [`Selection::of`], so
+    /// they exercise the desugaring instead of standing in for it.
+    fn flat_selection(
+        wanted: &[GithubEventKind],
+        include_own: bool,
+        branches: &[String],
+    ) -> Selection {
+        let mut s = src(wanted, include_own);
+        s.branches = branches.to_vec();
+        Selection::of(&s)
+    }
+
+    /// A source whose selection is written in the nested shape.
+    fn watch_selection(watch: &str) -> Selection {
+        let mut s = src(&[], false);
+        s.watch = serde_json::from_str(watch).expect("the clauses parse");
+        assert_eq!(s.refusal(), None, "{watch}");
+        Selection::of(&s)
+    }
+
+    pub(in crate::cli::github) fn classify_event_flat(
+        repo: &str,
+        event: &serde_json::Value,
+        wanted: &[GithubEventKind],
+        own_login: Option<&str>,
+        include_own: bool,
+        branches: &[String],
+    ) -> Option<Classified> {
+        classify_event(
+            repo,
+            event,
+            &flat_selection(wanted, include_own, branches),
+            own_login,
+        )
+    }
+
+    pub(in crate::cli::github) fn classify_webhook_flat(
+        repo: &str,
+        event_name: &str,
+        payload: &serde_json::Value,
+        wanted: &[GithubEventKind],
+        own_login: Option<&str>,
+        include_own: bool,
+        branches: &[String],
+    ) -> Option<Classified> {
+        classify_webhook(
+            repo,
+            event_name,
+            payload,
+            &flat_selection(wanted, include_own, branches),
+            own_login,
+        )
     }
 
     /// A recorded-shape `/events` element.
@@ -1074,7 +1206,7 @@ pub(super) mod tests {
             ),
         ];
         for (raw, want, detail) in cases {
-            let item = classify_event("o/r", &raw, all, None, false, &[])
+            let item = classify_event_flat("o/r", &raw, all, None, false, &[])
                 .unwrap_or_else(|| panic!("must classify {want}"))
                 .item;
             let WaitItem::GithubEvent {
@@ -1103,7 +1235,7 @@ pub(super) mod tests {
         // A TAG push is ignored even when branch_push is subscribed
         // with an empty branches filter (codex 3f04e3d).
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &push("refs/tags/v1.0"),
                 &[BranchPush],
@@ -1116,7 +1248,7 @@ pub(super) mod tests {
         );
         // Unsubscribed configs drop branch pushes.
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &push("refs/heads/main"),
                 &[GithubEventKind::PrOpened],
@@ -1129,7 +1261,7 @@ pub(super) mod tests {
         // The branches filter admits by SHORT ref and drops others.
         let main_only = vec!["main".to_string()];
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &push("refs/heads/main"),
                 &[BranchPush],
@@ -1140,7 +1272,7 @@ pub(super) mod tests {
             .is_some()
         );
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &push("refs/heads/dev"),
                 &[BranchPush],
@@ -1152,7 +1284,7 @@ pub(super) mod tests {
         );
         // Own-actor filtering applies like every other kind.
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &push("refs/heads/main"),
                 &[BranchPush],
@@ -1177,9 +1309,10 @@ pub(super) mod tests {
                 "x",
             )
         };
-        let item = classify_event("o/r", &pr_ev("synchronize"), &[PrUpdated], None, false, &[])
-            .expect("synchronize → pr_updated")
-            .item;
+        let item =
+            classify_event_flat("o/r", &pr_ev("synchronize"), &[PrUpdated], None, false, &[])
+                .expect("synchronize → pr_updated")
+                .item;
         let WaitItem::GithubEvent { event, number, .. } = item else {
             unreachable!()
         };
@@ -1188,7 +1321,8 @@ pub(super) mod tests {
         // Other head-adjacent actions stay unmapped.
         for action in ["edited", "labeled", "reopened"] {
             assert!(
-                classify_event("o/r", &pr_ev(action), &[PrUpdated], None, false, &[]).is_none(),
+                classify_event_flat("o/r", &pr_ev(action), &[PrUpdated], None, false, &[])
+                    .is_none(),
                 "{action} is not a pr_updated"
             );
         }
@@ -1203,8 +1337,9 @@ pub(super) mod tests {
             serde_json::json!({"action":"merged","pull_request":{"number":1}}),
         ] {
             let raw = ev("1", "PullRequestEvent", payload, "x");
-            let item = classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[])
-                .map(|c| c.item);
+            let item =
+                classify_event_flat("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[])
+                    .map(|c| c.item);
             assert!(
                 matches!(item, Some(WaitItem::GithubEvent { .. })),
                 "must be pr_merged"
@@ -1231,7 +1366,7 @@ pub(super) mod tests {
                 "x",
             );
             assert!(
-                classify_event("o/r", &raw, wanted, None, false, &[]).is_none(),
+                classify_event_flat("o/r", &raw, wanted, None, false, &[]).is_none(),
                 "{ty}/{action} must be filtered"
             );
         }
@@ -1246,7 +1381,8 @@ pub(super) mod tests {
             "x",
         );
         assert!(
-            classify_event("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[]).is_none()
+            classify_event_flat("o/r", &raw, &[GithubEventKind::PrMerged], None, false, &[])
+                .is_none()
         );
         let raw = ev(
             "1",
@@ -1255,7 +1391,7 @@ pub(super) mod tests {
             "me",
         );
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &raw,
                 &[GithubEventKind::PrOpened],
@@ -1266,7 +1402,7 @@ pub(super) mod tests {
             .is_none()
         );
         assert!(
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &raw,
                 &[GithubEventKind::PrOpened],
@@ -1322,6 +1458,7 @@ pub(super) mod tests {
                 IssueComment,
                 BranchPush,
             ],
+            watch: Vec::new(),
             poll_interval: None,
             include_own_actions: true, // don't filter — assert full mapping
             branches: Vec::new(),
@@ -1380,6 +1517,316 @@ pub(super) mod tests {
         assert_eq!(url.as_deref(), Some("https://github.com/o/r/pull/12"));
     }
 
+    /// A SUBMITTED REVIEW IS ITS OWN EVENT, and the watcher's own
+    /// submission is not noise.
+    ///
+    /// The incident: a team drafts review comments under one login, so
+    /// the watch excludes that login to stop the drafts — and that also
+    /// dropped that person's SUBMITTED reviews, which is the thing
+    /// everyone was waiting for. `include_own_actions` could not tell
+    /// them apart while it ran before classification.
+    #[test]
+    fn a_submitted_review_reaches_a_watch_that_filters_its_own_comments() {
+        let mine = Some("LLFourn");
+        let review = |action: &str| {
+            serde_json::json!({
+                "type": "PullRequestReviewEvent",
+                "actor": {"login": "LLFourn"},
+                "payload": {
+                    "action": action,
+                    "review": {"id": 9, "state": "approved",
+                               "html_url": "https://github.com/o/r/pull/603#pullrequestreview-9"},
+                    "pull_request": {"base": {}, "head": {}, "id": 1, "number": 603,
+                                     "url": "https://api.github.com/repos/o/r/pulls/603"},
+                }
+            })
+        };
+        let comment = serde_json::json!({
+            "type": "PullRequestReviewCommentEvent",
+            "actor": {"login": "LLFourn"},
+            "payload": {
+                "action": "created",
+                "comment": {"id": 7, "html_url": "https://github.com/o/r/pull/603#discussion_r7"},
+                "pull_request": {"base": {}, "head": {}, "id": 1, "number": 603,
+                                 "url": "https://api.github.com/repos/o/r/pulls/603"},
+            }
+        });
+
+        // The watch the incident needed: every submitted review, and
+        // other people's comments.
+        let wants = &[GithubEventKind::ReviewSubmitted, GithubEventKind::PrComment];
+        let got = classify_event_flat("o/r", &review("created"), wants, mine, false, &[])
+            .expect("a submitted review reaches its own watcher");
+        let WaitItem::GithubEvent {
+            event,
+            detail,
+            actor,
+            content,
+            ..
+        } = &got.item
+        else {
+            panic!("not a github event")
+        };
+        assert_eq!(event, "review_submitted");
+        assert_eq!(
+            detail.as_deref(),
+            Some("approved"),
+            "carrying the state, which is the thing the kind does not say",
+        );
+        assert_eq!(actor.as_deref(), Some("LLFourn"), "and the reviewer");
+        assert_eq!(
+            *content,
+            Some(clank_core::wait::ContentRef::Review { number: 603, id: 9 }),
+            "and the review's own id, addressed through its PR",
+        );
+        assert_eq!(
+            got.key.as_deref(),
+            Some("review_submitted#9"),
+            "keyed in its own namespace, not the review COMMENT subtype's",
+        );
+        assert!(
+            classify_event_flat("o/r", &comment, wants, mine, false, &[]).is_none(),
+            "while the same login's draft comment is still dropped",
+        );
+
+        // And a watch that never heard of the kind is unchanged: the
+        // same payload is still `pr_comment`, still filtered.
+        let legacy = &[GithubEventKind::PrComment];
+        let got = classify_event_flat("o/r", &review("created"), legacy, mine, true, &[])
+            .expect("classified");
+        let WaitItem::GithubEvent { event, detail, .. } = &got.item else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            (event.as_str(), detail.as_deref()),
+            ("pr_comment", Some("review")),
+            "a config that predates the kind records exactly what it did",
+        );
+        assert!(
+            classify_event_flat("o/r", &review("created"), legacy, mine, false, &[]).is_none(),
+            "and its own-actions filter still applies to it",
+        );
+
+        // The webhook says `submitted`; same answer.
+        let hook = serde_json::json!({
+            "action": "submitted",
+            "sender": {"login": "LLFourn"},
+            "review": {"id": 9, "state": "approved"},
+            "pull_request": {"number": 603}
+        });
+        let got =
+            classify_webhook_flat("o/r", "pull_request_review", &hook, wants, mine, false, &[])
+                .expect("the webhook reaches its own watcher too");
+        let WaitItem::GithubEvent {
+            event,
+            detail,
+            content,
+            ..
+        } = &got.item
+        else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            (event.as_str(), detail.as_deref()),
+            ("review_submitted", Some("approved"))
+        );
+        assert_eq!(
+            *content,
+            Some(clank_core::wait::ContentRef::Review { number: 603, id: 9 }),
+        );
+    }
+
+    /// A pending review is not an event, and its drafts are not it
+    /// either — only SUBMITTING one is `review_submitted`.
+    ///
+    /// GitHub sends the same `pull_request_review` shape for an edit
+    /// and a dismissal, and a draft comment arrives as the inline
+    /// comment it is. A watch that wants submitted reviews must not
+    /// be woken by any of them.
+    #[test]
+    fn only_submitting_a_review_produces_the_event() {
+        let sel = watch_selection(r#"[{"pr": {"events": ["review_submitted", "comment"]}}]"#);
+        for action in ["edited", "dismissed"] {
+            let poll = serde_json::json!({
+                "id": "1", "type": "PullRequestReviewEvent", "actor": {"login": "x"},
+                "payload": {"action": action, "review": {"id": 9, "state": "approved"},
+                            "pull_request": {"number": 1}}});
+            assert!(
+                classify_event("o/r", &poll, &sel, None).is_none(),
+                "a {action} review is not a submission",
+            );
+            let hook = serde_json::json!({
+                "action": action, "sender": {"login": "x"},
+                "review": {"id": 9, "state": "approved"}, "pull_request": {"number": 1}});
+            assert!(
+                classify_webhook("o/r", "pull_request_review", &hook, &sel, None).is_none(),
+                "nor on the webhook",
+            );
+        }
+
+        // The drafts a pending review is written as stay the inline
+        // comments they are, for this watch too.
+        let draft = serde_json::json!({
+            "id": "1", "type": "PullRequestReviewCommentEvent", "actor": {"login": "x"},
+            "payload": {"action": "created", "comment": {"id": 7},
+                        "pull_request": {"number": 1}}});
+        let WaitItem::GithubEvent { event, detail, .. } = classify_event("o/r", &draft, &sel, None)
+            .expect("the comment clause takes it")
+            .item
+        else {
+            panic!("not a github event")
+        };
+        assert_eq!(
+            (event.as_str(), detail.as_deref()),
+            ("pr_comment", Some("review_comment")),
+        );
+    }
+
+    /// WHICH recording a review gets is the watch's answer, not the
+    /// payload's.
+    ///
+    /// Here `review_submitted` is scoped to one PR and `comment`
+    /// covers every PR. A review on the scoped PR is the specific
+    /// recording; a review on any OTHER PR is still a comment the
+    /// broad clause asked for, and deciding the kind from membership
+    /// alone dropped it (codex 9dc8a13). Both transports, because a
+    /// fixture from one proves nothing about the other.
+    #[test]
+    fn a_review_outside_one_clause_is_taken_by_another() {
+        let sel = watch_selection(
+            r#"[{"pr": {"numbers": [603], "events": ["review_submitted"]}},
+                {"pr": {"events": ["comment"]}}]"#,
+        );
+        let poll = |number| {
+            serde_json::json!({
+                "id": "1", "type": "PullRequestReviewEvent", "actor": {"login": "someone"},
+                "payload": {"action": "created", "review": {"id": 9, "state": "approved"},
+                            "pull_request": {"number": number}}})
+        };
+        let hook = |number| {
+            serde_json::json!({
+                "action": "submitted", "sender": {"login": "someone"},
+                "review": {"id": 9, "state": "approved"},
+                "pull_request": {"number": number}})
+        };
+        let recorded = |c: Classified| match c.item {
+            WaitItem::GithubEvent { event, detail, .. } => (event, detail, c.key),
+            _ => panic!("not a github event"),
+        };
+        let both = |number: u64| {
+            [
+                recorded(classify_event("o/r", &poll(number), &sel, None).expect("poll")),
+                recorded(
+                    classify_webhook("o/r", "pull_request_review", &hook(number), &sel, None)
+                        .expect("webhook"),
+                ),
+            ]
+        };
+
+        for got in both(603) {
+            assert_eq!(
+                (got.0.as_str(), got.1.as_deref(), got.2.as_deref()),
+                (
+                    "review_submitted",
+                    Some("approved"),
+                    Some("review_submitted#9")
+                ),
+                "the clause that names the kind takes it",
+            );
+        }
+        for got in both(604) {
+            assert_eq!(
+                (got.0.as_str(), got.1.as_deref(), got.2.as_deref()),
+                ("pr_comment", Some("review"), Some("review#9")),
+                "and off that PR it is the comment the other clause asked for — ONE row",
+            );
+        }
+
+        // With nothing broader beneath it, the scope is the answer.
+        let only =
+            watch_selection(r#"[{"pr": {"numbers": [603], "events": ["review_submitted"]}}]"#);
+        assert!(classify_event("o/r", &poll(604), &only, None).is_none());
+        assert!(classify_webhook("o/r", "pull_request_review", &hook(604), &only, None).is_none());
+    }
+
+    /// A submitted review's STATE is its detail, on both transports.
+    ///
+    /// The slot used to hold the constant `review`, which the kind
+    /// already says. The state is what a watcher actually needs beside
+    /// it — an approval and a changes-requested are not the same news.
+    #[test]
+    fn a_submitted_reviews_state_is_its_detail() {
+        let wants = &[GithubEventKind::ReviewSubmitted];
+        let legacy = &[GithubEventKind::PrComment];
+        let detail_of = |c: Classified| match c.item {
+            WaitItem::GithubEvent { detail, .. } => detail,
+            _ => panic!("not a github event"),
+        };
+        let feed = |review: serde_json::Value, wanted: &[GithubEventKind]| {
+            detail_of(
+                classify_event_flat(
+                    "o/r",
+                    &serde_json::json!({
+                        "id": "1", "type": "PullRequestReviewEvent",
+                        "actor": {"login": "x"},
+                        "payload": {"action": "created", "review": review,
+                                    "pull_request": {"number": 603}},
+                    }),
+                    wanted,
+                    None,
+                    false,
+                    &[],
+                )
+                .expect("classifies"),
+            )
+        };
+        let hook = |review: serde_json::Value, wanted: &[GithubEventKind]| {
+            detail_of(
+                classify_webhook_flat(
+                    "o/r",
+                    "pull_request_review",
+                    &serde_json::json!({"action": "submitted", "sender": {"login": "x"},
+                                        "review": review, "pull_request": {"number": 603}}),
+                    wanted,
+                    None,
+                    false,
+                    &[],
+                )
+                .expect("classifies"),
+            )
+        };
+
+        for state in ["approved", "changes_requested", "commented"] {
+            let review = serde_json::json!({"id": 9, "state": state});
+            assert_eq!(feed(review.clone(), wants).as_deref(), Some(state));
+            assert_eq!(hook(review, wants).as_deref(), Some(state), "{state}");
+        }
+
+        // GitHub's reviews endpoint shouts it. One state an operator
+        // has to learn as two words is worse than a normalization
+        // that can only ever be a no-op on these two transports.
+        assert_eq!(
+            feed(serde_json::json!({"id": 9, "state": "APPROVED"}), wants).as_deref(),
+            Some("approved"),
+        );
+
+        // No state, no detail: the kind already says a review was
+        // submitted, so putting `review` back would be a word that
+        // carries nothing.
+        assert_eq!(feed(serde_json::json!({"id": 9}), wants), None);
+        assert_eq!(hook(serde_json::json!({"id": 9}), wants), None);
+
+        // And the legacy kind's detail is untouched by any of it — a
+        // constant then, a constant now, whatever the state says.
+        for review in [
+            serde_json::json!({"id": 9, "state": "changes_requested"}),
+            serde_json::json!({"id": 9}),
+        ] {
+            assert_eq!(feed(review.clone(), legacy).as_deref(), Some("review"));
+            assert_eq!(hook(review, legacy).as_deref(), Some("review"));
+        }
+    }
+
     /// THE SUBJECT'S OWN LINK, for each transport's REAL payload.
     ///
     /// The two classifiers see different shapes, so a fixture from one
@@ -1406,7 +1853,8 @@ pub(super) mod tests {
                 "pull_request": stub,
             }
         });
-        let got = classify_event("o/r", &poll, all, Some("me"), false, &[]).expect("classified");
+        let got =
+            classify_event_flat("o/r", &poll, all, Some("me"), false, &[]).expect("classified");
         let WaitItem::GithubEvent { url, title, .. } = &got.item else {
             panic!("not a github event")
         };
@@ -1431,7 +1879,7 @@ pub(super) mod tests {
                 "html_url": "https://github.com/o/r/pull/602"
             }
         });
-        let got = classify_webhook(
+        let got = classify_webhook_flat(
             "o/r",
             "pull_request_review_comment",
             &hook,
@@ -1458,7 +1906,7 @@ pub(super) mod tests {
             "review": {"id": 9, "html_url": "https://github.com/o/r/pull/587#pullrequestreview-9"},
             "pull_request": {"number": 587, "html_url": "https://github.com/o/r/pull/587"}
         });
-        let got = classify_webhook(
+        let got = classify_webhook_flat(
             "o/r",
             "pull_request_review",
             &review,
@@ -1487,7 +1935,8 @@ pub(super) mod tests {
                 "pull_request": stub,
             }
         });
-        let got = classify_event("o/r", &bare, all, Some("me"), false, &[]).expect("classified");
+        let got =
+            classify_event_flat("o/r", &bare, all, Some("me"), false, &[]).expect("classified");
         let WaitItem::GithubEvent { url, .. } = &got.item else {
             panic!("not a github event")
         };
@@ -1510,7 +1959,7 @@ pub(super) mod tests {
                 "html_url": "https://github.com/o/r/pull/602"
             }
         });
-        let got = classify_webhook(
+        let got = classify_webhook_flat(
             "o/r",
             "pull_request_review_comment",
             &empty,
@@ -1569,7 +2018,7 @@ pub(super) mod tests {
         });
         assert_eq!(
             url_of(
-                &classify_event("o/r", &poll_review, all, Some("me"), false, &[])
+                &classify_event_flat("o/r", &poll_review, all, Some("me"), false, &[])
                     .expect("classified")
             ),
             Some("https://github.com/o/r/pull/587#pullrequestreview-9".into()),
@@ -1593,7 +2042,7 @@ pub(super) mod tests {
         });
         assert_eq!(
             url_of(
-                &classify_event("o/r", &poll_issue, all, Some("me"), false, &[])
+                &classify_event_flat("o/r", &poll_issue, all, Some("me"), false, &[])
                     .expect("classified")
             ),
             Some("https://github.com/o/r/issues/12#issuecomment-5".into()),
@@ -1609,7 +2058,7 @@ pub(super) mod tests {
         });
         assert_eq!(
             url_of(
-                &classify_webhook(
+                &classify_webhook_flat(
                     "o/r",
                     "issue_comment",
                     &hook_issue,
@@ -1640,7 +2089,7 @@ pub(super) mod tests {
         });
         assert_eq!(
             url_of(
-                &classify_event("o/r", &poll_pr_issue, all, Some("me"), false, &[])
+                &classify_event_flat("o/r", &poll_pr_issue, all, Some("me"), false, &[])
                     .expect("classified")
             ),
             Some("https://github.com/o/r/pull/12#issuecomment-5".into()),
@@ -1661,7 +2110,7 @@ pub(super) mod tests {
             BranchPush,
         ][..];
         let wh = |event: &str, payload: serde_json::Value| {
-            classify_webhook("o/r", event, &payload, all, Some("me"), false, &[])
+            classify_webhook_flat("o/r", event, &payload, all, Some("me"), false, &[])
         };
         // Webhook shapes: top-level action, sender.login actor, review
         // action SUBMITTED (not the feed's created), push uses after.
@@ -1764,7 +2213,7 @@ pub(super) mod tests {
         use clank_core::wait::ContentRef;
         let all = &[GithubEventKind::PrComment, GithubEventKind::PrOpened][..];
         let got = |event: &str, payload: serde_json::Value| {
-            classify_webhook("o/r", event, &payload, all, Some("me"), false, &[]).map(|c| {
+            classify_webhook_flat("o/r", event, &payload, all, Some("me"), false, &[]).map(|c| {
                 match c.item {
                     WaitItem::GithubEvent { content, .. } => content,
                     other => panic!("unexpected {other:?}"),
@@ -1935,7 +2384,7 @@ pub(super) mod tests {
         let all = &[PrComment, IssueComment][..];
         let feed_key =
             |ty: &str, payload: serde_json::Value| {
-                classify_event(
+                classify_event_flat(
                 "o/r",
                 &serde_json::json!({"id":"1","type":ty,"actor":{"login":"x"},"payload":payload}),
                 all, None, false, &[],
@@ -1976,7 +2425,7 @@ pub(super) mod tests {
             serde_json::json!({"action":"created","pull_request":{"number":1}}),
         );
         assert_eq!(missing_feed, None, "no review.id → no key");
-        let missing_hook = classify_webhook(
+        let missing_hook = classify_webhook_flat(
             "o/r",
             "pull_request",
             &serde_json::json!({"action":"synchronize","sender":{"login":"x"},
@@ -1990,7 +2439,7 @@ pub(super) mod tests {
         .key;
         assert_eq!(missing_hook, None, "no head sha → no key");
         // Push without its sha: item still wakes, key is None.
-        let pushless = classify_webhook(
+        let pushless = classify_webhook_flat(
             "o/r",
             "push",
             &serde_json::json!({"ref":"refs/heads/main","before":"aa",
@@ -2023,7 +2472,7 @@ pub(super) mod tests {
             BranchPush,
         ][..];
         let feed = |ty: &str, payload: serde_json::Value| {
-            classify_event(
+            classify_event_flat(
                 "o/r",
                 &serde_json::json!({"id":"40001","type":ty,"actor":{"login":"x"},"payload":payload}),
                 all, None, false, &[],
@@ -2032,7 +2481,7 @@ pub(super) mod tests {
             .key
         };
         let hook = |name: &str, payload: serde_json::Value| {
-            classify_webhook("o/r", name, &payload, all, None, false, &[])
+            classify_webhook_flat("o/r", name, &payload, all, None, false, &[])
                 .expect("webhook classifies")
                 .key
         };
@@ -2440,18 +2889,18 @@ pub(super) mod tests {
             "created_at":"2026-07-29T01:02:03Z",
             "actor":{"login":"them"},
             "payload":{"action":"opened","issue":{"number":1}}});
-        let c =
-            classify_event("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[]).unwrap();
+        let c = classify_event_flat("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[])
+            .unwrap();
         assert_eq!(c.event_at, Some(1_785_286_923));
         // Feed without created_at → None (fallback is the caller's).
         let ev = serde_json::json!({"id":"1","type":"IssuesEvent",
             "actor":{"login":"them"},
             "payload":{"action":"opened","issue":{"number":1}}});
-        let c =
-            classify_event("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[]).unwrap();
+        let c = classify_event_flat("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[])
+            .unwrap();
         assert_eq!(c.event_at, None);
         // Webhook comment.created_at.
-        let c = classify_webhook(
+        let c = classify_webhook_flat(
             "o/r",
             "issue_comment",
             &serde_json::json!({"action":"created","sender":{"login":"them"},
@@ -2465,7 +2914,7 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(c.event_at, Some(1_785_286_923));
         // Webhook review.submitted_at.
-        let c = classify_webhook(
+        let c = classify_webhook_flat(
             "o/r",
             "pull_request_review",
             &serde_json::json!({"action":"submitted","sender":{"login":"them"},
@@ -2479,7 +2928,7 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(c.event_at, Some(1_785_286_923));
         // Webhook push head_commit.timestamp (offset form).
-        let c = classify_webhook(
+        let c = classify_webhook_flat(
             "o/r",
             "push",
             &serde_json::json!({"sender":{"login":"them"},
@@ -2597,50 +3046,66 @@ pub(super) mod tests {
 
     #[test]
     fn the_scope_governs_the_kinds_that_name_a_pr() {
-        let mut s = src(&[GithubEventKind::PrComment], true);
+        let scoped = [
+            GithubEventKind::PrComment,
+            GithubEventKind::PrUpdated,
+            GithubEventKind::PrMerged,
+            GithubEventKind::CiFailed,
+            GithubEventKind::CiPassed,
+            GithubEventKind::ReviewSubmitted,
+        ];
+        let mut s = src(&scoped, true);
         s.prs = vec![7];
-        for kind in [
-            "pr_comment",
-            "pr_updated",
-            "pr_merged",
-            "ci_failed",
-            "ci_passed",
-        ] {
-            assert!(in_scope(&s, &gh_item(kind, Some(7))), "{kind} on 7");
-            assert!(!in_scope(&s, &gh_item(kind, Some(8))), "{kind} on 8");
+        for kind in scoped {
+            let k = kind.wire();
+            assert!(row_in_scope(&s, &gh_item(k, Some(7))), "{k} on 7");
+            assert!(!row_in_scope(&s, &gh_item(k, Some(8))), "{k} on 8");
         }
     }
 
     #[test]
     fn the_kinds_that_name_no_pr_are_untouched() {
-        let mut s = src(&[GithubEventKind::PrOpened], true);
-        s.prs = vec![7];
         // A PR that does not exist yet cannot be in a list written
         // before it, so `pr_opened` is outside the scope by design.
-        assert!(in_scope(&s, &gh_item("pr_opened", Some(8))));
-        for kind in [
-            "issue_opened",
-            "issue_closed",
-            "issue_comment",
-            "branch_push",
-        ] {
-            assert!(in_scope(&s, &gh_item(kind, Some(8))), "{kind}");
-            assert!(
-                in_scope(&s, &gh_item(kind, None)),
-                "{kind} without a number"
-            );
+        let unscoped = [
+            GithubEventKind::PrOpened,
+            GithubEventKind::IssueOpened,
+            GithubEventKind::IssueClosed,
+            GithubEventKind::IssueComment,
+            GithubEventKind::BranchPush,
+        ];
+        let mut s = src(&unscoped, true);
+        s.prs = vec![7];
+        for kind in unscoped {
+            let k = kind.wire();
+            assert!(row_in_scope(&s, &gh_item(k, Some(8))), "{k}");
+            assert!(row_in_scope(&s, &gh_item(k, None)), "{k} without a number");
         }
         // A kind this binary does not know passes rather than
         // vanishing: the scope is not a place to lose events.
-        assert!(in_scope(&s, &gh_item("telepathy", Some(8))));
+        assert!(row_in_scope(&s, &gh_item("telepathy", Some(8))));
+    }
+
+    /// A watch's numbers scope the events the watch asks for under
+    /// them, and nothing else. Reaching past that is how a nested
+    /// watch's per-clause numbers would leak across its clauses —
+    /// `{pr: {numbers: [603], events: [comment]}}` beside
+    /// `{pr: {events: [merged]}}` means merges on EVERY pr, and a
+    /// scope built from the union of a watch's numbers would drop
+    /// them.
+    #[test]
+    fn a_kind_the_watch_does_not_name_is_not_scoped_by_it() {
+        let mut s = src(&[GithubEventKind::PrComment], true);
+        s.prs = vec![7];
+        assert!(row_in_scope(&s, &gh_item("pr_merged", Some(8))));
     }
 
     #[test]
     fn an_empty_scope_is_every_pr() {
         let s = src(&[GithubEventKind::PrComment], true);
         assert!(s.prs.is_empty());
-        assert!(in_scope(&s, &gh_item("pr_comment", Some(8))));
-        assert!(in_scope(&s, &gh_item("pr_comment", None)));
+        assert!(row_in_scope(&s, &gh_item("pr_comment", Some(8))));
+        assert!(row_in_scope(&s, &gh_item("pr_comment", None)));
     }
 
     #[test]
@@ -2648,7 +3113,7 @@ pub(super) mod tests {
         let mut s = src(&[GithubEventKind::PrComment], true);
         s.prs = vec![7];
         assert!(
-            !in_scope(&s, &gh_item("pr_comment", None)),
+            !row_in_scope(&s, &gh_item("pr_comment", None)),
             "it is dropped — loudly, since a scope that swallows events \
              silently is the thing that makes one hard to trust",
         );

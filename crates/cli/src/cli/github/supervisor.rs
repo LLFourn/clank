@@ -12,8 +12,9 @@ use clank_core::wait::WaitItem;
 
 use super::ci::{CiReader, GhCi};
 use super::coordinator::{ChecksSide, FeedSide, poll_loop};
-use super::feed::{EventFetcher, GhFetcher, effective_interval, in_scope};
+use super::feed::{EventFetcher, GhFetcher, effective_interval, row_in_scope};
 use super::relay::{GhForwarder, RelayGuard, RelayInbox, start_relay};
+use super::selection::Selection;
 use super::session::{GhLogin, LoginResolver, shared_session};
 
 /// Sidecar policy: CONFIG-origin watches never carry sidecars — the
@@ -83,7 +84,7 @@ pub(crate) async fn run_github_source(
             };
             let ci = GhCi {
                 repo: src.repo.clone(),
-                prs: src.prs.clone(),
+                prs: super::selection::Selection::of(&src).ci_scope(),
                 session: session.clone(),
             };
             let login = GhLogin(session);
@@ -282,7 +283,7 @@ async fn source_supervisor<F, R, C, RF, RFut>(
         {
             for row in read.rows {
                 if !row.acked
-                    && in_scope(src, &row.item)
+                    && row_in_scope(src, &row.item)
                     && presented.insert((row.seq, row.ident.clone()))
                     && tx.send(row.item).is_err()
                 {
@@ -319,6 +320,15 @@ pub(crate) fn source_key(src: &GithubSource) -> String {
             }
         })
         .collect();
+    // A NESTED watch is keyed by what it SELECTS, canonically, so
+    // reordering its clauses or relisting its numbers does not re-key
+    // a live log. A flat one keeps the bytes below, unchanged.
+    if !src.watch.is_empty() {
+        return hashed(
+            &slug,
+            &format!("{}|watch|{}", src.repo, Selection::of(src).canonical()),
+        );
+    }
     let mut identity = format!(
         "{}|{:?}|{:?}|{}",
         src.repo, src.events, src.branches, src.include_own_actions
@@ -332,6 +342,12 @@ pub(crate) fn source_key(src: &GithubSource) -> String {
     if !src.prs.is_empty() {
         identity.push_str(&format!("|prs{:?}", src.prs));
     }
+    hashed(&slug, &identity)
+}
+
+/// FNV-1a inlined for cross-release stability, like the zellij session
+/// hash.
+fn hashed(slug: &str, identity: &str) -> String {
     let mut h: u32 = 0x811c9dc5;
     for b in identity.as_bytes() {
         h ^= u32::from(*b);
@@ -350,7 +366,7 @@ mod tests {
 
     use crate::cli::github::ci::tests::NoCi;
     use crate::cli::github::feed::tests::{ScriptFetcher, classified, ev, gh_item, ok, src};
-    use crate::cli::github::feed::{GhResponse, classify_event};
+    use crate::cli::github::feed::{GhResponse, tests::classify_event_flat};
     use crate::cli::github::log::tests::wal_tempdir;
     use crate::cli::github::session::tests::FixedLogin;
 
@@ -538,7 +554,7 @@ mod tests {
         // The WAL side: a classified item serializes WITHOUT the
         // instructions field (presentation-only; the log format is
         // untouched by github-watch-prompts)…
-        let c = classify_event(
+        let c = classify_event_flat(
             "o/r",
             &ev(
                 "1",
@@ -595,12 +611,79 @@ mod tests {
         );
     }
 
+    /// The bytes a flat watch has always hashed, for the shapes that
+    /// exercise every field in the identity string.
+    ///
+    /// Recomputing the expectation from the current code would pin
+    /// nothing. These come from an independent reimplementation of
+    /// the identity string and FNV-1a as they stood BEFORE `watch`
+    /// existed, checked against
+    /// [`a_watch_without_a_pr_scope_keeps_the_key_it_had`]'s value
+    /// first so the method itself is known good. Moving them orphans
+    /// every armed watch's WAL, cursor and prompt sidecar.
+    #[test]
+    fn every_flat_shape_keeps_the_key_it_had() {
+        let mut a = src(
+            &[GithubEventKind::PrComment, GithubEventKind::BranchPush],
+            true,
+        );
+        a.branches = vec!["main".into()];
+        assert_eq!(source_key(&a), "github-o-r-bd7a0563");
+        a.prs = vec![7, 9];
+        assert_eq!(source_key(&a), "github-o-r-da9f71d4");
+        assert!(a.watch.is_empty(), "and none of it went through `watch`");
+    }
+
+    /// A nested watch is keyed by what it SELECTS, so writing the same
+    /// selection differently keeps one log. Rewriting a flat watch
+    /// into the nested shape is a re-key, and deliberately so: the two
+    /// shapes scope differently, so they are not the same watch.
+    #[test]
+    fn a_nested_watch_is_keyed_by_what_it_selects() {
+        let nested = |watch: &str| {
+            let mut s = src(&[], false);
+            s.watch = serde_json::from_str(watch).expect("parses");
+            source_key(&s)
+        };
+        let a = nested(
+            r#"[{"pr": {"numbers": [603, 522], "events": ["merged", "opened"]}},
+                           {"issue": {"events": ["opened"]}}]"#,
+        );
+        assert_eq!(
+            a,
+            nested(
+                r#"[{"issue": {"events": ["opened"]}},
+                       {"pr": {"numbers": [522, 603], "events": ["opened", "merged"]}}]"#
+            ),
+            "reordered clauses and relisted numbers are the same watch",
+        );
+        assert_ne!(
+            a,
+            nested(
+                r#"[{"pr": {"numbers": [603], "events": ["merged", "opened"]}},
+                       {"issue": {"events": ["opened"]}}]"#
+            ),
+            "a narrowed scope is a different presentable set, so a different log",
+        );
+
+        let mut flat = src(
+            &[GithubEventKind::PrMerged, GithubEventKind::PrOpened],
+            false,
+        );
+        flat.prs = vec![603, 522];
+        assert_ne!(
+            source_key(&flat),
+            nested(r#"[{"pr": {"numbers": [603, 522], "events": ["merged", "opened"]}}]"#),
+            "the nearest flat spelling admits a different set, so it is not the same log",
+        );
+    }
+
     #[test]
     fn source_key_separates_a_narrowed_pr_scope() {
         // Narrowing the PR scope changes which events are
         // presentable, so it is a DIFFERENT log — reusing the old
         // cursor would read a baseline taken for another set. This is
-        // also the claim the `in_scope` rationale must NOT contradict:
+        // also the claim the `row_in_scope` rationale must NOT contradict:
         // an EDITED list re-keys, so the replay filtering exists for
         // the unchanged-config upgrade, not for edits (ruthless
         // 8388d12).

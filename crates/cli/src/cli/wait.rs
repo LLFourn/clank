@@ -653,6 +653,9 @@ pub(crate) fn resolve_wait_event_sources(
     for (source, _) in &sources {
         match source {
             clank_core::agent_config::WaitEventSource::Github(g) => {
+                if let Some(why) = g.refusal() {
+                    anyhow::bail!("{why}");
+                }
                 if let Some(pi) = g.poll_interval.as_deref() {
                     parse_duration_str(pi).map_err(|e| {
                         anyhow::anyhow!("invalid poll_interval `{pi}` for {}: {e}", g.repo)

@@ -90,7 +90,8 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
 (or pass `--event '<json>'` ad hoc, same shape):
 
 - `{"kind":"github","repo":"owner/name","events":["pr_opened",
-  "pr_updated","pr_merged","pr_comment","issue_opened","issue_closed",
+  "pr_updated","pr_merged","pr_comment","review_submitted",
+  "issue_opened","issue_closed",
   "issue_comment","branch_push","ci_passed","ci_failed"]}` — wakes you
   with a `github_event` item when that repo sees the listed activity
   (polled via `gh`; auth is `gh`'s). `pr_updated` = new commits on a
@@ -109,7 +110,23 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
   each poll costs, so name them when you can. List as many `github` entries as you want to
   watch several repos. By default your OWN actions (the authenticated
   `gh` login) don't wake you — including your own pushes — set
-  `"include_own_actions":true` to override. `"poll_interval"`
+  `"include_own_actions":true` to override. `review_submitted` is the
+  exception it never filters: a review that was SUBMITTED (approved,
+  changes requested or commented — never a pending one, never its
+  draft comments) reaches you whoever submitted it, because that is
+  the act a team waits on while drafting is the chatter the filter
+  exists for. Its `detail` is the state.
+  Instead of the flat list you can select by OBJECT, which scopes an
+  object's events together and puts a filter on the events it
+  describes: `{"kind":"github","repo":"owner/name","watch":[
+  {"pr":{"numbers":[603],"events":["review_submitted","comment"]}},
+  {"pr":{"events":["opened"]}},
+  {"branch":{"names":["main"],"events":["push"]}}]}`. Clauses UNION
+  (one event any clause admits wakes you once), so two clauses is how
+  two events get different filters; `numbers` scopes EVERY event
+  beneath it where flat `prs` leaves `pr_opened` out, so the shapes
+  mean different things and are refused together. The `clank-github`
+  skill has the full vocabulary. `"poll_interval"`
   (`"60s"`) tunes cadence. Add `"delivery":"realtime"` for push-speed
   wakes via GitHub's webhook-forwarding relay: clank supervises
   `gh webhook forward` to a loopback listener, deduping against the

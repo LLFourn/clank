@@ -1078,6 +1078,7 @@ mod tests {
                     repo: "o/r".into(),
                     events: vec![clank_core::agent_config::GithubEventKind::PrOpened],
                     poll_interval: None,
+                    watch: Vec::new(),
                     include_own_actions: false,
                     branches: Vec::new(),
                     prs: Vec::new(),

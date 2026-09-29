@@ -18,9 +18,10 @@ use clank_core::wait::WaitItem;
 use super::ci::CiReader;
 use super::feed::{
     Classified, EventFetcher, FeedHorizon, MAX_PAGES, PollDelta, SEEN_CAP, SeenSet,
-    classify_webhook, effective_interval, in_scope, poll_once,
+    classify_webhook, effective_interval, poll_once, row_in_scope,
 };
 use super::relay::{RELAY_BUFFER_CAP, RelayInbox};
+use super::selection::Selection;
 use super::session::LoginResolver;
 
 /// Webhook events that mean "this PR's checks may have moved".
@@ -221,6 +222,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     mut log: Option<crate::cli::github::log::EventLog>,
     suppress_backlog: std::collections::HashSet<(u64, String)>,
 ) {
+    let sel = Selection::of(src);
     let configured = src
         .poll_interval
         .as_deref()
@@ -304,11 +306,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
             if suppress_backlog.contains(&(entry.seq, entry.ident.clone())) {
                 continue;
             }
-            // Saved rows never pass a classifier, so this is the
-            // only place the scope can govern them — and a log
-            // written when `prs` meant less than it does now is full
-            // of them.
-            if !in_scope(src, &entry.item) {
+            if !row_in_scope(src, &entry.item) {
                 continue;
             }
             if tx.send(entry.item.clone()).is_err() {
@@ -337,12 +335,12 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
         // it, and waiting on a login it does not need would hold a
         // red build behind an unrelated outage. Its failures are its
         // own too — the feed's poll is unaffected either way.
-        if src.events.iter().any(|k| k.is_ci()) {
+        if sel.wants_ci() {
             let attempt = checks.reader.read().await;
             last_checks_attempt = Some(tokio::time::Instant::now());
             match attempt {
                 Ok(results) => {
-                    let wakes = crate::cli::github::ci::wakes(&src.repo, &src.events, &results);
+                    let wakes = crate::cli::github::ci::wakes(&src.repo, &sel, &results);
                     let in_scope: std::collections::BTreeSet<u64> =
                         results.iter().map(|(pr, _)| pr.number).collect();
                     for c in ci_horizon.absorb(wakes, &in_scope) {
@@ -382,7 +380,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
 
         // Establish the own-action filter before ANY poll when it's
         // requested — never poll unfiltered.
-        if !src.include_own_actions && own_login.is_none() {
+        if sel.needs_own_login() && own_login.is_none() {
             match feed_side.login.resolve().await {
                 Ok(l) => own_login = Some(l),
                 Err(e) => {
@@ -544,7 +542,7 @@ async fn drain_relay_window(
     checks_only_tick: &mut bool,
     last_checks_attempt: Option<tokio::time::Instant>,
 ) -> bool {
-    let wants_ci = src.events.iter().any(|k| k.is_ci());
+    let wants_ci = Selection::of(src).wants_ci();
     loop {
         let Some(inbox) = relay.as_ref() else {
             tokio::time::sleep_until(deadline).await;
@@ -572,12 +570,9 @@ async fn drain_relay_window(
                         &src.repo,
                         &name,
                         &payload,
-                        &src.events,
+                        &Selection::of(src),
                         own_login,
-                        src.include_own_actions,
-                        &src.branches,
-                    ) && in_scope(src, &c.item)
-                        && !coordinator.deliver(c)
+                    ) && !coordinator.deliver(c)
                     {
                         return false; // wait gone
                     }

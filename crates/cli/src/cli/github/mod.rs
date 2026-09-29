@@ -25,6 +25,9 @@ pub(crate) mod log;
 /// The realtime relay: the forwarder, its loopback listener, and the
 /// bounded inbox deliveries wait in.
 mod relay;
+/// What a watch admits: the clauses its config desugars into, and
+/// the one predicate everything that filters an event asks.
+pub(crate) mod selection;
 /// The authorized session every GitHub read goes through.
 pub(crate) mod session;
 /// Driving one armed watch: the ingest lease, the follower tail and

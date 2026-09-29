@@ -76,6 +76,7 @@ pub(super) fn webhook_event_names(events: &[GithubEventKind]) -> Vec<&'static st
                 "pull_request"
             }
             GithubEventKind::PrComment => "pull_request_review", // + comment kinds below
+            GithubEventKind::ReviewSubmitted => "pull_request_review",
             GithubEventKind::IssueOpened | GithubEventKind::IssueClosed => "issues",
             GithubEventKind::IssueComment => "issue_comment",
             GithubEventKind::BranchPush => "push",
@@ -231,7 +232,8 @@ pub(super) async fn start_relay<Fw: Forwarder>(
     let port = listener.local_addr().ok()?.port();
     let inbox = std::sync::Arc::new(RelayInbox::new());
     let listen_task = tokio::spawn(run_relay_listener(listener, inbox.clone()));
-    let events = webhook_event_names(&src.events).join(",");
+    let events =
+        webhook_event_names(&crate::cli::github::selection::Selection::of(src).kinds()).join(",");
     let repo = src.repo.clone();
     let inbox_for_child = inbox.clone();
     let child_task = tokio::spawn(async move {

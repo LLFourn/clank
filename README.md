@@ -408,6 +408,25 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
     "prompt": "Triage the comment; reply on the PR, then ack." }
   ```
 
+  A watch can instead select by **object**, which scopes an object's
+  events together and lets a filter sit on the events it describes:
+
+  ```json
+  { "kind": "github", "repo": "o/r", "watch": [
+      {"pr": {"numbers": [603], "events": ["review_submitted", "comment"]}},
+      {"pr": {"events": ["opened"]}},
+      {"branch": {"names": ["main"], "events": ["push"]}} ] }
+  ```
+
+  Clauses UNION — an event any clause admits wakes you once — so two
+  clauses is how two events get different filters. `numbers` scopes
+  every event beneath it, where the flat `prs` leaves `pr_opened` out;
+  the shapes therefore mean different things and a watch uses one or
+  the other, never both. `review_submitted` is its own event, never
+  filtered by `include_own_actions`: submitting a review is the act a
+  team waits on, and the login that drafts review comments is usually
+  the one that submits them.
+
   The prompt is presentation config, never stored in the event log:
   editing it retitles the standing intent for already-logged
   unhandled events (per-kind granularity = split the watch). `"delivery":"realtime"` upgrades

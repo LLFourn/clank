@@ -15,6 +15,7 @@ use clank_core::agent_config::GithubEventKind;
 use clank_core::wait::WaitItem;
 
 use super::feed::Classified;
+use super::selection::{Event, Selection};
 use super::session::{GithubSession, HttpSend, PER_PAGE, read_every_page};
 
 /// What one check says about a commit.
@@ -466,19 +467,32 @@ impl CiHorizon {
     }
 }
 
-/// The wakes a read produces for a watch wanting `wanted` — the
-/// whole mapping from results to gate-ready actions, filter included,
-/// so a watch listing only `ci_failed` is never woken by green.
-pub(crate) fn wakes(
-    repo: &str,
-    wanted: &[GithubEventKind],
-    results: &[(PrHead, CiRollup)],
-) -> Vec<CiWake> {
+/// The wakes a read produces for `sel` — the whole mapping from
+/// results to gate-ready actions, filter included, so a watch listing
+/// only `ci_failed` is never woken by green.
+///
+/// The SELECTION, not a list of kinds. A clause names an event AND
+/// the objects it is about, so `ci_passed` on one PR beside
+/// `ci_failed` on another must not deliver either one crossed — kind
+/// membership alone said yes to both (codex bcda3c8). A conclusion is
+/// nobody's action, so the actor filter has nothing to say about it,
+/// and it names a PR by construction, so it can never be the
+/// unplaceable case.
+pub(crate) fn wakes(repo: &str, sel: &Selection, results: &[(PrHead, CiRollup)]) -> Vec<CiWake> {
     results
         .iter()
         .filter_map(|(pr, rollup)| {
             let kind = kind_of(rollup)?;
-            if !wanted.contains(&kind) {
+            if !sel
+                .admits(&Event {
+                    kind,
+                    detail: None,
+                    number: Some(pr.number),
+                    branch: None,
+                    is_own: false,
+                })
+                .admitted()
+            {
                 return None;
             }
             Some(CiWake {
@@ -1377,6 +1391,19 @@ pub(super) mod tests {
         )
     }
 
+    /// A selection written the flat way, for the tests that are about
+    /// which KINDS a watch wants.
+    fn flat(kinds: &[GithubEventKind]) -> Selection {
+        Selection::of(&crate::cli::github::feed::tests::src(kinds, false))
+    }
+
+    fn nested(watch: &str) -> Selection {
+        let mut s = crate::cli::github::feed::tests::src(&[], false);
+        s.watch = serde_json::from_str(watch).expect("the clauses parse");
+        assert_eq!(s.refusal(), None, "{watch}");
+        Selection::of(&s)
+    }
+
     #[tokio::test]
     async fn a_watch_that_wants_only_red_is_never_woken_by_green() {
         let results = vec![
@@ -1389,18 +1416,63 @@ pub(super) mod tests {
             ),
             red(9, "head2", "fmt"),
         ];
-        let only_red = ci::wakes("o/r", &[GithubEventKind::CiFailed], &results);
+        let only_red = ci::wakes("o/r", &flat(&[GithubEventKind::CiFailed]), &results);
         assert_eq!(only_red.len(), 1);
         assert_eq!(only_red[0].action.key.as_deref(), Some("ci_failed#9@head2"));
         let both = ci::wakes(
             "o/r",
-            &[GithubEventKind::CiFailed, GithubEventKind::CiPassed],
+            &flat(&[GithubEventKind::CiFailed, GithubEventKind::CiPassed]),
             &results,
         );
         assert_eq!(both.len(), 2);
         assert!(
-            ci::wakes("o/r", &[GithubEventKind::PrOpened], &results).is_empty(),
+            ci::wakes("o/r", &flat(&[GithubEventKind::PrOpened]), &results).is_empty(),
             "a watch with no ci kinds reads no ci wakes",
         );
+    }
+
+    /// A conclusion is delivered only where a clause asked for THAT
+    /// event on THAT PR.
+    ///
+    /// Kind membership alone said yes to every crossing: with red
+    /// wanted on one PR and green on another, a green on the first and
+    /// a red on the second were both delivered, though no clause had
+    /// asked for either (codex bcda3c8).
+    #[tokio::test]
+    async fn a_conclusion_crossed_with_the_wrong_pr_is_not_a_wake() {
+        let green = |number: u64, head: &str| {
+            (
+                ci::PrHead {
+                    number,
+                    head: head.into(),
+                },
+                ci::CiRollup::Passed,
+            )
+        };
+        let sel = nested(
+            r#"[{"pr": {"numbers": [603], "events": ["ci_passed"]}},
+                {"pr": {"numbers": [604], "events": ["ci_failed"]}}]"#,
+        );
+        let keys = |results: &[(ci::PrHead, ci::CiRollup)]| {
+            ci::wakes("o/r", &sel, results)
+                .into_iter()
+                .filter_map(|w| w.action.key)
+                .collect::<Vec<_>>()
+        };
+
+        // What each clause asked for.
+        assert_eq!(
+            keys(&[green(603, "a"), red(604, "b", "fmt")]),
+            ["ci_passed#603@a", "ci_failed#604@b"],
+        );
+        // And the crossings, which no clause asked for.
+        assert!(
+            keys(&[red(603, "a", "fmt"), green(604, "b")]).is_empty(),
+            "red on the PR that asked for green, and green on the one that asked for red",
+        );
+
+        // The reading that bounds the work still covers both PRs, so
+        // nothing is dropped before the clauses get to judge it.
+        assert_eq!(sel.ci_scope(), vec![603, 604]);
     }
 }

@@ -71,7 +71,10 @@ pub enum WaitEventSource {
 pub struct GithubSource {
     /// `owner/name`.
     pub repo: String,
-    /// Which event sub-kinds wake the agent.
+    /// Which event sub-kinds wake the agent — the FLAT shape, whose
+    /// scopes are [`prs`](Self::prs) and [`branches`](Self::branches).
+    /// Empty only when [`watch`](Self::watch) says it instead.
+    #[serde(default)]
     pub events: Vec<GithubEventKind>,
     /// Poll cadence as a duration string (`"60s"`, `"5m"`), same form
     /// as a duration string; validated at use site. The EFFECTIVE
@@ -111,12 +114,264 @@ pub struct GithubSource {
     /// stored in the event WAL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Objects and their events, as an alternative to the flat
+    /// [`events`](Self::events) + [`prs`](Self::prs) +
+    /// [`branches`](Self::branches). Empty means the flat shape; a
+    /// config uses one or the other, never both.
+    ///
+    /// See [`WatchClause`] for why nothing translates between them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<WatchClause>,
     /// How events arrive (github-http-client-and-realtime M2):
     /// `poll` (default) or `realtime` — the webhook-forward relay
     /// front-running the poll for latency, with the poll remaining
     /// the completeness backstop. Unknown values fail loud.
     #[serde(default)]
     pub delivery: Delivery,
+}
+
+/// One clause of a nested watch (github-selectors): which objects,
+/// which of their events, and the filters describing those events.
+///
+/// A watch admits an event if ANY clause does, so clauses SELECT and
+/// do not fan out — one event matched twice is still one event,
+/// because its feed id or action key is what the log dedups on. To
+/// give two events different filters, write two clauses.
+///
+/// This is not a second encoding of the flat fields, and nothing
+/// translates between them, because where they overlap they mean
+/// DIFFERENT things: [`GithubSource::prs`] scopes only the kinds that
+/// name a PR (`pr_opened` is deliberately outside it), while
+/// `numbers` under `pr` scopes every event beneath it. Rewriting a
+/// flat watch into this shape therefore changes what it wakes on,
+/// which is the author's call to make deliberately — and it re-keys
+/// the watch's log, so it is not a migration anything should perform
+/// unasked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchClause {
+    Pr(PrWatch),
+    Issue(IssueWatch),
+    Branch(BranchWatch),
+}
+
+/// Pull requests and the events under them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrWatch {
+    /// Only these PRs. Empty = every PR the watch sees. Unlike
+    /// [`GithubSource::prs`] this scopes EVERY event in the clause,
+    /// `opened` included — so a watch that wants new PRs as well
+    /// gives them their own clause.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub numbers: Vec<u64>,
+    pub events: Vec<PrEvent>,
+    /// Overrides [`GithubSource::include_own_actions`] for this
+    /// clause alone. `review_submitted` ignores both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_own_actions: Option<bool>,
+}
+
+/// Non-PR issues and the events under them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueWatch {
+    pub events: Vec<IssueEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_own_actions: Option<bool>,
+}
+
+/// Branches and the events under them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchWatch {
+    /// Short names, e.g. `"main"`. Empty = every branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    pub events: Vec<BranchEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_own_actions: Option<bool>,
+}
+
+/// What can happen to a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrEvent {
+    Opened,
+    Updated,
+    Merged,
+    /// Every comment class below, the review bodies of a watch that
+    /// does not also name `review_submitted` included.
+    Comment,
+    /// An issue comment posted on the PR.
+    IssueComment,
+    /// An inline comment on the diff — what a pending review's drafts
+    /// arrive as.
+    ReviewComment,
+    /// A review that was SUBMITTED. Never a pending one, never its
+    /// drafts, and never filtered by `include_own_actions`.
+    ReviewSubmitted,
+    CiPassed,
+    CiFailed,
+}
+
+/// What can happen to an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueEvent {
+    Opened,
+    Closed,
+    Comment,
+}
+
+/// What can happen to a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchEvent {
+    Push,
+}
+
+/// Which comment class a `pr_comment` is: the classifier stamps it as
+/// the event's `detail`, and [`PrEvent`] narrows to one.
+///
+/// One spelling for both, because the narrowing is a string match
+/// against what the classifier wrote — a second copy of these words
+/// would fail by selecting nothing rather than by failing to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentClass {
+    IssueCommentOnPr,
+    ReviewComment,
+    /// A submitted review seen as a comment, by a watch that predates
+    /// `review_submitted`.
+    Review,
+}
+
+impl CommentClass {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::IssueCommentOnPr => "issue_comment_on_pr",
+            Self::ReviewComment => "review_comment",
+            Self::Review => "review",
+        }
+    }
+}
+
+impl PrEvent {
+    /// The kind this names, and the `detail` it narrows to
+    /// (`None` = every detail of that kind).
+    pub fn selects(self) -> (GithubEventKind, Option<&'static str>) {
+        match self {
+            Self::Opened => (GithubEventKind::PrOpened, None),
+            Self::Updated => (GithubEventKind::PrUpdated, None),
+            Self::Merged => (GithubEventKind::PrMerged, None),
+            Self::Comment => (GithubEventKind::PrComment, None),
+            Self::IssueComment => (
+                GithubEventKind::PrComment,
+                Some(CommentClass::IssueCommentOnPr.wire()),
+            ),
+            Self::ReviewComment => (
+                GithubEventKind::PrComment,
+                Some(CommentClass::ReviewComment.wire()),
+            ),
+            Self::ReviewSubmitted => (GithubEventKind::ReviewSubmitted, None),
+            Self::CiPassed => (GithubEventKind::CiPassed, None),
+            Self::CiFailed => (GithubEventKind::CiFailed, None),
+        }
+    }
+}
+
+impl IssueEvent {
+    pub fn selects(self) -> (GithubEventKind, Option<&'static str>) {
+        match self {
+            Self::Opened => (GithubEventKind::IssueOpened, None),
+            Self::Closed => (GithubEventKind::IssueClosed, None),
+            Self::Comment => (GithubEventKind::IssueComment, None),
+        }
+    }
+}
+
+impl BranchEvent {
+    pub fn selects(self) -> (GithubEventKind, Option<&'static str>) {
+        match self {
+            Self::Push => (GithubEventKind::BranchPush, None),
+        }
+    }
+}
+
+impl WatchClause {
+    /// Every `(kind, detail)` this clause names, in written order.
+    pub fn selects(&self) -> Vec<(GithubEventKind, Option<&'static str>)> {
+        match self {
+            Self::Pr(w) => w.events.iter().map(|e| e.selects()).collect(),
+            Self::Issue(w) => w.events.iter().map(|e| e.selects()).collect(),
+            Self::Branch(w) => w.events.iter().map(|e| e.selects()).collect(),
+        }
+    }
+
+    /// This clause's own `include_own_actions`, if it set one.
+    pub fn include_own_actions(&self) -> Option<bool> {
+        match self {
+            Self::Pr(w) => w.include_own_actions,
+            Self::Issue(w) => w.include_own_actions,
+            Self::Branch(w) => w.include_own_actions,
+        }
+    }
+
+    /// The object name an operator wrote, for diagnostics.
+    pub fn object(&self) -> &'static str {
+        match self {
+            Self::Pr(_) => "pr",
+            Self::Issue(_) => "issue",
+            Self::Branch(_) => "branch",
+        }
+    }
+}
+
+impl GithubSource {
+    /// What makes this watch unusable, said so the operator knows
+    /// what to write instead — or `None` if it is fine.
+    ///
+    /// The shape errors serde already gives (an unknown object, event
+    /// or filter, each listing the valid ones) are not repeated here.
+    /// What is left is what one field means in the presence of
+    /// another, which serde cannot see.
+    pub fn refusal(&self) -> Option<String> {
+        let at = || format!("github watch on {}", self.repo);
+        if self.watch.is_empty() {
+            return self.events.is_empty().then(|| {
+                format!(
+                    "{} names no events: give it `events` (a flat list) or `watch` \
+                     (objects and the events under them)",
+                    at()
+                )
+            });
+        }
+        if !self.events.is_empty() {
+            return Some(format!(
+                "{} names events both at the top level and under `watch`. Use one shape: \
+                 they scope differently, so there is no reading that means both.",
+                at()
+            ));
+        }
+        for (field, used) in [
+            ("prs", !self.prs.is_empty()),
+            ("branches", !self.branches.is_empty()),
+        ] {
+            if used {
+                return Some(format!(
+                    "{} sets `{field}` beside `watch`. `{field}` scopes the flat shape, and it \
+                     scopes FEWER events than a clause does — write the scope on the object \
+                     instead, as {{\"pr\": {{\"numbers\": [..], \"events\": [..]}}}} or \
+                     {{\"branch\": {{\"names\": [..], \"events\": [\"push\"]}}}}.",
+                    at()
+                ));
+            }
+        }
+        self.watch
+            .iter()
+            .find(|c| c.selects().is_empty())
+            .map(|c| format!("{}: its `{}` clause names no events", at(), c.object()))
+    }
 }
 
 /// Delivery mode for a github source.
@@ -140,7 +395,21 @@ pub enum GithubEventKind {
     /// All three comment classes: an issue comment on a PR, a
     /// submitted review (including empty-body approvals), and an
     /// inline diff comment.
+    ///
+    /// Lumping them is why `ReviewSubmitted` exists: a team that
+    /// drafts review comments under one login has to exclude that
+    /// login to stop the drafts, and excluding it also loses that
+    /// person's submitted reviews.
     PrComment,
+    /// A review that was SUBMITTED — approved, changes requested, or
+    /// commented — never a pending one and never its draft comments.
+    ///
+    /// Its own kind so a watch can ask for every submitted review
+    /// while still filtering comments, and it ignores
+    /// `include_own_actions`: submitting is a deliberate act, and a
+    /// watcher who submits a review has done something its team
+    /// should hear about even though the actor is itself.
+    ReviewSubmitted,
     IssueOpened,
     IssueClosed,
     /// An issue comment on a NON-PR issue.
@@ -166,6 +435,21 @@ impl GithubEventKind {
         matches!(self, Self::CiPassed | Self::CiFailed)
     }
 
+    /// Whether `include_own_actions` can suppress this kind.
+    ///
+    /// A submitted review is the exception. The filter exists so a
+    /// watcher does not hear its own chatter back, and submitting is
+    /// not chatter — it is the act the rest of the team is waiting
+    /// on, and the login that drafts a review is usually the login
+    /// that submits it.
+    ///
+    /// On the type because two places ask: the filter itself, and the
+    /// question of whether a watch needs to resolve its own login at
+    /// all.
+    pub fn is_filterable_by_actor(self) -> bool {
+        self != Self::ReviewSubmitted
+    }
+
     /// Whether [`GithubSource::prs`] scopes this kind — i.e. whether
     /// it names a PR that could be in such a list.
     ///
@@ -175,7 +459,12 @@ impl GithubEventKind {
     pub fn is_pr_scoped(self) -> bool {
         matches!(
             self,
-            Self::PrUpdated | Self::PrMerged | Self::PrComment | Self::CiPassed | Self::CiFailed
+            Self::PrUpdated
+                | Self::PrMerged
+                | Self::PrComment
+                | Self::ReviewSubmitted
+                | Self::CiPassed
+                | Self::CiFailed
         )
     }
 
@@ -187,6 +476,7 @@ impl GithubEventKind {
             Self::PrUpdated => "pr_updated",
             Self::PrMerged => "pr_merged",
             Self::PrComment => "pr_comment",
+            Self::ReviewSubmitted => "review_submitted",
             Self::IssueOpened => "issue_opened",
             Self::IssueClosed => "issue_closed",
             Self::IssueComment => "issue_comment",
@@ -199,11 +489,12 @@ impl GithubEventKind {
     /// Every kind. The one list: `from_wire` reads it, and a caller
     /// selecting a subset (`is_pr_scoped`, `is_ci`) filters it, so a
     /// kind added to the enum cannot be missing from one of them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::PrOpened,
         Self::PrUpdated,
         Self::PrMerged,
         Self::PrComment,
+        Self::ReviewSubmitted,
         Self::IssueOpened,
         Self::IssueClosed,
         Self::IssueComment,
@@ -377,6 +668,164 @@ pub struct Session {
 }
 
 #[cfg(test)]
+mod watch_grammar_tests {
+    use super::*;
+
+    fn src(json: &str) -> Result<GithubSource, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    fn ok(json: &str) -> GithubSource {
+        let s = src(json).expect("parses");
+        assert_eq!(s.refusal(), None, "{json}");
+        s
+    }
+
+    /// The plan's own example, verbatim enough to matter: objects as
+    /// the major type, their events beneath, and a scope written once
+    /// on the object.
+    #[test]
+    fn the_nested_shape_parses_as_written() {
+        let s = ok(r#"{
+            "repo": "frostsnap/frostsnap",
+            "watch": [
+              {"pr": {"numbers": [603, 522],
+                      "events": ["review_submitted", "comment", "review_comment",
+                                 "updated", "merged"]}},
+              {"pr": {"events": ["opened", "merged", "review_submitted"]}},
+              {"issue": {"events": ["opened"]}}
+            ]
+        }"#);
+        assert_eq!(s.watch.len(), 3);
+        assert!(s.events.is_empty(), "the flat list stays empty");
+        let WatchClause::Pr(first) = &s.watch[0] else {
+            panic!("the first clause is about PRs")
+        };
+        assert_eq!(first.numbers, [603, 522]);
+        assert_eq!(
+            first.events[2].selects(),
+            (
+                GithubEventKind::PrComment,
+                Some(CommentClass::ReviewComment.wire())
+            ),
+            "an inline comment narrows pr_comment rather than inventing a kind",
+        );
+    }
+
+    /// Serde refuses an unknown name and names the alternatives, which
+    /// is the whole reason the vocabularies are enums rather than
+    /// strings. An operator who guesses learns the list from the
+    /// error.
+    #[test]
+    fn an_unknown_selector_is_refused_with_the_valid_ones() {
+        let object = src(r#"{"repo":"o/r","watch":[{"pull": {"events": ["opened"]}}]}"#)
+            .expect_err("an unknown object is refused")
+            .to_string();
+        for want in ["pull", "pr", "issue", "branch"] {
+            assert!(object.contains(want), "{object}");
+        }
+
+        let event = src(r#"{"repo":"o/r","watch":[{"pr": {"events": ["approved"]}}]}"#)
+            .expect_err("an unknown event is refused")
+            .to_string();
+        for want in [
+            "approved",
+            "review_submitted",
+            "review_comment",
+            "ci_failed",
+        ] {
+            assert!(event.contains(want), "{event}");
+        }
+
+        let filter = src(
+            r#"{"repo":"o/r","watch":[{"pr": {"events": ["opened"], "include_own_action": false}}]}"#,
+        )
+        .expect_err("an unknown filter is refused")
+        .to_string();
+        for want in ["include_own_action", "numbers", "events"] {
+            assert!(filter.contains(want), "{filter}");
+        }
+
+        // An issue has no numbers to scope by, and saying so beats
+        // accepting a field that would do nothing.
+        assert!(
+            src(r#"{"repo":"o/r","watch":[{"issue": {"numbers": [1], "events": ["opened"]}}]}"#)
+                .is_err()
+        );
+    }
+
+    /// The two shapes scope differently, so a config that mixes them
+    /// has no reading that means both. Each refusal says what to
+    /// write instead.
+    #[test]
+    fn the_two_shapes_are_not_mixed() {
+        let both = src(r#"{"repo":"o/r","events":["pr_opened"],
+                           "watch":[{"pr":{"events":["opened"]}}]}"#)
+        .unwrap()
+        .refusal()
+        .expect("refused");
+        assert!(
+            both.contains("both at the top level and under `watch`"),
+            "{both}"
+        );
+
+        let prs = src(r#"{"repo":"o/r","prs":[1],"watch":[{"pr":{"events":["opened"]}}]}"#)
+            .unwrap()
+            .refusal()
+            .expect("refused");
+        assert!(
+            prs.contains("\"numbers\""),
+            "{prs} must say what to write instead"
+        );
+
+        let branches =
+            src(r#"{"repo":"o/r","branches":["main"],"watch":[{"branch":{"events":["push"]}}]}"#)
+                .unwrap()
+                .refusal()
+                .expect("refused");
+        assert!(branches.contains("\"names\""), "{branches}");
+
+        let empty = src(r#"{"repo":"o/r","watch":[{"pr":{"events":[]}}]}"#)
+            .unwrap()
+            .refusal()
+            .expect("refused");
+        assert!(empty.contains("`pr` clause names no events"), "{empty}");
+
+        let neither = src(r#"{"repo":"o/r"}"#)
+            .unwrap()
+            .refusal()
+            .expect("refused");
+        assert!(neither.contains("names no events"), "{neither}");
+    }
+
+    /// A clause inherits the watch's own-actions setting and may
+    /// override it, so one rule everywhere is still written once.
+    #[test]
+    fn a_clause_overrides_the_watchs_own_actions_setting() {
+        let s = ok(r#"{"repo":"o/r","include_own_actions":true,"watch":[
+            {"pr":{"events":["comment"],"include_own_actions":false}},
+            {"pr":{"events":["merged"]}}
+        ]}"#);
+        assert_eq!(s.watch[0].include_own_actions(), Some(false));
+        assert_eq!(s.watch[1].include_own_actions(), None, "inherits");
+    }
+
+    /// Every flat config still parses, and gains an empty `watch`
+    /// rather than a translation of itself.
+    #[test]
+    fn a_flat_config_is_untouched() {
+        let s = ok(r#"{"repo":"o/r","events":["pr_comment"],"prs":[7],
+                       "branches":["main"],"include_own_actions":true}"#);
+        assert!(s.watch.is_empty());
+        assert_eq!(s.prs, [7]);
+        // And it serializes without the new key, so a round-trip
+        // through this binary does not rewrite anyone's config.
+        let back = serde_json::to_string(&s).unwrap();
+        assert!(!back.contains("watch"), "{back}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     fn cmd(name: &str) -> CommandSource {
         CommandSource {
@@ -533,6 +982,7 @@ mod tests {
         let src = WaitEventSource::Github(GithubSource {
             repo: "o/r".into(),
             events: vec![GithubEventKind::PrUpdated, GithubEventKind::BranchPush],
+            watch: Vec::new(),
             poll_interval: None,
             include_own_actions: false,
             branches: vec!["main".into()],

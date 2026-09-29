@@ -426,6 +426,7 @@ pub fn review_source(slug: &str, pr: u32) -> GithubSource {
             GithubEventKind::PrMerged,
         ],
         prs: vec![u64::from(pr)],
+        watch: Vec::new(),
         include_own_actions: true,
         poll_interval: None,
         branches: Vec::new(),

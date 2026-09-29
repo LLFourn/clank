@@ -55,6 +55,69 @@ the same fanout as `clank events ack` per copy).
 Ids are the listed seq (qualified as `<source>@<seq>` when several
 watched repos collide — the error message shows the qualified forms).
 
+## Saying what to watch
+
+Two shapes. The flat one names kinds and scopes them with `prs` /
+`branches`:
+
+```json
+{"kind":"github","repo":"o/r","events":["pr_comment","review_submitted"],
+ "prs":[603],"include_own_actions":false}
+```
+
+The nested one names OBJECTS and the events under them, so a scope is
+written once per object and a filter sits on the events it is about:
+
+```json
+{"kind":"github","repo":"o/r","watch":[
+  {"pr":{"numbers":[603,522],"events":["review_submitted","comment"]}},
+  {"pr":{"events":["opened"]}},
+  {"issue":{"events":["opened","comment"]}},
+  {"branch":{"names":["main"],"events":["push"]}}]}
+```
+
+- **Clauses union.** An event any clause admits wakes you ONCE; two
+  clauses matching it is not two wakes. So writing two clauses is how
+  two events get different filters — there is no per-event filter
+  syntax because there does not need to be.
+- **`numbers` scopes everything beneath it**, `opened` included. The
+  flat `prs` does not (see below). The two shapes therefore mean
+  different things, are refused together, and nothing translates one
+  into the other — rewriting a watch from one to the other starts a
+  fresh log.
+- **`include_own_actions`** sits on the clause, defaulting to the
+  watch-level value. `review_submitted` ignores both.
+
+The vocabulary, and what each name selects:
+
+| object | events |
+| --- | --- |
+| `pr` | `opened` `updated` `merged` `comment` `issue_comment` `review_comment` `review_submitted` `ci_passed` `ci_failed` |
+| `issue` | `opened` `closed` `comment` |
+| `branch` | `push` |
+
+`comment` is every comment class on a PR; `issue_comment` and
+`review_comment` narrow it to one (they are still `pr_comment` events —
+narrowing selects, it does not make a new kind). An unknown object,
+event or filter is refused at arm time, listing the valid ones.
+
+## A submitted review is its own event
+
+`review_submitted` fires when a review is SUBMITTED — approved,
+changes requested or commented — never for a pending review and never
+for its draft comments. Its `detail` is the state, so a wake reads
+`review_submitted (approved)`.
+
+**It is never filtered by `include_own_actions`.** A team that drafts
+review comments under one login has to exclude that login to stop the
+drafts, and excluding it used to lose that person's submitted reviews
+too — the thing everyone was waiting for. Submitting is a deliberate
+act; drafting is the chatter the filter exists for.
+
+A watch that does not name `review_submitted` is unaffected: it still
+records these as `pr_comment` with detail `review`, still filtered by
+its own-actions setting, keyed exactly as before.
+
 ## Catch-up semantics
 
 - Events that fire while NO wait is armed (agent offline, wait killed,
@@ -67,7 +130,10 @@ watched repos collide — the error message shows the qualified forms).
 - The very first arm of a new source baselines silently (history is
   not backlog). Editing a source's config (kinds, branches, the PR
   scope, filters) starts a fresh log — same silent baseline. Adding
-  an EMPTY `prs` list changes nothing and keeps the log.
+  an EMPTY `prs` list changes nothing and keeps the log. A nested
+  watch is keyed by what it SELECTS, so reordering its clauses or
+  relisting its numbers keeps the log; changing what it admits does
+  not.
 - `"prs":[7,9]` scopes the watch to those PRs, for every kind that
   NAMES one — comments, updates, merges, and the CI conclusions.
   `pr_opened` stays unscoped (a PR that does not exist yet cannot be
