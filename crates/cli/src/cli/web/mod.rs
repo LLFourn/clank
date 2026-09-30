@@ -132,10 +132,20 @@ impl Panes for Zellij {
                 {
                     return Ok(());
                 }
-                return open_zellij::say_to_codex_pane(&self.session, pane, text);
+                return open_zellij::say_to_pane_for_tool(
+                    &self.session,
+                    pane,
+                    clank_core::vocab::Tool::Codex,
+                    text,
+                );
             }
         }
-        open_zellij::say_to_pane(&self.session, pane, text)
+        open_zellij::say_to_pane_for_tool(
+            &self.session,
+            pane,
+            clank_core::vocab::Tool::Claude,
+            text,
+        )
     }
     fn stop(&self, pane: &str) -> anyhow::Result<()> {
         let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {

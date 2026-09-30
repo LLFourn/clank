@@ -75,7 +75,7 @@ pub(crate) fn find(
     let panes = if caller == CallerIdentity::Unidentified {
         Vec::new()
     } else {
-        open_zellij::panes_in_all_sessions(SCAN_DEADLINE)
+        open_zellij::panes_in_all_sessions(SCAN_DEADLINE).panes
     };
     let claude = if session.tool == Tool::Claude {
         claude_agents_listing(claude_program)

@@ -72,6 +72,13 @@ pub enum Command {
     /// (`--to`), or `--master` for whoever that repo's roster names
     /// master. The message wakes its agent until it is handled.
     Send(crate::cli::SendArgs),
+    /// Type a message straight into an agent's terminal
+    ///
+    /// The escape hatch for when `clank send` cannot be delivered —
+    /// a wedged hook, a stale binding, a wake that never fires. It
+    /// reads no inbox and no session binding, leaves no durable
+    /// record, and fails rather than guess which pane it meant.
+    Nudge(crate::cli::NudgeArgs),
     /// Print the repo timeline: commits, reviews, github events
     ///
     /// Chronological and newest-first, with github events interleaved
@@ -257,6 +264,7 @@ pub async fn dispatch_with(
         Command::Feedback(args) => crate::cli::feedback::run(args).await,
         Command::Events(args) => crate::cli::events::run(args).await,
         Command::Send(args) => crate::cli::send::run(args),
+        Command::Nudge(args) => crate::cli::nudge::run(args),
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::StopHook(args) => crate::cli::stop_hook::run(args).await,

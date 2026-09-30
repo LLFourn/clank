@@ -488,15 +488,51 @@ fn tab_is_open(tab: &str, open_names: &[String]) -> bool {
         .any(|n| crate::cli::status_tui::strip_leading_emoji(n) == tab)
 }
 
-/// `zellij list-sessions -n` stdout, or empty when the command
-/// fails — zellij exits non-zero when NO sessions exist, which is
-/// exactly the Create case, so failure degrades to "no sessions".
-fn zellij_list_sessions() -> String {
-    std::process::Command::new("zellij")
+/// `zellij list-sessions -n` stdout, or `None` when the command could
+/// not be RUN.
+///
+/// A non-zero exit is NOT a failure here: zellij exits non-zero when no
+/// sessions exist, which is an answer. Only an `Err` from `output()`
+/// means nothing was learned — and a caller that must not mistake "I
+/// could not ask" for "there are none" needs to see the difference.
+fn zellij_list_sessions_checked() -> Option<String> {
+    let out = std::process::Command::new("zellij")
         .args(["list-sessions", "-n"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default()
+        .ok()?;
+    interpret_listing(
+        out.status.success(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// What zellij says when there are none — verbatim from the binary.
+/// It exits non-zero to say it, which is why a bare status check
+/// cannot tell that answer from a failure.
+const NO_SESSIONS: &str = "No active zellij sessions found.";
+
+/// One `list-sessions` run, read strictly. `None` means NOTHING was
+/// learned; `Some("")` means zellij answered that there are none.
+///
+/// Both arrive as a non-zero exit with no session names, so a reader
+/// that only checks the status folds "the command broke" into "the
+/// repo has no sessions" — which for `clank nudge` is the difference
+/// between admitting it does not know and asserting an agent is absent.
+fn interpret_listing(ok: bool, stdout: &str, stderr: &str) -> Option<String> {
+    if ok {
+        return Some(stdout.to_string());
+    }
+    if stdout.contains(NO_SESSIONS) || stderr.contains(NO_SESSIONS) {
+        return Some(String::new());
+    }
+    None
+}
+
+/// The listing, degrading to "no sessions" when it could not be run —
+/// which is right for the Create path and wrong for a nudge.
+fn zellij_list_sessions() -> String {
+    zellij_list_sessions_checked().unwrap_or_default()
 }
 
 fn layout_file_path(repo: &Path) -> PathBuf {
@@ -1205,7 +1241,21 @@ impl ZellijPane {
     /// can be found and closed), but a dead pane holds no session
     /// (a-session-has-one-holder).
     pub(crate) fn runs(&self, command: &str) -> bool {
-        !self.is_plugin && !self.exited && self.terminal_command.as_deref() == Some(command)
+        self.launched_by(command) && !self.exited
+    }
+
+    /// Whether `command` LAUNCHED this pane, alive or not.
+    ///
+    /// Split from [`runs`] because a caller that reports absence has to
+    /// tell "this agent has no pane" from "its pane is a corpse": the
+    /// two need different words, and zellij accepts keystrokes typed at
+    /// either.
+    pub(crate) fn launched_by(&self, command: &str) -> bool {
+        !self.is_plugin && self.terminal_command.as_deref() == Some(command)
+    }
+
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exited
     }
 
     pub(crate) fn tab_name(&self) -> &str {
@@ -1472,6 +1522,25 @@ pub(crate) fn stop_pane(
         );
     }
     Ok(())
+}
+
+/// Type `text` into `pane` and submit it the way `tool` expects.
+///
+/// PANE ONLY: nothing here reads a stored session binding, which is
+/// what lets `clank nudge` use it when the binding is the suspect
+/// thing. The web bridge wraps this with the app-server attempt it is
+/// willing to trust; the submit-sequence knowledge lives here once.
+pub(crate) fn say_to_pane_for_tool(
+    session: &str,
+    pane: &str,
+    tool: clank_core::vocab::Tool,
+    text: &str,
+) -> anyhow::Result<()> {
+    if tool == clank_core::vocab::Tool::Codex {
+        say_to_codex_pane(session, pane, text)
+    } else {
+        say_to_pane(session, pane, text)
+    }
 }
 
 /// Say `text` to `pane` in `session` and press Enter.
@@ -1834,6 +1903,51 @@ pub(crate) struct SessionPane {
     pub(crate) pane: ZellijPane,
 }
 
+/// What one all-sessions scan saw, and what it did not.
+///
+/// `unanswered` is the part a caller can get wrong by not being told:
+/// a session dropped for a timeout, a failed exit, or an unreadable
+/// listing contributes no panes, so an absent pane means "not there"
+/// only when this is empty. `clank agent start` may fail open on it;
+/// `clank nudge` must not, because reporting "no agent" for a session
+/// that simply did not answer sends someone looking in the wrong place.
+#[derive(Debug, Default)]
+pub(crate) struct SessionScan {
+    pub(crate) panes: Vec<SessionPane>,
+    pub(crate) unanswered: Vec<String>,
+    /// The session LISTING itself could not be run, so `unanswered` is
+    /// not the list of what was missed — nothing is known, including
+    /// how many sessions exist.
+    pub(crate) listing_failed: bool,
+}
+
+/// What one session's `list-panes` produced: its panes, or nothing
+/// learned.
+pub(crate) type Listed = (String, Option<Vec<ZellijPane>>);
+
+/// Fold per-session outcomes into a scan. Pure, so the fail-closed
+/// contract is testable without a zellij server: every `None` becomes
+/// an `unanswered` name rather than an absence.
+pub(crate) fn assemble_scan(listing: Option<Vec<Listed>>) -> SessionScan {
+    let Some(outcomes) = listing else {
+        return SessionScan {
+            listing_failed: true,
+            ..Default::default()
+        };
+    };
+    let mut scan = SessionScan::default();
+    for (session, listed) in outcomes {
+        match listed {
+            Some(panes) => scan.panes.extend(panes.into_iter().map(|pane| SessionPane {
+                session: session.clone(),
+                pane,
+            })),
+            None => scan.unanswered.push(session),
+        }
+    }
+    scan
+}
+
 /// The names of sessions whose server is up, from `list-sessions -n`
 /// output: the first token of each line, skipping the EXITED ones
 /// (their server is gone and would not answer an action anyway).
@@ -1853,70 +1967,95 @@ fn live_session_names(list_output: &str) -> Vec<String> {
 /// and 4.8 s to answer while every healthy one took under 0.2 s, and
 /// an agent launch cannot wait on that. Dropping a session means its
 /// panes are not seen, which fails OPEN (no holder found).
-pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> Vec<SessionPane> {
+pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> SessionScan {
+    scan_sessions(deadline, zellij_list_sessions_checked, start_list_panes)
+}
+
+/// [`panes_in_all_sessions`] with the session listing supplied, so the
+/// blind case is reachable in a test. `None` means the listing could
+/// not be run; `Some("")` means it ran and found nothing, and the two
+/// must not converge.
+/// One session's `list-panes` in flight.
+struct Pending {
+    session: String,
+    child: std::process::Child,
+    reader: std::thread::JoinHandle<Vec<u8>>,
+}
+
+/// Start `list-panes` for `session`. `None` when the process could not
+/// be started at all, which is a session whose panes are UNKNOWN.
+fn start_list_panes(session: &str) -> Option<Pending> {
     use std::io::Read;
     use std::process::Stdio;
 
-    struct Pending {
-        session: String,
-        child: std::process::Child,
-        reader: std::thread::JoinHandle<Vec<u8>>,
+    let mut child = std::process::Command::new("zellij")
+        .args([
+            "-s",
+            session,
+            "action",
+            "list-panes",
+            "--json",
+            "--command",
+            "--tab",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Drained on its own thread so a listing larger than the pipe
+    // buffer cannot wedge the child before it exits.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    Some(Pending {
+        session: session.to_string(),
+        child,
+        reader,
+    })
+}
+
+fn scan_sessions(
+    deadline: std::time::Duration,
+    list: impl FnOnce() -> Option<String>,
+    start: impl Fn(&str) -> Option<Pending>,
+) -> SessionScan {
+    let Some(listing) = list() else {
+        return assemble_scan(None);
+    };
+    // A session whose `list-panes` could not even START is one whose
+    // panes are unknown, not one with none — it used to vanish here.
+    let mut outcomes: Vec<Listed> = Vec::new();
+    let mut pending: Vec<Pending> = Vec::new();
+    for session in live_session_names(&listing) {
+        match start(&session) {
+            Some(p) => pending.push(p),
+            None => outcomes.push((session, None)),
+        }
     }
-    let mut pending: Vec<Pending> = live_session_names(&zellij_list_sessions())
-        .into_iter()
-        .filter_map(|session| {
-            let mut child = std::process::Command::new("zellij")
-                .args([
-                    "-s",
-                    &session,
-                    "action",
-                    "list-panes",
-                    "--json",
-                    "--command",
-                    "--tab",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let mut stdout = child.stdout.take()?;
-            // Drained on its own thread so a listing larger than the
-            // pipe buffer cannot wedge the child before it exits.
-            let reader = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = stdout.read_to_end(&mut buf);
-                buf
-            });
-            Some(Pending {
-                session,
-                child,
-                reader,
-            })
-        })
-        .collect();
 
     let started = std::time::Instant::now();
-    let mut panes = Vec::new();
     loop {
         let mut i = 0;
         while i < pending.len() {
             match pending[i].child.try_wait() {
                 Ok(Some(status)) => {
                     let done = pending.swap_remove(i);
-                    if status.success()
-                        && let Ok(buf) = done.reader.join()
-                        && let Ok(listed) = serde_json::from_slice::<Vec<ZellijPane>>(&buf)
-                    {
-                        panes.extend(listed.into_iter().map(|pane| SessionPane {
-                            session: done.session.clone(),
-                            pane,
-                        }));
-                    }
+                    let listed = match done.reader.join() {
+                        Ok(buf) if status.success() => {
+                            serde_json::from_slice::<Vec<ZellijPane>>(&buf).ok()
+                        }
+                        _ => None,
+                    };
+                    outcomes.push((done.session, listed));
                 }
                 Ok(None) => i += 1,
                 Err(_) => {
-                    pending.swap_remove(i);
+                    let gone = pending.swap_remove(i);
+                    outcomes.push((gone.session, None));
                 }
             }
         }
@@ -1928,8 +2067,9 @@ pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> Vec<Sessio
     for mut late in pending {
         let _ = late.child.kill();
         let _ = late.child.wait();
+        outcomes.push((late.session, None));
     }
-    panes
+    assemble_scan(Some(outcomes))
 }
 
 /// The `new-pane` argv, split out so it is assertable without
@@ -2384,6 +2524,78 @@ fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// "I could not ask" and "there are none" must not converge.
+    ///
+    /// The ordinary listing folds a failed command into an empty one,
+    /// because zellij exits non-zero when no sessions exist. A scan
+    /// that inherited that would let `clank nudge` report a confident
+    /// absence after learning nothing (codex on 1eec51b). Neither case
+    /// starts a zellij process: one never lists, the other lists none.
+    #[test]
+    fn a_scan_that_could_not_list_is_blind_not_empty() {
+        let quick = std::time::Duration::from_millis(1);
+        let blind = scan_sessions(quick, || None, |_| None);
+        assert!(blind.listing_failed, "nothing was learned");
+
+        let empty = scan_sessions(quick, || Some(String::new()), |_| None);
+        assert!(
+            !empty.listing_failed,
+            "the listing answered: there are none"
+        );
+        assert!(empty.panes.is_empty() && empty.unanswered.is_empty());
+    }
+
+    /// A session that cannot be probed is UNANSWERED, through the real
+    /// mapping — a test of `assemble_scan` alone passes against a scan
+    /// that never reaches it (codex on 66afcf2). The fake starter
+    /// begins no process, so this spawns no zellij.
+    #[test]
+    fn a_session_that_cannot_be_probed_is_unanswered_not_absent() {
+        let scan = scan_sessions(
+            std::time::Duration::from_millis(1),
+            || Some("alpha [Created 1s ago]\nbeta [Created 1s ago]\n".to_string()),
+            |_| None,
+        );
+        assert_eq!(
+            scan.unanswered,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert!(scan.panes.is_empty());
+        assert!(!scan.listing_failed, "the listing itself was fine");
+    }
+
+    /// zellij exits NON-ZERO to say there are no sessions, so a status
+    /// check alone reads every other failure as "none" — which is the
+    /// difference between not knowing and asserting an absence.
+    #[test]
+    fn only_the_known_no_sessions_answer_survives_a_nonzero_exit() {
+        assert_eq!(
+            interpret_listing(true, "clank-proj [Created 1s ago]\n", ""),
+            Some("clank-proj [Created 1s ago]\n".to_string()),
+            "a clean exit is the listing"
+        );
+        assert_eq!(
+            interpret_listing(false, "", NO_SESSIONS),
+            Some(String::new()),
+            "zellij's own no-sessions answer is an answer"
+        );
+        assert_eq!(
+            interpret_listing(false, NO_SESSIONS, ""),
+            Some(String::new()),
+            "on either stream"
+        );
+        assert_eq!(
+            interpret_listing(false, "", "error: permission denied"),
+            None,
+            "any other failure taught us nothing"
+        );
+        assert_eq!(
+            interpret_listing(false, "", ""),
+            None,
+            "and a silent failure least of all"
+        );
+    }
     #[test]
     fn status_pane_size_is_a_percentage_in_both_orientations() {
         // zellij-status-pane-resizable: an ABSOLUTE layout size makes

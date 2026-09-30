@@ -33,6 +33,7 @@ pub mod init;
 pub mod js_guard;
 pub mod log;
 pub(crate) mod message;
+pub mod nudge;
 pub mod open;
 pub mod open_zellij;
 pub mod pick;
@@ -679,6 +680,30 @@ pub enum WaitFor {
     /// The repo came to a stop-point: a plan finalized OR a new
     /// unanswered block appeared (someone needs the human).
     Stopped,
+}
+
+/// `clank nudge`, addressed exactly like `clank send` so the escape
+/// hatch is a one-word edit from the command that failed.
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("nudge_recipient").required(true).args(["to", "master"])))]
+#[command(group(clap::ArgGroup::new("nudge_body").required(true).args(["message", "file"])))]
+pub struct NudgeArgs {
+    /// The recipient's repo. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// The agent to nudge, by its label on that repo's roster.
+    #[arg(long, value_name = "LABEL")]
+    pub to: Option<String>,
+    /// Nudge whoever that repo's roster names master.
+    #[arg(long)]
+    pub master: bool,
+    /// The message. Repeat for paragraphs, as with `git commit -m`;
+    /// `-m -` reads one paragraph from stdin.
+    #[arg(short = 'm', long = "message", value_name = "TEXT")]
+    pub message: Vec<String>,
+    /// Read the message from a file; `-` reads stdin.
+    #[arg(short = 'F', long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

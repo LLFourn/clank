@@ -34,6 +34,7 @@ enum Field<'a> {
 fn field_of(cmd: &mut Command) -> Option<Field<'_>> {
     Some(match cmd {
         Command::Send(a) => Field::Many(&mut a.message),
+        Command::Nudge(a) => Field::Many(&mut a.message),
         Command::Finish(a) => Field::Many(&mut a.message),
         Command::Unblock(a) => Field::One(&mut a.message),
         Command::Queue(QueueArgs {
@@ -137,6 +138,7 @@ mod tests {
         let body = "BODY";
         for args in [
             vec!["send", "--master", "-m", "-"],
+            vec!["nudge", "--master", "-m", "-"],
             vec!["finish", "-m", "-"],
             vec!["queue", "add", "some-plan", "-m", "-"],
             vec![
@@ -170,7 +172,7 @@ mod tests {
     fn every_free_text_m_is_wired() {
         let declared = include_str!("mod.rs").matches("short = 'm'").count();
         assert_eq!(
-            declared, 7,
+            declared, 8,
             "a `-m` was added or removed in mod.rs; route it in `field_of` and list it in \
              `every_command_with_a_free_text_m_reads_stdin_for_a_dash`, then update this count"
         );

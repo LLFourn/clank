@@ -49,7 +49,7 @@ pub(crate) fn recipient(repo: &Path, to: Option<&str>, master: bool) -> anyhow::
 
 /// The message: `-m` paragraphs joined as `git commit` joins them, or
 /// a file's contents, `-` meaning stdin. Never empty.
-fn body_of(message: &[String], file: Option<&Path>) -> anyhow::Result<String> {
+pub(crate) fn body_of(message: &[String], file: Option<&Path>) -> anyhow::Result<String> {
     let body = match file {
         Some(p) if p == Path::new("-") => std::io::read_to_string(std::io::stdin())?,
         Some(p) => std::fs::read_to_string(p)
