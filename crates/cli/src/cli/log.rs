@@ -2140,6 +2140,53 @@ mod tests {
         );
     }
 
+    /// A finalize stays legible while ANOTHER plan is active — which
+    /// `clank status` does not cover.
+    ///
+    /// `a-repo-transition-is-derived-not-delivered` retired the
+    /// `Finished` wake on the grounds that the state is derived and
+    /// readable. `status` only prints `last finished` when no plan is
+    /// active (`select_plans_and_finished` returns None otherwise), so
+    /// for the case the retired wake also covered — one plan finalizes
+    /// while another runs — the log is the surface, and this pins it
+    /// (codex on 777fb2c).
+    #[test]
+    fn a_finalize_is_marked_even_while_another_plan_is_active() {
+        let events = [
+            LogEvent::PlanFinalized {
+                plan: PlanKey::parse("done").unwrap(),
+                sha: sha("bb"),
+                ts: 2,
+                subject: "[done] wrap up".into(),
+            },
+            LogEvent::PlanIntro {
+                plan: PlanKey::parse("running").unwrap(),
+                sha: sha("cc"),
+                ts: 3,
+                subject: "[running] intro".into(),
+            },
+        ];
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        let lines = oneline_plain_lines(&oneline_rows(
+            &refs,
+            &Default::default(),
+            &Default::default(),
+        ));
+
+        assert!(
+            lines.iter().any(|l| l.starts_with("⚑ bb00000")),
+            "the finalize keeps its own marker: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "done"),
+            "and names the plan that finished: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("✎ cc00000")),
+            "beside the plan still running: {lines:?}"
+        );
+    }
+
     #[test]
     fn human_review_lines_shape_for_adhoc_reviews() {
         // adhoc-reviews-in-log: the pure line builder `clank log`'s

@@ -107,9 +107,7 @@ fn oldest_obligation(
             // Not obligations handed over by a review stage: a
             // notification, an idle prompt, a preempt the panel
             // surfaces elsewhere (the `fix` gauge, the queue).
-            WaitItem::Finished { .. }
-            | WaitItem::AdHocSettled { .. }
-            | WaitItem::Idle { .. }
+            WaitItem::Idle { .. }
             | WaitItem::FixCommitTag { .. }
             | WaitItem::MultiplePlansOpen { .. }
             | WaitItem::PromoteFromQueue { .. }

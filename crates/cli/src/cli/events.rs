@@ -330,15 +330,6 @@ fn display_id(rows: &[Sourced], s: &Sourced) -> Selector {
 /// (a-command-is-an-event-source-like-any-other). What github alone
 /// has rides `github`, which is the carve-out.
 fn describe(item: &WaitItem) -> String {
-    if let WaitItem::Finished {
-        plan, finalized_at, ..
-    } = item
-    {
-        return format!("finished  {plan}  {finalized_at}");
-    }
-    if let WaitItem::AdHocSettled { sha, gate, .. } = item {
-        return format!("adhoc-settled  {sha}  gate {}", gate.as_str());
-    }
     if let WaitItem::DraftChanged {
         pr,
         comment,
@@ -682,6 +673,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Legacy rows, in the shape the retired source wrote.
+    ///
+    /// The three `finished` lines and the ack are copied VERBATIM from
+    /// this repo's own `.clank/agents/claude/events/repo-lifecycle.jsonl`
+    /// — a baselined row, an unacked row and its ack. The
+    /// `adhoc_settled` line is SYNTHETIC: no ad-hoc gate ever settled
+    /// in this repo, so there was none to copy. It is built from the
+    /// serialization the source used (`kind` from the wake-kind table,
+    /// `gate` snake_case per `CommitGateState`), and it is the weaker
+    /// of the two rows for that reason.
+    const LEGACY_LIFECYCLE_JSONL: &str = concat!(
+        r#"{"t":"inbox","v":1,"seq":1,"at":1790560465,"baseline":true,"transport":"repo","action_key":"finished:adhoc-review:12ce5676a0d126a7a0c5ab684398ea14e6fe6858","item":{"kind":"finished","plan":"adhoc-review","finalized_at":"12ce5676a0d126a7a0c5ab684398ea14e6fe6858"}}"#,
+        "\n",
+        r#"{"t":"inbox","v":1,"seq":2,"at":1790560500,"transport":"repo","action_key":"adhoc:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:continued","item":{"kind":"adhoc_settled","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","gate":"continued"}}"#,
+        "\n",
+        r#"{"t":"inbox","v":1,"seq":420,"at":1790759854,"transport":"repo","action_key":"finished:send-m-dash:7da6c6f48b8cf5a16ef553112ebbdcf6a20167c4","item":{"kind":"finished","plan":"send-m-dash","finalized_at":"7da6c6f48b8cf5a16ef553112ebbdcf6a20167c4"}}"#,
+        "\n",
+        r#"{"t":"ack","v":1,"seq":420,"at":1790759860}"#,
+        "\n",
+    );
+
+    /// A repo upgraded across the retirement still lists its events.
+    ///
+    /// Every live repo has one of these on disk, most with unacked
+    /// rows. The log format promises that a recognized `t` whose
+    /// fields no longer parse is FOREIGN rather than corruption —
+    /// this holds it to that with the real bytes, because the cost of
+    /// being wrong is every upgraded repo reporting a corrupt log and
+    /// an unacked row that can never be acked.
+    #[test]
+    fn a_retired_sources_rows_are_inert_and_do_not_poison_the_directory() {
+        let dir = tempdir();
+        std::fs::write(dir.join("repo-lifecycle.jsonl"), LEGACY_LIFECYCLE_JSONL).unwrap();
+
+        let mut live = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
+        live.load();
+        live.append_inbox(Transport::Poll, None, Some("k"), None, &item(1))
+            .unwrap();
+
+        // FOREIGN, not corrupt. `read_all` skips both, so asserting
+        // only on the listing would pass for a log reported corrupt on
+        // every `clank events` in every upgraded repo.
+        let legacy = EventLog::open(&dir, "repo-lifecycle").unwrap();
+        let read = legacy
+            .read_rows()
+            .unwrap()
+            .expect("a retired variant is foreign, not corruption");
+        assert!(read.rows.is_empty(), "no row is readable: {:?}", read.rows);
+        assert_eq!(read.foreign, 3, "and all three are kept for custody");
+
+        let rows = read_all(&dir).expect("a legacy log must not fail the listing");
+        assert!(
+            rows.iter().all(|r| r.source != "repo-lifecycle"),
+            "a retired row must never surface again, acked or not: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "and the live source beside it still lists: {rows:?}"
+        );
+        assert_eq!(rows[0].source, "github-o-r-aaaa");
     }
 
     #[test]

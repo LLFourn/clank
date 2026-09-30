@@ -208,23 +208,15 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             .fold
             .derive_status(&reviews, &inputs.work_policy, head.as_ref())
     };
-    let initial_lifecycle = if inputs.role == Role::Master {
-        sync_lifecycle_events(&repo, &author, &initial_status, &initial_state.fold)?
-    } else {
-        Vec::new()
-    };
-
     {
         let items = present_with_blocks(check_blocks(&repo, &author), || {
-            let mut owed = items_for(
+            items_for(
                 &repo,
                 &author,
                 &inputs,
                 &initial_status,
                 &initial_state.fold,
-            );
-            owed.events.extend(initial_lifecycle);
-            owed
+            )
         });
         if !items.is_empty() {
             binding.ensure_current(&repo, &author)?;
@@ -348,11 +340,6 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             let status = state
                 .fold
                 .derive_status(&reviews, &inputs.work_policy, head.as_ref());
-            let lifecycle = if inputs.role == Role::Master {
-                sync_lifecycle_events(&repo, &author, &status, &state.fold)?
-            } else {
-                Vec::new()
-            };
             // THE single return boundary: one last drain catches items
             // produced during the refold, and then BOTH routes meet the
             // block decision TOGETHER. Park only when it admits nothing
@@ -373,7 +360,6 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             let items = present_with_blocks(check_blocks(&repo, &author), || {
                 beat_owed(
                     items_for(&repo, &author, &inputs, &status, &state.fold),
-                    lifecycle,
                     &mut external,
                 )
             });
@@ -698,8 +684,7 @@ fn drop_items_not_for(repo: &Path, role: Role, external: &mut Vec<WaitItem>) {
 /// No dedupe here. The channel is the ONLY route an external row takes
 /// — the projection does not read the WAL — so a row cannot arrive
 /// twice in one beat.
-fn beat_owed(mut owed: Owed, lifecycle: Vec<WaitItem>, external: &mut Vec<WaitItem>) -> Owed {
-    owed.events.extend(lifecycle);
+fn beat_owed(mut owed: Owed, external: &mut Vec<WaitItem>) -> Owed {
     owed.events.append(external);
     owed
 }
@@ -1228,106 +1213,6 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     result
 }
 
-const LIFECYCLE_SOURCE: &str = "repo-lifecycle";
-const LIFECYCLE_BASELINE: &str = "repo-lifecycle:baseline:v1";
-
-/// Ingest repo transitions before returning any wake. One waiter
-/// writes under the source lease; every waiter reads the same inbox.
-/// A later arm therefore sees the transition until it is acked, even
-/// when the waiter that first observed it has disappeared.
-fn sync_lifecycle_events(
-    repo: &Path,
-    author: &AgentLabel,
-    status: &clank_core::wait::WorkStatus,
-    fold: &clank_core::repo_state::RepoState,
-) -> anyhow::Result<Vec<WaitItem>> {
-    use crate::cli::github::log::{EventLog, IngestLease, Transport};
-
-    let dir = crate::agent_store::agents_root(repo)
-        .join(author.as_str())
-        .join("events");
-    // This source holds its lease only for one synchronous refold. A
-    // contender should wait for that short write, then ingest and
-    // read the same rows; returning an empty read during the write
-    // would make `--peek` and a newly armed wait miss the transition.
-    let mut lease = None;
-    for _ in 0..100 {
-        if let Some(found) = IngestLease::try_acquire(&dir, LIFECYCLE_SOURCE)? {
-            lease = Some(found);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let lease = lease.ok_or_else(|| anyhow::anyhow!("lifecycle event ingest remains busy"))?;
-    {
-        let _lease = lease;
-        let mut log = EventLog::open(&dir, LIFECYCLE_SOURCE)?;
-        log.load();
-        let mut seen = log
-            .all_action_keys()?
-            .ok_or_else(|| anyhow::anyhow!("lifecycle event log is corrupt"))?;
-        let baseline = !seen.contains(LIFECYCLE_BASELINE);
-        let mut transitions = Vec::new();
-        for finished in &fold.finished_plans {
-            transitions.push((
-                format!("finished:{}:{}", finished.plan, finished.finalized_at),
-                WaitItem::Finished {
-                    plan: finished.plan.clone(),
-                    finalized_at: finished.finalized_at.clone(),
-                    selector: None,
-                },
-            ));
-        }
-        for ad_hoc in &status.ad_hoc {
-            if ad_hoc.is_settled() {
-                transitions.push((
-                    format!("adhoc:{}:{}", ad_hoc.sha, ad_hoc.gate.as_str()),
-                    WaitItem::AdHocSettled {
-                        sha: ad_hoc.sha.clone(),
-                        gate: ad_hoc.gate,
-                        selector: None,
-                    },
-                ));
-            }
-        }
-        for (key, item) in transitions {
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            if baseline {
-                log.append_handled_inbox(Transport::Repo, &key, &item)?;
-            } else {
-                log.append_inbox(Transport::Repo, None, Some(&key), None, &item)?;
-            }
-        }
-        if baseline {
-            log.append_observation(None, Some(LIFECYCLE_BASELINE), true)?;
-        }
-    }
-    let log = EventLog::open(&dir, LIFECYCLE_SOURCE)?;
-    let rows = log
-        .read_rows()?
-        .ok_or_else(|| anyhow::anyhow!("lifecycle event log is corrupt"))?;
-    let mut pending = Vec::new();
-    for row in rows.rows {
-        if row.acked {
-            continue;
-        }
-        let mut item = row.item;
-        let selector =
-            crate::cli::events::Selector::qualified(LIFECYCLE_SOURCE, row.seq).to_string();
-        match &mut item {
-            WaitItem::Finished { selector: slot, .. }
-            | WaitItem::AdHocSettled { selector: slot, .. } => {
-                *slot = Some(selector);
-                pending.push(item);
-            }
-            _ => {}
-        }
-    }
-    Ok(pending)
-}
-
 /// Everything this agent is woken for at one fold: its repo work, the
 /// master's notices, the queue when the master has nothing active, and
 /// its pending messages. The initial pass and every refold ask this one
@@ -1339,8 +1224,8 @@ fn sync_lifecycle_events(
 /// Split by where an item came FROM rather than by a predicate over
 /// `WaitItem`, because provenance is the actual invariant and it is
 /// checkable: `work_for` and the queue are the review cycle by
-/// definition, and the message log, the lifecycle inbox and the
-/// external WALs are events that arrived on their own schedule. A new
+/// definition, and the message log and the external WALs are events
+/// that arrived on their own schedule. A new
 /// producer has to name a field to compile; a new item added to an
 /// existing producer inherits that producer's side, which is the
 /// answer and not an accident.
@@ -1513,12 +1398,6 @@ pub(crate) enum WaitJsonItem<'a> {
         sha: &'a str,
         feedback_path: &'a str,
     },
-    #[serde(rename = "finished")]
-    Finished {
-        plan: &'a str,
-        finalized_at: &'a str,
-        selector: Option<&'a str>,
-    },
     #[serde(rename = "idle")]
     Idle { prompt: &'a str },
     #[serde(rename = "adhoc_review")]
@@ -1528,12 +1407,6 @@ pub(crate) enum WaitJsonItem<'a> {
     },
     #[serde(rename = "adhoc_revise")]
     AdHocRevise { sha: &'a str },
-    #[serde(rename = "adhoc_settled")]
-    AdHocSettled {
-        sha: &'a str,
-        gate: &'a str,
-        selector: Option<&'a str>,
-    },
     #[serde(rename = "fix_commit_tag")]
     FixCommitTag {
         sha: &'a str,
@@ -1663,30 +1536,12 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             sha: sha.as_str(),
             feedback_path,
         },
-        WaitItem::Finished {
-            plan,
-            finalized_at,
-            selector,
-        } => WaitJsonItem::Finished {
-            plan: plan.as_str(),
-            finalized_at: finalized_at.as_str(),
-            selector: selector.as_deref(),
-        },
         WaitItem::Idle { prompt } => WaitJsonItem::Idle { prompt },
         WaitItem::AdHocReview { sha, feedback_path } => WaitJsonItem::AdHocReview {
             sha: sha.as_str(),
             feedback_path,
         },
         WaitItem::AdHocRevise { sha } => WaitJsonItem::AdHocRevise { sha: sha.as_str() },
-        WaitItem::AdHocSettled {
-            sha,
-            gate,
-            selector,
-        } => WaitJsonItem::AdHocSettled {
-            sha: sha.as_str(),
-            gate: gate.as_str(),
-            selector: selector.as_deref(),
-        },
         WaitItem::FixCommitTag { sha, violation } => WaitJsonItem::FixCommitTag {
             sha: sha.as_str(),
             unknown: &violation.unknown,
@@ -1836,31 +1691,11 @@ fn render_human(item: &WaitItem) -> String {
             sha = short(sha),
             feedback_path = feedback_path,
         ),
-        WaitItem::Finished {
-            plan,
-            finalized_at,
-            selector,
-        } => format!(
-            "finished {}  {}  ack: clank events ack {}",
-            plan.as_str(),
-            short(finalized_at),
-            selector.as_deref().unwrap_or("?")
-        ),
         WaitItem::Idle { prompt } => format!("idle     {prompt}"),
         WaitItem::AdHocReview { sha, .. } => {
             format!("adhoc-review  {}  write feedback", short(sha),)
         }
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
-        WaitItem::AdHocSettled {
-            sha,
-            gate,
-            selector,
-        } => format!(
-            "adhoc-settled  {}  gate {}  ack: clank events ack {}",
-            short(sha),
-            gate.as_str(),
-            selector.as_deref().unwrap_or("?")
-        ),
         WaitItem::FixCommitTag { sha, violation } => {
             let mut parts: Vec<String> = Vec::new();
             if !violation.untagged_touched.is_empty() {
@@ -2151,101 +1986,6 @@ pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn lifecycle_status(
-        gate: Option<clank_core::vocab::CommitGateState>,
-    ) -> clank_core::wait::WorkStatus {
-        clank_core::wait::WorkStatus {
-            plans: Vec::new(),
-            ad_hoc: gate
-                .into_iter()
-                .map(|gate| clank_core::wait::AdHocWorkState {
-                    sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
-                    gate,
-                    handover: Default::default(),
-                })
-                .collect(),
-            pr_reviews: Vec::new(),
-            head_correction: None,
-            multi_plan_open: None,
-        }
-    }
-
-    #[test]
-    fn lifecycle_events_replay_to_two_waits_until_explicit_ack() {
-        use clank_core::repo_state::FinishedPlan;
-        use clank_core::vocab::CommitGateState;
-        let dir = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("codex").unwrap();
-        let mut fold = clank_core::repo_state::RepoState::default();
-        let pending = lifecycle_status(Some(CommitGateState::Unreviewed));
-        assert!(
-            sync_lifecycle_events(dir.path(), &author, &pending, &fold)
-                .unwrap()
-                .is_empty()
-        );
-
-        fold.finished_plans.push(FinishedPlan {
-            plan: PlanKey::parse("done").unwrap(),
-            intro: CommitSha::parse(&"1".repeat(40)).unwrap(),
-            finalized_at: CommitSha::parse(&"2".repeat(40)).unwrap(),
-        });
-        let settled = lifecycle_status(Some(CommitGateState::Continued));
-        let first = sync_lifecycle_events(dir.path(), &author, &settled, &fold).unwrap();
-        let second = sync_lifecycle_events(dir.path(), &author, &settled, &fold).unwrap();
-        assert_eq!(first, second, "a later wait sees the same unacked events");
-        assert_eq!(first.len(), 2);
-        let events = crate::agent_store::agents_root(dir.path()).join("codex/events");
-        let mut log = crate::cli::github::log::EventLog::open(&events, LIFECYCLE_SOURCE).unwrap();
-        assert_eq!(
-            log.read_rows().unwrap().unwrap().rows.len(),
-            2,
-            "one durable row per transition"
-        );
-        let selector = match &first[0] {
-            WaitItem::Finished {
-                selector: Some(s), ..
-            } => s,
-            other => panic!("expected a finished event, got {other:?}"),
-        };
-        let id: crate::cli::events::Selector = selector.parse().unwrap();
-        log.append_ack(id.seq).unwrap();
-        let remaining = sync_lifecycle_events(dir.path(), &author, &settled, &fold).unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert!(matches!(remaining[0], WaitItem::AdHocSettled { .. }));
-        assert_eq!(
-            log.read_rows().unwrap().unwrap().rows.len(),
-            2,
-            "ack does not mint another event"
-        );
-    }
-
-    #[test]
-    fn lifecycle_baseline_does_not_wake_for_old_finalizations() {
-        use clank_core::repo_state::FinishedPlan;
-        let dir = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("codex").unwrap();
-        let mut fold = clank_core::repo_state::RepoState::default();
-        let finished = |plan: &str, digit: char| FinishedPlan {
-            plan: PlanKey::parse(plan).unwrap(),
-            intro: CommitSha::parse(&"1".repeat(40)).unwrap(),
-            finalized_at: CommitSha::parse(&digit.to_string().repeat(40)).unwrap(),
-        };
-        fold.finished_plans.push(finished("old", '2'));
-        let status = lifecycle_status(None);
-        assert!(
-            sync_lifecycle_events(dir.path(), &author, &status, &fold)
-                .unwrap()
-                .is_empty()
-        );
-        fold.finished_plans.push(finished("new", '3'));
-        assert_eq!(
-            sync_lifecycle_events(dir.path(), &author, &status, &fold)
-                .unwrap()
-                .len(),
-            1
-        );
-    }
 
     #[test]
     fn same_session_waits_coexist_and_rebind_revokes_only_other_sessions() {
@@ -3131,9 +2871,12 @@ mod tests {
             }]
         };
         let event = || {
-            vec![WaitItem::Finished {
-                plan: PlanKey::parse("p").unwrap(),
-                finalized_at: sha("aaaa"),
+            vec![WaitItem::Message {
+                handle: "h".into(),
+                from: None,
+                repo: None,
+                subject: "hello".into(),
+                body: "hello".into(),
                 selector: None,
             }]
         };
@@ -3146,7 +2889,7 @@ mod tests {
         assert!(
             matches!(
                 out.as_slice(),
-                [WaitItem::Blocked { .. }, WaitItem::Finished { .. }]
+                [WaitItem::Blocked { .. }, WaitItem::Message { .. }]
             ),
             "the block explains, the event wakes: {out:?}"
         );
@@ -3202,7 +2945,7 @@ mod tests {
         assert!(
             matches!(
                 out.as_slice(),
-                [WaitItem::Unblocked { .. }, WaitItem::Finished { .. }]
+                [WaitItem::Unblocked { .. }, WaitItem::Message { .. }]
             ),
             "the answer leads and nothing is dropped: {out:?}"
         );
@@ -3247,7 +2990,6 @@ mod tests {
                         review,
                         events: Vec::new(),
                     },
-                    Vec::new(),
                     &mut external,
                 )
             })
@@ -3296,7 +3038,6 @@ mod tests {
                         }],
                         events: Vec::new(),
                     },
-                    Vec::new(),
                     &mut external,
                 )
             })

@@ -91,8 +91,6 @@ pub(crate) enum Transport {
     Command,
     /// A change observed by polling an open pending PR review.
     Draft,
-    /// A repo gate transition observed by the master's wait.
-    Repo,
     /// A message one agent sent another
     /// (`a-message-is-an-event-like-any-other`). Its own transport
     /// rather than borrowing `Command`'s: nothing produced it by
@@ -108,7 +106,6 @@ impl Transport {
             Transport::Relay => "relay",
             Transport::Command => "command",
             Transport::Draft => "draft",
-            Transport::Repo => "repo",
             Transport::Message => "message",
         }
     }
@@ -851,39 +848,6 @@ impl EventLog {
         Ok(Some(ReadRows { rows, foreign }))
     }
 
-    /// Complete identity set for a source whose facts remain in repo
-    /// history. Unlike the bounded GitHub feed horizon, old lifecycle
-    /// identities must not be forgotten or they would wake again.
-    pub(crate) fn all_action_keys(
-        &self,
-    ) -> std::io::Result<Option<std::collections::HashSet<String>>> {
-        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
-        let text = match std::fs::read_to_string(&self.log_path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Some(Default::default()));
-            }
-            Err(e) => return Err(e),
-        };
-        let Some(lines) = Self::parse(&text).ok() else {
-            return Ok(None);
-        };
-        Ok(Some(
-            lines
-                .into_iter()
-                .filter_map(|line| match line {
-                    Line::Known(record) => match *record {
-                        Record::Inbox { action_key, .. } | Record::Obs { action_key, .. } => {
-                            action_key
-                        }
-                        Record::Ack { .. } => None,
-                    },
-                    Line::Foreign { .. } => None,
-                })
-                .collect(),
-        ))
-    }
-
     /// Read both artifacts. Never fails: every failure mode maps to
     /// the plan's degradation (torn tail dropped, interior corruption
     /// quarantined to `<log>.corrupt`, corrupt state resets cache
@@ -991,15 +955,6 @@ impl EventLog {
         item: &WaitItem,
     ) -> std::io::Result<u64> {
         self.append_inbox_record(Transport::Poll, feed_id, action_key, event_at, item, true)
-    }
-
-    pub(crate) fn append_handled_inbox(
-        &mut self,
-        transport: Transport,
-        action_key: &str,
-        item: &WaitItem,
-    ) -> std::io::Result<u64> {
-        self.append_inbox_record(transport, None, Some(action_key), None, item, true)
     }
 
     fn append_inbox_record(

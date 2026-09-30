@@ -2724,6 +2724,36 @@ mod dirty_and_wake_tests {
         }
     }
 
+    /// `clank status` is where a finalize is legible, now that it is
+    /// not delivered as a wake.
+    ///
+    /// `a-repo-transition-is-derived-not-delivered` retired the
+    /// `repo-lifecycle` source, whose `Finished` notice asked for
+    /// nothing but an ack. The state it announced is derived, and this
+    /// line is where it shows — untested until the notice went away.
+    #[test]
+    fn an_idle_repo_says_which_plan_finished_last() {
+        let mut snap = minimal_snapshot();
+        snap.plans = Vec::new();
+        snap.blocks = Vec::new();
+        snap.last_finished = Some(clank_core::repo_state::FinishedPlan {
+            plan: clank_core::ids::PlanKey::parse("done").unwrap(),
+            intro: clank_core::ids::CommitSha::parse(&"1".repeat(40)).unwrap(),
+            finalized_at: clank_core::ids::CommitSha::parse(&"2".repeat(40)).unwrap(),
+        });
+
+        let out = snap.to_human();
+
+        assert!(
+            out.contains("last finished: done (finalized 2222222)"),
+            "the finalize must still be readable somewhere: {out}"
+        );
+        assert!(
+            !out.contains("no active plan, nothing pending"),
+            "a finalize is not nothing: {out}"
+        );
+    }
+
     #[test]
     fn to_json_minimal_omits_conditional_keys() {
         // typed-json-not-json-macro: the typed `StatusJson` must

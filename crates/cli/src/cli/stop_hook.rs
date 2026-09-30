@@ -2139,7 +2139,6 @@ pub(crate) struct WaitItem {
     pub(crate) plan: Option<String>,
     pub(crate) sha: Option<String>,
     finalized_at: Option<String>,
-    gate: Option<String>,
     next: Option<String>,
     pub(crate) reason: Option<Tag<clank_core::vocab::WaitingReason>>,
     prompt: Option<String>,
@@ -2297,9 +2296,6 @@ pub(crate) fn discharge_of(
             }
         },
         K::Reviewer => Until("fires until you write feedback for that sha"),
-        K::Finished | K::AdHocSettled => {
-            Until("fires until the event is acked — `clank events ack`")
-        }
         K::FixCommitTag => Until("fires until the commit's plan tag is corrected"),
         K::MultiplePlansOpen => Until(
             "fires until one plan is active — `clank finish` one, or `clank stash push` the rest",
@@ -2427,29 +2423,12 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 let reason = item.raw_reason();
                 out.push_str(&format!("  - master: {next} {plan} @ {short} ({reason})\n"));
             }
-            K::Finished => {
-                let ack = item
-                    .selector
-                    .as_deref()
-                    .map(|s| format!(" — ack `clank events ack {s}`"))
-                    .unwrap_or_default();
-                out.push_str(&format!("  - finished: {plan} @ {short}{ack}\n"));
-            }
             K::Idle => {
                 let prompt = item.prompt.as_deref().unwrap_or("");
                 out.push_str(&format!("  - idle: {prompt}\n"));
             }
             K::AdHocReview => out.push_str(&format!("  - adhoc-review: {short}\n")),
             K::AdHocRevise => out.push_str(&format!("  - adhoc-revise: {short}\n")),
-            K::AdHocSettled => {
-                let gate = item.gate.as_deref().unwrap_or("?");
-                let ack = item
-                    .selector
-                    .as_deref()
-                    .map(|s| format!(" — ack `clank events ack {s}`"))
-                    .unwrap_or_default();
-                out.push_str(&format!("  - adhoc-settled: {short} (gate {gate}){ack}\n"));
-            }
             K::Message => {
                 let handle = item.handle.as_deref().unwrap_or("?");
                 let from = crate::inbox::sender_words(item.from.as_deref(), item.repo.as_deref());
@@ -4742,25 +4721,6 @@ mod tests {
         assert!(
             out.contains("then ack the event"),
             "the debt remains until ack: {out}"
-        );
-    }
-
-    #[test]
-    fn lifecycle_events_name_their_ack_and_repeat_condition() {
-        let out = items_text(&[
-            serde_json::json!({"kind":"finished", "plan":"done", "finalized_at":FULL_SHA,
-                "selector":"repo-lifecycle@1"}),
-            serde_json::json!({"kind":"adhoc_settled", "sha":FULL_SHA, "gate":"continued",
-                "selector":"repo-lifecycle@2"}),
-        ]);
-        assert!(out.contains("finished: done"), "{out}");
-        assert!(out.contains("adhoc-settled:"), "{out}");
-        assert!(out.contains("clank events ack repo-lifecycle@1"), "{out}");
-        assert!(out.contains("clank events ack repo-lifecycle@2"), "{out}");
-        assert_eq!(
-            out.matches("fires until the event is acked").count(),
-            2,
-            "{out}"
         );
     }
 

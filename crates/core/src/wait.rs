@@ -124,14 +124,6 @@ pub enum WaitItem {
         sha: CommitSha,
         feedback_path: String,
     },
-    /// A plan finalized after this agent's lifecycle inbox began.
-    /// Replayed until the master acknowledges the event.
-    Finished {
-        plan: PlanKey,
-        finalized_at: CommitSha,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<String>,
-    },
     Idle {
         prompt: String,
     },
@@ -141,13 +133,6 @@ pub enum WaitItem {
     },
     AdHocRevise {
         sha: CommitSha,
-    },
-    /// An ad-hoc gate reached a terminal verdict. Replayed until ack.
-    AdHocSettled {
-        sha: CommitSha,
-        gate: crate::vocab::CommitGateState,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<String>,
     },
     /// Master's HEAD commit's `[..]` tag doesn't match the plan files
     /// its diff touched (`commit-tag-fixup-is-first-class-state`).
@@ -430,13 +415,11 @@ macro_rules! wake_kinds {
 wake_kinds! {
     Master => "master",
     Reviewer => "reviewer",
-    Finished => "finished",
     Idle => "idle",
     // The wake renames these three; `WaitItem`'s own `rename_all`
     // derive spells them `ad_hoc_*`. The hook parses the WAKE.
     AdHocReview => "adhoc_review",
     AdHocRevise => "adhoc_revise",
-    AdHocSettled => "adhoc_settled",
     FixCommitTag => "fix_commit_tag",
     MultiplePlansOpen => "multiple_plans_open",
     PromoteFromQueue => "promote_from_queue",
@@ -529,11 +512,9 @@ impl WaitItem {
         match self {
             WaitItem::Master { .. } => WaitKind::Master,
             WaitItem::Reviewer { .. } => WaitKind::Reviewer,
-            WaitItem::Finished { .. } => WaitKind::Finished,
             WaitItem::Idle { .. } => WaitKind::Idle,
             WaitItem::AdHocReview { .. } => WaitKind::AdHocReview,
             WaitItem::AdHocRevise { .. } => WaitKind::AdHocRevise,
-            WaitItem::AdHocSettled { .. } => WaitKind::AdHocSettled,
             WaitItem::FixCommitTag { .. } => WaitKind::FixCommitTag,
             WaitItem::MultiplePlansOpen { .. } => WaitKind::MultiplePlansOpen,
             WaitItem::PromoteFromQueue { .. } => WaitKind::PromoteFromQueue,
