@@ -215,30 +215,21 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     };
 
     {
-        let br = check_blocks(&repo, &author);
-        let has_answer = br
-            .items
-            .iter()
-            .any(|i| matches!(i, WaitItem::Unblocked { .. }));
-        if has_answer {
-            binding.ensure_current(&repo, &author)?;
-            return Ok(Some(br.items));
-        }
-
-        if !br.suppress_all {
-            let mut items = items_for(
+        let items = present_with_blocks(check_blocks(&repo, &author), || {
+            let mut owed = items_for(
                 &repo,
                 &author,
                 &inputs,
                 &initial_status,
                 &initial_state.fold,
             );
-            items.extend(initial_lifecycle);
-            if !items.is_empty() {
-                binding.ensure_current(&repo, &author)?;
-                return Ok(Some(items));
-            }
-        } // !suppress_all
+            owed.events.extend(initial_lifecycle);
+            owed
+        });
+        if !items.is_empty() {
+            binding.ensure_current(&repo, &author)?;
+            return Ok(Some(items));
+        }
     }
 
     // `--peek`: the initial pass found no actionable work → report empty
@@ -362,32 +353,31 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             } else {
                 Vec::new()
             };
-            let br = check_blocks(&repo, &author);
-            let has_answer = br
-                .items
-                .iter()
-                .any(|i| matches!(i, WaitItem::Unblocked { .. }));
-            let repo_items: Option<Vec<WaitItem>> = if has_answer {
-                Some(br.items.clone())
-            } else if br.suppress_all {
-                None
-            } else {
-                let mut items = items_for(&repo, &author, &inputs, &status, &state.fold);
-                items.extend(lifecycle);
-                if !items.is_empty() {
-                    binding.ensure_current(&repo, &author)?;
-                    Some(items)
-                } else {
-                    None
-                }
-            };
-
             // THE single return boundary: one last drain catches items
-            // produced during the refold, then repo + external merge into
-            // ONE result. Park only when BOTH are empty (codex 907acd5).
+            // produced during the refold, and then BOTH routes meet the
+            // block decision TOGETHER. Park only when it admits nothing
+            // (codex 907acd5; codex 344280f for the together).
             drain_external(&mut sources.rx, &mut sources_open, &mut external);
             drop_items_not_for(&repo, inputs.role, &mut external);
-            if let Some(items) = combine_beat_result(repo_items, external) {
+            // Deciding BEFORE the merge left the channel route outside
+            // the decision: a blocked park returned a source item with
+            // no `Blocked` context to explain the silence around it,
+            // and an answered one returned the answer with the company
+            // it had just promised not to have (codex on 344280f).
+            //
+            // Nothing is lost by draining into the decision. It returns
+            // empty only when `events` is empty, and these items ARE
+            // events — which matters because a source running
+            // memory-only (`events_dir: None`) has no WAL to re-read
+            // them from.
+            let items = present_with_blocks(check_blocks(&repo, &author), || {
+                beat_owed(
+                    items_for(&repo, &author, &inputs, &status, &state.fold),
+                    lifecycle,
+                    &mut external,
+                )
+            });
+            if !items.is_empty() {
                 binding.ensure_current(&repo, &author)?;
                 return Ok(items);
             }
@@ -682,11 +672,6 @@ pub(crate) fn resolve_wait_event_sources(
     Ok(sources)
 }
 
-/// Merge a beat's repo-side result with its drained external items
-/// into the single emitted result (extra-wait-events, codex fc7a4ff):
-/// repo work carries external items along; external-only still
-/// returns; both empty parks (`None`). Pure — the deterministic proof
-/// that a beat with BOTH ready emits ONE combined result.
 /// Drop what this role must not be handed.
 ///
 /// A draft change belongs to MASTER. The role is re-derived every
@@ -703,18 +688,20 @@ fn drop_items_not_for(repo: &Path, role: Role, external: &mut Vec<WaitItem>) {
     });
 }
 
-fn combine_beat_result(
-    repo_items: Option<Vec<WaitItem>>,
-    external: Vec<WaitItem>,
-) -> Option<Vec<WaitItem>> {
-    match repo_items {
-        Some(mut items) => {
-            items.extend(external);
-            (!items.is_empty()).then_some(items)
-        }
-        None if !external.is_empty() => Some(external),
-        None => None,
-    }
+/// One beat's items from BOTH routes, merged before anything decides.
+///
+/// Named so the composition can be asserted without a watcher, and so
+/// the loop reads as two steps: merge, then decide. The channel items
+/// join `events` because that is their class: an event that arrived on
+/// its own schedule, which a pending block has nothing to say about.
+///
+/// No dedupe here. The channel is the ONLY route an external row takes
+/// — the projection does not read the WAL — so a row cannot arrive
+/// twice in one beat.
+fn beat_owed(mut owed: Owed, lifecycle: Vec<WaitItem>, external: &mut Vec<WaitItem>) -> Owed {
+    owed.events.extend(lifecycle);
+    owed.events.append(external);
+    owed
 }
 
 /// Drain every ready external item into `out`, flipping `open` to
@@ -1190,9 +1177,13 @@ async fn run_leased_command_source(
 
 /// Check blocks for the calling agent. An `Unblocked` answer is
 /// returned as the sole item so the caller exits immediately; any
-/// pending block sets `suppress_all`, which parks this agent until
-/// it is answered. Blocks are repo-wide, so there is no partial
-/// suppression and nothing downstream routes work around one.
+/// pending block sets `suppress_all`, which pauses this agent's REVIEW
+/// CYCLE until it is answered. Blocks stay repo-wide — there is no
+/// per-plan bookkeeping — but the suppression is partial by class:
+/// [`present_with_blocks`] withholds the review cycle and still
+/// delivers events. It used to withhold everything, which turned a
+/// question for a human into an agent that could not be reached at all
+/// (`a-block-pauses-the-review-cycle-not-the-world`).
 struct BlockResult {
     items: Vec<WaitItem>,
     suppress_all: bool,
@@ -1227,9 +1218,10 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
             name: b.name.clone(),
             question: b.question.clone(),
         });
-        // Every block is repo-wide: one pending block parks this
-        // agent entirely, so there is no per-plan bookkeeping and
-        // nothing downstream can route work "around" it.
+        // Every block is repo-wide: one pending block suppresses for
+        // every plan, so there is no per-plan bookkeeping. WHAT it
+        // suppresses is the review CYCLE — see `present_with_blocks`,
+        // the only reader of this flag.
         result.suppress_all = true;
     }
 
@@ -1341,24 +1333,85 @@ fn sync_lifecycle_events(
 /// its pending messages. The initial pass and every refold ask this one
 /// function, so a message reaches the agent whichever path returns —
 /// including `--peek`, which is the initial pass.
+/// What a turn is owed, split by PROVENANCE — which is what decides
+/// whether a pending block withholds it.
+///
+/// Split by where an item came FROM rather than by a predicate over
+/// `WaitItem`, because provenance is the actual invariant and it is
+/// checkable: `work_for` and the queue are the review cycle by
+/// definition, and the message log, the lifecycle inbox and the
+/// external WALs are events that arrived on their own schedule. A new
+/// producer has to name a field to compile; a new item added to an
+/// existing producer inherits that producer's side, which is the
+/// answer and not an accident.
+struct Owed {
+    /// The cycle a block exists to pause.
+    review: Vec<WaitItem>,
+    /// Debt that accrued regardless of the question a block is asking.
+    events: Vec<WaitItem>,
+}
+
 fn items_for(
     repo: &Path,
     author: &AgentLabel,
     inputs: &WaitInputs,
     status: &clank_core::wait::WorkStatus,
     fold: &clank_core::repo_state::RepoState,
-) -> Vec<WaitItem> {
-    let mut items = status.work_for(author, inputs.role);
-    if inputs.role == Role::Master {
-        if items.is_empty() && fold.plans.is_empty() {
-            let queue = crate::cli::queue::scan_queue_no_dups(repo).unwrap_or_else(|e| {
-                eprintln!("wait: {e}");
-                Vec::new()
-            });
-            items.extend(queue_promote_outcome(&queue));
-        }
+) -> Owed {
+    let mut review = status.work_for(author, inputs.role);
+    if inputs.role == Role::Master && review.is_empty() && fold.plans.is_empty() {
+        let queue = crate::cli::queue::scan_queue_no_dups(repo).unwrap_or_else(|e| {
+            eprintln!("wait: {e}");
+            Vec::new()
+        });
+        review.extend(queue_promote_outcome(&queue));
     }
-    items.extend(message_items(repo, author));
+    let events = message_items(repo, author);
+    Owed { review, events }
+}
+
+/// What this turn presents, with any pending block applied.
+///
+/// THE one place that decides what a block stops. Both callers — the
+/// initial pass and the watcher loop — used to decide it here and
+/// there, and each did it by skipping the whole projection wholesale.
+/// That is how a block came to stop things it has nothing to say
+/// about: a `clank send` message is reached only through `items_for`,
+/// so a human answering the very question the agent is blocked on
+/// could not reach it.
+fn present_with_blocks(br: BlockResult, owed: impl FnOnce() -> Owed) -> Vec<WaitItem> {
+    let Owed { review, mut events } = owed();
+    if !br.suppress_all {
+        let mut items = review;
+        items.extend(events);
+        return items;
+    }
+    // A block pauses the REVIEW CYCLE, and says nothing about debt
+    // that accrued on its own schedule. Withholding that debt does not
+    // discard it — the rows stay unacked and drain later — it only
+    // defers the wake behind a human answering a question, and the
+    // events whose whole value is timeliness are exactly the ones
+    // deferred: a CI failure, a review submitted, a reply waited on.
+    //
+    // The control items LEAD, as context: an agent woken by a message
+    // while its cycle is paused would otherwise have no way to know
+    // why its plan work went quiet.
+    //
+    // Whether they may wake on their OWN is the one place a pending
+    // block and an answered one differ. A pending block is not news —
+    // only a human can discharge it — so presenting it alone would wake
+    // the agent at every turn end until one did. An ANSWER is news, and
+    // is the thing the agent has been waiting for, so it wakes with
+    // nothing else ready.
+    let answered = br
+        .items
+        .iter()
+        .any(|i| matches!(i, WaitItem::Unblocked { .. }));
+    if !answered && events.is_empty() {
+        return Vec::new();
+    }
+    let mut items = br.items;
+    items.append(&mut events);
     items
 }
 
@@ -1373,10 +1426,14 @@ fn message_items(repo: &Path, author: &AgentLabel) -> Vec<WaitItem> {
 }
 
 /// The master-with-nothing-active outcome: a `PromoteFromQueue` for
-/// the first queued item, or empty when the queue is empty. Reached
-/// only through [`items_for`], which no pass calls while a block pends
-/// — a block sets `suppress_all` upstream — so there is no Blocked
-/// context to co-surface here and no suppression to apply.
+/// the first queued item, or empty when the queue is empty.
+///
+/// It is REVIEW-CYCLE work, and now that a block no longer skips
+/// `items_for` wholesale this function does run while one pends — its
+/// result is dropped by [`present_with_blocks`] instead. Starting a new
+/// plan is precisely what a pending question should stop, so the
+/// suppression lives there, with every other review item, rather than
+/// being re-decided here.
 fn queue_promote_outcome(queue: &[crate::cli::queue::QueueEntry]) -> Vec<WaitItem> {
     queue
         .first()
@@ -3051,41 +3108,246 @@ mod tests {
         assert!(out.chars().all(|c| c == '\u{FFFD}'));
     }
 
+    /// The pure decision, over the three shapes a block can meet.
+    ///
+    /// Asserted on `present_with_blocks` and not only through a peek
+    /// because this is the function both callers share: a regression
+    /// here is a regression in the park AND the peek at once, which is
+    /// the property the split was introduced for.
     #[test]
-    fn combine_beat_result_merges_repo_and_external_into_one() {
-        // codex fc7a4ff: the deterministic proof that a beat with BOTH
-        // a repo item and an external item ready emits ONE result
-        // containing both — no wall-clock racing.
-        let repo = || {
-            Some(vec![WaitItem::Idle {
-                prompt: "repo".into(),
-            }])
+    fn a_block_withholds_the_review_cycle_and_delivers_the_events() {
+        let blocked = || BlockResult {
+            items: vec![WaitItem::Blocked {
+                agent: "m".into(),
+                name: "q".into(),
+                question: "why?".into(),
+            }],
+            suppress_all: true,
         };
-        let ext = || {
-            vec![WaitItem::CommandEvent {
-                name: "cmd".into(),
-                id: "1".into(),
-                event: "k".into(),
-                content: String::new(),
-                at: None,
-                failure: false,
+        let review = || {
+            vec![WaitItem::PromoteFromQueue {
+                name: "next".into(),
+                priority: 500,
+            }]
+        };
+        let event = || {
+            vec![WaitItem::Finished {
+                plan: PlanKey::parse("p").unwrap(),
+                finalized_at: sha("aaaa"),
                 selector: None,
             }]
         };
-        // Both ready → one result with BOTH.
-        let combined = combine_beat_result(repo(), ext()).expect("wake");
+
+        // Events survive, with the block leading as context.
+        let out = present_with_blocks(blocked(), || Owed {
+            review: review(),
+            events: event(),
+        });
+        assert!(
+            matches!(
+                out.as_slice(),
+                [WaitItem::Blocked { .. }, WaitItem::Finished { .. }]
+            ),
+            "the block explains, the event wakes: {out:?}"
+        );
+
+        // …and the review cycle is what stays paused. Asserted by
+        // ABSENCE of the promote and PRESENCE of the event, because
+        // "returns nothing" satisfies the absence on its own.
+        assert!(
+            !out.iter()
+                .any(|i| matches!(i, WaitItem::PromoteFromQueue { .. })),
+            "{out:?}"
+        );
+
+        // A block with no event debt wakes nothing at all: the Blocked
+        // item alone would re-fire at every turn end until a human
+        // answered.
+        assert!(
+            present_with_blocks(blocked(), || Owed {
+                review: review(),
+                events: Vec::new(),
+            })
+            .is_empty()
+        );
+
+        // Unsuppressed, both classes travel together and the block
+        // contributes nothing.
+        let out = present_with_blocks(
+            BlockResult {
+                items: Vec::new(),
+                suppress_all: false,
+            },
+            || Owed {
+                review: review(),
+                events: event(),
+            },
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+
+        // An ANSWER leads, and unlike a pending block it wakes on its
+        // own — it is news, and it is what the agent has been waiting
+        // for. The review cycle stays paused until it is acknowledged.
+        let answered = || BlockResult {
+            items: vec![WaitItem::Unblocked {
+                name: "q".into(),
+                answer: "yes".into(),
+            }],
+            suppress_all: true,
+        };
+        let out = present_with_blocks(answered(), || Owed {
+            review: review(),
+            events: event(),
+        });
+        assert!(
+            matches!(
+                out.as_slice(),
+                [WaitItem::Unblocked { .. }, WaitItem::Finished { .. }]
+            ),
+            "the answer leads and nothing is dropped: {out:?}"
+        );
+        let out = present_with_blocks(answered(), || Owed {
+            review: review(),
+            events: Vec::new(),
+        });
+        assert!(
+            matches!(out.as_slice(), [WaitItem::Unblocked { .. }]),
+            "and it wakes with nothing else ready: {out:?}"
+        );
+    }
+
+    fn unblocked_repo() -> BlockResult {
+        BlockResult {
+            items: Vec::new(),
+            suppress_all: false,
+        }
+    }
+
+    fn cmd_row() -> WaitItem {
+        WaitItem::CommandEvent {
+            name: "cmd".into(),
+            id: "1".into(),
+            event: "k".into(),
+            content: String::new(),
+            at: None,
+            failure: false,
+            selector: None,
+        }
+    }
+
+    /// A beat with BOTH routes ready emits ONE result containing both,
+    /// and a beat with neither parks.
+    #[test]
+    fn a_beat_merges_both_routes_and_parks_only_when_both_are_empty() {
+        // codex fc7a4ff: deterministic, no wall-clock racing.
+        let beat = |review: Vec<WaitItem>, mut external: Vec<WaitItem>| {
+            present_with_blocks(unblocked_repo(), || {
+                beat_owed(
+                    Owed {
+                        review,
+                        events: Vec::new(),
+                    },
+                    Vec::new(),
+                    &mut external,
+                )
+            })
+        };
+        let repo_item = || {
+            vec![WaitItem::Idle {
+                prompt: "repo".into(),
+            }]
+        };
+
+        let combined = beat(repo_item(), vec![cmd_row()]);
         assert_eq!(combined.len(), 2);
         assert!(matches!(combined[0], WaitItem::Idle { .. }));
         assert!(matches!(combined[1], WaitItem::CommandEvent { .. }));
-        // External-only still wakes.
-        assert_eq!(combine_beat_result(None, ext()).unwrap().len(), 1);
-        // Repo-only wakes.
-        assert_eq!(combine_beat_result(repo(), Vec::new()).unwrap().len(), 1);
-        // Both empty → park.
-        assert!(combine_beat_result(None, Vec::new()).is_none());
+        // Either alone still wakes.
+        assert_eq!(beat(Vec::new(), vec![cmd_row()]).len(), 1);
+        assert_eq!(beat(repo_item(), Vec::new()).len(), 1);
+        // Neither → park.
         assert!(
-            combine_beat_result(Some(Vec::new()), Vec::new()).is_none(),
-            "an empty repo result must not make a normal wait exit",
+            beat(Vec::new(), Vec::new()).is_empty(),
+            "an empty beat must not make a normal wait exit",
+        );
+    }
+
+    /// The CHANNEL route obeys the block decision too.
+    ///
+    /// The decision used to run before the channel drain, so a source
+    /// item arriving after the projection read was returned raw: a
+    /// blocked park handed the agent an external event with no
+    /// `Blocked` beside it to explain why its plan work had gone
+    /// quiet, and an answered one handed back the answer with company
+    /// it had just promised not to have (codex on 344280f). Asserted
+    /// on the composition, because each half was already right alone.
+    #[test]
+    fn a_channel_only_beat_meets_the_same_block_decision() {
+        let decide = |br: BlockResult, mut external: Vec<WaitItem>| {
+            present_with_blocks(br, || {
+                beat_owed(
+                    Owed {
+                        // Review work is present and must be dropped:
+                        // a test with an empty review side cannot tell
+                        // suppression from having nothing to suppress.
+                        review: vec![WaitItem::PromoteFromQueue {
+                            name: "next".into(),
+                            priority: 500,
+                        }],
+                        events: Vec::new(),
+                    },
+                    Vec::new(),
+                    &mut external,
+                )
+            })
+        };
+
+        // Blocked, external-only: the event arrives WITH its context.
+        let out = decide(
+            BlockResult {
+                items: vec![WaitItem::Blocked {
+                    agent: "m".into(),
+                    name: "q".into(),
+                    question: "why?".into(),
+                }],
+                suppress_all: true,
+            },
+            vec![cmd_row()],
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [WaitItem::Blocked { .. }, WaitItem::CommandEvent { .. }]
+            ),
+            "a channel item must not bypass the decision: {out:?}"
+        );
+
+        // Answered, external also ready: the answer LEADS and the
+        // event follows. Neither is dropped — a memory-only source has
+        // no WAL to re-read its item from.
+        let out = decide(
+            BlockResult {
+                items: vec![WaitItem::Unblocked {
+                    name: "q".into(),
+                    answer: "yes".into(),
+                }],
+                suppress_all: true,
+            },
+            vec![cmd_row()],
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [WaitItem::Unblocked { .. }, WaitItem::CommandEvent { .. }]
+            ),
+            "the answer leads, and nothing is silently dropped: {out:?}"
+        );
+
+        // And in both cases the review cycle stayed paused.
+        assert!(
+            !out.iter()
+                .any(|i| matches!(i, WaitItem::PromoteFromQueue { .. })),
+            "{out:?}"
         );
     }
 
@@ -3193,8 +3455,12 @@ mod tests {
         assert!(queue_promote_outcome(&[]).is_empty());
     }
 
+    /// What `check_blocks` REPORTS is unchanged — every pending block
+    /// still sets `suppress_all` and still surfaces itself as context.
+    /// What that flag MEANS downstream is the thing that narrowed; see
+    /// `present_with_blocks`.
     #[test]
-    fn pending_block_parks_the_agent_entirely() {
+    fn pending_block_suppresses_and_surfaces_itself() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let blocks = repo.join(".clank/agents/claude/blocks");
@@ -3205,7 +3471,7 @@ mod tests {
 
         assert!(
             br.suppress_all,
-            "any pending block must park the agent; nothing routes around it"
+            "any pending block suppresses; blocks are repo-wide"
         );
         assert!(
             matches!(
