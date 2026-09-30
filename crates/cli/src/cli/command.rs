@@ -219,6 +219,18 @@ pub enum Command {
 /// Run the parsed command. The bin's `main` owns process concerns —
 /// SIGPIPE, tracing, the exit code — and calls this for the rest.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    dispatch_with(cli, || std::io::read_to_string(std::io::stdin())).await
+}
+
+/// `dispatch` with the stdin `-m -` reads from supplied, so the path a
+/// message actually travels can be driven in a test without starting a
+/// binary.
+pub async fn dispatch_with(
+    cli: Cli,
+    read_stdin: impl FnOnce() -> std::io::Result<String>,
+) -> anyhow::Result<()> {
+    let mut cli = cli;
+    crate::cli::message::resolve_with(&mut cli.command, read_stdin)?;
     match cli.command {
         Command::Init(args) => crate::cli::init::run(args).await,
         Command::Finish(args) => crate::cli::finish::run(args).await,

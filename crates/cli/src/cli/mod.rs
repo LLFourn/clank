@@ -32,6 +32,7 @@ pub mod init;
 #[cfg(test)]
 pub mod js_guard;
 pub mod log;
+pub(crate) mod message;
 pub mod open;
 pub mod open_zellij;
 pub mod pick;
@@ -693,7 +694,8 @@ pub struct SendArgs {
     /// Send to whoever that repo's roster names master.
     #[arg(long)]
     pub master: bool,
-    /// The message. Repeat for paragraphs, as with `git commit -m`.
+    /// The message. Repeat for paragraphs, as with `git commit -m`;
+    /// `-m -` reads one paragraph from stdin.
     #[arg(short = 'm', long = "message", value_name = "TEXT")]
     pub message: Vec<String>,
     /// Read the message from a file; `-` reads stdin.
@@ -809,7 +811,7 @@ pub struct FeedbackWriteArgs {
     /// Review message (like `git commit -m`). First line is the
     /// summary; subsequent lines are details. Required. Don't restate
     /// the verdict — a leading `CONTINUE:` / `REQUEST_CHANGES:` etc.
-    /// matching --verdict is stripped.
+    /// matching --verdict is stripped. `-m -` reads it from stdin.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
 }
@@ -899,7 +901,7 @@ pub struct PrReviewNoteArgs {
     /// Your verdict for the current round.
     #[arg(long, value_enum)]
     pub verdict: VerdictArg,
-    /// Review summary (like `git commit -m`).
+    /// Review summary (like `git commit -m`). `-m -` reads stdin.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
     /// PR number. Defaults to the single active review.
@@ -1409,8 +1411,9 @@ pub struct QueueAddArgs {
     pub name: String,
     #[arg(long, default_value_t = 500)]
     pub priority: u16,
-    /// Inline body. Multi-line allowed (newlines preserved). Omit to
-    /// take the body from `.clank/drafts/<name>.md`.
+    /// Inline body. Multi-line allowed (newlines preserved). `-m -`
+    /// reads it from stdin. Omit to take the body from
+    /// `.clank/drafts/<name>.md`.
     #[arg(short = 'm', long)]
     pub message: Option<String>,
 }
@@ -1444,7 +1447,8 @@ pub struct FinishArgs {
     /// message — a brief WHAT subject and a WHY body, written as if the whole
     /// plan were one commit. It becomes the plan's squash summary. A bare
     /// `finish` / subject-only message is rejected. Repeatable, git-style:
-    /// each `-m` becomes a paragraph (e.g. `-m "<subject>" -m "<why>"`).
+    /// each `-m` becomes a paragraph (e.g. `-m "<subject>" -m "<why>"`),
+    /// and `-m -` reads one paragraph from stdin.
     #[arg(short = 'm', long)]
     pub message: Vec<String>,
     /// After finalize, strip the plan's `.clank/` artifacts
@@ -1670,7 +1674,7 @@ pub struct BlockMigrateArgs {
 pub struct BlockCreateArgs {
     /// Block name.
     pub name: String,
-    /// Question or reason for the block.
+    /// Question or reason for the block. `-m -` reads it from stdin.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
     /// Agent label. Resolved from env when omitted.
@@ -1768,7 +1772,7 @@ pub struct UnblockArgs {
     pub agent: String,
     /// Block name to answer.
     pub name: String,
-    /// Answer message.
+    /// Answer message. `-m -` reads it from stdin.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
     #[arg(long, value_name = "PATH")]
