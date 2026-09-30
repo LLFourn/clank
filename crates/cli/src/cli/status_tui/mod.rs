@@ -226,6 +226,7 @@ fn apply_confirm(
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
         | ConfirmAction::RestorePlan
+        | ConfirmAction::DropStashedPlan { .. }
         | ConfirmAction::PurgeArtifacts
         | ConfirmAction::PurgeDrop { .. } => Ok(()),
     }
@@ -255,6 +256,20 @@ async fn run_plan_confirm(
         ConfirmAction::PromotePlan => crate::cli::queue::promote(repo, stem),
         ConfirmAction::RestorePlan => {
             crate::cli::stash::run_pop_inner(Some(repo), Some(stem)).await
+        }
+        // Warnings are DISCARDED, not printed: stdout belongs to the
+        // alternate screen, and the core's own warning is the same
+        // sentence the confirm already made the operator read.
+        // The fingerprint the SCREEN showed travels to the delete,
+        // which refuses a replacement. Verifying here instead would
+        // reopen the window it exists to close.
+        //
+        // Warnings are discarded, not printed: stdout belongs to the
+        // alternate screen, and the core's warning is the sentence the
+        // confirm already made the operator read.
+        ConfirmAction::DropStashedPlan { identity, .. } => {
+            crate::cli::stash::run_drop_checked(Some(repo), Some(stem), Some(identity), &mut |_| {})
+                .await
         }
         ConfirmAction::PurgeArtifacts | ConfirmAction::PurgeDrop { .. } => {
             crate::cli::purge::run(crate::cli::PurgeArgs {
@@ -308,6 +323,7 @@ fn plan_confirm_title(action: ConfirmAction) -> String {
         ConfirmAction::UnqueuePlan => "unqueue failed".to_string(),
         ConfirmAction::PromotePlan => "promote failed".to_string(),
         ConfirmAction::RestorePlan => "stash pop failed".to_string(),
+        ConfirmAction::DropStashedPlan { .. } => "stash drop failed".to_string(),
         ConfirmAction::PurgeArtifacts => "purge failed".to_string(),
         ConfirmAction::PurgeDrop { .. } => "purge --drop failed".to_string(),
         _ => "action failed".to_string(),
@@ -4133,6 +4149,52 @@ pub(crate) async fn run_tui(
                                             action: ConfirmAction::RestorePlan,
                                         };
                                     }
+                                    PlanAction::DropStash => {
+                                        // Counted from the RECORD, now,
+                                        // not from the snapshot the page
+                                        // was drawn with. The snapshot is
+                                        // as old as the last refresh, and
+                                        // a screen that says "3 commits"
+                                        // over a stash that has since
+                                        // changed is the defect
+                                        // `PurgeDrop` already records.
+                                        // No count, no screen.
+                                        let sized = plan_page.as_ref().and_then(|pp| {
+                                            crate::cli::stash::scan_stash(&repo)
+                                                .into_iter()
+                                                .find(|(stem, _)| *stem == pp.stem)
+                                                .and_then(|(_, rec)| {
+                                                    // BOTH halves captured here, with the
+                                                    // count. A protective ref that will
+                                                    // not resolve has no identity, so
+                                                    // there is no screen — `None` falls to
+                                                    // the error below rather than opening
+                                                    // a confirm that cannot keep its word.
+                                                    crate::cli::stash::StashIdentity::of(
+                                                        &repo, &rec,
+                                                    )
+                                                    .map(|id| (rec.shas.len(), id))
+                                                })
+                                        });
+                                        match sized {
+                                            Some((commits, identity)) => {
+                                                mode = Mode::Confirm {
+                                                    action: ConfirmAction::DropStashedPlan {
+                                                        commits,
+                                                        identity,
+                                                    },
+                                                };
+                                            }
+                                            None => {
+                                                detail = Some(Overlay::error(
+                                                    "cannot size the drop".to_string(),
+                                                    "no stash record for this plan — it may \
+                                                     have been popped or dropped already"
+                                                        .to_string(),
+                                                ));
+                                            }
+                                        }
+                                    }
                                     PlanAction::Purge => mode = Mode::PurgeChoice { sel: 0 },
                                     PlanAction::Back => {
                                         mode = close_plan_page(
@@ -7153,6 +7215,7 @@ pub(crate) mod tests {
             [
                 input::PlanAction::OpenHtml,
                 input::PlanAction::Restore,
+                input::PlanAction::DropStash,
                 input::PlanAction::Back
             ]
         );
@@ -7165,6 +7228,216 @@ pub(crate) mod tests {
         assert_eq!(
             open.map(|pg| pg.st),
             Some(input::PlanPageState::Active { repo_paused: false })
+        );
+    }
+
+    /// Dropping a stash from the page destroys it, and the page has
+    /// nothing left to read.
+    ///
+    /// Through `run_plan_confirm` — the SAME core `clank stash drop`
+    /// runs — because the TUI is a front-end and a reimplemented write
+    /// here would be a second way to delete something with no undo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_stash_from_its_page_destroys_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(p)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            )
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        let write = |rel: &str, body: &str| {
+            std::fs::create_dir_all(p.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(p.join(rel), body).unwrap();
+        };
+        write(
+            ".clank/config.json",
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        );
+        write(
+            ".clank/.gitignore",
+            "/cache/\n/agents/\n/stash/\n/shelved/\n",
+        );
+        write("base.rs", "// base\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        write(".clank/plans/foo.md", "# foo\n\nthe stashed plan\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "[foo] intro"]);
+        run_plan_confirm(ConfirmAction::StashPlan, p, "foo")
+            .await
+            .unwrap();
+
+        // What the screen would capture, read the way the loop reads
+        // it: from the record, not from a snapshot.
+        let shown = |p: &std::path::Path| {
+            crate::cli::stash::scan_stash(p)
+                .into_iter()
+                .find(|(stem, _)| stem == "foo")
+                .and_then(|(_, rec)| {
+                    crate::cli::stash::StashIdentity::of(p, &rec).map(|id| (rec.shas.len(), id))
+                })
+                .expect("a stash record to size")
+        };
+        let (commits, fingerprint) = shown(p);
+        assert_eq!(commits, 1);
+
+        let outcome = run_plan_confirm(
+            ConfirmAction::DropStashedPlan {
+                commits,
+                identity: fingerprint,
+            },
+            p,
+            "foo",
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        assert!(
+            crate::cli::stash::scan_stash(p).is_empty(),
+            "the stash is gone"
+        );
+        assert!(
+            !p.join(".clank/plans/foo.md").exists(),
+            "and it was NOT restored on the way out"
+        );
+
+        // And the page's source is gone with it, so a refresh closes
+        // the page rather than finding something else to show. The
+        // snapshot still lists an ACTIVE `foo` here — the stem the
+        // stash shared — so this also pins that the close does not
+        // fall through to it.
+        use clank_core::plan_view::WaitingOn;
+        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        s.stash.clear();
+        assert_eq!(
+            plan_page_facts(p, "foo", &s, PlanSource::Stash).await,
+            None,
+            "nothing left to read, and the active `foo` is not it"
+        );
+    }
+
+    /// A stash REPLACED while the confirm is open is not the stash the
+    /// operator agreed to destroy.
+    ///
+    /// The stem is a name and names are reused: pop `foo` and stash a
+    /// different `foo` while the screen sits there, and answering Yes
+    /// would delete whatever now answers to it. The count does not save
+    /// you — the replacement here has the same one — which is why the
+    /// confirm carries an identity and the delete refuses a mismatch
+    /// rather than taking it (codex on c1f9301).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stash_replaced_under_the_confirm_is_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(p)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            )
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        let write = |rel: &str, body: &str| {
+            std::fs::create_dir_all(p.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(p.join(rel), body).unwrap();
+        };
+        write(
+            ".clank/config.json",
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        );
+        write(
+            ".clank/.gitignore",
+            "/cache/\n/agents/\n/stash/\n/shelved/\n",
+        );
+        write("base.rs", "// base\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(p)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        write(".clank/plans/foo.md", "# foo\n\nthe FIRST foo\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "[foo] intro"]);
+        run_plan_confirm(ConfirmAction::StashPlan, p, "foo")
+            .await
+            .unwrap();
+
+        let captured = crate::cli::stash::scan_stash(p)
+            .into_iter()
+            .find(|(stem, _)| stem == "foo")
+            .and_then(|(_, rec)| {
+                crate::cli::stash::StashIdentity::of(p, &rec).map(|id| (rec.shas.len(), id))
+            })
+            .expect("the stash the screen would show");
+
+        // …and now somebody else discards it and stashes a DIFFERENT
+        // `foo` under the same name, while the confirm is still up.
+        // Built to the SAME SHAPE — one commit — so the count cannot be
+        // what tells them apart.
+        run_plan_confirm(ConfirmAction::RestorePlan, p, "foo")
+            .await
+            .unwrap();
+        git(&["reset", "--hard", "--quiet", &base]);
+        write(".clank/plans/foo.md", "# foo\n\nthe SECOND foo\n");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "[foo] intro"]);
+        run_plan_confirm(ConfirmAction::StashPlan, p, "foo")
+            .await
+            .unwrap();
+        let now = crate::cli::stash::scan_stash(p)
+            .into_iter()
+            .find(|(stem, _)| stem == "foo")
+            .map(|(_, rec)| rec.shas.len())
+            .expect("a replacement stash");
+        assert_eq!(
+            now, captured.0,
+            "the control: the count MATCHES, so a count-only confirm would have gone ahead"
+        );
+
+        let outcome = run_plan_confirm(
+            ConfirmAction::DropStashedPlan {
+                commits: captured.0,
+                identity: captured.1,
+            },
+            p,
+            "foo",
+        )
+        .await;
+
+        let err = outcome.expect_err("a replaced stash must not be dropped");
+        assert!(
+            format!("{err:#}").contains("not the stash you were shown"),
+            "and it says why: {err:#}"
+        );
+        assert!(
+            !crate::cli::stash::scan_stash(p).is_empty(),
+            "the replacement is still there — nothing was destroyed"
         );
     }
 

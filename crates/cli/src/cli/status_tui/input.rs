@@ -284,6 +284,15 @@ pub(super) enum PlanAction {
     Promote,
     /// `stash pop` a stashed plan — behind a confirm, as stashing is.
     Restore,
+    /// `stash drop` a stashed plan — behind a confirm, as every write
+    /// on this page is. The only IRREVERSIBLE one: a stash's commits
+    /// were rebased off the branch when it was pushed, so its
+    /// protective ref is the sole thing holding them and the reflog
+    /// does not have them. Every neighbour has a way back — `push` is
+    /// undone by `pop`, `unqueue` keeps the body, even `purge --drop`
+    /// leaves the reflog. This leaves nothing, which is the confirm's
+    /// whole job to say.
+    DropStash,
     /// Leave the page.
     Back,
 }
@@ -341,7 +350,7 @@ pub(super) fn plan_actions(st: PlanPageState) -> Vec<PlanAction> {
             }
             v.push(Purge);
         }
-        PlanPageState::Stashed => v.push(Restore),
+        PlanPageState::Stashed => v.extend([Restore, DropStash]),
     }
     v.push(Back);
     v
@@ -369,6 +378,13 @@ pub(super) fn plan_action_key(a: PlanAction) -> &'static str {
         Promote => "p",
         Unqueue => "u",
         Restore => "r",
+        // `d` on its own, like every other write here. Obscuring the
+        // key was considered and rejected: this page's safeguard is a
+        // confirm that defaults to NO and spells out the consequence,
+        // and `s` (stash) and `p` (the purge door) are single keys
+        // already. A second, private rule for one action would make
+        // the others read as safer than they are.
+        DropStash => "d",
         // Not `p`: purge and promote have it, and a queued page offers
         // promote beside this very row.
         Priority => "v",
@@ -385,13 +401,14 @@ pub(super) fn plan_hotkey(key: Key, actions: &[PlanAction]) -> Option<PlanAction
             let s = [c];
             match std::str::from_utf8(&s) {
                 Ok(_) => match c {
-                    b's' | b'f' | b'c' | b'p' | b'u' | b'r' | b'v' => match c {
+                    b's' | b'f' | b'c' | b'p' | b'u' | b'r' | b'v' | b'd' => match c {
                         b's' => "s",
                         b'f' => "f",
                         b'c' => "c",
                         b'p' => "p",
                         b'u' => "u",
                         b'r' => "r",
+                        b'd' => "d",
                         _ => "v",
                     },
                     _ => return None,
@@ -1325,6 +1342,32 @@ pub(super) enum ConfirmAction {
     PromotePlan,
     /// `stash pop` the open (stashed) plan page's plan.
     RestorePlan,
+    /// `stash drop` the open (stashed) plan page's plan — the one
+    /// action on this page with no way back, carrying the number of
+    /// commits it destroys.
+    ///
+    /// On the variant rather than beside it, for the reason
+    /// [`ConfirmAction::PurgeDrop`] records: a count that can go stale
+    /// separately from the mode is a screen that promises one thing
+    /// and does another.
+    ///
+    /// `identity` is WHICH stash, and it is the load-bearing half.
+    /// The stem is a name, and a name can be popped and re-pushed over
+    /// while this screen is open — so answering Yes on the count alone
+    /// destroys whatever now answers to that name, which may not be
+    /// what was shown and may even have the same count (codex on
+    /// c1f9301).
+    ///
+    /// It carries the ref TARGET as well as the record's fingerprint,
+    /// because either can go stale while the other holds: something
+    /// can move the protective ref and leave the record alone, after
+    /// which a fingerprint match says nothing about what is being
+    /// deleted (codex on fe17dc4). Both travel to the delete, which
+    /// refuses a mismatch rather than taking it.
+    DropStashedPlan {
+        commits: usize,
+        identity: crate::cli::stash::StashIdentity,
+    },
     /// `purge` (artifacts only) the open plan page's plan.
     PurgeArtifacts,
     /// `purge --drop` the open plan page's plan — the scariest one.
@@ -1360,6 +1403,7 @@ impl ConfirmAction {
                 | ConfirmAction::UnqueuePlan
                 | ConfirmAction::PromotePlan
                 | ConfirmAction::RestorePlan
+                | ConfirmAction::DropStashedPlan { .. }
                 | ConfirmAction::PurgeArtifacts
                 | ConfirmAction::PurgeDrop { .. }
         )
@@ -2655,13 +2699,50 @@ mod tests {
         assert_eq!(plan_hotkey(Key::Char(b'u'), &active), None);
     }
 
+    /// The drop is offered on a STASHED page and nowhere else.
+    ///
+    /// Asserted over every state rather than on the stashed one alone:
+    /// "stashed pages have it" is satisfied by an action present
+    /// everywhere, and an irreversible verb on a queued or active
+    /// plan's page would be the worst possible misfire — those have
+    /// no stash to drop, so it would act on somebody else's.
+    #[test]
+    fn only_a_stashed_page_offers_the_drop() {
+        use PlanAction::DropStash;
+        let has = |st| plan_actions(st).contains(&DropStash);
+        assert!(has(PlanPageState::Stashed));
+        assert!(!has(PlanPageState::Queued { priority: 500 }));
+        assert!(!has(PlanPageState::Active { repo_paused: false }));
+        assert!(!has(PlanPageState::Finished { multi_commit: true }));
+        assert!(!has(PlanPageState::Finished {
+            multi_commit: false
+        }));
+    }
+
+    /// Its key fires only where the action is, like every other one.
+    #[test]
+    fn the_drop_key_is_inert_off_a_stashed_page() {
+        assert_eq!(
+            plan_hotkey(Key::Char(b'd'), &plan_actions(PlanPageState::Stashed)),
+            Some(PlanAction::DropStash)
+        );
+        assert_eq!(
+            plan_hotkey(
+                Key::Char(b'd'),
+                &plan_actions(PlanPageState::Active { repo_paused: false })
+            ),
+            None,
+            "`d` on an active plan must do nothing at all"
+        );
+    }
+
     /// A stashed plan can be read, opened and restored — nothing an
     /// active plan's history needs (every-object-in-the-tui-has-a-page).
     #[test]
     fn a_stashed_plan_page_offers_restore() {
         use PlanAction::*;
         let stashed = plan_actions(PlanPageState::Stashed);
-        assert_eq!(stashed, vec![OpenHtml, Restore, Back]);
+        assert_eq!(stashed, vec![OpenHtml, Restore, DropStash, Back]);
         assert_eq!(plan_hotkey(Key::Char(b'r'), &stashed), Some(Restore));
         assert_eq!(plan_hotkey(Key::Char(b's'), &stashed), None);
         assert_eq!(
@@ -3034,6 +3115,13 @@ mod tests {
         for a in [
             ConfirmAction::StashPlan,
             ConfirmAction::RestorePlan,
+            ConfirmAction::DropStashedPlan {
+                commits: 11,
+                identity: crate::cli::stash::StashIdentity {
+                    fingerprint: 0,
+                    at: [0u8; 20],
+                },
+            },
             ConfirmAction::PurgeArtifacts,
             ConfirmAction::PurgeDrop { commits: 7 },
         ] {

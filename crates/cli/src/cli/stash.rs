@@ -49,6 +49,52 @@ pub struct StashRecord {
     pub waiting_for: Option<String>,
 }
 
+/// Exclusive and BLOCKING over a repo's stash directory.
+///
+/// A stash is TWO objects — a protective ref and a record file — and
+/// every verb here mutates both. Without one lock over the pair, the
+/// window between them is a stash somebody else can be halfway
+/// through: a drop that had verified its record could delete the ref a
+/// concurrent push had just replaced, and then remove that push's
+/// record (codex on 18c3fd1).
+///
+/// Blocking, not `try`: these are two small file operations and a ref
+/// edit, and a verb that gave up because another was mid-write would
+/// be the same bug with an error message. flock dies with the process,
+/// so a killed holder frees it with no cleanup protocol.
+///
+/// `scan_stash` reads only `*.json`, so this file is invisible to it.
+pub struct StashLock {
+    _file: std::fs::File,
+}
+
+pub fn lock_stash(repo: &Path) -> anyhow::Result<StashLock> {
+    use std::os::fd::AsRawFd;
+    let dir = stash_dir(repo);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
+    let path = dir.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening `{}`", path.display()))?;
+    loop {
+        // SAFETY: valid owned fd; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(StashLock { _file: file });
+        }
+        let err = std::io::Error::last_os_error();
+        // A signal arriving during the wait is a reason to keep
+        // waiting, not a failure to lock.
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err).context("locking the stash");
+        }
+    }
+}
+
 fn stash_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/stash")
 }
@@ -302,6 +348,10 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     }
 
     let repo = super::resolve_repo(args.repo.as_deref())?;
+    // The third writer of the pair. Held from before the
+    // already-stashed check, so two pushes of one stem cannot both
+    // pass it, and across the ref + record writes that follow.
+    let _lock = lock_stash(&repo)?;
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&repo)
         .ok_or_else(|| anyhow::anyhow!("unknown repo basename: {}", repo.display()))?;
     let state = crate::rebuild::rebuild_repo_with_policy(&repo, CachePolicy::Use)
@@ -512,6 +562,10 @@ pub(crate) async fn run_pop_checked(
     expected_revision: Option<&str>,
 ) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
+    // The other verb that destroys the pair: pop deletes the ref and
+    // the record once the commits are back. Same section as push and
+    // drop, or two of the three can interleave.
+    let _lock = lock_stash(&repo)?;
     let stem = resolve_stashed(&scan_stash(&repo), plan)?;
 
     // Merged lookup: the record may live at the new or the legacy path;
@@ -579,12 +633,100 @@ fn drop_warning(stem: &str) -> String {
 
 /// `warn` receives the warning BEFORE the ref or record is touched;
 /// injected so a test can hold the order to account.
+/// WHICH stash a record is, cheaply enough to carry through a screen.
+///
+/// The stem is a NAME and names are reused: pop a stash and push
+/// another under the same plan and the name still resolves — to
+/// different commits. Anything that decides to destroy a stash at one
+/// moment and destroys it at another has to say which one it meant, or
+/// it is deleting whatever now answers to that name (codex on
+/// c1f9301).
+///
+/// A 64-bit digest rather than the shas themselves because the caller
+/// that needs it is `Copy`. That is sound HERE: this guards an honest
+/// race between two clank processes, not a forged collision, and the
+/// only cost of the vanishing chance of one is the drop the operator
+/// asked for going ahead.
+pub fn record_fingerprint(record: &StashRecord) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    record.git_ref.hash(&mut h);
+    record.shas.hash(&mut h);
+    h.finish()
+}
+
+/// WHICH stash a caller looked at: the record it read AND where the
+/// protective ref pointed at that moment.
+///
+/// Both halves, because either alone can be stale while the other is
+/// not. The record identifies the stash; the ref target is the thing
+/// actually deleted, and something can move it while leaving the
+/// record untouched — after which the fingerprint still matches and a
+/// freshly-resolved target is the NEW one, so a delete conditional on
+/// it destroys a ref nobody was shown (codex on fe17dc4).
+///
+/// The target is the raw oid rather than a hash of it: it is what the
+/// compare-and-delete is given, so it is carried exactly. `Copy`,
+/// because the confirm screen that holds it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StashIdentity {
+    pub fingerprint: u64,
+    pub at: [u8; 20],
+}
+
+impl StashIdentity {
+    /// `None` when the protective ref does not resolve — there is
+    /// nothing to be sure about, so nothing should claim to be.
+    pub fn of(repo: &Path, record: &StashRecord) -> Option<Self> {
+        let at = crate::git_io::resolve_commit(repo, &record.git_ref)?;
+        let mut bytes = [0u8; 20];
+        let raw = hex_oid(at.as_str())?;
+        bytes.copy_from_slice(&raw);
+        Some(Self {
+            fingerprint: record_fingerprint(record),
+            at: bytes,
+        })
+    }
+
+    pub fn hex(&self) -> String {
+        self.at.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+fn hex_oid(sha: &str) -> Option<Vec<u8>> {
+    if sha.len() != 40 {
+        return None;
+    }
+    (0..20)
+        .map(|i| u8::from_str_radix(&sha[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
 pub async fn run_drop_inner(
     repo_override: Option<&Path>,
     plan: Option<&str>,
     warn: &mut dyn FnMut(String),
 ) -> anyhow::Result<()> {
+    run_drop_checked(repo_override, plan, None, warn).await
+}
+
+/// `expect` is the stash the caller MEANT, as a fingerprint.
+///
+/// `None` for a caller with no window to be raced through — the CLI
+/// verb resolves and deletes in one breath. A UI that showed a confirm
+/// first has a window, and passes what it showed: the check and the
+/// delete happen here, under one resolution, so there is nothing
+/// between them to swap the record.
+pub async fn run_drop_checked(
+    repo_override: Option<&Path>,
+    plan: Option<&str>,
+    expect: Option<StashIdentity>,
+    warn: &mut dyn FnMut(String),
+) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
+    // HELD across resolve, verify, ref-delete and record-removal. A
+    // stash is two objects and this is the verb that destroys both.
+    let _lock = lock_stash(&repo)?;
     let stem = resolve_stashed(&scan_stash(&repo), plan)?;
     let sp =
         find_record_path(&repo, &stem).ok_or_else(|| anyhow::anyhow!("`{stem}` is not stashed"))?;
@@ -594,8 +736,31 @@ pub async fn run_drop_inner(
         &std::fs::read_to_string(&sp).with_context(|| format!("reading `{}`", sp.display()))?,
     )
     .with_context(|| format!("parsing `{}`", sp.display()))?;
+    // The RECORD still being the one that was read, and the ref still
+    // pointing where it pointed then. A caller that looked at a stash
+    // and then decided to destroy it is only entitled to destroy THAT
+    // stash.
+    if let Some(want) = expect
+        && record_fingerprint(&record) != want.fingerprint
+    {
+        anyhow::bail!(
+            "`{stem}` is not the stash you were shown — its commits changed while the \
+             confirmation was open. Nothing was dropped; look again with `clank stash \
+             show {stem}`."
+        );
+    }
+    // CAPTURED, never re-resolved. Re-resolving would read whatever the
+    // ref points at NOW and then delete exactly that — which is not a
+    // guard, it is an obedient delete of something nobody was shown
+    // (codex on fe17dc4). With no expectation there is nothing to
+    // compare and the delete is unconditional, as the CLI verb's is.
+    let expected_at = expect.map(|w| w.hex());
     warn(drop_warning(&stem));
-    git_delete_ref(&repo, &record.git_ref)?;
+    // COMPARE-AND-DELETE, on top of the lock. The lock stops another
+    // clank verb; this stops everything else — another tool, or a
+    // future path here that forgets to take it. A ref that moved is
+    // refused by git rather than deleted.
+    crate::git_plumbing::delete_ref_at(&repo, &record.git_ref, expected_at.as_deref())?;
     std::fs::remove_file(&sp).with_context(|| format!("removing `{}`", sp.display()))?;
     println!("dropped stashed state for `{stem}`");
     Ok(())
@@ -747,4 +912,217 @@ fn plan_file_dirty(repo: &Path, rel_path: &str, head_sha: &str) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("invalid head SHA `{head_sha}`: {e}"))?;
     let head_content = crate::git_io::show_blob(repo, &head_sha_parsed, Path::new(rel_path)).ok();
     Ok(wt_content != head_content)
+}
+
+#[cfg(test)]
+mod drop_boundary_tests {
+    use super::*;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A stash's record and the identity a caller would capture from it.
+    fn stashed(repo: &Path) -> (StashRecord, StashIdentity) {
+        let rec = scan_stash(repo)
+            .into_iter()
+            .find(|(stem, _)| stem == "foo")
+            .map(|(_, r)| r)
+            .expect("a stash record");
+        let id = StashIdentity::of(repo, &rec).expect("the protective ref resolves");
+        (rec, id)
+    }
+
+    async fn repo_with_a_stash() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "--quiet", "--initial-branch=main"]);
+        git(p, &["config", "user.email", "t@t"]);
+        git(p, &["config", "user.name", "t"]);
+        git(p, &["config", "commit.gpgsign", "false"]);
+        let write = |rel: &str, body: &str| {
+            std::fs::create_dir_all(p.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(p.join(rel), body).unwrap();
+        };
+        write(
+            ".clank/config.json",
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        );
+        write(
+            ".clank/.gitignore",
+            "/cache/\n/agents/\n/stash/\n/shelved/\n",
+        );
+        write("base.rs", "// base\n");
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "--quiet", "-m", "base"]);
+        write(".clank/plans/foo.md", "# foo\n\nbody\n");
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "--quiet", "-m", "[foo] intro"]);
+        run_push(StashPushArgs {
+            plan: Some("foo".into()),
+            repo: Some(p.to_path_buf()),
+            waiting_for: None,
+            to_queue: false,
+            priority: None,
+            dry: false,
+        })
+        .await
+        .unwrap();
+        dir
+    }
+
+    /// The ref is deleted CONDITIONALLY, so a ref that moved between
+    /// the check and the delete is refused rather than destroyed.
+    ///
+    /// The lock keeps other clank verbs out of that window; this is the
+    /// other half, for everything the lock cannot reach — another tool,
+    /// a stray `git update-ref`, or a future path here that forgets to
+    /// take it. Driven through `warn`, which is the one hook that runs
+    /// between the two, so the mover is genuinely INSIDE the boundary
+    /// rather than before it (codex on 18c3fd1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ref_that_moves_inside_the_boundary_is_not_deleted() {
+        let dir = repo_with_a_stash().await;
+        let p = dir.path().to_path_buf();
+        let (rec, want) = stashed(&p);
+
+        // Something else will point the protective ref elsewhere while
+        // the drop is between verifying and deleting.
+        let elsewhere = git(&p, &["rev-parse", "HEAD"]);
+        assert_ne!(elsewhere, want.hex(), "the mover must change the target");
+
+        let moved = std::cell::Cell::new(false);
+        let out = run_drop_checked(Some(&p), Some("foo"), Some(want), &mut |_| {
+            git(&p, &["update-ref", &rec.git_ref, &elsewhere]);
+            moved.set(true);
+        })
+        .await;
+
+        assert!(moved.get(), "the seam ran — otherwise this proves nothing");
+        let err = out.expect_err("a moved ref must not be deleted");
+        assert!(
+            crate::git_io::resolve_commit(&p, &rec.git_ref).is_some(),
+            "and it is still there: {err:#}"
+        );
+    }
+
+    /// A ref moved BEFORE the answer — while the confirm sits open —
+    /// is not deleted either.
+    ///
+    /// The boundary test covers the sliver between verify and delete.
+    /// This covers the long window that actually exists: a screen a
+    /// human is reading. The record is untouched here, so the
+    /// fingerprint still matches — the only thing that can catch it is
+    /// the ref target having been CAPTURED when the screen opened
+    /// rather than resolved when the answer arrives (codex on fe17dc4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ref_moved_while_the_confirm_is_open_is_not_deleted() {
+        let dir = repo_with_a_stash().await;
+        let p = dir.path().to_path_buf();
+        let (rec, shown) = stashed(&p);
+
+        // The screen is open. Something else repoints the protective
+        // ref and leaves the record alone.
+        let elsewhere = git(&p, &["rev-parse", "HEAD"]);
+        assert_ne!(elsewhere, shown.hex());
+        git(&p, &["update-ref", &rec.git_ref, &elsewhere]);
+
+        let after = scan_stash(&p)
+            .into_iter()
+            .find(|(stem, _)| stem == "foo")
+            .map(|(_, r)| record_fingerprint(&r))
+            .expect("the record is still there");
+        assert_eq!(
+            after, shown.fingerprint,
+            "the control: the RECORD is untouched, so a fingerprint-only guard would pass"
+        );
+
+        let out = run_drop_checked(Some(&p), Some("foo"), Some(shown), &mut |_| {}).await;
+
+        out.expect_err("a ref that moved under the confirm must not be deleted");
+        assert_eq!(
+            crate::git_io::resolve_commit(&p, &rec.git_ref)
+                .map(|c| c.as_str().to_string())
+                .as_deref(),
+            Some(elsewhere.as_str()),
+            "and the ref somebody else set is still exactly where they put it"
+        );
+        assert!(!scan_stash(&p).is_empty(), "record intact too");
+    }
+
+    /// The drop holds the stash lock for its whole critical section.
+    ///
+    /// The compare-and-delete makes the REF deletion exact; it says
+    /// nothing about the record file removed afterwards. Only the lock
+    /// keeps another clank verb out of that gap, and only a second
+    /// thread can show it is held — a mutant that removes it passes
+    /// every single-threaded test (codex on 18c3fd1).
+    #[test]
+    fn the_drop_waits_for_the_stash_lock() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = rt.block_on(repo_with_a_stash());
+        let p = dir.path().to_path_buf();
+        let (rec, want) = stashed(&p);
+
+        let held = lock_stash(&p).expect("the lock");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, path) = (done.clone(), p.clone());
+        let dropping = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let out = rt.block_on(run_drop_checked(
+                Some(&path),
+                Some("foo"),
+                Some(want),
+                &mut |_| {},
+            ));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            out
+        });
+
+        for _ in 0..40 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "the drop ran while the stash was locked"
+        );
+        assert!(
+            !scan_stash(&p).is_empty(),
+            "and nothing was removed while it waited"
+        );
+
+        drop(held);
+        dropping.join().unwrap().expect("then it drops");
+        assert!(scan_stash(&p).is_empty());
+    }
+
+    /// The same path, unmolested, still drops. Without this the test
+    /// above passes against a drop that can never delete anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unmoved_ref_is_deleted() {
+        let dir = repo_with_a_stash().await;
+        let p = dir.path().to_path_buf();
+        let (rec, want) = stashed(&p);
+
+        run_drop_checked(Some(&p), Some("foo"), Some(want), &mut |_| {})
+            .await
+            .expect("an untouched stash drops");
+        assert!(crate::git_io::resolve_commit(&p, &rec.git_ref).is_none());
+        assert!(scan_stash(&p).is_empty());
+    }
 }

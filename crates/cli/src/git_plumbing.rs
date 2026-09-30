@@ -307,11 +307,31 @@ pub fn update_ref(
 /// Delete `full_name` — gix ref transaction, replacing `git
 /// update-ref -d <ref>`. Errors if the ref doesn't exist.
 pub fn delete_ref(repo: &Path, full_name: &str) -> anyhow::Result<()> {
+    delete_ref_at(repo, full_name, None)
+}
+
+/// The same, but only if the ref still points where the caller last
+/// saw it — `git update-ref -d <ref> <oldvalue>`.
+///
+/// `None` deletes whatever is there. `Some(sha)` makes the delete a
+/// COMPARE-AND-DELETE, which is the only way a caller that looked at a
+/// ref and then decided to delete it can be sure it is deleting the
+/// thing it looked at. Checking the target first and deleting after is
+/// not the same operation: the window between them is exactly where a
+/// concurrent writer replaces the ref (codex on 18c3fd1).
+pub fn delete_ref_at(repo: &Path, full_name: &str, expect: Option<&str>) -> anyhow::Result<()> {
     use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
     let r = open(repo)?;
+    let expected = match expect {
+        None => PreviousValue::Any,
+        Some(sha) => PreviousValue::MustExistAndMatch(gix::refs::Target::Object(
+            gix::ObjectId::from_hex(sha.as_bytes())
+                .with_context(|| format!("expected target `{sha}`"))?,
+        )),
+    };
     let edit = RefEdit {
         change: Change::Delete {
-            expected: PreviousValue::Any,
+            expected,
             log: RefLog::AndReference,
         },
         name: full_name

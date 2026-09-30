@@ -253,6 +253,7 @@ pub(super) fn render_at(
             | ConfirmAction::UnqueuePlan
             | ConfirmAction::PromotePlan
             | ConfirmAction::RestorePlan
+            | ConfirmAction::DropStashedPlan { .. }
             | ConfirmAction::PurgeArtifacts
             | ConfirmAction::PurgeDrop { .. } => {
                 if let Mode::BlockAnswer { block } = mode {
@@ -3268,6 +3269,11 @@ fn plan_button_row(a: PlanAction) -> (&'static str, &'static str, &'static str) 
             "restore…",
             "put its commits back on this branch, unreviewed: they are new commits",
         ),
+        PlanAction::DropStash => (
+            key,
+            "drop…",
+            "destroy its stashed commits — PERMANENT, the reflog does not have them",
+        ),
         PlanAction::Purge => (
             key,
             "purge…",
@@ -3348,6 +3354,7 @@ pub(super) fn render_roster_confirm(
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
         | ConfirmAction::RestorePlan
+        | ConfirmAction::DropStashedPlan { .. }
         | ConfirmAction::PurgeArtifacts
         | ConfirmAction::PurgeDrop { .. } => {
             unreachable!("plan confirmations render through render_plan_confirm")
@@ -3368,6 +3375,7 @@ pub(super) fn render_roster_confirm(
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
         | ConfirmAction::RestorePlan
+        | ConfirmAction::DropStashedPlan { .. }
         | ConfirmAction::PurgeArtifacts
         | ConfirmAction::PurgeDrop { .. } => {
             unreachable!("plan confirmations render through render_plan_confirm")
@@ -3522,6 +3530,21 @@ pub(super) fn render_plan_confirm(
             "strips the plan's .clank/ files from history; implementation commits stay;              rewrites this branch in place"
                 .to_string(),
         ),
+        ConfirmAction::DropStashedPlan {
+            commits: count,
+            identity: _,
+        } => (
+            format!("DROP `{stem}` — {count} commit(s) gone for good?"),
+            // `PurgeDrop` can offer the reflog; this cannot. A stash's
+            // commits left the branch when it was pushed, so the
+            // protective ref is the only thing holding them: dropping
+            // it makes them unreachable at once, not after gc. The
+            // screen has to say that plainly, because it is the whole
+            // difference between this action and every other one here.
+            format!(
+                "deletes the stash ref and its record. Those {count} commit(s) are NOT on any                  branch and NOT in the reflog — this is the only copy, and there is no undo.                  To keep the plan's text, leave this and SAVE the output of `clank stash show {stem}` first — it prints, it does not store."
+            ),
+        ),
         ConfirmAction::PurgeDrop { commits: count } => {
             // Say the SIZE and the BRANCH, because this is the screen
             // that decides it — and say the way back, because there
@@ -3548,7 +3571,9 @@ pub(super) fn render_plan_confirm(
     out.push(String::new());
     let banner_color = match action {
         // Reverse, uncolored: reversible or ordinary. Red is for the
-        // history rewrites.
+        // ones that destroy something — a history rewrite, or the
+        // stash drop, which rewrites nothing and is the only action
+        // here with no way back at all.
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
@@ -3572,7 +3597,17 @@ pub(super) fn render_plan_confirm(
     }
     if out.len() < rows {
         out.push(emit(
-            &[accent("  [y]es  [N]o  (⏎ = no)".to_string())],
+            &[accent(
+                // From the ACTION, not a literal: this line tells the
+                // operator what Enter does, and `key_to_answer` is
+                // what Enter actually does. A literal cannot be wrong
+                // today and cannot be right tomorrow.
+                if action.default_yes() {
+                    "  [Y]es  [n]o  (⏎ = yes)".to_string()
+                } else {
+                    "  [y]es  [N]o  (⏎ = no)".to_string()
+                },
+            )],
             "",
             cols,
         ));
@@ -4358,6 +4393,77 @@ mod tests {
             "drop consequence fully present across wrapped lines: {text}"
         );
         assert!(!text.contains("next screen"));
+    }
+
+    /// The stash drop's screen, and the one line it must NOT be able
+    /// to borrow from its neighbour.
+    ///
+    /// `PurgeDrop` can promise the reflog. This cannot: a stash's
+    /// commits left the branch when it was pushed, so the protective
+    /// ref is the only thing holding them and deleting it makes them
+    /// unreachable at once. A confirm that read like the other one
+    /// would be offering a recovery that does not exist, which is
+    /// worse than no confirm — it would make the operator braver.
+    #[test]
+    fn dropping_a_stash_says_it_is_the_only_copy_and_cannot_be_undone() {
+        use crate::cli::status_tui::input::ConfirmAction;
+        let snap = snap(vec![], vec![]);
+        let (lines, _) = render_plan_confirm(
+            &snap,
+            "my-plan",
+            ConfirmAction::DropStashedPlan {
+                commits: 11,
+                identity: crate::cli::stash::StashIdentity {
+                    fingerprint: 0,
+                    at: [0u8; 20],
+                },
+            },
+            24,
+            90,
+        );
+        let text = lines.join("\n");
+
+        assert!(text.contains("DROP `my-plan`"), "{text}");
+        assert!(text.contains("11 commit"), "the size of it: {text}");
+        assert!(text.contains("only copy"), "there is no other: {text}");
+        assert!(text.contains("no undo"), "and no way back: {text}");
+        // A USABLE path to keep the body. The first version said
+        // `stash push --to-queue`, which `run_push` refuses outright on
+        // an already-stashed plan — advice that cannot be followed is
+        // worse than none on the screen where it matters (codex on
+        // c1f9301).
+        assert!(
+            text.contains("stash show my-plan"),
+            "names something the operator can actually run: {text}"
+        );
+        assert!(
+            !text.contains("--to-queue"),
+            "and not the one that would be refused: {text}"
+        );
+        assert!(
+            text.contains("\x1b[1;41;97m"),
+            "red, like the other destructive screen: {text:?}"
+        );
+        assert!(text.contains("[y]es  [N]o  (⏎ = no)"), "default is No");
+
+        // Its NEIGHBOUR may promise recovery; this one may not. Asserted
+        // against the other screen rather than in the abstract, because
+        // the failure would be this text drifting toward that one.
+        let (purge, _) = render_plan_confirm(
+            &snap,
+            "my-plan",
+            ConfirmAction::PurgeDrop { commits: 11 },
+            24,
+            90,
+        );
+        assert!(
+            purge.join("\n").contains("Recoverable"),
+            "the purge screen offers the reflog"
+        );
+        assert!(
+            !text.contains("Recoverable"),
+            "and this one must not: {text}"
+        );
     }
 
     /// The one screen that decides a drop: it says how much goes, off
