@@ -1405,8 +1405,8 @@ mod tests {
         let cli_only = gh("o/c", Some("cli intent"));
 
         // Arm both: config-origin writes NO sidecar, CLI-origin does.
-        write_watch_sidecar(&dir, &configured, SourceOrigin::Config);
-        write_watch_sidecar(&dir, &cli_only, SourceOrigin::Cli);
+        write_watch_sidecar(&dir, &configured, SourceOrigin::Config, &key(&configured));
+        write_watch_sidecar(&dir, &cli_only, SourceOrigin::Cli, &key(&cli_only));
 
         // State 1: configured prompt wins (from config, not disk).
         let map = join_prompts(&[configured.clone()], &dir);
@@ -1427,11 +1427,39 @@ mod tests {
             r#"{"prompt":"stale pre-provenance"}"#,
         )
         .unwrap();
-        write_watch_sidecar(&dir, &configured, SourceOrigin::Config);
+        write_watch_sidecar(&dir, &configured, SourceOrigin::Config, &key(&configured));
         assert!(join_prompts(&[], &dir).get(&key(&configured)).is_none());
 
+        // A SCOPED CLI watch's prompt is found under the stem its rows
+        // live under. `join_prompts` indexes by file stem and
+        // rendering looks up each row's source stem, so a sidecar
+        // under the source's own key while its rows are under a
+        // scoped one is simply unreachable — and two invocations of
+        // one watch would overwrite the single shared file (codex on
+        // 03cc11f).
+        let scoped = format!("{}-inv-7", key(&cli_only));
+        let other = format!("{}-inv-8", key(&cli_only));
+        write_watch_sidecar(&dir, &cli_only, SourceOrigin::Cli, &scoped);
+        write_watch_sidecar(
+            &dir,
+            &gh("o/c", Some("the other invocation")),
+            SourceOrigin::Cli,
+            &other,
+        );
+        let map = join_prompts(&[], &dir);
+        assert_eq!(
+            map.get(&scoped).map(String::as_str),
+            Some("cli intent"),
+            "a scoped watch's prompt is found under the stem its rows use"
+        );
+        assert_eq!(
+            map.get(&other).map(String::as_str),
+            Some("the other invocation"),
+            "and a second invocation has its own, rather than overwriting"
+        );
+
         // CLI promptless re-arm removes the CLI sidecar.
-        write_watch_sidecar(&dir, &gh("o/c", None), SourceOrigin::Cli);
+        write_watch_sidecar(&dir, &gh("o/c", None), SourceOrigin::Cli, &key(&cli_only));
         assert!(join_prompts(&[], &dir).get(&key(&cli_only)).is_none());
     }
 

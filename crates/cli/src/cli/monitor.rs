@@ -23,8 +23,23 @@ use clank_core::wait::WaitItem;
 /// Skew is routine rather than exceptional here: monitors outlive
 /// `cargo install`, so a fresh client meeting an old monitor is the
 /// expected case and must degrade rather than fail.
-pub(crate) const PROTO: u32 = 3;
+pub(crate) const PROTO: u32 = 4;
 
+/// What a monitor can do, not just what its frames look like.
+///
+/// 4 is the HOSTING contract: this monitor runs an author's config
+/// `wait_events` and routes their rows back, so a wait that has such a
+/// source may stop running it. 3 is the monitor that does not — and
+/// one of those can still be RUNNING after an ordinary binary update,
+/// holding its repo's lease. It would accept the same hello, serve
+/// only projected repo work, and the client would have stopped
+/// tailing its own sources: configured events missed for as long as
+/// that monitor lives (codex on a135276).
+///
+/// So a capability change is a version change. The client refuses a
+/// monitor on any other number and watches for itself, which is the
+/// behaviour it had before this plan rather than a failure.
+///
 /// The version, readable WITHOUT decoding the rest.
 ///
 /// Negotiation must inspect this before the body, because a body
@@ -1504,6 +1519,13 @@ enum Served {
 struct Client {
     who: Served,
     out: tokio::sync::mpsc::Sender<String>,
+    /// What THIS client has been handed from its author's source logs.
+    ///
+    /// Per client, not per monitor: the monitor outlives every client,
+    /// so a set it kept for itself would mean a client admitted later
+    /// is told nothing about rows logged before it arrived. See
+    /// `command_source::owed_from_log`.
+    shown: std::collections::HashSet<(String, u64, String)>,
 }
 
 /// How many frames a client may fall behind before it is retired.
@@ -1598,6 +1620,29 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(fold.tick));
     watch_the_fold(heartbeat.clone(), WATCHDOG_TICK, WATCHDOG_MISSES);
 
+    // THE producers for this repo. One set per author, owned by this
+    // process rather than by whichever parked wait happened to take
+    // the ingest lease — which is what stops the user's command being
+    // respawned on every delivery.
+    // A SIGNAL, never a payload. What a client is owed is decided in
+    // one place, from the durable log and that client's own `shown`
+    // set; an item carried here and sent straight on would bypass both
+    // — delivering a row a later admission replays again, or one some
+    // other client has since acked (codex on ca2ea69).
+    let (source_items, mut from_sources) =
+        tokio::sync::mpsc::unbounded_channel::<(AgentLabel, crate::cli::command_source::Emission)>(
+        );
+    // The last completed fold, so a source signal can present against
+    // the same state a tick would.
+    let mut folded_state: Option<crate::repo_state::RepoState> = None;
+    // Transients with nowhere to go yet. A genuine non-durable
+    // emission arriving before the first fold has no state to present
+    // against AND no row for a later fold to replay, so dropping it
+    // loses it outright (codex on aa3d9a5).
+    let mut pending: Vec<(AgentLabel, WaitItem)> = Vec::new();
+    let mut hosted: std::collections::BTreeMap<AgentLabel, Hosted> = Default::default();
+    reconcile_hosting(&repo, &mut hosted, &source_items);
+
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -1616,7 +1661,38 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     }
                 });
             }
-            Some(client) = arrivals.recv() => clients.push(client),
+            Some(client) = arrivals.recv() => {
+                // Served at once rather than at the next tick — the
+                // producers have been running since the monitor
+                // started, so a newcomer may already be owed what they
+                // logged — but to the NEWCOMER ALONE. A queue is
+                // `CLIENT_QUEUE` deep, so presenting to everybody on
+                // each arrival would let a burst of joins retire
+                // established readers that were keeping up perfectly
+                // well (codex on 0555c8f).
+                admit_into(
+                    &repo,
+                    &mut clients,
+                    client,
+                    fold,
+                    folded_state.as_ref(),
+                    &mut pending,
+                );
+            }
+            // A source produced something. WHAT that author is owed is
+            // decided from their logs, not from this item — except
+            // when no log holds it, which is the one case the channel
+            // is the only record of.
+            Some((author, emission)) = from_sources.recv() => {
+                pending.extend(
+                    transient_of(emission)
+                        .into_iter()
+                        .map(|item| (author.clone(), item)),
+                );
+                if let Some(state) = &folded_state {
+                    serve_to(&repo, &mut clients, fold, state, Some(&author), &mut pending);
+                }
+            }
             // A beat: the FS event or the heartbeat, whichever landed.
             // Receiving from a channel is cancel-safe and carries no
             // state, which is the point — see `beats`.
@@ -1632,7 +1708,16 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 match advance(&repo, pid, &socket, fold, &heartbeat).await {
                     Some((next, state)) => {
                         fold = next;
-                        serve(&repo, &mut clients, fold, &state);
+                        // `.clank/` is a wake dir, so an edited
+                        // `wait_events` takes effect here rather than
+                        // on a restart.
+                        reconcile_hosting(&repo, &mut hosted, &source_items);
+                        // ONE presentation, carrying the projection,
+                        // the durable rows and anything held from
+                        // before there was a state to present it
+                        // against.
+                        serve_to(&repo, &mut clients, fold, &state, None, &mut pending);
+                        folded_state = Some(state);
                     }
                     // The stamp stays where it is. A client reading a
                     // stale fold is exactly how it should notice.
@@ -1676,6 +1761,213 @@ fn watch_the_fold(tick: std::sync::Arc<std::sync::atomic::AtomicU64>, every: Dur
             }
         }
     });
+}
+
+/// One author's config sources, running in the monitor.
+struct Hosted {
+    /// What they were resolved from, so a config change is noticed by
+    /// comparison rather than by guessing.
+    spec: Vec<(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::github::supervisor::SourceOrigin,
+    )>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Hosted {
+    fn stop(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// An author's CONFIG sources — the only kind the monitor may host.
+///
+/// A `--event` source belongs to ONE INVOCATION and is never pooled:
+/// a monitor that ran one would deliver an invocation's events to
+/// whoever else happened to be that author. Master's draft watch is
+/// derived per review rather than configured, so it is not here
+/// either; both keep their wait watching for itself.
+fn hostable(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+) -> Vec<(
+    clank_core::agent_config::WaitEventSource,
+    crate::cli::github::supervisor::SourceOrigin,
+)> {
+    crate::cli::wait::resolve_wait_event_sources(repo, author, &[]).unwrap_or_default()
+}
+
+/// Every agent this repo's roster names.
+///
+/// The ROSTER and not the connected clients, which is the whole point:
+/// tying a producer to whoever happens to be attached is tying it to a
+/// delivery client again, and the churn that causes is what this plan
+/// exists to end. A monitor's producers live as long as the monitor.
+fn roster_authors(repo: &std::path::Path) -> Vec<AgentLabel> {
+    let Ok(Some(set)) = crate::agent_store::try_resolve_via_team(repo) else {
+        return Vec::new();
+    };
+    let mut out = vec![set.master.clone()];
+    out.extend(set.members.iter().map(|m| m.label.clone()));
+    out
+}
+
+/// Bring hosting into line with the roster and its configs.
+///
+/// Called on every fold, because `.clank/` is a wake dir and an edited
+/// `wait_events` must take effect without restarting the monitor. An
+/// author whose spec is unchanged is left alone — restarting a healthy
+/// producer on an unrelated commit would be its own churn.
+fn reconcile_hosting(
+    repo: &std::path::Path,
+    hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::command_source::Emission)>,
+) {
+    let authors = roster_authors(repo);
+    for author in &authors {
+        let spec = hostable(repo, author);
+        match hosted.get(author) {
+            Some(running) if running.spec == spec => continue,
+            _ => {}
+        }
+        if let Some(previous) = hosted.remove(author) {
+            previous.stop();
+        }
+        if spec.is_empty() {
+            continue;
+        }
+        let events_dir = crate::agent_store::agents_root(repo)
+            .join(author.as_str())
+            .join("events");
+        let tasks = crate::cli::wait::EventSources::spawn(
+            &spec,
+            Some(&events_dir),
+            repo,
+            author,
+            // Never drafts: they are derived per review, not configured.
+            &[],
+            // No invocation to give, and none needed: `hostable`
+            // resolves with no CLI items, so every source here is an
+            // author's config source. A `--event` source handed to a
+            // pooled host would be refused rather than pooled.
+            None,
+        )
+        .tagged_into(author.clone(), into.clone());
+        hosted.insert(author.clone(), Hosted { spec, tasks });
+    }
+    // An author off the roster keeps nothing running: a revoked agent's
+    // producer is a producer nobody can ever be served from.
+    let gone: Vec<AgentLabel> = hosted
+        .keys()
+        .filter(|a| !authors.contains(a))
+        .cloned()
+        .collect();
+    for author in gone {
+        if let Some(running) = hosted.remove(&author) {
+            running.stop();
+        }
+    }
+}
+
+/// What a client is owed from its author's source logs.
+///
+/// Read at ADMISSION, because the monitor's producers have been running
+/// since the monitor started and a client that arrives later has been
+/// shown none of it. Forwarding only what comes next would drop the
+/// backlog at exactly the moment an agent comes back.
+///
+/// The rows come from the durable log rather than from anything the
+/// monitor remembers, so an ack made by the agent — or by an earlier
+/// incarnation of it — is what retires a row, and nothing here can
+/// re-present one that was handled.
+fn owed_from_sources(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    shown: &mut std::collections::HashSet<(String, u64, String)>,
+) -> Vec<WaitItem> {
+    use clank_core::agent_config::WaitEventSource;
+
+    let events_dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    let mut owed = Vec::new();
+    for (source, _) in hostable(repo, author) {
+        let (key, prompt) = match &source {
+            WaitEventSource::Command(c) => (c.source_key(), None),
+            WaitEventSource::Github(g) => (
+                crate::cli::github::supervisor::source_key(g),
+                g.prompt.clone(),
+            ),
+        };
+        // `read_rows` is the READ-ONLY inspector: the monitor holds the
+        // ingest lease for these logs, but a reader must never
+        // quarantine one, and admission is a read.
+        let Ok(log) = crate::cli::github::log::EventLog::open(&events_dir, &key) else {
+            continue;
+        };
+        let Ok(Some(read)) = log.read_rows() else {
+            continue;
+        };
+        owed.extend(crate::cli::command_source::owed_from_log(
+            read.rows,
+            &key,
+            prompt.as_deref(),
+            shown,
+        ));
+    }
+    owed
+}
+
+/// What of an emission the monitor must carry itself.
+///
+/// Empty for anything the log holds, because the log is what decides
+/// who is owed it and when. The item itself only for a `Transient`:
+/// github keeps delivering after a failed append so the agent still
+/// learns about the event, and that copy is the only record there will
+/// ever be.
+///
+/// Reads the provenance the producer SENT rather than inspecting the
+/// logs. Two rounds were spent inferring it and both were wrong: a
+/// durable emission is not equal to its stored row, because
+/// presentation is stamped after the append, and absence proves
+/// nothing anyway once a row can be compacted away (codex on 0555c8f,
+/// aa3d9a5).
+fn transient_of(emission: crate::cli::command_source::Emission) -> Vec<WaitItem> {
+    use crate::cli::command_source::Durability;
+    match emission {
+        (_, Durability::Logged) => Vec::new(),
+        (item, Durability::Transient) => vec![item],
+    }
+}
+
+/// Add a newcomer, having presented to IT and to nobody else.
+///
+/// A named step rather than loop plumbing because the thing worth
+/// getting right is which clients a join touches: a queue is
+/// `CLIENT_QUEUE` deep, so presenting to everybody on each arrival
+/// lets a burst of joins retire established readers that were keeping
+/// up. Returns nothing because a newcomer retired on its first frame
+/// simply never joins, which is the same answer as never arriving.
+fn admit_into(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    client: Client,
+    fold: Fold,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &mut Vec<(AgentLabel, WaitItem)>,
+) {
+    let mut arriving = vec![client];
+    if let Some(state) = state {
+        // The REAL buffer: a transient retained while its author had
+        // no client is owed to the first client that author gets, and
+        // a newcomer that returns on admission work without it would
+        // leave it waiting for a tick that may never find an eligible
+        // client (codex on 1552f66).
+        serve_to(repo, &mut arriving, fold, state, None, pending);
+    }
+    clients.append(&mut arriving);
 }
 
 /// Beats, produced independently of client traffic.
@@ -1879,7 +2171,11 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
     let who = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
     let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
     tokio::spawn(write_to(io.into_inner(), queued, who.name()));
-    Ok(Client { who, out })
+    Ok(Client {
+        who,
+        out,
+        shown: Default::default(),
+    })
 }
 
 impl Served {
@@ -1939,11 +2235,32 @@ async fn write_to_within(
 /// therefore `items_for`, is per author, and the role is re-read every
 /// tick so a roster change reaches a connected client rather than
 /// stranding it.
+/// Test-only: production always has a pending buffer to pass, and
+/// passing a fresh one would be the bug this plan spent two rounds on.
+#[cfg(test)]
 fn serve(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     fold: Fold,
     state: &crate::repo_state::RepoState,
+) {
+    serve_to(repo, clients, fold, state, None, &mut Vec::new())
+}
+
+/// [`serve`], optionally scoped to ONE author's clients.
+///
+/// Scoped on a source signal, because a client's queue is only
+/// `CLIENT_QUEUE` deep: presenting to everybody whenever one author's
+/// source logged something would put a frame in every other client's
+/// queue, and a burst would retire readers that were keeping up
+/// perfectly well.
+fn serve_to(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    fold: Fold,
+    state: &crate::repo_state::RepoState,
+    only: Option<&AgentLabel>,
+    pending: &mut Vec<(AgentLabel, WaitItem)>,
 ) {
     if clients.is_empty() {
         return;
@@ -1952,7 +2269,16 @@ fn serve(
     let head = crate::git_io::head_commit_at(repo, state);
 
     let mut keep = Vec::with_capacity(clients.len());
-    for client in clients.drain(..) {
+    // Whose client was WOKEN in this pass, and so received whatever was
+    // held for them.
+    let mut delivered: Vec<AgentLabel> = Vec::new();
+    for mut client in clients.drain(..) {
+        if let Some(only) = only
+            && !matches!(&client.who, Served::Agent { author, .. } if author == only)
+        {
+            keep.push(client);
+            continue;
+        }
         let note = match &client.who {
             // No projection is derived for an observer, which is the
             // point: it asked to know the fold moved, and deriving
@@ -1975,7 +2301,36 @@ fn serve(
                 let status = state
                     .fold
                     .derive_status(&reviews, &inputs.work_policy, head.as_ref());
-                let items = crate::cli::wait::owed_for(repo, author, &inputs, &status, &state.fold);
+                // The author's un-shown, unacked source rows go in as
+                // EXTERNALS, through the same decision as the
+                // projection. A source item delivered on its own would
+                // reach the agent without the block context the local
+                // path gives it, and without the durable eligibility
+                // that says it is still owed at all (codex on ca2ea69).
+                let mut external = owed_from_sources(repo, author, &mut client.shown);
+                // An emission no log holds exists nowhere else, so it
+                // is merged into THIS presentation rather than sent
+                // after it. A client returns on its first non-empty
+                // frame, so a second frame carrying the transients
+                // reaches a client that has already gone — and they
+                // have no row to replay (codex on 328677d). Each
+                // client of this author gets them, exactly as its own
+                // local wait would have.
+                external.extend(
+                    pending
+                        .iter()
+                        .filter(|(whose, _)| whose == author)
+                        .map(|(_, item)| item.clone()),
+                );
+
+                let items = crate::cli::wait::owed_for(
+                    repo,
+                    author,
+                    &inputs,
+                    &status,
+                    &state.fold,
+                    &mut external,
+                );
                 if items.is_empty() {
                     Note::Beat { fold }
                 } else {
@@ -1983,28 +2338,70 @@ fn serve(
                 }
             }
         };
-        let Ok(line) = serde_json::to_string(&note) else {
-            keep.push(client);
-            continue;
+        // An agent connection is ONE delivery opportunity. A client
+        // returns on its first `Items` and never reads another, so a
+        // frame queued behind that one is written into a socket nobody
+        // will read — and anything it carried is gone (codex on
+        // 1552f66). Retiring here is what keeps a later event for the
+        // next admission instead. The writer task drains what is
+        // already queued as its sender drops, so this frame still
+        // reaches the agent.
+        //
+        // The note alone decides, with no second check on who this is
+        // or whether the list is empty: `Items` is built just above,
+        // only for an agent and only when something is owed. Repeating
+        // those conditions here would be two more branches saying what
+        // the construction already says, and neither could be driven.
+        let woke = matches!(&note, Note::Items { .. });
+        let author = match &client.who {
+            Served::Agent { author, .. } => Some(author.clone()),
+            Served::Observer => None,
         };
-        // `try_send`, never `send`: the owner must not wait on a
-        // client. A full queue means this reader has fallen a whole
-        // `CLIENT_QUEUE` of ticks behind, and a closed one means its
-        // writer task has already given up — both are retirement.
-        match client.out.try_send(format!("{line}\n")) {
-            Ok(()) => keep.push(client),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                eprintln!(
-                    "monitor: `{}` is {CLIENT_QUEUE} frames behind; dropping it",
-                    client.who.name()
-                );
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                eprintln!("monitor: `{}` is gone; dropping it", client.who.name());
+        if send_note(&client, &note) {
+            if woke {
+                if let Some(author) = author
+                    && !delivered.contains(&author)
+                {
+                    delivered.push(author);
+                }
+            } else {
+                keep.push(client);
             }
         }
     }
     *clients = keep;
+    // Held for an author with nobody to receive them, or whose client
+    // was retired on this very frame: a transient that reached no
+    // client must keep waiting rather than be dropped, since nothing
+    // else will ever hold it.
+    pending.retain(|(author, _)| !delivered.contains(author));
+}
+
+/// Send one note, and say whether that client may be kept.
+///
+/// `try_send`, never `send`: the owner must not wait on a client. A
+/// full queue means this reader has fallen a whole `CLIENT_QUEUE` of
+/// ticks behind, and a closed one means its writer task has already
+/// given up — both are retirement. A frame that will not serialise is
+/// this process's fault rather than the client's, so it costs nothing.
+fn send_note(client: &Client, note: &Note) -> bool {
+    let Ok(line) = serde_json::to_string(note) else {
+        return true;
+    };
+    match client.out.try_send(format!("{line}\n")) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            eprintln!(
+                "monitor: `{}` is {CLIENT_QUEUE} frames behind; dropping it",
+                client.who.name()
+            );
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            eprintln!("monitor: `{}` is gone; dropping it", client.who.name());
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3824,6 +4221,7 @@ mod tests {
                     has_cli_sources: false,
                 },
                 out,
+                shown: Default::default(),
             });
             peers.push(theirs);
         }
@@ -4172,6 +4570,1026 @@ mod tests {
         assert!(why.contains("not on this repo's roster"), "{why}");
     }
 
+    /// Give an agent a config source, as `wait_events` would.
+    fn with_source(repo: &std::path::Path, author: &str, name: &str) {
+        let dir = crate::agent_store::agents_root(repo).join(author);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "wait_events": [
+                    {"kind": "command", "name": name, "command": ["true"]}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Everything the monitor hosts is an author's CONFIG source.
+    ///
+    /// The assumption that makes passing no invocation scope safe: a
+    /// pooled host has none to give, and `EventSources::spawn` refuses
+    /// an invocation's source without one. This is the other half —
+    /// that such a source can never arrive here, because `hostable`
+    /// resolves with no CLI items at all.
+    #[test]
+    fn nothing_the_monitor_hosts_belongs_to_an_invocation() {
+        use crate::cli::github::supervisor::SourceOrigin;
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        let codex = AgentLabel::parse("codex").unwrap();
+
+        let hosted = hostable(repo.path(), &codex);
+        assert!(!hosted.is_empty(), "the fixture declares one");
+        assert!(
+            hosted
+                .iter()
+                .all(|(_, origin)| matches!(origin, SourceOrigin::Config)),
+            "an invocation's source cannot reach a pooled host: {:?}",
+            hosted.iter().map(|(_, o)| *o).collect::<Vec<_>>()
+        );
+    }
+
+    /// Hosting follows the ROSTER, not whoever happens to be connected.
+    ///
+    /// Tying a producer to an attached client is tying it to a delivery
+    /// client again, and the churn that causes — the user's command
+    /// respawned on every wake, because the lease holder was a parked
+    /// wait that returned — is the whole reason for this plan.
+    #[tokio::test]
+    async fn hosting_follows_the_roster_and_reconciles_on_a_config_change() {
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = std::collections::BTreeMap::new();
+
+        // No client has connected, and the producer runs anyway.
+        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        assert_eq!(
+            hosted.keys().map(|a| a.to_string()).collect::<Vec<_>>(),
+            vec!["codex".to_string()],
+            "an author with no configured source hosts nothing"
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        let first: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+
+        // An unrelated fold leaves a healthy producer alone.
+        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        let again: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        assert_eq!(first, again, "an unchanged spec must not restart anything");
+
+        // An edited `wait_events` takes effect without a restart.
+        with_source(repo.path(), "codex", "builds");
+        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        let after: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        assert_ne!(first, after, "a changed spec restarts that author's set");
+
+        // And an author off the roster keeps nothing running.
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        )
+        .unwrap();
+        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        assert!(
+            hosted.is_empty(),
+            "a revoked agent's producer can serve nobody"
+        );
+    }
+
+    /// A config change restarts the EDITED author's sources and leaves
+    /// the other author's alone.
+    ///
+    /// `reconcile_hosting` runs on every fold, so rebuilding the whole
+    /// map when any one author's spec changed would respawn an
+    /// untouched author's command on every config write in the repo —
+    /// the producer churn this plan exists to remove, reintroduced one
+    /// level up.
+    ///
+    /// The test above catches that regression too, but only
+    /// incidentally: its roster has an author with NO sources, which
+    /// takes the restart arm on every pass and so drops the other
+    /// author's entry. Hoisting the `spec.is_empty()` skip above the
+    /// comparison — a tidy with no other effect — removes that
+    /// coverage and leaves the churn uncaught. I ran both edits
+    /// together: this test fails, that one passes. Here the untouched
+    /// author has a producer of its own to lose, which is the property
+    /// rather than a side effect of the fixture.
+    #[tokio::test]
+    async fn a_config_change_restarts_only_the_edited_author() {
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        with_source(repo.path(), "claude", "builds");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = std::collections::BTreeMap::new();
+        reconcile_hosting(repo.path(), &mut hosted, &tx);
+
+        let codex = AgentLabel::parse("codex").unwrap();
+        let claude = AgentLabel::parse("claude").unwrap();
+        let codex_before: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        let claude_before: Vec<_> = hosted[&claude].tasks.iter().map(|t| t.id()).collect();
+
+        with_source(repo.path(), "codex", "releases");
+        reconcile_hosting(repo.path(), &mut hosted, &tx);
+
+        let codex_after: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        let claude_after: Vec<_> = hosted[&claude].tasks.iter().map(|t| t.id()).collect();
+        assert_ne!(
+            codex_before, codex_after,
+            "the edited author's set restarts"
+        );
+        assert_eq!(
+            claude_before, claude_after,
+            "the untouched author's producer keeps running"
+        );
+    }
+
+    /// A row is presented ONCE, however many times its arrival is
+    /// signalled — and not at all once somebody has acked it.
+    ///
+    /// The failure this excludes is two delivery paths with different
+    /// rules: a backlog replayed from the WAL at admission and a live
+    /// item broadcast straight off the producer channel. A row logged
+    /// before a client arrived would then be sent twice, and a row
+    /// another client acked in between would be sent anyway. Both are
+    /// gone because the channel carries a SIGNAL and the log decides
+    /// (codex on ca2ea69).
+    #[tokio::test]
+    async fn a_logged_row_is_presented_once_and_never_after_an_ack() {
+        use crate::cli::github::log::{EventLog, Transport};
+
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        let codex = AgentLabel::parse("codex").unwrap();
+        let events = crate::agent_store::agents_root(repo.path())
+            .join("codex")
+            .join("events");
+        let key = match &hostable(repo.path(), &codex)[0].0 {
+            clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
+            other => panic!("the fixture declares a command source, got {other:?}"),
+        };
+
+        // A row logged BEFORE anyone connects, as a monitor's producer
+        // does: it has been running since the monitor started.
+        let mut log = EventLog::open(&events, &key).unwrap();
+        let seq = log
+            .append_inbox(
+                Transport::Command,
+                None,
+                None,
+                None,
+                &WaitItem::CommandEvent {
+                    name: "deploys".into(),
+                    id: "a".into(),
+                    event: "deploys".into(),
+                    content: "shipped".into(),
+                    at: None,
+                    failure: false,
+                    selector: None,
+                },
+            )
+            .unwrap();
+
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: codex.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let present = |clients: &mut Vec<Client>| {
+            serve_to(
+                repo.path(),
+                clients,
+                fold(1, 2),
+                &state,
+                Some(&codex),
+                &mut Vec::new(),
+            );
+        };
+
+        // The first presentation owes it, and WAKES the client — which
+        // ends that connection, because a wait returns on its first
+        // non-empty frame.
+        present(&mut clients);
+        let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
+        let Note::Items { items, .. } = note else {
+            panic!("the backlog is owed, got {note:?}")
+        };
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(
+            clients.is_empty(),
+            "a woken agent connection is spent: it will not read another frame"
+        );
+
+        // Its successor is owed the same row, because being shown to a
+        // client that has since gone is not being handled.
+        let (out, mut later) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let fresh = |out| Client {
+            who: Served::Agent {
+                author: codex.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        };
+        clients.push(fresh(out));
+        present(&mut clients);
+        let note: Note = serde_json::from_str(later.recv().await.unwrap().trim_end()).unwrap();
+        assert!(
+            matches!(note, Note::Items { ref items, .. } if items.len() == 1),
+            "an unacked row is owed to the next client too: {note:?}"
+        );
+
+        // Until it is acked. Then nobody is owed it, including a client
+        // that never saw it.
+        let (out, mut after) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        clients.push(fresh(out));
+        crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .append_ack(seq)
+            .unwrap();
+        present(&mut clients);
+        let note: Note = serde_json::from_str(after.recv().await.unwrap().trim_end()).unwrap();
+        assert!(
+            matches!(note, Note::Beat { .. }),
+            "an acked row is owed to nobody: {note:?}"
+        );
+    }
+
+    /// A source event reaching a BLOCKED agent arrives with its block
+    /// context, exactly as a local wait delivers it.
+    ///
+    /// The local path merges externals INSIDE `present_with_blocks`
+    /// deliberately: deciding before the merge left the channel route
+    /// outside the decision, so a blocked park returned a source item
+    /// with no `Blocked` context to explain the silence around it
+    /// (codex on 344280f). A monitor that appended its source rows
+    /// after the decision would reintroduce exactly that, which is why
+    /// `owed_for` takes the externals rather than the caller merging
+    /// them (codex on ca2ea69).
+    #[tokio::test]
+    async fn a_source_event_wakes_a_blocked_agent_with_its_block() {
+        use crate::cli::github::log::{EventLog, Transport};
+
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        let codex = AgentLabel::parse("codex").unwrap();
+        let agent_dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        std::fs::create_dir_all(agent_dir.join("blocks")).unwrap();
+        std::fs::write(
+            agent_dir.join("blocks/why-is-this-here.md"),
+            "# why is this here\n\nasking the human\n",
+        )
+        .unwrap();
+
+        let events = agent_dir.join("events");
+        let key = match &hostable(repo.path(), &codex)[0].0 {
+            clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
+            other => panic!("the fixture declares a command source, got {other:?}"),
+        };
+        EventLog::open(&events, &key)
+            .unwrap()
+            .append_inbox(
+                Transport::Command,
+                None,
+                None,
+                None,
+                &WaitItem::CommandEvent {
+                    name: "deploys".into(),
+                    id: "a".into(),
+                    event: "deploys".into(),
+                    content: "ci failed".into(),
+                    at: None,
+                    failure: false,
+                    selector: None,
+                },
+            )
+            .unwrap();
+
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: codex.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            Some(&codex),
+            &mut Vec::new(),
+        );
+
+        let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
+        let Note::Items { items, .. } = note else {
+            panic!("a source event wakes a blocked agent, got {note:?}")
+        };
+        assert!(
+            items.iter().any(|i| matches!(i, WaitItem::Blocked { .. })),
+            "the block LEADS as context, or the agent has no way to know \
+             why its plan work went quiet: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, WaitItem::CommandEvent { .. })),
+            "and the event that woke it is still there: {items:?}"
+        );
+    }
+
+    /// An emission no log holds still reaches the client, once.
+    ///
+    /// Github's WAL warns once on an append failure and keeps
+    /// delivering, so the agent still learns about the event. A monitor
+    /// that presented only from the log would throw that away — the
+    /// channel is the only record of it (codex on 0555c8f). Driven by
+    /// the real discriminator rather than a flag: the item is simply
+    /// not in any row.
+    #[tokio::test]
+    async fn an_emission_no_log_holds_is_still_presented() {
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        let codex = AgentLabel::parse("codex").unwrap();
+        let unlogged = WaitItem::GithubEvent {
+            repo: "o/n".into(),
+            event: "pr_opened".into(),
+            detail: None,
+            number: Some(7),
+            title: None,
+            actor: None,
+            url: None,
+            instructions: None,
+            content: None,
+        };
+
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: codex.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            Some(&codex),
+            &mut vec![(codex.clone(), unlogged.clone())],
+        );
+
+        let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
+        let Note::Items { items, .. } = note else {
+            panic!("an unlogged emission is still owed, got {note:?}")
+        };
+        assert_eq!(items, vec![unlogged.clone()]);
+
+        // And provenance, not inspection, is what decides. The
+        // producer saw the append succeed or fail; nothing a reader
+        // can measure tells it apart, which is why two attempts to
+        // infer it were wrong.
+        use crate::cli::command_source::Durability;
+        assert!(
+            transient_of((unlogged.clone(), Durability::Logged)).is_empty(),
+            "a logged emission is carried by the log, not beside it"
+        );
+        assert_eq!(
+            transient_of((unlogged.clone(), Durability::Transient)),
+            vec![unlogged],
+            "and only a transient is carried here"
+        );
+    }
+
+    /// A startup transient rides the SAME frame as the work that fold
+    /// already owed.
+    ///
+    /// A client returns on its first non-empty `Items`, so sending the
+    /// projection first and the held transients second reaches a
+    /// client that has already gone — and a transient has no row to
+    /// replay, because the append is what failed. One presentation per
+    /// completed fold, carrying everything (codex on 328677d).
+    #[tokio::test]
+    async fn a_held_transient_rides_the_first_frame_with_the_work_it_found() {
+        let repo = repo_with_roster();
+        // Something the fold itself owes master, so the first frame is
+        // non-empty on its own — which is the case that used to lose
+        // the transient.
+        std::fs::create_dir_all(repo.path().join(".clank/queue")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/queue/500-next.md"),
+            "# next\n\nsomething to promote\n",
+        )
+        .unwrap();
+
+        let claude = AgentLabel::parse("claude").unwrap();
+        let held = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "a".into(),
+            event: "deploys".into(),
+            content: "ci failed".into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        let mut pending = vec![(claude.clone(), held.clone())];
+
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: claude.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut pending,
+        );
+
+        let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
+        let Note::Items { items, .. } = note else {
+            panic!("the fold owes work and a transient is held, got {note:?}")
+        };
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, WaitItem::PromoteFromQueue { .. })),
+            "the work the fold found: {items:?}"
+        );
+        assert!(
+            items.contains(&held),
+            "AND the transient, in the same frame — a second frame would \
+             reach a client that already returned: {items:?}"
+        );
+        assert!(pending.is_empty(), "delivered, so no longer held");
+        assert!(heard.try_recv().is_err(), "and nothing follows it");
+    }
+
+    /// A transient for an author with nobody connected keeps waiting.
+    #[tokio::test]
+    async fn a_transient_with_no_client_is_held_rather_than_dropped() {
+        let repo = repo_with_roster();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let held = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "a".into(),
+            event: "deploys".into(),
+            content: "ci failed".into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        let mut pending = vec![(codex.clone(), held.clone())];
+
+        // Only ANOTHER author is connected.
+        let (out, mut other) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: AgentLabel::parse("claude").unwrap(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut pending,
+        );
+
+        assert_eq!(
+            pending,
+            vec![(codex, held.clone())],
+            "nothing else will ever hold it, so it waits for its author"
+        );
+        // And it did not reach the author who happened to be there:
+        // a transient is one author's event, like any other.
+        let note: Note = serde_json::from_str(other.recv().await.unwrap().trim_end()).unwrap();
+        match note {
+            Note::Beat { .. } => {}
+            Note::Items { items, .. } => assert!(
+                !items.contains(&held),
+                "another author's transient must not be delivered here: {items:?}"
+            ),
+        }
+    }
+
+    /// An admission carries what was held for that author.
+    ///
+    /// A transient retained while its author had no client is owed to
+    /// the first client that author gets. Admitting on ordinary work
+    /// without it would let the newcomer return on that work, leaving
+    /// the held event waiting for a tick that may never find an
+    /// eligible client (codex on 1552f66).
+    #[tokio::test]
+    async fn an_admission_carries_what_was_held_for_its_author() {
+        let repo = repo_with_roster();
+        // Ordinary work the fold owes master on its own.
+        std::fs::create_dir_all(repo.path().join(".clank/queue")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/queue/500-next.md"),
+            "# next\n\nsomething to promote\n",
+        )
+        .unwrap();
+
+        let claude = AgentLabel::parse("claude").unwrap();
+        let held = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "a".into(),
+            event: "deploys".into(),
+            content: "ci failed".into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        let mut pending = vec![(claude.clone(), held.clone())];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = Vec::new();
+        admit_into(
+            repo.path(),
+            &mut clients,
+            Client {
+                who: Served::Agent {
+                    author: claude.clone(),
+                    has_cli_sources: false,
+                },
+                out,
+                shown: Default::default(),
+            },
+            fold(1, 2),
+            Some(&state),
+            &mut pending,
+        );
+
+        let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
+        let Note::Items { items, .. } = note else {
+            panic!("admission owes both, got {note:?}")
+        };
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, WaitItem::PromoteFromQueue { .. })),
+            "the work admission found: {items:?}"
+        );
+        assert!(
+            items.contains(&held),
+            "AND what was held for this author, in the same frame: {items:?}"
+        );
+        assert!(pending.is_empty(), "delivered, so no longer held");
+    }
+
+    /// A transient arriving after a client was woken stays pending.
+    ///
+    /// A successful enqueue is not evidence anyone will read it: the
+    /// wait returned on its first non-empty frame, so a second one is
+    /// written into a socket nobody is listening to. Clearing the
+    /// pending buffer against that frame loses the event (codex on
+    /// 1552f66).
+    #[tokio::test]
+    async fn a_transient_after_a_wake_waits_for_the_next_admission() {
+        let repo = repo_with_roster();
+        std::fs::create_dir_all(repo.path().join(".clank/queue")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/queue/500-next.md"),
+            "# next\n\nsomething to promote\n",
+        )
+        .unwrap();
+
+        let claude = AgentLabel::parse("claude").unwrap();
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        // The receiver is HELD open, so an enqueue would succeed — which
+        // is exactly what made this look safe.
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: claude.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let mut pending = Vec::new();
+
+        // One ordinary wake.
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut pending,
+        );
+        assert!(
+            matches!(
+                serde_json::from_str::<Note>(heard.recv().await.unwrap().trim_end()).unwrap(),
+                Note::Items { .. }
+            ),
+            "the first frame wakes it"
+        );
+        assert!(clients.is_empty(), "and ends that connection");
+
+        // Now a transient. There is no eligible client, so it waits.
+        let later = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "b".into(),
+            event: "deploys".into(),
+            content: "and then this".into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        pending.push((claude.clone(), later.clone()));
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut pending,
+        );
+        assert_eq!(
+            pending,
+            vec![(claude.clone(), later.clone())],
+            "it must not be cleared against a frame nobody will read"
+        );
+        assert!(
+            heard.try_recv().is_err(),
+            "and nothing was queued behind the wake"
+        );
+
+        // The next admission is what receives it.
+        let (out, mut next) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        admit_into(
+            repo.path(),
+            &mut clients,
+            Client {
+                who: Served::Agent {
+                    author: claude.clone(),
+                    has_cli_sources: false,
+                },
+                out,
+                shown: Default::default(),
+            },
+            fold(1, 2),
+            Some(&state),
+            &mut pending,
+        );
+        let note: Note = serde_json::from_str(next.recv().await.unwrap().trim_end()).unwrap();
+        let Note::Items { items, .. } = note else {
+            panic!("the next admission is owed it, got {note:?}")
+        };
+        assert!(items.contains(&later), "{items:?}");
+        assert!(pending.is_empty());
+    }
+
+    /// The monitor serves an author's CONFIGURED logs and no others.
+    ///
+    /// Both logs sit in one directory and only the configured row is
+    /// served, because the monitor opens the keys it resolves from
+    /// config rather than whatever is in the directory — so a scoped
+    /// log is never one it reads.
+    ///
+    /// Exclusion only. It starts no producer and has no invocation
+    /// receiver, and an earlier version of this comment claimed both;
+    /// the delivery half is
+    /// `wait::a_cli_author_keeps_its_own_channel_while_another_shares`
+    /// (codex on 1756c68).
+    #[tokio::test]
+    async fn the_monitor_reads_only_an_authors_configured_logs() {
+        use crate::cli::github::log::{EventLog, Transport};
+
+        let repo = repo_with_roster();
+        with_source(repo.path(), "claude", "builds");
+        let claude = AgentLabel::parse("claude").unwrap();
+        let events = crate::agent_store::agents_root(repo.path())
+            .join("claude")
+            .join("events");
+
+        // What the monitor hosts: this author's configured source, with
+        // a row in it.
+        let configured = match &hostable(repo.path(), &claude)[0].0 {
+            clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
+            other => panic!("a command source, got {other:?}"),
+        };
+        let row = |content: &str| WaitItem::CommandEvent {
+            name: "builds".into(),
+            id: content.into(),
+            event: "builds".into(),
+            content: content.into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        EventLog::open(&events, &configured)
+            .unwrap()
+            .append_inbox(Transport::Command, None, None, None, &row("configured"))
+            .unwrap();
+
+        // And an INVOCATION's own source, under its scoped key, with a
+        // row of its own. This is the log the monitor must not read.
+        let invocation = crate::cli::command_source::storage_key(
+            configured.clone(),
+            crate::cli::github::supervisor::SourceOrigin::Cli,
+            "inv-9",
+        );
+        assert_ne!(invocation, configured);
+        EventLog::open(&events, &invocation)
+            .unwrap()
+            .append_inbox(Transport::Command, None, None, None, &row("invocation"))
+            .unwrap();
+
+        let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: claude.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut Vec::new(),
+        );
+
+        let Note::Items { items, .. } =
+            serde_json::from_str::<Note>(heard.recv().await.unwrap().trim_end()).unwrap()
+        else {
+            panic!("the configured row is owed")
+        };
+        let contents: Vec<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                WaitItem::CommandEvent { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["configured".to_string()],
+            "the monitor serves the author's CONFIGURED rows and cannot \
+             see an invocation's: it resolves only config keys, so a \
+             scoped log is not a log it reads — {contents:?}"
+        );
+    }
+
+    /// Two authors in one repo: each one's rows reach only that author.
+    ///
+    /// Both have a config source, so the monitor hosts both, and the
+    /// question is whether a row logged for one can reach the other —
+    /// the failure that would make hosting worse than not hosting.
+    /// CONFIG routing only; the mixed config/CLI case is its own test.
+    #[tokio::test]
+    async fn two_authors_sources_do_not_cross() {
+        use crate::cli::github::log::{EventLog, Transport};
+
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        with_source(repo.path(), "claude", "builds");
+
+        let row = |who: &str, content: &str| {
+            let author = AgentLabel::parse(who).unwrap();
+            let events = crate::agent_store::agents_root(repo.path())
+                .join(who)
+                .join("events");
+            let key = match &hostable(repo.path(), &author)[0].0 {
+                clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
+                other => panic!("a command source, got {other:?}"),
+            };
+            EventLog::open(&events, &key)
+                .unwrap()
+                .append_inbox(
+                    Transport::Command,
+                    None,
+                    None,
+                    None,
+                    &WaitItem::CommandEvent {
+                        name: "s".into(),
+                        id: content.into(),
+                        event: "s".into(),
+                        content: content.into(),
+                        at: None,
+                        failure: false,
+                        selector: None,
+                    },
+                )
+                .unwrap();
+        };
+        row("codex", "theirs");
+        row("claude", "mine");
+
+        let (a, mut codex_heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let (b, mut claude_heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let agent = |who: &str, out| Client {
+            who: Served::Agent {
+                author: AgentLabel::parse(who).unwrap(),
+                // Both are plain shared clients. An earlier version set
+                // this for one of them and claimed to be covering mixed
+                // delivery, which it was not: the flag starts no
+                // producer, and production refuses sharing to a wait
+                // that has a CLI source at all. The actual mixed case
+                // is `an_invocations_event_reaches_it_and_not_the_monitor`.
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        };
+        let mut clients = vec![agent("codex", a), agent("claude", b)];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut Vec::new(),
+        );
+
+        let content = |line: String| -> Vec<String> {
+            let Note::Items { items, .. } = serde_json::from_str(line.trim_end()).unwrap() else {
+                panic!("owed its own row")
+            };
+            items
+                .iter()
+                .filter_map(|i| match i {
+                    WaitItem::CommandEvent { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            content(codex_heard.recv().await.unwrap()),
+            vec!["theirs".to_string()],
+            "codex is owed its own row and nothing of claude's"
+        );
+        assert_eq!(
+            content(claude_heard.recv().await.unwrap()),
+            vec!["mine".to_string()],
+            "and claude the same, the other way"
+        );
+        assert!(
+            clients.is_empty(),
+            "both were woken, and a woken connection is spent"
+        );
+    }
+
+    /// A newcomer is presented to ALONE.
+    ///
+    /// A client's queue is `CLIENT_QUEUE` deep, so presenting to
+    /// everybody on each arrival lets a burst of joins retire
+    /// established readers that were keeping up perfectly well — the
+    /// same amplification the source path avoids, through the door the
+    /// source path does not use (codex on 0555c8f).
+    #[tokio::test]
+    async fn arrivals_do_not_put_frames_in_established_clients_queues() {
+        let repo = repo_with_roster();
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let (out, mut established) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: AgentLabel::parse("claude").unwrap(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        }];
+
+        // More arrivals than a queue is deep, none of them drained.
+        // Their receivers are HELD: a dropped one closes the channel,
+        // which would retire the newcomer for a reason this test is
+        // not about.
+        let mut newcomers = Vec::new();
+        for _ in 0..(CLIENT_QUEUE + 2) {
+            let (out, rx) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+            newcomers.push(rx);
+            admit_into(
+                repo.path(),
+                &mut clients,
+                Client {
+                    who: Served::Agent {
+                        author: AgentLabel::parse("codex").unwrap(),
+                        has_cli_sources: false,
+                    },
+                    out,
+                    shown: Default::default(),
+                },
+                fold(1, 2),
+                Some(&state),
+                &mut Vec::new(),
+            );
+        }
+
+        assert!(
+            established.try_recv().is_err(),
+            "an established client is sent nothing because others joined"
+        );
+        assert!(
+            clients.iter().any(|c| c.who.name() == "claude"),
+            "and it is still connected: {:?}",
+            clients.iter().map(|c| c.who.name()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A source signal presents to that author's clients and no others.
+    ///
+    /// Scope matters beyond tidiness: a client's queue is only
+    /// `CLIENT_QUEUE` deep, so presenting to everybody whenever one
+    /// author's log moved would put frames in queues that had no
+    /// reason to receive them, and a burst would retire readers that
+    /// were keeping up.
+    #[tokio::test]
+    async fn a_source_signal_presents_only_to_its_own_author() {
+        let repo = repo_with_roster();
+        let (mine, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let (theirs, mut unheard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let (watching, mut observer) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let agent = |author: &str, out| Client {
+            who: Served::Agent {
+                author: AgentLabel::parse(author).unwrap(),
+                has_cli_sources: false,
+            },
+            out,
+            shown: Default::default(),
+        };
+        let mut clients = vec![
+            agent("codex", mine),
+            agent("claude", theirs),
+            Client {
+                who: Served::Observer,
+                out: watching,
+                shown: Default::default(),
+            },
+        ];
+
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            Some(&AgentLabel::parse("codex").unwrap()),
+            &mut Vec::new(),
+        );
+
+        assert!(
+            heard.try_recv().is_ok(),
+            "the author whose log moved is presented to"
+        );
+        assert!(
+            unheard.try_recv().is_err(),
+            "another author's client must hear nothing"
+        );
+        assert!(
+            observer.try_recv().is_err(),
+            "and an observer is not owed anybody's items"
+        );
+        assert_eq!(clients.len(), 3, "nobody was retired for this");
+
+        // Unscoped, everybody is presented to — which is what a fold
+        // tick does and why the scope is a parameter rather than the
+        // rule.
+        serve_to(
+            repo.path(),
+            &mut clients,
+            fold(1, 2),
+            &state,
+            None,
+            &mut Vec::new(),
+        );
+        assert!(unheard.try_recv().is_ok());
+        assert!(observer.try_recv().is_ok());
+    }
+
     /// An observer is told the fold MOVED and never what anyone owes.
     ///
     /// Items are a projection of one author's work; an observer has no
@@ -4184,6 +5602,7 @@ mod tests {
         let mut clients = vec![Client {
             who: Served::Observer,
             out,
+            shown: Default::default(),
         }];
         // A repo with work to do: a queued plan is something an AGENT
         // would be handed, so an observer seeing a Beat here is the

@@ -24,8 +24,19 @@ use super::session::{GhLogin, LoginResolver, shared_session};
 /// written before provenance existed). CLI-origin (`--event`)
 /// watches write theirs — the only store such an arm has — and
 /// remove it when re-armed promptless.
-pub(crate) fn write_watch_sidecar(dir: &std::path::Path, src: &GithubSource, origin: SourceOrigin) {
-    let meta = dir.join(format!("{}.meta.json", source_key(src)));
+/// Keyed by the RESOLVED ownership key, the same one that names the
+/// log. `events::join_prompts` indexes this metadata by file stem and
+/// rendering looks up each row's source stem, so a sidecar under the
+/// source's own key while its rows live under a scoped one simply
+/// cannot be found — and concurrent invocations of one watch would
+/// overwrite or remove the single shared file (codex on 03cc11f).
+pub(crate) fn write_watch_sidecar(
+    dir: &std::path::Path,
+    src: &GithubSource,
+    origin: SourceOrigin,
+    key: &str,
+) {
+    let meta = dir.join(format!("{key}.meta.json"));
     let res = match (origin, &src.prompt) {
         (SourceOrigin::Cli, Some(p)) => std::fs::create_dir_all(dir)
             .and_then(|()| std::fs::write(&meta, serde_json::json!({ "prompt": p }).to_string())),
@@ -54,9 +65,10 @@ pub(crate) enum SourceOrigin {
 /// completeness backstop either way.
 pub(crate) async fn run_github_source(
     src: GithubSource,
-    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     events_dir: Option<std::path::PathBuf>,
     origin: SourceOrigin,
+    key: String,
 ) {
     // The per-watch operator prompt is stamped HERE — the single
     // choke point between this source's machinery (live ingest,
@@ -69,7 +81,7 @@ pub(crate) async fn run_github_source(
     // Presentation-metadata sidecar, provenance-gated — see
     // [`write_watch_sidecar`].
     if let Some(dir) = &events_dir {
-        write_watch_sidecar(dir, &src, origin);
+        write_watch_sidecar(dir, &src, origin, &key);
     }
 
     // The supervisor arm OWNS `itx`: when it returns, the drop
@@ -106,6 +118,7 @@ pub(crate) async fn run_github_source(
                         None
                     }
                 },
+                key,
             )
             .await;
             drop(itx);
@@ -117,11 +130,11 @@ pub(crate) async fn run_github_source(
 /// Forward items, stamping the watch's `prompt` onto every github
 /// event that passes. Pure plumbing, unit-tested without transports.
 async fn stamp_instructions_forwarder(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<WaitItem>,
-    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     prompt: Option<String>,
 ) {
-    while let Some(mut item) = rx.recv().await {
+    while let Some((mut item, durability)) = rx.recv().await {
         if let WaitItem::GithubEvent {
             ref mut instructions,
             ..
@@ -129,7 +142,7 @@ async fn stamp_instructions_forwarder(
         {
             instructions.clone_from(&prompt);
         }
-        if tx.send(item).is_err() {
+        if tx.send((item, durability)).is_err() {
             return;
         }
     }
@@ -146,9 +159,10 @@ async fn source_supervisor<F, R, C, RF, RFut>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     reader: &C,
-    tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     events_dir: Option<std::path::PathBuf>,
     relay_start: RF,
+    key: String,
 ) where
     F: EventFetcher,
     R: LoginResolver,
@@ -179,7 +193,6 @@ async fn source_supervisor<F, R, C, RF, RFut>(
         .await;
         return;
     };
-    let key = source_key(src);
     // FnOnce discipline across the loop: the transports start at most
     // once, exactly at lease acquisition.
     let mut relay_start = Some(relay_start);
@@ -285,7 +298,9 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                 if !row.acked
                     && row_in_scope(src, &row.item)
                     && presented.insert((row.seq, row.ident.clone()))
-                    && tx.send(row.item).is_err()
+                    && tx
+                        .send((row.item, crate::cli::command_source::Durability::Logged))
+                        .is_err()
                 {
                     return; // wait gone
                 }
@@ -430,6 +445,7 @@ mod tests {
                     rs.store(true, std::sync::atomic::Ordering::SeqCst);
                     None
                 },
+                source_key(&src(&[GithubEventKind::IssueOpened], true)),
             )
             .await;
         });
@@ -440,7 +456,7 @@ mod tests {
                 .await
                 .expect("the tailer must present the leased writer's entries")
                 .expect("open");
-            if let WaitItem::GithubEvent { number, .. } = &woke {
+            if let (WaitItem::GithubEvent { number, .. }, _) = &woke {
                 got.push(number.unwrap());
             }
         }
@@ -471,7 +487,7 @@ mod tests {
         // warm start suppresses what the tail phase already presented —
         // the channel holds no second copy of the event.
         let mut extra = 0;
-        while let Ok(item) = rx.try_recv() {
+        while let Ok((item, _)) = rx.try_recv() {
             if matches!(
                 &item,
                 WaitItem::GithubEvent {
@@ -529,6 +545,7 @@ mod tests {
                 &tx,
                 Some(d),
                 || async { None },
+                source_key(&s),
             )
             .await;
         });
@@ -537,7 +554,7 @@ mod tests {
         let _ = handle.await;
 
         let mut numbers = Vec::new();
-        while let Ok(item) = rx.try_recv() {
+        while let Ok((item, _)) = rx.try_recv() {
             if let WaitItem::GithubEvent { number, .. } = item {
                 numbers.push(number);
             }
@@ -579,10 +596,11 @@ mod tests {
             otx,
             Some("triage and reply".into()),
         ));
-        itx.send(c.item).unwrap();
+        itx.send((c.item, crate::cli::command_source::Durability::Logged))
+            .unwrap();
         drop(itx);
         let out = orx.recv().await.expect("forwarded");
-        let WaitItem::GithubEvent { instructions, .. } = out else {
+        let (WaitItem::GithubEvent { instructions, .. }, _) = out else {
             panic!("github item");
         };
         assert_eq!(instructions.as_deref(), Some("triage and reply"));

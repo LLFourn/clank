@@ -521,12 +521,12 @@ pub const DRAFT_POLL: std::time::Duration = std::time::Duration::from_secs(60);
 /// one shared `gh` account and no write path clank owns means there
 /// is no provenance to filter by, and every stand-in for it erases
 /// the operator's edits too.
-pub async fn run_draft_source(
+pub(crate) async fn run_draft_source(
     repo: std::path::PathBuf,
     slug: String,
     pr: u32,
     author: AgentLabel,
-    tx: tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     interval: std::time::Duration,
 ) {
     let reader = crate::cli::github::draft::production_reader(slug);
@@ -546,7 +546,7 @@ async fn drive_draft_source<R: crate::cli::github::draft::DraftReader, F: Fn() -
     author: &AgentLabel,
     still_mine: &F,
     reader: &R,
-    tx: tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     interval: std::time::Duration,
 ) {
     use crate::cli::github::log::{EventLog, IngestLease};
@@ -602,7 +602,7 @@ async fn drive_draft_source<R: crate::cli::github::draft::DraftReader, F: Fn() -
 fn present_draft_rows(
     log: &crate::cli::github::log::EventLog,
     key: &str,
-    tx: &tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     presented: &mut std::collections::HashSet<(u64, String)>,
 ) -> bool {
     let Ok(Some(read)) = log.read_rows() else {
@@ -616,7 +616,11 @@ fn present_draft_rows(
         if let clank_core::wait::WaitItem::DraftChanged { selector, .. } = &mut item {
             *selector = Some(crate::cli::events::Selector::qualified(key, row.seq).to_string());
         }
-        if tx.send(item).is_err() {
+        // Read back OUT of the log, so the log has it.
+        if tx
+            .send((item, crate::cli::command_source::Durability::Logged))
+            .is_err()
+        {
             return false;
         }
     }
@@ -632,7 +636,7 @@ async fn ingest_draft<R: crate::cli::github::draft::DraftReader, F: Fn() -> bool
     reader: &R,
     events_dir: &Path,
     key: &str,
-    tx: &tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     presented: &mut std::collections::HashSet<(u64, String)>,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
@@ -1594,12 +1598,13 @@ mod tests {
     }
 
     async fn next_draft(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<clank_core::wait::WaitItem>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
     ) -> clank_core::wait::WaitItem {
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
             .unwrap()
+            .0
     }
 
     #[tokio::test]
@@ -1799,7 +1804,7 @@ mod tests {
         repo: &Path,
         pr: u32,
         reader: &R,
-        tx: tokio::sync::mpsc::UnboundedSender<clank_core::wait::WaitItem>,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     ) {
         tokio::time::timeout(
             std::time::Duration::from_secs(600),

@@ -429,15 +429,38 @@ impl SharedWal {
         Self::new(None)
     }
 
-    fn with(&self, f: impl FnOnce(&mut EventLog) -> std::io::Result<()>) {
+    #[cfg(test)]
+    pub(crate) fn durability_of_a_write(
+        &self,
+        item: &WaitItem,
+    ) -> crate::cli::command_source::Durability {
+        self.inbox(Transport::Poll, None, None, None, item)
+    }
+
+    /// Returns whether the write LANDED, which is the one thing a
+    /// reader presenting from the log cannot work out for itself.
+    fn with(
+        &self,
+        f: impl FnOnce(&mut EventLog) -> std::io::Result<()>,
+    ) -> crate::cli::command_source::Durability {
+        use crate::cli::command_source::Durability;
         let mut inner = self.0.lock().unwrap();
         let warned = inner.warned;
-        if let Some(log) = inner.log.as_mut()
-            && let Err(e) = f(log)
-            && !warned
-        {
-            eprintln!("wait: github event log write failed ({e}); continuing without durability");
-            inner.warned = true;
+        let Some(log) = inner.log.as_mut() else {
+            // No log at all: nothing will ever hold this.
+            return Durability::Transient;
+        };
+        match f(log) {
+            Ok(()) => Durability::Logged,
+            Err(e) => {
+                if !warned {
+                    eprintln!(
+                        "wait: github event log write failed ({e}); continuing without durability"
+                    );
+                    inner.warned = true;
+                }
+                Durability::Transient
+            }
         }
     }
 
@@ -450,11 +473,11 @@ impl SharedWal {
         action_key: Option<&str>,
         event_at: Option<u64>,
         item: &WaitItem,
-    ) {
+    ) -> crate::cli::command_source::Durability {
         self.with(|log| {
             log.append_inbox(transport, feed_id, action_key, event_at, item)
                 .map(|_| ())
-        });
+        })
     }
 
     /// A pre-watch presentable event at baseline: payload kept for
@@ -1310,6 +1333,46 @@ pub(super) mod tests {
             instructions: None,
             content: None,
         }
+    }
+
+    /// The WAL says whether a write LANDED, which is the one thing a
+    /// reader presenting from the log cannot work out for itself.
+    ///
+    /// The failure half matters most: github warns once and keeps
+    /// DELIVERING, so the agent still learns about an event whose
+    /// append failed — and a reader told that was durable would
+    /// present from a log that has no row for it, which is the event
+    /// lost (codex on aa3d9a5).
+    #[test]
+    fn a_write_that_did_not_land_is_reported_as_transient() {
+        use crate::cli::command_source::Durability;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal = SharedWal::new(Some(log_in(dir.path())));
+        assert_eq!(
+            wal.durability_of_a_write(&item(1)),
+            Durability::Logged,
+            "an ordinary append is in the log"
+        );
+
+        // A DIRECTORY where the log's file belongs: the append cannot
+        // land, and the existing behaviour is to warn once and carry
+        // on rather than to stop delivering.
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(blocked.path().join("github-o-r-abcd.jsonl")).unwrap();
+        let wal = SharedWal::new(Some(log_in(blocked.path())));
+        assert_eq!(wal.durability_of_a_write(&item(2)), Durability::Transient);
+        assert_eq!(
+            wal.durability_of_a_write(&item(3)),
+            Durability::Transient,
+            "and it keeps saying so after the one warning"
+        );
+
+        // No log at all: nothing will ever hold it either.
+        assert_eq!(
+            SharedWal::disabled().durability_of_a_write(&item(4)),
+            Durability::Transient
+        );
     }
 
     fn log_in(dir: &Path) -> EventLog {

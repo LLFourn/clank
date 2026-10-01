@@ -300,12 +300,17 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     let events_dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");
+    // ONE invocation, this park: what scopes a `--event` source's
+    // durable state away from the author's configured ones and away
+    // from any other invocation of the same name.
+    let invocation = clank_core::pr_review::PrReviewState::new_instance().to_string();
     let mut spawned = EventSources::spawn(
         &sources.events,
         Some(&events_dir),
         &repo,
         &author,
         &sources.drafts,
+        Some(&invocation),
     );
     // Once the source channel closes (every source task finished, or
     // there were none), its `recv()` is permanently ready with `None`
@@ -331,7 +336,10 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
                 }
                 item = spawned.rx.recv(), if sources_open => {
                     match item {
-                        Some(item) => external.push(item),
+                        // The local path delivers from the channel
+                        // whatever the log holds, so provenance is not
+                        // its question.
+                        Some((item, _)) => external.push(item),
                         None => sources_open = false,
                     }
                 }
@@ -382,24 +390,12 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
             // block decision TOGETHER. Park only when it admits nothing
             // (codex 907acd5; codex 344280f for the together).
             drain_external(&mut spawned.rx, &mut sources_open, &mut external);
-            drop_items_not_for(&repo, inputs.role, &mut external);
-            // Deciding BEFORE the merge left the channel route outside
-            // the decision: a blocked park returned a source item with
-            // no `Blocked` context to explain the silence around it,
-            // and an answered one returned the answer with the company
-            // it had just promised not to have (codex on 344280f).
-            //
-            // Nothing is lost by draining into the decision. It returns
-            // empty only when `events` is empty, and these items ARE
-            // events — which matters because a source running
-            // memory-only (`events_dir: None`) has no WAL to re-read
-            // them from.
-            let items = present_with_blocks(check_blocks(&repo, &author), || {
-                beat_owed(
-                    items_for(&repo, &author, &inputs, &status, &state.fold),
-                    &mut external,
-                )
-            });
+            // Nothing is lost by draining into the decision. It
+            // returns empty only when `events` is empty, and these
+            // items ARE events — which matters because a source
+            // running memory-only (`events_dir: None`) has no WAL to
+            // re-read them from.
+            let items = owed_for(&repo, &author, &inputs, &status, &state.fold, &mut external);
             if !items.is_empty() {
                 binding.ensure_current(&repo, &author)?;
                 return Ok(items);
@@ -684,14 +680,29 @@ impl WakeSources {
         Self { events, drafts }
     }
 
-    /// Nothing here, so the monitor's watch is the whole picture.
+    /// Whether the monitor can cover everything that wakes this wait.
     ///
     /// Destructured on purpose: a source kind added later cannot be
     /// forgotten here, because the pattern stops compiling until it is
     /// named. That is the invariant this type exists to hold.
-    fn is_empty(&self) -> bool {
+    fn may_share(&self) -> bool {
         let Self { events, drafts } = self;
-        events.is_empty() && drafts.is_empty()
+        // Master's draft watch is derived from an open review rather
+        // than configured, and the monitor hosts no drafts.
+        drafts.is_empty()
+            // An author's CONFIG sources the monitor runs, once per
+            // repo, and routes back to that author. A `--event` source
+            // belongs to ONE INVOCATION and is never pooled — a monitor
+            // that ran one would deliver this invocation's events to
+            // whoever else happened to be this author.
+            && events
+                .iter()
+                .all(|(_, origin)| {
+                    matches!(
+                        origin,
+                        crate::cli::github::supervisor::SourceOrigin::Config
+                    )
+                })
     }
 }
 
@@ -726,7 +737,7 @@ async fn share_with(
     sources: &WakeSources,
     spawn: impl Fn(&Path) -> std::io::Result<Box<dyn crate::cli::monitor::Started>>,
 ) -> Option<crate::cli::monitor::Conn> {
-    if !sources.is_empty() {
+    if !sources.may_share() {
         return None;
     }
     match crate::cli::monitor::attach_or_spawn_with(
@@ -875,9 +886,19 @@ pub(crate) fn owed_for(
     inputs: &WaitInputs,
     status: &clank_core::wait::WorkStatus,
     fold: &clank_core::repo_state::RepoState,
+    external: &mut Vec<WaitItem>,
 ) -> Vec<WaitItem> {
+    drop_items_not_for(repo, inputs.role, external);
+    // Deciding BEFORE the merge left the channel route outside the
+    // decision: a blocked park returned a source item with no `Blocked`
+    // context to explain the silence around it, and an answered one
+    // returned the answer with the company it had just promised not to
+    // have (codex on 344280f). The monitor has to come through the same
+    // door for the same reason — a source event that woke an agent
+    // straight off the channel would arrive without the block context
+    // the local path gives it (codex on ca2ea69).
     present_with_blocks(check_blocks(repo, author), || {
-        items_for(repo, author, inputs, status, fold)
+        beat_owed(items_for(repo, author, inputs, status, fold), external)
     })
 }
 
@@ -983,7 +1004,7 @@ fn beat_owed(mut owed: Owed, external: &mut Vec<WaitItem>) -> Owed {
 /// fuse that prevents a closed channel from hot-looping the wait
 /// (codex 1bbb61d). No-op once closed.
 fn drain_external(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<WaitItem>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
     open: &mut bool,
     out: &mut Vec<WaitItem>,
 ) {
@@ -992,7 +1013,7 @@ fn drain_external(
     }
     loop {
         match rx.try_recv() {
-            Ok(item) => out.push(item),
+            Ok((item, _)) => out.push(item),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 *open = false;
@@ -1008,17 +1029,53 @@ fn drain_external(
 /// children die by process-group kill via a drop guard — abort-safe,
 /// so a shell wrapper's grandchildren can't outlive the wait
 /// (extra-wait-events).
-struct EventSources {
-    rx: tokio::sync::mpsc::UnboundedReceiver<WaitItem>,
+/// What a source calls itself, for a message about it.
+fn source_name(source: &clank_core::agent_config::WaitEventSource) -> String {
+    match source {
+        clank_core::agent_config::WaitEventSource::Command(c) => c.name.clone(),
+        clank_core::agent_config::WaitEventSource::Github(g) => g.repo.clone(),
+    }
+}
+
+pub(crate) struct EventSources {
+    rx: tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl EventSources {
+    /// Hand this set's items to `into`, TAGGED with whose they are, and
+    /// return every task that must be aborted to stop them.
+    ///
+    /// The monitor runs one of these per author and merges them onto a
+    /// single channel, so the tag is what keeps one author's events
+    /// from reaching another. Aborting the returned tasks stops the
+    /// sources AND this forwarder — the source tasks' own drops are
+    /// what end their producers, which is why they are handed back
+    /// rather than detached.
+    pub(crate) fn tagged_into(
+        self,
+        author: AgentLabel,
+        into: tokio::sync::mpsc::UnboundedSender<(
+            AgentLabel,
+            crate::cli::command_source::Emission,
+        )>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let Self { mut rx, mut tasks } = self;
+        tasks.push(tokio::spawn(async move {
+            while let Some(emission) = rx.recv().await {
+                if into.send((author.clone(), emission)).is_err() {
+                    return;
+                }
+            }
+        }));
+        tasks
+    }
+
     /// `events_dir` is the agent's github event-WAL home
     /// (`.clank/agents/<label>/events`) — `None` (ad-hoc/unbound
     /// waits) runs github sources memory-only, exactly the pre-WAL
     /// behavior (github-offline-catchup).
-    fn spawn(
+    pub(crate) fn spawn(
         sources: &[(
             clank_core::agent_config::WaitEventSource,
             crate::cli::github::supervisor::SourceOrigin,
@@ -1027,17 +1084,36 @@ impl EventSources {
         repo: &std::path::Path,
         author: &AgentLabel,
         drafts: &[(u32, String)],
+        invocation: Option<&str>,
     ) -> Self {
+        use crate::cli::github::supervisor::SourceOrigin;
         use clank_core::agent_config::WaitEventSource;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Vec::new();
         for (source, origin) in sources {
+            // A `--event` source is ONE INVOCATION's, so it needs that
+            // invocation to scope its durable state. A pooled host —
+            // the monitor — has no invocation to give and must never be
+            // handed one of these; refusing loudly beats sharing a log
+            // and a lease with somebody else's source.
+            let scope = match (origin, invocation) {
+                (SourceOrigin::Cli, None) => {
+                    eprintln!(
+                        "wait: refusing to run an invocation's source `{}` without an \
+                         invocation to scope it to",
+                        source_name(source)
+                    );
+                    continue;
+                }
+                (_, scope) => scope.unwrap_or_default(),
+            };
             match source {
                 WaitEventSource::Command(c) => {
                     tasks.push(tokio::spawn(run_command_source(
                         c.clone(),
                         tx.clone(),
                         events_dir.map(std::path::Path::to_path_buf),
+                        crate::cli::command_source::storage_key(c.source_key(), *origin, scope),
                     )));
                 }
                 WaitEventSource::Github(g) => {
@@ -1047,6 +1123,11 @@ impl EventSources {
                             tx.clone(),
                             events_dir.map(std::path::Path::to_path_buf),
                             *origin,
+                            crate::cli::command_source::storage_key(
+                                crate::cli::github::supervisor::source_key(g),
+                                *origin,
+                                scope,
+                            ),
                         ),
                     ));
                 }
@@ -1146,13 +1227,15 @@ impl RingTail {
 /// producer that will never start should find out.
 async fn run_command_source(
     src: clank_core::agent_config::CommandSource,
-    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     events_dir: Option<std::path::PathBuf>,
+    key: String,
 ) {
     run_command_source_with(
         src,
         tx,
         events_dir,
+        key,
         crate::cli::command_source::reap_previous_producer,
     )
     .await
@@ -1168,8 +1251,9 @@ async fn run_command_source(
 /// not something to arrange on a developer's machine.
 async fn run_command_source_with(
     src: clank_core::agent_config::CommandSource,
-    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     events_dir: Option<std::path::PathBuf>,
+    key: String,
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
 ) {
     use crate::cli::command_source as cs;
@@ -1187,7 +1271,6 @@ async fn run_command_source_with(
         eprintln!("wait: command source `{}` glyph {why}", src.name);
         return;
     }
-    let key = src.source_key();
     // No events dir (an ad-hoc wait) means no durable dedup: the
     // source still runs, it just cannot remember. Same degradation
     // the github sources take, in a temp dir that dies with the wait.
@@ -1250,7 +1333,7 @@ async fn run_command_source_with(
                         }
                         let mut item = row.item;
                         cs::stamp_selector(&mut item, &key, row.seq);
-                        if tx.send(item).is_err() {
+                        if tx.send((item, cs::Durability::Logged)).is_err() {
                             return;
                         }
                     }
@@ -1272,7 +1355,7 @@ async fn run_command_source_with(
 /// writes the log.
 async fn run_leased_command_source(
     src: &clank_core::agent_config::CommandSource,
-    tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     store_dir: &std::path::Path,
     key: &str,
     presented: &mut std::collections::HashSet<(u64, String)>,
@@ -1305,7 +1388,7 @@ async fn run_leased_command_source(
     let state_dir = events_dir
         .as_deref()
         .and_then(|d| d.parent())
-        .map(|agent| cs::backend_state_dir(agent, &src));
+        .map(|agent| cs::backend_state_dir(agent, &key));
     if let Some(dir) = state_dir.as_deref() {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!(
@@ -1362,7 +1445,7 @@ async fn run_leased_command_source(
         }
         let mut item = entry.item;
         cs::stamp_selector(&mut item, &key, entry.seq);
-        if tx.send(item).is_err() {
+        if tx.send((item, cs::Durability::Logged)).is_err() {
             return;
         }
     }
@@ -1503,7 +1586,7 @@ async fn run_leased_command_source(
                                                 &key,
                                                 &mut log,
                                                 &mut seen,
-                                                |item| tx.send(item).is_ok(),
+                                                |item| tx.send((item, cs::Durability::Logged)).is_ok(),
                                             ) {
                                                 break;
                                             }
@@ -1527,7 +1610,9 @@ async fn run_leased_command_source(
                     // second copy of that ordering here would be a
                     // second place for it to be wrong.
                     if !cs::apply(what, &key, &mut log, &mut seen, |item| {
-                        tx.send(item).is_ok()
+                        // `apply` only reaches its send after the
+                        // append RETURNED a seq, so this is logged.
+                        tx.send((item, cs::Durability::Logged)).is_ok()
                     }) {
                         return;
                     }
@@ -1555,7 +1640,7 @@ async fn run_leased_command_source(
                     "`{}` has stopped {failures} times in a row and is being restarted",
                     src.command.join(" ")
                 ),
-                |item| tx.send(item).is_ok(),
+                |item| tx.send((item, cs::Durability::Logged)).is_ok(),
             );
             if !live {
                 return;
@@ -2596,13 +2681,13 @@ mod shared_tests {
     /// `wait_events`, so a shared wait with github or command sources
     /// would never hear from them.
     #[tokio::test]
-    async fn a_wait_with_its_own_sources_keeps_watching_itself() {
+    async fn a_wait_shares_when_the_monitor_covers_all_of_its_sources() {
         let (repo, _dir) = repo_with_a_willing_monitor();
         let author = AgentLabel::parse("claude").unwrap();
         let binding = WaitBinding(None);
 
         let nothing = WakeSources::derive(repo.path(), Role::Reviewer, Vec::new());
-        assert!(nothing.is_empty());
+        assert!(nothing.may_share());
         assert!(
             share_without_starting(repo.path(), &author, &binding, &nothing)
                 .await
@@ -2610,7 +2695,37 @@ mod shared_tests {
             "with no sources it shares"
         );
 
+        // A CONFIG source is an AUTHOR's, and the monitor runs it once
+        // per repo and routes it back to that author — so having one is
+        // no longer a reason to watch alone.
+        let agent_dir = crate::agent_store::agents_root(repo.path()).join("claude");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("config.json"),
+            r#"{"wait_events":[{"kind":"command","name":"deploys","command":["true"]}]}"#,
+        )
+        .unwrap();
         let configured = WakeSources::derive(
+            repo.path(),
+            Role::Reviewer,
+            resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
+        );
+        assert!(
+            !configured.events.is_empty(),
+            "the fixture declares a config source"
+        );
+        assert!(configured.may_share());
+        assert!(
+            share_without_starting(repo.path(), &author, &binding, &configured)
+                .await
+                .is_some(),
+            "the monitor hosts config sources, so this wait may share"
+        );
+
+        // A `--event` source belongs to ONE INVOCATION. The monitor
+        // never pools it, or this invocation's events would reach
+        // whoever else happened to be this author.
+        let invoked = WakeSources::derive(
             repo.path(),
             Role::Reviewer,
             resolve_wait_event_sources(
@@ -2620,12 +2735,450 @@ mod shared_tests {
             )
             .unwrap(),
         );
-        assert!(!configured.is_empty(), "the fixture declares a source");
+        assert!(!invoked.may_share());
+        assert!(
+            share_without_starting(repo.path(), &author, &binding, &invoked)
+                .await
+                .is_none(),
+            "a source of this invocation's own keeps it watching for itself"
+        );
+    }
+
+    /// A configured source and an invocation's source of the SAME NAME
+    /// each run their own command, and keep their own state.
+    ///
+    /// They used to share everything keyed off the name: one log, one
+    /// ingest lease and one `CLANK_SOURCE_STATE_DIR`. The lease is
+    /// what made it visible — whichever arrived second tailed the
+    /// first's log and never ran the command it was given — and the
+    /// shared state directory is what made it lossy, because a
+    /// stateful backend reads another invocation's cursor there
+    /// (codex on 03cc11f).
+    #[tokio::test]
+    async fn a_configured_and_an_invocation_source_of_one_name_do_not_share() {
+        use crate::cli::command_source as cs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("claude").unwrap();
+        let agent_dir = crate::agent_store::agents_root(dir.path()).join("claude");
+        let events = agent_dir.join("events");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // A configured `deploys`, and a `--event` one by the same name.
+        // Built through `serde_json` rather than written as a nested
+        // string literal: the escaping of a shell command inside JSON
+        // inside Rust is where this test first silently tested nothing.
+        // Each producer reports the private directory it was HANDED,
+        // in `CLANK_SOURCE_STATE_DIR`. Recomputing the directories in
+        // the test proved only that the helper is injective; what has
+        // to be true is that the RUNNER passes the resolved key, and
+        // only the producer can report what it actually received.
+        let emits = |id: &str| {
+            format!(
+                r#"printf '{{"id":"{id}","content":"'"$CLANK_SOURCE_STATE_DIR"'"}}
+'; sleep 300"#
+            )
+        };
+        let declare = |name: &str, body: &str| serde_json::json!({"kind": "command", "name": name, "command": ["sh", "-c", body]});
+        std::fs::write(
+            agent_dir.join("config.json"),
+            serde_json::json!({"wait_events": [declare("deploys", &emits("cfg"))]}).to_string(),
+        )
+        .unwrap();
+        let both = resolve_wait_event_sources(
+            dir.path(),
+            &author,
+            &[declare("deploys", &emits("inv")).to_string()],
+        )
+        .unwrap();
+        assert_eq!(both.len(), 2, "one configured and one invocation's");
+
+        let spawned = EventSources::spawn(
+            &both,
+            Some(&events),
+            dir.path(),
+            &author,
+            &[],
+            Some("inv-7"),
+        );
+        let mut rx = spawned.rx;
+        let mut seen: Vec<String> = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while seen.len() < 2 {
+                match rx.recv().await {
+                    Some((WaitItem::CommandEvent { content, .. }, _)) => seen.push(content),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            seen.len(),
+            2,
+            "BOTH commands ran: neither tailed the other's log — {seen:?}"
+        );
+        seen.sort();
+        assert_ne!(
+            seen[0], seen[1],
+            "and each was handed its OWN private directory. One shared \
+             `CLANK_SOURCE_STATE_DIR` is how a stateful backend reads the \
+             other invocation's cursor, so an event disappears before it \
+             reaches the isolated log: {seen:?}"
+        );
+        // Each is the directory that source's RESOLVED key names, which
+        // is what ties the private state to the log and the lease.
+        let keys: Vec<String> = both
+            .iter()
+            .map(|(s, origin)| match s {
+                clank_core::agent_config::WaitEventSource::Command(c) => {
+                    cs::storage_key(c.source_key(), *origin, "inv-7")
+                }
+                other => panic!("command sources, got {other:?}"),
+            })
+            .collect();
+        for key in &keys {
+            let want = cs::backend_state_dir(&agent_dir, key)
+                .to_string_lossy()
+                .to_string();
+            assert!(
+                seen.contains(&want),
+                "a producer was handed {seen:?}, not the directory its own \
+                 key names ({want})"
+            );
+        }
+
+        for task in spawned.tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// A CLI author runs its own sources and receives both of them; a
+    /// config-only author is eligible to share and receives its own.
+    ///
+    /// That is the whole of what this drives, and the doc says so
+    /// because the previous version of it did not. Each author gets
+    /// its own `EventSources` and its own receiver, so "neither author
+    /// sees the other's" could not fail here — there is no shared
+    /// channel for a row to cross — and no monitor exists in this test
+    /// to see anything. The three isolation properties are real and
+    /// proved elsewhere, where they CAN fail (codex and ruthless on
+    /// 153f450):
+    ///
+    /// - cross-author delivery, by `monitor::two_authors_sources_do_not_cross`,
+    ///   which writes a row into each author's events dir and serves
+    ///   both through one `serve_to`;
+    /// - a scoped log being invisible to the monitor, by
+    ///   `monitor::the_monitor_reads_only_an_authors_configured_logs`;
+    /// - and that nothing the monitor hosts is an invocation's, by
+    ///   `monitor::nothing_the_monitor_hosts_belongs_to_an_invocation`.
+    ///
+    /// What this one does establish, and what the mutation check
+    /// confirms, is that the CLI source RUNS and DELIVERS: it fails if
+    /// the source is never started, and if it is started with its
+    /// delivery discarded.
+    #[tokio::test]
+    async fn a_cli_author_keeps_its_own_channel_while_another_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
+        std::fs::write(
+            dir.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
+        )
+        .unwrap();
+
+        let emits = |name: &str, what: &str| {
+            serde_json::json!({
+                "kind": "command",
+                "name": name,
+                "command": [
+                    "sh",
+                    "-c",
+                    format!(r#"printf '{{"id":"{what}","content":"{what}"}}\n'; sleep 300"#),
+                ],
+            })
+        };
+        let configure = |who: &str, name: &str, what: &str| {
+            let agent = crate::agent_store::agents_root(dir.path()).join(who);
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(
+                agent.join("config.json"),
+                serde_json::json!({"wait_events": [emits(name, what)]}).to_string(),
+            )
+            .unwrap();
+            agent
+        };
+        let claude = AgentLabel::parse("claude").unwrap();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let claude_dir = configure("claude", "builds", "claude-config");
+        let codex_dir = configure("codex", "deploys", "codex-config");
+
+        // `codex` also declares an invocation source, so it may NOT
+        // share and runs everything itself.
+        let mine = resolve_wait_event_sources(
+            dir.path(),
+            &codex,
+            &[emits("ticker", "codex-invocation").to_string()],
+        )
+        .unwrap();
+        let sources = WakeSources::derive(dir.path(), Role::Reviewer, mine.clone());
+        assert!(
+            !sources.may_share(),
+            "an invocation's source keeps this wait watching for itself"
+        );
+        let spawned = EventSources::spawn(
+            &mine,
+            Some(&codex_dir.join("events")),
+            dir.path(),
+            &codex,
+            &[],
+            Some("inv-3"),
+        );
+
+        // Its own channel receives BOTH: the configured event and the
+        // invocation's.
+        let mut rx = spawned.rx;
+        let mut heard: Vec<String> = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while heard.len() < 2 {
+                match rx.recv().await {
+                    Some((WaitItem::CommandEvent { content, .. }, _)) => heard.push(content),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        heard.sort();
+        assert_eq!(
+            heard,
+            vec!["codex-config".to_string(), "codex-invocation".to_string()],
+            "the CLI author runs and receives both of its own sources"
+        );
+
+        // `claude` is config-only, so it is ELIGIBLE to share. What
+        // this reads is its own config source emitting, not a monitor
+        // presenting: the presentation path is `monitor::serve_to`'s
+        // own tests, and this half is here to show the eligibility and
+        // the emission are both real for the same author.
+        let theirs = resolve_wait_event_sources(dir.path(), &claude, &[]).unwrap();
+        assert!(
+            WakeSources::derive(dir.path(), Role::Master, theirs.clone()).may_share(),
+            "config only, so the monitor covers everything that wakes it"
+        );
+        let claude_spawned = EventSources::spawn(
+            &theirs,
+            Some(&claude_dir.join("events")),
+            dir.path(),
+            &claude,
+            &[],
+            None,
+        );
+        let mut claude_rx = claude_spawned.rx;
+        let claude_heard = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match claude_rx.recv().await {
+                    Some((WaitItem::CommandEvent { content, .. }, _)) => return content,
+                    Some(_) => {}
+                    None => return String::new(),
+                }
+            }
+        })
+        .await
+        .unwrap_or_default();
+        assert_eq!(
+            claude_heard, "claude-config",
+            "the sharing author gets its OWN configured event and no \
+             invocation of anybody else's"
+        );
+
+        for task in spawned.tasks.into_iter().chain(claude_spawned.tasks) {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Two invocations of ONE name for one author each get their own
+    /// event, on their own channel.
+    ///
+    /// Two live producers, not two computed keys: comparing the keys
+    /// proved the helper injective and left the delivery unproven,
+    /// which is the gap this plan kept finding in its own tests
+    /// (codex on a61a56d).
+    #[tokio::test]
+    async fn two_invocations_of_one_name_each_receive_their_own_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("claude").unwrap();
+        let events = crate::agent_store::agents_root(dir.path())
+            .join("claude")
+            .join("events");
+        let emits = |what: &str| {
+            serde_json::json!({
+                "kind": "command",
+                "name": "deploys",
+                "command": [
+                    "sh",
+                    "-c",
+                    format!(r#"printf '{{"id":"{what}","content":"{what}"}}\n'; sleep 300"#),
+                ],
+            })
+            .to_string()
+        };
+
+        let arm = |body: String, scope: &'static str| {
+            let declared = resolve_wait_event_sources(dir.path(), &author, &[body]).unwrap();
+            EventSources::spawn(
+                &declared,
+                Some(&events),
+                dir.path(),
+                &author,
+                &[],
+                Some(scope),
+            )
+        };
+        let first = arm(emits("one"), "inv-1");
+        let second = arm(emits("two"), "inv-2");
+
+        let heard = |mut rx: tokio::sync::mpsc::UnboundedReceiver<
+            crate::cli::command_source::Emission,
+        >| async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    match rx.recv().await {
+                        Some((WaitItem::CommandEvent { content, .. }, _)) => return content,
+                        Some(_) => {}
+                        None => return String::new(),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let tasks: Vec<_> = first.tasks.into_iter().chain(second.tasks).collect();
+        let (a, b) = tokio::join!(heard(first.rx), heard(second.rx));
+
+        assert_eq!(a, "one", "the first invocation's own command ran");
+        assert_eq!(
+            b, "two",
+            "and so did the second's — neither tailed the other's log, \
+             which is what sharing one name-derived key did"
+        );
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Two invocations of one name for one author do not share either.
+    #[tokio::test]
+    async fn two_invocations_of_one_name_keep_their_own_state() {
+        use crate::cli::command_source as cs;
+        let src = clank_core::agent_config::CommandSource {
+            name: "deploys".into(),
+            command: vec!["true".into()],
+            glyph: None,
+        };
+        let agent_dir = std::path::Path::new("/a/.clank/agents/claude");
+
+        let one = cs::storage_key(
+            src.source_key(),
+            crate::cli::github::supervisor::SourceOrigin::Cli,
+            "inv-1",
+        );
+        let two = cs::storage_key(
+            src.source_key(),
+            crate::cli::github::supervisor::SourceOrigin::Cli,
+            "inv-2",
+        );
+        assert_ne!(one, two);
+        assert_ne!(
+            cs::backend_state_dir(agent_dir, &one),
+            cs::backend_state_dir(agent_dir, &two),
+            "two invocations of one watch must not read each other's cursor"
+        );
+    }
+
+    /// A pooled host refuses an invocation's source rather than pooling
+    /// it.
+    ///
+    /// The monitor has no invocation to scope one to. Running it under
+    /// the author's shared namespace is exactly the collision this
+    /// plan must not have, so the refusal is the safe answer and is
+    /// said out loud.
+    #[tokio::test]
+    async fn a_pooled_host_will_not_run_an_invocations_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("claude").unwrap();
+        let cli = resolve_wait_event_sources(
+            dir.path(),
+            &author,
+            &[r#"{"kind":"command","name":"ticker","command":["true"]}"#.to_string()],
+        )
+        .unwrap();
+        assert_eq!(cli.len(), 1);
+
+        // No invocation to give: what the monitor passes.
+        let spawned = EventSources::spawn(&cli, None, dir.path(), &author, &[], None);
+        assert!(
+            spawned.tasks.is_empty(),
+            "an invocation's source is refused, not pooled under the author"
+        );
+
+        // With one, it runs.
+        let spawned = EventSources::spawn(&cli, None, dir.path(), &author, &[], Some("inv-1"));
+        assert_eq!(spawned.tasks.len(), 1);
+        spawned.shutdown().await;
+    }
+
+    /// A PRE-HOSTING monitor is refused, and the wait keeps its sources.
+    ///
+    /// One of those can still be running after a binary update, holding
+    /// its repo's lease. It accepts the same hello and serves only
+    /// projected repo work, so a config-source wait that attached to it
+    /// would have stopped running its own sources and missed their
+    /// events for as long as that monitor lived (codex on a135276).
+    #[tokio::test]
+    async fn a_config_source_wait_refuses_a_monitor_that_cannot_host() {
+        let (repo, dir) = repo_with_a_willing_monitor();
+        let author = AgentLabel::parse("claude").unwrap();
+        let binding = WaitBinding(None);
+        let agent_dir = crate::agent_store::agents_root(repo.path()).join("claude");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("config.json"),
+            r#"{"wait_events":[{"kind":"command","name":"deploys","command":["true"]}]}"#,
+        )
+        .unwrap();
+        let configured = WakeSources::derive(
+            repo.path(),
+            Role::Reviewer,
+            resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
+        );
+
+        // The willing monitor, re-announced as the version that does
+        // NOT host sources.
+        let socket = crate::cli::monitor::socket_path(dir.path(), 4242).unwrap();
+        crate::cli::monitor::publish(
+            repo.path(),
+            &crate::cli::monitor::Descriptor {
+                proto: crate::cli::monitor::PROTO - 1,
+                pid: 4242,
+                repo: repo.path().to_string_lossy().to_string(),
+                socket: socket.to_string_lossy().to_string(),
+                fold: fold(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            configured.may_share(),
+            "the wait itself is eligible — it is the MONITOR that cannot"
+        );
         assert!(
             share_without_starting(repo.path(), &author, &binding, &configured)
                 .await
                 .is_none(),
-            "with a source of its own it must watch for itself"
+            "so it watches for itself rather than losing its events"
         );
     }
 
@@ -2906,6 +3459,42 @@ mod tests {
         }
     }
 
+    /// A draft wake belongs to the master that opened the review.
+    ///
+    /// Covered here because it had no test at all — found while moving
+    /// the call into `owed_for` so the monitor comes through the same
+    /// door. Only the ROLE half is driven: the instance half needs an
+    /// open review on disk, and this is the half that needs none.
+    #[test]
+    fn a_draft_wake_is_not_owed_to_a_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = || WaitItem::DraftChanged {
+            pr: 42,
+            instance: 1,
+            comment: None,
+            path: None,
+            change: clank_core::pr_review::DraftChange::Removed,
+            revision: 1,
+            selector: None,
+        };
+        let other = || WaitItem::PromoteFromQueue {
+            name: "next".into(),
+            priority: 500,
+        };
+
+        let mut items = vec![draft(), other()];
+        drop_items_not_for(dir.path(), Role::Reviewer, &mut items);
+        assert!(
+            matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
+            "a reviewer owns no review's drafts: {items:?}"
+        );
+
+        // And nothing else is touched by it.
+        let mut untouched = vec![other()];
+        drop_items_not_for(dir.path(), Role::Master, &mut untouched);
+        assert_eq!(untouched.len(), 1);
+    }
+
     #[test]
     fn supersession_has_a_distinct_wait_wire() {
         let value = serde_json::to_value(SupersededEnvelope {
@@ -2935,12 +3524,13 @@ mod tests {
         want: usize,
     ) -> Vec<WaitItem> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run_command_source(src, tx, dir));
+        let key = src.source_key();
+        let task = tokio::spawn(run_command_source(src, tx, dir, key));
         let mut out = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while out.len() < want {
                 match rx.recv().await {
-                    Some(i) => out.push(i),
+                    Some((item, _)) => out.push(item),
                     None => break,
                 }
             }
@@ -3039,7 +3629,12 @@ mod tests {
             .unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run_command_source(src, tx, Some(events.clone())));
+        let task = tokio::spawn(run_command_source(
+            src,
+            tx,
+            Some(events.clone()),
+            key.clone(),
+        ));
 
         // Which pid it was. The child writes this before sleeping.
         let pid = tokio::time::timeout(Duration::from_secs(10), async {
@@ -3126,10 +3721,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let task = {
             let defer = defer.clone();
+            let key = src.source_key();
             tokio::spawn(run_command_source_with(
                 src,
                 tx,
                 Some(events.clone()),
+                key,
                 move |_: &Path, _: &str| {
                     if defer.load(std::sync::atomic::Ordering::Acquire) {
                         cs::Retired::Deferred("cannot confirm it ended".into())
@@ -3195,7 +3792,12 @@ mod tests {
         let key = src.source_key();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run_command_source(src, tx, Some(events.clone())));
+        let task = tokio::spawn(run_command_source(
+            src,
+            tx,
+            Some(events.clone()),
+            key.clone(),
+        ));
         tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await
             .expect("the producer emitted nothing")
@@ -3592,6 +4194,7 @@ mod tests {
             producer("owned"),
             tx_a,
             Some(events.clone()),
+            key.clone(),
         ));
         assert!(
             tokio::time::timeout(Duration::from_secs(20), rx_a.recv())
@@ -3606,8 +4209,9 @@ mod tests {
             producer("contender"),
             tx_b,
             Some(events.clone()),
+            key.clone(),
         ));
-        let tailed = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
+        let (tailed, _) = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
             .await
             .expect("the follower must receive the holder's row, not sit idle")
             .expect("channel open");
@@ -3633,7 +4237,7 @@ mod tests {
         // and starts its own producer — exactly one more run.
         holder.abort();
         let _ = holder.await;
-        let taken = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
+        let (taken, _) = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
             .await
             .expect("the follower must take over when the holder leaves")
             .expect("channel open");
@@ -3658,7 +4262,7 @@ mod tests {
             again.push(i);
         }
         assert!(
-            !again.iter().any(|i| event_parts(i).0 == "owned"),
+            !again.iter().any(|(i, _)| event_parts(i).0 == "owned"),
             "a takeover must not re-present what this process already presented: {again:?}",
         );
 
@@ -4211,15 +4815,18 @@ mod tests {
         // the select branch stays off and can't hot-loop), while a live
         // channel drains its queued items and stays open.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(WaitItem::CommandEvent {
-            name: "a".into(),
-            id: "1".into(),
-            event: "k".into(),
-            content: String::new(),
-            at: None,
-            failure: false,
-            selector: None,
-        })
+        tx.send((
+            WaitItem::CommandEvent {
+                name: "a".into(),
+                id: "1".into(),
+                event: "k".into(),
+                content: String::new(),
+                at: None,
+                failure: false,
+                selector: None,
+            },
+            crate::cli::command_source::Durability::Logged,
+        ))
         .unwrap();
         let mut open = true;
         let mut out = Vec::new();

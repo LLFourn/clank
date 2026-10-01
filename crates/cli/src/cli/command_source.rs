@@ -154,10 +154,16 @@ impl Seen {
 /// Clank creates it and NEVER reads it. Whatever cursor, cache or
 /// baseline a backend needs lives here, which is the counterpart of
 /// clank no longer holding a resume point on its behalf.
-pub(crate) fn backend_state_dir(
-    agent_dir: &std::path::Path,
-    src: &clank_core::agent_config::CommandSource,
-) -> std::path::PathBuf {
+/// Takes the RESOLVED ownership key — the same one that names the log,
+/// the lease and the index — and not the source's own. A `--event`
+/// source scoped away from the author's configured one would otherwise
+/// still share its private directory: a configured `deploys` producer
+/// and a CLI `deploys` producer would run at once on separate logs and
+/// one `CLANK_SOURCE_STATE_DIR`, where a stateful backend can consume
+/// the other invocation's cursor or overwrite its cache and lose an
+/// event before it ever reaches the isolated log (codex on 03cc11f).
+/// One key owns every piece of a source's state.
+pub(crate) fn backend_state_dir(agent_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
     // The SOURCE KEY, not a slug of the name. A slug is lossy the
     // same way it was for the key — `ci/deploy` and `ci-deploy`
     // collide, and two backends would share one private cache — and
@@ -165,7 +171,7 @@ pub(crate) fn backend_state_dir(
     // to the agent directory itself (codex 1948041). The key is
     // `command-<slug>-<hash>`, which is a single safe component by
     // construction.
-    agent_dir.join("sources").join(src.source_key())
+    agent_dir.join("sources").join(key)
 }
 
 /// One line of a producer's stdout, as the wire carries it.
@@ -488,6 +494,32 @@ pub(crate) fn apply(
     }
 }
 
+/// Re-apply the fields a row carries only when PRESENTED.
+///
+/// Neither of these is in the log, and for the same reason: both are
+/// facts about where a row is being read from rather than about the
+/// row. A command event's ack selector is derived from its log and
+/// sequence. A github watch's `prompt` is stamped at presentation and
+/// deliberately kept OUT of the WAL bytes, so editing the watch
+/// retitles events already logged — which also means a backlog
+/// replayed straight from the log reaches the agent with its
+/// instructions missing unless they are put back here (codex on
+/// 09a9cc8).
+pub(crate) fn stamp_presentation(
+    item: &mut clank_core::wait::WaitItem,
+    source_key: &str,
+    seq: u64,
+    prompt: Option<&str>,
+) {
+    match item {
+        clank_core::wait::WaitItem::CommandEvent { .. } => stamp_selector(item, source_key, seq),
+        clank_core::wait::WaitItem::GithubEvent { instructions, .. } => {
+            *instructions = prompt.map(str::to_string);
+        }
+        _ => {}
+    }
+}
+
 /// Tell a presented event how to be acked.
 ///
 /// Stamped here rather than stored, exactly as github stamps a
@@ -502,6 +534,102 @@ pub(crate) fn stamp_selector(item: &mut clank_core::wait::WaitItem, source_key: 
     if let clank_core::wait::WaitItem::CommandEvent { selector, .. } = item {
         *selector = Some(crate::cli::events::Selector::qualified(source_key, seq).to_string());
     }
+}
+
+/// Where a source's durable state lives — log, ingest lease and index.
+///
+/// A CONFIG source is an AUTHOR's: one key, shared by every reader of
+/// that author, which is exactly what lets one holder own the producer
+/// and every other reader tail its log.
+///
+/// A `--event` source belongs to ONE INVOCATION, and
+/// `CommandSource::source_key` is derived from the NAME alone — so a
+/// CLI `deploys` and a configured `deploys` would share a log and a
+/// lease. With a monitor permanently holding that lease, the
+/// invocation's task tails the monitor's log and never runs the
+/// command it was given; and two invocations of the same name for one
+/// author would receive each other's events (codex on a135276). The
+/// invocation goes in the key, so neither can happen.
+pub(crate) fn storage_key(
+    key: String,
+    origin: crate::cli::github::supervisor::SourceOrigin,
+    invocation: &str,
+) -> String {
+    use crate::cli::github::supervisor::SourceOrigin;
+    match origin {
+        SourceOrigin::Config => key,
+        SourceOrigin::Cli => format!("{key}-inv-{invocation}"),
+    }
+}
+
+/// Whether the event an emission describes is in its source's log.
+///
+/// CARRIED, never inferred. A reader that presents from the log has to
+/// know, and only the producer does — it is the one that saw the
+/// append succeed or fail. Two rounds were spent trying to infer it
+/// and both failed for different reasons (codex on 0555c8f, aa3d9a5):
+/// a durable emission is not even EQUAL to its stored row, because
+/// presentation is stamped after the append; and absence from the log
+/// proves nothing anyway, since an acked row is compacted away, a
+/// reconfigured source stops being scanned, and a read can simply
+/// fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// The log holds it, so the log decides who is owed it and when.
+    /// A reader presenting from the log must not deliver this copy
+    /// beside it.
+    Logged,
+    /// The append failed and the source emitted anyway — github warns
+    /// once and keeps delivering so the agent still learns about the
+    /// event — so this copy is the only record there will ever be.
+    Transient,
+}
+
+/// An emitted item, and whether its log holds it.
+pub(crate) type Emission = (clank_core::wait::WaitItem, Durability);
+
+/// What a client is owed from a source's durable log.
+///
+/// `shown` is PER CLIENT, and that is the whole point. When a parked
+/// wait owned its own producer, "what has been presented" and "what
+/// this agent has seen" were the same set, because the process was
+/// both. A monitor outlives every client, so a set it kept for itself
+/// would mean a client admitted later is told nothing about rows
+/// logged before it arrived — the backlog silently dropped at exactly
+/// the moment an agent comes back.
+///
+/// So exactly-once is per CLIENT ADMISSION, not per row for all time.
+/// An unacked row is owed to each client that has not been shown it;
+/// being shown to a client that then died is not being handled, and
+/// only a durable ack retires a row.
+///
+/// The `shown` key carries the SOURCE as well, so one set per client
+/// is correct however many sources that client has: a `(seq, ident)`
+/// pair belongs to one WAL, and two sources numbering from 1 would
+/// otherwise suppress each other's first rows (codex on 09a9cc8).
+/// Scoping that a caller has to remember is scoping a caller gets
+/// wrong, so the identity carries it instead.
+///
+/// Pure over the rows so the decision is testable without a producer,
+/// a lease, or a log on disk.
+pub(crate) fn owed_from_log(
+    rows: Vec<crate::cli::github::log::EventRow>,
+    source_key: &str,
+    prompt: Option<&str>,
+    shown: &mut std::collections::HashSet<(String, u64, String)>,
+) -> Vec<clank_core::wait::WaitItem> {
+    let mut owed = Vec::new();
+    for row in rows {
+        // An acked row is finished with, whoever acked it. A row this
+        // client has already been handed is not owed twice.
+        if row.acked || !shown.insert((source_key.to_string(), row.seq, row.ident.clone())) {
+            continue;
+        }
+        let mut item = row.item;
+        stamp_presentation(&mut item, source_key, row.seq, prompt);
+        owed.push(item);
+    }
+    owed
 }
 
 /// Report that a source cannot stay up — unless an earlier report is
@@ -1162,7 +1290,7 @@ mod tests {
     #[test]
     fn the_backend_state_dir_is_distinct_and_contained() {
         let agent = std::path::Path::new("/a/.clank/agents/claude");
-        let at = |n: &str| backend_state_dir(agent, &src_named(n));
+        let at = |n: &str| backend_state_dir(agent, &src_named(n).source_key());
 
         // Names that slug alike still get their own directory.
         assert_ne!(at("ci/deploy"), at("ci-deploy"));
@@ -1797,6 +1925,227 @@ mod producer_tests {
             pgid: 4242,
             started: WHEN.into(),
         }
+    }
+
+    /// One logged row, with only the fields this decision reads.
+    fn row(seq: u64, ident: &str, acked: bool) -> crate::cli::github::log::EventRow {
+        crate::cli::github::log::EventRow {
+            seq,
+            at: 0,
+            event_at: None,
+            transport: crate::cli::github::log::Transport::Command,
+            acked,
+            baseline: false,
+            ident: ident.into(),
+            feed_id: None,
+            action_key: None,
+            item: clank_core::wait::WaitItem::CommandEvent {
+                name: "deploys".into(),
+                id: ident.into(),
+                event: "deploys".into(),
+                content: ident.into(),
+                at: None,
+                failure: false,
+                selector: None,
+            },
+        }
+    }
+
+    fn selectors(items: &[clank_core::wait::WaitItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                clank_core::wait::WaitItem::CommandEvent { selector, .. } => {
+                    selector.clone().unwrap_or_default()
+                }
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A client admitted LATER is owed the backlog, and a second client
+    /// is owed it too.
+    ///
+    /// The failure this excludes is the monitor keeping one `shown` set
+    /// for itself: the first client would drain the backlog and every
+    /// client after it would be told nothing about rows logged before
+    /// it arrived — which is every agent that reconnects.
+    #[test]
+    fn each_client_is_owed_the_unacked_backlog_once() {
+        let logged = || vec![row(1, "a", false), row(2, "b", true), row(3, "c", false)];
+
+        let mut first = std::collections::HashSet::new();
+        let owed = owed_from_log(logged(), "deploys", None, &mut first);
+        assert_eq!(
+            selectors(&owed),
+            vec!["deploys@1", "deploys@3"],
+            "unacked only, and each stamped with the selector its ack needs"
+        );
+
+        // The same client again: nothing, because it has been shown
+        // them and only an ACK retires a row.
+        assert!(owed_from_log(logged(), "deploys", None, &mut first).is_empty());
+
+        // A client admitted later, with a set of its own: owed the same
+        // backlog. Being shown to somebody else is not being handled.
+        let mut second = std::collections::HashSet::new();
+        assert_eq!(
+            selectors(&owed_from_log(logged(), "deploys", None, &mut second)),
+            vec!["deploys@1", "deploys@3"],
+        );
+
+        // And once the row IS acked, nobody is owed it — not even a
+        // client that never saw it.
+        let acked = vec![row(1, "a", true), row(2, "b", true), row(3, "c", true)];
+        let mut third = std::collections::HashSet::new();
+        assert!(owed_from_log(acked, "deploys", None, &mut third).is_empty());
+    }
+
+    /// A github row replayed from the log gets its instructions back.
+    ///
+    /// The WAL stores none — the watch's prompt is stamped at
+    /// presentation so that editing the watch retitles events already
+    /// logged — so a backlog handed straight to an agent would arrive
+    /// with the operator's instructions missing.
+    #[test]
+    fn a_replayed_github_row_is_stamped_with_the_watchs_prompt() {
+        let github = |seq: u64| crate::cli::github::log::EventRow {
+            seq,
+            at: 0,
+            event_at: None,
+            transport: crate::cli::github::log::Transport::Poll,
+            acked: false,
+            baseline: false,
+            ident: format!("i{seq}"),
+            feed_id: None,
+            action_key: None,
+            item: clank_core::wait::WaitItem::GithubEvent {
+                repo: "o/n".into(),
+                event: "pr_opened".into(),
+                detail: None,
+                number: Some(7),
+                title: None,
+                actor: None,
+                url: None,
+                // As the log holds it: never stored, so never read back.
+                instructions: None,
+                content: None,
+            },
+        };
+        let instructions = |items: &[clank_core::wait::WaitItem]| -> Vec<Option<String>> {
+            items
+                .iter()
+                .map(|i| match i {
+                    clank_core::wait::WaitItem::GithubEvent { instructions, .. } => {
+                        instructions.clone()
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut shown = std::collections::HashSet::new();
+        assert_eq!(
+            instructions(&owed_from_log(
+                vec![github(1)],
+                "prs",
+                Some("triage and reply"),
+                &mut shown
+            )),
+            vec![Some("triage and reply".to_string())],
+        );
+
+        // And a promptless watch stamps nothing rather than something
+        // empty, which is what keeps its WAL bytes byte-stable.
+        let mut other = std::collections::HashSet::new();
+        assert_eq!(
+            instructions(&owed_from_log(vec![github(1)], "prs", None, &mut other)),
+            vec![None],
+        );
+    }
+
+    /// Two sources both numbering from 1 do not suppress each other.
+    ///
+    /// A `(seq, ident)` pair belongs to ONE log. A client with several
+    /// sources keeps one set, so the source has to be part of the
+    /// identity — otherwise the second source's first row looks like
+    /// the first source's first row and is silently never delivered.
+    #[test]
+    fn one_set_per_client_still_separates_its_sources() {
+        let mut shown = std::collections::HashSet::new();
+        assert_eq!(
+            selectors(&owed_from_log(
+                vec![row(1, "a", false)],
+                "deploys",
+                None,
+                &mut shown
+            )),
+            vec!["deploys@1"]
+        );
+        assert_eq!(
+            selectors(&owed_from_log(
+                vec![row(1, "a", false)],
+                "builds",
+                None,
+                &mut shown
+            )),
+            vec!["builds@1"],
+            "the same seq and ident in ANOTHER log is another row"
+        );
+        // And within one source it is still suppressed.
+        assert!(owed_from_log(vec![row(1, "a", false)], "deploys", None, &mut shown).is_empty());
+    }
+
+    /// A row that reappears under the same seq and ident is the same
+    /// row, not a second one.
+    #[test]
+    fn a_replayed_row_is_not_owed_twice() {
+        let mut shown = std::collections::HashSet::new();
+        assert_eq!(
+            owed_from_log(vec![row(7, "x", false)], "d", None, &mut shown).len(),
+            1
+        );
+        assert!(owed_from_log(vec![row(7, "x", false)], "d", None, &mut shown).is_empty());
+        // A different ident at the same seq is a different row, which
+        // is why the pair and not the seq is the key.
+        assert_eq!(
+            owed_from_log(vec![row(7, "y", false)], "d", None, &mut shown).len(),
+            1
+        );
+    }
+
+    /// A `--event` source does not share a namespace with a configured
+    /// one, nor with another invocation of the same name.
+    ///
+    /// `CommandSource::source_key` is derived from the NAME alone, so
+    /// a CLI `deploys` and a configured `deploys` would own the same
+    /// log and the same ingest lease. With a monitor permanently
+    /// holding that lease, the invocation's task tails the monitor's
+    /// log and never runs the command it was given — and two
+    /// invocations of one name for one author would receive each
+    /// other's events (codex on a135276).
+    #[test]
+    fn an_invocations_source_owns_its_own_namespace() {
+        use crate::cli::github::supervisor::SourceOrigin;
+        let named = "command-deploys-1234abcd".to_string();
+
+        assert_eq!(
+            storage_key(named.clone(), SourceOrigin::Config, "whatever"),
+            named,
+            "an author's configured source is shared by every reader of \
+             that author, which is what lets one hold and the rest tail"
+        );
+
+        let one = storage_key(named.clone(), SourceOrigin::Cli, "inv-1");
+        let two = storage_key(named.clone(), SourceOrigin::Cli, "inv-2");
+        assert_ne!(one, named, "and an invocation's is not the configured one");
+        assert_ne!(one, two, "nor another invocation's of the same name");
+        assert_eq!(
+            one,
+            storage_key(named, SourceOrigin::Cli, "inv-1"),
+            "while being stable for the invocation that owns it, so its \
+             own rows stay ackable and discoverable"
+        );
     }
 
     #[test]

@@ -13,7 +13,6 @@
 //! coordinator.
 
 use clank_core::agent_config::GithubSource;
-use clank_core::wait::WaitItem;
 
 use super::ci::CiReader;
 use super::feed::{
@@ -77,7 +76,7 @@ pub(crate) struct Coordinator {
     keys: SeenSet,
     baseline_done: bool,
     buffered: std::collections::VecDeque<Classified>,
-    tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     /// The write-ahead sink: every gate decision lands here BEFORE any
     /// emission (github-offline-catchup). Disabled for sources without
     /// a persistence dir.
@@ -87,12 +86,14 @@ pub(crate) struct Coordinator {
 impl Coordinator {
     /// Test convenience: a coordinator with no persistence.
     #[cfg(test)]
-    pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<WaitItem>) -> Self {
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    ) -> Self {
         Self::with_wal(tx, crate::cli::github::log::SharedWal::disabled())
     }
 
     pub(crate) fn with_wal(
-        tx: tokio::sync::mpsc::UnboundedSender<WaitItem>,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
         wal: crate::cli::github::log::SharedWal,
     ) -> Self {
         Self {
@@ -137,14 +138,18 @@ impl Coordinator {
             }
             self.keys.extend([k.clone()]);
         }
-        self.wal.inbox(
+        // The WRITE's outcome rides along: a reader presenting from
+        // the log cannot work out whether this one is in it, and the
+        // existing behaviour on a failed append is to warn once and
+        // keep delivering so the agent still learns about the event.
+        let durability = self.wal.inbox(
             transport,
             c.feed_id.as_deref(),
             c.key.as_deref(),
             c.event_at,
             &c.item,
         );
-        self.tx.send(c.item).is_ok()
+        self.tx.send((c.item, durability)).is_ok()
     }
 
     /// A classified wake from the POLL path.
@@ -217,7 +222,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     checks: ChecksSide<'_, C>,
-    tx: &tokio::sync::mpsc::UnboundedSender<WaitItem>,
+    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
     mut relay: Option<std::sync::Arc<RelayInbox>>,
     mut log: Option<crate::cli::github::log::EventLog>,
     suppress_backlog: std::collections::HashSet<(u64, String)>,
@@ -309,7 +314,14 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
             if !row_in_scope(src, &entry.item) {
                 continue;
             }
-            if tx.send(entry.item.clone()).is_err() {
+            // Read back OUT of the log, so the log has it.
+            if tx
+                .send((
+                    entry.item.clone(),
+                    crate::cli::command_source::Durability::Logged,
+                ))
+                .is_err()
+            {
                 return; // wait gone
             }
         }
@@ -598,6 +610,7 @@ async fn drain_relay_window(
 mod tests {
     use super::*;
     use crate::cli::github::ci;
+    use clank_core::wait::WaitItem;
     // The session's fakes live with the session; these two tests
     // drive the FETCHER over it, so they stay here — and so does
     // their own fake, which speaks the session's response type.
@@ -670,7 +683,7 @@ mod tests {
             .await
             .expect("poll-only recovery")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = item else {
+        let (WaitItem::GithubEvent { number, .. }, _) = item else {
             unreachable!()
         };
         assert_eq!(number, Some(7));
@@ -717,7 +730,7 @@ mod tests {
         // and the backlog drains through the gate: 1 drops, 5 emits.
         assert!(c.baseline(vec![classified(1, Some("issue_opened#1"))]));
         let emitted = rx.try_recv().expect("the genuinely-new action");
-        let WaitItem::GithubEvent { number, .. } = emitted else {
+        let (WaitItem::GithubEvent { number, .. }, _) = emitted else {
             unreachable!()
         };
         assert_eq!(number, Some(5));
@@ -736,7 +749,7 @@ mod tests {
         }
         assert!(c.baseline(vec![]));
         let mut got = Vec::new();
-        while let Ok(item) = rx.try_recv() {
+        while let Ok((item, _)) = rx.try_recv() {
             let WaitItem::GithubEvent { number, .. } = item else {
                 unreachable!()
             };
@@ -866,7 +879,7 @@ mod tests {
             .await
             .expect("an event is emitted within a few ticks")
             .expect("channel open");
-        match item {
+        match item.0 {
             WaitItem::GithubEvent { number, .. } => assert_eq!(number, Some(2)),
             other => panic!("expected the new event, got {other:?}"),
         }
@@ -910,12 +923,15 @@ mod tests {
             .await
             .expect("the new head's failure wakes")
             .expect("channel open");
-        let WaitItem::GithubEvent {
-            event,
-            number,
-            title,
-            ..
-        } = item
+        let (
+            WaitItem::GithubEvent {
+                event,
+                number,
+                title,
+                ..
+            },
+            _,
+        ) = item
         else {
             panic!("a github event");
         };
@@ -965,7 +981,7 @@ mod tests {
             .await
             .expect("the feed still wakes")
             .expect("channel open");
-        match item {
+        match item.0 {
             WaitItem::GithubEvent { number, .. } => assert_eq!(number, Some(2)),
             other => panic!("expected the feed's event, got {other:?}"),
         }
@@ -1014,7 +1030,7 @@ mod tests {
             .await
             .expect("the build's wake does not wait on the feed")
             .expect("channel open");
-        let WaitItem::GithubEvent { event, title, .. } = item else {
+        let (WaitItem::GithubEvent { event, title, .. }, _) = item else {
             panic!("a github event");
         };
         assert_eq!(event, "ci_failed");
@@ -1064,7 +1080,7 @@ mod tests {
             .await
             .expect("a conclusion does not wait on the actor filter")
             .expect("channel open");
-        let WaitItem::GithubEvent { event, actor, .. } = item else {
+        let (WaitItem::GithubEvent { event, actor, .. }, _) = item else {
             panic!("a github event");
         };
         assert_eq!(event, "ci_failed");
@@ -1224,7 +1240,7 @@ mod tests {
             .await
             .expect("the CHANGED conclusion wakes")
             .expect("open");
-        let WaitItem::GithubEvent { title, .. } = item else {
+        let (WaitItem::GithubEvent { title, .. }, _) = item else {
             panic!("a github event");
         };
         assert_eq!(
@@ -1323,7 +1339,7 @@ mod tests {
             .expect("open");
         handle.abort();
         let _ = handle.await;
-        let WaitItem::GithubEvent { number, .. } = item else {
+        let (WaitItem::GithubEvent { number, .. }, _) = item else {
             panic!("a github event");
         };
         assert_eq!(
@@ -1385,7 +1401,7 @@ mod tests {
         let _ = handle.await;
 
         let mut numbers = Vec::new();
-        while let Ok(item) = rx.try_recv() {
+        while let Ok((item, _)) = rx.try_recv() {
             if let WaitItem::GithubEvent { number, .. } = item {
                 numbers.push(number);
             }
@@ -1483,7 +1499,7 @@ mod tests {
             .await
             .expect("the event missed while away still wakes after an upgrade")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = woke else {
+        let (WaitItem::GithubEvent { number, .. }, _) = woke else {
             panic!("a github event");
         };
         assert_eq!(number, Some(2));
@@ -1554,7 +1570,7 @@ mod tests {
             1,
             "only the first tick's fetch — a cue does not re-poll the events feed",
         );
-        let WaitItem::GithubEvent { event, title, .. } = item else {
+        let (WaitItem::GithubEvent { event, title, .. }, _) = item else {
             panic!("a github event");
         };
         assert_eq!(event, "ci_failed");
@@ -1842,7 +1858,7 @@ mod tests {
             .await
             .expect("the webhook emits once the empty baseline is done")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = relayed else {
+        let (WaitItem::GithubEvent { number, .. }, _) = relayed else {
             panic!("a github event");
         };
         assert_eq!(number, Some(4));
@@ -1891,7 +1907,7 @@ mod tests {
             .await
             .expect("an event after an empty baseline is delivered, not re-baselined")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = woke else {
+        let (WaitItem::GithubEvent { number, .. }, _) = woke else {
             panic!("a github event");
         };
         assert_eq!(number, Some(9));
@@ -1961,7 +1977,7 @@ mod tests {
             .await
             .expect("the event that arrived after an empty baseline is catch-up")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = woke else {
+        let (WaitItem::GithubEvent { number, .. }, _) = woke else {
             panic!("a github event");
         };
         assert_eq!(number, Some(9));
@@ -2041,7 +2057,7 @@ mod tests {
             .await
             .expect("an upgrade from a relay-only log keeps its catch-up")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = woke else {
+        let (WaitItem::GithubEvent { number, .. }, _) = woke else {
             panic!("a github event");
         };
         assert_eq!(number, Some(9));
@@ -2137,7 +2153,7 @@ mod tests {
         // Arm 1's CI wake was never acked, so it re-presents here —
         // that is the at-least-once backlog, not the webhook.
         let mut seen = Vec::new();
-        while let Ok(item) = rx.try_recv() {
+        while let Ok((item, _)) = rx.try_recv() {
             let WaitItem::GithubEvent { event, .. } = &item else {
                 continue;
             };
@@ -2324,7 +2340,7 @@ mod tests {
             .await
             .expect("the first conclusion after an empty read is news")
             .expect("open");
-        assert!(matches!(item, WaitItem::GithubEvent { .. }));
+        assert!(matches!(item.0, WaitItem::GithubEvent { .. }));
         run2.abort();
         let _ = run2.await;
     }
@@ -2455,7 +2471,7 @@ mod tests {
             .await
             .expect("a foreign event emits once the filter is established")
             .expect("channel open");
-        match item {
+        match item.0 {
             // ONLY the foreign new event (id 3) — never the own id 1.
             WaitItem::GithubEvent { number, .. } => assert_eq!(number, Some(3)),
             other => panic!("expected the foreign event, got {other:?}"),
@@ -2632,7 +2648,7 @@ mod tests {
             .await
             .expect("the relay delivery emits")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = first else {
+        let (WaitItem::GithubEvent { number, .. }, _) = first else {
             unreachable!()
         };
         assert_eq!(number, Some(2), "relay latency path");
@@ -2642,7 +2658,7 @@ mod tests {
             .await
             .expect("the poll-only action emits")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = second else {
+        let (WaitItem::GithubEvent { number, .. }, _) = second else {
             unreachable!()
         };
         assert_eq!(number, Some(3), "the poll's copy of #2 was suppressed");
@@ -2717,7 +2733,7 @@ mod tests {
             let mut got = Vec::new();
             while got.len() < expect {
                 let Some(item) = rx.recv().await else { break };
-                let WaitItem::GithubEvent { number, .. } = item else {
+                let (WaitItem::GithubEvent { number, .. }, _) = item else {
                     unreachable!()
                 };
                 got.push(number.unwrap());
@@ -2827,7 +2843,7 @@ mod tests {
             .await
             .expect("the loop out-lives the relay and still polls")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = item else {
+        let (WaitItem::GithubEvent { number, .. }, _) = item else {
             unreachable!()
         };
         assert_eq!(number, Some(7));
@@ -2945,14 +2961,14 @@ mod tests {
             .await
             .expect("the missed event must wake the second run")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = &woke else {
+        let (WaitItem::GithubEvent { number, .. }, _) = &woke else {
             unreachable!()
         };
         assert_eq!(*number, Some(2), "only the NEW event emits, not history");
         // WAL-first: the emitted event is durably unhandled.
         let loaded = open_log(&dir).load();
         assert_eq!(loaded.unhandled.len(), 1);
-        assert_eq!(loaded.unhandled[0].item, woke, "byte-faithful record");
+        assert_eq!(loaded.unhandled[0].item, woke.0, "byte-faithful record");
         run2.abort();
         let _ = run2.await;
     }
@@ -3003,7 +3019,7 @@ mod tests {
             .await
             .expect("backlog wakes the arm")
             .expect("open");
-        assert_eq!(woke, classified(9, Some("issue#9")).item);
+        assert_eq!(woke.0, classified(9, Some("issue#9")).item);
         run.abort();
         let _ = run.await;
 
@@ -3085,7 +3101,7 @@ mod tests {
             .await
             .expect("the baseline must establish and drain the buffered relay delivery")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = &first else {
+        let (WaitItem::GithubEvent { number, .. }, _) = &first else {
             unreachable!()
         };
         assert_eq!(*number, Some(5), "the buffered relay delivery drained");
@@ -3093,7 +3109,7 @@ mod tests {
             .await
             .expect("the post-baseline delta emits")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = &second else {
+        let (WaitItem::GithubEvent { number, .. }, _) = &second else {
             unreachable!()
         };
         assert_eq!(*number, Some(2));
@@ -3253,7 +3269,7 @@ mod tests {
             .await
             .expect("the new event emits once")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = &woke else {
+        let (WaitItem::GithubEvent { number, .. }, _) = &woke else {
             unreachable!()
         };
         assert_eq!(*number, Some(2));
@@ -3313,7 +3329,7 @@ mod tests {
             .await
             .expect("relay emits")
             .expect("open");
-        let WaitItem::GithubEvent { number, .. } = &first else {
+        let (WaitItem::GithubEvent { number, .. }, _) = &first else {
             unreachable!()
         };
         assert_eq!(*number, Some(2));
