@@ -79,6 +79,15 @@ pub enum Command {
     /// reads no inbox and no session binding, leaves no durable
     /// record, and fails rather than guess which pane it meant.
     Nudge(crate::cli::NudgeArgs),
+    /// Watch a repo once, for every waiter
+    ///
+    /// A repo was being watched once per WAITER: every parked
+    /// `clank wait` attached its own filesystem watcher and refolded
+    /// the whole repo on each change, as did every `clank tui`. The
+    /// monitor does it once and hands each waiter what its author is
+    /// owed. Delivery does not move — a waiter still speaks its own
+    /// adapter's protocol.
+    Monitor(crate::cli::MonitorArgs),
     /// Print the repo timeline: commits, reviews, github events
     ///
     /// Chronological and newest-first, with github events interleaved
@@ -265,6 +274,7 @@ pub async fn dispatch_with(
         Command::Events(args) => crate::cli::events::run(args).await,
         Command::Send(args) => crate::cli::send::run(args),
         Command::Nudge(args) => crate::cli::nudge::run(args),
+        Command::Monitor(args) => crate::cli::monitor::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::StopHook(args) => crate::cli::stop_hook::run(args).await,

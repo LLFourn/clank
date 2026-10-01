@@ -1292,3 +1292,1106 @@ mod tests {
         );
     }
 }
+
+/// What a producer recorded about the child it spawned, so a successor
+/// can RECOGNISE it before signalling anything.
+///
+/// A command source's child runs in its own process group with a
+/// `GroupKill` guard, which covers every orderly end. It does not
+/// cover SIGKILL: the guard never runs, the group is reparented to
+/// init, and the user's command goes on running. The next owner of
+/// this source is the only thing in a position to notice, and it can
+/// only notice what was written down.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Producer {
+    /// The child is its own group leader (`process_group(0)`), so this
+    /// is both its pid and its group.
+    pub(crate) pgid: i32,
+    /// When that pid began, as the system reports it.
+    ///
+    /// The INCARNATION, which is what makes a pid an identity. A pid
+    /// alone is a number the kernel re-issues; `argv[0]` was tried and
+    /// is wrong in both directions — a recycled pid running another
+    /// copy of the same command matches, and the ordinary
+    /// `sh -c '<cmd>'` form EXECS, so the live process reports the
+    /// exec'd name and the producer stops recognising its own child
+    /// (codex on 697807a). A start time survives exec and separates
+    /// incarnations, which is exactly the pair of properties needed.
+    pub(crate) started: String,
+}
+
+/// What the system says about a live process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Observed {
+    pub(crate) pgid: i32,
+    pub(crate) started: String,
+}
+
+/// What looking for a pid found.
+///
+/// `Gone` and `Unknown` must not be the same answer: a pid that has
+/// provably exited makes its record spent, while a look that FAILED
+/// says nothing at all — and forgetting the record on a failed look
+/// discards the only evidence that an orphan exists (codex on
+/// 697807a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Look {
+    Alive(Observed),
+    Gone,
+    Unknown,
+}
+
+/// A process group id that is safe to address.
+///
+/// `kill(-1, …)` is POSIX for "every process this user may signal",
+/// not group 1, and `kill(0, …)` is the caller's own group. Both are
+/// catastrophic to reach by accident, and a validating `if` inside the
+/// signalling function was NOT enough: a mutation check deleted that
+/// `if`, the run was interrupted before it restored the file, and the
+/// test written to prove the guard worked — which called
+/// `signal_group(1, SIGKILL)` — then ran `kill(-1, SIGKILL)` and took
+/// down a developer's entire login session, twice.
+///
+/// So the rule lives in the type, where there is no statement to
+/// delete and no test has to issue a real signal to check it:
+/// `signal_group(1, …)` does not compile, and the only way to obtain
+/// one of these is through a constructor that refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Pgid(i32);
+
+impl Pgid {
+    /// `None` for the ids that do not name a group we may address.
+    pub(crate) fn new(pgid: i32) -> Option<Self> {
+        (pgid > 1).then_some(Self(pgid))
+    }
+
+    pub(crate) fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Pgid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Whether anything remains in a recorded process group.
+///
+/// The GROUP is what a producer owns, what gets signalled, and
+/// therefore what has to be empty before a replacement may start. The
+/// leader's absence does not answer this: a `sh -c` that backgrounds
+/// something exits while that descendant keeps running in the same
+/// group, and a check that looked only at the leader would call the
+/// record spent, skip the escalation, and start a second producer
+/// beside the survivor (codex on 14ab92e).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Group {
+    Empty,
+    Occupied,
+    Unknown,
+}
+
+/// Whether a live process is the same INCARNATION that was recorded.
+///
+/// Identity only. Whether it may be signalled is a separate question
+/// with a separate answer — conflating them let "this pid is somebody
+/// else's now" and "this is ours and still running" reach the same
+/// conclusion (codex on 14ab92e).
+pub(crate) fn same_incarnation(record: &Producer, seen: &Observed) -> bool {
+    !record.started.is_empty() && seen.pgid == record.pgid && seen.started == record.started
+}
+
+/// Where a source records its producer, beside that source's log.
+pub(crate) fn producer_path(store_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
+    store_dir.join(format!("{key}.producer"))
+}
+
+/// Note that `pgid` is this source's producer, for a successor to find.
+///
+/// Written through a temp file and renamed, because this is RECOVERY
+/// evidence: a truncating write interrupted by the very SIGKILL this
+/// exists to survive would leave a record that parses as nothing.
+/// Returns what went wrong, since a producer that cannot be recorded
+/// is one the caller must end rather than run.
+pub(crate) fn record_producer(
+    store_dir: &std::path::Path,
+    key: &str,
+    pgid: i32,
+    started: &str,
+) -> std::io::Result<()> {
+    let record = Producer {
+        pgid,
+        started: started.to_string(),
+    };
+    let body = serde_json::to_vec(&record)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let path = producer_path(store_dir, key);
+    let tmp = path.with_extension("producer.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Forget it, because it has been dealt with or ended cleanly.
+pub(crate) fn clear_producer(store_dir: &std::path::Path, key: &str) {
+    let _ = std::fs::remove_file(producer_path(store_dir, key));
+}
+
+/// Ask the system about one pid.
+///
+/// Death is settled by `kill(pid, 0)` and never by `ps`: a failed
+/// query is not evidence of absence, and on this platform even a
+/// missing pid writes to stderr, so no amount of reading `ps`'s
+/// output distinguishes "gone" from "that question did not work"
+/// (codex on 8d3d669). `ESRCH` does distinguish it, in one syscall,
+/// with nothing to parse.
+///
+/// `ps` is then asked only for the DETAILS — a start time, which macOS
+/// offers no `/proc` for and `libc` exposes only through `sysctl` with
+/// a different shape per platform.
+///
+/// `lstart` is compared as an opaque string, normalised only for the
+/// padding `ps` adds. Both sides go through this same function, so a
+/// format this build does not anticipate makes the comparison FAIL,
+/// and a failed comparison signals nothing — which is the direction to
+/// be wrong in.
+pub(crate) fn look(pid: i32) -> Look {
+    if pid <= 0 {
+        // Not a process: 0 is our own group and -1 is every process.
+        return Look::Gone;
+    }
+    // SAFETY: signal 0 checks for the process without delivering one.
+    if unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return Look::Gone;
+    }
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "pgid=,lstart=", "-p"])
+        .arg(pid.to_string())
+        .output()
+    else {
+        return Look::Unknown;
+    };
+    if !out.status.success() {
+        return Look::Unknown;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.split_whitespace();
+    let Some(Ok(pgid)) = parts.next().map(str::parse) else {
+        return Look::Unknown;
+    };
+    let started = parts.collect::<Vec<_>>().join(" ");
+    if started.is_empty() {
+        return Look::Unknown;
+    }
+    Look::Alive(Observed { pgid, started })
+}
+
+/// Whether a process group still has members.
+///
+/// `kill(-pgid, 0)` asks the kernel directly, which is the group-level
+/// counterpart of the `ESRCH` check above and needs no enumeration.
+/// `EPERM` counts as OCCUPIED: it means the group exists and is
+/// somebody else's, which is every reason not to call it empty.
+pub(crate) fn group_of(pgid: Pgid) -> Group {
+    // SAFETY: a negative pid addresses the process group; `Pgid` has
+    // already refused the ids for which that would mean something else,
+    // and signal 0 only checks for the group rather than delivering.
+    let rc = unsafe { libc::kill(-pgid.get(), 0) };
+    group_from((rc != 0).then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))
+}
+
+/// Read a `kill(-pgid, 0)` outcome, with `None` meaning it succeeded.
+///
+/// Separated from the call so that `EPERM` — a group that exists and
+/// belongs to somebody else — is reachable without another user's
+/// process to point at, which a test has no way to arrange.
+fn group_from(errno: Option<i32>) -> Group {
+    match errno {
+        None => Group::Occupied,
+        Some(e) if e == libc::ESRCH => Group::Empty,
+        Some(e) if e == libc::EPERM => Group::Occupied,
+        Some(_) => Group::Unknown,
+    }
+}
+
+/// When a live pid began, for recording a producer we just spawned.
+pub(crate) fn started_at(pid: i32) -> Option<String> {
+    match look(pid) {
+        Look::Alive(o) => Some(o.started),
+        _ => None,
+    }
+}
+
+/// What the recorded group IS, from its leader and its occupancy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// Nothing remains. The record is spent.
+    Gone,
+    /// Still ours, and still ours to end.
+    Ours,
+    /// The id names another group now — which means ours ENDED, since
+    /// the id could not have been reused otherwise.
+    Theirs,
+    /// Members remain and there is no leader to identify them by.
+    ///
+    /// NOT a synonym for ours. The kernel only promises that an id is
+    /// not reused while that group still has members; it says nothing
+    /// about whether THIS group has been alive continuously since the
+    /// record was written. So these members may be a stranger's: our
+    /// group ended, the number was later re-issued, and that group's
+    /// leader exited too, leaving its own descendants (codex on
+    /// aef11a3). Signalling them would be 49dec39's catastrophe in
+    /// miniature, so this earns no signal — and, because it is equally
+    /// no evidence that our producer has ended, no replacement either.
+    Unidentified,
+    /// Could not be established.
+    Unsure,
+}
+
+/// Decide a recorded group's standing.
+///
+/// The LEADER is the only thing that identifies a group, because its
+/// incarnation is the only part of a group that was ever written down.
+/// The kernel's guarantee — an id is not reused while its group still
+/// has members — is what makes that identity meaningful, but it does
+/// NOT bridge a gap in observation. A record read hours later cannot
+/// tell "our group, leader exited, descendants remain" from "our group
+/// ended, the number was re-issued, that group's leader exited too,
+/// its descendants remain". Both read as a missing leader over an
+/// occupied group, and only one of them is ours to kill.
+///
+/// So a missing leader buys nothing: that is `Unidentified`, which
+/// earns neither a signal nor a replacement.
+pub(crate) fn standing(record: &Producer, leader: &Look, group: &Group) -> Standing {
+    match (leader, group) {
+        (Look::Unknown, _) | (_, Group::Unknown) => Standing::Unsure,
+        (Look::Alive(seen), _) if !same_incarnation(record, seen) => Standing::Theirs,
+        (Look::Alive(_), Group::Occupied) => Standing::Ours,
+        // A live leader over an empty group cannot both be true.
+        (Look::Alive(_), Group::Empty) => Standing::Unsure,
+        (Look::Gone, Group::Empty) => Standing::Gone,
+        (Look::Gone, Group::Occupied) => Standing::Unidentified,
+    }
+}
+
+/// Whether a source may start a producer yet.
+///
+/// A RESULT, not a courtesy. The whole point of retiring the previous
+/// owner's child is that a second one must not run beside it, so the
+/// outcome has to reach the decision it exists to gate — and
+/// `record_producer` would overwrite the only evidence of the first
+/// one on its way past (codex on 8d3d669).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Retired {
+    /// The recorded group is empty. Launch.
+    Clear,
+    /// It may still have members, or its state could not be
+    /// established. Its record is kept, the backlog keeps being
+    /// presented, and the launch waits for a later look.
+    Deferred(String),
+}
+
+/// End a previous owner's producer, if one is still running.
+///
+/// Called by whoever has just taken this source's ingest lease, which
+/// means the previous owner is gone — a lease is held for the life of
+/// its process. What may survive it is the process GROUP, and starting
+/// a second producer beside it is how a SIGKILLed monitor's command
+/// sources accumulate.
+///
+/// The LEASE is the entitlement to signal, not the orphan's parentage.
+/// An earlier version demanded `ppid == 1`, which is what an orphan
+/// looks like here but NOT on a Linux session with a subreaper, where
+/// orphans reparent to the session manager instead. That would have
+/// left such a group forever unsignalled and so forever deferred —
+/// the source never running again — in exchange for a guarantee the
+/// lease already gives.
+pub(crate) fn reap_previous_producer(store_dir: &std::path::Path, key: &str) -> Retired {
+    reap_previous_producer_with(
+        store_dir,
+        key,
+        look,
+        group_of,
+        signal_group,
+        ESCALATE_AFTER,
+        std::time::Instant::now,
+    )
+}
+
+/// How long a producer is given to end on a `SIGTERM` before `SIGKILL`.
+pub(crate) const ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long an identification stays good enough to escalate on when
+/// the leader has since gone.
+///
+/// Generous against the `ESCALATE_AFTER` sleep and tight against pid
+/// reuse, which needs the allocator to walk the whole pid space. The
+/// measurement is what matters, not the number: a process that was
+/// stopped or starved resumes with the sleep "finished" and an
+/// arbitrary amount of the world's time elapsed, and only a clock
+/// notices (codex on 1d90b9b).
+pub(crate) const IDENTIFICATION_KEEPS: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether an escalation may still be sent.
+///
+/// `sleep` gives a MINIMUM delay and never a maximum gap in
+/// observation. Two things therefore have to hold, and the old code
+/// checked neither: the leader must not have been replaced by a
+/// different live one, and the identification must not have aged out
+/// while this process was not running.
+pub(crate) fn may_escalate(
+    seen: &Standing,
+    since_identified: std::time::Duration,
+    keeps: std::time::Duration,
+) -> bool {
+    match seen {
+        // The same leader is still there, so the identity is current
+        // rather than remembered. Nothing needs to be assumed.
+        Standing::Ours => true,
+        // The leader went while members remain. Ours only if little
+        // enough of the world has happened for the id to still be
+        // ours — which is the claim a clock can check and a sleep
+        // cannot.
+        Standing::Unidentified => since_identified <= keeps,
+        // A different live leader means the id is already somebody
+        // else's; the rest are no evidence at all.
+        Standing::Theirs | Standing::Gone | Standing::Unsure => false,
+    }
+}
+
+/// [`reap_previous_producer`] with the system calls supplied, so the
+/// whole decision is reachable without a process to kill — a test that
+/// signalled a real group would be a test that can kill this machine's
+/// own processes whenever the decision under test is wrong.
+pub(crate) fn reap_previous_producer_with(
+    store_dir: &std::path::Path,
+    key: &str,
+    look: impl Fn(i32) -> Look,
+    group_of: impl Fn(Pgid) -> Group,
+    signal: impl Fn(Pgid, libc::c_int),
+    escalate_after: std::time::Duration,
+    clock: impl Fn() -> std::time::Instant,
+) -> Retired {
+    let path = producer_path(store_dir, key);
+    let record = match std::fs::read(&path) {
+        Ok(body) => match serde_json::from_slice::<Producer>(&body) {
+            Ok(record) => record,
+            // Evidence that cannot be read is UNKNOWN prior state, not
+            // absence, and a launch would overwrite it. The rename in
+            // `record_producer` should make this unreachable; if it is
+            // ever reached, the path is named so it can be dealt with.
+            Err(e) => {
+                return Retired::Deferred(format!(
+                    "{} is not a usable producer record ({e}); remove it if no producer \
+                     is running",
+                    path.display()
+                ));
+            }
+        },
+        // The ordinary first launch: nothing was ever recorded.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Retired::Clear,
+        Err(e) => {
+            return Retired::Deferred(format!("cannot read {} ({e})", path.display()));
+        }
+    };
+    // Validated BEFORE anything is looked at or signalled, and the
+    // validation is what the rest of this function then carries: a
+    // record naming one of the special ids cannot have come from
+    // `record_producer` — a child's pid is never 0 or 1 — so it is
+    // evidence from somewhere else, and nothing here will act on it.
+    let Some(pgid) = Pgid::new(record.pgid) else {
+        return Retired::Deferred(format!(
+            "{} names pgid {}, which is not a process group; remove it",
+            path.display(),
+            record.pgid
+        ));
+    };
+
+    let now = |record: &Producer| standing(record, &look(pgid.get()), &group_of(pgid));
+    let spent = || {
+        let _ = std::fs::remove_file(&path);
+        Retired::Clear
+    };
+
+    match now(&record) {
+        Standing::Gone | Standing::Theirs => return spent(),
+        Standing::Unsure => {
+            return Retired::Deferred(format!(
+                "cannot tell what has become of the previous producer's group (pgid {pgid})"
+            ));
+        }
+        Standing::Unidentified => {
+            return Retired::Deferred(format!(
+                "pgid {pgid} has members but no leader to identify them by, so they may not \
+                 be this source's — neither signalling them nor replacing them is safe; \
+                 remove {} once you have established what they are",
+                path.display()
+            ));
+        }
+        Standing::Ours => {}
+    }
+
+    // IDENTIFIED, and the moment of it is recorded rather than assumed.
+    let identified_at = clock();
+    eprintln!("wait: command source `{key}` left a producer behind (pgid {pgid}); ending it");
+    signal(pgid, libc::SIGTERM);
+    std::thread::sleep(escalate_after);
+
+    // Looked at AGAIN, leader included: the term may have ended the
+    // leader while a descendant ignored it, and it may equally have
+    // ended the whole group and let the id be re-issued. Occupancy
+    // alone cannot tell those apart, and the gap is MEASURED rather
+    // than assumed to be the sleep.
+    let seen = now(&record);
+    if may_escalate(
+        &seen,
+        clock().saturating_duration_since(identified_at),
+        IDENTIFICATION_KEEPS,
+    ) {
+        signal(pgid, libc::SIGKILL);
+        std::thread::sleep(escalate_after);
+    }
+
+    match now(&record) {
+        Standing::Gone | Standing::Theirs => spent(),
+        Standing::Ours | Standing::Unidentified => Retired::Deferred(format!(
+            "the previous producer's group (pgid {pgid}) is still running"
+        )),
+        Standing::Unsure => Retired::Deferred(format!(
+            "cannot tell whether the previous producer's group (pgid {pgid}) has ended"
+        )),
+    }
+}
+
+/// Signal a whole process group, so a producer's own children go too.
+///
+/// No validation here, and none needed: [`Pgid`] carries the proof,
+/// and a guard at this boundary is exactly the thing that turned out
+/// to be deletable.
+fn signal_group(pgid: Pgid, sig: libc::c_int) {
+    // SAFETY: a negative pid addresses the process group; the signal is
+    // valid and has no memory effects.
+    unsafe {
+        libc::kill(-pgid.get(), sig);
+    }
+}
+
+#[cfg(test)]
+mod producer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const WHEN: &str = "Thu 1 Oct 16:58:08 2026";
+
+    fn record() -> Producer {
+        Producer {
+            pgid: 4242,
+            started: WHEN.into(),
+        }
+    }
+
+    fn alive() -> Observed {
+        Observed {
+            pgid: 4242,
+            started: WHEN.into(),
+        }
+    }
+
+    #[test]
+    fn identity_is_the_incarnation_not_the_name() {
+        assert!(same_incarnation(&record(), &alive()));
+
+        // The case that made a NAME wrong in the permissive direction:
+        // a pid re-issued to another copy of the same command. There
+        // is no name here to be fooled by, and the start time differs.
+        assert!(
+            !same_incarnation(
+                &record(),
+                &Observed {
+                    started: "Thu 1 Oct 17:04:00 2026".into(),
+                    ..alive()
+                }
+            ),
+            "a recycled pid is a different incarnation, same command or not"
+        );
+        assert!(
+            !same_incarnation(
+                &record(),
+                &Observed {
+                    pgid: 77,
+                    ..alive()
+                }
+            ),
+            "it must still lead the group we recorded"
+        );
+        assert!(
+            !same_incarnation(
+                &Producer {
+                    started: String::new(),
+                    ..record()
+                },
+                &Observed {
+                    started: String::new(),
+                    ..alive()
+                }
+            ),
+            "and an unknown start time is not an identity, even when the \
+             live process reports one just as empty"
+        );
+    }
+
+    /// `ps` output this build cannot read must not read as death.
+    #[test]
+    fn an_unreadable_look_is_unknown_and_an_absent_pid_is_gone() {
+        let me = std::process::id() as i32;
+        let Look::Alive(seen) = look(me) else {
+            panic!("this process is running")
+        };
+        assert!(!seen.started.is_empty(), "{seen:?}");
+        assert_eq!(
+            look(me),
+            Look::Alive(seen),
+            "and the same look twice gives the same incarnation"
+        );
+        assert_eq!(look(0), Look::Gone, "pid 0 is not a process to find");
+
+        // A pid that really has gone, in range and once real. Death is
+        // settled by `ESRCH` and not by reading `ps`, whose failure for
+        // an absent pid is indistinguishable from its failure for a
+        // query it did not understand — on this platform both exit
+        // non-zero and both write to stderr.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id() as i32;
+        child.wait().unwrap();
+        assert_eq!(
+            look(dead),
+            Look::Gone,
+            "an exited pid must read as gone, not as a failed look"
+        );
+        assert_eq!(
+            group_of(Pgid::new(dead).expect("a real pid is a real group")),
+            Group::Empty,
+            "and so must its group"
+        );
+    }
+
+    #[test]
+    fn our_own_group_is_occupied() {
+        // SAFETY: a plain query, no memory effects.
+        let mine = unsafe { libc::getpgid(0) };
+        assert_eq!(
+            group_of(Pgid::new(mine).expect("we are in a real group")),
+            Group::Occupied
+        );
+    }
+
+    /// The special ids cannot be addressed, because they cannot be
+    /// CONSTRUCTED.
+    ///
+    /// Asserted on the constructor and never by signalling: the test
+    /// this replaces called `signal_group(1, SIGKILL)` to show the
+    /// guard held, which meant its safety depended on the very code it
+    /// was checking. A mutation run deleted that guard, was interrupted
+    /// before restoring it, and the test then issued
+    /// `kill(-1, SIGKILL)` — every process this user may signal —
+    /// twice. There is nothing to delete here, and nothing is sent.
+    #[test]
+    fn a_special_id_is_not_a_group_that_can_be_addressed() {
+        assert_eq!(Pgid::new(1), None, "`kill(-1, …)` is every process");
+        assert_eq!(Pgid::new(0), None, "`kill(0, …)` is our own group");
+        assert_eq!(Pgid::new(-1), None);
+        assert_eq!(Pgid::new(-4242), None);
+        assert_eq!(Pgid::new(2).map(Pgid::get), Some(2), "and 2 is a group");
+        assert_eq!(Pgid::new(4242).map(Pgid::get), Some(4242));
+    }
+
+    #[test]
+    fn a_group_we_may_not_signal_is_not_an_empty_one() {
+        assert_eq!(group_from(None), Group::Occupied);
+        assert_eq!(group_from(Some(libc::ESRCH)), Group::Empty);
+        assert_eq!(
+            group_from(Some(libc::EPERM)),
+            Group::Occupied,
+            "it exists and is somebody else's, which is every reason not \
+             to call it empty"
+        );
+        assert_eq!(
+            group_from(Some(libc::EINVAL)),
+            Group::Unknown,
+            "and an answer we do not understand is not absence"
+        );
+    }
+
+    #[test]
+    fn only_a_live_leader_identifies_a_group() {
+        let live = Look::Alive(alive());
+        let stranger = Look::Alive(Observed {
+            started: "Thu 1 Oct 17:04:00 2026".into(),
+            ..alive()
+        });
+
+        assert_eq!(standing(&record(), &live, &Group::Occupied), Standing::Ours);
+        assert_eq!(
+            standing(&record(), &Look::Gone, &Group::Empty),
+            Standing::Gone
+        );
+        assert_eq!(
+            standing(&record(), &Look::Gone, &Group::Occupied),
+            Standing::Unidentified,
+            "members with no leader to identify them by are not ours by \
+             default: our group may have ended long ago and the number \
+             been re-issued to a group whose leader has also exited"
+        );
+        assert_eq!(
+            standing(&record(), &stranger, &Group::Occupied),
+            Standing::Theirs,
+            "a live leader of another incarnation means the id was reused, \
+             which could only happen after ours ended"
+        );
+        assert_eq!(
+            standing(&record(), &stranger, &Group::Empty),
+            Standing::Theirs
+        );
+        assert_eq!(
+            standing(&record(), &live, &Group::Empty),
+            Standing::Unsure,
+            "a live leader in an empty group is not something to act on"
+        );
+        for group in [Group::Empty, Group::Occupied, Group::Unknown] {
+            assert_eq!(
+                standing(&record(), &Look::Unknown, &group),
+                Standing::Unsure
+            );
+        }
+        assert_eq!(
+            standing(&record(), &live, &Group::Unknown),
+            Standing::Unsure
+        );
+    }
+
+    /// Scripted observations, so a sequence can be driven.
+    ///
+    /// The leader and the group are scripted SEPARATELY, because the
+    /// code asks them separately: the escalation probes the group
+    /// alone, on the strength of an identification it already made. A
+    /// script that runs out repeats its last answer, so a test lists
+    /// only the observations it cares about.
+    fn reap_over(
+        dir: &std::path::Path,
+        looks: Vec<Look>,
+        groups: Vec<Group>,
+    ) -> (Retired, Vec<(i32, libc::c_int)>) {
+        // A clock that does not move: the attempt is as prompt as the
+        // sleep claims, which is the ordinary case.
+        reap_over_taking(dir, looks, groups, Duration::ZERO)
+    }
+
+    /// [`reap_over`] with the time this attempt actually took.
+    ///
+    /// Injected, because the hazard is precisely that `sleep` reports a
+    /// minimum and the world supplies the maximum — a stopped process
+    /// resumes with its sleep "over" and an arbitrary gap behind it.
+    /// A test cannot wait that out and must not try.
+    fn reap_over_taking(
+        dir: &std::path::Path,
+        looks: Vec<Look>,
+        groups: Vec<Group>,
+        took: Duration,
+    ) -> (Retired, Vec<(i32, libc::c_int)>) {
+        let started = std::time::Instant::now();
+        let reads = std::cell::Cell::new(0u32);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            // The first read is the identification; every one after it
+            // is the gap being measured.
+            if reads.get() <= 1 {
+                started
+            } else {
+                started + took
+            }
+        };
+        let looks = std::cell::RefCell::new((looks.into_iter(), Look::Unknown));
+        let groups = std::cell::RefCell::new((groups.into_iter(), Group::Unknown));
+        let sent = std::cell::RefCell::new(Vec::new());
+        let out = reap_previous_producer_with(
+            dir,
+            "src-1",
+            |_| {
+                let mut s = looks.borrow_mut();
+                if let Some(next) = s.0.next() {
+                    s.1 = next;
+                }
+                s.1.clone()
+            },
+            |_| {
+                let mut s = groups.borrow_mut();
+                if let Some(next) = s.0.next() {
+                    s.1 = next;
+                }
+                s.1.clone()
+            },
+            // Recorded as plain numbers, so an assertion about what was
+            // signalled names the GROUP without the type in the way.
+            |pgid, sig| sent.borrow_mut().push((pgid.get(), sig)),
+            std::time::Duration::ZERO,
+            clock,
+        );
+        (out, sent.into_inner())
+    }
+
+    #[test]
+    fn a_recorded_orphan_is_terminated_then_killed_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+
+        let (out, sent) = reap_over(
+            dir.path(),
+            vec![Look::Alive(alive()), Look::Gone],
+            vec![Group::Occupied, Group::Occupied, Group::Empty],
+        );
+        assert_eq!(
+            sent,
+            vec![(4242, libc::SIGTERM), (4242, libc::SIGKILL)],
+            "gently first: it is the user's own command and may have \
+             state worth flushing"
+        );
+        assert_eq!(out, Retired::Clear, "and the launch is authorised");
+        assert!(
+            !producer_path(dir.path(), "src-1").exists(),
+            "the record goes, so a successor does not signal it again"
+        );
+    }
+
+    /// The shell exits on the `SIGTERM` and a descendant it
+    /// backgrounded ignores it.
+    ///
+    /// The escalation asks about the GROUP rather than the leader —
+    /// sound because the group was IDENTIFIED moments earlier in this
+    /// same attempt, and a pid is not re-issued inside a fraction of a
+    /// second. A cold record carries no such bound, which is why one
+    /// whose leader is already gone is refused instead.
+    #[test]
+    fn a_descendant_that_outlives_its_leader_is_still_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+
+        let (out, sent) = reap_over(
+            dir.path(),
+            // Identified, then the leader goes while the group does not.
+            vec![Look::Alive(alive()), Look::Gone],
+            vec![Group::Occupied, Group::Occupied, Group::Empty],
+        );
+        assert_eq!(
+            sent,
+            vec![(4242, libc::SIGTERM), (4242, libc::SIGKILL)],
+            "a leader that exited on the term must not spare the group"
+        );
+        assert_eq!(out, Retired::Clear, "and the source may run again");
+    }
+
+    /// A group that outlasts the kill defers rather than replacing.
+    #[test]
+    fn a_group_that_will_not_end_withholds_the_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+
+        let (out, sent) = reap_over(
+            dir.path(),
+            vec![Look::Alive(alive())],
+            vec![Group::Occupied],
+        );
+        assert_eq!(sent, vec![(4242, libc::SIGTERM), (4242, libc::SIGKILL)]);
+        assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
+        assert!(
+            producer_path(dir.path(), "src-1").exists(),
+            "and the record stays: the group it names is still running"
+        );
+    }
+
+    /// A replacement leader appearing between the term and the
+    /// escalation cancels it.
+    ///
+    /// The escalation used to ask only whether the group was occupied,
+    /// so a live leader with an obviously different start time was not
+    /// read until AFTER the kill had been sent — to that leader's
+    /// group (codex on 1d90b9b).
+    #[test]
+    fn a_replacement_leader_between_the_term_and_the_kill_cancels_it() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+
+        let (out, sent) = reap_over(
+            dir.path(),
+            vec![
+                Look::Alive(alive()),
+                // Our group ended and the number is already somebody
+                // else's, with a leader that says so.
+                Look::Alive(Observed {
+                    started: "Thu 1 Oct 17:04:00 2026".into(),
+                    ..alive()
+                }),
+            ],
+            vec![Group::Occupied],
+        );
+        assert_eq!(
+            sent,
+            vec![(4242, libc::SIGTERM)],
+            "only the term: the id belongs to another group now"
+        );
+        assert_eq!(out, Retired::Clear, "and ours must therefore have ended");
+    }
+
+    /// An attempt that took arbitrarily long does not escalate on
+    /// occupancy alone.
+    ///
+    /// `sleep(200ms)` is a MINIMUM. A process stopped between the term
+    /// and the escalation resumes with its sleep over and any amount of
+    /// the world's time behind it, by which point the id may name a
+    /// group it never owned. Only a measured gap notices, and when the
+    /// identification has aged out this fails closed.
+    #[test]
+    fn an_attempt_that_took_too_long_does_not_escalate() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+
+        let (out, sent) = reap_over_taking(
+            dir.path(),
+            // Identified, then the leader is gone and members remain —
+            // which is the one case that rests on the gap being short.
+            vec![Look::Alive(alive()), Look::Gone],
+            vec![Group::Occupied],
+            IDENTIFICATION_KEEPS + Duration::from_millis(1),
+        );
+        assert_eq!(
+            sent,
+            vec![(4242, libc::SIGTERM)],
+            "the identification aged out, so no kill may follow it"
+        );
+        assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
+        assert!(
+            producer_path(dir.path(), "src-1").exists(),
+            "and nothing is replaced on evidence that expired"
+        );
+
+        // The same observations, promptly, DO escalate — so it is the
+        // elapsed time deciding and not the shape of the sequence.
+        let (out, sent) = reap_over_taking(
+            dir.path(),
+            vec![Look::Alive(alive()), Look::Gone],
+            vec![Group::Occupied, Group::Occupied, Group::Empty],
+            IDENTIFICATION_KEEPS,
+        );
+        assert_eq!(sent, vec![(4242, libc::SIGTERM), (4242, libc::SIGKILL)]);
+        assert_eq!(out, Retired::Clear);
+    }
+
+    /// The escalation decision, on its own.
+    #[test]
+    fn only_a_current_identity_or_a_fresh_one_may_escalate() {
+        let keeps = Duration::from_secs(1);
+        let prompt = Duration::from_millis(10);
+        let late = keeps + Duration::from_millis(1);
+
+        // A leader that is still ours needs no freshness argument.
+        assert!(may_escalate(&Standing::Ours, late, keeps));
+        // A leaderless group rests entirely on one.
+        assert!(may_escalate(&Standing::Unidentified, prompt, keeps));
+        assert!(may_escalate(&Standing::Unidentified, keeps, keeps));
+        assert!(!may_escalate(&Standing::Unidentified, late, keeps));
+        // And the rest are not evidence at all.
+        for s in [Standing::Theirs, Standing::Gone, Standing::Unsure] {
+            assert!(!may_escalate(&s, prompt, keeps), "{s:?}");
+        }
+    }
+
+    /// A STALE record over a re-issued group whose leader has ALSO
+    /// ended: members, no leader, and none of it ours.
+    ///
+    /// The sequence the "an id is not reused while its group has
+    /// members" guarantee does not cover — it bounds reuse during a
+    /// lifetime, not the gap since a record was written. Our group
+    /// ended, the number went to a group we know nothing about, and
+    /// that group's leader exited too. What remains looks exactly like
+    /// our own surviving descendants, and killing it would be killing
+    /// a stranger's processes (codex on aef11a3).
+    #[test]
+    fn a_recycled_group_whose_leader_also_ended_is_never_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+
+        let (out, sent) = reap_over(dir.path(), vec![Look::Gone], vec![Group::Occupied]);
+        assert!(
+            sent.is_empty(),
+            "nothing identifies these members as ours, so nothing may be sent"
+        );
+        assert!(
+            matches!(out, Retired::Deferred(_)),
+            "and being unable to identify them is not permission to \
+             replace them either: {out:?}"
+        );
+        assert!(
+            producer_path(dir.path(), "src-1").exists(),
+            "the record stays, and says what to do about it"
+        );
+        let Retired::Deferred(why) = out else {
+            unreachable!()
+        };
+        assert!(why.contains("no leader to identify them by"), "{why}");
+    }
+
+    #[test]
+    fn nothing_is_signalled_for_a_group_that_is_not_ours() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No record at all: the ordinary first launch.
+        let (out, sent) = reap_over(dir.path(), vec![], vec![]);
+        assert!(sent.is_empty());
+        assert_eq!(out, Retired::Clear);
+
+        // A record whose group has provably gone.
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        let (out, sent) = reap_over(dir.path(), vec![Look::Gone], vec![Group::Empty]);
+        assert!(sent.is_empty(), "a group that has ended needs no signal");
+        assert_eq!(out, Retired::Clear);
+        assert!(!producer_path(dir.path(), "src-1").exists());
+
+        // A live leader of another incarnation: the id was reused, so
+        // ours ended, and whatever is in that group now is theirs.
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        let (out, sent) = reap_over(
+            dir.path(),
+            vec![Look::Alive(Observed {
+                started: "Thu 1 Oct 17:04:00 2026".into(),
+                ..alive()
+            })],
+            vec![Group::Occupied],
+        );
+        assert!(sent.is_empty(), "a recycled id must never be signalled");
+        assert_eq!(out, Retired::Clear);
+
+        // A look that FAILED keeps the record AND withholds the
+        // launch: the record is the only evidence the group exists,
+        // and a launch would overwrite it on its way past.
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        let (out, sent) = reap_over(dir.path(), vec![Look::Unknown], vec![Group::Empty]);
+        assert!(sent.is_empty());
+        assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
+        assert!(producer_path(dir.path(), "src-1").exists());
+
+        // A group whose state cannot be established, likewise.
+        let (out, _) = reap_over(dir.path(), vec![Look::Gone], vec![Group::Unknown]);
+        assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
+        assert!(producer_path(dir.path(), "src-1").exists());
+    }
+
+    /// A record naming a special id is refused before anything is
+    /// looked at, let alone signalled.
+    ///
+    /// `kill(-1, …)` is every process this user may signal rather than
+    /// group 1, and `record_producer` cannot write such a record — a
+    /// child's pid is never 0 or 1 — so reaching this means evidence
+    /// that did not come from here, and the only safe response is to
+    /// touch nothing.
+    #[test]
+    fn a_record_naming_a_special_id_signals_nothing() {
+        for pgid in [1i32, 0, -1] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                producer_path(dir.path(), "src-1"),
+                serde_json::to_vec(&Producer {
+                    pgid,
+                    started: WHEN.into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            let looked = std::cell::Cell::new(false);
+            let sent = std::cell::RefCell::new(Vec::new());
+            let out = reap_previous_producer_with(
+                dir.path(),
+                "src-1",
+                |_| {
+                    looked.set(true);
+                    Look::Alive(Observed {
+                        pgid,
+                        started: WHEN.into(),
+                    })
+                },
+                |_| Group::Occupied,
+                |pgid, sig| sent.borrow_mut().push((pgid, sig)),
+                std::time::Duration::ZERO,
+                std::time::Instant::now,
+            );
+            assert!(sent.borrow().is_empty(), "pgid {pgid} was signalled");
+            assert!(!looked.get(), "pgid {pgid} was not even worth looking at");
+            assert!(matches!(out, Retired::Deferred(_)), "pgid {pgid}: {out:?}");
+        }
+    }
+
+    /// Unreadable evidence is unknown prior state, not absence.
+    #[test]
+    fn evidence_that_cannot_be_read_withholds_the_launch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Malformed, which the rename should make unreachable — but if
+        // it is ever reached, overwriting it is the one thing that
+        // must not happen.
+        std::fs::write(producer_path(dir.path(), "src-1"), b"not json").unwrap();
+        let (out, sent) = reap_over(dir.path(), vec![], vec![]);
+        assert!(sent.is_empty());
+        assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
+        assert!(
+            producer_path(dir.path(), "src-1").exists(),
+            "an unusable record is kept, and the message names it"
+        );
+        let Retired::Deferred(why) = out else {
+            unreachable!()
+        };
+        assert!(why.contains("src-1.producer"), "{why}");
+
+        // A read that fails for any other reason — here, a DIRECTORY
+        // where the record belongs — is not absence either.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(producer_path(other.path(), "src-1")).unwrap();
+        let (out, sent) = reap_over(other.path(), vec![], vec![]);
+        assert!(sent.is_empty());
+        assert!(
+            matches!(out, Retired::Deferred(_)),
+            "a read that failed is not a first launch: {out:?}"
+        );
+    }
+
+    /// Published through a rename, since this is the evidence that has
+    /// to survive the SIGKILL it exists for: a truncating write caught
+    /// mid-flight would leave a record that parses as nothing.
+    ///
+    /// The atomicity itself is NOT what this asserts — a write
+    /// interrupted mid-flight cannot be provoked from a test here, and
+    /// a mutation to a plain `fs::write` survives. What is asserted is
+    /// what can be: the record round-trips, no temp file is left
+    /// behind, and a publication that fails says so instead of
+    /// pretending.
+    #[test]
+    fn a_record_is_published_whole_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        let back: Producer =
+            serde_json::from_slice(&std::fs::read(producer_path(dir.path(), "src-1")).unwrap())
+                .unwrap();
+        assert_eq!(back, record());
+        assert!(
+            !producer_path(dir.path(), "src-1")
+                .with_extension("producer.tmp")
+                .exists(),
+            "and the temp file does not linger"
+        );
+
+        // An unwritable directory is reported, not swallowed: the
+        // caller decides whether to run an unrecorded producer.
+        let gone = dir.path().join("not-there");
+        assert!(record_producer(&gone, "src-1", 4242, WHEN).is_err());
+    }
+}

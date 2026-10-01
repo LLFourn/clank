@@ -160,7 +160,7 @@ async fn run_forwarder_process(mut cmd: tokio::process::Command) -> String {
         Ok(c) => c,
         Err(e) => return format!("failed to start: {e}"),
     };
-    let _group = crate::cli::wait::GroupKill(child.id());
+    let _group = crate::cli::wait::GroupKill::over(child.id());
     let mut stderr = child.stderr.take();
     let mut tail = crate::cli::wait::RingTail::new(4096);
     let mut buf = [0u8; 1024];

@@ -438,24 +438,42 @@ fn pick_url(said: &str, wanted: Option<&str>) -> Option<String> {
         .find(|url| wanted.is_none_or(|w| url.contains(w)))
 }
 
-/// Whether any process of the group is left, zombies included.
-fn group_alive(group: i32) -> bool {
-    // SAFETY: signal 0 checks existence and sends nothing.
-    unsafe { libc::killpg(group, 0) == 0 }
+/// A process group id that is safe to address.
+///
+/// `killpg(0, …)` signals the CALLER'S OWN group — in a test binary,
+/// the whole session that ran it — and `killpg(1, …)` is not ours to
+/// touch either. Both are one bad number away from a catastrophe, and
+/// a validating `if` inside the signalling function is a statement
+/// that can be deleted. So the rule lives in the type: `signal_group`
+/// cannot be handed a number at all, and the only way to obtain one of
+/// these is a constructor that refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pgid(i32);
+
+impl Pgid {
+    fn new(group: i32) -> Option<Self> {
+        (group > 1).then_some(Self(group))
+    }
 }
 
-fn signal_group(group: i32, signal: i32) {
+/// Whether any process of the group is left, zombies included.
+fn group_alive(group: Pgid) -> bool {
+    // SAFETY: signal 0 checks existence and sends nothing.
+    unsafe { libc::killpg(group.0, 0) == 0 }
+}
+
+fn signal_group(group: Pgid, signal: i32) {
     // SAFETY: signalling a process group this process created; no
-    // memory effects.
-    unsafe { libc::killpg(group, signal) };
+    // memory effects. `Pgid` has already refused the ids for which
+    // `killpg` would mean something other than that group.
+    unsafe { libc::killpg(group.0, signal) };
 }
 
 impl Handle for CommandHandle {
     fn stop(self: Box<Self>) -> BoxFuture<'static, Option<String>> {
         Box::pin(async move {
             let mut this = *self;
-            if let Some(pid) = this.child.id() {
-                let group = pid as i32;
+            if let Some(group) = this.child.id().and_then(|pid| Pgid::new(pid as i32)) {
                 signal_group(group, libc::SIGTERM);
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), this.child.wait())
                     .await;
@@ -501,8 +519,7 @@ impl Drop for CommandHandle {
     /// that was spawned and leaves a wrapper's forwarding child and
     /// its pipes behind (codex on 49e387f).
     fn drop(&mut self) {
-        if let Some(pid) = self.child.id() {
-            let group = pid as i32;
+        if let Some(group) = self.child.id().and_then(|pid| Pgid::new(pid as i32)) {
             signal_group(group, libc::SIGTERM);
             let gone = std::time::Instant::now() + std::time::Duration::from_millis(500);
             while group_alive(group) && std::time::Instant::now() < gone {

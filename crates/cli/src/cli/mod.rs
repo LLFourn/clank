@@ -33,6 +33,7 @@ pub mod init;
 pub mod js_guard;
 pub mod log;
 pub(crate) mod message;
+pub mod monitor;
 pub mod nudge;
 pub mod open;
 pub mod open_zellij;
@@ -680,6 +681,26 @@ pub enum WaitFor {
     /// The repo came to a stop-point: a plan finalized OR a new
     /// unanswered block appeared (someone needs the human).
     Stopped,
+}
+
+/// `clank monitor`: one watcher per repo.
+#[derive(Args, Debug)]
+pub struct MonitorArgs {
+    #[command(subcommand)]
+    pub command: MonitorCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum MonitorCmd {
+    /// Watch this repo once, for every waiter.
+    Start(MonitorStartArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorStartArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 /// `clank nudge`, addressed exactly like `clank send` so the escape

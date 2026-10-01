@@ -1415,10 +1415,14 @@ pub(crate) fn watch_status_paths(
     tx: mpsc::Sender<()>,
     repo: &Path,
 ) -> anyhow::Result<StatusWatchers> {
-    // Gate state comes from the SHARED core watcher (the same producer
-    // `clank wait` uses), so the panel and the stop-hook wake on the
-    // same changes. `status` is always native (no poll mode).
-    let core = crate::repo_watch::RepoStateWatcher::attach(repo, false, tx.clone())?;
+    // Gate state comes from the repo's MONITOR when one is running —
+    // one watcher and one fold for the whole repo, which is the point
+    // of `a-repo-is-watched-once-not-once-per-waiter`: this panel used
+    // to attach a watcher of its own alongside one per parked wait.
+    // With no monitor it attaches that watcher itself, so the panel
+    // behaves the same either way. `status` is always native (no poll
+    // mode).
+    let core = crate::cli::monitor::core_wakes(repo, tx.clone())?;
     let diff = watch_diff_paths(tx, repo)?;
     Ok(StatusWatchers {
         _core: core,
@@ -1431,7 +1435,11 @@ pub(crate) fn watch_status_paths(
 /// watcher feeds dirty/diff. They send on one channel; the loop's
 /// nothing-changed gate ([`InputSignature`]) coalesces.
 pub(crate) struct StatusWatchers {
-    _core: crate::repo_watch::RepoStateWatcher,
+    /// The shared fold, or a watcher of our own — see
+    /// [`crate::cli::monitor::core_wakes`].
+    _core: crate::cli::monitor::CoreWakes,
+    /// Kept local on purpose: the monitor has no reason to compute a
+    /// diff, and nothing but this panel wants one.
     _diff: RecommendedWatcher,
 }
 
