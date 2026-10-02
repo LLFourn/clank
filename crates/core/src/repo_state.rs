@@ -6,7 +6,7 @@
 //! plan intro clears them. A commit is attributed to a plan by its
 //! `[plan]` tag or by touching the plan file — nothing is inherited.
 //! `warnings` holds the few facts the fold notices but doesn't act on
-//! (currently `DanglingPlanRef`).
+//! including rejected introductions and their ignored-run provenance.
 //!
 //! `apply_commit` is the single fold step: take a `CommitEvent`
 //! (built by the daemon from git_io), classify it, mutate state.
@@ -19,7 +19,7 @@
 //! are NEVER stored in `RepoState` — they are synthesized on
 //! demand by the daemon's projection layer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,10 +37,9 @@ use crate::vocab::{CommitGateState, Verdict};
     derive(wincode::SchemaWrite, wincode::SchemaRead)
 )]
 pub struct RepoState {
-    /// Active plans only. A plan exits the map on finalize (moved
-    /// to `finished_plans`) or on `TouchKind::Delete` (gone from
-    /// state entirely; see hard-forget semantics in `apply_commit`).
-    pub plans: BTreeMap<PlanKey, PlanState>,
+    /// The one accepted introduction in flight. Finalize or hard-forget
+    /// empties this slot; an overlapping introduction cannot enter it.
+    pub active_plan: Option<ActivePlan>,
 
     /// Ordered log of finalize events: "plan X was finalized at
     /// SHA Y." Body at freeze / continuer count / full historical
@@ -52,16 +51,15 @@ pub struct RepoState {
     /// intro.
     pub ad_hoc: Vec<AdHocEvent>,
 
-    /// Warnings the fold notices but doesn't act on (currently just
-    /// `DanglingPlanRef`, surfaced by projection). The classifier
-    /// itself no longer emits warnings — prefix ambiguity is caught
-    /// live at HEAD, not recorded against history.
+    /// Projection warnings and rejected-run provenance. A rejected intro stays
+    /// here until a genuine accepted intro of that name supersedes it. It must
+    /// outlive the accepting plan so later finish/delete touches cannot mutate
+    /// older finished history with the rejected name. No second active map exists.
     pub warnings: Vec<RepoWarning>,
 
     /// Has this repo ever participated in clank? Set true on the
-    /// first commit that touches any plan (intro / revise /
-    /// finalize / delete) and never cleared, even when
-    /// `PlanDeleted` removes the plan from `plans` without
+    /// first accepted plan touch and never cleared, even when
+    /// `PlanDeleted` empties the active slot without
     /// promoting it into `finished_plans`. Gate for `LogEvent::AdHoc`
     /// emission — pre-adoption code commits don't surface as
     /// ad-hoc events.
@@ -74,6 +72,17 @@ pub struct RepoState {
     /// never need to enter the clank fold.
     #[serde(default)]
     pub adopted_at: Option<CommitSha>,
+}
+
+/// Identity and timeline of the single accepted plan run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct ActivePlan {
+    pub key: PlanKey,
+    pub state: PlanState,
 }
 
 /// One active plan. Just its per-commit timeline; every other
@@ -107,7 +116,7 @@ impl PlanState {
 }
 
 /// One entry in a plan's timeline: how a single commit affected
-/// this plan. Multi-plan commits emit one event per touched plan.
+/// the accepted plan. A commit can affect only this one active timeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "cache-encoding",
@@ -137,6 +146,16 @@ pub struct FinishedPlan {
     pub plan: PlanKey,
     pub intro: CommitSha,
     pub finalized_at: CommitSha,
+    /// Author-time interval from this accepted introduction to its finalize.
+    /// Computed once when the fold closes the run; never an event's age.
+    pub duration_secs: u64,
+}
+
+/// The one definition of a plan's duration. Git author clocks may move
+/// backwards: clamp that interval to zero. i128 covers the entire difference
+/// between two i64 timestamps, whose nonnegative range fits u64 exactly.
+fn plan_duration_secs(introduced_at: i64, finalized_at: i64) -> u64 {
+    (i128::from(finalized_at) - i128::from(introduced_at)).max(0) as u64
 }
 
 /// One entry in `state.ad_hoc`.
@@ -159,8 +178,8 @@ pub struct AdHocEvent {
 )]
 pub struct RepoWarning {
     pub sha: CommitSha,
-    /// The plan a plan-scoped warning is about (`DanglingPlanRef` is
-    /// always plan-scoped). `None` is reserved for any future
+    /// The plan this warning belongs to. Both current variants are
+    /// plan-scoped; `None` is reserved for any future
     /// repo-scoped warning.
     pub plan: Option<PlanKey>,
     pub warning: Warning,
@@ -178,7 +197,7 @@ pub struct RepoWarning {
 pub enum Warning {
     /// Emitted by projection helpers when a `plan_attribution`
     /// (or `touches` key) names a plan that no longer exists in
-    /// `state.plans`. Not a fold-time warning per se — the
+    /// `state.active_plan`. Not a fold-time warning per se — the
     /// classifier doesn't know about future deletions; projection
     /// surfaces it on each affected commit.
     ///
@@ -187,6 +206,49 @@ pub enum Warning {
     /// silently and mistakes are caught live at HEAD by wait, not
     /// retroactively. adhoc-commits-and-plan-tag-validation.)
     DanglingPlanRef { plan: PlanKey },
+    /// This introduction was ignored. Its follow-up touches and tags
+    /// remain ignored until a genuine introduction into an empty slot.
+    /// This warning is scoped to the rejected run, not to the accepting
+    /// plan: finishing/deleting the latter must not revive the former.
+    RejectedPlanIntro {
+        plan: PlanKey,
+        reason: IntroRejection,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntroRejection {
+    PlanAlreadyActive {
+        active: PlanKey,
+    },
+    /// An atomic commit cannot select between several introductions.
+    MultipleIntroductions,
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DanglingPlanRef { plan } => {
+                write!(f, "plan reference `{plan}` no longer resolves")
+            }
+            Self::RejectedPlanIntro { plan, reason } => {
+                write!(f, "ignored introduction of `{plan}`: ")?;
+                match reason {
+                    IntroRejection::PlanAlreadyActive { active } => {
+                        write!(f, "`{active}` was already active")
+                    }
+                    IntroRejection::MultipleIntroductions => {
+                        write!(f, "several plans introduced in one commit")
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -214,6 +276,7 @@ pub enum LogEvent {
         subject: String,
     },
     PlanFinalized {
+        duration_secs: u64,
         plan: PlanKey,
         sha: CommitSha,
         ts: i64,
@@ -291,10 +354,10 @@ pub fn umbrella_key(event: &LogEvent) -> UmbrellaKey {
 
 /// THE umbrella rule, shared by every timeline renderer (html,
 /// `clank log --oneline`, the status TUI log pane): group
-/// CONTIGUOUS events into one section per plan. A plan interrupted
-/// by ANOTHER plan's commit opens a NEW umbrella — chronology is
-/// never reordered, so interleaved `A1 B1 A2` yields THREE sections
-/// (A, B, A), not a merged A.
+/// contiguous events into one section per accepted run. Intro and close
+/// boundaries distinguish successive runs even when a name is reused.
+/// Chronology is preserved; partial or historical event streams with
+/// different plan keys also remain separate.
 ///
 /// Ad-hoc commits (no `[plan]` tag) have NO umbrella of their own:
 /// they FOLD into the CHRONOLOGICALLY-PRECEDING plan's run (the plan
@@ -333,10 +396,15 @@ pub fn umbrella_sections<'a>(
             // (which appears BEFORE it in the stream) is NEWER than the finish
             // — it landed AFTER the plan finished and must NOT fold into it.
             // Flush the pending ad-hocs as their own header-less section first.
-            if matches!(e, LogEvent::PlanFinalized { .. }) && !pending.is_empty() {
+            if matches!(
+                e,
+                LogEvent::PlanFinalized { .. } | LogEvent::PlanDeleted { .. }
+            ) && !pending.is_empty()
+            {
                 out.push((UmbrellaKey::AdHoc, std::mem::take(&mut pending)));
             }
-            let same = matches!(out.last(), Some((k, _)) if *k == key);
+            let same = matches!(out.last(), Some((k, run))
+                if *k == key && !matches!(run.last(), Some(LogEvent::PlanIntro { .. })));
             if !same {
                 out.push((key, Vec::new()));
             }
@@ -353,8 +421,25 @@ pub fn umbrella_sections<'a>(
         for e in events {
             let key = umbrella_key(e);
             match out.last_mut() {
-                Some((_, run)) if key == UmbrellaKey::AdHoc => run.push(e),
-                Some((k, run)) if *k == key => run.push(e),
+                Some((k, run))
+                    if key == UmbrellaKey::AdHoc
+                        && (*k == UmbrellaKey::AdHoc
+                            || !matches!(
+                                run.last(),
+                                Some(LogEvent::PlanFinalized { .. } | LogEvent::PlanDeleted { .. })
+                            )) =>
+                {
+                    run.push(e)
+                }
+                Some((k, run))
+                    if *k == key
+                        && !matches!(
+                            run.last(),
+                            Some(LogEvent::PlanFinalized { .. } | LogEvent::PlanDeleted { .. })
+                        ) =>
+                {
+                    run.push(e)
+                }
                 _ => out.push((key, vec![e])),
             }
         }
@@ -403,50 +488,34 @@ pub enum TouchKind {
 // Classifier
 // ============================================================
 
-/// Classifier inputs: a commit's subject + the plans known BEFORE the
-/// commit is applied. The tag is the only signal — no touches, no
-/// active-plan hint (adhoc-commits-and-plan-tag-validation).
+/// Classify against the single accepted plan, including a just-accepted intro.
 #[derive(Debug, Clone)]
 pub struct ClassifierInputs<'a> {
     pub subject: &'a str,
-    pub known_plans: &'a BTreeSet<PlanKey>,
+    pub active_plan: Option<&'a PlanKey>,
 }
 
-/// Classifier output: which plans the commit's `[tag]` attributes it
-/// to (the known subset; empty when untagged or the tag names no
-/// known plan). `apply_commit` unions this with the commit's touches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifierOutput {
-    pub plan_attribution: BTreeSet<PlanKey>,
+    pub plan_attribution: Option<PlanKey>,
 }
 
-/// Title-prefix vocabulary: `[plan-a]` / `[plan-a,plan-b]` names the
-/// plan(s) a commit is attributed to. There is no special `[misc]` —
-/// the ad-hoc opt-in is simply NOT tagging (adhoc-commits-and-plan-tag-
-/// validation); `[misc]` parses as a one-element plan list that won't
-/// match a real plan.
+/// The first bracketed prefix names exactly one candidate, without splitting
+/// on commas. `[a,b]` is the literal invalid name `a,b`; `[a] [b] work`
+/// names `a` and leaves `[b] work` in the body. History is never rewritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TitlePrefix {
-    Plans(Vec<String>),
+    Plan(String),
 }
 
-/// A commit subject parsed into its `[prefix] body` parts.
-/// `body` is the text after a recognized prefix (with the
-/// single separating space consumed); when no prefix matched,
-/// `body` is the raw subject verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSubject<'a> {
     pub prefix: Option<TitlePrefix>,
     pub body: &'a str,
 }
 
-/// Pure subject parser. Splits a commit subject into its
-/// `[plan,...] | [misc]` prefix and the remaining body. Both
-/// renderers and the classifier go through this so prefix
-/// vocabulary lives in one place.
 pub fn parse_subject(subject: &str) -> ParsedSubject<'_> {
-    let trimmed_offset = subject.len() - subject.trim_start().len();
-    let trimmed = &subject[trimmed_offset..];
+    let trimmed = subject.trim_start();
     let Some(rest) = trimmed.strip_prefix('[') else {
         return ParsedSubject {
             prefix: None,
@@ -459,59 +528,32 @@ pub fn parse_subject(subject: &str) -> ParsedSubject<'_> {
             body: subject,
         };
     };
-    let inner = &rest[..close];
-    if inner.is_empty() {
+    let name = rest[..close].trim();
+    if name.is_empty() {
         return ParsedSubject {
             prefix: None,
             body: subject,
         };
     }
-    let names: Vec<String> = inner
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if names.is_empty() {
-        return ParsedSubject {
-            prefix: None,
-            body: subject,
-        };
-    }
-    let prefix = TitlePrefix::Plans(names);
-    // body starts after `[<inner>]`. Consume one separating
-    // space if present so callers don't have to.
-    let after = &rest[close + 1..];
-    let body = after.strip_prefix(' ').unwrap_or(after);
+    let body = &rest[close + 1..];
     ParsedSubject {
-        prefix: Some(prefix),
-        body,
+        prefix: Some(TitlePrefix::Plan(name.to_owned())),
+        body: body.strip_prefix(' ').unwrap_or(body),
     }
 }
 
-/// Pure prefix parser. Thin wrapper over [`parse_subject`]
-/// kept for callers that only need the prefix.
 pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
     parse_subject(subject).prefix
 }
 
-/// Pure classifier. Computes `plan_attribution` (a set, possibly
-/// empty) from the title prefix and active-plan hint; emits
-/// warnings for unknown / mismatched / missing prefixes;
-/// emits no warnings (history is tolerated; mistakes are caught live
-/// at HEAD by wait — adhoc-commits-and-plan-tag-validation).
-///
-/// The tag is the ONLY attribution signal: `[a,b,…]` → the subset of
-/// the named plans that are known; an untagged commit or a tag naming
-/// no known plan → `∅`. `apply_commit` then unions this with the
-/// commit's touches (plan-file edits attribute on their own).
+/// Tags attribute code only when they identify the accepted plan. Unknown
+/// tags remain tolerated in history; the HEAD gate diagnoses mistakes.
 pub fn classify(inputs: ClassifierInputs<'_>) -> ClassifierOutput {
-    let plan_attribution: BTreeSet<PlanKey> = match parse_title_prefix(inputs.subject) {
-        Some(TitlePrefix::Plans(names)) => names
-            .iter()
-            .filter_map(|n| PlanKey::parse(n).ok())
-            .filter(|k| inputs.known_plans.contains(k))
-            .collect(),
-        None => BTreeSet::new(),
+    let plan_attribution = match parse_title_prefix(inputs.subject) {
+        Some(TitlePrefix::Plan(name)) => PlanKey::parse(&name)
+            .ok()
+            .filter(|key| inputs.active_plan == Some(key)),
+        None => None,
     };
     ClassifierOutput { plan_attribution }
 }
@@ -537,152 +579,265 @@ impl RepoState {
     /// the rewrite preview walks.
     ///
     /// Says nothing about whether the plan is ALSO active — a
-    /// re-introduced plan is in both sets, and `plans` wins.
+    /// re-introduced plan has old finished records and an active run; the latter wins.
     pub fn finished_record(&self, plan: &PlanKey) -> Option<&FinishedPlan> {
         self.finished_plans.iter().find(|f| &f.plan == plan)
     }
 
-    /// Apply one `CommitEvent` to this state.
+    /// Look up the accepted timeline by identity, including historical callers
+    /// that also query finished runs. There is no alternative active container.
+    pub fn plan(&self, key: &PlanKey) -> Option<&PlanState> {
+        self.active_plan
+            .as_ref()
+            .filter(|p| &p.key == key)
+            .map(|p| &p.state)
+    }
+
+    pub(crate) fn ignored_run(&self, key: &PlanKey) -> bool {
+        self.plan(key).is_none()
+            && self.warnings.iter().any(|w| match &w.warning {
+                Warning::RejectedPlanIntro { plan, reason } if plan == key => match reason {
+                    // A duplicate intro of the occupied name cannot denote another
+                    // file/run. Warn about the commit, but keep the accepted identity
+                    // authoritative even after it finishes (including hard-forget).
+                    IntroRejection::PlanAlreadyActive { active } => active != plan,
+                    IntroRejection::MultipleIntroductions => true,
+                },
+                _ => false,
+            })
+    }
+
+    /// Shared fold/HEAD-gate disposition. Ignored work must not become either
+    /// an ad-hoc review or a tag correction that pauses the accepted run.
+    pub(crate) fn ignores_commit<'a>(
+        &self,
+        sha: &CommitSha,
+        subject: &str,
+        touched: impl IntoIterator<Item = &'a PlanKey>,
+    ) -> bool {
+        if self
+            .warnings
+            .iter()
+            .any(|w| &w.sha == sha && matches!(w.warning, Warning::RejectedPlanIntro { .. }))
+        {
+            return true;
+        }
+        let mut had_touch = false;
+        for key in touched {
+            had_touch = true;
+            if !self.ignored_run(key) {
+                return false;
+            }
+        }
+        if had_touch {
+            return true;
+        }
+        match parse_title_prefix(subject) {
+            Some(TitlePrefix::Plan(name)) => PlanKey::parse(&name)
+                .ok()
+                .is_some_and(|key| self.ignored_run(&key)),
+            None => false,
+        }
+    }
+
     pub fn apply_commit(&mut self, event: &CommitEvent) -> Vec<LogEvent> {
-        let was_adopted = self.adopted;
-        let mut log_events = Vec::new();
-        let touches: BTreeMap<PlanKey, TouchKind> = event
+        let mut intros = event
             .plan_touches
             .iter()
-            .map(|t| (t.plan.clone(), t.kind))
-            .collect();
-        // Known plans = existing active plans ∪ plans this commit
-        // introduces. Without the union, an `[foo] intro` commit sees
-        // `[foo]` as unknown and emits a spurious warning.
-        let mut known_plans: BTreeSet<PlanKey> = self.plans.keys().cloned().collect();
-        for touch in &event.plan_touches {
-            if matches!(touch.kind, TouchKind::Intro) {
-                known_plans.insert(touch.plan.clone());
-            }
-        }
-
-        let classified = classify(ClassifierInputs {
-            subject: &event.subject,
-            known_plans: &known_plans,
-        });
-
-        let mut intros_this_commit: BTreeSet<PlanKey> = BTreeSet::new();
-        let mut finished_this_commit: BTreeSet<PlanKey> = BTreeSet::new();
-
-        for touch in &event.plan_touches {
-            match touch.kind {
-                TouchKind::Intro => {
-                    self.plans
-                        .entry(touch.plan.clone())
-                        .or_insert_with(PlanState::default);
-                    intros_this_commit.insert(touch.plan.clone());
-                    self.adopted = true;
-                    log_events.push(LogEvent::PlanIntro {
-                        plan: touch.plan.clone(),
+            .filter(|t| t.kind == TouchKind::Intro);
+        let intro = intros.next();
+        let several_intros = intros.next().is_some();
+        // Reject the whole introduction commit before any lifecycle, attribution,
+        // adoption or ad-hoc mutation. The warnings are also the ignored-run
+        // provenance needed to protect an earlier finished run with the same name.
+        let rejection = if let Some(active) = &self.active_plan {
+            Some(IntroRejection::PlanAlreadyActive {
+                active: active.key.clone(),
+            })
+        } else if several_intros {
+            Some(IntroRejection::MultipleIntroductions)
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            if intro.is_some() {
+                for intro in event
+                    .plan_touches
+                    .iter()
+                    .filter(|t| t.kind == TouchKind::Intro)
+                {
+                    self.warnings.push(RepoWarning {
                         sha: event.sha.clone(),
-                        ts: event.author_ts,
-                        subject: event.subject.clone(),
+                        plan: Some(intro.plan.clone()),
+                        warning: Warning::RejectedPlanIntro {
+                            plan: intro.plan.clone(),
+                            reason: reason.clone(),
+                        },
                     });
                 }
-                TouchKind::Revise => {
-                    self.adopted = true;
-                }
-                TouchKind::Delete => {
-                    self.adopted = true;
-                    log_events.push(LogEvent::PlanDeleted {
-                        plan: touch.plan.clone(),
-                        sha: event.sha.clone(),
-                        ts: event.author_ts,
-                    });
-                    self.plans.remove(&touch.plan);
-                    self.finished_plans.retain(|f| f.plan != touch.plan);
-                    self.warnings.retain(|w| {
-                        w.plan.as_ref() != Some(&touch.plan)
-                            && !warning_mentions_plan(&w.warning, &touch.plan)
-                    });
-                }
-                TouchKind::Finish => {
-                    finished_this_commit.insert(touch.plan.clone());
-                }
+                return Vec::new();
             }
         }
 
-        // Attribution sources: `touches` (the diff edited
-        // `.clank/plans/<x>.md` — objective) and `plan_attribution`
-        // (the `[..]` tag — author claim). These are ORTHOGONAL facts,
-        // not a contradictory dual source: `touched_plan` records the
-        // file edit, `touched_code` records tag-attributed code. The
-        // HEAD commit-tag invariant
-        // (`commit-tag-fixup-is-first-class-state`) now forces the two
-        // to AGREE at HEAD — a tag that names a different plan than the
-        // diff touched is a dominating `MasterToFixCommitTag`
-        // correction in `derive_status`, caught before reviewability
-        // matters. The fold itself is over ALL history, which is
-        // deliberately NOT policed (HEAD-only semantics), so a
-        // historical `[b]`-tagged commit that touched `a.md` must still
-        // land on BOTH timelines as it did before — collapsing the
-        // union here would silently rewrite tolerated history. The
-        // collapse is therefore enforced at the HEAD gate, not in the
-        // fold (see the plan's "leave a clear note" escape hatch).
-        let mut affected: BTreeSet<PlanKey> = BTreeSet::new();
-        affected.extend(touches.keys().cloned());
-        affected.extend(classified.plan_attribution.iter().cloned());
-        affected.extend(finished_this_commit.iter().cloned());
-
-        for plan in &affected {
-            let Some(ps) = self.plans.get_mut(plan) else {
-                continue;
-            };
-            let tp = touches.contains_key(plan);
-            let tc = event.has_code_changes && classified.plan_attribution.contains(plan);
-            ps.commits.push(PlanTimelineEvent {
-                sha: event.sha.clone(),
-                ts: event.author_ts,
-                touched_plan: tp,
-                touched_code: tc,
+        let was_adopted = self.adopted;
+        let mut log = Vec::new();
+        if let Some(intro) = intro {
+            // A real introduction, rather than an edit/tag, starts a new run and
+            // retires the previous rejection of this name. Other warnings survive.
+            self.warnings.retain(|w| {
+                !matches!(&w.warning,
+                Warning::RejectedPlanIntro { plan, .. } if plan == &intro.plan)
             });
-            if !intros_this_commit.contains(plan) && !finished_this_commit.contains(plan) {
-                self.adopted = true;
-                log_events.push(LogEvent::PlanCommit {
-                    plan: plan.clone(),
-                    sha: event.sha.clone(),
-                    ts: event.author_ts,
-                    touched_plan: tp,
-                    touched_code: tc,
-                    subject: event.subject.clone(),
-                });
-            }
-        }
-
-        for plan in &finished_this_commit {
-            let intro = self
-                .plans
-                .remove(plan)
-                .and_then(|ps| ps.commits.first().map(|e| e.sha.clone()))
-                .unwrap_or_else(|| event.sha.clone());
-            self.finished_plans.push(FinishedPlan {
-                plan: plan.clone(),
-                intro,
-                finalized_at: event.sha.clone(),
+            self.active_plan = Some(ActivePlan {
+                key: intro.plan.clone(),
+                state: PlanState::default(),
             });
-            self.adopted = true;
-            log_events.push(LogEvent::PlanFinalized {
-                plan: plan.clone(),
+            self.ad_hoc.clear();
+            log.push(LogEvent::PlanIntro {
+                plan: intro.plan.clone(),
                 sha: event.sha.clone(),
                 ts: event.author_ts,
                 subject: event.subject.clone(),
             });
         }
 
-        // Ad-hoc bucket: bare code-only commit with no touches and
-        // no attribution. Gated on `self.adopted` so pre-adoption
-        // history (everything before the first plan touch in this
-        // repo) doesn't flood the log / bucket with AdHoc events.
-        // `adopted` is durable, so a later PlanDeleted that drops
-        // `plans` doesn't reverse the gate.
-        if !touches.is_empty() || !classified.plan_attribution.is_empty() {
-            self.ad_hoc.clear();
-        } else if self.adopted {
+        if self.ignores_commit(
+            &event.sha,
+            &event.subject,
+            event.plan_touches.iter().map(|t| &t.plan),
+        ) {
+            return log;
+        }
+        let touches: Vec<_> = event
+            .plan_touches
+            .iter()
+            .filter(|t| !self.ignored_run(&t.plan))
+            .collect();
+        let attribution = classify(ClassifierInputs {
+            subject: &event.subject,
+            active_plan: self.active_plan.as_ref().map(|p| &p.key),
+        })
+        .plan_attribution;
+        let mut affected = false;
+        if let Some(active) = &self.active_plan {
+            let key = active.key.clone();
+            for touch in touches
+                .iter()
+                .filter(|t| t.kind == TouchKind::Delete && t.plan != key)
+            {
+                self.finished_plans.retain(|f| f.plan != touch.plan);
+                self.warnings
+                    .retain(|w| !warning_mentions_plan(&w.warning, &touch.plan));
+                self.adopted = true;
+                affected = true;
+                log.push(LogEvent::PlanDeleted {
+                    plan: touch.plan.clone(),
+                    sha: event.sha.clone(),
+                    ts: event.author_ts,
+                });
+            }
+        }
+        if let Some(active) = &mut self.active_plan {
+            let touch = touches.iter().find(|t| t.plan == active.key);
+            let touched_code = event.has_code_changes && attribution.as_ref() == Some(&active.key);
+            if touch.is_some() || attribution.as_ref() == Some(&active.key) {
+                affected = true;
+                self.adopted = true;
+                let kind = touch.map(|t| t.kind);
+                if kind != Some(TouchKind::Delete) {
+                    active.state.commits.push(PlanTimelineEvent {
+                        sha: event.sha.clone(),
+                        ts: event.author_ts,
+                        touched_plan: touch.is_some(),
+                        touched_code,
+                    });
+                }
+                match kind {
+                    Some(TouchKind::Delete) => {
+                        let key = active.key.clone();
+                        self.active_plan = None;
+                        self.finished_plans.retain(|f| f.plan != key);
+                        self.warnings
+                            .retain(|w| !warning_mentions_plan(&w.warning, &key));
+                        log.push(LogEvent::PlanDeleted {
+                            plan: key,
+                            sha: event.sha.clone(),
+                            ts: event.author_ts,
+                        });
+                    }
+                    Some(TouchKind::Finish) => {
+                        let active = self.active_plan.take().unwrap();
+                        let intro = active.state.commits.first().unwrap();
+                        let duration_secs = plan_duration_secs(intro.ts, event.author_ts);
+                        self.finished_plans.push(FinishedPlan {
+                            plan: active.key.clone(),
+                            intro: intro.sha.clone(),
+                            finalized_at: event.sha.clone(),
+                            duration_secs,
+                        });
+                        log.push(LogEvent::PlanFinalized {
+                            duration_secs,
+                            plan: active.key,
+                            sha: event.sha.clone(),
+                            ts: event.author_ts,
+                            subject: event.subject.clone(),
+                        });
+                    }
+                    Some(TouchKind::Intro) => {}
+                    _ => log.push(LogEvent::PlanCommit {
+                        plan: active.key.clone(),
+                        sha: event.sha.clone(),
+                        ts: event.author_ts,
+                        touched_plan: touch.is_some(),
+                        touched_code,
+                        subject: event.subject.clone(),
+                    }),
+                }
+            }
+        } else {
+            // A squashed finished plan has no separate intro. Preserve that
+            // historical boundary without ever opening a second active plan.
+            for touch in &touches {
+                match touch.kind {
+                    TouchKind::Finish => {
+                        affected = true;
+                        self.adopted = true;
+                        let duration_secs = plan_duration_secs(event.author_ts, event.author_ts);
+                        self.finished_plans.push(FinishedPlan {
+                            plan: touch.plan.clone(),
+                            intro: event.sha.clone(),
+                            finalized_at: event.sha.clone(),
+                            duration_secs,
+                        });
+                        log.push(LogEvent::PlanFinalized {
+                            duration_secs,
+                            plan: touch.plan.clone(),
+                            sha: event.sha.clone(),
+                            ts: event.author_ts,
+                            subject: event.subject.clone(),
+                        });
+                    }
+                    TouchKind::Delete => {
+                        affected = true;
+                        self.adopted = true;
+                        self.finished_plans.retain(|f| f.plan != touch.plan);
+                        self.warnings
+                            .retain(|w| !warning_mentions_plan(&w.warning, &touch.plan));
+                        log.push(LogEvent::PlanDeleted {
+                            plan: touch.plan.clone(),
+                            sha: event.sha.clone(),
+                            ts: event.author_ts,
+                        });
+                    }
+                    TouchKind::Revise => {
+                        affected = true;
+                        self.adopted = true;
+                    }
+                    TouchKind::Intro => unreachable!("intro already accepted"),
+                }
+            }
+        }
+        if !affected && touches.is_empty() && self.adopted {
             if event.has_code_changes {
                 self.ad_hoc.push(AdHocEvent {
                     sha: event.sha.clone(),
@@ -690,34 +845,34 @@ impl RepoState {
                     touched_code: true,
                 });
             }
-            log_events.push(LogEvent::AdHoc {
+            log.push(LogEvent::AdHoc {
                 sha: event.sha.clone(),
                 ts: event.author_ts,
                 subject: event.subject.clone(),
             });
         }
-
         if !was_adopted && self.adopted && self.adopted_at.is_none() {
             self.adopted_at = Some(event.sha.clone());
         }
-
-        log_events
+        log
     }
 }
 
 /// Returns `Some(plan)` when the warning is plan-scoped.
 pub fn warning_plan_tag(w: &Warning) -> Option<PlanKey> {
     match w {
-        Warning::DanglingPlanRef { plan } => Some(plan.clone()),
+        Warning::DanglingPlanRef { plan } | Warning::RejectedPlanIntro { plan, .. } => {
+            Some(plan.clone())
+        }
     }
 }
 
-/// True iff `warning` directly references `key` in its payload —
-/// used by the `Delete` hard-forget path so that wiping a key
-/// removes every warning that mentions it.
+/// True iff this warning belongs to `key`. Hard-forget clears that plan's
+/// warnings, but not a different rejected run's provenance merely because
+/// its diagnostic names `key` as the plan that prevented its introduction.
 pub fn warning_mentions_plan(warning: &Warning, key: &PlanKey) -> bool {
     match warning {
-        Warning::DanglingPlanRef { plan } => plan == key,
+        Warning::DanglingPlanRef { plan } | Warning::RejectedPlanIntro { plan, .. } => plan == key,
     }
 }
 
@@ -736,9 +891,8 @@ pub struct CommitNode {
     pub subject: String,
     pub touches: BTreeMap<PlanKey, TouchKind>,
     pub has_code_changes: bool,
-    /// Plans the master attributed this commit to. Empty set ==
-    /// ad-hoc / `[misc]`.
-    pub plan_attribution: BTreeSet<PlanKey>,
+    /// Accepted plan the master attributed this commit to; `None` is ad-hoc.
+    pub plan_attribution: Option<PlanKey>,
     pub warnings: Vec<Warning>,
     pub feedback: Vec<CommitReview>,
 }
@@ -900,61 +1054,138 @@ mod tests {
         }
     }
 
-    // ============ Classifier ============
-    //
-    // The tag is the ONLY signal: `[X]` → the known subset of X; an
-    // untagged commit or a tag naming no known plan → ∅. No warnings,
-    // no hint, no `[misc]` special case (adhoc-commits-and-plan-tag-
-    // validation).
+    #[test]
+    fn finalized_duration_uses_the_accepted_boundaries_and_survives_name_reuse() {
+        let mut state = RepoState::default();
+        for event in [
+            ev(
+                "a1",
+                100,
+                "[run] intro",
+                touches(&[("run", TouchKind::Intro)]),
+            ),
+            ev(
+                "a2",
+                700,
+                "[run] revise",
+                touches(&[("run", TouchKind::Revise)]),
+            ),
+            ev(
+                "a3",
+                90_000,
+                "[ignored] intro",
+                touches(&[("ignored", TouchKind::Intro)]),
+            ),
+            ev(
+                "a4",
+                1000,
+                "[run] finish",
+                touches(&[("run", TouchKind::Finish)]),
+            ),
+            ev(
+                "a5",
+                2000,
+                "[run] intro again",
+                touches(&[("run", TouchKind::Intro)]),
+            ),
+            ev(
+                "a6",
+                1900,
+                "[run] finish again",
+                touches(&[("run", TouchKind::Finish)]),
+            ),
+            ev(
+                "a7",
+                3000,
+                "[squashed] whole run",
+                touches(&[("squashed", TouchKind::Finish)]),
+            ),
+        ] {
+            let emitted = state.apply_commit(&event);
+            for log in emitted {
+                if let LogEvent::PlanFinalized {
+                    duration_secs, sha, ..
+                } = log
+                {
+                    let record = state.finished_plans.last().unwrap();
+                    assert_eq!(record.finalized_at, sha);
+                    assert_eq!(record.duration_secs, duration_secs);
+                }
+            }
+        }
+        assert_eq!(
+            state
+                .finished_plans
+                .iter()
+                .map(|p| (p.plan.as_str(), p.duration_secs))
+                .collect::<Vec<_>>(),
+            vec![("run", 900), ("run", 0), ("squashed", 0)]
+        );
+        assert_eq!(plan_duration_secs(i64::MIN, i64::MAX), u64::MAX);
+        assert!(state.active_plan.is_none());
+    }
 
-    fn classify_with(subject: &str, known: &[&str]) -> BTreeSet<PlanKey> {
-        let known: BTreeSet<PlanKey> = known.iter().map(|k| plan(k)).collect();
+    #[test]
+    fn umbrella_sections_keep_reintroduced_names_and_post_close_work_separate() {
+        let intro = |n: &str| LogEvent::PlanIntro {
+            plan: plan("repeat"),
+            sha: sha(n),
+            ts: 1,
+            subject: "[repeat] intro".into(),
+        };
+        // Equal author clocks cannot erase the lifecycle boundaries.
+        let (first, second) = (intro("a1"), intro("a3"));
+        let (end_first, end_second) = (log_finish("repeat", 2), log_finish("repeat", 4));
+        let post_close = log_ev(None, 5);
+        let oldest = [&first, &end_first, &second, &end_second, &post_close];
+        let forward = umbrella_sections(&oldest, false);
+        assert_eq!(
+            forward.iter().map(|(_, run)| run.len()).collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        assert_eq!(forward[2].0, UmbrellaKey::AdHoc);
+        let newest: Vec<_> = oldest.into_iter().rev().collect();
+        let backward = umbrella_sections(&newest, true);
+        assert_eq!(
+            backward
+                .iter()
+                .map(|(_, run)| run.len())
+                .collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
+        assert_eq!(backward[0].0, UmbrellaKey::AdHoc);
+        assert_eq!(backward[1].1[1].sha(), second.sha());
+        assert_eq!(backward[2].1[1].sha(), first.sha());
+    }
+
+    // ============ Classifier ============
+    fn classify_with(subject: &str, active: &str) -> Option<PlanKey> {
         classify(ClassifierInputs {
             subject,
-            known_plans: &known,
+            active_plan: Some(&plan(active)),
         })
         .plan_attribution
     }
 
     #[test]
-    fn known_prefix_attributes_to_that_plan() {
-        assert_eq!(
-            classify_with("[foo] revise", &["foo"]),
-            [plan("foo")].into_iter().collect()
-        );
+    fn matching_tag_attributes_only_the_accepted_plan() {
+        assert_eq!(classify_with("[foo] revise", "foo"), Some(plan("foo")));
+        for subject in [
+            "[ghost] work",
+            "[misc] work",
+            "plain work",
+            "[foo,bar] work",
+        ] {
+            assert_eq!(classify_with(subject, "foo"), None, "{subject}");
+        }
     }
 
     #[test]
-    fn unknown_prefix_is_unattributed_no_warning() {
-        // `[ghost]` names no known plan → ∅ (ad-hoc). History is
-        // tolerated silently; the live HEAD nag catches it.
-        assert!(classify_with("[ghost] random", &["other"]).is_empty());
-    }
-
-    #[test]
-    fn misc_is_not_special_just_an_unknown_tag() {
-        // No `[misc]` carve-out — `misc` isn't a plan, so it's
-        // unattributed like any other unknown tag.
-        assert!(classify_with("[misc] one-off", &["foo"]).is_empty());
-    }
-
-    #[test]
-    fn multi_plan_prefix_attributes_the_known_subset() {
-        assert_eq!(
-            classify_with("[foo,bar] cross-cut", &["foo", "bar"]),
-            [plan("foo"), plan("bar")].into_iter().collect()
-        );
-        // Unknown members are dropped, not attributed.
-        assert_eq!(
-            classify_with("[foo,ghost] cross-cut", &["foo"]),
-            [plan("foo")].into_iter().collect()
-        );
-    }
-
-    #[test]
-    fn no_prefix_is_unattributed() {
-        // No tag → ad-hoc. No touches inference, no hint inheritance.
-        assert!(classify_with("implement a thing", &["foo"]).is_empty());
+    fn consecutive_brackets_preserve_the_second_in_the_body() {
+        let parsed = parse_subject("[foo] [bar] work");
+        assert_eq!(parsed.prefix, Some(TitlePrefix::Plan("foo".into())));
+        assert_eq!(parsed.body, "[bar] work");
+        assert_eq!(classify_with("[foo] [bar] work", "foo"), Some(plan("foo")));
     }
 
     // ============ apply_commit ============
@@ -974,10 +1205,10 @@ mod tests {
             touches(&[("foo", TouchKind::Intro)]),
         ));
         assert!(s.ad_hoc.is_empty());
-        assert!(s.plans.contains_key(&plan("foo")));
-        assert_eq!(s.plans[&plan("foo")].commits.len(), 1);
-        assert!(s.plans[&plan("foo")].commits[0].touched_plan);
-        assert!(!s.plans[&plan("foo")].commits[0].touched_code);
+        assert!(s.plan(&plan("foo")).is_some());
+        assert_eq!(s.plan(&plan("foo")).unwrap().commits.len(), 1);
+        assert!(s.plan(&plan("foo")).unwrap().commits[0].touched_plan);
+        assert!(!s.plan(&plan("foo")).unwrap().commits[0].touched_code);
     }
 
     #[test]
@@ -995,7 +1226,7 @@ mod tests {
             "[foo] revise",
             touches(&[("foo", TouchKind::Revise)]),
         ));
-        let p = &s.plans[&plan("foo")];
+        let p = &s.plan(&plan("foo")).unwrap();
         assert_eq!(p.commits.len(), 2);
         assert!(p.commits[1].touched_plan);
     }
@@ -1011,6 +1242,7 @@ mod tests {
         ));
         // Plant a finished_plans entry for foo (simulating prior cycle).
         s.finished_plans.push(FinishedPlan {
+            duration_secs: 0,
             plan: plan("foo"),
             intro: sha("0000"),
             finalized_at: sha("0001"),
@@ -1028,7 +1260,7 @@ mod tests {
             "[foo] delete",
             touches(&[("foo", TouchKind::Delete)]),
         ));
-        assert!(!s.plans.contains_key(&plan("foo")));
+        assert!(!s.plan(&plan("foo")).is_some());
         assert!(s.finished_plans.is_empty());
         assert!(s.warnings.is_empty());
     }
@@ -1048,7 +1280,7 @@ mod tests {
             "Finish foo",
             touches(&[("foo", TouchKind::Finish)]),
         ));
-        assert!(!s.plans.contains_key(&plan("foo")));
+        assert!(!s.plan(&plan("foo")).is_some());
         assert_eq!(s.finished_plans.len(), 1);
         assert_eq!(s.finished_plans[0].plan, plan("foo"));
         assert_eq!(s.finished_plans[0].intro.as_str(), sha("1111").as_str());
@@ -1067,7 +1299,7 @@ mod tests {
             "squashed plan",
             touches(&[("foo", TouchKind::Finish)]),
         ));
-        assert!(s.plans.is_empty());
+        assert!(s.active_plan.is_none());
         assert_eq!(s.finished_plans.len(), 1);
         assert_eq!(s.finished_plans[0].plan, plan("foo"));
         assert_eq!(s.finished_plans[0].intro.as_str(), sha("1111").as_str());
@@ -1250,7 +1482,7 @@ mod tests {
     #[test]
     fn adhoc_emitted_after_plan_deleted_then_plain_commit() {
         // Codex's flag: intro -> delete -> `[misc]` commit.
-        // After PlanDeleted, `plans` is empty AND
+        // After PlanDeleted, the active slot is empty AND
         // `finished_plans` is empty for this plan — but
         // `adopted` is durable, so the misc commit still
         // emits AdHoc. PlanDeleted also clears the
@@ -1268,7 +1500,7 @@ mod tests {
             "[foo] delete",
             touches(&[("foo", TouchKind::Delete)]),
         ));
-        assert!(s.plans.is_empty());
+        assert!(s.active_plan.is_none());
         assert!(s.finished_plans.is_empty());
         assert!(s.adopted, "adoption must persist across PlanDeleted");
         let adopted_at = s.adopted_at.clone();
@@ -1283,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_revision_supersedes_adhoc() {
+    fn ad_hoc_survives_revision_until_an_accepted_intro() {
         let mut s = RepoState::new();
         s.apply_commit(&ev(
             "1111",
@@ -1302,7 +1534,21 @@ mod tests {
             "[foo] revise",
             touches(&[("foo", TouchKind::Revise)]),
         ));
-        assert!(s.ad_hoc.is_empty(), "plan revision should clear ad-hoc");
+        assert_eq!(s.ad_hoc.len(), 1, "revision does not start a new lifecycle");
+        s.apply_commit(&ev(
+            "4444",
+            4,
+            "[foo] finish",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        assert_eq!(s.ad_hoc.len(), 1);
+        s.apply_commit(&ev(
+            "5555",
+            5,
+            "[bar] intro",
+            touches(&[("bar", TouchKind::Intro)]),
+        ));
+        assert!(s.ad_hoc.is_empty());
     }
 
     #[test]
@@ -1325,6 +1571,178 @@ mod tests {
         assert_eq!(s.ad_hoc.len(), 1, "unknown-tag code commit is ad-hoc");
     }
 
+    fn introduce(s: &mut RepoState, name: &str, n: &str) {
+        s.apply_commit(&ev(
+            n,
+            1,
+            &format!("[{name}] intro"),
+            touches(&[(name, TouchKind::Intro)]),
+        ));
+    }
+
+    #[test]
+    fn overlapping_intro_is_atomic_except_for_its_warning() {
+        let mut s = RepoState::new();
+        introduce(&mut s, "foo", "1111");
+        s.ad_hoc.push(AdHocEvent {
+            sha: sha("aaaa"),
+            ts: 1,
+            touched_code: true,
+        });
+        let before = s.clone();
+        let mut event = ev(
+            "2222",
+            2,
+            "[foo] work and [bar] intro",
+            touches(&[("foo", TouchKind::Revise), ("bar", TouchKind::Intro)]),
+        );
+        event.has_code_changes = true;
+        assert!(s.apply_commit(&event).is_empty());
+        assert_eq!(s.warnings.len(), 1);
+        assert!(matches!(&s.warnings[0].warning,
+            Warning::RejectedPlanIntro { plan: p, reason: IntroRejection::PlanAlreadyActive { active } }
+                if p == &plan("bar") && active == &plan("foo")));
+        s.warnings.clear();
+        assert_eq!(
+            s, before,
+            "no timeline, adoption, finished or ad-hoc mutation"
+        );
+    }
+
+    #[test]
+    fn ignored_run_cannot_mutate_any_work_before_or_after_active_ends() {
+        for end in [TouchKind::Finish, TouchKind::Delete] {
+            let mut s = RepoState::new();
+            // Rejected reuse of an old name must not erase its accepted history.
+            introduce(&mut s, "bar", "0001");
+            s.apply_commit(&ev(
+                "0002",
+                1,
+                "[bar] finish",
+                touches(&[("bar", TouchKind::Finish)]),
+            ));
+            introduce(&mut s, "foo", "1111");
+            introduce(&mut s, "bar", "2222");
+            for phase in 0..2 {
+                let before = s.clone();
+                for kind in [TouchKind::Revise, TouchKind::Finish, TouchKind::Delete] {
+                    let mut event = ev("3333", 3, "[bar] work", touches(&[("bar", kind)]));
+                    event.has_code_changes = true;
+                    assert!(s.apply_commit(&event).is_empty());
+                    assert_eq!(s, before);
+                }
+                let mut tag_only = ev("4444", 4, "[bar] implementation", Vec::new());
+                tag_only.has_code_changes = true;
+                assert!(s.apply_commit(&tag_only).is_empty());
+                assert_eq!(s, before, "ignored tags cannot create ad-hoc reviewer work");
+                if phase == 0 {
+                    s.apply_commit(&ev("5555", 5, "[foo] end", touches(&[("foo", end)])));
+                }
+            }
+            assert_eq!(s.finished_record(&plan("bar")).unwrap().intro, sha("0001"));
+            introduce(&mut s, "bar", "6666");
+            assert_eq!(s.active_plan.as_ref().unwrap().key, plan("bar"));
+            assert_eq!(s.plan(&plan("bar")).unwrap().commits[0].sha, sha("6666"));
+            s.apply_commit(&ev(
+                "7777",
+                7,
+                "[bar] finish",
+                touches(&[("bar", TouchKind::Finish)]),
+            ));
+            assert_eq!(
+                s.finished_plans
+                    .iter()
+                    .filter(|f| f.plan == plan("bar"))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_intro_does_not_reassign_the_occupied_identity() {
+        let mut s = RepoState::new();
+        introduce(&mut s, "foo", "1111");
+        let before = s.active_plan.clone();
+        introduce(&mut s, "foo", "2222");
+        assert_eq!(s.active_plan, before);
+        assert_eq!(s.warnings.len(), 1);
+        s.apply_commit(&ev(
+            "3333",
+            3,
+            "[foo] revise",
+            touches(&[("foo", TouchKind::Revise)]),
+        ));
+        assert_eq!(s.plan(&plan("foo")).unwrap().commits.len(), 2);
+        s.apply_commit(&ev(
+            "4444",
+            4,
+            "[foo] finish",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        s.apply_commit(&ev(
+            "5555",
+            5,
+            "[foo] delete",
+            touches(&[("foo", TouchKind::Delete)]),
+        ));
+        assert!(s.finished_record(&plan("foo")).is_none());
+        assert!(s.warnings.is_empty());
+    }
+
+    #[test]
+    fn hard_forget_of_finished_history_preserves_the_different_active_run() {
+        let mut s = RepoState::new();
+        introduce(&mut s, "old", "0001");
+        s.apply_commit(&ev(
+            "0002",
+            1,
+            "[old] finish",
+            touches(&[("old", TouchKind::Finish)]),
+        ));
+        introduce(&mut s, "live", "1111");
+        let active = s.active_plan.clone();
+        let log = s.apply_commit(&ev(
+            "2222",
+            2,
+            "[old] delete",
+            touches(&[("old", TouchKind::Delete)]),
+        ));
+        assert_eq!(s.active_plan, active);
+        assert!(s.finished_record(&plan("old")).is_none());
+        assert!(matches!(&log[0], LogEvent::PlanDeleted { plan: key, .. } if key == &plan("old")));
+    }
+
+    #[test]
+    fn several_intros_in_one_commit_require_an_unambiguous_new_intro() {
+        let mut s = RepoState::new();
+        let before = s.clone();
+        assert!(
+            s.apply_commit(&ev(
+                "1111",
+                1,
+                "[a,b] intro",
+                touches(&[("a", TouchKind::Intro), ("b", TouchKind::Intro)])
+            ))
+            .is_empty()
+        );
+        assert_eq!(s.warnings.len(), 2);
+        let warnings = std::mem::take(&mut s.warnings);
+        assert_eq!(s, before);
+        s.warnings = warnings;
+        assert!(
+            s.apply_commit(&ev(
+                "2222",
+                2,
+                "[a] revise",
+                touches(&[("a", TouchKind::Revise)])
+            ))
+            .is_empty()
+        );
+        introduce(&mut s, "a", "3333");
+        assert_eq!(s.active_plan.as_ref().unwrap().key, plan("a"));
+    }
+
     #[test]
     fn warning_mentions_plan_payload_aware() {
         let w = Warning::DanglingPlanRef { plan: plan("foo") };
@@ -1337,17 +1755,14 @@ mod tests {
     #[test]
     fn parse_subject_single_plan() {
         let p = parse_subject("[foo] intro");
-        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["foo".into()])));
+        assert_eq!(p.prefix, Some(TitlePrefix::Plan("foo".into())));
         assert_eq!(p.body, "intro");
     }
 
     #[test]
-    fn parse_subject_multi_plan() {
+    fn parse_subject_comma_is_one_literal_candidate() {
         let p = parse_subject("[foo,bar] shared work");
-        assert_eq!(
-            p.prefix,
-            Some(TitlePrefix::Plans(vec!["foo".into(), "bar".into()]))
-        );
+        assert_eq!(p.prefix, Some(TitlePrefix::Plan("foo,bar".into())));
         assert_eq!(p.body, "shared work");
     }
 
@@ -1356,7 +1771,7 @@ mod tests {
         // No special `[misc]` — it parses as a one-element plan list
         // (that won't match a real plan, so it's ad-hoc).
         let p = parse_subject("[misc] drive-by");
-        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["misc".into()])));
+        assert_eq!(p.prefix, Some(TitlePrefix::Plan("misc".into())));
         assert_eq!(p.body, "drive-by");
     }
 
@@ -1393,14 +1808,14 @@ mod tests {
     fn parse_subject_consumes_one_separating_space() {
         // Only one space is consumed between `]` and body.
         let p = parse_subject("[foo]  double-space");
-        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["foo".into()])));
+        assert_eq!(p.prefix, Some(TitlePrefix::Plan("foo".into())));
         assert_eq!(p.body, " double-space");
     }
 
     #[test]
     fn parse_subject_no_body() {
         let p = parse_subject("[foo]");
-        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["foo".into()])));
+        assert_eq!(p.prefix, Some(TitlePrefix::Plan("foo".into())));
         assert_eq!(p.body, "");
     }
 
@@ -1409,11 +1824,11 @@ mod tests {
         // Backwards-compat wrapper.
         assert_eq!(
             parse_title_prefix("[foo] x"),
-            Some(TitlePrefix::Plans(vec!["foo".into()]))
+            Some(TitlePrefix::Plan("foo".into()))
         );
         assert_eq!(
             parse_title_prefix("[misc] x"),
-            Some(TitlePrefix::Plans(vec!["misc".into()]))
+            Some(TitlePrefix::Plan("misc".into()))
         );
         assert_eq!(parse_title_prefix("plain"), None);
     }
@@ -1441,6 +1856,7 @@ mod tests {
 
     fn log_finish(plan: &str, n: u8) -> LogEvent {
         LogEvent::PlanFinalized {
+            duration_secs: 0,
             plan: PlanKey::parse(plan).unwrap(),
             sha: CommitSha::parse(&format!("{n:0<40x}")).unwrap(),
             ts: n as i64,

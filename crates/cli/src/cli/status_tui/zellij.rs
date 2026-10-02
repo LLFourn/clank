@@ -1955,7 +1955,7 @@ mod tests {
     fn roster_snap(labels: &[(&str, bool)]) -> StatusSnapshot {
         // Reuse the shared snapshot fixture; only labels + master matter
         // to RosterView.
-        let mut s = snap(vec![], vec![]);
+        let mut s = snap(None, vec![]);
         s.agents = labels
             .iter()
             .map(|(l, _)| crate::cli::status::AgentAutoRow {
@@ -3209,7 +3209,7 @@ mod tests {
 
         // First refresh: both agent panes get a title.
         let awaited = with_team(snap(
-            vec![plan_state("p", reviewer_missing("codex"))],
+            Some(plan_state("p", reviewer_missing("codex"))),
             vec![],
         ));
         go(&mut ps, &awaited);
@@ -3230,7 +3230,7 @@ mod tests {
         // emojis at once — master 💤→🔨 and codex 👀→💤 — so two panes
         // rename.
         let idle = with_team(snap(
-            vec![plan_state("p", WaitingOn::MasterToContinue)],
+            Some(plan_state("p", WaitingOn::MasterToContinue)),
             vec![],
         ));
         go(&mut ps, &idle);

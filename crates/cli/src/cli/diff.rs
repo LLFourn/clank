@@ -149,8 +149,9 @@ async fn resolve_kind(
 fn active_plan_candidates(state: &crate::repo_state::RepoState) -> String {
     let mut names: Vec<String> = state
         .fold
-        .plans
-        .keys()
+        .active_plan
+        .iter()
+        .map(|p| &p.key)
         .map(|k| k.as_str().to_string())
         .collect();
     names.sort();

@@ -10,10 +10,9 @@ use crate::repo_state::RepoState;
 ///
 /// - Explicit arg: parse `<basename>/<stem>.md`, `<stem>.md`, or
 ///   `<stem>`. If the arg includes a basename, it must match the
-///   target repo. Resulting stem must exist in `state.fold.plans`.
-/// - No arg: filter `state.fold.plans` to active visible plans
-///   (worktree file present, not finished). Exactly one wins; zero
-///   or many is an error with candidate ids.
+///   target repo. Resulting stem must identify the active run or finished history.
+/// - No arg: use the single active run when its worktree file is present;
+///   otherwise report that no active plan is visible, with history candidates.
 pub fn resolve_plan(
     state: &RepoState,
     expected_basename: &str,
@@ -23,8 +22,7 @@ pub fn resolve_plan(
         let stem = parse_arg(raw, expected_basename)?;
         let key = PlanKey::parse(&stem)
             .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
-        let known =
-            state.fold.plans.contains_key(&key) || state.fold.finished_record(&key).is_some();
+        let known = state.fold.plan(&key).is_some() || state.fold.finished_record(&key).is_some();
         if !known {
             anyhow::bail!(
                 "plan `{}/{}.md` not found in repo. candidates: {}",
@@ -42,34 +40,12 @@ fn infer_single_visible_active(
     state: &RepoState,
     expected_basename: &str,
 ) -> anyhow::Result<PlanKey> {
-    let visible: Vec<&PlanKey> = state
-        .fold
-        .plans
-        .keys()
-        .filter(|key| {
-            let path = state
-                .root
-                .join(crate::init_facts::plan_md_rel(key.as_str()));
-            path.exists()
-        })
-        .collect();
-    match visible.as_slice() {
-        [one] => Ok((*one).clone()),
-        [] => anyhow::bail!(
-            "no active in-flight plan to infer; pass a plan id explicitly. repo: `{expected_basename}`",
-        ),
-        many => {
-            let names: Vec<String> = many
-                .iter()
-                .map(|k| format!("{}/{}.md", expected_basename, k.as_str()))
-                .collect();
-            anyhow::bail!(
-                "ambiguous: {} active plans in `{expected_basename}`; pass one explicitly. candidates: {}",
-                many.len(),
-                names.join(", "),
-            )
-        }
-    }
+    state.fold.active_plan.as_ref()
+        .filter(|plan| state.root.join(crate::init_facts::plan_md_rel(plan.key.as_str())).exists())
+        .map(|plan| plan.key.clone())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no active in-flight plan to infer; pass a plan id explicitly. repo: `{expected_basename}`"
+        ))
 }
 
 /// How many finished plans a "not found" diagnostic names. A repo
@@ -83,8 +59,9 @@ const FINISHED_NAMED: usize = 5;
 fn candidate_summary(state: &RepoState, basename: &str, asked: &str) -> String {
     let mut names: Vec<String> = state
         .fold
-        .plans
-        .keys()
+        .active_plan
+        .iter()
+        .map(|p| &p.key)
         .map(|k| format!("{basename}/{}.md", k.as_str()))
         .collect();
 
@@ -148,7 +125,7 @@ pub fn parse_arg(raw: &str, expected_basename: &str) -> anyhow::Result<String> {
 /// Plan-attributed commits for a plan key, in chronological order.
 ///
 /// Source of truth differs by plan status:
-/// - **Active**: `state.fold.plans[plan_key].commits` — the fold's
+/// - **Active**: `state.fold.plan(plan_key).unwrap().commits` — the fold's
 ///   per-plan timeline. Attribution is intrinsic (the fold only
 ///   adds plan-attributed events to a plan's timeline).
 /// - **Finished**: re-derive via [`crate::preview::build_rewrite_preview`]
@@ -159,8 +136,8 @@ pub fn parse_arg(raw: &str, expected_basename: &str) -> anyhow::Result<String> {
 ///   that omitting it reintroduces the interleaved-plans bug
 ///   (cba9249 active-path; 0859200 finished-path).
 ///
-/// Returns an error if the plan key is in neither `state.fold.plans`
-/// nor `state.fold.finished_plans` — matches `resolve_plan`'s
+/// Returns an error if the plan key identifies neither the active run
+/// nor a record in `state.fold.finished_plans` — matches `resolve_plan`'s
 /// "plan not found" diagnostic shape.
 pub async fn commits_for_plan(
     repo_root: &Path,
@@ -188,7 +165,7 @@ pub async fn plan_history(
 ) -> anyhow::Result<PlanHistory> {
     // Active path: fold's per-plan timeline is already
     // plan-attributed. Cheap — no preview rebuild needed.
-    if let Some(ps) = state.fold.plans.get(plan_key) {
+    if let Some(ps) = state.fold.plan(plan_key) {
         return Ok(PlanHistory {
             finished: None,
             commits: ps.commits.iter().map(|e| e.sha.clone()).collect(),
@@ -254,18 +231,20 @@ mod tests {
 
     fn state_with(active: &[&str], finished: &[&str]) -> RepoState {
         let mut state = RepoState::empty(std::path::PathBuf::from("/nowhere"));
-        for stem in active {
-            state
-                .fold
-                .plans
-                .insert(PlanKey::parse(stem).unwrap(), Default::default());
-        }
+        assert!(active.len() <= 1);
+        state.fold.active_plan = active
+            .first()
+            .map(|stem| clank_core::repo_state::ActivePlan {
+                key: PlanKey::parse(stem).unwrap(),
+                state: Default::default(),
+            });
         let sha = CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
         for stem in finished {
             state
                 .fold
                 .finished_plans
                 .push(clank_core::repo_state::FinishedPlan {
+                    duration_secs: 0,
                     plan: PlanKey::parse(stem).unwrap(),
                     intro: sha.clone(),
                     finalized_at: sha.clone(),

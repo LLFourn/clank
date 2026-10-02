@@ -59,8 +59,8 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
 
     let mut all_shas: Vec<CommitSha> = Vec::new();
-    for ps in state.fold.plans.values() {
-        all_shas.extend(ps.reviewable_shas());
+    if let Some(active) = &state.fold.active_plan {
+        all_shas.extend(active.state.reviewable_shas());
     }
     for ah in &state.fold.ad_hoc {
         all_shas.push(ah.sha.clone());

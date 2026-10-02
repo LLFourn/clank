@@ -57,6 +57,8 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Serialize changes that empty/rewrite the slot with its admission paths.
+    let _slot = super::plan_mutation::lock(&repo)?;
     if args.amend {
         return run_amend(&repo, &basename, &args).await;
     }
@@ -640,8 +642,8 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
-    fn init_test_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn init_test_repo() -> super::super::monitor::TempRepo {
+        let dir = super::super::monitor::TempRepo::new();
         let path = dir.path();
         git(path, &["init", "--quiet", "--initial-branch=work"]);
         git(path, &["config", "user.email", "test@test"]);
@@ -651,7 +653,7 @@ mod tests {
     }
 
     /// Create a repo with a plan intro, an impl commit, and a
-    fn repo_with_finalize() -> tempfile::TempDir {
+    fn repo_with_finalize() -> super::super::monitor::TempRepo {
         let dir = init_test_repo();
         let repo = dir.path();
         write_file(repo, ".clank/plans/foo.md", "# foo\n");

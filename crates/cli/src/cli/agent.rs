@@ -1091,9 +1091,8 @@ enum RosterTransitionPolicy {
 #[derive(Debug, Clone)]
 struct GateTarget {
     sha: clank_core::ids::CommitSha,
-    /// A shared commit can be latest for several plans with different
-    /// milestone facts. One stand-in must preserve every context.
-    touched_plan: Vec<bool>,
+    /// Milestone fact for the one accepted plan's latest reviewable commit.
+    touched_plan: bool,
     reviews: Vec<clank_core::wait::ReviewEntry>,
 }
 
@@ -1142,23 +1141,17 @@ fn add_label_from_after(
     }
 }
 
-fn gates_for_target(
+fn gate_for_target(
     target: &GateTarget,
     tiers: &crate::agent_store::ReviewerTiers,
-) -> Vec<clank_core::vocab::CommitGateState> {
-    target
-        .touched_plan
-        .iter()
-        .map(|touched_plan| {
-            clank_core::wait::compute_gate(
-                &target.reviews,
-                &tiers.commit,
-                &tiers.plan,
-                &tiers.final_,
-                *touched_plan,
-            )
-        })
-        .collect()
+) -> clank_core::vocab::CommitGateState {
+    clank_core::wait::compute_gate(
+        &target.reviews,
+        &tiers.commit,
+        &tiers.plan,
+        &tiers.final_,
+        target.touched_plan,
+    )
 }
 
 /// Pure gate-preservation planner. Removals and tier exits are already present
@@ -1168,104 +1161,92 @@ fn plan_roster_stand_ins(
     before: crate::agent_store::ReviewerTiers,
     after: crate::agent_store::ReviewerTiers,
     policy: RosterTransitionPolicy,
-    targets: &mut [GateTarget],
+    target: Option<&mut GateTarget>,
 ) -> anyhow::Result<Vec<RosterStandIn>> {
     if policy == RosterTransitionPolicy::RequireFreshReview {
         return Ok(Vec::new());
     }
 
+    let Some(target) = target else {
+        return Ok(Vec::new());
+    };
     let entrants = added_expected_labels(&before, &after);
     let mut current = after.clone();
     remove_labels(&mut current, &entrants);
     let mut stand_ins = Vec::new();
 
     for entrant in entrants {
-        let baseline: Vec<_> = targets
-            .iter()
-            .map(|target| gates_for_target(target, &current))
-            .collect();
+        let expected_gate = gate_for_target(target, &current);
         add_label_from_after(&mut current, &after, &entrant);
 
-        for (target, expected_gates) in targets.iter_mut().zip(baseline) {
-            // A real (or earlier synthetic) verdict is historical evidence and
-            // must never be replaced. Its own effect on the gate is legitimate.
-            if target.reviews.iter().any(|review| review.author == entrant) {
-                continue;
-            }
-            if gates_for_target(target, &current) == expected_gates {
-                continue;
-            }
-
-            let verdict = [clank_core::Verdict::Continue, clank_core::Verdict::Finished]
-                .into_iter()
-                .find(|verdict| {
-                    target.reviews.push(clank_core::wait::ReviewEntry {
-                        author: entrant.clone(),
-                        verdict: *verdict,
-                        // A verdict tried on for size, not one anyone
-                        // wrote: it has no time.
-                        at: None,
-                    });
-                    let preserves = gates_for_target(target, &current) == expected_gates;
-                    target.reviews.pop();
-                    preserves
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "cannot preserve the gate for reviewer `{}` entering at {}",
-                        entrant.as_str(),
-                        target.sha.as_str()
-                    )
-                })?;
-
-            target.reviews.push(clank_core::wait::ReviewEntry {
-                author: entrant.clone(),
-                verdict,
-                at: None,
-            });
-            stand_ins.push(RosterStandIn {
-                author: entrant.clone(),
-                sha: target.sha.clone(),
-                verdict,
-            });
+        // A real (or earlier synthetic) verdict is historical evidence and
+        // must never be replaced. Its own effect on the gate is legitimate.
+        if target.reviews.iter().any(|review| review.author == entrant) {
+            continue;
         }
+        if gate_for_target(target, &current) == expected_gate {
+            continue;
+        }
+
+        let verdict = [clank_core::Verdict::Continue, clank_core::Verdict::Finished]
+            .into_iter()
+            .find(|verdict| {
+                target.reviews.push(clank_core::wait::ReviewEntry {
+                    author: entrant.clone(),
+                    verdict: *verdict,
+                    // A verdict tried on for size, not one anyone
+                    // wrote: it has no time.
+                    at: None,
+                });
+                let preserves = gate_for_target(target, &current) == expected_gate;
+                target.reviews.pop();
+                preserves
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot preserve the gate for reviewer `{}` entering at {}",
+                    entrant.as_str(),
+                    target.sha.as_str()
+                )
+            })?;
+
+        target.reviews.push(clank_core::wait::ReviewEntry {
+            author: entrant.clone(),
+            verdict,
+            at: None,
+        });
+        stand_ins.push(RosterStandIn {
+            author: entrant.clone(),
+            sha: target.sha.clone(),
+            verdict,
+        });
     }
     Ok(stand_ins)
 }
 
-fn latest_gate_targets(repo: &Path, state: &crate::repo_state::RepoState) -> Vec<GateTarget> {
+fn latest_gate_target(repo: &Path, state: &crate::repo_state::RepoState) -> Option<GateTarget> {
     use clank_core::wait::PlanStateLookup;
-
+    let event = state
+        .fold
+        .active_plan
+        .as_ref()?
+        .state
+        .commits
+        .iter()
+        .rev()
+        .find(|event| event.touched_plan || event.touched_code)?;
     let lookup = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
-    let mut contexts: BTreeMap<clank_core::ids::CommitSha, Vec<bool>> = BTreeMap::new();
-    for plan in state.fold.plans.values() {
-        let Some(event) = plan
-            .commits
-            .iter()
-            .rev()
-            .find(|event| event.touched_plan || event.touched_code)
-        else {
-            continue;
-        };
-        let touched = contexts.entry(event.sha.clone()).or_default();
-        if !touched.contains(&event.touched_plan) {
-            touched.push(event.touched_plan);
-        }
-    }
-    contexts
-        .into_iter()
-        .map(|(sha, touched_plan)| GateTarget {
-            reviews: lookup.reviews_for(&sha),
-            sha,
-            touched_plan,
-        })
-        .collect()
+    Some(GateTarget {
+        reviews: lookup.reviews_for(&event.sha),
+        sha: event.sha.clone(),
+        touched_plan: event.touched_plan,
+    })
 }
 
 fn all_reviewable_shas(state: &crate::repo_state::RepoState) -> Vec<clank_core::ids::CommitSha> {
     let mut shas = Vec::new();
-    for plan in state.fold.plans.values() {
-        shas.extend(plan.reviewable_shas());
+    if let Some(active) = &state.fold.active_plan {
+        shas.extend(active.state.reviewable_shas());
     }
     shas.extend(state.fold.ad_hoc.iter().map(|event| event.sha.clone()));
     shas.sort();
@@ -1352,11 +1333,11 @@ fn write_repo_transition(
                 repo,
                 crate::rebuild::CachePolicy::Bypass,
             )?;
-            let mut targets = latest_gate_targets(repo, &state);
+            let mut target = latest_gate_target(repo, &state);
             let before_tiers = crate::agent_store::ReviewerTiers::from_roster(&before.agents);
             let after_tiers = crate::agent_store::ReviewerTiers::from_roster(&after.agents);
             (
-                plan_roster_stand_ins(before_tiers, after_tiers, policy, &mut targets)?,
+                plan_roster_stand_ins(before_tiers, after_tiers, policy, target.as_mut())?,
                 all_reviewable_shas(&state),
             )
         } else {
@@ -2145,7 +2126,7 @@ mod tests {
     fn gate_target(touched_plan: bool, reviews: &[(&str, clank_core::Verdict)]) -> GateTarget {
         GateTarget {
             sha: clank_core::ids::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            touched_plan: vec![touched_plan],
+            touched_plan,
             reviews: reviews
                 .iter()
                 .map(|(author, verdict)| clank_core::wait::ReviewEntry {
@@ -2161,7 +2142,7 @@ mod tests {
         target: &GateTarget,
         tiers: &crate::agent_store::ReviewerTiers,
     ) -> clank_core::vocab::CommitGateState {
-        gates_for_target(target, tiers)[0]
+        gate_for_target(target, tiers)
     }
 
     #[test]
@@ -2231,7 +2212,7 @@ mod tests {
                 case.before,
                 case.after.clone(),
                 RosterTransitionPolicy::PreserveGate,
-                std::slice::from_mut(&mut case.target),
+                Some(&mut case.target),
             )
             .unwrap();
             assert_eq!(
@@ -2267,7 +2248,7 @@ mod tests {
             before,
             after.clone(),
             RosterTransitionPolicy::PreserveGate,
-            std::slice::from_mut(&mut target),
+            Some(&mut target),
         )
         .unwrap();
 
@@ -2289,7 +2270,7 @@ mod tests {
             before,
             after.clone(),
             RosterTransitionPolicy::PreserveGate,
-            std::slice::from_mut(&mut target),
+            Some(&mut target),
         )
         .unwrap();
 
@@ -2310,7 +2291,7 @@ mod tests {
             before,
             after.clone(),
             RosterTransitionPolicy::RequireFreshReview,
-            std::slice::from_mut(&mut target),
+            Some(&mut target),
         )
         .unwrap();
 
@@ -2330,7 +2311,7 @@ mod tests {
             before,
             after.clone(),
             RosterTransitionPolicy::PreserveGate,
-            std::slice::from_mut(&mut target),
+            Some(&mut target),
         )
         .unwrap();
 
@@ -2377,14 +2358,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_gate_targets_never_backfills_older_commits() {
+    fn latest_gate_target_never_backfills_older_commits() {
         let repo = tempfile::tempdir().unwrap();
         let old = clank_core::ids::CommitSha::parse(&"1".repeat(40)).unwrap();
         let latest = clank_core::ids::CommitSha::parse(&"2".repeat(40)).unwrap();
         let mut state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        state.fold.plans.insert(
-            clank_core::ids::PlanKey::parse("example").unwrap(),
-            clank_core::repo_state::PlanState {
+        state.fold.active_plan = Some(clank_core::repo_state::ActivePlan {
+            key: clank_core::ids::PlanKey::parse("example").unwrap(),
+            state: clank_core::repo_state::PlanState {
                 commits: vec![
                     clank_core::repo_state::PlanTimelineEvent {
                         sha: old,
@@ -2400,12 +2381,11 @@ mod tests {
                     },
                 ],
             },
-        );
+        });
 
-        let targets = latest_gate_targets(repo.path(), &state);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].sha, latest);
-        assert_eq!(targets[0].touched_plan, vec![false]);
+        let target = latest_gate_target(repo.path(), &state).unwrap();
+        assert_eq!(target.sha, latest);
+        assert!(!target.touched_plan);
     }
 
     #[test]

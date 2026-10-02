@@ -395,9 +395,9 @@ async fn submit_plan_input(
             // WHO decided (the human, at the TUI) and what the gate
             // said at bypass.
             let gate = snapshot
-                .plans
-                .iter()
-                .find(|p| p.plan.as_str() == stem)
+                .active_plan
+                .as_ref()
+                .filter(|p| p.plan.as_str() == stem)
                 .map(|p| p.gate.as_str().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             let why = format!(
@@ -637,7 +637,11 @@ async fn plan_page_facts(
     if !has_plan_page(repo, stem, snapshot) {
         return None;
     }
-    if snapshot.plans.iter().any(|p| p.plan.as_str() == stem) {
+    if snapshot
+        .active_plan
+        .as_ref()
+        .is_some_and(|p| p.plan.as_str() == stem)
+    {
         let repo_paused = snapshot
             .blocks
             .iter()
@@ -655,7 +659,10 @@ async fn plan_page_facts(
 /// Whether `stem` is an active or finished plan: what a page opened
 /// from the plans can show.
 fn has_plan_page(repo: &std::path::Path, stem: &str, snapshot: &StatusSnapshot) -> bool {
-    snapshot.plans.iter().any(|p| p.plan.as_str() == stem)
+    snapshot
+        .active_plan
+        .as_ref()
+        .is_some_and(|p| p.plan.as_str() == stem)
         || repo.join(crate::init_facts::finished_md_rel(stem)).exists()
 }
 
@@ -977,7 +984,7 @@ async fn finished_multi_commit(repo: &std::path::Path, stem: &str) -> bool {
     let Ok(key) = crate::lifecycle::PlanKey::parse(stem) else {
         return true;
     };
-    let Some(fp) = state.fold.finished_plans.iter().find(|f| f.plan == key) else {
+    let Some(fp) = state.fold.finished_record(&key) else {
         return true;
     };
     match crate::preview::re_fold_finished_plan_natives(repo, &key, &fp.finalized_at).await {
@@ -1673,29 +1680,17 @@ fn fetch_commit_detail(
     })
 }
 
-/// The plans `subject`'s `[plan]` tag names that have a page, in tag
-/// order, each once. A name that is not a plan key names no plan — as
-/// the fold's classifier has it — and is never a path to read.
-fn commit_plans(
+/// The subject's one plan tag, when its page can be read. Invalid names
+/// remain untrusted input and never become filesystem paths.
+fn commit_plan(
     repo: &std::path::Path,
     subject: &str,
     snapshot: &StatusSnapshot,
-) -> Vec<crate::lifecycle::PlanKey> {
-    let Some(clank_core::repo_state::TitlePrefix::Plans(names)) =
-        clank_core::repo_state::parse_title_prefix(subject)
-    else {
-        return Vec::new();
-    };
-    let mut plans = Vec::new();
-    for key in names
-        .iter()
-        .filter_map(|n| crate::lifecycle::PlanKey::parse(n).ok())
-    {
-        if !plans.contains(&key) && has_plan_page(repo, key.as_str(), snapshot) {
-            plans.push(key);
-        }
-    }
-    plans
+) -> Option<crate::lifecycle::PlanKey> {
+    let clank_core::repo_state::TitlePrefix::Plan(name) =
+        clank_core::repo_state::parse_title_prefix(subject)?;
+    let key = crate::lifecycle::PlanKey::parse(&name).ok()?;
+    has_plan_page(repo, key.as_str(), snapshot).then_some(key)
 }
 
 /// A commit's page, opened on its rows — or, from a review row, with
@@ -1709,10 +1704,10 @@ fn open_commit_page(
     cols: usize,
 ) -> Option<(CommitPage, Mode)> {
     let detail = fetch_commit_detail(repo, sha)?;
-    let plans = commit_plans(repo, &detail.subject, snapshot);
+    let plan = commit_plan(repo, &detail.subject, snapshot);
     let (sel, scroll) = match focus {
         Some(author) => (
-            document_focus(&commit_actions(&plans)),
+            document_focus(&commit_actions(&plan)),
             commit_review_offset(&commit_doc(&detail), author, cols),
         ),
         None => (0, 0),
@@ -1720,7 +1715,7 @@ fn open_commit_page(
     Some((
         CommitPage {
             detail,
-            plans,
+            plan,
             scroll,
             left_at: 0,
         },
@@ -1737,13 +1732,13 @@ fn refresh_commit_page(
     sel: usize,
     snapshot: &StatusSnapshot,
 ) -> Mode {
-    let before = commit_actions(&cp.plans);
+    let before = commit_actions(&cp.plan);
     if let Some(detail) = fetch_commit_detail(repo, &cp.detail.sha) {
         cp.detail = detail;
     }
-    cp.plans = commit_plans(repo, &cp.detail.subject, snapshot);
+    cp.plan = commit_plan(repo, &cp.detail.subject, snapshot);
     Mode::CommitPage {
-        sel: rebind_page_sel(&before, sel, &commit_actions(&cp.plans)),
+        sel: rebind_page_sel(&before, sel, &commit_actions(&cp.plan)),
     }
 }
 
@@ -1816,7 +1811,7 @@ async fn open_plan_from_commit(
 ) -> Option<PlanPage> {
     let pp = open_plan_page(repo, key, snapshot).await?;
     let mut cp = commit_page.take()?;
-    cp.left_at = commit_actions(&cp.plans)
+    cp.left_at = commit_actions(&cp.plan)
         .iter()
         .position(|a| matches!(a, CommitAction::OpenPlan(k) if k == key))
         .unwrap_or(0);
@@ -2112,8 +2107,14 @@ pub(crate) fn web_facts(
         .collect();
 
     let ledger = Ledger {
-        plan: snap.plans.first().map(|p| p.plan.as_str().to_string()),
-        gate: snap.plans.first().map(|p| gate_word(p.gate).to_string()),
+        plan: snap
+            .active_plan
+            .as_ref()
+            .map(|p| p.plan.as_str().to_string()),
+        gate: snap
+            .active_plan
+            .as_ref()
+            .map(|p| gate_word(p.gate).to_string()),
         dirty: snap.dirty.as_ref().map(crate::cli::status::dirty_summary),
         queue: snap
             .queue
@@ -2304,11 +2305,15 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
     let short = |s: &crate::lifecycle::CommitSha| s.as_str()[..7.min(s.as_str().len())].to_string();
     let commit_page = |s: &crate::lifecycle::CommitSha| Some(format!("commit/{}.html", s.as_str()));
     match row {
-        OnelineRow::Header { plan } => LedgerRow {
+        OnelineRow::Header {
+            plan,
+            duration_secs,
+            ..
+        } => LedgerRow {
             kind: "header".into(),
             glyph: None,
             sha: None,
-            text: plan.clone().unwrap_or_else(|| "adhoc".into()),
+            text: crate::cli::log::plan_footer_text(plan.as_deref(), *duration_secs),
             author: None,
             verdict: None,
             verdict_class: None,
@@ -3104,7 +3109,7 @@ pub(crate) async fn run_tui(
                 log.window += page_size;
                 log.next = page.next.clone();
                 snapshot.log_next = page.next;
-                snapshot.log_rows.extend(page.rows);
+                crate::cli::log::extend_oneline_rows(&mut snapshot.log_rows, page.rows);
                 log.complete = log.next.is_none();
             }
             log.fill = false;
@@ -4078,7 +4083,7 @@ pub(crate) async fn run_tui(
                                 mode = Mode::LogScroll; // invariant breach — bail out
                                 continue;
                             };
-                            let actions = commit_actions(&cp.plans);
+                            let actions = commit_actions(&cp.plan);
                             match commit_page_nav(sel, &actions, k, page, cp.scroll) {
                                 CommitNav::Sel(x) => mode = Mode::CommitPage { sel: x },
                                 CommitNav::Scroll(delta) => {
@@ -5870,7 +5875,7 @@ pub(crate) mod tests {
         // the old frame, and mounts exactly one transient notice.
         use crate::cli::log::OnelineRow;
         use crate::cli::status_tui::fixtures::snap;
-        let mut current = snap(vec![], vec![]);
+        let mut current = snap(None, vec![]);
         current.basename = "old-frame".into();
         let mut failures = 0u32;
 
@@ -5912,7 +5917,7 @@ pub(crate) mod tests {
 
         // Success replaces the snapshot, clears the notice (fresh
         // rows), resets the streak, and advances.
-        let mut next = snap(vec![], vec![]);
+        let mut next = snap(None, vec![]);
         next.basename = "new-frame".into();
         let advance = apply_refresh(&mut current, Vec::new(), Ok(next), &mut failures);
         assert!(advance, "success advances the signature");
@@ -5990,14 +5995,14 @@ pub(crate) mod tests {
         const PAGE: &str = clank_web::assets::PAGE;
         let mut s = fixtures::with_agents(
             fixtures::snap(
-                vec![fixtures::plan_state_at(
+                Some(fixtures::plan_state_at(
                     "foo",
                     clank_core::plan_view::WaitingOn::MasterToContinue,
                     clank_core::wait::Handover {
                         opened: Some(1_000),
                         ..Default::default()
                     },
-                )],
+                )),
                 vec![],
             ),
             &[("claude", crate::cli::teams_config::RosterRole::Master)],
@@ -6099,7 +6104,7 @@ pub(crate) mod tests {
     #[test]
     fn the_facts_carry_the_queue_in_the_order_it_runs() {
         use crate::cli::status_tui::fixtures::snap;
-        let mut s = snap(vec![], vec!["later", "sooner"]);
+        let mut s = snap(None, vec!["later", "sooner"]);
         s.queue[0].priority = 900;
         s.queue[0].path = std::path::PathBuf::from("/r/.clank/queue/900-later.md");
         s.queue[1].priority = 100;
@@ -6159,14 +6164,14 @@ pub(crate) mod tests {
         .unwrap();
         let mut s = with_agents(
             crate::cli::status_tui::fixtures::snap(
-                vec![plan_state_at(
+                Some(plan_state_at(
                     "foo",
                     clank_core::plan_view::WaitingOn::ReviewerApprovalsMissing { missing },
                     clank_core::wait::Handover {
                         opened: Some(1_000),
                         ..Default::default()
                     },
-                )],
+                )),
                 vec![],
             ),
             &[
@@ -6261,9 +6266,9 @@ pub(crate) mod tests {
         broken.head_correction = Some(clank_core::wait::HeadCorrection {
             sha: clank_core::ids::CommitSha::parse(&format!("{:0<40}", "dec0de")).unwrap(),
             violation: clank_core::wait::HeadTagViolation {
-                unknown: vec![],
+                unknown: None,
                 untagged_touched: vec![clank_core::ids::PlanKey::parse("foo").unwrap()],
-                extra_named: vec![],
+                extra_named: None,
             },
         });
         let c = web_facts(&broken, &with)
@@ -6277,7 +6282,7 @@ pub(crate) mod tests {
 
     #[test]
     fn web_facts_carry_only_pending_blocks_with_their_identity() {
-        let mut snap = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
+        let mut snap = crate::cli::status_tui::fixtures::snap(None, vec![]);
         snap.blocks = vec![
             crate::cli::block::BlockEntry {
                 agent: "claude".into(),
@@ -6346,6 +6351,16 @@ pub(crate) mod tests {
             2,
             "an active plan counts its own commits"
         );
+
+        // End this run before introducing the next historical example.
+        std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+        std::fs::rename(
+            repo.join(".clank/plans/live.md"),
+            repo.join(".clank/finished/live.md"),
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "[live] finish"]);
 
         // A FINISHED plan collapsed to ONE commit: the same commit
         // introduces the plan and finishes it.
@@ -6520,7 +6535,7 @@ pub(crate) mod tests {
         }
         let rows = oneline_rows(&refs, &reviews, &Default::default());
         assert!(
-            matches!(rows.last(), Some(OnelineRow::Header { plan: Some(p) }) if p == "ant"),
+            matches!(rows.last(), Some(OnelineRow::Header { plan: Some(p), .. }) if p == "ant"),
             "the producer puts the name last: {rows:?}"
         );
         let page = |s: &str| Some(format!("commit/{}.html", sha(s).as_str()));
@@ -6553,6 +6568,8 @@ pub(crate) mod tests {
         };
         let rows = vec![
             OnelineRow::Header {
+                duration_secs: None,
+                starts_here: true,
                 plan: Some("foo".into()),
             },
             review(),
@@ -6565,7 +6582,11 @@ pub(crate) mod tests {
                 stands_for: None,
             },
             review(),
-            OnelineRow::Header { plan: None },
+            OnelineRow::Header {
+                duration_secs: None,
+                starts_here: true,
+                plan: None,
+            },
             review(),
             OnelineRow::PlainCommit {
                 sha: sha('b'),
@@ -7471,10 +7492,11 @@ pub(crate) mod tests {
         write(".clank/queue/500-queued.md", "# queued\n");
         for (i, subject) in [
             "[foo] intro",
-            "[foo,bar,misc,foo] both",
+            "[bar] finished work",
+            "[foo] current work",
             "tweak",
             "[gone] a purged plan's commit",
-            "[../queue/500-queued,.hidden,_] not plan keys",
+            "[../queue/500-queued] not a plan key",
         ]
         .iter()
         .enumerate()
@@ -7500,25 +7522,28 @@ pub(crate) mod tests {
         crate::lifecycle::PlanKey::parse(s).unwrap()
     }
 
-    /// A commit's page offers each plan its OWN tag names that has a
-    /// page, once, in tag order (every-object-in-the-tui-has-a-page).
+    /// A commit page offers its tagged active or finished plan when readable.
     #[test]
-    fn a_commit_page_offers_the_plans_its_tag_names() {
+    fn a_commit_page_offers_its_one_readable_tagged_plan() {
         use crate::cli::status_tui::fixtures::{plan_state, snap};
         use clank_core::plan_view::WaitingOn;
         let repo = repo_with_tagged_commits();
         let p = repo.path();
-        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let s = snap(Some(plan_state("foo", WaitingOn::MasterToContinue)), vec![]);
         let rows = |subject: &str| {
             let (cp, mode) = open_commit_page(p, &sha_of(p, subject), None, &s, 80).unwrap();
             assert_eq!(mode, Mode::CommitPage { sel: 0 }, "opens on its rows");
-            commit_actions(&cp.plans)
+            commit_actions(&cp.plan)
         };
         use CommitAction::*;
         assert_eq!(
-            rows("[foo,bar,misc,foo] both"),
-            [OpenHtml, OpenPlan(key("foo")), OpenPlan(key("bar")), Back],
-            "active and finished plans, once each; `misc` has no page"
+            rows("[bar] finished work"),
+            [OpenHtml, OpenPlan(key("bar")), Back],
+            "a finished plan has a page"
+        );
+        assert_eq!(
+            rows("[foo] current work"),
+            [OpenHtml, OpenPlan(key("foo")), Back]
         );
         assert_eq!(rows("tweak"), [OpenHtml, Back], "an ad-hoc commit");
         assert_eq!(
@@ -7527,7 +7552,7 @@ pub(crate) mod tests {
             "a tag naming no plan"
         );
         assert_eq!(
-            rows("[../queue/500-queued,.hidden,_] not plan keys"),
+            rows("[../queue/500-queued] not a plan key"),
             [OpenHtml, Back],
             "a name that is not a plan key is not a path to read"
         );
@@ -7543,9 +7568,9 @@ pub(crate) mod tests {
         use clank_core::plan_view::WaitingOn;
         let repo = repo_with_tagged_commits();
         let p = repo.path();
-        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
-        let both = sha_of(p, "[foo,bar,misc,foo] both");
-        let (mut cp, _) = open_commit_page(p, &both, None, &s, 80).unwrap();
+        let s = snap(Some(plan_state("foo", WaitingOn::MasterToContinue)), vec![]);
+        let finished = sha_of(p, "[bar] finished work");
+        let (mut cp, _) = open_commit_page(p, &finished, None, &s, 80).unwrap();
         cp.scroll = 3;
         let (mut commit_page, mut beneath) = (Some(cp), None);
 
@@ -7560,7 +7585,7 @@ pub(crate) mod tests {
         );
         assert!(commit_page.is_none(), "the commit page waits beneath");
         let back = close_plan_page(p, &mut plan_page, &mut beneath, &mut commit_page, &s);
-        assert_eq!(back, Mode::CommitPage { sel: 2 }, "on bar's row");
+        assert_eq!(back, Mode::CommitPage { sel: 1 }, "on bar's row");
         assert!(plan_page.is_none() && beneath.is_none());
         assert_eq!(commit_page.as_ref().unwrap().scroll, 3, "at its scroll");
 
@@ -7571,11 +7596,11 @@ pub(crate) mod tests {
             .await
             .expect_err("bar's page closes");
         let cp = commit_page.as_ref().unwrap();
-        assert_eq!(cp.plans, [key("foo")], "bar has no page to offer now");
+        assert_eq!(cp.plan, None, "bar has no page to offer now");
         assert_eq!(
             closed,
             Mode::CommitPage {
-                sel: document_focus(&commit_actions(&cp.plans))
+                sel: document_focus(&commit_actions(&cp.plan))
             },
             "its row is gone, so the cursor is on none"
         );
@@ -7595,7 +7620,7 @@ pub(crate) mod tests {
         use crate::cli::status_tui::fixtures::snap;
         let repo = repo_with_tagged_commits();
         let p = repo.path();
-        let sha = sha_of(p, "[foo,bar,misc,foo] both");
+        let sha = sha_of(p, "[bar] finished work");
         for (author, verdict) in [
             ("codex", "REQUEST_CHANGES fix it"),
             ("ruthless", "CONTINUE lgtm"),
@@ -7610,9 +7635,9 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
-        let s = snap(vec![], vec![]);
+        let s = snap(None, vec![]);
         let (cp, mode) = open_commit_page(p, &sha, Some("ruthless"), &s, 80).unwrap();
-        let actions = commit_actions(&cp.plans);
+        let actions = commit_actions(&cp.plan);
         assert_eq!(
             mode,
             Mode::CommitPage {
@@ -7684,7 +7709,7 @@ pub(crate) mod tests {
         std::fs::write(p.join(".clank/plans/foo.md"), "# foo active").unwrap();
         // The SAME stem in the queue, and only-queued `bar`.
         let mut s = snap(
-            vec![plan_state("foo", WaitingOn::MasterToContinue)],
+            Some(plan_state("foo", WaitingOn::MasterToContinue)),
             vec!["foo", "bar"],
         );
         s.queue[0].priority = 120;
@@ -7905,7 +7930,7 @@ pub(crate) mod tests {
         // stash shared — so this also pins that the close does not
         // fall through to it.
         use clank_core::plan_view::WaitingOn;
-        let mut s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let mut s = snap(Some(plan_state("foo", WaitingOn::MasterToContinue)), vec![]);
         s.stash.clear();
         assert_eq!(
             plan_page_facts(p, "foo", &s, PlanSource::Stash).await,
@@ -8051,7 +8076,7 @@ pub(crate) mod tests {
             (999, 999),
             "and the parse cannot tell them apart"
         );
-        let mut s = snap(vec![], vec![]);
+        let mut s = snap(None, vec![]);
         s.queue = entries
             .iter()
             .map(|e| crate::cli::status::QueueItemView {
@@ -8206,7 +8231,7 @@ pub(crate) mod tests {
         let entry = p.join(".clank/queue/300-foo.md");
         std::fs::write(&entry, "# foo queued").unwrap();
         let mut s = snap(
-            vec![plan_state("foo", WaitingOn::MasterToContinue)],
+            Some(plan_state("foo", WaitingOn::MasterToContinue)),
             vec!["foo"],
         );
         s.queue[0].priority = 300;

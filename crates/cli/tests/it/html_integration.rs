@@ -319,6 +319,14 @@ fn html_timeline_breaks_umbrella_on_plan_change() {
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
+    // Finish the first accepted run before introducing the next one.
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/foo.md"),
+        repo.join(".clank/finished/foo.md"),
+    )
+    .unwrap();
+    commit(repo, "[foo] finish");
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
 
@@ -989,11 +997,19 @@ fn html_timeline_row_does_not_nest_button_inside_anchor() {
 }
 
 #[test]
-fn html_writes_plan_page_for_each_active_plan() {
+fn html_writes_pages_for_finished_history_and_the_active_plan() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
+    // Finish the first accepted run before introducing the next one.
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/foo.md"),
+        repo.join(".clank/finished/foo.md"),
+    )
+    .unwrap();
+    commit(repo, "[foo] finish");
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
 
@@ -1049,6 +1065,14 @@ fn html_plan_page_contains_events_for_that_plan_only() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let foo_sha = head_sha(repo);
+    // Finish the first accepted run before introducing the next one.
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/foo.md"),
+        repo.join(".clank/finished/foo.md"),
+    )
+    .unwrap();
+    commit(repo, "[foo] finish");
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
     let bar_sha = head_sha(repo);
@@ -1247,6 +1271,14 @@ fn html_version_mismatch_rebuilds_every_plan_page() {
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
+    // Finish the first accepted run before introducing the next one.
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/foo.md"),
+        repo.join(".clank/finished/foo.md"),
+    )
+    .unwrap();
+    commit(repo, "[foo] finish");
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
 
@@ -1308,5 +1340,48 @@ fn html_version_match_preserves_incremental_skip() {
     assert_eq!(
         mtime_before, mtime_after,
         "pinned older commit page should NOT be rewritten when version matches and it's outside top-N"
+    );
+}
+
+#[test]
+fn html_finished_run_projects_the_recorded_duration_in_its_page_and_timeline() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", "/cache/\n/html/\n");
+    let dated_commit = |ts: i64, subject: &str| {
+        git(repo, &["add", "-A"]);
+        let date = format!("@{ts} +0000");
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["commit", "--quiet", "-m", subject])
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    write(repo, ".clank/plans/voice-spike.md", "# voice-spike\n");
+    dated_commit(1_700_000_000, "[voice-spike] intro");
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/voice-spike.md"),
+        repo.join(".clank/finished/voice-spike.md"),
+    )
+    .unwrap();
+    dated_commit(1_700_000_180, "[voice-spike] finish");
+    build_html(repo);
+    let page = std::fs::read_to_string(repo.join(".clank/html/plan/voice-spike.html")).unwrap();
+    let timeline = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    assert!(page.contains("finished · duration 3m"), "{page}");
+    assert!(timeline.contains("duration 3m"), "{timeline}");
+    assert!(timeline.contains("class=\"duration\">· 3m"), "{timeline}");
+    assert_eq!(
+        timeline
+            .matches("data-umbrella-key=\"voice-spike\"")
+            .count(),
+        1
     );
 }

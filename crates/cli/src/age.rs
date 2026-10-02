@@ -1,16 +1,21 @@
 //! How long ago something happened, said in one unit.
 //!
-//! Every duration clank shows is the age of a RECORDED event — a
-//! commit's author time, a feedback file's write time — never a clock
-//! the process started for itself. This module is where such a time
-//! becomes text, and where a record's write time is read.
+//! Ages refer to recorded commits and feedback writes. Plan durations
+//! are recorded intro-to-finalize intervals and never age with the clock.
+//! This module formats both and reads record write times; neither uses
+//! a timer started by the process.
 
 use std::path::Path;
 
 /// A duration at one significant unit — long enough to judge staleness
 /// by eye, short enough for a status line that must not wrap.
 pub(crate) fn short(secs: i64) -> String {
-    match secs.max(0) {
+    duration(secs.max(0) as u64)
+}
+
+/// A recorded interval, in one unit, independent of the current clock.
+pub(crate) fn duration(secs: u64) -> String {
+    match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86_400 => format!("{}h", s / 3600),

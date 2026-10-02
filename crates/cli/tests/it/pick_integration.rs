@@ -138,6 +138,9 @@ fn picks_replay_in_source_order_regardless_of_argument_order() {
     git(repo, &["checkout", "-q", "-b", "side"]);
     write(repo, ".clank/plans/first.md", "# first\n\nbody\n");
     commit(repo, "[first] intro");
+    write(repo, ".clank/finished/first.md", "# first\n\nbody\n");
+    git(repo, &["rm", "--quiet", ".clank/plans/first.md"]);
+    commit(repo, "[first] finish");
     write(repo, ".clank/plans/second.md", "# second\n\nbody\n");
     commit(repo, "[second] intro");
     git(repo, &["checkout", "-q", "main"]);
@@ -151,7 +154,7 @@ fn picks_replay_in_source_order_regardless_of_argument_order() {
     .expect("multi-pick");
 
     assert_eq!(
-        git_out(repo, &["log", "-1", "--format=%s", "HEAD~1"]),
+        git_out(repo, &["log", "-1", "--format=%s", "HEAD~2"]),
         "[first] intro",
         "source order, not argument order"
     );
@@ -159,6 +162,15 @@ fn picks_replay_in_source_order_regardless_of_argument_order() {
         git_out(repo, &["log", "-1", "--format=%s"]),
         "[second] intro"
     );
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%s", "HEAD~1"]),
+        "[first] finish"
+    );
+    let state =
+        clank::rebuild::rebuild_repo_sync_with_policy(repo, clank::rebuild::CachePolicy::Use)
+            .unwrap();
+    assert_eq!(state.fold.active_plan.unwrap().key.as_str(), "second");
+    assert_eq!(state.fold.finished_plans[0].plan.as_str(), "first");
 }
 
 #[test]
@@ -173,7 +185,7 @@ fn pick_refuses_a_stem_already_on_the_target() {
 
     let err = block_on(clank::cli::pick::run(pick_args(repo, &["foo"], "side")))
         .expect_err("collision must refuse");
-    assert!(err.to_string().contains("already ACTIVE"), "{err}");
+    assert!(err.to_string().contains("`foo` is already active"), "{err}");
 }
 
 #[test]
@@ -419,7 +431,7 @@ fn pick_dry_squash_purge_previews_the_shape_and_is_a_noop() {
 }
 
 #[test]
-fn pick_collapse_refuses_interleaved_plans() {
+fn pick_refuses_an_unaccepted_source_run_before_partially_copying_the_accepted_one() {
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
@@ -436,13 +448,19 @@ fn pick_collapse_refuses_interleaved_plans() {
     commit(repo, "[b] impl");
     git(repo, &["checkout", "-q", "main"]);
 
-    let mut args = pick_args(repo, &["a", "b"], "side");
-    args.squash = true;
-    let err = block_on(clank::cli::pick::run(args))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("interleave"), "{err}");
-    // Plain pick of the same pair still works.
-    block_on(clank::cli::pick::run(pick_args(repo, &["a", "b"], "side")))
-        .expect("plain pick of interleaved plans");
+    let target_head = git_out(repo, &["rev-parse", "HEAD"]);
+    let source_head = git_out(repo, &["rev-parse", "side"]);
+    for squash in [false, true] {
+        let mut args = pick_args(repo, &["a", "b"], "side");
+        args.squash = squash;
+        let err = block_on(clank::cli::pick::run(args))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`b` not found on `side`"), "{err}");
+        assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), target_head);
+        assert_eq!(git_out(repo, &["rev-parse", "side"]), source_head);
+        assert!(!repo.join(".clank/plans/a.md").exists());
+        assert!(!repo.join("a.rs").exists());
+        assert!(!repo.join("b.rs").exists());
+    }
 }

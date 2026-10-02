@@ -41,7 +41,7 @@ pub(crate) fn bound(tool: clank_core::vocab::Tool, id: &str) -> clank_core::Sess
 pub(crate) fn two_agent_snap() -> StatusSnapshot {
     use crate::cli::teams_config::RosterRole;
     use clank_core::vocab::AutoMode;
-    let mut s = snap(vec![], vec![]);
+    let mut s = snap(None, vec![]);
     s.agents = vec![
         agent_row("claude", RosterRole::Master, AutoMode::On),
         agent_row("codex", RosterRole::Commit, AutoMode::Off),
@@ -105,7 +105,7 @@ pub(crate) fn reviewer_missing(label: &str) -> WaitingOn {
     }
 }
 
-pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
+pub(crate) fn snap(active_plan: Option<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
     StatusSnapshot {
         forks: Vec::new(),
         repo_path: "/r".into(),
@@ -114,7 +114,7 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
         head_sha: Some(format!("{:0<40}", "deadbeef")),
         head_subject: None,
         dirty: None,
-        plans,
+        active_plan,
         last_finished: None,
         blocks: Vec::new(),
         queue: queue
@@ -137,6 +137,7 @@ pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapsho
         pr_reviews: Vec::new(),
         ad_hoc: Vec::new(),
         head_correction: None,
+        warnings: Vec::new(),
     }
 }
 

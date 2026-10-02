@@ -155,20 +155,6 @@ pub enum WaitItem {
         sha: CommitSha,
         violation: HeadTagViolation,
     },
-    /// ≥2 open plans at HEAD (soft-disallow-multiple-plans). Master's
-    /// next action is resolving the overlap — park one via stash,
-    /// finish the older, or fold the newer in. Current-state only:
-    /// history with overlapping plans is never warned about
-    /// retroactively. Blocked plans don't count (see
-    /// [`WorkStatus::multi_plan_open`]).
-    MultiplePlansOpen {
-        /// Oldest open plan by intro time — "the plan in progress".
-        in_progress: PlanKey,
-        /// Every other open plan, intro order — "the new plan(s)".
-        new_plans: Vec<PlanKey>,
-        /// HEAD, for display parity with `FixCommitTag`.
-        sha: CommitSha,
-    },
     PromoteFromQueue {
         name: String,
         priority: u16,
@@ -438,7 +424,6 @@ wake_kinds! {
     AdHocReview => "adhoc_review",
     AdHocRevise => "adhoc_revise",
     FixCommitTag => "fix_commit_tag",
-    MultiplePlansOpen => "multiple_plans_open",
     PromoteFromQueue => "promote_from_queue",
     Message => "message",
     GithubEvent => "github_event",
@@ -535,7 +520,6 @@ impl WaitItem {
             WaitItem::AdHocReview { .. } => WaitKind::AdHocReview,
             WaitItem::AdHocRevise { .. } => WaitKind::AdHocRevise,
             WaitItem::FixCommitTag { .. } => WaitKind::FixCommitTag,
-            WaitItem::MultiplePlansOpen { .. } => WaitKind::MultiplePlansOpen,
             WaitItem::PromoteFromQueue { .. } => WaitKind::PromoteFromQueue,
             WaitItem::Message { .. } => WaitKind::Message,
             WaitItem::GithubEvent { .. } => WaitKind::GithubEvent,
@@ -672,21 +656,18 @@ pub struct HeadCommit {
 
 /// A structured HEAD commit-tag invariant violation. The three kinds
 /// are independent and reported together so one amend fixes them all.
-/// At least one field is non-empty whenever a `HeadTagViolation` is
+/// At least one diagnostic is present whenever a `HeadTagViolation` is
 /// produced. (`commit-tag-fixup-is-first-class-state`.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadTagViolation {
-    /// `G ⊄ active∪introduced` — tag names that resolve to no real
-    /// plan (the original unknown-tag check).
-    pub unknown: Vec<String>,
+    /// The one invalid/unknown tag candidate, when it cannot resolve.
+    pub unknown: Option<String>,
     /// `T ⊄ G` — plans HEAD's diff touched that the tag fails to
-    /// name. Must add these to the tag.
+    /// name. Split unrelated plan-file changes into single-tag commits.
     pub untagged_touched: Vec<PlanKey>,
-    /// `G ⊋ T` on a plan-touching commit — named plans HEAD did NOT
-    /// touch. A planning commit must tag EXACTLY its touched plans;
-    /// these extras must be dropped (genuine code for them goes in
-    /// its own commit). Empty when `T = ∅`.
-    pub extra_named: Vec<PlanKey>,
+    /// The one known tag naming a file HEAD did not touch. Absent for
+    /// code-only commits, where the active tag is ordinary attribution.
+    pub extra_named: Option<PlanKey>,
 }
 
 /// HEAD-only commit-tag invariant check
@@ -717,43 +698,24 @@ pub fn head_tag_violation(
     if !head.adopted {
         return None;
     }
-    // G = the plan set the tag names. An unparsable name (e.g. one
-    // with illegal chars) can't be a real plan → unknown.
-    let mut unknown: Vec<String> = Vec::new();
-    let mut named: BTreeSet<PlanKey> = BTreeSet::new();
-    if let Some(TitlePrefix::Plans(names)) = parse_title_prefix(&head.subject) {
-        for n in names {
-            match PlanKey::parse(&n) {
-                Ok(k) if known_plans.contains(&k) => {
-                    named.insert(k);
-                }
-                _ => unknown.push(n),
-            }
-        }
-    }
-
-    // `T ⊆ G`: every touched plan must be named.
+    // One parsed candidate, either a known plan or one invalid/unknown name.
+    let (named, unknown) = match parse_title_prefix(&head.subject) {
+        Some(TitlePrefix::Plan(name)) => match PlanKey::parse(&name) {
+            Ok(key) if known_plans.contains(&key) => (Some(key), None),
+            _ => (None, Some(name)),
+        },
+        None => (None, None),
+    };
+    // Physical diff inputs can touch several files, but the tag names one.
     let untagged_touched: Vec<PlanKey> = head
         .touched
         .iter()
-        .filter(|t| !named.contains(t))
+        .filter(|t| named.as_ref() != Some(*t))
         .cloned()
         .collect();
+    let extra_named = named.filter(|key| !head.touched.is_empty() && !head.touched.contains(key));
 
-    // `G ⊆ T` only when the commit touches a plan file (strict
-    // `G == T`). On a `T = ∅` (pure-code) commit, named active plans
-    // are legit implementation attribution — not extras.
-    let extra_named: Vec<PlanKey> = if head.touched.is_empty() {
-        Vec::new()
-    } else {
-        named
-            .iter()
-            .filter(|g| !head.touched.contains(g))
-            .cloned()
-            .collect()
-    };
-
-    if unknown.is_empty() && untagged_touched.is_empty() && extra_named.is_empty() {
+    if unknown.is_none() && untagged_touched.is_empty() && extra_named.is_none() {
         None
     } else {
         Some(HeadTagViolation {
@@ -994,7 +956,7 @@ pub struct WorkPolicy {
 
 #[derive(Debug, Clone)]
 pub struct WorkStatus {
-    pub plans: Vec<PlanWorkState>,
+    pub active_plan: Option<PlanWorkState>,
     pub ad_hoc: Vec<AdHocWorkState>,
     /// Active GitHub PR reviews (clank-pr-review-mode), projected
     /// from `.clank/pr-reviews/` via `PlanStateLookup::pr_reviews`.
@@ -1008,16 +970,6 @@ pub struct WorkStatus {
     /// (same computation) so status/TUI render the correction. Empty
     /// when no HEAD facts were supplied or the tag is valid.
     pub head_correction: Option<HeadCorrection>,
-    /// `Some` iff ≥2 open plans are NOT block-suppressed on an adopted
-    /// repo (soft-disallow-multiple-plans). Routes the master to a
-    /// `WaitItem::MultiplePlansOpen`, preempting its other items —
-    /// resolving the overlap IS the next action. Reviewers are NOT
-    /// silenced (the "soft" in soft-disallow): review flow continues.
-    /// Blocked plans are excluded from the count for gate agreement:
-    /// wait's promotion gate deliberately offers the queue while a
-    /// plan is blocked, so counting blocked plans would have wait
-    /// warn against its own advice.
-    pub multi_plan_open: Option<MultiPlanOpen>,
 }
 
 /// A HEAD commit-tag violation paired with the SHA to amend, ready to
@@ -1026,16 +978,6 @@ pub struct WorkStatus {
 pub struct HeadCorrection {
     pub sha: CommitSha,
     pub violation: HeadTagViolation,
-}
-
-/// ≥2 open (non-blocked) plans on an adopted repo, ready to route to
-/// the master as `WaitItem::MultiplePlansOpen`
-/// (soft-disallow-multiple-plans).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiPlanOpen {
-    pub in_progress: PlanKey,
-    pub new_plans: Vec<PlanKey>,
-    pub sha: CommitSha,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1370,256 +1312,237 @@ impl RepoState {
         // is active ∪ plans HEAD introduced so a `[foo] intro` accepts
         // its own brand-new tag (mirrors `apply_commit`'s known set).
         let head_correction = head.and_then(|h| {
-            let mut known: BTreeSet<PlanKey> = self.plans.keys().cloned().collect();
-            known.extend(h.touched.iter().cloned());
-            head_tag_violation(h, &known).map(|violation| HeadCorrection {
+            // The fold rejects the whole intro commit atomically. Neither that
+            // commit nor ignored-run follow-ups may preempt the accepted gate.
+            if self.ignores_commit(&h.sha, &h.subject, &h.touched) {
+                return None;
+            }
+            let touched: BTreeSet<_> = h
+                .touched
+                .iter()
+                .filter(|k| !self.ignored_run(k))
+                .cloned()
+                .collect();
+            let mut known: BTreeSet<PlanKey> =
+                self.active_plan.iter().map(|p| p.key.clone()).collect();
+            known.extend(touched.iter().cloned());
+            let effective = HeadCommit {
+                touched,
+                ..h.clone()
+            };
+            head_tag_violation(&effective, &known).map(|violation| HeadCorrection {
                 sha: h.sha.clone(),
                 violation,
             })
         });
-        // Active plans the violation implicates: those HEAD touched or
-        // named with a real plan. Their rows get `MasterToFixCommitTag`
-        // (below `Blocked`, above review/master-action states) so the
-        // correction renders uniformly.
-        let correction_plans: BTreeSet<PlanKey> = match (&head_correction, head) {
-            (Some(c), Some(h)) => {
-                let mut s: BTreeSet<PlanKey> = h.touched.iter().cloned().collect();
-                s.extend(c.violation.untagged_touched.iter().cloned());
-                s.extend(c.violation.extra_named.iter().cloned());
-                s.retain(|k| self.plans.contains_key(k));
-                s
-            }
-            _ => BTreeSet::new(),
-        };
-
-        // Soft-disallow multiple open plans: ≥2 open plans that are
-        // not block-suppressed is a live problem at HEAD, whatever
-        // commit HEAD is. Gated on the same HEAD facts as the tag
-        // invariant (`None`/un-adopted → never police), and NEVER
-        // derived from history — overlap that already resolved is
-        // tolerated silently (soft-disallow-multiple-plans).
-        let multi_plan_open = head.filter(|h| h.adopted).and_then(|h| {
-            let mut open: Vec<(&PlanKey, i64)> = self
-                .plans
-                .iter()
-                .filter(|(k, _)| reviews.blocks_for(k).is_empty())
-                .map(|(k, ps)| (k, ps.commits.first().map_or(i64::MAX, |e| e.ts)))
-                .collect();
-            if open.len() < 2 {
-                return None;
-            }
-            // Oldest intro = "the plan in progress"; ts ties break
-            // by key so the split is deterministic.
-            open.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-            Some(MultiPlanOpen {
-                in_progress: open[0].0.clone(),
-                new_plans: open[1..].iter().map(|&(k, _)| k.clone()).collect(),
-                sha: h.sha.clone(),
+        // The one active plan implicated by the HEAD correction.
+        let correction_plan = self.active_plan.as_ref().is_some_and(|active| {
+            head_correction.as_ref().zip(head).is_some_and(|(c, h)| {
+                h.touched.contains(&active.key)
+                    || c.violation.untagged_touched.contains(&active.key)
+                    || c.violation.extra_named.as_ref() == Some(&active.key)
             })
         });
 
-        let mut plans = Vec::new();
-        {
-            for (key, ps) in &self.plans {
-                // Block precedence: pending plan-scoped blocks
-                // dominate the review gate AND surface plans that
-                // have no reviewable commit yet (intro-only with
-                // an open block). Block check runs BEFORE the
-                // empty-reviewable early-continue.
-                let mut pending_blocks = reviews.blocks_for(key);
-                if !pending_blocks.is_empty() {
-                    // Lexicographic tie-breaker by (creator, name)
-                    // matches scan_blocks's sort order. The first
-                    // pending block surfaces on the gate line.
-                    pending_blocks.sort_by(|a, b| {
-                        a.creator
-                            .as_str()
-                            .cmp(b.creator.as_str())
-                            .then_with(|| a.name.cmp(&b.name))
-                    });
-                    let block = pending_blocks.into_iter().next().unwrap();
-                    let reviewable = ps.reviewable_shas();
-                    let sha = reviewable.last().cloned();
-                    let latest_event = sha
-                        .as_ref()
-                        .and_then(|s| ps.commits.iter().rev().find(|e| &e.sha == s));
-                    let touched_code = latest_event.is_some_and(|e| e.touched_code);
-                    plans.push(PlanWorkState {
-                        plan: key.clone(),
-                        sha,
-                        gate: CommitGateState::Blocked,
-                        waiting_on: WaitingOn::Blocked { block },
-                        touched_code,
-                        handover: Handover {
-                            opened: latest_event.map(|e| e.ts),
-                            ..Handover::default()
-                        },
-                    });
-                    continue;
-                }
-
+        let active_plan = self.active_plan.as_ref().and_then(|active| {
+            let (key, ps) = (&active.key, &active.state);
+            // Block precedence: pending plan-scoped blocks
+            // dominate the review gate AND surface plans that
+            // have no reviewable commit yet (intro-only with
+            // an open block). Block check runs BEFORE the
+            // empty-reviewable early return.
+            let mut pending_blocks = reviews.blocks_for(key);
+            if !pending_blocks.is_empty() {
+                // Lexicographic tie-breaker by (creator, name)
+                // matches scan_blocks's sort order. The first
+                // pending block surfaces on the gate line.
+                pending_blocks.sort_by(|a, b| {
+                    a.creator
+                        .as_str()
+                        .cmp(b.creator.as_str())
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                let block = pending_blocks.into_iter().next().unwrap();
                 let reviewable = ps.reviewable_shas();
-                if reviewable.is_empty() {
-                    continue;
-                }
-                let latest_sha = reviewable.last().unwrap().clone();
-                let latest_event = ps.commits.iter().rev().find(|e| e.sha == latest_sha);
-                let touched_code = latest_event.map_or(false, |e| e.touched_code);
-                let latest_touched_plan = latest_event.map_or(false, |e| e.touched_plan);
+                let sha = reviewable.last().cloned();
+                let latest_event = sha
+                    .as_ref()
+                    .and_then(|s| ps.commits.iter().rev().find(|e| &e.sha == s));
+                let touched_code = latest_event.is_some_and(|e| e.touched_code);
+                return Some(PlanWorkState {
+                    plan: key.clone(),
+                    sha,
+                    gate: CommitGateState::Blocked,
+                    waiting_on: WaitingOn::Blocked { block },
+                    touched_code,
+                    handover: Handover {
+                        opened: latest_event.map(|e| e.ts),
+                        ..Handover::default()
+                    },
+                });
+            }
 
-                let entries = reviews.reviews_for(&latest_sha);
-                // SINGLE gate-state decision: always `compute_gate`. When
-                // plan review is disabled, route through it with EMPTY tiers
-                // (→ `Continued`) so the master isn't blocked — rather than a
-                // duplicate inline verdict check that would re-implement (and
-                // drift from) the gate logic.
-                let (commit_tier, plan_tier, final_tier): (
-                    &[AgentLabel],
-                    &[AgentLabel],
-                    &[AgentLabel],
-                ) = if policy.plan_feedback {
-                    (
-                        &policy.commit_reviewers,
-                        &policy.plan_reviewers,
-                        &policy.final_reviewers,
-                    )
-                } else {
-                    (&[], &[], &[])
-                };
-                let gate = compute_gate(
+            let reviewable = ps.reviewable_shas();
+            if reviewable.is_empty() {
+                return None;
+            }
+            let latest_sha = reviewable.last().unwrap().clone();
+            let latest_event = ps.commits.iter().rev().find(|e| e.sha == latest_sha);
+            let touched_code = latest_event.map_or(false, |e| e.touched_code);
+            let latest_touched_plan = latest_event.map_or(false, |e| e.touched_plan);
+
+            let entries = reviews.reviews_for(&latest_sha);
+            // SINGLE gate-state decision: always `compute_gate`. When
+            // plan review is disabled, route through it with EMPTY tiers
+            // (→ `Continued`) so the master isn't blocked — rather than a
+            // duplicate inline verdict check that would re-implement (and
+            // drift from) the gate logic.
+            let (commit_tier, plan_tier, final_tier): (
+                &[AgentLabel],
+                &[AgentLabel],
+                &[AgentLabel],
+            ) = if policy.plan_feedback {
+                (
+                    &policy.commit_reviewers,
+                    &policy.plan_reviewers,
+                    &policy.final_reviewers,
+                )
+            } else {
+                (&[], &[], &[])
+            };
+            let gate = compute_gate(
+                &entries,
+                commit_tier,
+                plan_tier,
+                final_tier,
+                latest_touched_plan,
+            );
+
+            // Filter to expected reviewers for any downstream uses
+            // (MasterToRevise payload, missing-set computation). Same
+            // principle as compute_gate's filter. All tiers.
+            let expected: std::collections::HashSet<&AgentLabel> = policy
+                .commit_reviewers
+                .iter()
+                .chain(policy.plan_reviewers.iter())
+                .chain(policy.final_reviewers.iter())
+                .collect();
+            let filtered_entries: Vec<&ReviewEntry> = entries
+                .iter()
+                .filter(|r| expected.contains(&r.author))
+                .collect();
+
+            let worktree = reviews.worktree_status(key);
+            // Worktree-first dispatch: an uncommitted plan edit
+            // is author intent that supersedes the gate's view of
+            // the last committed version. Routing the master to
+            // anything other than Commit is asking them to make
+            // decisions on a version they're already replacing,
+            // AND wakes reviewers to a doc that's about to change.
+            //
+            // Block precedence still wins (handled by the
+            // early return above), so this only runs for unblocked
+            // plans. A dirty plan body is master's to commit
+            // regardless of gate state.
+            let waiting_on = if worktree == PlanWorktreeStatus::BodyDirty {
+                WaitingOn::MasterToCommit
+            } else {
+                match gate {
+                    CommitGateState::Blocked => {
+                        // Unreachable: the block-precedence check above
+                        // already consumed any blocked plan via the
+                        // continue. compute_gate cannot return Blocked
+                        // (it's a per-commit review verdict; Blocked is
+                        // a plan-level state). This arm exists only to
+                        // satisfy match exhaustiveness.
+                        unreachable!(
+                            "compute_gate cannot return Blocked; plan-level Blocked is handled above"
+                        );
+                    }
+                    CommitGateState::ChangesRequested => {
+                        let requesters = filtered_entries
+                            .iter()
+                            .filter(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
+                            .map(|r| r.author.clone())
+                            .collect();
+                        let ambiguous = filtered_entries
+                            .iter()
+                            .filter(|r| r.verdict == crate::vocab::Verdict::Unmarked)
+                            .map(|r| r.author.clone())
+                            .collect();
+                        WaitingOn::MasterToRevise {
+                            requesters,
+                            ambiguous,
+                        }
+                    }
+                    CommitGateState::Finished => WaitingOn::MasterToFinalize,
+                    CommitGateState::Continued => WaitingOn::MasterToContinue,
+                    CommitGateState::ContinuedPendingGate => {
+                        // All commit-reviewers signed off; some gate-
+                        // reviewer hasn't voted yet. Master sleeps; the
+                        // PENDING gate-reviewers wake. Single-source via
+                        // `missing_for_gate` (→ `tier_coverage`) — a
+                        // gate-reviewer who already filed Request-Changes
+                        // is HELD, not re-summoned.
+                        let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
+                            gate,
+                            &entries,
+                            policy,
+                            latest_touched_plan,
+                        ))
+                        .expect(
+                            "ContinuedPendingGate state implies a non-empty pending gate-reviewer set",
+                        );
+                        WaitingOn::GateReviewersMissing { missing }
+                    }
+                    CommitGateState::Unreviewed => {
+                        // Some commit-reviewer hasn't verdicted yet. The
+                        // PENDING reviewers wake; master sleeps. A
+                        // commit-reviewer who already filed Request-Changes
+                        // /Unmarked is HELD (not pending), so it is NOT in
+                        // the wake set — its verdict surfaces to the master
+                        // once everyone has spoken. Single-source via
+                        // `missing_for_gate` (→ `tier_coverage`).
+                        let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
+                            gate,
+                            &entries,
+                            policy,
+                            latest_touched_plan,
+                        ))
+                        .expect(
+                            "Unreviewed gate state implies a non-empty pending commit-reviewer set",
+                        );
+                        WaitingOn::ReviewerApprovalsMissing { missing }
+                    }
+                }
+            };
+
+            // Commit-tag correction dominates review/master-action
+            // states (but not Blocked — handled by the early return
+            // above). Marked from the SAME violation that produced
+            // `head_correction`, so display and routing can't drift.
+            let waiting_on = if correction_plan {
+                WaitingOn::MasterToFixCommitTag
+            } else {
+                waiting_on
+            };
+
+            Some(PlanWorkState {
+                plan: key.clone(),
+                sha: Some(latest_sha),
+                gate,
+                waiting_on,
+                touched_code,
+                handover: stage_closures(
+                    latest_event.map(|e| e.ts),
                     &entries,
                     commit_tier,
                     plan_tier,
                     final_tier,
                     latest_touched_plan,
-                );
-
-                // Filter to expected reviewers for any downstream uses
-                // (MasterToRevise payload, missing-set computation). Same
-                // principle as compute_gate's filter. All tiers.
-                let expected: std::collections::HashSet<&AgentLabel> = policy
-                    .commit_reviewers
-                    .iter()
-                    .chain(policy.plan_reviewers.iter())
-                    .chain(policy.final_reviewers.iter())
-                    .collect();
-                let filtered_entries: Vec<&ReviewEntry> = entries
-                    .iter()
-                    .filter(|r| expected.contains(&r.author))
-                    .collect();
-
-                let worktree = reviews.worktree_status(key);
-                // Worktree-first dispatch: an uncommitted plan edit
-                // is author intent that supersedes the gate's view of
-                // the last committed version. Routing the master to
-                // anything other than Commit is asking them to make
-                // decisions on a version they're already replacing,
-                // AND wakes reviewers to a doc that's about to change.
-                //
-                // Block precedence still wins (handled by the
-                // `continue` above), so this only runs for unblocked
-                // plans. A dirty plan body is master's to commit
-                // regardless of gate state.
-                let waiting_on = if worktree == PlanWorktreeStatus::BodyDirty {
-                    WaitingOn::MasterToCommit
-                } else {
-                    match gate {
-                        CommitGateState::Blocked => {
-                            // Unreachable: the block-precedence check above
-                            // already consumed any blocked plan via the
-                            // continue. compute_gate cannot return Blocked
-                            // (it's a per-commit review verdict; Blocked is
-                            // a plan-level state). This arm exists only to
-                            // satisfy match exhaustiveness.
-                            unreachable!(
-                                "compute_gate cannot return Blocked; plan-level Blocked is handled above"
-                            );
-                        }
-                        CommitGateState::ChangesRequested => {
-                            let requesters = filtered_entries
-                                .iter()
-                                .filter(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
-                                .map(|r| r.author.clone())
-                                .collect();
-                            let ambiguous = filtered_entries
-                                .iter()
-                                .filter(|r| r.verdict == crate::vocab::Verdict::Unmarked)
-                                .map(|r| r.author.clone())
-                                .collect();
-                            WaitingOn::MasterToRevise {
-                                requesters,
-                                ambiguous,
-                            }
-                        }
-                        CommitGateState::Finished => WaitingOn::MasterToFinalize,
-                        CommitGateState::Continued => WaitingOn::MasterToContinue,
-                        CommitGateState::ContinuedPendingGate => {
-                            // All commit-reviewers signed off; some gate-
-                            // reviewer hasn't voted yet. Master sleeps; the
-                            // PENDING gate-reviewers wake. Single-source via
-                            // `missing_for_gate` (→ `tier_coverage`) — a
-                            // gate-reviewer who already filed Request-Changes
-                            // is HELD, not re-summoned.
-                            let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
-                                gate,
-                                &entries,
-                                policy,
-                                latest_touched_plan,
-                            ))
-                            .expect(
-                                "ContinuedPendingGate state implies a non-empty pending gate-reviewer set",
-                            );
-                            WaitingOn::GateReviewersMissing { missing }
-                        }
-                        CommitGateState::Unreviewed => {
-                            // Some commit-reviewer hasn't verdicted yet. The
-                            // PENDING reviewers wake; master sleeps. A
-                            // commit-reviewer who already filed Request-Changes
-                            // /Unmarked is HELD (not pending), so it is NOT in
-                            // the wake set — its verdict surfaces to the master
-                            // once everyone has spoken. Single-source via
-                            // `missing_for_gate` (→ `tier_coverage`).
-                            let missing = crate::repo_state::NonEmptyVec::new(missing_for_gate(
-                                gate,
-                                &entries,
-                                policy,
-                                latest_touched_plan,
-                            ))
-                            .expect(
-                                "Unreviewed gate state implies a non-empty pending commit-reviewer set",
-                            );
-                            WaitingOn::ReviewerApprovalsMissing { missing }
-                        }
-                    }
-                };
-
-                // Commit-tag correction dominates review/master-action
-                // states (but not Blocked — handled by the `continue`
-                // above). Marked from the SAME violation that produced
-                // `head_correction`, so display and routing can't drift.
-                let waiting_on = if correction_plans.contains(key) {
-                    WaitingOn::MasterToFixCommitTag
-                } else {
-                    waiting_on
-                };
-
-                plans.push(PlanWorkState {
-                    plan: key.clone(),
-                    sha: Some(latest_sha),
-                    gate,
-                    waiting_on,
-                    touched_code,
-                    handover: stage_closures(
-                        latest_event.map(|e| e.ts),
-                        &entries,
-                        commit_tier,
-                        plan_tier,
-                        final_tier,
-                        latest_touched_plan,
-                    ),
-                });
-            }
-        }
+                ),
+            })
+        });
 
         let mut ad_hoc = Vec::new();
         if policy.adhoc_feedback {
@@ -1695,11 +1618,10 @@ impl RepoState {
         }
 
         WorkStatus {
-            plans,
+            active_plan,
             ad_hoc,
             pr_reviews,
             head_correction,
-            multi_plan_open,
         }
     }
 }
@@ -1775,25 +1697,8 @@ impl WorkStatus {
             };
         }
 
-        // Multiple open plans preempt the master's other items —
-        // resolving the overlap IS the next action; every remedy
-        // (stash-and-swap, finish the older, fold the newer in) goes
-        // through this one item. Reviewers are NOT silenced, unlike
-        // the tag correction: that's the "soft" in soft-disallow —
-        // the gate keeps flowing (stash/pop resets reviews anyway,
-        // and the fold-in remedy continues the existing gate).
-        if role == Role::Master
-            && let Some(mp) = &self.multi_plan_open
-        {
-            return vec![WaitItem::MultiplePlansOpen {
-                in_progress: mp.in_progress.clone(),
-                new_plans: mp.new_plans.clone(),
-                sha: mp.sha.clone(),
-            }];
-        }
-
         let mut out = Vec::new();
-        for ps in &self.plans {
+        if let Some(ps) = &self.active_plan {
             // Safe: only non-blocked plans reach the WaitItem-emitting
             // arms below, and the block-precedence path in
             // `derive_status` guarantees those have Some(sha). The
@@ -2045,8 +1950,8 @@ mod tests {
         // unknown-tag check. Flagged on an adopted repo, tolerated on
         // a guest repo.
         let v = violate(true, "[bar] work", &["foo"], &[]).expect("unknown tag flagged");
-        assert_eq!(v.unknown, vec!["bar".to_string()]);
-        assert!(v.untagged_touched.is_empty() && v.extra_named.is_empty());
+        assert_eq!(v.unknown, Some("bar".to_string()));
+        assert!(v.untagged_touched.is_empty() && v.extra_named.is_none());
         // `[misc]` is no longer special — just an unknown tag.
         assert!(violate(true, "[misc] one-off", &["foo"], &[]).is_some());
         // Known active plan, no touch → legit implementation tag.
@@ -2055,9 +1960,9 @@ mod tests {
         assert!(violate(true, "just code", &["foo"], &[]).is_none());
         // NOT adopted → never police.
         assert!(violate(false, "[bar] work", &["foo"], &[]).is_none());
-        // Multi-tag, one unknown (T = ∅) → flag only the unknown name.
-        let v = violate(true, "[foo,bar] x", &["foo"], &[]).expect("partial unknown flagged");
-        assert_eq!(v.unknown, vec!["bar".to_string()]);
+        // A comma candidate is a single invalid name, even when a member is active.
+        let v = violate(true, "[foo,bar] x", &["foo"], &[]).expect("invalid candidate flagged");
+        assert_eq!(v.unknown, Some("foo,bar".to_string()));
     }
 
     #[test]
@@ -2067,7 +1972,7 @@ mod tests {
         let v = violate(true, "[plan] fix it", &["real"], &["real"])
             .expect("placeholder over real plan flagged");
         assert_eq!(v.untagged_touched, vec![plan("real")]);
-        assert_eq!(v.unknown, vec!["plan".to_string()]);
+        assert_eq!(v.unknown, Some("plan".to_string()));
         // untagged touching real.md → T={real}, G=∅.
         let v = violate(true, "fix it", &["real"], &["real"]).expect("untagged touch flagged");
         assert_eq!(v.untagged_touched, vec![plan("real")]);
@@ -2075,22 +1980,21 @@ mod tests {
         let v = violate(true, "[a] cross", &["a", "b"], &["a", "b"])
             .expect("second touched plan must be named");
         assert_eq!(v.untagged_touched, vec![plan("b")]);
-        assert!(v.extra_named.is_empty());
+        assert!(v.extra_named.is_none());
     }
 
     #[test]
     fn head_tag_extra_named_on_plan_touch_is_flagged() {
-        // G ⊋ T on a plan-touching commit: `[a,b]` but only a.md
-        // touched. `b` rides along unverifiably — strict G == T bans it.
-        let v = violate(true, "[a,b] x", &["a", "b"], &["a"]).expect("extra named flagged");
-        assert_eq!(v.extra_named, vec![plan("b")]);
-        assert!(v.untagged_touched.is_empty() && v.unknown.is_empty());
+        let v = violate(true, "[b] x", &["b"], &["a"]).expect("mismatched tag flagged");
+        assert_eq!(v.extra_named, Some(plan("b")));
+        assert_eq!(v.untagged_touched, vec![plan("a")]);
+        assert!(v.unknown.is_none());
     }
 
     #[test]
     fn head_tag_strict_equality_when_touch_is_satisfied() {
         // T = G exactly → valid.
-        assert!(violate(true, "[a,b] both", &["a", "b"], &["a", "b"]).is_none());
+        assert!(violate(true, "[a] work", &["a"], &["a"]).is_none());
         // codex 1ea61ae: `[foo] finish`/`delete` IS a touch of foo, so
         // T={foo}=G even though finalize removes foo from active. The
         // carve-out falls out for free.
@@ -2837,18 +2741,17 @@ mod tests {
 
     fn work_status_with_one_plan(waiting_on: WaitingOn) -> WorkStatus {
         WorkStatus {
-            plans: vec![PlanWorkState {
+            active_plan: Some(PlanWorkState {
                 plan: plan("a.md"),
                 sha: Some(sha("aaaa")),
                 gate: CommitGateState::Unreviewed,
                 waiting_on,
                 touched_code: false,
                 handover: Handover::default(),
-            }],
+            }),
             ad_hoc: Vec::new(),
             pr_reviews: Vec::new(),
             head_correction: None,
-            multi_plan_open: None,
         }
     }
 
@@ -3219,11 +3122,10 @@ mod tests {
             "no reviewer summoned before the review is opened"
         );
         let ws = WorkStatus {
-            plans: Vec::new(),
+            active_plan: None,
             ad_hoc: Vec::new(),
             pr_reviews: vec![s],
             head_correction: None,
-            multi_plan_open: None,
         };
         assert_eq!(
             ws.work_for(&label("claude"), Role::Master),
@@ -3246,7 +3148,7 @@ mod tests {
         // ChangesRequested to master (the only two routed states).
         use crate::vocab::CommitGateState as G;
         let ws = |gate: G| WorkStatus {
-            plans: Vec::new(),
+            active_plan: None,
             ad_hoc: vec![AdHocWorkState {
                 sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
                 gate,
@@ -3254,7 +3156,6 @@ mod tests {
             }],
             pr_reviews: Vec::new(),
             head_correction: None,
-            multi_plan_open: None,
         };
         // The reproduction: continued/finished → master empty.
         assert!(
@@ -3301,7 +3202,7 @@ mod tests {
 
     fn ws_pr(gate: crate::vocab::CommitGateState, missing: &[&str]) -> WorkStatus {
         WorkStatus {
-            plans: Vec::new(),
+            active_plan: None,
             ad_hoc: Vec::new(),
             pr_reviews: vec![PrReviewWorkState {
                 handoff_blocked: false,
@@ -3313,7 +3214,6 @@ mod tests {
                 handover: Handover::default(),
             }],
             head_correction: None,
-            multi_plan_open: None,
         }
     }
 
@@ -3499,9 +3399,10 @@ mod tests {
     /// Unreviewed → reviewers woken).
     fn state_one_plan(stem: &str) -> RepoState {
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan(stem), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan(stem),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         state
     }
 
@@ -3521,7 +3422,10 @@ mod tests {
             status.head_correction.is_some(),
             "violation must be derived"
         );
-        assert_eq!(status.plans[0].waiting_on, WaitingOn::MasterToFixCommitTag);
+        assert_eq!(
+            status.active_plan.as_ref().unwrap().waiting_on,
+            WaitingOn::MasterToFixCommitTag
+        );
         // Master routed to fix; reviewers NOT woken.
         let master = status.work_for(&label("lloyd"), Role::Master);
         assert_eq!(master.len(), 1);
@@ -3534,148 +3438,71 @@ mod tests {
         );
     }
 
-    // ── soft-disallow-multiple-plans ────────────────────────────
-    //
-    // ≥2 open, non-blocked plans on an adopted repo route the master
-    // to a MultiplePlansOpen item (preempting its other items);
-    // reviewers keep flowing. Current-state only, never history.
-
-    /// One open plan with a single reviewable commit whose intro
-    /// timestamp is controllable (intro order decides which plan the
-    /// warning calls "in progress").
-    fn open_plan(ts: i64, commit_sha: CommitSha) -> PlanState {
-        use crate::repo_state::PlanTimelineEvent;
-        let mut ps = PlanState::default();
-        ps.commits.push(PlanTimelineEvent {
-            sha: commit_sha,
-            ts,
-            touched_plan: true,
-            touched_code: false,
+    #[test]
+    fn rejected_intro_does_not_create_a_second_reviewer_assignment() {
+        use crate::repo_state::{CommitEvent, PlanTouchInput, TouchKind};
+        let mut state = state_one_plan("accepted");
+        state.apply_commit(&CommitEvent {
+            sha: sha("bbbb"),
+            author_ts: 2,
+            subject: "[ignored] intro".into(),
+            plan_touches: vec![PlanTouchInput {
+                plan: plan("ignored"),
+                kind: TouchKind::Intro,
+            }],
+            has_code_changes: false,
         });
-        ps
-    }
-
-    #[test]
-    fn two_open_plans_route_master_to_the_overlap_warning() {
-        let mut state = RepoState::default();
-        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
-        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
-        // Untagged pure-code HEAD: no tag violation, so the overlap
-        // warning is what routes.
-        let status = state.derive_status(
-            &MockReviews(vec![]),
-            &plan_policy(),
-            Some(&head("work", &[])),
-        );
-        let master = status.work_for(&label("lloyd"), Role::Master);
-        assert_eq!(master.len(), 1, "the warning preempts other master items");
-        let WaitItem::MultiplePlansOpen {
-            in_progress,
-            new_plans,
-            ..
-        } = &master[0]
-        else {
-            panic!("expected MultiplePlansOpen, got {:?}", master[0]);
-        };
-        assert_eq!(in_progress.as_str(), "old", "oldest intro is in progress");
-        assert_eq!(new_plans.len(), 1);
-        assert_eq!(new_plans[0].as_str(), "new");
-        // Reviewers are NOT silenced — the soft in soft-disallow.
-        let reviewer = status.work_for(&label("codex"), Role::Reviewer);
-        assert_eq!(reviewer.len(), 2, "review flow continues on both plans");
-    }
-
-    #[test]
-    fn single_open_plan_never_warns() {
-        let state = state_one_plan("real");
-        let status = state.derive_status(
-            &MockReviews(vec![]),
-            &plan_policy(),
-            Some(&head("[real] work", &[])),
-        );
-        assert!(status.multi_plan_open.is_none());
-        assert!(
-            !status
-                .work_for(&label("lloyd"), Role::Master)
-                .iter()
-                .any(|i| matches!(i, WaitItem::MultiplePlansOpen { .. }))
-        );
-    }
-
-    #[test]
-    fn broken_head_tag_preempts_the_overlap_warning() {
-        let mut state = RepoState::default();
-        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
-        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
-        // `[nope]` names no plan → tag correction. Both derived states
-        // exist; the correction routes first.
-        let status = state.derive_status(
-            &MockReviews(vec![]),
-            &plan_policy(),
-            Some(&head("[nope] work", &[])),
-        );
-        assert!(status.multi_plan_open.is_some(), "both states derived");
-        let master = status.work_for(&label("lloyd"), Role::Master);
-        assert_eq!(master.len(), 1);
-        assert!(
-            matches!(master[0], WaitItem::FixCommitTag { .. }),
-            "tag correction first — one amend may even remove the overlap"
-        );
-    }
-
-    #[test]
-    fn blocked_plans_dont_count_toward_the_overlap() {
-        // The promotion gate deliberately offers the queue while a
-        // plan is blocked; the warning must agree with it or wait
-        // contradicts its own advice.
-        let mut state = RepoState::default();
-        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
-        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
-        let mut blocks = std::collections::BTreeMap::new();
-        blocks.insert(
-            plan("old"),
-            vec![mkblock("claude", "q", "waiting on lloyd")],
-        );
-        let status = state.derive_status(
-            &MockBlocks(blocks),
-            &plan_policy(),
-            Some(&head("work", &[])),
-        );
-        assert!(
-            status.multi_plan_open.is_none(),
-            "a blocked plan is not an overlap"
-        );
-    }
-
-    #[test]
-    fn three_open_plans_name_all_new_ones_in_intro_order() {
-        let mut state = RepoState::default();
-        // Keys deliberately out of intro order: c introduced first.
-        state.plans.insert(plan("c"), open_plan(1, sha("aaaa")));
-        state.plans.insert(plan("a"), open_plan(2, sha("bbbb")));
-        state.plans.insert(plan("b"), open_plan(3, sha("cccc")));
-        let status = state.derive_status(
-            &MockReviews(vec![]),
-            &plan_policy(),
-            Some(&head("work", &[])),
-        );
-        let mp = status.multi_plan_open.expect("three open plans warn");
-        assert_eq!(mp.in_progress.as_str(), "c", "intro time, not key order");
-        let names: Vec<&str> = mp.new_plans.iter().map(|p| p.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn unadopted_or_headless_repos_never_warn() {
-        let mut state = RepoState::default();
-        state.plans.insert(plan("old"), open_plan(1, sha("aaaa")));
-        state.plans.insert(plan("new"), open_plan(2, sha("bbbb")));
-        let mut unadopted = head("work", &[]);
-        unadopted.adopted = false;
-        let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), Some(&unadopted));
-        assert!(status.multi_plan_open.is_none(), "guest repos not policed");
         let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), None);
-        assert!(status.multi_plan_open.is_none(), "no HEAD facts, no check");
+        assert!(status.active_plan.is_some());
+        let reviewer = status.work_for(&label("codex"), Role::Reviewer);
+        assert_eq!(reviewer.len(), 1);
+        assert!(
+            matches!(&reviewer[0], WaitItem::Reviewer { plan: key, .. } if key == &plan("accepted"))
+        );
+    }
+
+    #[test]
+    fn ignored_run_tags_and_touches_do_not_preempt_the_accepted_gate() {
+        use crate::repo_state::{CommitEvent, PlanTouchInput, TouchKind};
+        let mut state = state_one_plan("accepted");
+        state.apply_commit(&CommitEvent {
+            sha: sha("bbbb"),
+            author_ts: 2,
+            subject: "[ignored] intro".into(),
+            plan_touches: vec![PlanTouchInput {
+                plan: plan("ignored"),
+                kind: TouchKind::Intro,
+            }],
+            has_code_changes: true,
+        });
+        let baseline = state
+            .derive_status(&MockReviews(vec![]), &plan_policy(), None)
+            .work_for(&label("codex"), Role::Reviewer);
+        let cases = [
+            ("[ignored] intro", vec![plan("ignored")], sha("bbbb")),
+            ("[ignored] implementation", vec![], sha("cccc")),
+            ("[ignored] revise", vec![plan("ignored")], sha("dddd")),
+            (
+                "[accepted] mixed rejected intro",
+                vec![plan("accepted"), plan("ignored")],
+                sha("bbbb"),
+            ),
+        ];
+        for (subject, touched, sha) in cases {
+            let h = HeadCommit {
+                sha,
+                subject: subject.into(),
+                touched: touched.into_iter().collect(),
+                adopted: true,
+            };
+            let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), Some(&h));
+            assert!(status.head_correction.is_none(), "{subject}");
+            assert_eq!(
+                status.work_for(&label("codex"), Role::Reviewer),
+                baseline,
+                "{subject}"
+            );
+        }
     }
 
     #[test]
@@ -3688,28 +3515,32 @@ mod tests {
             Some(&head("fix it", &["real"])),
         );
         assert!(status.head_correction.is_some());
-        assert_eq!(status.plans[0].waiting_on, WaitingOn::MasterToFixCommitTag);
+        assert_eq!(
+            status.active_plan.as_ref().unwrap().waiting_on,
+            WaitingOn::MasterToFixCommitTag
+        );
         assert!(status.work_for(&label("codex"), Role::Reviewer).is_empty());
     }
 
     #[test]
     fn derive_status_tag_missing_second_touched_plan_is_correction() {
-        // `[a]` touching a.md + b.md → b unnamed. Both plans active.
+        // `[a]` touching a.md + b.md → b unnamed. Only a is accepted.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("a"), make_plan_with_one_reviewable(sha("aaaa")));
-        state
-            .plans
-            .insert(plan("b"), make_plan_with_one_reviewable(sha("bbbb")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("a"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
+
         let status = state.derive_status(
             &MockReviews(vec![]),
             &plan_policy(),
             Some(&head("[a] cross", &["a", "b"])),
         );
         assert!(status.head_correction.is_some());
-        // Both implicated plans carry the correction.
-        for ps in &status.plans {
+        assert!(status.active_plan.is_some());
+        assert_eq!(status.active_plan.as_ref().unwrap().plan, plan("a"));
+        // Only the accepted run carries the correction.
+        for ps in &status.active_plan {
             assert_eq!(
                 ps.waiting_on,
                 WaitingOn::MasterToFixCommitTag,
@@ -3722,7 +3553,7 @@ mod tests {
     }
 
     #[test]
-    fn work_for_reviewer_idle_cross_plan_under_head_correction() {
+    fn correction_idles_an_active_plan_even_when_the_bad_tag_does_not_name_it() {
         // A broken HEAD tag is a repo-GLOBAL preempt: while it stands NO
         // reviewer is woken — not even one missing on a DIFFERENT,
         // NON-implicated plan. This is the drift `unify-repo-state-watcher`
@@ -3730,12 +3561,11 @@ mod tests {
         // `is_actionable` (= `work_for` non-empty), so it must agree with
         // this here, cross-plan.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("a"), make_plan_with_one_reviewable(sha("aaaa")));
-        state
-            .plans
-            .insert(plan("b"), make_plan_with_one_reviewable(sha("bbbb")));
+
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("b"),
+            state: make_plan_with_one_reviewable(sha("bbbb")),
+        });
         // Untagged HEAD (sha aaaa) touches only plan a → the violation
         // implicates a; plan b is untouched and keeps its ordinary
         // reviewer-wait.
@@ -3746,7 +3576,7 @@ mod tests {
         );
         assert!(status.head_correction.is_some());
         let b = status
-            .plans
+            .active_plan
             .iter()
             .find(|p| p.plan.as_str() == "b")
             .expect("plan b present");
@@ -3765,29 +3595,17 @@ mod tests {
     }
 
     #[test]
-    fn derive_status_valid_multi_tag_stays_valid() {
-        // `[a,b]` touching a.md + b.md → T == G → no correction; normal
-        // review resumes (reviewers woken on the Unreviewed gate).
-        let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("a"), make_plan_with_one_reviewable(sha("aaaa")));
-        state
-            .plans
-            .insert(plan("b"), make_plan_with_one_reviewable(sha("bbbb")));
+    fn comma_candidate_is_reported_as_one_invalid_name() {
+        let state = state_one_plan("a");
         let status = state.derive_status(
             &MockReviews(vec![]),
             &plan_policy(),
-            Some(&head("[a,b] both", &["a", "b"])),
+            Some(&head("[a,b] work", &["a"])),
         );
-        assert!(status.head_correction.is_none(), "T == G is valid");
-        for ps in &status.plans {
-            assert!(matches!(
-                ps.waiting_on,
-                WaitingOn::ReviewerApprovalsMissing { .. }
-            ));
-        }
-        assert_eq!(status.work_for(&label("codex"), Role::Reviewer).len(), 2);
+        let correction = status.head_correction.as_ref().unwrap();
+        assert_eq!(correction.violation.unknown, Some("a,b".to_owned()));
+        assert_eq!(correction.violation.untagged_touched, vec![plan("a")]);
+        assert!(status.work_for(&label("codex"), Role::Reviewer).is_empty());
     }
 
     #[test]
@@ -3844,7 +3662,7 @@ mod tests {
             Some(&head("[plan] fix", &["real"])),
         );
         assert!(matches!(
-            status.plans[0].waiting_on,
+            status.active_plan.as_ref().unwrap().waiting_on,
             WaitingOn::Blocked { .. }
         ));
     }
@@ -3867,9 +3685,10 @@ mod tests {
         // gate reviewer. (compute_gate proving Continued isn't enough
         // — work_for is a separate match-arm surface.)
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let reviews = MockReviews(vec![(
             sha("aaaa"),
             vec![entry(crate::vocab::Verdict::Continue, "codex")],
@@ -3877,7 +3696,7 @@ mod tests {
         let status = state.derive_status(&reviews, &master_gate_policy(), None);
 
         assert_eq!(
-            status.plans[0].gate,
+            status.active_plan.as_ref().unwrap().gate,
             CommitGateState::Continued,
             "routine code commit must bypass the gate tier"
         );
@@ -3894,16 +3713,20 @@ mod tests {
         // Contrast: a plan-doc commit the commit tier CONTINUED IS a
         // milestone → the gate reviewer DOES get a work item.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_plan_doc_commit(sha("bbbb")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_plan_doc_commit(sha("bbbb")),
+        });
         let reviews = MockReviews(vec![(
             sha("bbbb"),
             vec![entry(crate::vocab::Verdict::Continue, "codex")],
         )]);
         let status = state.derive_status(&reviews, &master_gate_policy(), None);
 
-        assert_eq!(status.plans[0].gate, CommitGateState::ContinuedPendingGate);
+        assert_eq!(
+            status.active_plan.as_ref().unwrap().gate,
+            CommitGateState::ContinuedPendingGate
+        );
         assert_eq!(
             status.work_for(&label("ruthless"), Role::Reviewer).len(),
             1,
@@ -3916,16 +3739,17 @@ mod tests {
         // A plan with a reviewable commit + a pending block lands
         // in PlanWorkState with gate=Blocked and waiting_on=Blocked.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let blocks = std::collections::BTreeMap::from([(
             plan("foo"),
             vec![mkblock("claude", "halt", "checking the design")],
         )]);
         let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
-        assert_eq!(status.plans.len(), 1);
-        let ps = &status.plans[0];
+        assert!(status.active_plan.is_some());
+        let ps = &status.active_plan.as_ref().unwrap();
         assert_eq!(ps.gate, CommitGateState::Blocked);
         match &ps.waiting_on {
             WaitingOn::Blocked { block } => {
@@ -3948,14 +3772,17 @@ mod tests {
         // still surfaces in per-plan output (was invisible
         // pre-change). sha is None.
         let mut state = RepoState::default();
-        state.plans.insert(plan("foo"), PlanState::default());
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: PlanState::default(),
+        });
         let blocks = std::collections::BTreeMap::from([(
             plan("foo"),
             vec![mkblock("claude", "halt", "intro only")],
         )]);
         let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
-        assert_eq!(status.plans.len(), 1);
-        let ps = &status.plans[0];
+        assert!(status.active_plan.is_some());
+        let ps = &status.active_plan.as_ref().unwrap();
         assert_eq!(ps.gate, CommitGateState::Blocked);
         assert!(
             ps.sha.is_none(),
@@ -3968,12 +3795,16 @@ mod tests {
         // Empty blocks → review gate path (Unreviewed in this case
         // since no reviews were provided).
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let status = state.derive_status(&MockBlocks(Default::default()), &plan_policy(), None);
-        assert_eq!(status.plans.len(), 1);
-        assert_eq!(status.plans[0].gate, CommitGateState::Unreviewed);
+        assert!(status.active_plan.is_some());
+        assert_eq!(
+            status.active_plan.as_ref().unwrap().gate,
+            CommitGateState::Unreviewed
+        );
     }
 
     #[test]
@@ -3982,9 +3813,10 @@ mod tests {
         // matches scan_blocks's sort. The first pending block surfaces
         // on the gate line.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let blocks = std::collections::BTreeMap::from([(
             plan("foo"),
             vec![
@@ -3996,11 +3828,11 @@ mod tests {
             ],
         )]);
         let status = state.derive_status(&MockBlocks(blocks), &plan_policy(), None);
-        let block_creator = match &status.plans[0].waiting_on {
+        let block_creator = match &status.active_plan.as_ref().unwrap().waiting_on {
             WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
             other => panic!("expected Blocked; got: {other:?}"),
         };
-        let block_name = match &status.plans[0].waiting_on {
+        let block_name = match &status.active_plan.as_ref().unwrap().waiting_on {
             WaitingOn::Blocked { block } => block.name.clone(),
             _ => unreachable!(),
         };
@@ -4014,9 +3846,10 @@ mod tests {
         // Phase 5 pin: blocked plans emit no work for any role.
         // Block-creator clears the block out-of-band.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let blocks = std::collections::BTreeMap::from([(
             plan("foo"),
             vec![mkblock("claude", "halt", "wait")],
@@ -4157,9 +3990,10 @@ mod tests {
         // sides were waiting for each other. Post-fix: worktree-first
         // dispatch routes master to MasterToCommit.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         // No reviews → Unreviewed gate.
         let status = state.derive_status(&MockDirty::new(), &plan_policy(), None);
         let work = status.work_for(&label("lloyd"), Role::Master);
@@ -4180,9 +4014,10 @@ mod tests {
         // behavior routed master to Revise even though the worktree
         // already had a new revision in flight.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let reviews = vec![(
             sha("aaaa"),
             vec![ReviewEntry {
@@ -4214,9 +4049,10 @@ mod tests {
         // via the pre-fix per-arm check. Defends against re-introducing
         // the bug when the per-arm checks are removed.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let reviews = vec![(
             sha("aaaa"),
             vec![
@@ -4252,13 +4088,17 @@ mod tests {
         // dispatch, so a blocked plan with BodyDirty still surfaces
         // as Blocked, and work_for emits no Master Commit item.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         let mock =
             MockDirty::new().with_block(plan("foo"), vec![mkblock("claude", "halt", "hold")]);
         let status = state.derive_status(&mock, &plan_policy(), None);
-        assert_eq!(status.plans[0].gate, CommitGateState::Blocked);
+        assert_eq!(
+            status.active_plan.as_ref().unwrap().gate,
+            CommitGateState::Blocked
+        );
         // Blocked plans emit no work for any role.
         let master_work = status.work_for(&label("lloyd"), Role::Master);
         let reviewer_work = status.work_for(&label("codex"), Role::Reviewer);
@@ -4280,9 +4120,10 @@ mod tests {
         // version would be at risk of being thrown away the moment
         // master commits the revision.
         let mut state = RepoState::default();
-        state
-            .plans
-            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        state.active_plan = Some(crate::repo_state::ActivePlan {
+            key: plan("foo"),
+            state: make_plan_with_one_reviewable(sha("aaaa")),
+        });
         // No reviews → Unreviewed gate. Pre-fix this would have
         // woken reviewers via ReviewerApprovalsMissing.
         let status = state.derive_status(&MockDirty::new(), &plan_policy(), None);

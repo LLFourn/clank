@@ -39,7 +39,7 @@ pub enum PreviewError {
 }
 
 /// Single-plan finalize preview. The plan must be active in
-/// `state.fold.plans`.
+/// `state.fold.active_plan`.
 pub async fn build_finish_preview(
     repo_root: &Path,
     state: &RepoState,
@@ -50,7 +50,7 @@ pub async fn build_finish_preview(
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
     let plan_path = crate::init_facts::plan_md_rel(plan_key.as_str());
 
-    let active = state.fold.plans.get(plan_key);
+    let active = state.fold.plan(plan_key);
     let is_finished = active.is_none() && state.fold.finished_record(plan_key).is_some();
     if !is_finished && active.is_none() {
         return Err(PreviewError::PlanNotFound(plan_id_str));
@@ -156,7 +156,7 @@ pub async fn build_rewrite_preview(
     // finalize SHA so native_shas can be computed by replaying the
     // [intro, finalized_at] interval through the sans-io fold (the
     // fold itself drops finished plans' per-commit timeline).
-    let (intro_sha, finalized_at) = if let Some(ps) = state.fold.plans.get(plan_key) {
+    let (intro_sha, finalized_at) = if let Some(ps) = state.fold.plan(plan_key) {
         (ps.commits.first().map(|e| e.sha.clone()), None)
     } else if let Some(fp) = state.fold.finished_record(plan_key) {
         (Some(fp.intro.clone()), Some(fp.finalized_at.clone()))
@@ -197,7 +197,7 @@ pub async fn build_rewrite_preview(
     // folding the [intro, finalized_at] interval — `RepoState`
     // doesn't retain finished-plan timelines (Acceptance: finished
     // plans keep only `{ plan, intro, finalized_at }`).
-    let native_shas: BTreeSet<CommitSha> = if let Some(ps) = state.fold.plans.get(plan_key) {
+    let native_shas: BTreeSet<CommitSha> = if let Some(ps) = state.fold.plan(plan_key) {
         ps.commits.iter().map(|e| e.sha.clone()).collect()
     } else if let Some(end) = finalized_at.as_ref() {
         re_fold_finished_plan_natives(repo_root, plan_key, end).await?
@@ -349,16 +349,11 @@ pub async fn build_rewrite_preview_all(
 ///
 /// The canonical `RepoState` only stores `{ plan, intro,
 /// finalized_at }` for finished plans (no timeline). Reconstructing
-/// the timeline requires the SAME repo-scoped classifier context
-/// the original fold saw — `known_plans` and `active_plan_hint` at
-/// each commit can be established by OTHER plans the classifier
-/// already knew before this plan's intro (e.g. a `[other,this]`
-/// prefix needs `other` in `known_plans` for the attribution to
-/// hold). So we cold-fold the first-parent chain from ROOT up to
-/// but excluding `finalized_at`. At that boundary the plan is
-/// still active in `state.fold.plans` with its current cycle's
-/// timeline (prior cycles, if any, were already dropped by their
-/// own finalize). The finalize SHA itself is added back at the end.
+/// the timeline requires the same repo-scoped lifecycle the original fold
+/// saw. Cold-fold the first-parent chain up to but excluding `finalized_at`.
+/// The accepted run is still in the single active slot at that boundary;
+/// ignored overlapping runs never contribute natives. Add the finalize SHA
+/// back for a normal or squashed finished run.
 ///
 /// Phase-2 cache loading is opportunistic: try the closest cached
 /// ancestor of `finalized_at` and fold-forward from there; fall
@@ -394,8 +389,7 @@ pub(crate) async fn re_fold_finished_plan_natives(
     }
     let mut native: BTreeSet<CommitSha> = scratch
         .fold
-        .plans
-        .get(plan_key)
+        .plan(plan_key)
         .map(|ps| ps.commits.iter().map(|e| e.sha.clone()).collect())
         .unwrap_or_default();
     native.insert(finalized_at.clone());
@@ -588,27 +582,21 @@ mod tests {
         run_git(repo, &["commit", "--quiet", "-m", msg]);
     }
 
-    /// Regression for codex on 31df65e: finished-plan rewrite
-    /// preview must reflect the historical classifier context of
-    /// the repo, not an isolated target-plan scratch fold. If plan
-    /// A is active when plan B is introduced and a commit titled
-    /// `[a,b] shared` lands while both are active, B's native_shas
-    /// must include the shared commit — the cold-from-root re-fold
-    /// keeps A in known_plans at the shared commit so the prefix
-    /// resolves and B's per-cycle timeline picks the commit up.
     #[tokio::test]
-    async fn finished_plan_rewrite_preview_uses_repo_history() {
+    async fn finished_plan_rewrite_preview_preserves_serial_history_and_foreign_commits() {
         let dir = init_repo();
         write_file(dir.path(), ".clank/plans/a.md", "# a\n");
         commit(dir.path(), "[a] intro");
+        write_file(dir.path(), ".clank/finished/a.md", "# a\n");
+        run_git(dir.path(), &["rm", "--quiet", ".clank/plans/a.md"]);
+        commit(dir.path(), "[a] finish");
         write_file(dir.path(), ".clank/plans/b.md", "# b\n");
         commit(dir.path(), "[b] intro");
         write_file(dir.path(), "src.rs", "fn main() {}\n");
-        write_file(dir.path(), ".clank/plans/a.md", "# a v2\n");
-        write_file(dir.path(), ".clank/plans/b.md", "# b v2\n");
-        commit(dir.path(), "[a,b] shared work");
-        // Move the plan file to finished/ to trigger Finish detection.
-        write_file(dir.path(), ".clank/finished/b.md", "# b v2\n");
+        commit(dir.path(), "[b] implementation");
+        write_file(dir.path(), "foreign.rs", "fn foreign() {}\n");
+        commit(dir.path(), "[a,b] historical literal tag");
+        write_file(dir.path(), ".clank/finished/b.md", "# b\n");
         run_git(dir.path(), &["rm", "--quiet", ".clank/plans/b.md"]);
         commit(dir.path(), "[b] finish");
 
@@ -619,17 +607,23 @@ mod tests {
         let preview = build_rewrite_preview(dir.path(), &state, &key, true)
             .await
             .unwrap();
-
-        // The `[a,b] shared work` commit must NOT be foreign to b.
-        let shared = preview
-            .commits
-            .iter()
-            .find(|c| c.subject == "[a,b] shared work")
-            .expect("shared commit in rewrite range");
         assert!(
-            !shared.foreign,
-            "shared `[a,b]` commit must be attributed to b too (historical classifier context)",
+            !preview
+                .commits
+                .iter()
+                .find(|c| c.subject == "[b] implementation")
+                .unwrap()
+                .foreign
         );
+        assert!(
+            preview
+                .commits
+                .iter()
+                .find(|c| c.subject == "[a,b] historical literal tag")
+                .unwrap()
+                .foreign
+        );
+        assert_eq!(state.fold.finished_plans.len(), 2);
     }
 
     #[test]

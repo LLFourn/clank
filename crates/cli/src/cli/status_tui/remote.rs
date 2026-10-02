@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     fn snap() -> crate::cli::status::StatusSnapshot {
-        crate::cli::status_tui::fixtures::snap(vec![], vec![])
+        crate::cli::status_tui::fixtures::snap(None, vec![])
     }
 
     /// The press returns at once and the row reads `starting…` while

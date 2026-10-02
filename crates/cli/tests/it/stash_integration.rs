@@ -176,12 +176,12 @@ fn unshelve_restores_and_resets_reviews() {
     // with its latest reviewable = the replayed head.)
     let snap = block_on(clank::cli::status::snapshot(repo, Some(env.home()))).unwrap();
     let json = snap.to_json();
-    let plans = json["plans"].as_array().unwrap();
-    assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0]["plan"], "foo");
+    let plan = &json["active_plan"];
+    assert!(plan.is_object());
+    assert_eq!(plan["plan"], "foo");
     let head = git_out(repo, &["rev-parse", "HEAD"]);
     assert_eq!(
-        plans[0]["latest_reviewable_sha"].as_str().unwrap(),
+        plan["latest_reviewable_sha"].as_str().unwrap(),
         head.trim(),
         "replayed head is the new latest reviewable"
     );

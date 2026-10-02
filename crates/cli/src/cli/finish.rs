@@ -13,6 +13,8 @@ use clank_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewRespo
 
 pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
+    // Serialize changes that empty/rewrite the slot with its admission paths.
+    let _slot = super::plan_mutation::lock(&repo)?;
     let basename = repo_basename(&repo)?;
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
@@ -687,8 +689,8 @@ mod tests {
     use clank_core::api::{FinalizeReadiness, FinishPreviewResponse};
     use clank_core::vocab::{CommitGateState, PlanWorktreeStatus};
 
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn init_repo() -> super::super::monitor::TempRepo {
+        let dir = super::super::monitor::TempRepo::new();
         run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
         run_git(dir.path(), &["config", "user.email", "test@test"]);
         run_git(dir.path(), &["config", "user.name", "test"]);

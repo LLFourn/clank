@@ -125,7 +125,7 @@ mod tests {
                 },
             ),
         );
-        assert!(state.fold.plans.contains_key(&plan("foo")));
+        assert!(state.fold.plan(&plan("foo")).is_some());
 
         apply_commit(
             &mut state,
@@ -137,7 +137,7 @@ mod tests {
                 },
             ),
         );
-        assert!(!state.fold.plans.contains_key(&plan("foo")));
+        assert!(!state.fold.plan(&plan("foo")).is_some());
         assert_eq!(state.fold.finished_plans.len(), 1);
     }
 }

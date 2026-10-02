@@ -81,9 +81,9 @@ fn oldest_obligation(
         None => return None,
     };
     let plan_at = |key: &clank_core::ids::PlanKey| {
-        snap.plans
-            .iter()
-            .find(|p| &p.plan == key)
+        snap.active_plan
+            .as_ref()
+            .filter(|p| &p.plan == key)
             .and_then(|p| p.handover.since(tier))
     };
     let adhoc_at = |sha: &crate::lifecycle::CommitSha| {
@@ -109,7 +109,6 @@ fn oldest_obligation(
             // surfaces elsewhere (the `fix` gauge, the queue).
             WaitItem::Idle { .. }
             | WaitItem::FixCommitTag { .. }
-            | WaitItem::MultiplePlansOpen { .. }
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Message { .. }
             | WaitItem::GithubEvent { .. }
@@ -154,7 +153,7 @@ pub(super) fn spinner_glyph(frame: usize) -> &'static str {
 /// invisibly. Pure — unit-tested.
 pub(super) fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
     let plan_verb = |label: &str| -> &'static str {
-        if let [v] = snap.plans.as_slice()
+        if let Some(v) = snap.active_plan.as_ref()
             && let WaitingOn::ReviewerApprovalsMissing { missing }
             | WaitingOn::GateReviewersMissing { missing } = &v.waiting_on
             && missing.iter().any(|l| l.as_str() == label)
@@ -176,7 +175,7 @@ pub(super) fn in_progress_rows(snap: &StatusSnapshot) -> Vec<InProgress> {
     let master_since = |snap: &StatusSnapshot, name: &str| {
         oldest_obligation(snap, &work, name, clank_core::vocab::Role::Master)
     };
-    if let [v] = snap.plans.as_slice() {
+    if let Some(v) = snap.active_plan.as_ref() {
         match &v.waiting_on {
             WaitingOn::MasterToContinue
             | WaitingOn::MasterToRevise { .. }
@@ -309,7 +308,9 @@ pub(super) fn entry_target(seq: &[Seg], cursor: usize) -> Option<EntryTarget> {
                 focus: Some(author.clone()),
             })
         }
-        Seg::Log(OnelineRow::Header { plan: Some(stem) }) => crate::lifecycle::PlanKey::parse(stem)
+        Seg::Log(OnelineRow::Header {
+            plan: Some(stem), ..
+        }) => crate::lifecycle::PlanKey::parse(stem)
             .ok()
             .map(|key| EntryTarget::Plan { key }),
         _ => None, // ad-hoc header, ask, in-progress
@@ -403,7 +404,7 @@ mod tests {
         ];
         // Pending reviewers → one spinner row each, verb "reviewing".
         let s = with_agents(
-            snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]),
+            snap(Some(plan_state("foo", reviewer_missing("codex"))), vec![]),
             roster,
         );
         assert!(matches!(
@@ -412,7 +413,7 @@ mod tests {
                 if label == "codex" && *verb == "reviewing"
         ));
         // Master producing the next commit → one master row, per-state verb.
-        let s = snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]);
+        let s = snap(Some(plan_state("foo", WaitingOn::MasterToContinue)), vec![]);
         assert!(matches!(
             in_progress_rows(&s).as_slice(),
             [InProgress::MasterWorking { verb, .. }] if *verb == "working"
@@ -420,14 +421,14 @@ mod tests {
         // FLIP (reproduce-first): finalizing IS making the finish commit,
         // so it now produces a master row — shipped M2 wrongly returned
         // none for MasterToFinalize.
-        let s = snap(vec![plan_state("foo", WaitingOn::MasterToFinalize)], vec![]);
+        let s = snap(Some(plan_state("foo", WaitingOn::MasterToFinalize)), vec![]);
         assert!(matches!(
             in_progress_rows(&s).as_slice(),
             [InProgress::MasterWorking { verb, .. }] if *verb == "finalizing"
         ));
         // MasterToFixCommitTag → surfaced by the `fix` gauge, no spinner.
         let s = snap(
-            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            Some(plan_state("foo", WaitingOn::MasterToFixCommitTag)),
             vec![],
         );
         assert!(in_progress_rows(&s).is_empty());
@@ -473,11 +474,11 @@ mod tests {
         // The commit tier still owes: codex has owed since the commit.
         let s = with_agents(
             snap(
-                vec![plan_state_at(
+                Some(plan_state_at(
                     "foo",
                     reviewer_missing("codex"),
                     stages(None, None),
-                )],
+                )),
                 vec![],
             ),
             roster,
@@ -488,7 +489,7 @@ mod tests {
         // ruthless has owed since 200, not since the commit.
         let s = with_agents(
             snap(
-                vec![plan_state_at(
+                Some(plan_state_at(
                     "foo",
                     WaitingOn::GateReviewersMissing {
                         missing: clank_core::repo_state::NonEmptyVec::new(vec![
@@ -497,7 +498,7 @@ mod tests {
                         .unwrap(),
                     },
                     stages(Some(200), None),
-                )],
+                )),
                 vec![],
             ),
             roster,
@@ -507,11 +508,11 @@ mod tests {
         // Master was handed the plan back by the last tier to close.
         let s = with_agents(
             snap(
-                vec![plan_state_at(
+                Some(plan_state_at(
                     "foo",
                     WaitingOn::MasterToContinue,
                     stages(Some(200), Some(300)),
-                )],
+                )),
                 vec![],
             ),
             roster,
@@ -521,11 +522,11 @@ mod tests {
         // what handed it back.
         let s = with_agents(
             snap(
-                vec![plan_state_at(
+                Some(plan_state_at(
                     "foo",
                     WaitingOn::MasterToContinue,
                     stages(Some(200), None),
-                )],
+                )),
                 vec![],
             ),
             roster,
@@ -540,7 +541,7 @@ mod tests {
         use crate::cli::status_tui::fixtures::{pr_awaiting, with_agents};
         use crate::cli::teams_config::RosterRole;
         let mut s = with_agents(
-            snap(vec![], vec![]),
+            snap(None, vec![]),
             &[
                 ("claude", RosterRole::Master),
                 ("codex", RosterRole::Commit),
@@ -570,12 +571,9 @@ mod tests {
             opened: Some(9_000),
             ..Default::default()
         };
-        let s = with_agents(
+        let mut s = with_agents(
             snap(
-                vec![
-                    plan_state_at("newer", reviewer_missing("codex"), recent),
-                    plan_state_at("older", reviewer_missing("codex"), old),
-                ],
+                Some(plan_state_at("newer", reviewer_missing("codex"), recent)),
                 vec![],
             ),
             &[
@@ -583,6 +581,9 @@ mod tests {
                 ("codex", RosterRole::Commit),
             ],
         );
+        let mut pr = crate::cli::status_tui::fixtures::pr_awaiting(&["codex"]);
+        pr.handover = old;
+        s.pr_reviews.push(pr);
         assert_eq!(since_of(&in_progress_rows(&s), "codex"), Some(100));
     }
 
@@ -595,11 +596,11 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         let s = with_agents(
             snap(
-                vec![plan_state_at(
+                Some(plan_state_at(
                     "foo",
                     reviewer_missing("codex"),
                     clank_core::wait::Handover::default(),
-                )],
+                )),
                 vec![],
             ),
             &[
@@ -616,10 +617,12 @@ mod tests {
     // plan `foo`, used to check WHERE placeholders get spliced.
     fn snap_with_header_and_commit(waiting: WaitingOn) -> StatusSnapshot {
         use crate::cli::log::OnelineRow;
-        let mut s = snap(vec![plan_state("foo", waiting)], vec![]);
-        let sha = s.plans[0].sha.clone().unwrap();
+        let mut s = snap(Some(plan_state("foo", waiting)), vec![]);
+        let sha = s.active_plan.as_ref().unwrap().sha.clone().unwrap();
         s.log_rows = vec![
             OnelineRow::Header {
+                duration_secs: None,
+                starts_here: true,
                 plan: Some("foo".into()),
             },
             OnelineRow::Commit {
@@ -726,7 +729,7 @@ mod tests {
         let shape: Vec<&str> = rows
             .iter()
             .map(|r| match r {
-                OnelineRow::Header { plan } => plan.as_deref().unwrap_or("adhoc"),
+                OnelineRow::Header { plan, .. } => plan.as_deref().unwrap_or("adhoc"),
                 OnelineRow::Review { .. } => "review",
                 _ => "commit",
             })
@@ -788,6 +791,8 @@ mod tests {
             summary: "ok".into(),
         };
         let header = || OnelineRow::Header {
+            duration_secs: None,
+            starts_here: true,
             plan: Some("foo".into()),
         };
 
@@ -826,7 +831,11 @@ mod tests {
         assert!(entry_target(&seq, 99).is_none());
 
         // An ad-hoc header (plan: None) has no document.
-        let adhoc = [OnelineRow::Header { plan: None }];
+        let adhoc = [OnelineRow::Header {
+            duration_secs: None,
+            starts_here: true,
+            plan: None,
+        }];
         let seq_adhoc: Vec<Seg> = adhoc.iter().map(Seg::Log).collect();
         assert!(entry_target(&seq_adhoc, 0).is_none());
 

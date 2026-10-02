@@ -41,6 +41,7 @@ pub mod nudge;
 pub mod open;
 pub mod open_zellij;
 pub mod pick;
+pub(crate) mod plan_mutation;
 pub mod plan_resolve;
 pub mod pr_review;
 pub mod purge;

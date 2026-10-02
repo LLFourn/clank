@@ -2173,8 +2173,6 @@ pub(crate) struct WaitItem {
     answer: Option<String>,
     pr: Option<u64>,
     round: Option<u64>,
-    in_progress: Option<String>,
-    new_plans: Option<Vec<String>>,
     // External wake payloads (external-wake-hints-carry-payload):
     // github_event / command_event fields, all optional like the rest.
     repo: Option<String>,
@@ -2323,9 +2321,6 @@ pub(crate) fn discharge_of(
         },
         K::Reviewer => Until("fires until you write feedback for that sha"),
         K::FixCommitTag => Until("fires until the commit's plan tag is corrected"),
-        K::MultiplePlansOpen => Until(
-            "fires until one plan is active — `clank finish` one, or `clank stash push` the rest",
-        ),
         K::PromoteFromQueue => Until("fires until the item is promoted or removed from the queue"),
         K::Message => Until("fires until the message is acked — `clank events ack`"),
         K::GithubEvent => Until("fires until the event is acked — `clank events ack`"),
@@ -2501,34 +2496,6 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 out.push_str(&format!(
                     "  - pr-review: master {next} #{pr} round {round}\n"
                 ));
-            }
-            // The one deliberately non-minimal item: the remedies are
-            // parameterized by the plan names (WHICH stash push goes
-            // first depends on them), so unlike the static HOW in the
-            // skill doc they must ride in the nudge itself
-            // (soft-disallow-multiple-plans).
-            K::MultiplePlansOpen => {
-                let in_progress = item.in_progress.as_deref().unwrap_or("?");
-                let news: Vec<&str> = item
-                    .new_plans
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                out.push_str(&format!(
-                    "  - multiple-plans-open: commits exist for {} while `{}` is \
-                     still unfinished. Do NOT keep working on either until you \
-                     resolve this by ONE of:\n",
-                    news.iter()
-                        .map(|n| format!("`{n}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    in_progress,
-                ));
-                for r in crate::cli::wait::multi_plan_open_remedies(in_progress, &news) {
-                    out.push_str(&format!("      {r}\n"));
-                }
             }
             // External wakes carry their payload — a bare `? @ ?`
             // fallback hint is unactionable
@@ -5144,32 +5111,6 @@ mod tests {
         ]);
         assert!(out.contains("  - blocked: claude/q on foo (awaiting human)\n"));
         assert!(out.contains("  - promote: next-up (priority 042)\n"));
-    }
-
-    #[test]
-    fn multiple_plans_open_nudge_carries_the_ordered_remedies() {
-        // The one deliberately non-minimal nudge: the remedies are
-        // parameterized by the plan names, so they ride in the wake
-        // itself rather than the static skill doc
-        // (soft-disallow-multiple-plans). The stash ORDER is the
-        // load-bearing content: new plan first.
-        let out = items_text(&[serde_json::json!({
-            "kind": "multiple_plans_open",
-            "in_progress": "old-plan",
-            "new_plans": ["new-plan"],
-            "sha": FULL_SHA,
-        })]);
-        assert!(out.contains("multiple-plans-open"), "{out}");
-        assert!(out.contains("`old-plan`"), "{out}");
-        assert!(out.contains("`new-plan`"), "{out}");
-        let push_new = out.find("stash push new-plan").expect("pushes new");
-        let push_old = out
-            .find("stash push old-plan --for new-plan")
-            .expect("pushes in-progress with --for");
-        assert!(push_new < push_old, "new plan stashed FIRST:\n{out}");
-        for n in ["1.", "2.", "3."] {
-            assert!(out.contains(n), "all three remedies:\n{out}");
-        }
     }
 
     #[test]

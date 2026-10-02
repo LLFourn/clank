@@ -48,7 +48,7 @@ pub enum RegisterOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoveOutcome {
-    Removed { plan_count: usize },
+    Removed { active_plan: Option<PlanKey> },
     NotPresent,
 }
 
@@ -106,7 +106,7 @@ impl Runtime {
         let Some(removed) = clank.repos.remove(&canonical) else {
             return RemoveOutcome::NotPresent;
         };
-        let plan_count = removed.fold.plans.len();
+        let active_plan = removed.fold.active_plan.map(|plan| plan.key);
         clank.repo_basenames.retain(|_, root| root != &canonical);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -117,10 +117,12 @@ impl Runtime {
             LiveEvent::Repo(RepoEvent {
                 ts: now,
                 repo: canonical,
-                payload: RepoEventPayload::RepoUnwatched { plan_count },
+                payload: RepoEventPayload::RepoUnwatched {
+                    active_plan: active_plan.clone(),
+                },
             }),
         );
-        RemoveOutcome::Removed { plan_count }
+        RemoveOutcome::Removed { active_plan }
     }
 
     pub async fn snapshot_repo(&self, repo_root: &Path) -> Result<RepoState, RuntimeError> {
@@ -243,7 +245,7 @@ impl Runtime {
             .any(|f| &f.plan == session_id)
         {
             clank_core::PlanLifecycle::Finished
-        } else if state.fold.plans.contains_key(session_id) {
+        } else if state.fold.plan(session_id).is_some() {
             clank_core::PlanLifecycle::Active
         } else {
             return;

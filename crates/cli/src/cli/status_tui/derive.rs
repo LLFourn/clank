@@ -34,9 +34,9 @@ pub(super) enum AttentionState {
 
 pub(super) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
     let blocked = snap
-        .plans
-        .iter()
-        .any(|v| matches!(v.waiting_on, WaitingOn::Blocked { .. }))
+        .active_plan
+        .as_ref()
+        .is_some_and(|v| matches!(v.waiting_on, WaitingOn::Blocked { .. }))
         || snap.blocks.iter().any(|b| b.answer.is_none());
     if blocked {
         return AttentionState::Blocked;
@@ -48,16 +48,16 @@ pub(super) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
     // a per-plan `MasterToFixCommitTag` row is an additional signal.
     if snap.head_correction.is_some()
         || snap
-            .plans
-            .iter()
-            .any(|v| matches!(v.waiting_on, WaitingOn::MasterToFixCommitTag))
+            .active_plan
+            .as_ref()
+            .is_some_and(|v| matches!(v.waiting_on, WaitingOn::MasterToFixCommitTag))
     {
         return AttentionState::NeedsCorrection;
     }
     // Ad-hoc counts as in-flight only while its gate still ROUTES
     // work (codex 923a679) — a positively reviewed ad-hoc commit
     // (Continued/Finished) is terminal, not active.
-    let nothing_in_flight = snap.plans.is_empty()
+    let nothing_in_flight = snap.active_plan.is_none()
         && snap.pr_reviews.is_empty()
         && snap.queue.is_empty()
         && !snap.ad_hoc.iter().any(|a| a.is_open());
@@ -82,9 +82,9 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
         AttentionState::Blocked | AttentionState::Idle => return false,
         AttentionState::Active => {}
     }
-    match snap.plans.as_slice() {
+    match snap.active_plan.as_ref() {
         // No plans: PR reviews take precedence over the queue.
-        [] if !snap.pr_reviews.is_empty() => {
+        None if !snap.pr_reviews.is_empty() => {
             // Master's turn iff no PR still owes a reviewer.
             !snap
                 .pr_reviews
@@ -97,19 +97,18 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
         // queue; an Unreviewed ad-hoc gives master nothing, so wait
         // DOES reach queue promotion — promote beats the
         // reviewers'-turn fallthrough.
-        [] if snap
+        None if snap
             .ad_hoc
             .iter()
             .any(|a| a.gate == clank_core::vocab::CommitGateState::ChangesRequested) =>
         {
             true
         }
-        [] if !snap.queue.is_empty() => true, // promote
-        [] if snap.ad_hoc.iter().any(|a| a.is_open()) => false, // reviewers' turn
-        [] => false,                          // unreachable (Idle covers it)
-        // Plans present: queue/PR ignored — master's turn iff some
-        // plan is on a master action.
-        plans => plans.iter().any(|v| {
+        None if !snap.queue.is_empty() => true, // promote
+        None if snap.ad_hoc.iter().any(|a| a.is_open()) => false, // reviewers' turn
+        None => false,                          // unreachable (Idle covers it)
+        // The active plan dominates queue/PR work.
+        Some(v) => {
             matches!(
                 v.waiting_on,
                 WaitingOn::MasterToRevise { .. }
@@ -118,7 +117,7 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
                     | WaitingOn::MasterToFinalize
                     | WaitingOn::MasterToFixCommitTag
             )
-        }),
+        }
     }
 }
 
@@ -230,7 +229,7 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> Hue {
                 // cyan for the queue-promote branch (no plans, no
                 // PRs, no ad-hoc revision), green for master working
                 // on a plan, PR, or ad-hoc revision (codex 4a4be39).
-                if snap.plans.is_empty()
+                if snap.active_plan.is_none()
                     && snap.pr_reviews.is_empty()
                     && !snap
                         .ad_hoc
@@ -253,14 +252,10 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> Hue {
 /// (tui-adhoc-review-activity).
 pub(super) fn work_projection(snap: &StatusSnapshot) -> clank_core::wait::WorkStatus {
     clank_core::wait::WorkStatus {
-        plans: snap.plans.clone(),
+        active_plan: snap.active_plan.clone(),
         ad_hoc: snap.ad_hoc.clone(),
         pr_reviews: snap.pr_reviews.clone(),
         head_correction: snap.head_correction.clone(),
-        // Irrelevant to the reviewer question: the multi-plan warning
-        // preempts MASTER items only — reviewer routing is untouched
-        // by design (soft-disallow-multiple-plans).
-        multi_plan_open: None,
     }
 }
 
@@ -360,25 +355,25 @@ mod tests {
     #[test]
     fn master_is_active_follows_state_color_precedence() {
         // Idle → false.
-        assert!(!master_is_active(&snap(vec![], vec![])));
+        assert!(!master_is_active(&snap(None, vec![])));
         // Plan on a master action → true.
         assert!(master_is_active(&snap(
-            vec![plan_state("p", WaitingOn::MasterToContinue)],
+            Some(plan_state("p", WaitingOn::MasterToContinue)),
             vec![]
         )));
         // THE codex fbdb27b case: a plan awaiting reviewers dominates a
         // pending queue → master is NOT active (bar stays yellow).
         assert!(
             !master_is_active(&snap(
-                vec![plan_state("p", reviewer_missing("codex"))],
+                Some(plan_state("p", reviewer_missing("codex"))),
                 vec!["queued"]
             )),
             "plans take precedence over the queue"
         );
         // No plans + queue only → master promotes.
-        assert!(master_is_active(&snap(vec![], vec!["queued"])));
+        assert!(master_is_active(&snap(None, vec!["queued"])));
         // No plans + PR: master's turn iff no reviewer is owed.
-        let mut s = snap(vec![], vec![]);
+        let mut s = snap(None, vec![]);
         s.pr_reviews.push(pr_awaiting(&["codex"]));
         assert!(!master_is_active(&s), "PR still owes a reviewer");
         s.pr_reviews[0].missing_reviewers.clear();
@@ -393,13 +388,13 @@ mod tests {
         // missing on a plan the tag never implicated. Without routing
         // through the single source, this reviewer showed 👀 while their
         // stop-hook returned nothing.
-        let mut s = snap(vec![plan_state("other", reviewer_missing("codex"))], vec![]);
+        let mut s = snap(Some(plan_state("other", reviewer_missing("codex"))), vec![]);
         s.head_correction = Some(clank_core::wait::HeadCorrection {
             sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
             violation: clank_core::wait::HeadTagViolation {
-                unknown: vec!["ghost".to_string()],
+                unknown: Some("ghost".to_string()),
                 untagged_touched: vec![],
-                extra_named: vec![],
+                extra_named: None,
             },
         });
         assert!(
@@ -426,7 +421,7 @@ mod tests {
             ("codex", RosterRole::Commit),
             ("ruthless", RosterRole::Gate),
         ];
-        let mut s = with_agents(snap(vec![], vec![]), roster);
+        let mut s = with_agents(snap(None, vec![]), roster);
         s.ad_hoc = vec![clank_core::wait::AdHocWorkState {
             handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
@@ -450,9 +445,9 @@ mod tests {
         broken.head_correction = Some(clank_core::wait::HeadCorrection {
             sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
             violation: clank_core::wait::HeadTagViolation {
-                unknown: vec!["ghost".to_string()],
+                unknown: Some("ghost".to_string()),
                 untagged_touched: vec![],
-                extra_named: vec![],
+                extra_named: None,
             },
         });
         assert!(
@@ -462,7 +457,7 @@ mod tests {
 
         // ChangesRequested: the reviewers' part is done — they idle
         // (master's ad-hoc revise is out of this plan's scope).
-        let mut done = with_agents(snap(vec![], vec![]), roster);
+        let mut done = with_agents(snap(None, vec![]), roster);
         done.ad_hoc = vec![clank_core::wait::AdHocWorkState {
             handover: Default::default(),
             sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
@@ -479,7 +474,7 @@ mod tests {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::Role;
         let mut s = with_agents(
-            snap(vec![], vec![]),
+            snap(None, vec![]),
             &[
                 ("claude", RosterRole::Master),
                 ("codex", RosterRole::Commit),
@@ -499,7 +494,7 @@ mod tests {
     fn awaited_reviewers_unions_plans_and_prs() {
         use crate::cli::teams_config::RosterRole;
         let mut s = with_agents(
-            snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]),
+            snap(Some(plan_state("p", reviewer_missing("codex"))), vec![]),
             &[
                 ("claude", RosterRole::Master),
                 ("codex", RosterRole::Commit),
@@ -515,7 +510,7 @@ mod tests {
         // Master's turn → nobody awaited.
         assert!(
             awaited_reviewers(&snap(
-                vec![plan_state("p", WaitingOn::MasterToContinue)],
+                Some(plan_state("p", WaitingOn::MasterToContinue)),
                 vec![]
             ))
             .is_empty()
@@ -525,14 +520,14 @@ mod tests {
     #[test]
     fn agent_status_emoji_per_role() {
         use clank_core::vocab::Role;
-        let working = snap(vec![plan_state("p", WaitingOn::MasterToContinue)], vec![]);
+        let working = snap(Some(plan_state("p", WaitingOn::MasterToContinue)), vec![]);
         assert_eq!(agent_status_emoji(&working, "claude", Role::Master), "🔨");
         assert_eq!(agent_status_emoji(&working, "codex", Role::Reviewer), "💤");
 
         // Roster-driven candidates (tui-adhoc-review-activity): the
         // fixture must declare who is on the team.
         let reviewing = with_agents(
-            snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]),
+            snap(Some(plan_state("p", reviewer_missing("codex"))), vec![]),
             &[
                 ("claude", crate::cli::teams_config::RosterRole::Master),
                 ("codex", crate::cli::teams_config::RosterRole::Commit),
@@ -550,7 +545,7 @@ mod tests {
         assert_eq!(agent_status_emoji(&reviewing, "claude", Role::Master), "💤");
 
         assert_eq!(
-            agent_status_emoji(&snap(vec![], vec![]), "claude", Role::Master),
+            agent_status_emoji(&snap(None, vec![]), "claude", Role::Master),
             "💤"
         );
     }
@@ -558,22 +553,22 @@ mod tests {
     #[test]
     fn attention_state_classifies_blocked_idle_active() {
         // Idle: nothing in flight.
-        assert_eq!(attention_state(&snap(vec![], vec![])), AttentionState::Idle);
+        assert_eq!(attention_state(&snap(None, vec![])), AttentionState::Idle);
 
         // Active: an in-flight plan, OR queued work, OR a PR review.
         assert_eq!(
             attention_state(&snap(
-                vec![plan_state("foo", reviewer_missing("codex"))],
+                Some(plan_state("foo", reviewer_missing("codex"))),
                 vec![]
             )),
             AttentionState::Active
         );
         assert_eq!(
-            attention_state(&snap(vec![], vec!["queued"])),
+            attention_state(&snap(None, vec!["queued"])),
             AttentionState::Active,
             "queued work is not idle — master owes a promote"
         );
-        let mut s = snap(vec![], vec![]);
+        let mut s = snap(None, vec![]);
         s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
             handoff_blocked: false,
             handover: Default::default(),
@@ -586,7 +581,7 @@ mod tests {
         assert_eq!(attention_state(&s), AttentionState::Active);
 
         // Blocked: an unanswered block dominates even with no plans.
-        let mut s = snap(vec![], vec!["queued"]);
+        let mut s = snap(None, vec!["queued"]);
         s.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
@@ -605,7 +600,7 @@ mod tests {
     /// snapshot→hue mapping is what ships, and a branch reachable only
     /// in theory would not be worth pinning.
     fn rendered_branches() -> Vec<(&'static str, StatusSnapshot)> {
-        let mut blocked = snap(vec![], vec!["queued"]);
+        let mut blocked = snap(None, vec!["queued"]);
         blocked.blocks = vec![crate::cli::block::BlockEntry {
             agent: "claude".into(),
             name: "q".into(),
@@ -617,19 +612,19 @@ mod tests {
             (
                 "correction",
                 snap(
-                    vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+                    Some(plan_state("foo", WaitingOn::MasterToFixCommitTag)),
                     vec![],
                 ),
             ),
-            ("idle", snap(vec![], vec![])),
+            ("idle", snap(None, vec![])),
             (
                 "master",
-                snap(vec![plan_state("foo", WaitingOn::MasterToContinue)], vec![]),
+                snap(Some(plan_state("foo", WaitingOn::MasterToContinue)), vec![]),
             ),
-            ("promote", snap(vec![], vec!["queued"])),
+            ("promote", snap(None, vec!["queued"])),
             (
                 "reviewer",
-                snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]),
+                snap(Some(plan_state("foo", reviewer_missing("codex"))), vec![]),
             ),
         ]
     }
@@ -711,7 +706,7 @@ mod tests {
     /// that fails on half the terminals in use.
     #[test]
     fn idle_is_the_blue_the_contrast_derivation_chose() {
-        assert_eq!(state_color(&snap(vec![], vec![])), Hue::Indexed(63));
+        assert_eq!(state_color(&snap(None, vec![])), Hue::Indexed(63));
     }
 
     #[test]
@@ -719,7 +714,7 @@ mod tests {
         // commit-tag-fixup-is-first-class-state: a MasterToFixCommitTag
         // plan row → NeedsCorrection (orange), above ordinary Active.
         let s = snap(
-            vec![plan_state("foo", WaitingOn::MasterToFixCommitTag)],
+            Some(plan_state("foo", WaitingOn::MasterToFixCommitTag)),
             vec![],
         );
         assert_eq!(attention_state(&s), AttentionState::NeedsCorrection);

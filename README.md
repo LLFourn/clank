@@ -33,7 +33,10 @@ not chase them.
 ## The model
 
 - A **plan** is a markdown file under `.clank/plans/`. Committing it
-  (tagged `[<plan>] intro`) opens the review cycle.
+  (tagged `[<plan>] intro`) opens the review cycle. Each repo accepts at most
+  one active plan. Finish or stash it before promoting, restoring or importing
+  another run. An overlapping introduction made directly in Git is ignored
+  with a visible warning; it does not displace the accepted plan.
 - The **master** authors and implements plans. **Reviewers** review —
   at one of four tiers:
   - **commit** — reviews every reviewable commit as it lands.
@@ -185,6 +188,16 @@ with live state (`?` marks an agent whose pane is not open),
 per-agent pages (auto-mode, review tier, swap, reopen a closed pane,
 remove), the plan and its verdicts, queued plans, and github event
 pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
+Status JSON carries `active_plan` and `last_finished` as objects or `null`. A
+finished run carries `duration_secs`, recorded once from its accepted intro to
+finalize using Git author timestamps (clock reversals clamp to zero; squashed
+runs have the single commit as both boundaries). Log banners show one name per
+run across external events and loaded pages, with its recorded duration.
+HEAD tag diagnostics carry `unknown` and `extra_named` as a string or `null`;
+`untagged_touched` remains an array of actual files touched by the diff.
+The latter is shown when no active plan is selected. These replace the former
+`plans` and `finished_plans` arrays; `clank open` inspection also reports one
+optional `active_plan` name.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
@@ -321,7 +334,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 
 ```
 <repo>/.clank/
-├── plans/                          # active plans — TRACKED
+├── plans/                          # active plan — TRACKED
 ├── finished/                       # finalized plan records — TRACKED
 ├── queue/                          # queued plan bodies (NNN-<name>.md)
 ├── drafts/                         # staging area consumed by `queue add`

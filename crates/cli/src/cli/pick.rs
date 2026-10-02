@@ -16,7 +16,6 @@ use std::collections::BTreeSet;
 
 use super::PickArgs;
 use crate::lifecycle::{CommitSha, PlanKey};
-use crate::rebuild::CachePolicy;
 
 pub async fn run(args: PickArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
@@ -31,16 +30,21 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Target state: collision checks + merge-base for the dependency warn.
-    let target = crate::rebuild::rebuild_repo_with_policy(&repo, CachePolicy::Use)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    // A copied history passes through its introductions even if its last
+    // commit finishes the plan. Admission is serial for the whole replay.
+    let slot = super::plan_mutation::lock(&repo)?;
+    let target = if args.purge {
+        slot.state()?
+    } else {
+        slot.empty_state()?
+    };
     for key in &keys {
         let stem = key.as_str();
-        if target.fold.plans.contains_key(key) {
+        // A code-only copy introduces no active run, but keep the existing
+        // same-name collision rule for that path as well.
+        if target.fold.plan(key).is_some() {
             anyhow::bail!(
-                "plan `{stem}` is already ACTIVE on this branch — finish or purge it \
-                 before picking a copy from elsewhere."
+                "plan `{stem}` is already ACTIVE on this branch — finish or purge it before picking a copy from elsewhere."
             );
         }
         if target.fold.finished_plans.iter().any(|f| &f.plan == key) {
@@ -63,9 +67,9 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
     let mut natives_by_plan: Vec<(PlanKey, BTreeSet<CommitSha>)> = Vec::new();
     for key in &keys {
         let stem = key.as_str();
-        let natives: BTreeSet<CommitSha> = if let Some(ps) = source.fold.plans.get(key) {
+        let natives: BTreeSet<CommitSha> = if let Some(ps) = source.fold.plan(key) {
             ps.commits.iter().map(|e| e.sha.clone()).collect()
-        } else if let Some(fp) = source.fold.finished_plans.iter().find(|f| &f.plan == key) {
+        } else if let Some(fp) = source.fold.finished_record(key) {
             let end = fp.finalized_at.clone();
             crate::preview::re_fold_finished_plan_natives(&repo, key, &end)
                 .await
@@ -136,17 +140,14 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
         let top = ordered.last().and_then(|m| pos_of(&m.sha)).unwrap_or(0);
         let picked: BTreeSet<&str> = keys.iter().map(|k| k.as_str()).collect();
         let mut below: Vec<&str> = Vec::new();
-        for (k, ps) in &source.fold.plans {
-            if picked.contains(k.as_str()) {
-                continue;
-            }
-            if let Some(first) = ps.commits.first()
-                && let Some(p) = pos_of(&first.sha)
-                && p > mb_pos
-                && p < top
-            {
-                below.push(k.as_str());
-            }
+        if let Some(active) = &source.fold.active_plan
+            && !picked.contains(active.key.as_str())
+            && let Some(first) = active.state.commits.first()
+            && let Some(p) = pos_of(&first.sha)
+            && p > mb_pos
+            && p < top
+        {
+            below.push(active.key.as_str());
         }
         for fp in &source.fold.finished_plans {
             if picked.contains(fp.plan.as_str()) {
@@ -485,7 +486,7 @@ fn squash_message(
     n_commits: usize,
 ) -> String {
     let stem = key.as_str();
-    let (subject_core, body) = match source.finished_plans.iter().find(|f| &f.plan == key) {
+    let (subject_core, body) = match source.finished_record(key) {
         Some(fp) => {
             let subject = crate::git_io::commit_subject_at(repo, &fp.finalized_at)
                 .ok()

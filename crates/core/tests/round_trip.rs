@@ -103,17 +103,21 @@ fn live_event_repo_rebuilt_round_trips() {
 }
 
 #[test]
-fn live_event_repo_unwatched_carries_plan_count() {
-    let ev = LiveEvent::Repo(RepoEvent {
-        ts: 1700000000,
-        payload: RepoEventPayload::RepoUnwatched { plan_count: 4 },
-    });
-    let v = serde_json::to_value(&ev).unwrap();
-    assert_eq!(v["scope"], "repo");
-    assert_eq!(v["kind"], "repo_unwatched");
-    assert_eq!(v["plan_count"], 4);
-    let back: LiveEvent = serde_json::from_value(v).unwrap();
-    assert_eq!(ev, back);
+fn live_event_repo_unwatched_carries_its_optional_active_plan() {
+    for active_plan in [None, Some(clank_core::ids::PlanKey::parse("work").unwrap())] {
+        let ev = LiveEvent::Repo(RepoEvent {
+            ts: 1700000000,
+            payload: RepoEventPayload::RepoUnwatched {
+                active_plan: active_plan.clone(),
+            },
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["scope"], "repo");
+        assert_eq!(v["kind"], "repo_unwatched");
+        assert_eq!(v["active_plan"], serde_json::to_value(active_plan).unwrap());
+        let back: LiveEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(ev, back);
+    }
 }
 
 #[test]

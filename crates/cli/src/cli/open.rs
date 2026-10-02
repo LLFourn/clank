@@ -110,7 +110,7 @@ pub struct GitInfo {
 pub struct ClankInfo {
     pub master_agents: Vec<String>,
     pub agents: Vec<AgentInfo>,
-    pub active_plans: usize,
+    pub active_plan: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<String>,
 }
@@ -550,13 +550,13 @@ async fn clank_info_for_repo(
         // e5d0880).
     }
 
-    let (active_plans, waiting_on, fold_warning) = fold_summary(repo_root, home).await;
+    let (active_plan, waiting_on, fold_warning) = fold_summary(repo_root, home).await;
 
     (
         ClankInfo {
             master_agents,
             agents,
-            active_plans,
+            active_plan,
             waiting_on,
         },
         recommendations,
@@ -580,13 +580,13 @@ fn agent_session_info(
 async fn fold_summary(
     repo_root: &Path,
     home: Option<&Path>,
-) -> (usize, Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>) {
     let state =
         match crate::rebuild::rebuild_repo_with_policy(repo_root, crate::rebuild::CachePolicy::Use)
             .await
         {
             Ok(s) => s,
-            Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
+            Err(e) => return (None, None, Some(format!("fold failed: {e}"))),
         };
     let config = crate::cli::config::load_with_home(repo_root, home);
     // Reviewer tiers from the team resolver
@@ -596,7 +596,7 @@ async fn fold_summary(
         Ok(t) => t,
         Err(e) => {
             return (
-                0,
+                None,
                 None,
                 Some(format!("loading registered reviewers failed: {e}")),
             );
@@ -615,15 +615,15 @@ async fn fold_summary(
     let work_status = state
         .fold
         .derive_status(&reviews, &work_policy, head.as_ref());
-    let active_plans = work_status.plans.len();
-    let waiting_on = if work_status.plans.len() == 1 {
-        Some(format_waiting_on(&work_status.plans[0].waiting_on))
-    } else if work_status.plans.is_empty() {
-        None
-    } else {
-        Some("multiple plans".to_string())
-    };
-    (active_plans, waiting_on, None)
+    let active_plan = work_status
+        .active_plan
+        .as_ref()
+        .map(|p| p.plan.as_str().to_owned());
+    let waiting_on = work_status
+        .active_plan
+        .as_ref()
+        .map(|p| format_waiting_on(&p.waiting_on));
+    (active_plan, waiting_on, None)
 }
 
 fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
@@ -677,18 +677,18 @@ fn print_human(r: &OpenResponse) {
         } else {
             format!("[{}]", c.master_agents.join(", "))
         };
-        let plans = if c.active_plans == 1 {
-            "1 active plan".to_string()
-        } else {
-            format!("{} active plans", c.active_plans)
-        };
+        let plan = c
+            .active_plan
+            .as_deref()
+            .map(|p| format!("active plan={p}"))
+            .unwrap_or_else(|| "no active plan".to_owned());
         let waiting = c
             .waiting_on
             .as_deref()
             .map(|w| format!(", waiting on {w}"))
             .unwrap_or_default();
         println!(
-            "clank:        master={master}, {} agents, {plans}{waiting}",
+            "clank:        master={master}, {} agents, {plan}{waiting}",
             c.agents.len()
         );
     } else {

@@ -62,7 +62,9 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 /// - v13: `RepoState` gained the durable `adopted_at` boundary used to
 ///   splice pre-adoption Git history without folding it. Old checkpoints
 ///   know only the boolean and cannot provide a safe floor.
-const CACHE_FORMAT_VERSION: u32 = 13;
+// v14: optional active plan, scalar attribution, rejected-intro warning provenance.
+// v15: finished runs persist their intro-to-finalize duration.
+const CACHE_FORMAT_VERSION: u32 = 15;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;
@@ -350,6 +352,147 @@ mod tests {
             sha: state.head.clone().unwrap(),
             depth,
         }
+    }
+
+    // Captured with the v13 writer at 281235815474, before changing the fold.
+    // Both overlapping active maps are genuinely encoded in these old bytes.
+    const V13: &[u8] = include_bytes!("../tests/it/fixtures/repo-state-v13.bin");
+
+    // Frozen v13/v14 record: it predates the recorded duration field.
+    #[derive(wincode::SchemaRead)]
+    struct LegacyFinishedPlan {
+        plan: crate::lifecycle::PlanKey,
+        intro: CommitSha,
+        finalized_at: CommitSha,
+    }
+
+    #[test]
+    fn legacy_scalar_checkpoint_preserves_real_finished_bytes_but_requires_refolding() {
+        use clank_core::repo_state::{ActivePlan, AdHocEvent, RepoWarning};
+        #[derive(wincode::SchemaRead)]
+        struct V14Fold {
+            active_plan: Option<ActivePlan>,
+            finished_plans: Vec<LegacyFinishedPlan>,
+            ad_hoc: Vec<AdHocEvent>,
+            warnings: Vec<RepoWarning>,
+            adopted: bool,
+            adopted_at: Option<CommitSha>,
+        }
+        // Captured with e5d34f7's actual v14 writer before adding duration.
+        let bytes = include_bytes!("../tests/it/fixtures/repo-state-v14.bin");
+        let old: V14Fold = wincode::deserialize(&bytes[HEADER_LEN..]).unwrap();
+        assert_eq!(old.active_plan.unwrap().key.as_str(), "next");
+        assert_eq!(old.finished_plans.len(), 1);
+        let first = &old.finished_plans[0];
+        assert_eq!(first.plan.as_str(), "first");
+        assert_ne!(first.intro, first.finalized_at);
+        assert!(old.ad_hoc.is_empty() && old.warnings.is_empty());
+        assert!(old.adopted && old.adopted_at.is_some());
+        let dir = fresh_repo();
+        let state = synth_state(dir.path());
+        let cp = cp_for(&state, 4);
+        fs::create_dir_all(cache_dir(dir.path())).unwrap();
+        let legacy = cache_dir(dir.path()).join(format!("{}.4.v14.bin", cp.sha.as_str()));
+        fs::write(&legacy, bytes).unwrap();
+        assert!(list_checkpoints(dir.path()).is_empty());
+        assert!(try_load(dir.path(), &cp).unwrap().is_none());
+        let alias = cache_file_for(dir.path(), &cp.sha, cp.depth);
+        fs::write(&alias, bytes).unwrap();
+        assert!(matches!(
+            try_load(dir.path(), &cp),
+            Err(CacheError::FormatVersion {
+                file: 14,
+                current: CACHE_FORMAT_VERSION
+            })
+        ));
+        assert!(!alias.exists());
+        assert_eq!(fs::read(legacy).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_map_checkpoint_is_skipped_and_rejected_before_decoding() {
+        use clank_core::repo_state::{AdHocEvent, PlanState, RepoWarning};
+        #[derive(wincode::SchemaRead)]
+        struct V13Fold {
+            plans: std::collections::BTreeMap<crate::lifecycle::PlanKey, PlanState>,
+            finished_plans: Vec<LegacyFinishedPlan>,
+            ad_hoc: Vec<AdHocEvent>,
+            warnings: Vec<RepoWarning>,
+            adopted: bool,
+            adopted_at: Option<CommitSha>,
+        }
+        // Prove this is the old payload, not a current payload with an old header.
+        let old: V13Fold = wincode::deserialize(&V13[HEADER_LEN..]).unwrap();
+        assert_eq!(
+            old.plans.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            vec!["accepted", "overlapping"]
+        );
+        assert!(old.plans.values().all(|p| p.commits.len() == 1));
+        assert!(old.finished_plans.is_empty() && old.ad_hoc.is_empty() && old.warnings.is_empty());
+        assert!(old.adopted && old.adopted_at.is_some());
+
+        let dir = fresh_repo();
+        let state = synth_state(dir.path());
+        let cp = cp_for(&state, 2);
+        fs::create_dir_all(cache_dir(dir.path())).unwrap();
+        let legacy = cache_dir(dir.path()).join(format!("{}.2.v13.bin", cp.sha.as_str()));
+        fs::write(&legacy, V13).unwrap();
+        assert!(list_checkpoints(dir.path()).is_empty());
+        assert!(try_load(dir.path(), &cp).unwrap().is_none());
+        assert_eq!(fs::read(&legacy).unwrap(), V13);
+
+        // A renamed old checkpoint must fail version validation, not decode as
+        // a scalar fold. The existing corrupt-cache recovery discards this alias.
+        let current = cache_file_for(dir.path(), &cp.sha, cp.depth);
+        fs::write(&current, V13).unwrap();
+        assert!(matches!(
+            try_load(dir.path(), &cp),
+            Err(CacheError::FormatVersion {
+                file: 13,
+                current: CACHE_FORMAT_VERSION
+            })
+        ));
+        assert!(!current.exists());
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn ignored_run_provenance_survives_checkpoint_and_active_finalization() {
+        use clank_core::repo_state::{CommitEvent, PlanTouchInput, TouchKind};
+        let dir = fresh_repo();
+        let mut state = synth_state(dir.path());
+        let event = |name: &str, kind, n: u8| CommitEvent {
+            sha: CommitSha::parse(&format!("{n:040x}")).unwrap(),
+            author_ts: n as i64,
+            subject: format!("[{name}] work"),
+            plan_touches: vec![PlanTouchInput {
+                plan: crate::lifecycle::PlanKey::parse(name).unwrap(),
+                kind,
+            }],
+            has_code_changes: true,
+        };
+        state
+            .fold
+            .apply_commit(&event("accepted", TouchKind::Intro, 1));
+        state
+            .fold
+            .apply_commit(&event("ignored", TouchKind::Intro, 2));
+        write(dir.path(), &state, 2).unwrap();
+        let mut loaded = try_load(dir.path(), &cp_for(&state, 2)).unwrap().unwrap();
+        assert_eq!(loaded.fold, state.fold);
+        loaded
+            .fold
+            .apply_commit(&event("accepted", TouchKind::Finish, 3));
+        let before = loaded.fold.clone();
+        assert!(
+            loaded
+                .fold
+                .apply_commit(&event("ignored", TouchKind::Finish, 4))
+                .is_empty()
+        );
+        assert_eq!(loaded.fold, before);
+        assert!(loaded.fold.active_plan.is_none());
+        assert_eq!(loaded.fold.finished_plans.len(), 1);
     }
 
     #[test]

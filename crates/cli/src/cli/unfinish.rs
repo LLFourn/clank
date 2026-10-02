@@ -16,6 +16,8 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
     let plan_key = clank_core::ids::PlanKey::parse(&stem)
         .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
 
+    let slot = super::plan_mutation::lock(&repo)?;
+    slot.empty_state()?;
     require_clean_worktree(&repo)?;
     require_head_is_trivial_finish(&repo, plan_key.as_str())?;
 

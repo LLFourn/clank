@@ -457,7 +457,7 @@ mod tests {
         let dir = init_repo();
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert!(state.head.is_none());
-        assert!(state.fold.plans.is_empty());
+        assert!(state.fold.active_plan.is_none());
     }
 
     #[tokio::test]
@@ -467,8 +467,8 @@ mod tests {
         commit(dir.path(), "[foo] intro");
         let state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();
-        assert!(state.fold.plans.contains_key(&key));
-        assert!(state.fold.plans[&key].commits[0].touched_plan);
+        assert!(state.fold.plan(&key).is_some());
+        assert!(state.fold.plan(&key).unwrap().commits[0].touched_plan);
     }
 
     #[tokio::test]
@@ -482,7 +482,7 @@ mod tests {
         commit(dir.path(), "[foo] finish");
         let state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();
-        assert!(!state.fold.plans.contains_key(&key));
+        assert!(!state.fold.plan(&key).is_some());
         assert_eq!(state.fold.finished_plans.len(), 1);
     }
 
@@ -649,7 +649,7 @@ mod tests {
             .unwrap();
         assert!(diag.cache_hit);
         let key = PlanKey::parse("foo").unwrap();
-        assert_eq!(state.fold.plans[&key].commits.len(), 2);
+        assert_eq!(state.fold.plan(&key).unwrap().commits.len(), 2);
     }
 
     /// `n` code commits on top of whatever exists.
@@ -825,7 +825,7 @@ mod tests {
         );
         let key = PlanKey::parse("foo").unwrap();
         assert_eq!(
-            cached.fold.plans[&key].commits.len(),
+            cached.fold.plan(&key).unwrap().commits.len(),
             2,
             "intro + merge revision only — no duplicated side commit"
         );

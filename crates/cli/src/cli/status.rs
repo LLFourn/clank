@@ -45,12 +45,9 @@ pub struct StatusSnapshot {
     /// counts, which are there only when it is true.
     #[serde(flatten, with = "dirty_wire")]
     pub(crate) dirty: Option<DirtyStats>,
-    #[serde(serialize_with = "plans_wire")]
-    pub(crate) plans: Vec<PlanWorkState>,
-    /// A list on the wire, of nought or one. It is `Some` only where
-    /// there is no active plan — which `select_plans_and_finished`
-    /// decides, so nothing here has to decide it again.
-    #[serde(rename = "finished_plans", serialize_with = "as_list")]
+    #[serde(serialize_with = "active_plan_wire")]
+    pub(crate) active_plan: Option<PlanWorkState>,
+    /// The latest finished run, shown only when no active plan is selected.
     pub(crate) last_finished: Option<FinishedPlan>,
     #[serde(serialize_with = "blocks_wire")]
     pub(crate) blocks: Vec<crate::cli::block::BlockEntry>,
@@ -144,6 +141,8 @@ pub struct StatusSnapshot {
         serialize_with = "correction_wire"
     )]
     pub(crate) head_correction: Option<clank_core::wait::HeadCorrection>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<clank_core::repo_state::RepoWarning>,
 }
 
 /// One team agent as the TUI's agent panel sees it: its label,
@@ -376,19 +375,14 @@ mod queue_wire {
     }
 }
 
-/// Nought or one, as a list: the key has always been an array.
-fn as_list<T: serde::Serialize, S: serde::Serializer>(
-    one: &Option<T>,
+fn active_plan_wire<S: serde::Serializer>(
+    plan: &Option<PlanWorkState>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    s.collect_seq(one.iter())
-}
-
-fn plans_wire<S: serde::Serializer>(
-    plans: &[clank_core::wait::PlanWorkState],
-    s: S,
-) -> Result<S::Ok, S::Error> {
-    s.collect_seq(plans.iter().map(Planned))
+    match plan {
+        Some(plan) => s.serialize_some(&Planned(plan)),
+        None => s.serialize_none(),
+    }
 }
 
 fn blocks_wire<S: serde::Serializer>(
@@ -462,10 +456,7 @@ impl serde::Serialize for Corrected<'_> {
                 .map(PlanKey::as_str)
                 .collect::<Vec<_>>(),
         )?;
-        m.serialize_entry(
-            "extra_named",
-            &extra_named.iter().map(PlanKey::as_str).collect::<Vec<_>>(),
-        )?;
+        m.serialize_entry("extra_named", &extra_named.as_ref().map(PlanKey::as_str))?;
         m.end()
     }
 }
@@ -606,8 +597,8 @@ impl StatusSnapshot {
             .fold
             .derive_status(&reviews, &work_policy, head.as_ref());
 
-        let (plans, last_finished) = select_plans_and_finished(
-            &work_status.plans,
+        let (active_plan, last_finished) = select_plan_and_finished(
+            &work_status.active_plan,
             &state.fold,
             basename,
             plan_arg,
@@ -670,7 +661,7 @@ impl StatusSnapshot {
             head_sha,
             head_subject,
             dirty,
-            plans,
+            active_plan,
             last_finished,
             blocks,
             queue,
@@ -686,6 +677,7 @@ impl StatusSnapshot {
             pr_reviews: work_status.pr_reviews,
             ad_hoc: work_status.ad_hoc,
             head_correction: work_status.head_correction,
+            warnings: state.fold.warnings.clone(),
         })
     }
 
@@ -709,6 +701,14 @@ impl StatusSnapshot {
         }
         if let Some(s) = &self.head_sha {
             let _ = writeln!(out, "head:   {s}");
+        }
+        for warning in &self.warnings {
+            let _ = writeln!(
+                out,
+                "warning: {} ({})",
+                warning.warning,
+                short_sha(warning.sha.as_str())
+            );
         }
         // A broken HEAD commit tag dominates: shown even when no active
         // plan row carries it (unknown-tag-only — codex 2bf46d9).
@@ -788,12 +788,13 @@ impl StatusSnapshot {
             }
         }
 
-        if self.plans.is_empty() && self.last_finished.is_none() && self.pr_reviews.is_empty() {
+        if self.active_plan.is_none() && self.last_finished.is_none() && self.pr_reviews.is_empty()
+        {
             let _ = writeln!(out);
             let _ = writeln!(out, "no active plan, nothing pending");
         }
 
-        for v in &self.plans {
+        if let Some(v) = &self.active_plan {
             let _ = writeln!(out);
             let _ = writeln!(out, "plan: {}", v.plan.as_str());
             // Omit `latest reviewable:` line when sha is None (blocked
@@ -820,14 +821,15 @@ impl StatusSnapshot {
             );
         }
 
-        if self.plans.is_empty() {
+        if self.active_plan.is_none() {
             if let Some(fp) = &self.last_finished {
                 let _ = writeln!(out);
                 let _ = writeln!(
                     out,
-                    "last finished: {} (finalized {})",
+                    "last finished: {} (finalized {}, duration {})",
                     fp.plan.as_str(),
-                    short_sha(fp.finalized_at.as_str())
+                    short_sha(fp.finalized_at.as_str()),
+                    crate::age::duration(fp.duration_secs)
                 );
             }
         }
@@ -998,7 +1000,7 @@ async fn run_watch(
 /// subprocess — ruthless 54c37f6 concern 1) rendered through the
 /// shared `clank log --oneline` row producer to PLAIN lines (the
 /// TUI styles them). Scope: repo-wide recent activity, ALWAYS — the
-/// pane shows the same window regardless of how many plans are active
+/// pane shows the same window whether or not a plan is active
 /// (status-tui-unified-log; the old single-active-plan narrowing made
 /// a just-finished plan's commits vanish the moment one plan was
 /// active). Best-effort: any failure yields an empty pane, never a
@@ -1500,26 +1502,20 @@ pub(crate) fn spawn_sigwinch_forwarder(tx: mpsc::Sender<()>) -> anyhow::Result<(
     Ok(())
 }
 
-fn select_plans_and_finished(
-    work_plans: &[PlanWorkState],
+fn select_plan_and_finished(
+    work_plan: &Option<PlanWorkState>,
     fold: &clank_core::repo_state::RepoState,
     basename: &str,
     plan_arg: Option<&str>,
     watch_mode: bool,
-) -> anyhow::Result<(Vec<PlanWorkState>, Option<FinishedPlan>)> {
+) -> anyhow::Result<(Option<PlanWorkState>, Option<FinishedPlan>)> {
     if let Some(raw) = plan_arg {
         let stem = parse_arg(raw, basename)?;
         let key = PlanKey::parse(&stem)
             .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
 
-        let matching: Vec<PlanWorkState> = work_plans
-            .iter()
-            .filter(|ps| ps.plan == key)
-            .cloned()
-            .collect();
-
-        if !matching.is_empty() {
-            return Ok((matching, None));
+        if let Some(matching) = work_plan.as_ref().filter(|ps| ps.plan == key) {
+            return Ok((Some(matching.clone()), None));
         }
 
         if watch_mode {
@@ -1530,7 +1526,7 @@ fn select_plans_and_finished(
                 .find(|fp| fp.plan == key)
                 .cloned();
             if last_finished.is_some() {
-                return Ok((vec![], last_finished));
+                return Ok((None, last_finished));
             }
         }
 
@@ -1540,13 +1536,13 @@ fn select_plans_and_finished(
         );
     }
 
-    let plans = work_plans.to_vec();
-    let last_finished = if plans.is_empty() {
+    let active_plan = work_plan.clone();
+    let last_finished = if active_plan.is_none() {
         fold.finished_plans.last().cloned()
     } else {
         None
     };
-    Ok((plans, last_finished))
+    Ok((active_plan, last_finished))
 }
 
 pub(crate) fn waiting_actor(w: &WaitingOn) -> String {
@@ -1578,17 +1574,14 @@ pub(crate) fn describe_head_violation(v: &clank_core::wait::HeadTagViolation) ->
             plans(&v.untagged_touched)
         ));
     }
-    if !v.extra_named.is_empty() {
+    if let Some(extra) = &v.extra_named {
         parts.push(format!(
             "tag names [{}] whose plan file it didn't touch",
-            plans(&v.extra_named)
+            extra.as_str()
         ));
     }
-    if !v.unknown.is_empty() {
-        parts.push(format!(
-            "tag names unknown plan(s) [{}]",
-            v.unknown.join(", ")
-        ));
+    if let Some(unknown) = &v.unknown {
+        parts.push(format!("tag names unknown plan [{}]", unknown));
     }
     parts.join("; ")
 }
@@ -1666,16 +1659,10 @@ pub(crate) fn waiting_reason(w: &WaitingOn) -> String {
 }
 
 fn active_summary(fold: &clank_core::repo_state::RepoState, basename: &str) -> String {
-    let names: Vec<String> = fold
-        .plans
-        .keys()
-        .map(|k| format!("{basename}/{}.md", k.as_str()))
-        .collect();
-    if names.is_empty() {
-        "(none)".into()
-    } else {
-        names.join(", ")
-    }
+    fold.active_plan.as_ref().map_or_else(
+        || "(none)".into(),
+        |p| format!("{basename}/{}.md", p.key.as_str()),
+    )
 }
 
 pub(crate) fn short_sha(s: &str) -> &str {
@@ -1795,7 +1782,7 @@ mod dirty_and_wake_tests {
             !read
                 .rows
                 .iter()
-                .any(|r| matches!(r, crate::cli::log::OnelineRow::Header { plan: Some(p) } if p == "solo")),
+                .any(|r| matches!(r, crate::cli::log::OnelineRow::Header { plan: Some(p), .. } if p == "solo")),
             "and drops the umbrella: {:?}",
             read.rows
         );
@@ -1814,12 +1801,14 @@ mod dirty_and_wake_tests {
         state.fold.finished_plans = vec![
             // One commit: intro and finalize are the same commit.
             FinishedPlan {
+                duration_secs: 0,
                 plan: plan("solo"),
                 intro: sha("aa"),
                 finalized_at: sha("aa"),
             },
             // Two: they are not.
             FinishedPlan {
+                duration_secs: 0,
                 plan: plan("duo"),
                 intro: sha("bb"),
                 finalized_at: sha("cc"),
@@ -2701,14 +2690,14 @@ mod dirty_and_wake_tests {
             head_sha: Some("abcd123".to_string()),
             head_subject: Some("do the thing".to_string()),
             dirty: None,
-            plans: vec![PlanWorkState {
+            active_plan: Some(PlanWorkState {
                 handover: Default::default(),
                 plan: plan_key("foo"),
                 sha: Some(sha("0123456789abcdef0123456789abcdef01234567")),
                 gate: CommitGateState::Unreviewed,
                 waiting_on: WaitingOn::MasterToContinue,
                 touched_code: true,
-            }],
+            }),
             last_finished: None,
             blocks: vec![crate::cli::block::BlockEntry {
                 agent: "codex".to_string(),
@@ -2729,6 +2718,7 @@ mod dirty_and_wake_tests {
             pr_reviews: Vec::new(),
             ad_hoc: Vec::new(),
             head_correction: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -2742,9 +2732,10 @@ mod dirty_and_wake_tests {
     #[test]
     fn an_idle_repo_says_which_plan_finished_last() {
         let mut snap = minimal_snapshot();
-        snap.plans = Vec::new();
+        snap.active_plan = None;
         snap.blocks = Vec::new();
         snap.last_finished = Some(clank_core::repo_state::FinishedPlan {
+            duration_secs: 0,
             plan: clank_core::ids::PlanKey::parse("done").unwrap(),
             intro: clank_core::ids::CommitSha::parse(&"1".repeat(40)).unwrap(),
             finalized_at: clank_core::ids::CommitSha::parse(&"2".repeat(40)).unwrap(),
@@ -2753,7 +2744,7 @@ mod dirty_and_wake_tests {
         let out = snap.to_human();
 
         assert!(
-            out.contains("last finished: done (finalized 2222222)"),
+            out.contains("last finished: done (finalized 2222222, duration 0s)"),
             "the finalize must still be readable somewhere: {out}"
         );
         assert!(
@@ -2764,9 +2755,8 @@ mod dirty_and_wake_tests {
 
     #[test]
     fn to_json_minimal_omits_conditional_keys() {
-        // typed-json-not-json-macro: the typed `StatusJson` must
-        // serialize to the SAME shape the old `json!` builder
-        // produced. Minimal case: every conditional key is ABSENT.
+        // The typed snapshot is the wire, including its optional active
+        // and latest-finished values. Conditional keys are absent here.
         // (`json!` expresses the expected value; the ban is on
         // production output. `to_value` equality is order-independent.)
         let snap = minimal_snapshot();
@@ -2781,7 +2771,7 @@ mod dirty_and_wake_tests {
             "head_sha": "abcd123",
             "head_subject": "do the thing",
             "worktree_dirty": false,
-            "plans": [{
+            "active_plan": {
                 // The two keys the wire fixed before this was one
                 // model, and the rest of what a plan's state holds.
                 "plan": "foo",
@@ -2790,8 +2780,8 @@ mod dirty_and_wake_tests {
                 "waiting_on": WaitingOn::MasterToContinue,
                 "handover": {"opened": null, "commit_tier_closed": null, "second_tier_closed": null},
                 "touched_code": true,
-            }],
-            "finished_plans": [],
+            },
+            "last_finished": null,
             "blocks": [{
                 "agent": "codex",
                 "name": "q",
@@ -2880,7 +2870,7 @@ mod dirty_and_wake_tests {
             head_sha,
             head_subject,
             dirty,
-            plans,
+            active_plan,
             last_finished: _,
             blocks,
             queue,
@@ -2891,6 +2881,7 @@ mod dirty_and_wake_tests {
             pr_reviews,
             ad_hoc,
             head_correction: _,
+            warnings,
             // Emitted, and pinned by the wire fixture below rather
             // than here: `--repo` means the reader need not be
             // standing in it (codex on 772b84f).
@@ -2908,12 +2899,13 @@ mod dirty_and_wake_tests {
             github_events: _,
         } = &snap;
 
+        assert!(warnings.is_empty() && v.get("warnings").is_none());
         assert_eq!(v["repo_basename"], **basename);
         assert_eq!(v["branch"], *branch.as_deref().unwrap());
         assert_eq!(v["head_sha"], *head_sha.as_deref().unwrap());
         assert_eq!(v["head_subject"], *head_subject.as_deref().unwrap());
         assert_eq!(v["worktree_dirty"], dirty.is_some());
-        assert_eq!(v["plans"].as_array().unwrap().len(), plans.len());
+        assert_eq!(v["active_plan"].is_object(), active_plan.is_some());
         assert_eq!(v["blocks"].as_array().unwrap().len(), blocks.len());
         assert_eq!(v["master"], *master.as_deref().unwrap());
         // The TIER, not "master or reviewer": the pane draws the
@@ -3010,9 +3002,9 @@ mod dirty_and_wake_tests {
         snap.head_correction = Some(clank_core::wait::HeadCorrection {
             sha: sha("deadbeef"),
             violation: clank_core::wait::HeadTagViolation {
-                unknown: vec!["ghost".to_string()],
+                unknown: Some("ghost".to_string()),
                 untagged_touched: vec![plan_key("foo")],
-                extra_named: vec![plan_key("bar")],
+                extra_named: Some(plan_key("bar")),
             },
         });
         let got = snap.to_json();
@@ -3037,33 +3029,34 @@ mod dirty_and_wake_tests {
             got["head_correction"],
             serde_json::json!({
                 "sha": "deadbeef",
-                "unknown": ["ghost"],
+                "unknown": "ghost",
                 "untagged_touched": ["foo"],
-                "extra_named": ["bar"],
+                "extra_named": "bar",
             })
         );
     }
 
     #[test]
-    fn to_json_finished_plan_only_when_no_active_plans() {
-        // The finished-plan row appears only when there are no active
-        // plans (mirrors the old `if self.plans.is_empty()` guard).
+    fn to_json_finished_plan_when_active_slot_is_empty() {
+        // The idle projection carries the latest finished run as an object.
         let mut snap = minimal_snapshot();
-        snap.plans = Vec::new();
+        snap.active_plan = None;
         snap.blocks = Vec::new();
         snap.last_finished = Some(clank_core::repo_state::FinishedPlan {
+            duration_secs: 0,
             plan: plan_key("foo"),
             intro: sha("aaaaaaa"),
             finalized_at: sha("bbbbbbb"),
         });
         let got = snap.to_json();
         assert_eq!(
-            got["finished_plans"],
-            serde_json::json!([{
+            got["last_finished"],
+            serde_json::json!({
                 "plan": "foo",
                 "intro": "aaaaaaa",
                 "finalized_at": "bbbbbbb",
-            }])
+                "duration_secs": 0,
+            })
         );
     }
 }

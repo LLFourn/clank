@@ -354,7 +354,11 @@ pub(crate) fn interleave_with_plain<'a>(
 fn gh_colored_row(g: &crate::cli::github::timeline::MergedEvent, mark: &str) -> String {
     let line = gh_describe(g);
     let badge = event_badge(g);
-    if g.baseline {
+    colored_event_row(badge, &line, g.baseline, mark)
+}
+
+fn colored_event_row(badge: &str, line: &str, baseline: bool, mark: &str) -> String {
+    if baseline {
         format!("{DIM}{badge} {line}{mark}{Z}")
     } else {
         format!("{C}{badge}{Z} {line}{mark}")
@@ -792,10 +796,14 @@ impl RowMarker {
 /// pane (which dims it). Plan: status-tui-live-log.
 #[derive(Debug)]
 pub(crate) enum OnelineRow {
-    /// Umbrella header: the plan that groups the following commit
-    /// rows, or `None` for the ad-hoc bucket
-    /// (log-plan-umbrellas).
-    Header { plan: Option<String> },
+    /// Footer naming the plan run above it. Ad-hoc rows stay inline.
+    Header {
+        plan: Option<String>,
+        duration_secs: Option<u64>,
+        /// This page reaches the real introduction. Otherwise its footer is
+        /// provisional context and can move down when an older page joins.
+        starts_here: bool,
+    },
     Commit {
         sha: CommitSha,
         /// The commit's author time (epoch seconds) — what the TUI's
@@ -863,10 +871,6 @@ pub(crate) enum OnelineRow {
     Notice(String),
 }
 
-/// The interleaved oneline row sequence — pure, shared by the status
-/// TUI's log pane (and testable without a repo): repo chunks through
-/// [`oneline_rows`], github entries as [`OnelineRow::Github`] rows in
-/// timeline position.
 /// Finalize SHAs that stand for their whole plan, mapped to its name.
 ///
 /// Keyed by SHA, never by name: `FinishedPlan` is an INSTANCE record
@@ -874,43 +878,112 @@ pub(crate) enum OnelineRow {
 /// inherit an earlier `foo`'s eligibility (codex on 5b1e87c).
 pub(crate) type StandsFor = std::collections::BTreeMap<String, String>;
 
+/// Group the bounded Git window once and retain external event positions.
 pub(crate) fn oneline_items_rows(
     items: &[TimelineItem],
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
     stands_for: &StandsFor,
 ) -> Vec<OnelineRow> {
+    // External rows preserve timeline order but do not end a Git plan run.
+    // Group the bounded Git window once, then splice those rows by event.
+    let events: Vec<&LogEvent> = items
+        .iter()
+        .filter_map(|item| match item {
+            TimelineItem::Repo(event) => Some(*event),
+            _ => None,
+        })
+        .collect();
+    let mut git_rows = oneline_rows(&events, reviews, stands_for)
+        .into_iter()
+        .peekable();
     let mut out = Vec::new();
-    let mut chunk: Vec<&LogEvent> = Vec::new();
     for item in items {
         match item {
-            TimelineItem::Repo(e) => chunk.push(e),
-            TimelineItem::Plain(commit) => {
-                out.extend(oneline_rows(&chunk, reviews, stands_for));
-                chunk.clear();
-                out.push(OnelineRow::PlainCommit {
-                    sha: commit.meta.sha.clone(),
-                    at: commit.meta.author_ts,
-                    subject: commit.meta.subject.clone(),
-                    refs: commit.refs.clone(),
-                });
+            TimelineItem::Repo(event) => {
+                for row in git_rows.by_ref() {
+                    let commit =
+                        matches!(&row, OnelineRow::Commit { sha, .. } if sha == event.sha());
+                    out.push(row);
+                    if commit {
+                        break;
+                    }
+                }
+                // A footer follows only the oldest Git event of its run.
+                while matches!(git_rows.peek(), Some(OnelineRow::Header { .. })) {
+                    out.push(git_rows.next().unwrap());
+                }
             }
-            TimelineItem::Github(idx, g) => {
-                out.extend(oneline_rows(&chunk, reviews, stands_for));
-                chunk.clear();
-                out.push(OnelineRow::Github {
-                    event_idx: *idx,
-                    line: gh_describe(g),
-                    unhandled: g.unhandled,
-                    baseline: g.baseline,
-                    at: g.at,
-                    backend: g.backend,
-                    glyph: g.glyph.clone(),
-                });
-            }
+            TimelineItem::Plain(commit) => out.push(OnelineRow::PlainCommit {
+                sha: commit.meta.sha.clone(),
+                at: commit.meta.author_ts,
+                subject: commit.meta.subject.clone(),
+                refs: commit.refs.clone(),
+            }),
+            TimelineItem::Github(idx, g) => out.push(OnelineRow::Github {
+                event_idx: *idx,
+                line: gh_describe(g),
+                unhandled: g.unhandled,
+                baseline: g.baseline,
+                at: g.at,
+                backend: g.backend,
+                glyph: g.glyph.clone(),
+            }),
         }
     }
-    out.extend(oneline_rows(&chunk, reviews, stands_for));
     out
+}
+
+/// Join one older bounded page. A provisional footer moves to the actual
+/// introduction without duplicating the plan name or losing its duration.
+/// Inspect only the page being appended, never rebuild or scan loaded history.
+pub(crate) fn extend_oneline_rows(rows: &mut Vec<OnelineRow>, mut older: Vec<OnelineRow>) {
+    if let Some(OnelineRow::Header {
+        plan: Some(plan),
+        duration_secs,
+        starts_here: false,
+    }) = rows.last()
+    {
+        let first_header = older
+            .iter()
+            .position(|r| matches!(r, OnelineRow::Header { .. }));
+        if let Some(i) = first_header {
+            if let OnelineRow::Header {
+                plan: Some(next),
+                duration_secs: next_duration,
+                ..
+            } = &mut older[i]
+                && next == plan
+            {
+                if next_duration.is_none() {
+                    *next_duration = *duration_secs;
+                }
+                rows.pop();
+            }
+        } else if !older.iter().any(|r| {
+            matches!(
+                r,
+                OnelineRow::PlainCommit { .. }
+                    | OnelineRow::Commit {
+                        stands_for: Some(_),
+                        ..
+                    }
+            )
+        }) {
+            let footer = rows.pop().unwrap();
+            rows.append(&mut older);
+            rows.push(footer);
+            return;
+        }
+    }
+    rows.append(&mut older);
+}
+
+pub(crate) fn plan_footer_text(plan: Option<&str>, duration_secs: Option<u64>) -> String {
+    let name = plan.unwrap_or("adhoc");
+    match duration_secs {
+        Some(secs) => format!("{name} · {}", crate::age::duration(secs)),
+        None => name.to_owned(),
+    }
 }
 
 /// Pure row producer for the oneline view. Subjects come from the
@@ -950,6 +1023,11 @@ pub(crate) fn oneline_rows(
             Some(plan) if !collapses(plan) => Some(plan.to_string()),
             _ => None,
         };
+        let run_duration = run.iter().find_map(|e| match e {
+            LogEvent::PlanFinalized { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        });
+        let starts_here = run.iter().any(|e| matches!(e, LogEvent::PlanIntro { .. }));
         for event in run {
             let (sha, subject) = match event {
                 LogEvent::PlanIntro { sha, subject, .. }
@@ -976,13 +1054,13 @@ pub(crate) fn oneline_rows(
             // Strip the `[plan]` prefix only when it names EXACTLY
             // the umbrella's plan — a real parse
             // (core::parse_subject), never string-munging. Foreign
-            // or multi-plan prefixes still carry information and
+            // or invalid prefixes still carry information and
             // stay verbatim.
             let parsed = parse_subject(&subject);
             let strip = matches!(
                 (&umbrella_plan, &parsed.prefix),
-                (Some(up), Some(clank_core::repo_state::TitlePrefix::Plans(ps)))
-                    if ps.len() == 1 && &ps[0] == up
+                (Some(up), Some(clank_core::repo_state::TitlePrefix::Plan(name)))
+                    if name == up
             );
             let subject = if strip {
                 parsed.body.to_string()
@@ -1020,12 +1098,16 @@ pub(crate) fn oneline_rows(
         // the plan orphaned at the far end. Same clock as a review,
         // which renders above the commit it followed.
         //
-        // It is a FOOTER FOR THIS RUN, not one global name: sections
-        // are cut per chunk, so a run split across pages gets its name
-        // on each, rather than one label attached to an intro that may
-        // be off-page (codex on 51fb3c8).
+        // A truncated page gets a provisional footer. Appending an older
+        // page moves it to the introduction via `extend_oneline_rows`,
+        // retaining the recorded duration and one name for that run.
         if let Some(plan) = footer {
-            out.push(OnelineRow::Header { plan: Some(plan) });
+            let duration_secs = run_duration;
+            out.push(OnelineRow::Header {
+                plan: Some(plan),
+                duration_secs,
+                starts_here,
+            });
         }
     }
     out
@@ -1036,7 +1118,11 @@ pub(crate) fn oneline_rows(
 pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
-            OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
+            OnelineRow::Header {
+                plan,
+                duration_secs,
+                ..
+            } => plan_footer_text(plan.as_deref(), *duration_secs),
             OnelineRow::Github {
                 event_idx: _,
                 line,
@@ -1098,68 +1184,56 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
 fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
     let c = color();
-    let mut chunk: Vec<&LogEvent> = Vec::new();
-    for item in items {
-        match item {
-            TimelineItem::Repo(e) => chunk.push(e),
-            TimelineItem::Plain(commit) => {
-                print_oneline_events(&chunk, &reviews, c);
-                chunk.clear();
-                let refs = if commit.refs.is_empty() {
+    print_oneline_rows(oneline_items_rows(items, &reviews, &Default::default()), c);
+    Ok(())
+}
+
+fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
+    for row in rows {
+        match row {
+            OnelineRow::Notice(message) => println!("{message}"),
+            OnelineRow::PlainCommit {
+                sha, subject, refs, ..
+            } => {
+                let refs = if refs.is_empty() {
                     String::new()
                 } else {
-                    format!(" ({})", commit.refs.join(", "))
+                    format!(" ({})", refs.join(", "))
                 };
                 if c {
-                    println!(
-                        "  {Y}{}{Z} {}{refs}",
-                        short(&commit.meta.sha),
-                        commit.meta.subject
-                    );
+                    println!("  {Y}{}{Z} {subject}{refs}", short(&sha));
                 } else {
-                    println!(
-                        "  {} {}{refs}",
-                        short(&commit.meta.sha),
-                        commit.meta.subject
-                    );
+                    println!("  {} {subject}{refs}", short(&sha));
                 }
             }
-            TimelineItem::Github(_, g) => {
-                print_oneline_events(&chunk, &reviews, c);
-                chunk.clear();
-                // One row, marker-led like commits; unhandled events
-                // carry the open-work mark, pre-watch history its own.
-                let mark = if g.unhandled {
+            OnelineRow::Github {
+                line,
+                unhandled,
+                baseline,
+                glyph,
+                backend,
+                ..
+            } => {
+                let badge = badge_of(glyph.as_deref(), backend);
+                let mark = if unhandled {
                     " ⚠"
-                } else if g.baseline {
+                } else if baseline {
                     " (pre-watch)"
                 } else {
                     ""
                 };
                 if c {
-                    println!("{}", gh_colored_row(g, mark));
+                    println!("{}", colored_event_row(badge, &line, baseline, mark));
                 } else {
-                    println!("{} {}{mark}", event_badge(g), gh_describe(g));
+                    println!("{badge} {line}{mark}");
                 }
             }
-        }
-    }
-    print_oneline_events(&chunk, &reviews, c);
-    Ok(())
-}
-
-fn print_oneline_events(
-    events: &[&LogEvent],
-    reviews: &std::collections::BTreeMap<String, Vec<Review>>,
-    c: bool,
-) {
-    for row in oneline_rows(events, reviews, &Default::default()) {
-        match row {
-            // oneline_rows never produces these; the interleaving
-            // caller prints github rows itself.
-            OnelineRow::Github { .. } | OnelineRow::Notice(_) | OnelineRow::PlainCommit { .. } => {}
-            OnelineRow::Header { plan } => {
-                let name = plan.unwrap_or_else(|| "adhoc".to_string());
+            OnelineRow::Header {
+                plan,
+                duration_secs,
+                ..
+            } => {
+                let name = plan_footer_text(plan.as_deref(), duration_secs);
                 if c {
                     println!("{C}{name}{Z}");
                 } else {
@@ -1233,6 +1307,7 @@ enum LogJsonRow<'a> {
     },
     #[serde(rename = "finalized")]
     Finalized {
+        duration_secs: u64,
         plan: &'a str,
         sha: &'a str,
         ts: i64,
@@ -1429,11 +1504,13 @@ fn json_rows<'a>(
                 subject,
             },
             LogEvent::PlanFinalized {
+                duration_secs,
                 plan,
                 sha,
                 ts,
                 subject,
             } => LogJsonRow::Finalized {
+                duration_secs: *duration_secs,
                 plan: plan.as_str(),
                 sha: sha.as_str(),
                 ts: *ts,
@@ -1580,12 +1657,9 @@ mod json_output_tests {
         assert!(!colored.contains(DIM), "{colored:?}");
     }
 
-    /// A run split by a github row is TWO sections, so each gets its
-    /// own name — the change is a footer per run, not one global name
-    /// pinned to an intro that may be off this page (codex on
-    /// 51fb3c8).
+    /// External rows preserve their position inside one Git plan run.
     #[test]
-    fn a_run_split_by_a_github_row_names_each_half() {
+    fn an_external_row_keeps_one_plan_run() {
         use crate::lifecycle::{CommitSha, PlanKey};
         let commit = |ts: i64| LogEvent::PlanCommit {
             plan: PlanKey::parse("foo").unwrap(),
@@ -1597,14 +1671,14 @@ mod json_output_tests {
         };
         let (newer, older) = (commit(200), commit(100));
         let events: Vec<&LogEvent> = vec![&newer, &older];
-        // A github event dated between them splits the run.
+        // A github event dated between them stays inside the run.
         let gh_events = vec![gh(150, "between", true)];
         let items = interleave(&events, &gh_events);
         let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
         let shape: Vec<&str> = rows
             .iter()
             .map(|r| match r {
-                OnelineRow::Header { plan } => plan.as_deref().unwrap_or("adhoc"),
+                OnelineRow::Header { plan, .. } => plan.as_deref().unwrap_or("adhoc"),
                 OnelineRow::Github { backend, .. } => match backend {
                     crate::cli::github::timeline::Backend::Github => "gh",
                     crate::cli::github::timeline::Backend::Command => "cmd",
@@ -1616,8 +1690,91 @@ mod json_output_tests {
             .collect();
         assert_eq!(
             shape,
-            vec!["commit", "foo", "gh", "commit", "foo"],
-            "each half closes with its own name: {rows:?}"
+            vec!["commit", "gh", "commit", "foo"],
+            "one footer for the Git run: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn older_pages_move_one_footer_to_the_intro_and_keep_its_duration() {
+        use crate::lifecycle::{CommitSha, PlanKey};
+        let key = PlanKey::parse("repeat").unwrap();
+        let hash = |n| CommitSha::parse(&format!("{n:040x}")).unwrap();
+        let intro = LogEvent::PlanIntro {
+            plan: key.clone(),
+            sha: hash(1),
+            ts: 100,
+            subject: "[repeat] intro".into(),
+        };
+        let work = LogEvent::PlanCommit {
+            plan: key.clone(),
+            sha: hash(3),
+            ts: 200,
+            touched_plan: false,
+            touched_code: true,
+            subject: "[repeat] work".into(),
+        };
+        let finish = LogEvent::PlanFinalized {
+            plan: key,
+            sha: hash(4),
+            ts: 220,
+            duration_secs: 120,
+            subject: "[repeat] finish".into(),
+        };
+        let drive_by = LogEvent::AdHoc {
+            sha: hash(2),
+            ts: 150,
+            subject: "drive by".into(),
+        };
+        let page =
+            |events: &[&LogEvent]| oneline_rows(events, &Default::default(), &Default::default());
+        let mut rows = page(&[&finish]);
+        extend_oneline_rows(&mut rows, page(&[&work]));
+        extend_oneline_rows(&mut rows, page(&[&drive_by]));
+        extend_oneline_rows(&mut rows, page(&[&intro]));
+        assert_eq!(oneline_plain_lines(&rows).last().unwrap(), "repeat · 2m");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, OnelineRow::Header { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            rows.last(),
+            Some(OnelineRow::Header {
+                starts_here: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            rows.iter()
+                .filter_map(|r| match r {
+                    OnelineRow::Commit { sha, .. } => Some(sha.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [hash(4), hash(3), hash(2), hash(1)]
+        );
+        // A fully loaded newer run cannot merge into the same historical name.
+        let old_intro = LogEvent::PlanIntro {
+            plan: PlanKey::parse("repeat").unwrap(),
+            sha: hash(5),
+            ts: 40,
+            subject: "[repeat] earlier intro".into(),
+        };
+        let old_finish = LogEvent::PlanFinalized {
+            plan: PlanKey::parse("repeat").unwrap(),
+            sha: hash(6),
+            ts: 50,
+            duration_secs: 10,
+            subject: "[repeat] earlier finish".into(),
+        };
+        extend_oneline_rows(&mut rows, page(&[&old_finish, &old_intro]));
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, OnelineRow::Header { .. }))
+                .count(),
+            2
         );
     }
 
@@ -1847,13 +2004,14 @@ mod json_output_tests {
             ),
             (
                 serde_json::to_value(LogJsonRow::Finalized {
+                    duration_secs: 120,
                     plan: "p",
                     sha: "abc",
                     ts: 5,
                     subject: "[p] wrap it up",
                 })
                 .unwrap(),
-                serde_json::json!({"kind":"finalized","plan":"p","sha":"abc","ts":5,"subject":"[p] wrap it up"}),
+                serde_json::json!({"kind":"finalized","plan":"p","sha":"abc","ts":5,"subject":"[p] wrap it up","duration_secs":120}),
             ),
             (
                 serde_json::to_value(LogJsonRow::Deleted {
@@ -1954,6 +2112,7 @@ mod tests {
     #[test]
     fn a_one_commit_finished_plan_collapses_and_a_two_commit_one_does_not() {
         let one = [LogEvent::PlanFinalized {
+            duration_secs: 0,
             plan: PlanKey::parse("solo").unwrap(),
             sha: sha("aa"),
             ts: 2,
@@ -1991,6 +2150,7 @@ mod tests {
                 subject: "[duo] intro".into(),
             },
             LogEvent::PlanFinalized {
+                duration_secs: 0,
                 plan: PlanKey::parse("duo").unwrap(),
                 sha: sha("dd"),
                 ts: 2,
@@ -2001,7 +2161,7 @@ mod tests {
         let rows = oneline_rows(&refs, &Default::default(), &Default::default());
         assert!(
             rows.iter()
-                .any(|r| matches!(r, OnelineRow::Header { plan: Some(p) } if p == "duo")),
+                .any(|r| matches!(r, OnelineRow::Header { plan: Some(p), .. } if p == "duo")),
             "a two-commit plan keeps its umbrella: {rows:?}"
         );
     }
@@ -2019,6 +2179,7 @@ mod tests {
             subject: "[split] intro".into(),
         };
         let fin = LogEvent::PlanFinalized {
+            duration_secs: 0,
             plan: PlanKey::parse("split").unwrap(),
             sha: sha("22"),
             ts: 3,
@@ -2052,9 +2213,9 @@ mod tests {
         let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
         let headers = rows
             .iter()
-            .filter(|r| matches!(r, OnelineRow::Header { plan: Some(p) } if p == "split"))
+            .filter(|r| matches!(r, OnelineRow::Header { plan: Some(p), .. } if p == "split"))
             .count();
-        assert_eq!(headers, 2, "each chunk keeps its umbrella: {rows:?}");
+        assert_eq!(headers, 1, "one run keeps one umbrella: {rows:?}");
         assert!(
             rows.iter().all(|r| !matches!(
                 r,
@@ -2081,6 +2242,7 @@ mod tests {
                 subject: "[foo] intro".into(),
             },
             LogEvent::PlanFinalized {
+                duration_secs: 1,
                 plan: PlanKey::parse("foo").unwrap(),
                 sha: sha("bb"),
                 ts: 2,
@@ -2092,7 +2254,7 @@ mod tests {
                 subject: "drive-by".into(),
             },
         ];
-        let refs: Vec<&LogEvent> = events.iter().collect();
+        let refs: Vec<&LogEvent> = events.iter().rev().collect();
         let mut reviews = std::collections::BTreeMap::new();
         reviews.insert(
             sha("aa").as_str().to_string(),
@@ -2128,14 +2290,12 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                // review renders ABOVE its commit (newest-first time
-                // order — status-timeline-progress)
-                "    ✓ codex: lgtm".to_string(),
-                "✎ aa00000 intro".to_string(),
-                "⚑ bb00000 wrap up".to_string(),
-                "foo".to_string(),
                 "    ✓ codex: x".to_string(),
                 "~ cc00000 drive-by".to_string(),
+                "⚑ bb00000 wrap up".to_string(),
+                "    ✓ codex: lgtm".to_string(),
+                "✎ aa00000 intro".to_string(),
+                "foo · 1s".to_string(),
             ]
         );
     }
@@ -2154,6 +2314,7 @@ mod tests {
     fn a_finalize_is_marked_even_while_another_plan_is_active() {
         let events = [
             LogEvent::PlanFinalized {
+                duration_secs: 0,
                 plan: PlanKey::parse("done").unwrap(),
                 sha: sha("bb"),
                 ts: 2,
@@ -2178,7 +2339,7 @@ mod tests {
             "the finalize keeps its own marker: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l == "done"),
+            lines.iter().any(|l| l == "done · 0s"),
             "and names the plan that finished: {lines:?}"
         );
         assert!(
@@ -2240,7 +2401,7 @@ mod tests {
             .filter(|r| matches!(r, OnelineRow::Header { .. }))
             .collect();
         assert_eq!(headers.len(), 1, "no separate adhoc header: {rows:?}");
-        assert!(matches!(headers[0], OnelineRow::Header { plan: Some(p) } if p == "foo"));
+        assert!(matches!(headers[0], OnelineRow::Header { plan: Some(p), .. } if p == "foo"));
         // The plan commit (touched code) is Impl; the drive-by is AdHoc.
         let marker = |prefix: &str| {
             rows.iter().find_map(|r| match r {
@@ -2327,7 +2488,7 @@ mod tests {
             touched_code: false,
             subject: "[foo] intro".into(),
         };
-        // Multi-plan prefix carries information → stays verbatim.
+        // An invalid comma candidate still carries historical commit text.
         let e2 = LogEvent::PlanCommit {
             plan: foo.clone(),
             sha: sha(2),
@@ -2345,7 +2506,7 @@ mod tests {
         );
         assert!(
             lines[1].ends_with(" [foo,bar] shared change"),
-            "multi-plan prefix kept verbatim: {lines:?}"
+            "invalid candidate kept verbatim: {lines:?}"
         );
         // The name closes its run: last, at col 0.
         assert_eq!(lines[2], "foo", "umbrella name under its commits");

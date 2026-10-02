@@ -351,6 +351,7 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     // The third writer of the pair. Held from before the
     // already-stashed check, so two pushes of one stem cannot both
     // pass it, and across the ref + record writes that follow.
+    let _slot = super::plan_mutation::lock(&repo)?;
     let _lock = lock_stash(&repo)?;
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&repo)
         .ok_or_else(|| anyhow::anyhow!("unknown repo basename: {}", repo.display()))?;
@@ -565,6 +566,7 @@ pub(crate) async fn run_pop_checked(
     // The other verb that destroys the pair: pop deletes the ref and
     // the record once the commits are back. Same section as push and
     // drop, or two of the three can interleave.
+    let slot = super::plan_mutation::lock(&repo)?;
     let _lock = lock_stash(&repo)?;
     let stem = resolve_stashed(&scan_stash(&repo), plan)?;
 
@@ -585,6 +587,7 @@ pub(crate) async fn run_pop_checked(
              current plan. `clank stash drop {stem}` to discard them."
         );
     }
+    slot.empty_state()?;
     // The rewrite engine's policy, not a raw status: clank's own
     // untracked scratch under `.clank/` — this very stash's record,
     // in a repo whose `.clank/.gitignore` does not cover it — is not
@@ -939,8 +942,8 @@ mod drop_boundary_tests {
         (rec, id)
     }
 
-    async fn repo_with_a_stash() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    async fn repo_with_a_stash() -> super::super::monitor::TempRepo {
+        let dir = super::super::monitor::TempRepo::new();
         let p = dir.path();
         git(p, &["init", "--quiet", "--initial-branch=main"]);
         git(p, &["config", "user.email", "t@t"]);

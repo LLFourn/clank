@@ -447,6 +447,8 @@ pub fn promote_entry(repo: &Path, entry: &QueueEntry) -> anyhow::Result<()> {
     let name = entry.name.clone();
     let name = name.as_str();
     validate_name(name)?;
+    let admission = super::plan_mutation::lock(repo)?;
+    admission.empty_state()?;
     let plan_path = crate::init_facts::plan_md_rel(name);
     let dest = repo.join(&plan_path);
     std::fs::create_dir_all(dest.parent().unwrap())?;
@@ -512,6 +514,27 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    fn git_repo() -> super::super::monitor::TempRepo {
+        let repo = super::super::monitor::TempRepo::new();
+        for args in [
+            vec!["init", "--quiet", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.test"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        repo
     }
 
     /// A handle is a FILE, and two queued files may parse to one
@@ -600,7 +623,7 @@ mod tests {
     /// (codex on 66488eb).
     #[test]
     fn a_promote_that_fails_for_another_reason_says_that_reason() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = git_repo();
         let repo = dir.path();
         write(&repo.join(".clank/queue/100-foo.md"), "# foo\n");
         let entry = entry_by_stem(repo, "100-foo").unwrap();
@@ -679,7 +702,7 @@ mod tests {
     /// the first just made.
     #[test]
     fn a_promote_does_not_replace_the_plan_another_entry_made() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = git_repo();
         let repo = dir.path();
         write(
             &repo.join(".clank/plans/foo.md"),

@@ -32,8 +32,7 @@ pub async fn rereview_plan(
 
     let target = state
         .fold
-        .plans
-        .get(&plan_key)
+        .plan(&plan_key)
         .and_then(|ps| {
             ps.commits
                 .iter()

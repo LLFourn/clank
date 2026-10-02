@@ -676,7 +676,7 @@ fn fold_failure_pushes_warning_but_keeps_clank_initialized() {
         }),
         "expected a fold-failure warning, got: {warnings:?}"
     );
-    assert_eq!(v["clank"]["active_plans"], 0);
+    assert!(v["clank"]["active_plan"].is_null());
 }
 
 #[test]

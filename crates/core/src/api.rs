@@ -223,7 +223,9 @@ pub struct RepoEvent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RepoEventPayload {
     RepoRebuilt {},
-    RepoUnwatched { plan_count: usize },
+    RepoUnwatched {
+        active_plan: Option<crate::ids::PlanKey>,
+    },
 }
 
 impl std::fmt::Display for RepoEventPayload {

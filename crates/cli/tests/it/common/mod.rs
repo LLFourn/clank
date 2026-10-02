@@ -58,6 +58,18 @@ impl TestEnv {
     }
 }
 
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(repo) = dunce::canonicalize(self.repo()) {
+            let tag = blake3::hash(repo.as_os_str().as_bytes()).to_hex()[..32].to_string();
+            let path = PathBuf::from(format!("/tmp/clank-run-{}", unsafe { libc::getuid() }))
+                .join(format!("{tag}.plan-mutation"));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")

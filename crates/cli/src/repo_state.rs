@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
+use crate::lifecycle::{AgentLabel, CommitSha, RepoBasename};
 
 pub use clank_core::PlanLifecycle;
 pub use clank_core::PlanWorktreeStatus;
@@ -20,7 +20,6 @@ pub struct Clank {
     pub repos: BTreeMap<RepoRoot, RepoState>,
     pub repo_basenames: BTreeMap<RepoBasename, RepoRoot>,
     pub live_events: VecDeque<LiveEvent>,
-    pub active_selections: BTreeMap<(RepoBasename, AgentLabel), PlanKey>,
     pub opportunistic_bodies:
         BTreeMap<(RepoRoot, AgentLabel, String), crate::lifecycle::ContentHash>,
     pub seen_stale_reviews: std::collections::BTreeSet<(RepoRoot, AgentLabel, String)>,
@@ -48,7 +47,7 @@ impl RepoState {
     /// Stable digest over every meaningful field.
     pub fn digest(&self) -> StateDigest {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"clank-state-v3\n");
+        hasher.update(b"clank-state-v5\n");
         hasher.update(self.root.to_string_lossy().as_bytes());
         hasher.update(b"\nhead=");
         hasher.update(
@@ -58,8 +57,9 @@ impl RepoState {
                 .unwrap_or("")
                 .as_bytes(),
         );
-        hasher.update(b"\nfold.plans[");
-        for (key, ps) in &self.fold.plans {
+        hasher.update(b"\nfold.active_plan[");
+        if let Some(active) = &self.fold.active_plan {
+            let (key, ps) = (&active.key, &active.state);
             hasher.update(key.as_str().as_bytes());
             hasher.update(b":");
             for ev in &ps.commits {
@@ -72,7 +72,9 @@ impl RepoState {
         for fp in &self.fold.finished_plans {
             hasher.update(fp.plan.as_str().as_bytes());
             hasher.update(b":");
+            hasher.update(fp.intro.as_str().as_bytes());
             hasher.update(fp.finalized_at.as_str().as_bytes());
+            hasher.update(&fp.duration_secs.to_le_bytes());
             hasher.update(b";");
         }
         hasher.update(b"]\nfold.ad_hoc[");

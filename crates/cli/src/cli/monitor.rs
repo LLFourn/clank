@@ -23,7 +23,9 @@ use clank_core::wait::WaitItem;
 /// Skew is routine rather than exceptional here: monitors outlive
 /// `cargo install`, so a fresh client meeting an old monitor is the
 /// expected case and must degrade rather than fail.
-pub(crate) const PROTO: u32 = 5;
+// Version 7 also makes single-tag diagnostics scalar.
+// Old monitors must not keep serving the previous lifecycle after an upgrade.
+pub(crate) const PROTO: u32 = 7;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -1527,6 +1529,11 @@ impl Drop for TempRepo {
     fn drop(&mut self) {
         for ext in ["json", "lock", "status", "repair"] {
             let _ = std::fs::remove_file(runtime_path(self.0.path(), ext));
+        }
+        // Mutation callers canonicalize even when a test's temp root has a
+        // /var or /tmp alias. Their inode is keyed by that canonical path.
+        if let Ok(repo) = dunce::canonicalize(self.0.path()) {
+            let _ = std::fs::remove_file(runtime_path(&repo, "plan-mutation"));
         }
     }
 }

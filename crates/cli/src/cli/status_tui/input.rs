@@ -1916,10 +1916,9 @@ pub(super) struct CommitDetail {
 /// The open commit page (every-object-in-the-tui-has-a-page).
 pub(super) struct CommitPage {
     pub(super) detail: CommitDetail,
-    /// The plans the subject's `[plan]` tag names that have a page, in
-    /// tag order — the commit's own attribution, not the umbrella the
-    /// log draws it under.
-    pub(super) plans: Vec<crate::lifecycle::PlanKey>,
+    /// The subject's one plan tag, when that plan has a readable page.
+    /// This is the commit's own attribution, not its log umbrella.
+    pub(super) plan: Option<crate::lifecycle::PlanKey>,
     /// Scroll offset into the document beneath the rows.
     pub(super) scroll: usize,
     /// The row a plan page was opened from, as indexed in the rows the
@@ -1936,30 +1935,21 @@ pub(super) enum CommitAction {
     Back,
 }
 
-pub(super) fn commit_actions(plans: &[crate::lifecycle::PlanKey]) -> Vec<CommitAction> {
-    let mut v = vec![CommitAction::OpenHtml];
-    v.extend(plans.iter().cloned().map(CommitAction::OpenPlan));
-    v.push(CommitAction::Back);
-    v
+pub(super) fn commit_actions(plan: &Option<crate::lifecycle::PlanKey>) -> Vec<CommitAction> {
+    let mut actions = vec![CommitAction::OpenHtml];
+    if let Some(plan) = plan {
+        actions.push(CommitAction::OpenPlan(plan.clone()));
+    }
+    actions.push(CommitAction::Back);
+    actions
 }
 
-/// The key the row at `i` shows and fires. Plan rows are numbered from
-/// `1`, not lettered: a commit tagged with several plans has a row for
-/// each, and one letter names only one of them. A tenth plan row is
-/// reached by the cursor alone.
+/// The one plan row keeps the existing `1` shortcut.
 pub(super) fn commit_action_key(actions: &[CommitAction], i: usize) -> Option<(Key, &'static str)> {
-    const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
     match actions.get(i)? {
         CommitAction::OpenHtml => Some((Key::Html, "o")),
         CommitAction::Back => Some((Key::Escape, "esc")),
-        CommitAction::OpenPlan(_) => {
-            let n = actions[..i]
-                .iter()
-                .filter(|a| matches!(a, CommitAction::OpenPlan(_)))
-                .count();
-            let shown = DIGITS.get(n)?;
-            Some((Key::Char(shown.as_bytes()[0]), shown))
-        }
+        CommitAction::OpenPlan(_) => Some((Key::Char(b'1'), "1")),
     }
 }
 

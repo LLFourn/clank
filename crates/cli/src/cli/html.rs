@@ -33,12 +33,15 @@ use crate::cli::status::StatusSnapshot;
 /// carry their own class, so a page built by 4 has both the wrong
 /// markup and a ceiling it could exceed.
 ///
+/// 6: run boundaries and recorded durations change finished-plan markup;
+/// rebuild older pages once rather than retaining stale partial projections.
+///
 /// 3: markdown destinations are checked against an allow-list and
 /// raw HTML is escaped rather than dropped. Without the bump, a page
 /// already on disk keeps the rendering it was built with — including
 /// live `javascript:` links — because only missing pages and the top
 /// ten commits are rewritten (codex on 2709ac1).
-const BUILDER_VERSION: &str = "5";
+const BUILDER_VERSION: &str = "6";
 const TOP_N_FEEDBACK_RECHECK: usize = 10;
 
 pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
@@ -572,11 +575,6 @@ async fn build_site(
     progress.end();
 
     // Plan pages. One per active or finished plan.
-    let work_by_stem: BTreeMap<String, &PlanWorkState> = status
-        .plans
-        .iter()
-        .map(|p| (p.plan.as_str().to_string(), p))
-        .collect();
     progress.begin("writing plan pages", plan_writes.len());
     for (i, (stem, lifecycle)) in plan_writes.iter().enumerate() {
         let plan_events: Vec<LogEvent> = events
@@ -591,7 +589,10 @@ async fn build_site(
             &plan_events,
             &reviews,
             &subjects,
-            work_by_stem.get(stem.as_str()).copied(),
+            status
+                .active_plan
+                .as_ref()
+                .filter(|p| p.plan.as_str() == stem.as_str()),
         );
         std::fs::write(out_dir.join(format!("plan/{stem}.html")), page)?;
         progress.tick(i + 1);
@@ -1104,23 +1105,22 @@ fn render_index(
         esc(head_short),
         dirty
     ));
-    if !status.plans.is_empty() {
+    if let Some(p) = &status.active_plan {
         out.push_str("  <ul class=\"plan-list\">\n");
-        for p in &status.plans {
-            out.push_str(&format!(
+        out.push_str(&format!(
                 "    <li><span class=\"plan-pill\">{}</span> <span class=\"gate gate-{}\">{}</span> <span class=\"waiting\">{:?}</span></li>\n",
                 esc(p.plan.as_str()),
                 p.gate.as_str(),
                 esc(p.gate.as_str()),
                 p.waiting_on
             ));
-        }
         out.push_str("  </ul>\n");
     } else if let Some(fp) = &status.last_finished {
         out.push_str(&format!(
-            "  <div class=\"last-finished\">last finished: <span class=\"plan-pill\">{}</span> at <code>{}</code></div>\n",
+            "  <div class=\"last-finished\">last finished: <span class=\"plan-pill\">{}</span> at <code>{}</code> · duration {}</div>\n",
             esc(fp.plan.as_str()),
-            esc(short(fp.finalized_at.as_str()))
+            esc(short(fp.finalized_at.as_str())),
+            crate::age::duration(fp.duration_secs)
         ));
     } else {
         out.push_str("  <div class=\"empty\">No active plans — repo is idle.</div>\n");
@@ -1260,6 +1260,15 @@ fn render_umbrella(
             )),
         },
         UmbrellaKey::AdHoc => out.push_str("<span class=\"adhoc-label\">ad-hoc</span>"),
+    }
+    if let Some(duration) = rows.iter().find_map(|e| match e {
+        LogEvent::PlanFinalized { duration_secs, .. } => Some(*duration_secs),
+        _ => None,
+    }) {
+        out.push_str(&format!(
+            " <span class=\"duration\">· {}</span>",
+            crate::age::duration(duration)
+        ));
     }
     out.push_str("</header>\n");
     for event in rows {
@@ -1649,7 +1658,13 @@ fn render_plan_page(
             }
             bits.join(" · ")
         }
-        PlanLifecycle::Finished => "finished".to_string(),
+        PlanLifecycle::Finished => match plan_events.iter().rev().find_map(|e| match e {
+            LogEvent::PlanFinalized { duration_secs, .. } => Some(*duration_secs),
+            _ => None,
+        }) {
+            Some(duration) => format!("finished · duration {}", crate::age::duration(duration)),
+            None => "finished".to_string(),
+        },
     };
     out.push_str(&format!(
         "  <div class=\"plan-state\">{}</div>\n",
@@ -3615,7 +3630,7 @@ mod tests {
     fn render_index_stash_block_sits_above_the_queue_block() {
         use crate::cli::queue::QueueEntry;
         use crate::cli::stash::StashRecord;
-        let status = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
+        let status = crate::cli::status_tui::fixtures::snap(None, vec![]);
         let empty_events: Vec<LogEvent> = Vec::new();
         let reviews = BTreeMap::new();
         let subjects = BTreeMap::new();
@@ -3662,7 +3677,7 @@ mod tests {
     #[test]
     fn render_index_queue_block_lists_by_priority_and_hides_when_empty() {
         use crate::cli::queue::QueueEntry;
-        let status = crate::cli::status_tui::fixtures::snap(vec![], vec![]);
+        let status = crate::cli::status_tui::fixtures::snap(None, vec![]);
         let empty_events: Vec<LogEvent> = Vec::new();
         let reviews = BTreeMap::new();
         let subjects = BTreeMap::new();
