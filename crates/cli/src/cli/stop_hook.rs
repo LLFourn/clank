@@ -245,7 +245,7 @@ async fn compute_outcome_with(
         // outlived their turn.
         leave_projection(&agent_dir, plan.projection());
 
-        let (role, route) = match plan {
+        let route = match plan {
             TurnPlan::Decided(decision) => {
                 return outcome_of(&decision);
             }
@@ -274,7 +274,7 @@ async fn compute_outcome_with(
                     .await,
                 );
             }
-            TurnPlan::Drive(role, route, _) => (role, route),
+            TurnPlan::Drive(route, _) => route,
         };
 
         match route {
@@ -282,7 +282,6 @@ async fn compute_outcome_with(
                 compute_wait_outcome(
                     &repo,
                     &label,
-                    role,
                     started,
                     &live_ids,
                     deadline_action(tool),
@@ -335,9 +334,9 @@ enum TurnPlan<'a> {
     /// proof because the projection is recorded either way — the
     /// timer is what differs, not the attendance.
     AttendedYield(Proven<'a>),
-    /// Drive as this role, by this route — and say what became of an
+    /// Drive by this route — and say what became of an
     /// attendance this turn did not act on.
-    Drive(Role, TurnRoute, Attendance),
+    Drive(TurnRoute, Attendance),
 }
 
 /// What a driving turn did about an attendance it did not act on.
@@ -390,8 +389,8 @@ impl<'a> TurnPlan<'a> {
             TurnPlan::Attend(proven) | TurnPlan::AttendedYield(proven) => {
                 Projection::Attended(proven.rec)
             }
-            TurnPlan::Drive(_, _, Attendance::Declined) => Projection::Untouched,
-            TurnPlan::Decided(_) | TurnPlan::Drive(_, _, Attendance::None) => Projection::Empty,
+            TurnPlan::Drive(_, Attendance::Declined) => Projection::Untouched,
+            TurnPlan::Decided(_) | TurnPlan::Drive(_, Attendance::None) => Projection::Empty,
         }
     }
 }
@@ -402,10 +401,9 @@ impl<'a> TurnPlan<'a> {
 /// `compute_outcome_with`, so the only way to ask what a turn decides
 /// was to build a repo that reached that depth.
 fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
-    let role = match drive_gate(&ev.auto, &ev.role) {
-        Err(decision) => return TurnPlan::Decided(decision),
-        Ok(role) => role,
-    };
+    if let Err(decision) = drive_gate(&ev.auto, &ev.role) {
+        return TurnPlan::Decided(decision);
+    }
     // An attendance is a waker only where a completion wake exists.
     // For an in-hook adapter nothing delivers one, so yielding to the
     // task would be the same silence under a better name — it routes
@@ -428,7 +426,7 @@ fn decide(ev: TurnEvidence<'_>) -> TurnPlan<'_> {
             TurnPlan::AttendedYield(proven)
         };
     }
-    TurnPlan::Drive(role, route(ev.tool), declined)
+    TurnPlan::Drive(route(ev.tool), declined)
 }
 
 /// What a driving turn does next.
@@ -484,12 +482,12 @@ fn route(tool: Tool) -> TurnRoute {
 /// Each of those was a position in a run of returns, which is a thing
 /// you can only test by building a repo that reaches it.
 ///
-/// `Err` is the decision the turn ends with; `Ok` is the role it
-/// drives as.
+/// `Err` is the decision the turn ends with; `Ok` means the roster is valid
+/// at entry. The role used to present work is resolved after the wait.
 fn drive_gate(
     auto: &Result<AutoMode, String>,
     role: &Result<Role, String>,
-) -> Result<Role, TurnDecision> {
+) -> Result<(), TurnDecision> {
     match auto {
         Err(e) => return Err(TurnDecision::Failed(e.clone())),
         // The agent asked not to be driven. Diagnosing its roster
@@ -506,7 +504,9 @@ fn drive_gate(
     // So arm nothing, and SAY so. That failure cost hours of dead
     // session undiagnosable from outside; a quiet exit would rebuild
     // exactly that hole.
-    role.clone().map_err(TurnDecision::Failed)
+    role.as_ref()
+        .map(|_| ())
+        .map_err(|e| TurnDecision::Failed(e.clone()))
 }
 
 /// Which continuation model a tool's stop-hook uses — the PURE
@@ -940,7 +940,6 @@ async fn under_deadline<F: std::future::Future>(
 async fn compute_wait_outcome(
     repo: &Path,
     label: &AgentLabel,
-    role: Role,
     started: std::time::Instant,
     live_ids: &[String],
     on_deadline: DeadlineAction,
@@ -955,14 +954,34 @@ async fn compute_wait_outcome(
         let mut cmd = wait_command(&exe, repo, label, session, tool);
         Ok(OwnedWait::spawn(&mut cmd)?.run())
     };
-    let result = await_wait_under_deadline(deadline, on_deadline, arm).await;
-    if !crate::agent_store::binding_matches(repo, label, tool, session) {
+    wait_then_present(
+        await_wait_under_deadline(deadline, on_deadline, arm),
+        label,
+        live_ids,
+        || crate::agent_store::binding_matches(repo, label, tool, session),
+        || crate::agent_store::resolve_role(repo, label).map_err(|e| format!("{e:#}")),
+    )
+    .await
+}
+
+/// Finish the wait before inspecting presentation state. The closures retain
+/// identity, not snapshots: a stale binding suppresses the reply, and the
+/// decoder reads the current role only for actionable work.
+async fn wait_then_present(
+    waiting: impl std::future::Future<Output = Result<std::process::Output, HookOutcome>>,
+    label: &AgentLabel,
+    live_ids: &[String],
+    binding_matches: impl FnOnce() -> bool,
+    resolve_role: impl FnOnce() -> Result<Role, String>,
+) -> HookOutcome {
+    let result = waiting.await;
+    if !binding_matches() {
         return HookOutcome::Silent {
             why: SilentReason::StaleBinding,
         };
     }
     match result {
-        Ok(output) => outcome_from_wait_output(&output, label, role, live_ids),
+        Ok(output) => outcome_from_wait_output(&output, label, resolve_role, live_ids),
         Err(outcome) => outcome,
     }
 }
@@ -1791,15 +1810,15 @@ fn record_attended(agent_dir: &Path, rec: &Attending) {
     }
 }
 
-/// Map the finished wait's output to an outcome. Pure, so the
-/// contract can be asserted without spawning anything.
+/// Decode the finished wait's output, resolving presentation state lazily so
+/// the contract can be asserted without spawning anything.
 ///
 /// A superseded wait carries a distinct control envelope even though
 /// its process exits nonzero. Other nonzero exits are diagnostics.
 fn outcome_from_wait_output(
     output: &std::process::Output,
     label: &AgentLabel,
-    role: Role,
+    resolve_role: impl FnOnce() -> Result<Role, String>,
     live_ids: &[String],
 ) -> HookOutcome {
     if matches!(parse_wait_reply(&output.stdout), Ok(WaitReply::Superseded)) {
@@ -1819,6 +1838,17 @@ fn outcome_from_wait_output(
                 // old as the park itself. Attendance is settled at
                 // hook entry, where the evidence is fresh.
                 let kept: Vec<&WaitItem> = items.iter().collect();
+                let role = match resolve_role() {
+                    Ok(role) => role,
+                    Err(e) => {
+                        return HookOutcome::Diagnostic {
+                            message: format!(
+                                "hook: cannot resolve `{}`'s role at wake presentation: {e}",
+                                label.as_str()
+                            ),
+                        };
+                    }
+                };
                 let mut reason = render_wait_items_ref(&kept, label, role);
                 // A live task and no marker is the shape that produced
                 // a dozen identical wakes.
@@ -2760,7 +2790,7 @@ mod tests {
         outcome_from_wait_output(
             &wait_output(items),
             &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
+            || Ok(Role::Master),
             live,
         )
     }
@@ -3226,7 +3256,7 @@ mod tests {
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
+            || Ok(Role::Master),
             &["task-42".to_string()],
         );
         match out {
@@ -3252,7 +3282,7 @@ mod tests {
         let out = outcome_from_wait_output(
             &wait_output(serde_json::json!([standing_item()])),
             &AgentLabel::parse("claude").unwrap(),
-            Role::Master,
+            || Ok(Role::Master),
             &[],
         );
         match out {
@@ -3310,10 +3340,7 @@ mod tests {
         for tool in [Tool::Codex, Tool::OpenCode] {
             let plan = decide(ev(tool, false));
             assert!(
-                matches!(
-                    plan,
-                    TurnPlan::Drive(_, TurnRoute::Wait, Attendance::Declined)
-                ),
+                matches!(plan, TurnPlan::Drive(TurnRoute::Wait, Attendance::Declined)),
                 "{tool:?} must route to its own wait, not yield to the task",
             );
             // AND IT KEEPS THE MARKER. Declining is not consuming: the
@@ -3336,7 +3363,7 @@ mod tests {
             role: Ok(Role::Master),
             proven: None,
         });
-        assert!(matches!(plan, TurnPlan::Drive(_, _, Attendance::None)));
+        assert!(matches!(plan, TurnPlan::Drive(_, Attendance::None)));
         assert!(matches!(plan.projection(), Projection::Empty));
     }
 
@@ -3430,7 +3457,7 @@ mod tests {
             role: Ok(Role::Master),
             proven: None,
         }) {
-            TurnPlan::Drive(_, route, _) => Some(route),
+            TurnPlan::Drive(route, _) => Some(route),
             _ => None,
         };
         for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode, Tool::Grok] {
@@ -3460,8 +3487,8 @@ mod tests {
         let master: Result<Role, String> = Ok(Role::Master);
         let bad_role: Result<Role, String> = Err("no roster".into());
 
-        // Driving: the role comes back and nothing is decided here.
-        assert_eq!(drive_gate(&on, &master), Ok(Role::Master));
+        // Driving: roster validity is checked without retaining a role.
+        assert_eq!(drive_gate(&on, &master), Ok(()));
 
         // A config that will not parse outranks everything below it,
         // including auto-off — the read is what failed, so the mode
@@ -4227,11 +4254,169 @@ mod tests {
             stderr: Vec::new(),
         };
         assert_eq!(
-            outcome_from_wait_output(&empty, &label, Role::Master, &[]),
+            outcome_from_wait_output(&empty, &label, || panic!("no actionable work"), &[]),
             HookOutcome::Diagnostic {
                 message: "hook: non-peek wait exited successfully with no items".into()
             },
         );
+    }
+
+    #[tokio::test]
+    async fn wake_presentation_resolves_the_roster_after_controlled_completion() {
+        // Each wait is held by a channel until the roster changes. No monitor,
+        // subprocess, scheduling sleep or role snapshot participates in it.
+        for (entry_role, wake_role) in [
+            (Role::Reviewer, Some(Role::Master)),
+            (Role::Master, Some(Role::Reviewer)),
+            (Role::Master, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let config = repo.join(".clank/config.json");
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let write_roster = |role: Option<Role>| {
+                let (codex, claude) = match role {
+                    Some(Role::Master) => ("master", "commit"),
+                    Some(Role::Reviewer) => ("commit", "master"),
+                    None => ("commit", "commit"),
+                    Some(Role::Standby) => unreachable!(),
+                };
+                std::fs::write(
+                    &config,
+                    serde_json::to_vec(&serde_json::json!({"agents": {
+                        "codex": {"tool": "codex", "role": codex},
+                        "claude": {"tool": "claude", "role": claude},
+                    }}))
+                    .unwrap(),
+                )
+                .unwrap();
+            };
+            let label = AgentLabel::parse("codex").unwrap();
+            write_roster(Some(entry_role));
+            assert_eq!(
+                crate::agent_store::resolve_role(repo, &label).unwrap(),
+                entry_role
+            );
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let lookups = std::cell::Cell::new(0);
+            let binding_checks = std::cell::Cell::new(0);
+            let hook = wait_then_present(
+                async {
+                    entered_tx.send(()).unwrap();
+                    Ok(reply_rx.await.unwrap())
+                },
+                &label,
+                &[],
+                || {
+                    binding_checks.set(binding_checks.get() + 1);
+                    true
+                },
+                || {
+                    assert_eq!(binding_checks.get(), 1, "binding precedes role lookup");
+                    lookups.set(lookups.get() + 1);
+                    crate::agent_store::resolve_role(repo, &label).map_err(|e| format!("{e:#}"))
+                },
+            );
+            let change_then_complete = async {
+                entered_rx.await.unwrap();
+                assert_eq!(binding_checks.get(), 0, "binding is checked after waiting");
+                assert_eq!(
+                    lookups.get(),
+                    0,
+                    "presentation does not read before waiting"
+                );
+                write_roster(wake_role);
+                let item = if wake_role == Some(Role::Reviewer) {
+                    serde_json::json!({"kind":"reviewer","plan":"p","sha":FULL_SHA})
+                } else {
+                    standing_item()
+                };
+                reply_tx
+                    .send(wait_output(serde_json::json!([item])))
+                    .unwrap();
+            };
+            let (outcome, ()) = tokio::join!(hook, change_then_complete);
+            assert_eq!(lookups.get(), 1, "one lookup per actionable wake");
+            match (wake_role, outcome) {
+                (Some(role), HookOutcome::Continue { reason }) => assert!(
+                    reason.starts_with(&format!(
+                        "Clank wait returned work for `codex` ({}). Items:",
+                        role.as_str()
+                    )),
+                    "{reason}"
+                ),
+                (None, HookOutcome::Diagnostic { message }) => {
+                    assert!(
+                        message.contains("`codex`'s role at wake presentation"),
+                        "{message}"
+                    );
+                    assert!(message.contains("no master"), "{message}");
+                }
+                (_, other) => panic!("unexpected wake outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_binding_suppresses_work_without_reading_the_role() {
+        let label = AgentLabel::parse("codex").unwrap();
+        let outcome = wait_then_present(
+            std::future::ready(Ok(wait_output(serde_json::json!([standing_item()])))),
+            &label,
+            &[],
+            || false,
+            || panic!("stale binding must not read the roster"),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Silent {
+                why: SilentReason::StaleBinding
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_failure_keeps_its_outcome_without_reading_the_role() {
+        let label = AgentLabel::parse("codex").unwrap();
+        let failure = HookOutcome::Diagnostic {
+            message: "wait setup failed".into(),
+        };
+        assert_eq!(
+            wait_then_present(
+                std::future::ready(Err(failure.clone())),
+                &label,
+                &[],
+                || true,
+                || panic!("failed wait must not read the roster"),
+            )
+            .await,
+            failure,
+        );
+    }
+
+    #[test]
+    fn malformed_wait_output_is_diagnostic_without_reading_the_role() {
+        let label = AgentLabel::parse("codex").unwrap();
+        let mut output = wait_output(serde_json::json!([]));
+        output.stdout = b"not json".to_vec();
+        let outcome = outcome_from_wait_output(
+            &output,
+            &label,
+            || panic!("malformed reply must not read the roster"),
+            &[],
+        );
+        match outcome {
+            HookOutcome::Diagnostic { message } => {
+                assert!(
+                    message.starts_with("hook: wait stdout malformed:"),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected malformed-reply outcome: {other:?}"),
+        }
     }
 
     #[test]
@@ -4244,7 +4429,7 @@ mod tests {
         };
         let label = AgentLabel::parse("claude").unwrap();
         assert_eq!(
-            outcome_from_wait_output(&output, &label, Role::Master, &[]),
+            outcome_from_wait_output(&output, &label, || panic!("superseded wait"), &[]),
             HookOutcome::Silent {
                 why: SilentReason::StaleBinding
             }
@@ -4273,7 +4458,7 @@ mod tests {
                 role: Ok(Role::Master),
                 proven: prove_attendance(None, &input),
             }),
-            TurnPlan::Drive(Role::Master, TurnRoute::Wait, Attendance::None)
+            TurnPlan::Drive(TurnRoute::Wait, Attendance::None)
         ));
     }
 
@@ -4997,7 +5182,7 @@ mod tests {
         // Exit 2 used to mean "timed out, go quiet". It has no
         // special meaning now, so it must surface rather than be
         // swallowed as a routine idle.
-        let two = outcome_from_wait_output(&out(2, ""), &label, Role::Master, &[]);
+        let two = outcome_from_wait_output(&out(2, ""), &label, || panic!("failed wait"), &[]);
         assert!(
             matches!(two, HookOutcome::Diagnostic { .. }),
             "a non-zero wait exit must surface, got {two:?}"
@@ -5005,7 +5190,12 @@ mod tests {
 
         // A normal wait parks until it has items. Empty success is a
         // broken wait contract, so neither adapter may treat it as idle.
-        let empty = outcome_from_wait_output(&out(0, r#"{"items":[]}"#), &label, Role::Master, &[]);
+        let empty = outcome_from_wait_output(
+            &out(0, r#"{"items":[]}"#),
+            &label,
+            || panic!("no actionable work"),
+            &[],
+        );
         assert!(
             matches!(empty, HookOutcome::Diagnostic { .. }),
             "empty normal wait must surface, got {empty:?}"
