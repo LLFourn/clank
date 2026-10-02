@@ -13,6 +13,11 @@
 //! understand must be refused outright rather than compared field by
 //! field against a shape it does not have.
 
+pub mod inspect;
+
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+
 /// A process's birth identity. Compared in FULL; a prefix match is the
 /// same bug in a smaller form.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -52,17 +57,33 @@ impl ProcToken {
 /// the pid is gone, permission is denied, or the platform has no
 /// supported source.
 pub fn token_for(pid: i32) -> Option<ProcToken> {
+    read_token_for(pid).ok()
+}
+
+fn read_token_for(pid: i32) -> std::io::Result<ProcToken> {
     if pid <= 0 {
-        return None;
+        return Err(std::io::ErrorKind::InvalidInput.into());
     }
-    platform::token_for(pid)
+    platform::read_token_for(pid)
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::ProcToken;
 
-    pub(super) fn token_for(pid: i32) -> Option<ProcToken> {
+    /// libproc reports a missing PID as ESRCH. Rust's ErrorKind mapping
+    /// does not promise to classify that errno as NotFound, so give the
+    /// process boundary its explicit disappearance meaning. Other errors
+    /// (especially permission failures) retain their original semantics.
+    pub(super) fn process_read_error(error: std::io::Error) -> std::io::Error {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            std::io::Error::new(std::io::ErrorKind::NotFound, error)
+        } else {
+            error
+        }
+    }
+
+    pub(super) fn bsd_info(pid: i32) -> std::io::Result<libc::proc_bsdinfo> {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         // SAFETY: `info` is a correctly sized, zeroed proc_bsdinfo and
@@ -76,10 +97,41 @@ mod platform {
                 size,
             )
         };
-        (n == size).then_some(ProcToken::MacStart {
+        if n != size {
+            return Err(if n <= 0 {
+                process_read_error(std::io::Error::last_os_error())
+            } else {
+                std::io::ErrorKind::InvalidData.into()
+            });
+        }
+        Ok(info)
+    }
+
+    pub(super) fn read_token_for(pid: i32) -> std::io::Result<ProcToken> {
+        let info = bsd_info(pid)?;
+        Ok(ProcToken::MacStart {
             sec: info.pbi_start_tvsec,
             usec: info.pbi_start_tvusec,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn raw_esrch_means_a_missing_process_without_reclassifying_other_errors() {
+            let error = process_read_error(std::io::Error::from_raw_os_error(libc::ESRCH));
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::EIO] {
+                let original = std::io::Error::from_raw_os_error(errno);
+                let kind = original.kind();
+                let error = process_read_error(original);
+                assert_eq!(error.raw_os_error(), Some(errno));
+                assert_eq!(error.kind(), kind);
+                assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+            }
+        }
     }
 }
 
@@ -87,21 +139,22 @@ mod platform {
 mod platform {
     use super::ProcToken;
 
-    pub(super) fn token_for(pid: i32) -> Option<ProcToken> {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // Field 2 is the comm, parenthesised and free to contain
-        // spaces or ')' — so fields are counted from AFTER the last
-        // ')', never by splitting the whole line.
-        let rest = &stat[stat.rfind(')')? + 1..];
-        // starttime is field 22; two fields precede it in `rest`
-        // (the empty split before ' ' and state), so it is index 20
-        // once `rest` is split on whitespace.
-        let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()?
-            .trim()
-            .to_string();
-        (!boot.is_empty()).then_some(ProcToken::LinuxStart { ticks, boot })
+    pub(super) fn read_token_for(pid: i32) -> std::io::Result<ProcToken> {
+        let stat = super::linux::read_stat(pid)?;
+        let bytes = super::linux::read_bounded(
+            std::fs::File::open("/proc/sys/kernel/random/boot_id")?,
+            128,
+        )?;
+        let boot = std::str::from_utf8(&bytes)
+            .map_err(|_| std::io::ErrorKind::InvalidData)?
+            .trim();
+        if boot.is_empty() {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(ProcToken::LinuxStart {
+            ticks: stat.ticks,
+            boot: boot.into(),
+        })
     }
 }
 
@@ -111,8 +164,8 @@ mod platform {
 
     /// No supported source: everything that consults a token treats
     /// `None` as "cannot identify", which refuses rather than guesses.
-    pub(super) fn token_for(_pid: i32) -> Option<ProcToken> {
-        None
+    pub(super) fn read_token_for(_pid: i32) -> std::io::Result<ProcToken> {
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 

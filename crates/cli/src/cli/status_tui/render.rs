@@ -183,7 +183,20 @@ pub(super) fn render_at(
             .and_then(|a| a.attending.as_ref().map(|t| (a, t)))
     {
         let actions = wait_actions(att.killable_pid().is_some());
-        return render_wait_page(&a.label, att, &actions, sel, rows, cols);
+        let process = view
+            .wait_process
+            .filter(|slot| slot.request.page.matches(&a.label, att));
+        return render_wait_page(
+            &a.label,
+            att,
+            process.map(|slot| &slot.state),
+            process.and_then(|slot| slot.command.as_deref()),
+            view.wait_scroll,
+            &actions,
+            sel,
+            rows,
+            cols,
+        );
     }
     if let Mode::PriorityPage { value } = mode {
         let stem = view.plan_page.map(|p| p.stem.as_str()).unwrap_or("");
@@ -1703,68 +1716,253 @@ pub(super) fn render_candidate_screen(
 pub(super) fn render_wait_page(
     label: &str,
     att: &crate::cli::stop_hook::Attended,
+    process: Option<&super::wait_process::State>,
+    command: Option<&super::wait_detail::Command>,
+    scroll: usize,
     actions: &[WaitAction],
     sel: usize,
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
-    let mut out: Vec<String> = Vec::new();
-    out.push(region_rule(&format!("wait · {label}"), "", true, cols));
-    out.push(String::new());
-
-    let field = |name: &str, value: String| {
-        emit(
-            &[dim(format!("   {name:<11}")), plain(one_line(&value, cols))],
-            "",
-            cols,
-        )
-    };
-    out.push(field("doing", att.subject().to_string()));
-    out.push(field("task", att.task.clone()));
-    out.push(field(
-        "started",
-        att.age(time::OffsetDateTime::now_utc())
-            .map(|a| format!("{a} ago"))
-            .unwrap_or_else(|| "unknown".to_string()),
-    ));
-    out.push(field(
+    use super::{wait_detail, wait_process::State};
+    use crate::proc_identity::inspect::Inspection;
+    let mut body = Vec::new();
+    // Command gets the FIRST fact row, including in a small viewport.
+    let value_cols = if cols >= 24 { cols - 13 } else { cols };
+    let preview = command
+        .map(|c| c.middle(value_cols))
+        .unwrap_or_else(|| wait_command_unknown(process));
+    if command.is_some() {
+        // Preserve spaces within quoted arguments; word wrapping would
+        // silently change even a command that fits without elision.
+        if cols >= 24 {
+            body.push(emit(
+                &[dim(format!(" {:<12}", "command")), plain(&preview)],
+                "",
+                cols,
+            ));
+        } else {
+            body.push(emit(&[dim("command")], "", cols));
+            body.push(emit(&[plain(&preview)], "", cols));
+        }
+    } else {
+        push_wait_field(&mut body, "command", &preview, cols);
+    }
+    push_wait_field(
+        &mut body,
         "process",
-        match (att.pid, att.process_alive()) {
-            (Some(pid), Some(true)) => format!("pid {pid}, running"),
-            (Some(pid), Some(false)) => format!("pid {pid}, ended"),
-            (Some(pid), None) => format!("pid {pid}"),
-            (None, _) => "not recorded".to_string(),
-        },
-    ));
-
-    // Why the kill row is absent, when it is. The page says it rather
-    // than showing a control that cannot work.
-    if let Some(why) = att.kill_blocker() {
-        out.push(String::new());
-        for line in wrap(
-            &format!("cannot stop it: {why}"),
-            cols.saturating_sub(3).max(1),
-        ) {
-            out.push(emit(&[dim(format!("   {line}"))], "", cols));
+        &wait_process_summary(att, process),
+        cols,
+    );
+    if let Some(State::Ready(Inspection::Verified(details))) = process {
+        push_wait_field(&mut body, "born", &wait_detail::birth(&details.birth), cols);
+        let relation = |field: Result<i32, crate::proc_identity::inspect::Unavailable>| match field
+        {
+            Ok(0) => "none (OS reported 0)".into(),
+            Ok(pid) => format!("{pid}"),
+            Err(why) => format!("unknown ({})", wait_detail::unavailable(why)),
+        };
+        push_wait_field(&mut body, "parent PID", &relation(details.parent), cols);
+        push_wait_field(&mut body, "group", &relation(details.group), cols);
+    } else {
+        let why = wait_command_unknown(process);
+        for name in ["born", "parent PID", "group"] {
+            push_wait_field(&mut body, name, &why, cols);
         }
     }
-
-    out.push(String::new());
-    for (i, a) in actions.iter().enumerate() {
-        let (glyph, text, danger) = match a {
-            WaitAction::Kill => ("✗", "stop this process", true),
-            WaitAction::Back => ("‹", "back", false),
-        };
-        let spans = vec![if danger {
-            colored("31", format!("   {glyph} {text}"))
-        } else {
-            plain(format!("   {glyph} {text}"))
-        }];
-        out.push(row_line(&spans, sel == i, "", cols));
+    push_wait_field(
+        &mut body,
+        "doing",
+        &wait_detail::safe_text(att.subject()),
+        cols,
+    );
+    push_wait_field(&mut body, "task", &wait_detail::safe_text(&att.task), cols);
+    push_wait_field(
+        &mut body,
+        "wait age",
+        &att.age(time::OffsetDateTime::now_utc())
+            .map(|age| format!("{age} ago"))
+            .unwrap_or_else(|| "unknown (wait timestamp unavailable)".into()),
+        cols,
+    );
+    if let Some(why) = att.kill_blocker() {
+        push_wait_field(
+            &mut body,
+            "cannot stop",
+            &format!("cannot stop it: {why}"),
+            cols,
+        );
     }
-    let len = out.len();
-    out.truncate(rows);
-    (out, len)
+    let total = body.len();
+    if rows == 0 {
+        return (Vec::new(), total);
+    }
+    // Reserve the action rows BEFORE spending rows on facts. At one row,
+    // display the selected action; ↑↓ still reaches every other action.
+    let selected = sel.min(actions.len().saturating_sub(1));
+    let budget = wait_page_budget(rows, actions.len());
+    let (menu_rows, title_rows, hint_rows, capacity) =
+        (budget.menu, budget.title, budget.hint, budget.body);
+    let offset = scroll.min(total.saturating_sub(capacity.max(1)));
+    let mut out = Vec::new();
+    if title_rows != 0 {
+        out.push(region_rule(
+            &format!("wait · {}", wait_detail::safe_text(label)),
+            "",
+            true,
+            cols,
+        ));
+    }
+    out.extend(body.into_iter().skip(offset).take(capacity));
+    let menu_start = if menu_rows < actions.len() {
+        selected
+    } else {
+        0
+    };
+    for (index, action) in actions.iter().enumerate().skip(menu_start).take(menu_rows) {
+        let (long, short, danger) = match action {
+            WaitAction::Kill => ("stop this process", "stop", true),
+            WaitAction::Back => ("back", "back", false),
+        };
+        let text = if cols >= 22 { long } else { short };
+        let span = if danger {
+            colored("31", format!(" {text}"))
+        } else {
+            plain(format!(" {text}"))
+        };
+        out.push(row_line(&[span], index == selected, "", cols));
+    }
+    if hint_rows != 0 {
+        let hint = if cols >= 45 {
+            "c command · r refresh details · PgUp/PgDn"
+        } else {
+            "c cmd · r refresh · PgDn"
+        };
+        out.push(emit(&[dim(hint)], "", cols));
+    }
+    (out, total)
+}
+
+pub(super) struct WaitPageBudget {
+    menu: usize,
+    title: usize,
+    hint: usize,
+    pub(super) body: usize,
+}
+
+pub(super) fn wait_page_budget(rows: usize, actions: usize) -> WaitPageBudget {
+    let menu = actions.min(if rows <= 3 { rows.min(1) } else { rows });
+    let remaining = rows.saturating_sub(menu);
+    let title = usize::from(remaining >= 3);
+    let hint = usize::from(remaining >= 4);
+    WaitPageBudget {
+        menu,
+        title,
+        hint,
+        body: remaining - title - hint,
+    }
+}
+
+fn push_wait_field(body: &mut Vec<String>, name: &str, value: &str, cols: usize) {
+    if cols >= 24 {
+        let lines = wrap(value, cols - 13);
+        for (index, line) in lines.iter().enumerate() {
+            let label = if index == 0 {
+                format!(" {name:<12}")
+            } else {
+                " ".repeat(13)
+            };
+            body.push(emit(&[dim(label), plain(line)], "", cols));
+        }
+    } else {
+        body.push(emit(&[dim(name)], "", cols));
+        body.extend(
+            wrap(value, cols.max(1))
+                .iter()
+                .map(|line| emit(&[plain(line)], "", cols)),
+        );
+    }
+}
+
+pub(super) fn wait_command_unknown(process: Option<&super::wait_process::State>) -> String {
+    use super::{wait_detail, wait_process::State};
+    use crate::proc_identity::inspect::Inspection;
+    let reason = match process {
+        Some(State::Loading) => "inspection in progress",
+        Some(State::NoPid) => "no recorded PID",
+        Some(State::NoToken) => "no recorded process identity",
+        Some(State::Ready(Inspection::Ended)) => "recorded process ended",
+        Some(State::Ready(Inspection::Mismatched)) => "recorded process replaced",
+        Some(State::Ready(Inspection::Unavailable(why))) => wait_detail::unavailable(*why),
+        Some(State::Ready(Inspection::Verified(details))) => match &details.argv {
+            Err(why) => wait_detail::unavailable(*why),
+            Ok(_) => "command unavailable",
+        },
+        None => "details unavailable",
+    };
+    format!("unknown ({reason})")
+}
+
+/// Byte-windowed full argv: no re-encoding, rewrap or full-command clone.
+/// The immutable observation remains the same while the reader scrolls.
+pub(super) fn render_wait_command(
+    command: &super::wait_detail::Command,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if rows >= 3 {
+        out.push(region_rule(
+            "command · escaped argv",
+            "esc back",
+            true,
+            cols,
+        ));
+    }
+    let capacity = rows.saturating_sub(out.len());
+    let mut offset = offset.min(command.text.len());
+    for _ in 0..capacity {
+        let (line, next) = command.line(offset, cols);
+        if next == offset {
+            break;
+        }
+        out.push(emit(&[plain(line)], "", cols));
+        offset = next;
+    }
+    out
+}
+
+/// Fixed-time observations only; this never performs process inspection.
+fn wait_process_summary(
+    att: &crate::cli::stop_hook::Attended,
+    process: Option<&super::wait_process::State>,
+) -> String {
+    use super::wait_process::State;
+    use crate::proc_identity::inspect::Inspection;
+    let pid = att
+        .pid
+        .map(|pid| format!("pid {pid}"))
+        .unwrap_or_else(|| "not recorded".into());
+    match process {
+        Some(State::Loading) => format!("{pid} · checking details"),
+        Some(State::NoPid) => "not recorded".into(),
+        Some(State::NoToken) => format!("{pid} · identity not recorded"),
+        Some(State::Ready(Inspection::Ended)) => format!("{pid} · ended (observed)"),
+        Some(State::Ready(Inspection::Mismatched)) => format!("{pid} · recorded process replaced"),
+        Some(State::Ready(Inspection::Unavailable(_))) => format!("{pid} · details unavailable"),
+        Some(State::Ready(Inspection::Verified(details))) => {
+            let state = super::wait_detail::state(details.state);
+            let at = details.observed_at;
+            format!(
+                "{pid} · {state} · observed {:02}:{:02}:{:02} UTC",
+                at.hour(),
+                at.minute(),
+                at.second()
+            )
+        }
+        None => format!("{pid} · state unknown (not inspected)"),
+    }
 }
 
 /// The remote page: the switch and its state, the two ways in while
@@ -4955,6 +5153,8 @@ mod tests {
                             commit_page: None,
                             event_page: None,
                             wait_page: None,
+                            wait_process: None,
+                            wait_scroll: 0,
                             seen_session: None,
                             clear_target: None,
                             plan_input: None,
@@ -5000,6 +5200,8 @@ mod tests {
             commit_page: None,
             event_page: None,
             wait_page: None,
+            wait_process: None,
+            wait_scroll: 0,
             seen_session: None,
             clear_target: None,
             plan_input: None,
@@ -5220,6 +5422,8 @@ mod tests {
             commit_page: None,
             event_page: None,
             wait_page: None,
+            wait_process: None,
+            wait_scroll: 0,
             seen_session: None,
             clear_target: None,
             plan_input: None,
@@ -6850,6 +7054,8 @@ mod tests {
                 commit_page: None,
                 event_page: None,
                 wait_page: None,
+                wait_process: None,
+                wait_scroll: 0,
                 seen_session: None,
                 clear_target: None,
                 plan_input: None,
@@ -6903,6 +7109,8 @@ mod tests {
             commit_page: None,
             event_page: None,
             wait_page: None,
+            wait_process: None,
+            wait_scroll: 0,
             seen_session: None,
             clear_target: None,
             plan_input: None,
@@ -7006,6 +7214,8 @@ mod tests {
                 commit_page: None,
                 event_page: None,
                 wait_page: None,
+                wait_process: None,
+                wait_scroll: 0,
                 seen_session: None,
                 clear_target: None,
                 plan_input: None,
@@ -7421,6 +7631,8 @@ mod tests {
             commit_page: None,
             event_page: None,
             wait_page: None,
+            wait_process: None,
+            wait_scroll: 0,
             seen_session: None,
             clear_target: None,
             plan_input: None,
@@ -8968,7 +9180,7 @@ mod tests {
         let me = std::process::id() as i32;
         let body = |a: &crate::cli::stop_hook::Attended| {
             let actions = wait_actions(a.killable_pid().is_some());
-            render_wait_page("claude", a, &actions, 0, 40, 80)
+            render_wait_page("claude", a, None, None, 0, &actions, 0, 40, 80)
                 .0
                 .iter()
                 .map(|l| visible(l))
@@ -8982,7 +9194,11 @@ mod tests {
 
         let no_token = body(&att(Some(me), None));
         assert!(
-            no_token.contains("before clank identified processes"),
+            no_token
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("before clank identified processes"),
             "{no_token}"
         );
 
@@ -9004,6 +9220,219 @@ mod tests {
         let live = body(&att(Some(me), crate::proc_identity::token_for(me)));
         assert!(live.contains("stop this process"), "{live}");
         assert!(!live.contains("cannot stop it"), "{live}");
+    }
+
+    #[test]
+    fn wait_process_observations_are_fixed_and_partial_errors_keep_the_stop_action() {
+        use super::super::wait_process::State;
+        use crate::proc_identity::inspect::{
+            Inspection, ProcessDetails, ProcessState, Unavailable,
+        };
+        let pid = std::process::id() as i32;
+        let birth = crate::proc_identity::token_for(pid).unwrap();
+        let att = crate::cli::stop_hook::Attended {
+            expect: None,
+            task: "task".into(),
+            desc: Some("test run".into()),
+            pid: Some(pid),
+            token: Some(birth.clone()),
+            at: "2026-10-03T00:00:00Z".into(),
+        };
+        let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
+        let details = ProcessDetails {
+            pid,
+            birth,
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            argv: Err(error),
+            state: Ok(ProcessState::Sleeping),
+            parent: Err(error),
+            group: Err(error),
+        };
+        let ready = State::Ready(Inspection::Verified(details));
+        let summary = wait_process_summary(&att, Some(&ready));
+        assert!(summary.contains("sleeping"));
+        assert!(summary.contains("observed 00:00:00 UTC"));
+        let actions = wait_actions(att.killable_pid().is_some());
+        for state in [
+            ready,
+            State::Ready(Inspection::Unavailable(error)),
+            State::Loading,
+        ] {
+            let body = render_wait_page(
+                "reviewer",
+                &att,
+                Some(&state),
+                None,
+                0,
+                &actions,
+                0,
+                40,
+                100,
+            )
+            .0
+            .iter()
+            .map(|line| visible(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(body.contains("stop this process"), "{body}");
+            assert!(body.contains("r refresh details"), "{body}");
+        }
+    }
+
+    #[test]
+    fn wait_detail_actions_and_full_command_remain_reachable_in_short_narrow_panes() {
+        use super::super::wait_detail::Command;
+        use super::super::wait_process::State;
+        use crate::proc_identity::inspect::{Inspection, ProcessDetails, ProcessState};
+        let pid = std::process::id() as i32;
+        let token = crate::proc_identity::token_for(pid).unwrap();
+        let att = crate::cli::stop_hook::Attended {
+            expect: None,
+            task: "task".into(),
+            desc: Some("wait\x1b]52;unsafe\x07".into()),
+            pid: Some(pid),
+            token: Some(token.clone()),
+            at: "2026-10-03T00:00:00Z".into(),
+        };
+        let args = vec![
+            format!("/{}界/tool", "directory/".repeat(30)).into(),
+            "--agent".into(),
+            "reviewer".into(),
+            "two  spaces".into(),
+            "".into(),
+        ];
+        let command = Command::encode(&args);
+        let state = State::Ready(Inspection::Verified(ProcessDetails {
+            pid,
+            birth: token,
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            argv: Ok(args),
+            state: Ok(ProcessState::Sleeping),
+            parent: Ok(7),
+            group: Ok(8),
+        }));
+        let actions = wait_actions(true);
+        for cols in [8, 12, 23, 24, 40, 80, 120] {
+            for rows in [1, 2, 3, 4, 5, 8, 20, 40] {
+                for sel in 0..actions.len() {
+                    let (lines, total) = render_wait_page(
+                        "reviewer",
+                        &att,
+                        Some(&state),
+                        Some(&command),
+                        usize::MAX,
+                        &actions,
+                        sel,
+                        rows,
+                        cols,
+                    );
+                    assert!(lines.len() <= rows);
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|line| display_width(&visible(line)) <= cols)
+                    );
+                    let shown = lines
+                        .iter()
+                        .map(|line| visible(line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let selected = if sel == 0 { "stop" } else { "back" };
+                    assert!(shown.contains(selected), "{rows}x{cols}: {shown}");
+                    assert!(total > 0);
+                    // The separate full-command document is reachable via c,
+                    // has no action obstruction and preserves every byte.
+                    let mut offset = 0;
+                    let mut reconstructed = String::new();
+                    while offset < command.text.len() {
+                        let (line, next) = command.line(offset, cols);
+                        reconstructed.push_str(line);
+                        offset = next;
+                    }
+                    assert_eq!(reconstructed, command.text);
+                    assert!(
+                        render_wait_command(&command, command.tail(rows, cols), rows, cols).len()
+                            <= rows
+                    );
+                }
+            }
+        }
+        let body = render_wait_page(
+            "reviewer",
+            &att,
+            Some(&state),
+            Some(&command),
+            0,
+            &actions,
+            0,
+            40,
+            120,
+        )
+        .0
+        .iter()
+        .map(|line| visible(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(body.contains("born"));
+        assert!(body.contains("parent PID"));
+        assert!(body.contains("group"));
+        assert!(body.contains("wait age"));
+        assert!(!body.contains("\x1b]52"));
+    }
+
+    #[test]
+    fn wait_detail_preview_keeps_spaces_and_unknown_fields_are_explicit() {
+        use super::super::{wait_detail::Command, wait_process::State};
+        use crate::proc_identity::inspect::{
+            Inspection, ProcessDetails, ProcessState, Unavailable,
+        };
+        let pid = std::process::id() as i32;
+        let token = crate::proc_identity::token_for(pid).unwrap();
+        let att = crate::cli::stop_hook::Attended {
+            expect: None,
+            task: "task".into(),
+            desc: None,
+            pid: Some(pid),
+            token: Some(token.clone()),
+            at: "bad".into(),
+        };
+        let command = Command::encode(&["tool".into(), "two  spaces".into(), "".into()]);
+        let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
+        let state = State::Ready(Inspection::Verified(ProcessDetails {
+            pid,
+            birth: token,
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            argv: Err(error),
+            state: Ok(ProcessState::Zombie),
+            parent: Err(error),
+            group: Ok(0),
+        }));
+        let actions = wait_actions(true);
+        let body = render_wait_page(
+            "reviewer",
+            &att,
+            Some(&state),
+            Some(&command),
+            0,
+            &actions,
+            0,
+            40,
+            100,
+        )
+        .0
+        .iter()
+        .map(|line| visible(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(body.contains("tool \"two  spaces\" \"\""));
+        assert!(body.contains("unknown (permission denied)"));
+        assert!(body.contains("none (OS reported 0)"));
+        assert!(body.contains("zombie"));
+        assert!(body.contains("stop this process"));
+        assert_eq!(
+            wait_command_unknown(Some(&state)),
+            "unknown (permission denied)"
+        );
     }
 
     /// The confirm names the blast radius rather than implying a clean

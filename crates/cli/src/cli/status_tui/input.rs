@@ -800,9 +800,6 @@ pub(super) enum DetailNav {
     MoveCursor(usize),
     /// Activate the action under the cursor.
     Activate(DetailAction),
-    /// The wait page's kill row — routed to a confirm, never straight
-    /// to a signal.
-    ActivateKill,
 }
 
 /// What the panel cursor was ON, by IDENTITY rather than position.
@@ -963,17 +960,37 @@ pub(super) fn wait_actions(killable: bool) -> Vec<WaitAction> {
     }
 }
 
-pub(super) fn wait_page_nav(sel: usize, actions: &[WaitAction], key: Key) -> DetailNav {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitNav {
+    Quit,
+    Back,
+    MoveCursor(usize),
+    Kill,
+    Refresh,
+    FullCommand,
+    Scroll(i32),
+    Top,
+    Bottom,
+    None,
+}
+
+pub(super) fn wait_page_nav(sel: usize, actions: &[WaitAction], key: Key) -> WaitNav {
     match key {
-        Key::Quit => DetailNav::Quit,
-        Key::Escape | Key::Focus | Key::Char(b'a') => DetailNav::Back,
-        Key::Up => DetailNav::MoveCursor(move_selection(sel, actions.len(), false)),
-        Key::Down => DetailNav::MoveCursor(move_selection(sel, actions.len(), true)),
+        Key::Quit => WaitNav::Quit,
+        Key::Escape | Key::Focus | Key::Char(b'a') => WaitNav::Back,
+        Key::Char(b'r') => WaitNav::Refresh,
+        Key::Char(b'c') => WaitNav::FullCommand,
+        Key::PageUp => WaitNav::Scroll(-1),
+        Key::PageDown | Key::Space => WaitNav::Scroll(1),
+        Key::Top => WaitNav::Top,
+        Key::Bottom => WaitNav::Bottom,
+        Key::Up => WaitNav::MoveCursor(move_selection(sel, actions.len(), false)),
+        Key::Down => WaitNav::MoveCursor(move_selection(sel, actions.len(), true)),
         Key::Enter => match actions.get(sel) {
-            Some(WaitAction::Kill) => DetailNav::ActivateKill,
-            _ => DetailNav::Back,
+            Some(WaitAction::Kill) => WaitNav::Kill,
+            _ => WaitNav::Back,
         },
-        _ => DetailNav::None,
+        _ => WaitNav::None,
     }
 }
 
@@ -1456,13 +1473,29 @@ pub(super) struct WaitPage {
     pub(super) task: String,
     /// Per-record, so a replacement is a DIFFERENT instance.
     pub(super) at: String,
+    pub(super) pid: Option<i32>,
+    pub(super) token: Option<crate::proc_identity::ProcToken>,
 }
 
 impl WaitPage {
+    pub(super) fn new(label: &str, att: &crate::cli::stop_hook::Attended) -> Self {
+        Self {
+            label: label.to_string(),
+            task: att.task.clone(),
+            at: att.at.clone(),
+            pid: att.pid,
+            token: att.token.clone(),
+        }
+    }
+
     /// Is this still the same attendance? Compared in full — agent,
-    /// task and instance.
+    /// task, instance, PID and full recorded birth token.
     pub(super) fn matches(&self, label: &str, att: &crate::cli::stop_hook::Attended) -> bool {
-        self.label == label && self.task == att.task && self.at == att.at
+        self.label == label
+            && self.task == att.task
+            && self.at == att.at
+            && self.pid == att.pid
+            && self.token == att.token
     }
 }
 
@@ -2017,6 +2050,8 @@ pub(super) struct PanelView<'a> {
     pub(super) commit_page: Option<&'a CommitPage>,
     pub(super) event_page: Option<&'a EventPage>,
     pub(super) wait_page: Option<&'a WaitPage>,
+    pub(super) wait_process: Option<&'a super::wait_process::Slot>,
+    pub(super) wait_scroll: usize,
     pub(super) seen_session: Option<&'a SeenSession>,
     pub(super) clear_target: Option<&'a ClearTarget>,
     pub(super) plan_input: Option<&'a TextInput>,
@@ -2062,6 +2097,8 @@ impl<'a> PanelView<'a> {
             commit_page: None,
             event_page: None,
             wait_page: None,
+            wait_process: None,
+            wait_scroll: 0,
             seen_session: None,
             clear_target: None,
             plan_input: None,
@@ -3979,11 +4016,27 @@ mod tests {
         // can never reach the kill.
         assert_eq!(
             wait_page_nav(0, &wait_actions(false), Key::Enter),
-            DetailNav::Back
+            WaitNav::Back
         );
         assert_eq!(
             wait_page_nav(0, &wait_actions(true), Key::Enter),
-            DetailNav::ActivateKill
+            WaitNav::Kill
+        );
+        assert_eq!(
+            wait_page_nav(0, &wait_actions(true), Key::Char(b'r')),
+            WaitNav::Refresh
+        );
+        assert_eq!(
+            wait_page_nav(0, &wait_actions(true), Key::Char(b'c')),
+            WaitNav::FullCommand
+        );
+        assert_eq!(
+            wait_page_nav(0, &wait_actions(true), Key::PageDown),
+            WaitNav::Scroll(1)
+        );
+        assert_eq!(
+            wait_page_nav(0, &wait_actions(true), Key::PageUp),
+            WaitNav::Scroll(-1)
         );
     }
 

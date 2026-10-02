@@ -35,6 +35,8 @@ use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_status_paths
 mod event_content;
 pub(crate) mod lease;
 pub(crate) mod text;
+mod wait_detail;
+mod wait_process;
 // Re-export for `open_zellij`'s tab/pane renamer, which strips the same
 // stale lamp prefix. (The IO shell itself uses no text primitives — the
 // view modules do.)
@@ -80,6 +82,9 @@ enum Ev {
         target: clank_core::wait::ContentRef,
         state: event_content::ContentState,
     },
+    /// One bounded process read completed; the request carries the full
+    /// attendance/process identity and generation needed to reject stragglers.
+    Process(wait_process::Completion),
     /// A raw stdin chunk. Parsed AT THE LOOP, not in the reader
     /// thread: bytes → keys is interpretation and the interpretation
     /// is mode-scoped — an open text input reads the letters
@@ -134,7 +139,7 @@ fn row_position(
 /// Where the open wait page's attendance lives NOW in the roster, or
 /// `None` if that attendance is gone.
 ///
-/// Located by INSTANCE — agent label, task and `at` — never by the
+/// Located by INSTANCE — agent label, task, `at`, PID and birth — never by the
 /// index it had when the page opened. A roster edit reorders the list
 /// under the cursor, and this repo has already paid once for trusting
 /// an index across a refresh.
@@ -148,6 +153,63 @@ fn relocate_wait(
                 .as_ref()
                 .is_some_and(|att| page.matches(&a.label, att))
     })
+}
+
+/// Snapshot refresh and repaint only retain or invalidate a request; they
+/// NEVER request another inspection. Reordering relocates the same instance.
+fn reconcile_wait_process(
+    mode: &mut Mode,
+    page: &mut Option<WaitPage>,
+    agents: &[crate::cli::status::AgentAutoRow],
+    process: &mut wait_process::Controller,
+) {
+    if !matches!(
+        mode,
+        Mode::WaitDetail { .. }
+            | Mode::Confirm {
+                action: ConfirmAction::KillAttended
+            }
+    ) {
+        *page = None;
+        process.close();
+        return;
+    }
+    match page.as_ref().and_then(|p| relocate_wait(p, agents)) {
+        Some(agent) => {
+            if let Mode::WaitDetail { sel, .. } = *mode {
+                *mode = Mode::WaitDetail { agent, sel };
+            }
+        }
+        None => {
+            *page = None;
+            process.close();
+            *mode = Mode::AgentPanel { sel: 0 };
+        }
+    }
+}
+
+fn pump_wait_process(process: &mut wait_process::Controller, tx: &mpsc::Sender<Ev>) {
+    let Some(request) = process.take_job() else {
+        return;
+    };
+    let wake = tx.clone();
+    if let Err(error) = wait_process::spawn(
+        request.clone(),
+        crate::proc_identity::inspect::inspect,
+        move |completion| {
+            let _ = wake.send(Ev::Process(completion));
+        },
+    ) {
+        // Thread creation failed: release the reservation and report an
+        // unavailable observation. No retry or render-loop native read.
+        process.complete(wait_process::Completion {
+            command: None,
+            request,
+            inspection: crate::proc_identity::inspect::Inspection::Unavailable(
+                crate::proc_identity::inspect::Unavailable::Io(error.kind()),
+            ),
+        });
+    }
 }
 
 /// The pid a confirmed kill may signal, or why it may not.
@@ -1474,6 +1536,9 @@ fn initial_mode(snapshot: &StatusSnapshot) -> Mode {
 /// background `Refresh`: each is a moment or a fixed text, and objects
 /// that change under the reader are pages (every-object-in-the-tui-has-a-page).
 enum OverlayData {
+    /// Escaped argv retained by Arc from the accepted observation. Rendering
+    /// and scrolling visit only visible bytes, even for large commands.
+    Command(std::sync::Arc<wait_detail::Command>),
     /// A failed action's error text (no re-fetch identity — the error
     /// is a moment, not a live document; Refresh leaves it as-is).
     Error { title: String, message: String },
@@ -2551,6 +2616,7 @@ struct Batch {
         clank_core::wait::ContentRef,
         event_content::ContentState,
     )>,
+    process: Vec<wait_process::Completion>,
 }
 
 /// What one event arriving BEHIND an overlay owes the page beneath.
@@ -2581,7 +2647,9 @@ fn behind_overlay(ev: &Ev) -> BehindOverlay {
             refresh: false,
             fill: true,
         },
-        Ev::Stdin(_) | Ev::Content { .. } | Ev::Worker | Ev::Remote => BehindOverlay::default(),
+        Ev::Stdin(_) | Ev::Content { .. } | Ev::Process(_) | Ev::Worker | Ev::Remote => {
+            BehindOverlay::default()
+        }
     }
 }
 
@@ -2595,6 +2663,7 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
         refresh: false,
         resize: false,
         content: Vec::new(),
+        process: Vec::new(),
     };
     for ev in events {
         match ev {
@@ -2608,6 +2677,7 @@ fn coalesce(events: impl IntoIterator<Item = Ev>) -> Batch {
                 target,
                 state,
             } => b.content.push((generation, target, state)),
+            Ev::Process(completion) => b.process.push(completion),
             Ev::Worker | Ev::Remote => {}
         }
     }
@@ -2730,9 +2800,9 @@ pub(crate) async fn run_tui(
             }
         });
     }
-    // Kept for the content fetches spawned later; the stdin reader
+    // Kept for body fetches and process observations; the stdin reader
     // takes its own clone rather than the original.
-    let ev_tx_content = ev_tx.clone();
+    let ev_tx_async = ev_tx.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 16];
         loop {
@@ -2797,6 +2867,8 @@ pub(crate) async fn run_tui(
     // ⟺ mode is `EventDetail` (set/cleared together, like plan_page).
     let mut event_page: Option<EventPage> = None;
     let mut wait_page: Option<crate::cli::status_tui::input::WaitPage> = None;
+    let mut wait_process = wait_process::Controller::default();
+    let mut wait_scroll: usize = 0;
     let mut seen_session: Option<crate::cli::status_tui::input::SeenSession> = None;
     let mut clear_target: Option<crate::cli::status_tui::input::ClearTarget> = None;
     // Monotonic across the whole session: every request the page makes
@@ -2835,6 +2907,13 @@ pub(crate) async fn run_tui(
     // Labeled so a `Quit` key inside the per-key drain loop exits the
     // event loop, not just the inner `for`.
     'evloop: loop {
+        reconcile_wait_process(
+            &mut mode,
+            &mut wait_page,
+            &snapshot.agents,
+            &mut wait_process,
+        );
+        pump_wait_process(&mut wait_process, &ev_tx_async);
         for (label, answer) in web_reopen_rx.try_iter() {
             reopen_pending.push_back((label.clone(), Some(answer)));
             reconcile_worker.reopen(&label);
@@ -2870,6 +2949,10 @@ pub(crate) async fn run_tui(
             // that must come back to unpaint it are one decision.
             let hint = hint_at(overlay.copied, std::time::Instant::now());
             let (lines, total) = match &overlay.data {
+                OverlayData::Command(command) => (
+                    render_wait_command(command, overlay.offset, rows as usize, cols as usize),
+                    0,
+                ),
                 OverlayData::Info { title, body } => {
                     render_info_doc(title, body, overlay.offset, rows as usize, cols as usize)
                 }
@@ -2925,12 +3008,34 @@ pub(crate) async fn run_tui(
                 }
                 Ok(Ev::Stdin(bytes)) => {
                     for k in parse_keys(&bytes) {
+                        if let Some(d) = detail.as_mut()
+                            && let OverlayData::Command(command) = &d.data
+                        {
+                            match k {
+                                Key::Top => {
+                                    d.offset = 0;
+                                    continue;
+                                }
+                                Key::Bottom => {
+                                    d.offset = command.tail(
+                                        (rows as usize).saturating_sub(1).max(1),
+                                        cols as usize,
+                                    );
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         match doc_nav(k, page) {
                             DocNav::Back => detail = None,
                             DocNav::Scroll(delta) => {
                                 let max_off = total.saturating_sub((rows as usize).max(1));
                                 if let Some(d) = detail.as_mut() {
-                                    d.scroll(delta, max_off);
+                                    if let OverlayData::Command(command) = &d.data {
+                                        d.offset = command.advance(d.offset, delta, cols as usize);
+                                    } else {
+                                        d.scroll(delta, max_off);
+                                    }
                                 }
                             }
                             DocNav::Copy => {
@@ -2949,6 +3054,9 @@ pub(crate) async fn run_tui(
                             break; // dismissed — remaining keys route next pass
                         }
                     }
+                }
+                Ok(Ev::Process(completion)) => {
+                    wait_process.complete(completion);
                 }
                 // The overlay hides the notice row; the answer is
                 // drained and painted once the overlay closes. A refresh
@@ -3038,6 +3146,8 @@ pub(crate) async fn run_tui(
         };
         let view = PanelView {
             wait_page: wait_page.as_ref(),
+            wait_process: wait_process.slot.as_ref(),
+            wait_scroll,
             seen_session: seen_session.as_ref(),
             clear_target: clear_target.as_ref(),
             mode,
@@ -3184,6 +3294,9 @@ pub(crate) async fn run_tui(
                 let batch = coalesce(
                     std::iter::once(first).chain(std::iter::from_fn(|| ev_rx.try_recv().ok())),
                 );
+                for completion in batch.process {
+                    wait_process.complete(completion);
+                }
                 // Body fetches that landed: each is applied only if
                 // the page still wants it (Contract 3). A refused one
                 // is silently dropped — it answers a question nobody
@@ -3540,20 +3653,60 @@ pub(crate) async fn run_tui(
                                 att.is_some_and(|a| a.killable_pid().is_some()),
                             );
                             match crate::cli::status_tui::input::wait_page_nav(sel, &actions, k) {
-                                DetailNav::Quit => break 'evloop,
-                                DetailNav::Back => {
+                                WaitNav::Quit => break 'evloop,
+                                WaitNav::Back => {
                                     wait_page = None;
+                                    wait_process.close();
                                     mode = Mode::AgentPanel { sel: 0 };
                                 }
-                                DetailNav::MoveCursor(s) => {
-                                    mode = Mode::WaitDetail { agent, sel: s }
-                                }
-                                DetailNav::ActivateKill => {
+                                WaitNav::MoveCursor(s) => mode = Mode::WaitDetail { agent, sel: s },
+                                WaitNav::Kill => {
                                     mode = Mode::Confirm {
                                         action: ConfirmAction::KillAttended,
                                     }
                                 }
-                                DetailNav::Activate(_) | DetailNav::None => {}
+                                WaitNav::Refresh => {
+                                    if let Some(page) = wait_page.as_ref() {
+                                        wait_process.request(page.clone());
+                                    }
+                                }
+                                WaitNav::FullCommand => {
+                                    if let Some(command) = wait_process
+                                        .slot
+                                        .as_ref()
+                                        .and_then(|slot| slot.command.as_ref())
+                                    {
+                                        detail = Some(Overlay {
+                                            data: OverlayData::Command(command.clone()),
+                                            offset: 0,
+                                            copied: None,
+                                        });
+                                    } else {
+                                        detail = Some(Overlay::info(
+                                            "command".into(),
+                                            wait_command_unknown(
+                                                wait_process.slot.as_ref().map(|slot| &slot.state),
+                                            ),
+                                        ));
+                                    }
+                                }
+                                WaitNav::Scroll(direction) => {
+                                    let page =
+                                        wait_page_budget(rows as usize, actions.len()).body.max(1);
+                                    let max = screen_total.saturating_sub(page);
+                                    wait_scroll = if direction < 0 {
+                                        wait_scroll.min(max).saturating_sub(page)
+                                    } else {
+                                        wait_scroll.saturating_add(page).min(max)
+                                    };
+                                }
+                                WaitNav::Top => wait_scroll = 0,
+                                WaitNav::Bottom => {
+                                    let page =
+                                        wait_page_budget(rows as usize, actions.len()).body.max(1);
+                                    wait_scroll = screen_total.saturating_sub(page);
+                                }
+                                WaitNav::None => {}
                             }
                             continue;
                         }
@@ -3573,11 +3726,10 @@ pub(crate) async fn run_tui(
                                             a.attending.as_ref().map(|t| (a.label.clone(), t))
                                         })
                                     {
-                                        wait_page = Some(crate::cli::status_tui::input::WaitPage {
-                                            label,
-                                            task: att.task.clone(),
-                                            at: att.at.clone(),
-                                        });
+                                        let page = WaitPage::new(&label, att);
+                                        wait_scroll = 0;
+                                        wait_process.request(page.clone());
+                                        wait_page = Some(page);
                                         mode = Mode::WaitDetail { agent, sel: 0 };
                                     }
                                 }
@@ -3688,7 +3840,6 @@ pub(crate) async fn run_tui(
                             match agent_detail_nav(sel, &actions, k) {
                                 // The kill row belongs to the WAIT page; the
                                 // agent page never produces it.
-                                DetailNav::ActivateKill => {}
                                 DetailNav::Quit => break 'evloop,
                                 DetailNav::Back => {
                                     mode = Mode::AgentPanel {
@@ -4052,7 +4203,7 @@ pub(crate) async fn run_tui(
                                             content_generation += 1;
                                             slot.retry(content_generation);
                                             spawn_content_fetch(
-                                                &ev_tx_content,
+                                                &ev_tx_async,
                                                 live.event.source.clone(),
                                                 slot.target.clone(),
                                                 content_generation,
@@ -4422,7 +4573,7 @@ pub(crate) async fn run_tui(
                                         let slot = want.map(|target| {
                                             content_generation += 1;
                                             spawn_content_fetch(
-                                                &ev_tx_content,
+                                                &ev_tx_async,
                                                 ev.source.clone(),
                                                 target.clone(),
                                                 content_generation,
@@ -4716,7 +4867,7 @@ pub(crate) async fn run_tui(
                     }
                     // The wait page is bound to an attendance
                     // INSTANCE. Re-locate the agent by label, then
-                    // demand the same task AND the same `at`: a
+                    // demand the same task, `at`, PID and birth: a
                     // replacement record is a different wait, and
                     // silently retargeting the page at it is how a
                     // confirmed action lands on something the user
@@ -4869,7 +5020,7 @@ pub(crate) async fn run_tui(
                             Some(r) => {
                                 if let Some((repo_slug, target, generation)) = r.fetch {
                                     spawn_content_fetch(
-                                        &ev_tx_content,
+                                        &ev_tx_async,
                                         repo_slug,
                                         target,
                                         generation,
@@ -8831,11 +8982,10 @@ pub(crate) mod tests {
     }
 
     fn page(label: &str, task: &str, at: &str) -> crate::cli::status_tui::input::WaitPage {
-        crate::cli::status_tui::input::WaitPage {
-            label: label.to_string(),
-            task: task.to_string(),
-            at: at.to_string(),
-        }
+        WaitPage::new(
+            label,
+            &attended(task, at, Some(std::process::id() as i32), true),
+        )
     }
 
     /// Put an attendance record where the resolver will look for it.
@@ -8999,6 +9149,92 @@ pub(crate) mod tests {
         assert_eq!(relocate_wait(&p, &s.agents), None);
     }
 
+    #[test]
+    fn wait_process_repaint_and_snapshot_refresh_do_not_request_another_read() {
+        use crate::proc_identity::inspect::Inspection;
+        let me = std::process::id() as i32;
+        let mut snap = snap_attending(Some(attended("t1", "same", Some(me), true)));
+        let mut page = Some(WaitPage::new(
+            "claude",
+            snap.agents[0].attending.as_ref().unwrap(),
+        ));
+        let mut mode = Mode::WaitDetail { agent: 0, sel: 0 };
+        let mut process = wait_process::Controller::default();
+        process.request(page.as_ref().unwrap().clone());
+        let job = process.take_job().unwrap();
+        let generation = job.generation;
+        process.complete(wait_process::Completion {
+            command: None,
+            request: job,
+            inspection: Inspection::Ended,
+        });
+        snap.agents.swap(0, 1);
+        for _ in 0..100 {
+            reconcile_wait_process(&mut mode, &mut page, &snap.agents, &mut process);
+            assert!(process.take_job().is_none());
+            assert_eq!(
+                process.slot.as_ref().unwrap().request.generation,
+                generation
+            );
+            assert_eq!(mode, Mode::WaitDetail { agent: 1, sel: 0 });
+        }
+    }
+
+    #[test]
+    fn wait_process_replacement_or_closed_page_discards_pending_work() {
+        use crate::proc_identity::inspect::Inspection;
+        let me = std::process::id() as i32;
+        for replacement in 0..3 {
+            let mut snap = snap_attending(Some(attended("t1", "same", Some(me), true)));
+            let mut page = Some(WaitPage::new(
+                "claude",
+                snap.agents[0].attending.as_ref().unwrap(),
+            ));
+            let mut mode = Mode::WaitDetail { agent: 0, sel: 0 };
+            let mut process = wait_process::Controller::default();
+            process.request(page.as_ref().unwrap().clone());
+            let job = process.take_job().unwrap();
+            process.request(page.as_ref().unwrap().clone()); // pending explicit refresh
+            match replacement {
+                0 => snap.agents[0].attending.as_mut().unwrap().pid = Some(42),
+                1 => snap.agents[0].attending.as_mut().unwrap().token = None,
+                _ => mode = Mode::AgentPanel { sel: 0 },
+            }
+            // Task and timestamp did not change: PID/birth changes still invalidate.
+            reconcile_wait_process(&mut mode, &mut page, &snap.agents, &mut process);
+            assert!(page.is_none());
+            assert!(process.slot.is_none());
+            assert_eq!(mode, Mode::AgentPanel { sel: 0 });
+            assert!(!process.complete(wait_process::Completion {
+                command: None,
+                request: job,
+                inspection: Inspection::Ended
+            }));
+            assert!(process.take_job().is_none());
+        }
+    }
+
+    #[test]
+    fn wait_process_completions_are_data_even_behind_an_overlay() {
+        use crate::proc_identity::inspect::Inspection;
+        let page = page("claude", "task", "at");
+        let mut process = wait_process::Controller::default();
+        process.request(page);
+        let job = process.take_job().unwrap();
+        let ev = Ev::Process(wait_process::Completion {
+            command: None,
+            request: job,
+            inspection: Inspection::Ended,
+        });
+        assert_eq!(behind_overlay(&ev), BehindOverlay::default());
+        let mut batch = coalesce([ev, Ev::Resize]);
+        assert!(batch.resize);
+        assert!(!batch.refresh);
+        assert_eq!(batch.process.len(), 1);
+        assert!(process.complete(batch.process.pop().unwrap()));
+        assert!(process.take_job().is_none());
+    }
+
     /// Removing an agent leaves its local `attended` file behind, so
     /// the file alone is not authority to signal. An agent taken off
     /// the roster while the confirm was open must not be killable.
@@ -9100,7 +9336,7 @@ pub(crate) mod tests {
         // Same live pid, a birth this process does not have.
         att.token = Some(crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 });
         write_attended(repo.path(), "claude", &att);
-        let err = resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path())
+        let err = resolve_kill_target(&WaitPage::new("claude", &att), repo.path())
             .expect_err("a mismatched identity must never be signalled");
         assert!(err.contains("reused") || err.contains("DIFFERENT"), "{err}");
     }
@@ -9119,10 +9355,7 @@ pub(crate) mod tests {
         );
         assert_eq!(att.killable_pid(), None, "but not actionable");
         write_attended(repo.path(), "claude", &att);
-        assert!(
-            resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path())
-                .is_err()
-        );
+        assert!(resolve_kill_target(&WaitPage::new("claude", &att), repo.path()).is_err());
     }
 
     /// The other ways the target can change while the confirm sits on
