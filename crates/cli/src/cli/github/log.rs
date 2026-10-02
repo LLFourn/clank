@@ -471,7 +471,7 @@ impl SharedWal {
     pub(crate) fn durability_of_a_write(
         &self,
         item: &WaitItem,
-    ) -> crate::cli::command_source::Durability {
+    ) -> crate::cli::event_source::Durability {
         self.inbox(Transport::Poll, None, None, None, item)
     }
 
@@ -480,8 +480,8 @@ impl SharedWal {
     fn with(
         &self,
         f: impl FnOnce(&mut EventLog) -> std::io::Result<()>,
-    ) -> crate::cli::command_source::Durability {
-        use crate::cli::command_source::Durability;
+    ) -> crate::cli::event_source::Durability {
+        use crate::cli::event_source::Durability;
         let mut inner = self.0.lock().unwrap();
         let warned = inner.warned;
         let Some(log) = inner.log.as_mut() else {
@@ -511,7 +511,7 @@ impl SharedWal {
         action_key: Option<&str>,
         event_at: Option<u64>,
         item: &WaitItem,
-    ) -> crate::cli::command_source::Durability {
+    ) -> crate::cli::event_source::Durability {
         self.with(|log| {
             log.append_inbox(transport, feed_id, action_key, event_at, item)
                 .map(|_| ())
@@ -1754,7 +1754,7 @@ pub(super) mod tests {
     /// lost (codex on aa3d9a5).
     #[test]
     fn a_write_that_did_not_land_is_reported_as_transient() {
-        use crate::cli::command_source::Durability;
+        use crate::cli::event_source::Durability;
 
         let dir = tempfile::tempdir().unwrap();
         let wal = SharedWal::new(Some(log_in(dir.path())));

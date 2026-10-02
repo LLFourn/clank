@@ -13,10 +13,6 @@
 //! mirroring the coordinator's deliberate emit-always treatment of
 //! missing identity; no manufactured time buckets.
 
-// Staged layer: the consumers (clank log interleave, TUI timeline)
-// land in this plan's next commits — the allow goes with them.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::Path;
 

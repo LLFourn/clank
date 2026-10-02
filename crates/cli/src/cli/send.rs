@@ -128,13 +128,33 @@ mod tests {
     }
 
     #[test]
-    fn a_message_sent_to_another_repo_lands_in_its_inbox() {
+    fn a_message_sent_to_another_repo_lands_in_its_event_log() {
         let there = repo_with_roster(TEAM);
-        let to = recipient(there.path(), None, true).unwrap();
-        crate::inbox::send(there.path(), &to, None, "2026-09-22T10:15:00Z", "hello").unwrap();
-        let pending = crate::inbox::scan(there.path(), &to);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].subject(), "hello");
+        run(SendArgs {
+            repo: Some(there.path().to_path_buf()),
+            to: None,
+            master: true,
+            message: vec!["hello".into()],
+            file: None,
+        })
+        .unwrap();
+        let repo = dunce::canonicalize(there.path()).unwrap();
+        let to = recipient(&repo, None, true).unwrap();
+        let messages = crate::inbox::pending(&repo, &to);
+        assert_eq!(messages.len(), 1);
+        let clank_core::wait::WaitItem::Message {
+            subject,
+            body,
+            selector,
+            ..
+        } = &messages[0]
+        else {
+            panic!("message")
+        };
+        assert_eq!(subject, "hello");
+        assert_eq!(body, "hello");
+        assert_eq!(selector.as_deref(), Some("messages@1"));
+        assert!(!crate::inbox::inbox_dir(&repo, &to).exists());
     }
 
     #[test]

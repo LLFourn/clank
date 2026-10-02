@@ -1,6 +1,0 @@
-{
-  "kind": "string",
-  "active_plan": "string | null",
-  "scope": "string",
-  "ts": "integer"
-}

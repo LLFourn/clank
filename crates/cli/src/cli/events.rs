@@ -1580,7 +1580,8 @@ mod tests {
         // prompt wins; a configured watch REMOVED from config leaves
         // no prompt (its arm never wrote a sidecar — and removes any
         // leftover); genuine CLI-only metadata stays visible.
-        use crate::cli::github::supervisor::{SourceOrigin, write_watch_sidecar};
+        use crate::cli::event_source::SourceOrigin;
+        use crate::cli::github::supervisor::write_watch_sidecar;
         use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {

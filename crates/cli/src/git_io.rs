@@ -1976,8 +1976,6 @@ pub fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, Git
 /// File mtime as unix seconds. Returns 0 with a `tracing::warn` if the
 /// metadata read or unix-epoch conversion fails — the UI treats 0 as
 /// "no chronological hint" rather than erroring the whole request.
-/// Shared by both the rebuild path (initial `collect_feedback_files`)
-/// and the watcher-driven `runtime::upsert_*` callsites.
 pub(crate) fn file_mtime_unix_secs(path: &Path) -> i64 {
     match std::fs::metadata(path).and_then(|m| m.modified()) {
         Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {

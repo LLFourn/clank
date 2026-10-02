@@ -1632,6 +1632,7 @@ pub(crate) enum Ownership {
 /// timer: it is non-blocking, and dropping it immediately hands the
 /// repo to whichever monitor is started next. Several clients racing
 /// here is fine — whoever wins serves the rest.
+#[cfg(test)]
 pub(crate) async fn wait_for_ownership(
     repo: &std::path::Path,
     by: std::time::Instant,
@@ -1640,7 +1641,7 @@ pub(crate) async fn wait_for_ownership(
     wait_for_ownership_by(repo, by, step, |r| acquire_lease(r).is_ok()).await
 }
 
-/// [`wait_for_ownership`] with the probe supplied.
+/// Wait within one deadline using the caller's non-blocking ownership probe.
 ///
 /// A seam, because the boundary that matters cannot be reached
 /// otherwise: ownership becoming available and then the deadline
@@ -2158,6 +2159,7 @@ pub(crate) fn publish_in(
 }
 
 /// What a repo's monitor published, if anything readable.
+#[cfg(test)]
 pub(crate) fn read_published(repo: &std::path::Path) -> Option<Descriptor> {
     match published(repo) {
         Published::Ours(d) => Some(d),
@@ -2185,6 +2187,12 @@ pub(crate) enum Published {
     Untrusted(String),
 }
 
+#[cfg(test)]
+pub(crate) fn published(repo: &std::path::Path) -> Published {
+    let me = unsafe { libc::getuid() };
+    published_in(&runtime_dir(me), repo, me)
+}
+
 /// Read the descriptor VERSION FIRST, as every frame on the socket is.
 ///
 /// Serde parses a struct whole, so a descriptor whose SHAPE changed
@@ -2193,13 +2201,6 @@ pub(crate) enum Published {
 /// first is a candidate to replace; the second is a reason to start
 /// one. Collapsing them is how a successor would spawn against a live
 /// holder for ever (codex on 258d979).
-pub(crate) fn published(repo: &std::path::Path) -> Published {
-    let me = unsafe { libc::getuid() };
-    published_in(&runtime_dir(me), repo, me)
-}
-
-/// [`published`] with the namespace supplied, so a test can hand it one
-/// it must refuse.
 pub(crate) fn published_in(dir: &std::path::Path, repo: &std::path::Path, me: u32) -> Published {
     match trusted_dir(dir, me) {
         Trust::Ours => {}
@@ -2234,16 +2235,6 @@ pub(crate) fn published_in(dir: &std::path::Path, repo: &std::path::Path, me: u3
     }
 }
 
-/// Whether a client in `repo` may use what it found.
-///
-/// Both halves, because a descriptor outlives what it describes: the
-/// repo may have moved under it, and the monitor may predate this
-/// build. Either way the client does its own local wait rather than
-/// trusting it.
-pub(crate) fn usable(d: &Descriptor, repo: &std::path::Path, ours: u32) -> bool {
-    serves(repo, &d.repo) && admits(ours, d.proto)
-}
-
 /// One connected waiter, as the fold owner sees it.
 ///
 /// A QUEUE, never a socket. An earlier version held the stream and
@@ -2256,13 +2247,7 @@ pub(crate) fn usable(d: &Descriptor, repo: &std::path::Path, ours: u32) -> bool 
 /// What the monitor knows about a connected reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Served {
-    Agent {
-        author: AgentLabel,
-        /// Declared, never owned: a `--event` source belongs to ONE
-        /// invocation, so the monitor must not pool it.
-        #[allow(dead_code)]
-        has_cli_sources: bool,
-    },
+    Agent { author: AgentLabel },
     Observer,
 }
 
@@ -2401,8 +2386,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // — delivering a row a later admission replays again, or one some
     // other client has since acked (codex on ca2ea69).
     let (source_items, mut from_sources) =
-        tokio::sync::mpsc::unbounded_channel::<(AgentLabel, crate::cli::command_source::Emission)>(
-        );
+        tokio::sync::mpsc::unbounded_channel::<(AgentLabel, crate::cli::event_source::Emission)>();
     // The last completed fold, so a source signal can present against
     // the same state a tick would.
     let mut folded_state: Option<crate::repo_state::RepoState> = None;
@@ -2627,7 +2611,7 @@ struct Hosted {
     /// comparison rather than by guessing.
     spec: Vec<(
         clank_core::agent_config::WaitEventSource,
-        crate::cli::github::supervisor::SourceOrigin,
+        crate::cli::event_source::SourceOrigin,
     )>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -2661,7 +2645,7 @@ fn hostable(
     author: &AgentLabel,
 ) -> Vec<(
     clank_core::agent_config::WaitEventSource,
-    crate::cli::github::supervisor::SourceOrigin,
+    crate::cli::event_source::SourceOrigin,
 )> {
     crate::cli::wait::resolve_wait_event_sources(repo, author, &[]).unwrap_or_default()
 }
@@ -2691,7 +2675,7 @@ fn roster_authors(repo: &std::path::Path) -> Vec<AgentLabel> {
 fn reconcile_hosting(
     repo: &std::path::Path,
     hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
-    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::command_source::Emission)>,
+    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut departing = Vec::new();
     let authors = roster_authors(repo);
@@ -2722,8 +2706,9 @@ fn reconcile_hosting(
             // author's config source. A `--event` source handed to a
             // pooled host would be refused rather than pooled.
             None,
+            crate::cli::event_source::EmissionSink::for_author(into.clone(), author.clone()),
         )
-        .tagged_into(author.clone(), into.clone());
+        .into_tasks();
         hosted.insert(author.clone(), Hosted { spec, tasks });
     }
     // An author off the roster keeps nothing running: a revoked agent's
@@ -2804,8 +2789,8 @@ fn owed_from_sources(
 /// presentation is stamped after the append, and absence proves
 /// nothing anyway once a row can be compacted away (codex on 0555c8f,
 /// aa3d9a5).
-fn transient_of(emission: crate::cli::command_source::Emission) -> Vec<WaitItem> {
-    use crate::cli::command_source::Durability;
+fn transient_of(emission: crate::cli::event_source::Emission) -> Vec<WaitItem> {
+    use crate::cli::event_source::Durability;
     match emission {
         (_, Durability::Logged) => Vec::new(),
         (item, Durability::Transient) => vec![item],
@@ -2962,20 +2947,13 @@ fn revoked(err: &anyhow::Error) -> bool {
 fn served_for(repo: &std::path::Path, who: Who) -> Result<Served, Welcome> {
     match who {
         Who::Observer => Ok(Served::Observer),
-        Who::Agent {
-            author,
-            has_cli_sources,
-            ..
-        } => {
+        Who::Agent { author, .. } => {
             let author = AgentLabel::parse(&author).map_err(|e| Welcome::Decline {
                 proto: PROTO,
                 why: format!("invalid author `{author}`: {e}"),
             })?;
             match crate::agent_store::resolve_role(repo, &author) {
-                Ok(_) => Ok(Served::Agent {
-                    author,
-                    has_cli_sources,
-                }),
+                Ok(_) => Ok(Served::Agent { author }),
                 Err(e) => Err(Welcome::Decline {
                     proto: PROTO,
                     why: format!("`{author}` is not on this repo's roster: {e}"),
@@ -3289,7 +3267,7 @@ async fn stand_down(
     arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<Greeted>,
     from_sources: &mut tokio::sync::mpsc::UnboundedReceiver<(
         AgentLabel,
-        crate::cli::command_source::Emission,
+        crate::cli::event_source::Emission,
     )>,
     folded: Option<&crate::repo_state::RepoState>,
     pending: &mut Vec<(AgentLabel, WaitItem)>,
@@ -3319,12 +3297,9 @@ async fn stand_down(
         eprintln!("monitor: {late} admission(s) arrived during the cutoff");
     }
 
-    // THREE: stop the sources, then take what they already handed
-    // over. Aborting the forwarder together with its producers without
-    // reading its buffer would discard accepted emissions and then
-    // report nothing about them — a durable row replays from the WAL
-    // for whoever connects next, a transient has no row at all
-    // (codex on 5f7bc36).
+    // Successful sends already hold custody in this queue; cancelling
+    // the producers cannot discard a private forwarding buffer. Durable
+    // rows replay from the WAL, but transients need this final drain.
     let mut producers: Vec<tokio::task::JoinHandle<()>> = owned.take_all();
     for (_, running) in hosted {
         producers.extend(running.stop());
@@ -3731,8 +3706,7 @@ mod tests {
     /// A source channel nothing ever produced on, for the fixtures
     /// whose subject is not the source buffer.
     fn no_sources()
-    -> tokio::sync::mpsc::UnboundedReceiver<(AgentLabel, crate::cli::command_source::Emission)>
-    {
+    -> tokio::sync::mpsc::UnboundedReceiver<(AgentLabel, crate::cli::event_source::Emission)> {
         tokio::sync::mpsc::unbounded_channel().1
     }
 
@@ -3775,7 +3749,6 @@ mod tests {
         let mut clients = vec![Client {
             who: Served::Agent {
                 author: claude.clone(),
-                has_cli_sources: false,
             },
             out,
             writer: Some(writer),
@@ -4097,9 +4070,8 @@ mod tests {
 
     /// An emission the sources already handed over is still presented.
     ///
-    /// Aborting the forwarder together with its producers without
-    /// reading its buffer discards work the monitor ACCEPTED and then
-    /// says nothing about it. A durable row replays from the WAL for
+    /// Acknowledgment of acceptance precedes cancellation of the producer.
+    /// A durable row replays from the WAL for
     /// whoever connects next; a transient has no row, so this is the
     /// one the cutoff has to carry (codex on 5f7bc36).
     ///
@@ -4115,12 +4087,11 @@ mod tests {
         let claude = AgentLabel::parse("claude").unwrap();
         let (_joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
 
-        // Accepted by the monitor and sitting in the channel, which is
-        // where an emission is between its producer and the loop.
         let (tx, mut from_sources) = tokio::sync::mpsc::unbounded_channel();
-        tx.send((
-            claude.clone(),
-            (
+        let sink = crate::cli::event_source::EmissionSink::for_author(tx, claude.clone());
+        let (accepted, acceptance) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            sink.send((
                 WaitItem::CommandEvent {
                     name: "deploys".into(),
                     id: "a".into(),
@@ -4132,20 +4103,26 @@ mod tests {
                     reply_route: None,
                     selector: None,
                 },
-                crate::cli::command_source::Durability::Transient,
-            ),
-        ))
-        .unwrap();
-        drop(tx);
+                crate::cli::event_source::Durability::Transient,
+            ))
+            .unwrap();
+            accepted.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        acceptance.await.unwrap();
+        let hosted = std::collections::BTreeMap::from([(
+            claude.clone(),
+            Hosted {
+                spec: Vec::new(),
+                tasks: vec![producer],
+            },
+        )]);
 
         let (ours, mut theirs) = tokio::net::UnixStream::pair().unwrap();
         let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let writer = tokio::spawn(write_to(ours, queued, "claude".to_string()));
         let clients = vec![Client {
-            who: Served::Agent {
-                author: claude,
-                has_cli_sources: false,
-            },
+            who: Served::Agent { author: claude },
             out,
             writer: Some(writer),
             shown: Default::default(),
@@ -4157,7 +4134,7 @@ mod tests {
             repo.path(),
             clients,
             Vec::new(),
-            Default::default(),
+            hosted,
             OwnedTasks::default(),
             &mut arrivals,
             &mut from_sources,
@@ -4273,7 +4250,6 @@ mod tests {
             .send(Greeted::Client(Client {
                 who: Served::Agent {
                     author: claude.clone(),
-                    has_cli_sources: false,
                 },
                 out,
                 writer: Some(writer),
@@ -5067,32 +5043,6 @@ mod tests {
             .filter(|n| n.contains("tmp"))
             .collect();
         assert!(strays.is_empty(), "a temp file survived: {strays:?}");
-    }
-
-    /// A descriptor outlives what it describes.
-    #[test]
-    fn a_descriptor_from_elsewhere_is_not_usable() {
-        let repo = repo_dir();
-        let mine = descriptor_for(repo.path());
-        assert!(usable(&mine, repo.path(), PROTO));
-
-        let moved = Descriptor {
-            repo: "/w/somewhere-else".into(),
-            ..mine.clone()
-        };
-        assert!(
-            !usable(&moved, repo.path(), PROTO),
-            "the repo moved under it"
-        );
-
-        let older = Descriptor {
-            proto: PROTO - 1,
-            ..mine
-        };
-        assert!(
-            !usable(&older, repo.path(), PROTO),
-            "and it predates this build"
-        );
     }
 
     fn hello_line(proto: u32, repo: &str) -> String {
@@ -7446,7 +7396,6 @@ mod tests {
             client.who,
             Served::Agent {
                 author: AgentLabel::parse("codex").unwrap(),
-                has_cli_sources: false,
             }
         );
     }
@@ -7631,10 +7580,7 @@ mod tests {
             tokio::spawn(write_to(mine, queued, label.to_string()));
             clients.push(Client {
                 writer: None,
-                who: Served::Agent {
-                    author: label,
-                    has_cli_sources: false,
-                },
+                who: Served::Agent { author: label },
                 out,
                 shown: Default::default(),
             });
@@ -7996,6 +7942,90 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn hosted_producers_deliver_with_their_author_and_release_their_leases() {
+        use crate::cli::event_source::Durability;
+        use crate::cli::github::log::IngestLease;
+
+        let repo = repo_with_roster();
+        for who in ["claude", "codex"] {
+            with_source(repo.path(), who, "builds");
+            let config = crate::agent_store::agents_root(repo.path())
+                .join(who)
+                .join("config.json");
+            std::fs::write(config, serde_json::to_vec(&serde_json::json!({
+                "wait_events": [{"kind": "command", "name": "builds", "command": [
+                    "sh", "-c", format!(r#"printf '{{"id":"{who}","content":"{who}"}}\n'; sleep 300"#)
+                ]}]
+            })).unwrap()).unwrap();
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = std::collections::BTreeMap::new();
+        assert!(reconcile_hosting(repo.path(), &mut hosted, &tx).is_empty());
+        assert_eq!(hosted.len(), 2);
+        assert!(hosted.values().all(|host| host.tasks.len() == 1));
+
+        let mut heard = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut heard = Vec::new();
+            for _ in 0..2 {
+                let (author, (item, durability)) = rx.recv().await.unwrap();
+                assert_eq!(durability, Durability::Logged);
+                let WaitItem::CommandEvent {
+                    content, failure, ..
+                } = item
+                else {
+                    panic!("expected the hosted command's event");
+                };
+                assert!(!failure);
+                assert_eq!(content, author.as_str());
+                heard.push(author);
+            }
+            heard
+        })
+        .await
+        .expect("both hosted producers must deliver into the monitor queue");
+        heard.sort();
+        assert_eq!(
+            heard.iter().map(AgentLabel::as_str).collect::<Vec<_>>(),
+            vec!["claude", "codex"]
+        );
+        for author in &heard {
+            let spec = &hosted[author].spec;
+            let clank_core::agent_config::WaitEventSource::Command(command) = &spec[0].0 else {
+                unreachable!()
+            };
+            let events = crate::agent_store::agents_root(repo.path())
+                .join(author.as_str())
+                .join("events");
+            assert!(
+                IngestLease::try_acquire(&events, &command.source_key())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut stopped = Vec::new();
+        for (_, host) in hosted {
+            stopped.extend(host.stop());
+        }
+        for task in stopped {
+            let _ = task.await;
+        }
+        for author in &heard {
+            let sources = hostable(repo.path(), author);
+            let clank_core::agent_config::WaitEventSource::Command(command) = &sources[0].0 else {
+                unreachable!()
+            };
+            let events = crate::agent_store::agents_root(repo.path())
+                .join(author.as_str())
+                .join("events");
+            assert!(
+                IngestLease::try_acquire(&events, &command.source_key())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
     /// Everything the monitor hosts is an author's CONFIG source.
     ///
     /// The assumption that makes passing no invocation scope safe: a
@@ -8005,7 +8035,7 @@ mod tests {
     /// resolves with no CLI items at all.
     #[test]
     fn nothing_the_monitor_hosts_belongs_to_an_invocation() {
-        use crate::cli::github::supervisor::SourceOrigin;
+        use crate::cli::event_source::SourceOrigin;
         let repo = repo_with_roster();
         with_source(repo.path(), "codex", "deploys");
         let codex = AgentLabel::parse("codex").unwrap();
@@ -8043,6 +8073,7 @@ mod tests {
         );
         let codex = AgentLabel::parse("codex").unwrap();
         let first: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        assert_eq!(first.len(), 1, "one source driver, no author forwarder");
 
         // An unrelated fold leaves a healthy producer alone.
         reconcile_hosting(repo.path(), &mut hosted, &tx);
@@ -8168,7 +8199,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: codex.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8199,7 +8229,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: codex.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8285,7 +8314,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: codex.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8346,7 +8374,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: codex.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8370,7 +8397,7 @@ mod tests {
         // producer saw the append succeed or fail; nothing a reader
         // can measure tells it apart, which is why two attempts to
         // infer it were wrong.
-        use crate::cli::command_source::Durability;
+        use crate::cli::event_source::Durability;
         assert!(
             transient_of((unlogged.clone(), Durability::Logged)).is_empty(),
             "a logged emission is carried by the log, not beside it"
@@ -8422,7 +8449,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: claude.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8473,7 +8499,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse("claude").unwrap(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8540,7 +8565,6 @@ mod tests {
                 writer: None,
                 who: Served::Agent {
                     author: claude.clone(),
-                    has_cli_sources: false,
                 },
                 out,
                 shown: Default::default(),
@@ -8592,7 +8616,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: claude.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8643,7 +8666,6 @@ mod tests {
                 writer: None,
                 who: Served::Agent {
                     author: claude.clone(),
-                    has_cli_sources: false,
                 },
                 out,
                 shown: Default::default(),
@@ -8708,7 +8730,7 @@ mod tests {
         // row of its own. This is the log the monitor must not read.
         let invocation = crate::cli::command_source::storage_key(
             configured.clone(),
-            crate::cli::github::supervisor::SourceOrigin::Cli,
+            crate::cli::event_source::SourceOrigin::Cli,
             "inv-9",
         );
         assert_ne!(invocation, configured);
@@ -8722,7 +8744,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: claude.clone(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8800,17 +8821,12 @@ mod tests {
 
         let (a, mut codex_heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let (b, mut claude_heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        // Both are plain shared clients. Invocation-source isolation is
+        // covered by `an_invocations_event_reaches_it_and_not_the_monitor`.
         let agent = |who: &str, out| Client {
             writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse(who).unwrap(),
-                // Both are plain shared clients. An earlier version set
-                // this for one of them and claimed to be covering mixed
-                // delivery, which it was not: the flag starts no
-                // producer, and production refuses sharing to a wait
-                // that has a CLI source at all. The actual mixed case
-                // is `an_invocations_event_reaches_it_and_not_the_monitor`.
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8863,7 +8879,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse("claude").unwrap(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),
@@ -8884,7 +8899,6 @@ mod tests {
                     writer: None,
                     who: Served::Agent {
                         author: AgentLabel::parse("codex").unwrap(),
-                        has_cli_sources: false,
                     },
                     out,
                     shown: Default::default(),
@@ -8922,7 +8936,6 @@ mod tests {
             writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse(author).unwrap(),
-                has_cli_sources: false,
             },
             out,
             shown: Default::default(),

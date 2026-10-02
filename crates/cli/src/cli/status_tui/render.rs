@@ -834,11 +834,6 @@ pub(super) fn agent_wait_view(snap: &StatusSnapshot, cols: usize) -> Vec<(bool, 
         .collect()
 }
 
-/// The lines of document a page of `rows` can show, after its footer.
-pub(super) fn page_height(rows: usize) -> usize {
-    rows.saturating_sub(1).max(1)
-}
-
 pub(super) fn drawable_waits(snap: &StatusSnapshot, cols: usize) -> Vec<usize> {
     agent_wait_view(snap, cols)
         .into_iter()
@@ -934,6 +929,7 @@ pub(super) const MARK_FIELD: usize = 2;
 /// characters behind the indent. `render_at` clamps to `cols.max(1)`,
 /// so those widths are reachable and the page must still render
 /// without panicking there — it simply cannot promise every glyph.
+#[cfg(test)]
 pub(super) const MIN_EVENT_BODY_COLS: usize = 4;
 
 /// The narrowest pane at which an event row still shows its state.
@@ -943,6 +939,7 @@ pub(super) const MIN_EVENT_BODY_COLS: usize = 4;
 /// visible" would be unkeepable. Below this the pane is degraded for
 /// every row kind alike. Above it, the state is leftmost in the row's
 /// own spans, so truncation eats the describe line first.
+#[cfg(test)]
 pub(super) const MIN_EVENT_STATE_COLS: u16 = 20;
 
 /// Whether this event still wants someone, in a fixed

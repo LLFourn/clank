@@ -76,7 +76,7 @@ pub(crate) struct Coordinator {
     keys: SeenSet,
     baseline_done: bool,
     buffered: std::collections::VecDeque<Classified>,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: crate::cli::event_source::EmissionSink,
     /// The write-ahead sink: every gate decision lands here BEFORE any
     /// emission (github-offline-catchup). Disabled for sources without
     /// a persistence dir.
@@ -86,14 +86,12 @@ pub(crate) struct Coordinator {
 impl Coordinator {
     /// Test convenience: a coordinator with no persistence.
     #[cfg(test)]
-    pub(crate) fn new(
-        tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
-    ) -> Self {
+    pub(crate) fn new(tx: crate::cli::event_source::EmissionSink) -> Self {
         Self::with_wal(tx, crate::cli::github::log::SharedWal::disabled())
     }
 
     pub(crate) fn with_wal(
-        tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+        tx: crate::cli::event_source::EmissionSink,
         wal: crate::cli::github::log::SharedWal,
     ) -> Self {
         Self {
@@ -222,7 +220,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     checks: ChecksSide<'_, C>,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: &crate::cli::event_source::EmissionSink,
     mut relay: Option<std::sync::Arc<RelayInbox>>,
     mut log: Option<crate::cli::github::log::EventLog>,
     suppress_backlog: std::collections::HashSet<(u64, String)>,
@@ -318,7 +316,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
             if tx
                 .send((
                     entry.item.clone(),
-                    crate::cli::command_source::Durability::Logged,
+                    crate::cli::event_source::Durability::Logged,
                 ))
                 .is_err()
             {
@@ -660,6 +658,7 @@ mod tests {
             Box::new(|_p, _e| Ok(ok(vec![issue("7", 7)], None, None))),
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -696,6 +695,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_gates_emission_by_action_key() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let mut c = Coordinator::new(tx);
         assert!(c.baseline(vec![classified(1, Some("issue_opened#1"))]));
         // Baseline emitted nothing.
@@ -721,6 +721,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_buffers_relay_deliveries_until_the_baseline() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let mut c = Coordinator::new(tx);
         // Deliveries BEFORE the baseline buffer silently…
         assert!(c.deliver(classified(1, Some("issue_opened#1"))));
@@ -743,6 +744,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_buffer_is_bounded_drop_oldest() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let mut c = Coordinator::new(tx);
         for i in 0..(RELAY_BUFFER_CAP as u64 + 3) {
             assert!(c.deliver(classified(i, Some(&format!("issue_opened#{i}")))));
@@ -808,6 +810,7 @@ mod tests {
             session: session.clone(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let run = tokio::spawn(async move {
             poll_loop(
@@ -856,6 +859,7 @@ mod tests {
             Box::new(|_p, _e| Ok(ok(vec![issue("2", 2), issue("1", 1)], Some("\"e2\""), None))),
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
@@ -901,6 +905,7 @@ mod tests {
         ]);
         let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::CiFailed], true),
@@ -956,6 +961,7 @@ mod tests {
             Box::new(|_p, _e| Ok(ok(vec![issue("2", 2), issue("1", 1)], None, None))),
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(
@@ -1005,6 +1011,7 @@ mod tests {
             vec![red(7, "head2", "test")],
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(
@@ -1057,6 +1064,7 @@ mod tests {
         ]);
         let f = ScriptFetcher::new(vec![]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 // include_own_actions = false: the gate is armed.
@@ -1108,6 +1116,7 @@ mod tests {
         }
         let ci = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
             poll_loop(
@@ -1139,6 +1148,7 @@ mod tests {
         })]);
         let ci2 = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
@@ -1180,6 +1190,7 @@ mod tests {
             Ok(ok(vec![issue("1", 1)], None, None))
         })]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
@@ -1213,6 +1224,7 @@ mod tests {
         ]);
         let f2 = ScriptFetcher::new(vec![]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
@@ -1264,6 +1276,7 @@ mod tests {
             let ci = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
             let f = ScriptFetcher::new(vec![]);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
             let s = src(&[GithubEventKind::CiFailed], true);
             let d = dir.clone();
             let handle = tokio::spawn(async move {
@@ -1314,6 +1327,7 @@ mod tests {
         }
         let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -1377,6 +1391,7 @@ mod tests {
         s.prs = vec![7];
         let f = ScriptFetcher::new(vec![]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let d = dir.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -1439,6 +1454,7 @@ mod tests {
             Ok(ok(vec![issue("1", 1)], None, None))
         })]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
@@ -1475,6 +1491,7 @@ mod tests {
             Ok(ok(vec![issue("2", 2), issue("1", 1)], None, None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
@@ -1523,6 +1540,7 @@ mod tests {
         let fetches = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
@@ -1600,6 +1618,7 @@ mod tests {
             serde_json::json!({ "action": "completed" }),
         ));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let loop_inbox = inbox.clone();
         let counter = reads.clone();
@@ -1656,6 +1675,7 @@ mod tests {
         let fetches = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
@@ -1713,6 +1733,7 @@ mod tests {
         let f = ScriptFetcher::new(vec![]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
         let loop_inbox = inbox.clone();
         let counter = attempts.clone();
@@ -1768,6 +1789,7 @@ mod tests {
         let f = ScriptFetcher::new(vec![]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
         let loop_inbox = inbox.clone();
         let counter = reads.clone();
@@ -1833,6 +1855,7 @@ mod tests {
             Ok(ok(vec![], Some("\"e1\""), None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let loop_inbox = inbox.clone();
@@ -1883,6 +1906,7 @@ mod tests {
             Ok(ok(vec![issue("9", 9)], None, None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
@@ -1925,6 +1949,7 @@ mod tests {
         let dir = wal_tempdir();
         let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
@@ -1953,6 +1978,7 @@ mod tests {
             Ok(ok(vec![issue("9", 9)], None, None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
@@ -2033,6 +2059,7 @@ mod tests {
             Ok(ok(vec![issue("9", 9)], None, None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let handle = tokio::spawn(async move {
@@ -2085,6 +2112,7 @@ mod tests {
             vec![red(7, "head2", "test")],
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
@@ -2125,6 +2153,7 @@ mod tests {
         ));
         let ci2 = ScriptCi::new(vec![vec![red(7, "head2", "test")]]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
@@ -2193,6 +2222,7 @@ mod tests {
         for arm in 0..2 {
             let ci = ScriptCi::new(vec![many.clone()]);
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
             let s = src(
                 &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
                 true,
@@ -2239,6 +2269,7 @@ mod tests {
         ]);
         let f = ScriptFetcher::new(vec![]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
         let d = dir.clone();
         let handle = tokio::spawn(async move {
@@ -2289,6 +2320,7 @@ mod tests {
         let ci = ScriptCi::new(vec![vec![]]);
         let f = ScriptFetcher::new(vec![]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
@@ -2316,6 +2348,7 @@ mod tests {
         let ci2 = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
         let f2 = ScriptFetcher::new(vec![]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::CiFailed], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
@@ -2355,6 +2388,7 @@ mod tests {
         let ci = ScriptCi::new(vec![vec![red(7, "head1", "fmt")]]);
         let f = ScriptFetcher::new(vec![]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
         let d = dir.clone();
         let handle = tokio::spawn(async move {
@@ -2449,6 +2483,7 @@ mod tests {
             }),
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
@@ -2500,6 +2535,7 @@ mod tests {
             }),
         ]));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let f2 = f.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2554,6 +2590,7 @@ mod tests {
             }),
         ]));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let f2 = f.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2618,6 +2655,7 @@ mod tests {
         ]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2706,6 +2744,7 @@ mod tests {
         ));
         assert_eq!(inbox.len(), RELAY_BUFFER_CAP, "bounded at the inbox itself");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2767,6 +2806,7 @@ mod tests {
         let f = ScriptFetcher::new(vec![]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2820,6 +2860,7 @@ mod tests {
         let inbox = std::sync::Arc::new(RelayInbox::new());
         inbox.close(); // dead before login ever resolves
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2864,6 +2905,7 @@ mod tests {
             }
         }
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
                 &src(&[GithubEventKind::IssueOpened], false),
@@ -2904,6 +2946,7 @@ mod tests {
             Ok(ok(vec![issue("1", 1)], Some("\"e1\""), None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
@@ -2937,6 +2980,7 @@ mod tests {
             Ok(ok(vec![issue("2", 2), issue("1", 1)], None, None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
@@ -2995,6 +3039,7 @@ mod tests {
         // WITHOUT any fetch completing.
         let f = ScriptFetcher::new(vec![]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run = tokio::spawn(async move {
@@ -3070,6 +3115,7 @@ mod tests {
         let calls = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let loop_inbox = inbox.clone();
@@ -3158,6 +3204,7 @@ mod tests {
         }
         let f = DeadFeed;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
@@ -3193,6 +3240,7 @@ mod tests {
         ]));
         let calls = f.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {
@@ -3245,6 +3293,7 @@ mod tests {
             Box::new(|_p, _e| Ok(ok(vec![], None, None))),
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run = tokio::spawn(async move {
@@ -3299,6 +3348,7 @@ mod tests {
         let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], Some("\"e\""), None)))]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let loop_inbox = inbox.clone();
@@ -3349,6 +3399,7 @@ mod tests {
             Ok(ok(vec![issue("77", 2)], None, None))
         })]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s2 = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run2 = tokio::spawn(async move {

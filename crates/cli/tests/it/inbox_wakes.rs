@@ -60,7 +60,15 @@ fn send(repo: &Path, to: &str, body: &str) -> String {
 /// A message dropped into the OLD file inbox, as one sent before this
 /// existed would be. Migration is what brings it into the log.
 fn legacy_file(repo: &Path, to: &str, body: &str) -> std::path::PathBuf {
-    clank::inbox::send(repo, &label(to), None, "2026-09-22T10:15:00Z", body).unwrap()
+    let dir = clank::inbox::inbox_dir(repo, &label(to));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("500-00000001-legacy.md");
+    std::fs::write(
+        &file,
+        format!("---\nsent: 2026-09-22T10:15:00Z\n---\n{body}\n"),
+    )
+    .unwrap();
+    file
 }
 
 /// The selector a message's wake names — what `clank events ack`

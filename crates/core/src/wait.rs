@@ -1019,18 +1019,6 @@ impl AdHocWorkState {
                 | crate::vocab::CommitGateState::ChangesRequested
         )
     }
-
-    /// Whether the gate reached a terminal verdict. NOT the negation
-    /// of [`is_open`](Self::is_open): `ContinuedPendingGate` and
-    /// `Blocked` are neither open (no one is routed work) nor
-    /// settled (the verdict is still pending) — master sleeps
-    /// through them and must still be woken when they resolve.
-    pub fn is_settled(&self) -> bool {
-        matches!(
-            self.gate,
-            crate::vocab::CommitGateState::Continued | crate::vocab::CommitGateState::Finished
-        )
-    }
 }
 
 /// Compute the gate state for one commit given its review

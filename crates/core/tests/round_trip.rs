@@ -1,13 +1,10 @@
-//! Wire-shape tests for `clank-core`'s surviving public DTOs.
+//! Wire-string tests for `clank-core`'s closed vocabulary.
 //!
 //! Pins:
 //! - snake_case wire strings for every closed-vocab enum
 //! - `as_str` agrees with serde's wire form
-//! - tagged-enum round-trips (`LiveEvent`, `DiffLine`)
-//! - representative decode-failure cases (null on a required
-//!   field, missing kind, unknown variant)
+//! - rejection of unknown vocabulary strings
 
-use clank_core::api::*;
 use clank_core::vocab::*;
 use serde_json::json;
 
@@ -83,150 +80,6 @@ fn as_str_agrees_with_wire() {
     check!(CommitGateState::ChangesRequested);
     check!(WaitingReason::CommitNeedsReview);
     check!(WaitingReason::ReadyToFinalize);
-}
-
-// ============================================================
-// LiveEvent round-trips
-// ============================================================
-
-#[test]
-fn live_event_repo_rebuilt_round_trips() {
-    let ev = LiveEvent::Repo(RepoEvent {
-        ts: 1700000000,
-        payload: RepoEventPayload::RepoRebuilt {},
-    });
-    let v = serde_json::to_value(&ev).unwrap();
-    assert_eq!(v["scope"], "repo");
-    assert_eq!(v["kind"], "repo_rebuilt");
-    let back: LiveEvent = serde_json::from_value(v).unwrap();
-    assert_eq!(ev, back);
-}
-
-#[test]
-fn live_event_repo_unwatched_carries_its_optional_active_plan() {
-    for active_plan in [None, Some(clank_core::ids::PlanKey::parse("work").unwrap())] {
-        let ev = LiveEvent::Repo(RepoEvent {
-            ts: 1700000000,
-            payload: RepoEventPayload::RepoUnwatched {
-                active_plan: active_plan.clone(),
-            },
-        });
-        let v = serde_json::to_value(&ev).unwrap();
-        assert_eq!(v["scope"], "repo");
-        assert_eq!(v["kind"], "repo_unwatched");
-        assert_eq!(v["active_plan"], serde_json::to_value(active_plan).unwrap());
-        let back: LiveEvent = serde_json::from_value(v).unwrap();
-        assert_eq!(ev, back);
-    }
-}
-
-#[test]
-fn live_event_plan_worktree_changed_carries_path() {
-    let ev = LiveEvent::Plan(PlanEvent {
-        ts: 1700000000,
-        plan_id: "clank/foo.md".into(),
-        lifecycle: PlanLifecycle::Active,
-        payload: PlanEventPayload::PlanWorktreeChanged {
-            path: ".clank/plans/foo.md".into(),
-        },
-    });
-    let v = serde_json::to_value(&ev).unwrap();
-    assert_eq!(v["scope"], "plan");
-    assert_eq!(v["kind"], "plan_worktree_changed");
-    assert_eq!(v["path"], ".clank/plans/foo.md");
-    let back: LiveEvent = serde_json::from_value(v).unwrap();
-    assert_eq!(ev, back);
-}
-
-#[test]
-fn live_event_plan_feedback_changed_has_no_extra_fields() {
-    let ev = LiveEvent::Plan(PlanEvent {
-        ts: 1700000000,
-        plan_id: "clank/foo.md".into(),
-        lifecycle: PlanLifecycle::Active,
-        payload: PlanEventPayload::FeedbackChanged {},
-    });
-    let v = serde_json::to_value(&ev).unwrap();
-    assert_eq!(v["scope"], "plan");
-    assert_eq!(v["kind"], "feedback_changed");
-    let back: LiveEvent = serde_json::from_value(v).unwrap();
-    assert_eq!(ev, back);
-}
-
-// ============================================================
-// DiffLine round-trips
-// ============================================================
-
-#[test]
-fn diff_line_insert_round_trips() {
-    let line = DiffLine::Insert {
-        content: " hi".into(),
-        new_lineno: 7,
-    };
-    let v = serde_json::to_value(&line).unwrap();
-    assert_eq!(v["kind"], "insert");
-    assert_eq!(v["new_lineno"], 7);
-    assert!(v.get("old_lineno").is_none());
-    let back: DiffLine = serde_json::from_value(v).unwrap();
-    assert_eq!(line, back);
-}
-
-#[test]
-fn diff_line_delete_round_trips() {
-    let line = DiffLine::Delete {
-        content: " bye".into(),
-        old_lineno: 3,
-    };
-    let v = serde_json::to_value(&line).unwrap();
-    assert_eq!(v["kind"], "delete");
-    assert_eq!(v["old_lineno"], 3);
-    assert!(v.get("new_lineno").is_none());
-    let back: DiffLine = serde_json::from_value(v).unwrap();
-    assert_eq!(line, back);
-}
-
-#[test]
-fn diff_line_context_round_trips() {
-    let line = DiffLine::Context {
-        content: " ctx".into(),
-        old_lineno: 1,
-        new_lineno: 1,
-    };
-    let v = serde_json::to_value(&line).unwrap();
-    assert_eq!(v["kind"], "context");
-    assert_eq!(v["old_lineno"], 1);
-    assert_eq!(v["new_lineno"], 1);
-    let back: DiffLine = serde_json::from_value(v).unwrap();
-    assert_eq!(line, back);
-}
-
-#[test]
-fn diff_line_meta_round_trips() {
-    let line = DiffLine::Meta {
-        content: "@@ -1,1 +1,1 @@".into(),
-    };
-    let v = serde_json::to_value(&line).unwrap();
-    assert_eq!(v["kind"], "meta");
-    assert!(v.get("old_lineno").is_none());
-    assert!(v.get("new_lineno").is_none());
-    let back: DiffLine = serde_json::from_value(v).unwrap();
-    assert_eq!(line, back);
-}
-
-// ============================================================
-// Decode-failure regressions
-// ============================================================
-
-#[test]
-fn live_event_rejects_unknown_scope() {
-    let v = json!({"scope": "ghost", "ts": 1});
-    assert!(serde_json::from_value::<LiveEvent>(v).is_err());
-}
-
-#[test]
-fn diff_line_rejects_missing_kind() {
-    let v = json!({"content": "x", "new_lineno": 1});
-    assert!(serde_json::from_value::<DiffLine>(v).is_err());
 }
 
 #[test]

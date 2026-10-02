@@ -20,6 +20,7 @@ pub mod command_source;
 pub mod config;
 pub mod diff;
 pub mod doctor;
+pub(crate) mod event_source;
 pub mod events;
 pub mod export;
 pub mod feedback;

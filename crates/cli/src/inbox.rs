@@ -1,19 +1,14 @@
-//! An agent's inbox: `.clank/agents/<label>/inbox/`, a
-//! [`crate::priority_dir`] of messages. A message is its file, and its
-//! name — `NNN-<seq>-<slug>` — is both its place in line and its
-//! identity: the sequence number comes before the slug, so a priority
-//! reads in send order, and it is never reused, so a name that was
-//! handled can never come to mean a newer message.
+//! WAL-backed message delivery and migration of legacy file inboxes.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clank_core::ids::AgentLabel;
+use clank_core::wait::WaitItem;
 
-use crate::priority_dir::{self, Lookup};
+use crate::cli::github::log::{EventLog, Transport};
 
-const SEQ_DIGITS: usize = 8;
-const SEQ_MAX: u64 = 99_999_999;
+use crate::priority_dir;
 
 pub fn inbox_dir(repo: &Path, label: &AgentLabel) -> PathBuf {
     crate::agent_store::agents_root(repo)
@@ -29,21 +24,14 @@ pub struct Sender {
     pub repo: PathBuf,
 }
 
-/// One pending message.
+/// Parsed legacy input; its file retains custody until the WAL append succeeds.
 #[derive(Debug, Clone)]
-pub struct Message {
-    pub entry: priority_dir::Entry,
-    pub from: Option<String>,
-    pub repo: Option<PathBuf>,
-    pub sent: Option<String>,
-    pub body: String,
-}
-
-impl Message {
-    /// The body's first non-blank line, without a heading's `#`s.
-    pub fn subject(&self) -> &str {
-        first_line(&self.body)
-    }
+struct LegacyMessage {
+    entry: priority_dir::Entry,
+    from: Option<String>,
+    repo: Option<PathBuf>,
+    sent: Option<String>,
+    body: String,
 }
 
 /// Who a message says it is from, as a reader wants it — one wording
@@ -56,93 +44,10 @@ pub fn sender_words(from: Option<&str>, repo: Option<&str>) -> String {
     }
 }
 
-/// Every pending message in `label`'s inbox, in the order they wake.
-pub fn scan(repo: &Path, label: &AgentLabel) -> Vec<Message> {
-    priority_dir::scan(&inbox_dir(repo, label))
-        .into_iter()
-        // A file gone between the listing and the read was handled in
-        // between; it is not pending.
-        .filter_map(|entry| {
-            let raw = std::fs::read_to_string(&entry.path).ok()?;
-            Some(parse(entry, &raw))
-        })
-        .collect()
-}
-
-/// The pending message `handle` means: its file stem, else its name.
-pub fn resolve(repo: &Path, label: &AgentLabel, handle: &str) -> anyhow::Result<Message> {
-    let entries = priority_dir::scan(&inbox_dir(repo, label));
-    let entry = match priority_dir::by_handle(&entries, handle) {
-        Lookup::One(e) => e.clone(),
-        Lookup::None => {
-            anyhow::bail!(
-                "no such message `{handle}` in `{label}`'s inbox (it may already \
-                 have migrated into the event log -- see `clank events list`)"
-            )
-        }
-        Lookup::Many(many) => anyhow::bail!(
-            "`{handle}` names {} messages ({}); pass the file stem",
-            many.len(),
-            many.iter()
-                .map(|e| e.file_stem())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    let raw = std::fs::read_to_string(&entry.path)
-        .with_context(|| format!("reading `{}`", entry.path.display()))?;
-    Ok(parse(entry, &raw))
-}
-
-/// Mark a message handled: it leaves the inbox. Returns where it was.
-pub fn done(repo: &Path, label: &AgentLabel, handle: &str) -> anyhow::Result<PathBuf> {
-    let message = resolve(repo, label, handle)?;
-    std::fs::remove_file(&message.entry.path)
-        .with_context(|| format!("removing `{}`", message.entry.path.display()))?;
-    Ok(message.entry.path)
-}
-
-/// Every message sits at one priority. Ordering is ARRIVAL order,
-/// which the sequence number in the stem already carries; a per-message
-/// knob for reordering an inbox is what
-/// `a-message-is-an-event-like-any-other` removes.
-pub const SEND_PRIORITY: u16 = 500;
-
-pub fn send(
-    repo: &Path,
-    label: &AgentLabel,
-    from: Option<&Sender>,
-    sent: &str,
-    body: &str,
-) -> anyhow::Result<PathBuf> {
-    let priority = SEND_PRIORITY;
-    let dir = inbox_dir(repo, label);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
-    let _lock = crate::agent_store::exclusive_lock(&dir.join(".lock"))?;
-    clear_staging(&dir);
-    let mut staged = tempfile::Builder::new()
-        .prefix(STAGING_PREFIX)
-        .suffix(".tmp")
-        .tempfile_in(&dir)
-        .with_context(|| format!("staging a message in `{}`", dir.display()))?;
-    {
-        use std::io::Write;
-        staged
-            .write_all(render(from, sent, body).as_bytes())
-            .and_then(|()| staged.as_file().sync_all())
-            .with_context(|| format!("writing `{}`", staged.path().display()))?;
-    }
-    let seq = next_seq(&dir)?;
-    publish(&dir, staged.path(), priority, seq, &slug_of(body))
-}
-
 const STAGING_PREFIX: &str = ".send-";
 
-/// Remove what earlier sends left staged. A send that died after
-/// publishing leaves its staging file as a second name for the message
-/// it published; unlinking that name leaves the message whole, and no
-/// send ever opens one again. Only called under the inbox lock, so no
-/// other send is staging.
+/// Interrupted legacy sends may leave staging hard links. Unlinking them
+/// preserves published messages; migration holds the old inbox lock.
 fn clear_staging(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -158,68 +63,6 @@ fn clear_staging(dir: &Path) {
     }
 }
 
-/// Link the complete file `tmp` into `dir` under the first number from
-/// `seq` whose name is free, reserving each number it tries.
-fn publish(dir: &Path, tmp: &Path, priority: u16, seq: u64, slug: &str) -> anyhow::Result<PathBuf> {
-    let mut seq = seq;
-    loop {
-        reserve(dir, seq)?;
-        let name = format!("{seq:0width$}-{slug}", width = SEQ_DIGITS);
-        let dest = dir.join(priority_dir::file_name(priority, &name));
-        match std::fs::hard_link(tmp, &dest) {
-            Ok(()) => return Ok(dest),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => seq += 1,
-            Err(e) => {
-                return Err(anyhow::anyhow!("publishing `{}`: {e}", dest.display()));
-            }
-        }
-    }
-}
-
-/// One past the larger of the last number allocated and the highest
-/// pending, so a message written by hand cannot make the counter go
-/// back. An unreadable counter is an error, never a guess: guessing low
-/// is how a number gets reused.
-fn next_seq(dir: &Path) -> anyhow::Result<u64> {
-    let path = dir.join(".seq");
-    let stored = match std::fs::read_to_string(&path) {
-        Ok(s) => s
-            .trim()
-            .parse::<u64>()
-            .with_context(|| format!("`{}` does not hold a message number", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(anyhow::anyhow!("reading `{}`: {e}", path.display())),
-    };
-    let pending = priority_dir::scan(dir)
-        .iter()
-        .filter_map(|e| seq_of(&e.name))
-        .max()
-        .unwrap_or(0);
-    Ok(stored.max(pending) + 1)
-}
-
-fn reserve(dir: &Path, seq: u64) -> anyhow::Result<()> {
-    if seq > SEQ_MAX {
-        anyhow::bail!(
-            "`{}` has used every message number up to {SEQ_MAX}; nothing more can be sent to it",
-            dir.display()
-        );
-    }
-    let tmp = dir.join(".seq.tmp");
-    std::fs::write(&tmp, format!("{seq}\n"))
-        .with_context(|| format!("writing `{}`", tmp.display()))?;
-    std::fs::rename(&tmp, dir.join(".seq"))
-        .with_context(|| format!("recording message number {seq} in `{}`", dir.display()))
-}
-
-/// The sequence number a message's name leads with, if it has one.
-fn seq_of(name: &str) -> Option<u64> {
-    let (digits, _) = name.split_once('-')?;
-    (digits.len() == SEQ_DIGITS && digits.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| digits.parse().ok())
-        .flatten()
-}
-
 fn first_line(body: &str) -> &str {
     body.lines()
         .map(str::trim)
@@ -228,49 +71,14 @@ fn first_line(body: &str) -> &str {
         .unwrap_or("")
 }
 
-/// A file-name-safe rendering of the body's first line.
-fn slug_of(body: &str) -> String {
-    const MAX: usize = 40;
-    let mut slug = String::new();
-    for c in first_line(body).chars() {
-        if slug.len() >= MAX {
-            break;
-        }
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug = slug.trim_end_matches('-');
-    if slug.is_empty() {
-        "message".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-fn render(from: Option<&Sender>, sent: &str, body: &str) -> String {
-    let mut out = String::from("---\n");
-    if let Some(s) = from {
-        out.push_str(&format!("from: {}\nrepo: {}\n", s.label, s.repo.display()));
-    }
-    out.push_str(&format!("sent: {sent}\n---\n"));
-    out.push_str(body);
-    if !body.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
 /// Split a message file into its header and body.
 ///
 /// Only a header clank writes is a header: a closed `---` block of
 /// nothing but `from`, `repo` and `sent`, with `sent` present. Anything
 /// else at the top — a hand-written message that opens with a markdown
 /// rule — is body, all of it.
-fn parse(entry: priority_dir::Entry, raw: &str) -> Message {
-    let whole = |entry| Message {
+fn parse(entry: priority_dir::Entry, raw: &str) -> LegacyMessage {
+    let whole = |entry| LegacyMessage {
         entry,
         from: None,
         repo: None,
@@ -289,7 +97,7 @@ fn parse(entry: priority_dir::Entry, raw: &str) -> Message {
             let Some(sent) = sent else {
                 return whole(entry);
             };
-            return Message {
+            return LegacyMessage {
                 entry,
                 from,
                 repo,
@@ -306,13 +114,6 @@ fn parse(entry: priority_dir::Entry, raw: &str) -> Message {
     }
     whole(entry)
 }
-
-// ── a message is an event (a-message-is-an-event-like-any-other) ──
-// Everything above this line is the FILE inbox, which exists now only
-// so messages written before this change can be migrated out of it.
-
-use crate::cli::github::log::{EventLog, Transport};
-use clank_core::wait::WaitItem;
 
 /// The one source every message in a repo is logged to.
 ///
@@ -678,15 +479,12 @@ mod tests {
         AgentLabel::parse("grok").unwrap()
     }
 
-    fn names(repo: &Path) -> Vec<String> {
-        scan(repo, &grok())
-            .iter()
-            .map(|m| m.entry.file_stem())
-            .collect()
-    }
-
-    fn send_at(repo: &Path, body: &str) -> PathBuf {
-        send(repo, &grok(), None, SENT, body).unwrap()
+    fn legacy_file(repo: &Path, name: &str, raw: &str) -> PathBuf {
+        let dir = inbox_dir(repo, &grok());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        std::fs::write(&file, raw).unwrap();
+        file
     }
 
     /// A MESSAGE IS AN EVENT: it is logged, it wakes until acked, and
@@ -920,6 +718,22 @@ mod tests {
 
         let woken = pending(repo.path(), &to);
         assert_eq!(woken.len(), n, "all of them are owed: {woken:?}");
+        let mut bodies: Vec<String> = woken
+            .iter()
+            .map(|item| {
+                let WaitItem::Message { body, .. } = item else {
+                    panic!("message")
+                };
+                body.clone()
+            })
+            .collect();
+        bodies.sort();
+        let mut expected: Vec<String> = (0..n).map(|i| format!("# Ping {i}\n\nbody")).collect();
+        expected.sort();
+        assert_eq!(
+            bodies, expected,
+            "concurrent appends preserve every body whole"
+        );
         let selectors: std::collections::BTreeSet<String> = woken
             .iter()
             .filter_map(|i| match i {
@@ -1360,24 +1174,29 @@ mod tests {
     }
 
     /// A REAL INBOX MIGRATES AWAY COMPLETELY.
-    ///
-    /// Built by the send path rather than by hand, so it has what a
-    /// historical inbox actually has: a `.seq` counter and a `.lock`
-    /// beside the messages. Hand-made fixtures have neither, which is
-    /// how a cleanup that removed only the lock passed while leaving
-    /// every real directory standing and every read re-migrating it.
     #[test]
     fn a_real_inbox_leaves_nothing_behind() {
         let repo = tempfile::tempdir().unwrap();
         let to = grok();
-        let from = Sender {
-            label: "claude".into(),
-            repo: PathBuf::from("/src/clank"),
-        };
-        send(repo.path(), &to, Some(&from), SENT, "# First\n\nbody").unwrap();
-        send(repo.path(), &to, None, SENT, "# Second\n\nbody").unwrap();
+        legacy_file(
+            repo.path(),
+            "500-00000001-first.md",
+            &format!("---\nfrom: claude\nrepo: /src/clank\nsent: {SENT}\n---\n# First\n\nbody\n"),
+        );
+        legacy_file(
+            repo.path(),
+            "500-00000002-second.md",
+            &format!("---\nsent: {SENT}\n---\n# Second\n\nbody\n"),
+        );
         let dir = inbox_dir(repo.path(), &to);
-        assert!(dir.join(".seq").exists(), "the send path keeps a counter");
+        for (name, contents) in [
+            (".seq", "2\n"),
+            (".seq.tmp", "2\n"),
+            (".lock", ""),
+            (".send-incomplete.tmp", "half a message"),
+        ] {
+            std::fs::write(dir.join(name), contents).unwrap();
+        }
 
         assert_eq!(migrate(repo.path(), &to).unwrap(), 2);
         assert!(
@@ -1560,11 +1379,20 @@ mod tests {
     #[test]
     fn sends_read_in_send_order() {
         let repo = tempfile::tempdir().unwrap();
-        send_at(repo.path(), "z-first");
-        send_at(repo.path(), "a-second");
+        deliver(repo.path(), &grok(), None, SENT, "z-first").unwrap();
+        deliver(repo.path(), &grok(), None, SENT, "a-second").unwrap();
+        let subjects: Vec<String> = pending(repo.path(), &grok())
+            .into_iter()
+            .map(|item| {
+                let WaitItem::Message { subject, .. } = item else {
+                    panic!("message")
+                };
+                subject
+            })
+            .collect();
         assert_eq!(
-            names(repo.path()),
-            ["500-00000001-z-first", "500-00000002-a-second"],
+            subjects,
+            ["z-first", "a-second"],
             "send order, not subject order"
         );
     }
@@ -1573,202 +1401,155 @@ mod tests {
     fn twelve_sends_with_one_subject_read_in_send_order() {
         let repo = tempfile::tempdir().unwrap();
         for i in 0..12 {
-            send(repo.path(), &grok(), None, SENT, &format!("review\n\n{i}")).unwrap();
+            deliver(repo.path(), &grok(), None, SENT, &format!("review\n\n{i}")).unwrap();
         }
-        let bodies: Vec<String> = scan(repo.path(), &grok())
-            .iter()
-            .map(|m| m.body.lines().last().unwrap().to_string())
-            .collect();
-        let expected: Vec<String> = (0..12).map(|i| i.to_string()).collect();
-        assert_eq!(bodies, expected, "the tenth after the ninth");
-    }
-
-    /// Send order is the only order, now that every message sits at one
-    /// priority — and a hand-dropped file with no sequence at all still
-    /// has a place, which migration depends on.
-    #[test]
-    fn sends_read_in_order_and_a_bare_file_sorts_last() {
-        let repo = tempfile::tempdir().unwrap();
-        send_at(repo.path(), "early");
-        send_at(repo.path(), "urgent");
-        std::fs::write(inbox_dir(repo.path(), &grok()).join("by-hand.md"), "x").unwrap();
-        assert_eq!(
-            names(repo.path()),
-            ["500-00000001-early", "500-00000002-urgent", "by-hand"]
-        );
-    }
-
-    #[test]
-    fn a_send_leaves_nothing_but_its_message_to_list() {
-        let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".send-1.tmp"), "half a mess").unwrap();
-        send_at(repo.path(), "hello");
-        assert_eq!(names(repo.path()), ["500-00000001-hello"]);
-    }
-
-    /// A writer that bypassed the lock has taken the name this send
-    /// would publish under. Linking refuses the name; renaming onto it
-    /// would have deleted that writer's message.
-    #[test]
-    fn publishing_never_replaces_a_message() {
-        let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
-        let theirs = dir.join("500-00000001-hello.md");
-        std::fs::write(&theirs, "theirs").unwrap();
-        let tmp = dir.join(".send-test.tmp");
-        std::fs::write(&tmp, "mine").unwrap();
-
-        let dest = publish(&dir, &tmp, 500, 1, "hello").unwrap();
-
-        assert_eq!(dest, dir.join("500-00000002-hello.md"));
-        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs");
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
-    }
-
-    #[test]
-    fn senders_released_together_all_arrive_whole() {
-        let repo = tempfile::tempdir().unwrap();
-        let n = 8;
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                let (repo, barrier) = (repo.path().to_path_buf(), barrier.clone());
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    send(&repo, &grok(), None, SENT, &format!("from sender {i}")).unwrap();
-                })
+        let bodies: Vec<String> = pending(repo.path(), &grok())
+            .into_iter()
+            .map(|item| {
+                let WaitItem::Message { body, .. } = item else {
+                    panic!("message")
+                };
+                body.lines().last().unwrap().to_string()
             })
             .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        let mut bodies: Vec<String> = scan(repo.path(), &grok())
+        assert_eq!(bodies, (0..12).map(|i| i.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn migration_preserves_file_order_with_a_bare_file_last() {
+        let repo = tempfile::tempdir().unwrap();
+        legacy_file(repo.path(), "500-00000001-early.md", "early");
+        legacy_file(repo.path(), "500-00000002-urgent.md", "urgent");
+        legacy_file(repo.path(), "by-hand.md", "by hand");
+        let subjects: Vec<String> = pending(repo.path(), &grok())
             .into_iter()
-            .map(|m| m.body)
+            .map(|item| {
+                let WaitItem::Message { subject, .. } = item else {
+                    panic!("message")
+                };
+                subject
+            })
             .collect();
-        bodies.sort();
-        let mut expected: Vec<String> = (0..n).map(|i| format!("from sender {i}\n")).collect();
-        expected.sort();
-        assert_eq!(bodies, expected);
+        assert_eq!(subjects, ["early", "urgent", "by hand"]);
     }
 
     #[test]
-    fn a_handled_name_never_comes_to_mean_a_newer_message() {
+    fn an_acked_selector_never_handles_a_new_message() {
         let repo = tempfile::tempdir().unwrap();
-        let a = send_at(repo.path(), "review please");
-        let a_handle = a.file_stem().unwrap().to_string_lossy().into_owned();
-        done(repo.path(), &grok(), &a_handle).unwrap();
-        let b = send_at(repo.path(), "review please");
-        let b_bytes = std::fs::read(&b).unwrap();
-
-        assert_ne!(a, b, "the drained inbox did not reuse A's number");
-        let late = done(repo.path(), &grok(), &a_handle).unwrap_err();
-        assert!(late.to_string().contains("no such message"), "{late}");
-        assert_eq!(std::fs::read(&b).unwrap(), b_bytes, "B is untouched");
-    }
-
-    #[test]
-    fn a_counter_it_cannot_read_stops_the_send() {
-        let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".seq"), "not a number").unwrap();
-        assert!(send(repo.path(), &grok(), None, SENT, "hello").is_err());
-        assert!(names(repo.path()).is_empty());
-    }
-
-    #[test]
-    fn numbers_stop_rather_than_wrap() {
-        let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".seq"), format!("{SEQ_MAX}")).unwrap();
-        let err = send(repo.path(), &grok(), None, SENT, "hello").unwrap_err();
-        assert!(err.to_string().contains("every message number"), "{err}");
-        assert!(names(repo.path()).is_empty());
-    }
-
-    #[test]
-    fn the_header_names_its_sender_or_nobody() {
-        let repo = tempfile::tempdir().unwrap();
-        let claude = Sender {
-            label: "claude".to_string(),
-            repo: PathBuf::from("/src/clank"),
+        deliver(repo.path(), &grok(), None, SENT, "review please").unwrap();
+        let first = rows_of(repo.path(), &grok()).remove(0);
+        let key = crate::cli::github::timeline::MemberKey {
+            agent: grok().as_str().into(),
+            source: MESSAGES_SOURCE.into(),
+            seq: first.seq,
+            ident: first.ident,
         };
-        send(
+        crate::cli::events::ack_members(repo.path(), std::slice::from_ref(&key)).unwrap();
+        let second = deliver(repo.path(), &grok(), None, SENT, "review please").unwrap();
+        crate::cli::events::ack_members(repo.path(), &[key]).unwrap();
+        let owed = pending(repo.path(), &grok());
+        assert_eq!(owed.len(), 1);
+        let WaitItem::Message {
+            handle, selector, ..
+        } = &owed[0]
+        else {
+            panic!("message")
+        };
+        assert_eq!(handle, &second);
+        assert_eq!(selector.as_deref(), Some("messages@2"));
+    }
+
+    #[test]
+    fn migration_preserves_sender_metadata_or_its_absence() {
+        let repo = tempfile::tempdir().unwrap();
+        legacy_file(
             repo.path(),
-            &grok(),
-            Some(&claude),
-            SENT,
-            "# Rebase please\n\nonto master",
-        )
-        .unwrap();
-        send_at(repo.path(), "from a person");
-        let messages = scan(repo.path(), &grok());
-
-        assert_eq!(messages[0].from.as_deref(), Some("claude"));
-        assert_eq!(messages[0].repo.as_deref(), Some(Path::new("/src/clank")));
-        assert_eq!(messages[0].sent.as_deref(), Some(SENT));
-        assert_eq!(messages[0].subject(), "Rebase please");
-        assert_eq!(messages[0].body, "# Rebase please\n\nonto master\n");
-        assert_eq!(messages[0].entry.name, "00000001-rebase-please");
-
-        assert_eq!(
-            (messages[1].from.as_ref(), messages[1].repo.as_ref()),
-            (None, None)
+            "500-00000001-agent.md",
+            &format!(
+                "---\nfrom: claude\nrepo: /src/clank\nsent: {SENT}\n---\n# Rebase please\n\nonto master\n"
+            ),
         );
-        assert_eq!(messages[1].sent.as_deref(), Some(SENT));
+        legacy_file(
+            repo.path(),
+            "500-00000002-person.md",
+            &format!("---\nsent: {SENT}\n---\nfrom a person\n"),
+        );
+        let messages = pending(repo.path(), &grok());
+        let timestamps: Vec<Option<u64>> = rows_of(repo.path(), &grok())
+            .into_iter()
+            .map(|row| row.event_at)
+            .collect();
+        assert_eq!(timestamps, vec![Some(1790072100); 2]);
+
+        let WaitItem::Message {
+            from,
+            repo,
+            subject,
+            body,
+            ..
+        } = &messages[0]
+        else {
+            panic!("message")
+        };
+        assert_eq!(from.as_deref(), Some("claude"));
+        assert_eq!(repo.as_deref(), Some("/src/clank"));
+        assert_eq!(subject, "Rebase please");
+        assert_eq!(body, "# Rebase please\n\nonto master\n");
+        let WaitItem::Message { from, repo, .. } = &messages[1] else {
+            panic!("message")
+        };
+        assert_eq!((from.as_ref(), repo.as_ref()), (None, None));
     }
 
     #[test]
     fn a_hand_written_message_is_all_body() {
         let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("note.md"), "---\nnot closed\n").unwrap();
-        let m = &scan(repo.path(), &grok())[0];
-        assert_eq!((m.from.as_ref(), m.sent.as_ref()), (None, None));
-        assert_eq!(m.body, "---\nnot closed\n");
+        let raw = "---\nnot closed\n";
+        legacy_file(repo.path(), "note.md", raw);
+        let messages = pending(repo.path(), &grok());
+        let WaitItem::Message { from, body, .. } = &messages[0] else {
+            panic!("message")
+        };
+        assert_eq!(from, &None);
+        assert_eq!(body, raw);
     }
 
     #[test]
     fn an_opening_rule_is_body_not_a_header() {
         let repo = tempfile::tempdir().unwrap();
-        let dir = inbox_dir(repo.path(), &grok());
-        std::fs::create_dir_all(&dir).unwrap();
         let ruled = "---\nImportant first section\n---\nSecond section\n";
-        std::fs::write(dir.join("ruled.md"), ruled).unwrap();
         let unsent = "---\nfrom: claude\n---\nbody\n";
-        std::fs::write(dir.join("unsent.md"), unsent).unwrap();
-        let messages = scan(repo.path(), &grok());
-        for (m, raw) in messages.iter().zip([ruled, unsent]) {
-            assert_eq!(m.body, raw, "{}", m.entry.name);
-            assert_eq!((m.from.as_ref(), m.sent.as_ref()), (None, None));
+        legacy_file(repo.path(), "ruled.md", ruled);
+        legacy_file(repo.path(), "unsent.md", unsent);
+        let messages = pending(repo.path(), &grok());
+        for (item, raw) in messages.iter().zip([ruled, unsent]) {
+            let WaitItem::Message { body, from, .. } = item else {
+                panic!("message")
+            };
+            assert_eq!(body, raw);
+            assert_eq!(from, &None);
         }
     }
 
-    /// A send that died after publishing left its staging file as a
-    /// second name for the message it published. A later send must not
-    /// write through that name.
     #[test]
-    fn a_leftover_staging_file_is_never_written_through() {
+    fn migration_removes_staging_links_without_mutating_the_message() {
         let repo = tempfile::tempdir().unwrap();
-        let a = send_at(repo.path(), "first");
-        let a_bytes = std::fs::read(&a).unwrap();
+        let file = legacy_file(repo.path(), "500-00000001-first.md", "first\n");
+        let bytes = std::fs::read(&file).unwrap();
+        let witness = repo.path().join("published-bytes");
+        std::fs::hard_link(&file, &witness).unwrap();
         let dir = inbox_dir(repo.path(), &grok());
-        for leftover in [
-            format!(".send-{}.tmp", std::process::id()),
-            ".send-leftover.tmp".to_string(),
-        ] {
-            std::fs::hard_link(&a, dir.join(leftover)).unwrap();
+        for name in [".send-old.tmp", ".send-leftover.tmp"] {
+            std::fs::hard_link(&file, dir.join(name)).unwrap();
         }
-
-        send_at(repo.path(), "second");
-
-        assert_eq!(std::fs::read(&a).unwrap(), a_bytes, "A is untouched");
-        assert_eq!(names(repo.path()).len(), 2);
+        assert_eq!(migrate(repo.path(), &grok()).unwrap(), 1);
+        assert_eq!(std::fs::read(witness).unwrap(), bytes);
+        assert!(!dir.exists());
+        let messages = pending(repo.path(), &grok());
+        assert_eq!(messages.len(), 1);
+        let WaitItem::Message { body, .. } = &messages[0] else {
+            panic!("message")
+        };
+        assert_eq!(body.as_bytes(), bytes);
     }
 }

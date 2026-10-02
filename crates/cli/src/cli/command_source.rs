@@ -557,41 +557,15 @@ pub(crate) fn stamp_selector(item: &mut clank_core::wait::WaitItem, source_key: 
 /// invocation goes in the key, so neither can happen.
 pub(crate) fn storage_key(
     key: String,
-    origin: crate::cli::github::supervisor::SourceOrigin,
+    origin: crate::cli::event_source::SourceOrigin,
     invocation: &str,
 ) -> String {
-    use crate::cli::github::supervisor::SourceOrigin;
+    use crate::cli::event_source::SourceOrigin;
     match origin {
         SourceOrigin::Config => key,
         SourceOrigin::Cli => format!("{key}-inv-{invocation}"),
     }
 }
-
-/// Whether the event an emission describes is in its source's log.
-///
-/// CARRIED, never inferred. A reader that presents from the log has to
-/// know, and only the producer does — it is the one that saw the
-/// append succeed or fail. Two rounds were spent trying to infer it
-/// and both failed for different reasons (codex on 0555c8f, aa3d9a5):
-/// a durable emission is not even EQUAL to its stored row, because
-/// presentation is stamped after the append; and absence from the log
-/// proves nothing anyway, since an acked row is compacted away, a
-/// reconfigured source stops being scanned, and a read can simply
-/// fail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Durability {
-    /// The log holds it, so the log decides who is owed it and when.
-    /// A reader presenting from the log must not deliver this copy
-    /// beside it.
-    Logged,
-    /// The append failed and the source emitted anyway — github warns
-    /// once and keeps delivering so the agent still learns about the
-    /// event — so this copy is the only record there will ever be.
-    Transient,
-}
-
-/// An emitted item, and whether its log holds it.
-pub(crate) type Emission = (clank_core::wait::WaitItem, Durability);
 
 /// What a client is owed from a source's durable log.
 ///
@@ -2112,7 +2086,7 @@ mod producer_tests {
     /// other's events (codex on a135276).
     #[test]
     fn an_invocations_source_owns_its_own_namespace() {
-        use crate::cli::github::supervisor::SourceOrigin;
+        use crate::cli::event_source::SourceOrigin;
         let named = "command-deploys-1234abcd".to_string();
 
         assert_eq!(

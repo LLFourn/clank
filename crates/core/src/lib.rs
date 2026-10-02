@@ -18,10 +18,6 @@
 //! - [`checkpoint`] — pure spacing policy for the fold's on-disk
 //!   state checkpoints (`should_checkpoint`, `prune_plan`): every
 //!   commit near the tip, gaps doubling with distance.
-//! - [`model`] — small surviving DTOs (`Feedback`, `CommitGate`)
-//!   used by projection-time review-gate computation. Not folded
-//!   into state; built on demand from
-//!   `.clank/agents/<author>/feedback/<plan-or-_>/<ref>.md` files.
 //! - [`feedback_view`] — typed `FeedbackView` of one plan's review
 //!   files. Pure data; the CLI scans the filesystem into this shape
 //!   and feeds it to gate computation.
@@ -57,7 +53,6 @@ pub mod feedback_view;
 pub mod hook_io;
 pub mod identity;
 pub mod ids;
-pub mod model;
 pub mod plan_view;
 pub mod pr_review;
 pub mod repo_state;

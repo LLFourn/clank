@@ -10,6 +10,8 @@
 use clank_core::agent_config::GithubSource;
 use clank_core::wait::WaitItem;
 
+use crate::cli::event_source::SourceOrigin;
+
 use super::ci::{CiReader, GhCi};
 use super::coordinator::{ChecksSide, FeedSide, poll_loop};
 use super::feed::{EventFetcher, GhFetcher, effective_interval, row_in_scope};
@@ -50,14 +52,6 @@ pub(crate) fn write_watch_sidecar(
     }
 }
 
-/// Where an armed source came from — the provenance that decides
-/// who stores its prompt (github-watch-prompts, codex 16ea191).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SourceOrigin {
-    Config,
-    Cli,
-}
-
 /// One github wake source: the production entry point. Every source
 /// in the process shares ONE host-scoped session (one token
 /// acquisition, one 401 story — codex f9807c3). `delivery: realtime`
@@ -65,76 +59,54 @@ pub(crate) enum SourceOrigin {
 /// completeness backstop either way.
 pub(crate) async fn run_github_source(
     src: GithubSource,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
     origin: SourceOrigin,
     key: String,
 ) {
-    // The per-watch operator prompt is stamped HERE — the single
-    // choke point between this source's machinery (live ingest,
-    // backlog, takeover tail) and the wait — never at
-    // classification, so the WAL stores no prompt and editing the
-    // watch retitles already-logged events (github-watch-prompts).
-    let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
-    let stamper = stamp_instructions_forwarder(irx, tx, src.prompt.clone());
-
-    // Presentation-metadata sidecar, provenance-gated — see
-    // [`write_watch_sidecar`].
+    let tx = with_prompt(tx, src.prompt.clone());
     if let Some(dir) = &events_dir {
         write_watch_sidecar(dir, &src, origin, &key);
     }
-
-    // The supervisor arm OWNS `itx`: when it returns, the drop
-    // closes the channel and the stamper drains out — the join can
-    // never hang on a live-but-idle intermediate channel.
-    let ((), ()) = tokio::join!(
-        async {
-            let session = shared_session();
-            let fetcher = GhFetcher {
-                repo: src.repo.clone(),
-                session: session.clone(),
-            };
-            let ci = GhCi {
-                repo: src.repo.clone(),
-                prs: super::selection::Selection::of(&src).ci_scope(),
-                session: session.clone(),
-            };
-            let login = GhLogin(session);
-            let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
-            let src2 = src.clone();
-            source_supervisor(
-                &src,
-                FeedSide {
-                    fetcher: &fetcher,
-                    login: &login,
-                },
-                &ci,
-                &itx,
-                events_dir,
-                move || async move {
-                    if realtime {
-                        start_relay(&src2, GhForwarder).await
-                    } else {
-                        None
-                    }
-                },
-                key,
-            )
-            .await;
-            drop(itx);
+    let session = shared_session();
+    let fetcher = GhFetcher {
+        repo: src.repo.clone(),
+        session: session.clone(),
+    };
+    let ci = GhCi {
+        repo: src.repo.clone(),
+        prs: Selection::of(&src).ci_scope(),
+        session: session.clone(),
+    };
+    let login = GhLogin(session);
+    let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
+    let src2 = src.clone();
+    source_supervisor(
+        &src,
+        FeedSide {
+            fetcher: &fetcher,
+            login: &login,
         },
-        stamper
-    );
+        &ci,
+        &tx,
+        events_dir,
+        move || async move {
+            if realtime {
+                start_relay(&src2, GhForwarder).await
+            } else {
+                None
+            }
+        },
+        key,
+    )
+    .await;
 }
 
-/// Forward items, stamping the watch's `prompt` onto every github
-/// event that passes. Pure plumbing, unit-tested without transports.
-async fn stamp_instructions_forwarder(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+fn with_prompt(
+    tx: crate::cli::event_source::EmissionSink,
     prompt: Option<String>,
-) {
-    while let Some((mut item, durability)) = rx.recv().await {
+) -> crate::cli::event_source::EmissionSink {
+    tx.map(move |(mut item, durability)| {
         if let WaitItem::GithubEvent {
             ref mut instructions,
             ..
@@ -142,10 +114,8 @@ async fn stamp_instructions_forwarder(
         {
             instructions.clone_from(&prompt);
         }
-        if tx.send((item, durability)).is_err() {
-            return;
-        }
-    }
+        (item, durability)
+    })
 }
 
 /// The lease-gated source runtime (wal-single-ingest-writer): the
@@ -159,7 +129,7 @@ async fn source_supervisor<F, R, C, RF, RFut>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     reader: &C,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: &crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
     relay_start: RF,
     key: String,
@@ -299,7 +269,7 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                     && row_in_scope(src, &row.item)
                     && presented.insert((row.seq, row.ident.clone()))
                     && tx
-                        .send((row.item, crate::cli::command_source::Durability::Logged))
+                        .send((row.item, crate::cli::event_source::Durability::Logged))
                         .is_err()
                 {
                     return; // wait gone
@@ -427,6 +397,7 @@ mod tests {
             }
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let rs = relay_started.clone();
@@ -532,6 +503,7 @@ mod tests {
             }
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let d = dir.clone();
         let s2 = s.clone();
         let handle = tokio::spawn(async move {
@@ -567,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stamper_stamps_github_items_at_presentation_only() {
+    async fn sink_stamps_github_items_at_presentation_only() {
         // The WAL side: a classified item serializes WITHOUT the
         // instructions field (presentation-only; the log format is
         // untouched by github-watch-prompts)…
@@ -588,23 +560,17 @@ mod tests {
         let stored = serde_json::to_string(&c.item).unwrap();
         assert!(!stored.contains("instructions"), "WAL bytes: {stored}");
 
-        // …and the forwarder is the single stamping choke point.
-        let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
-        let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
-        let fwd = tokio::spawn(stamp_instructions_forwarder(
-            irx,
-            otx,
-            Some("triage and reply".into()),
-        ));
-        itx.send((c.item, crate::cli::command_source::Durability::Logged))
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = with_prompt(tx.into(), Some("triage and reply".into()));
+        sink.send((c.item, crate::cli::event_source::Durability::Logged))
             .unwrap();
-        drop(itx);
-        let out = orx.recv().await.expect("forwarded");
+        let out = rx
+            .try_recv()
+            .expect("prompt stamped before acceptance returns");
         let (WaitItem::GithubEvent { instructions, .. }, _) = out else {
             panic!("github item");
         };
         assert_eq!(instructions.as_deref(), Some("triage and reply"));
-        fwd.await.unwrap();
     }
 
     #[test]

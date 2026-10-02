@@ -400,13 +400,15 @@ async fn items_with_policy(
     // `EventSources::spawn`, because the claim under test is about this
     // PATH reaching it, not about that function's own behaviour.
     starts.record();
-    let mut spawned = EventSources::spawn(
+    let (tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
+    let spawned = EventSources::spawn(
         &sources.events,
         Some(&events_dir),
         &repo,
         &author,
         &sources.drafts,
         Some(&invocation),
+        tx.into(),
     );
     // Once the source channel closes (every source task finished, or
     // there were none), its `recv()` is permanently ready with `None`
@@ -430,7 +432,7 @@ async fn items_with_policy(
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     while beat.rx.try_recv().is_ok() {}
                 }
-                item = spawned.rx.recv(), if sources_open => {
+                item = source_rx.recv(), if sources_open => {
                     match item {
                         // The local path delivers from the channel
                         // whatever the log holds, so provenance is not
@@ -446,7 +448,7 @@ async fn items_with_policy(
             // Drain items queued before/at this beat (whichever branch
             // woke us) so a repo-branch win doesn't strand a ready
             // external item (codex 1bbb61d).
-            drain_external(&mut spawned.rx, &mut sources_open, &mut external);
+            drain_external(&mut source_rx, &mut sources_open, &mut external);
 
             // Re-derive the projection inputs EVERY wake: config.json is a
             // wake dir, and a parked wait projecting with the team captured
@@ -485,7 +487,7 @@ async fn items_with_policy(
             // produced during the refold, and then BOTH routes meet the
             // block decision TOGETHER. Park only when it admits nothing
             // (codex 907acd5; codex 344280f for the together).
-            drain_external(&mut spawned.rx, &mut sources_open, &mut external);
+            drain_external(&mut source_rx, &mut sources_open, &mut external);
             // Nothing is lost by draining into the decision. It
             // returns empty only when `events` is empty, and these
             // items ARE events — which matters because a source
@@ -748,7 +750,7 @@ pub(crate) fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Re
 struct WakeSources {
     events: Vec<(
         clank_core::agent_config::WaitEventSource,
-        crate::cli::github::supervisor::SourceOrigin,
+        crate::cli::event_source::SourceOrigin,
     )>,
     drafts: Vec<(u32, String)>,
 }
@@ -759,7 +761,7 @@ impl WakeSources {
         role: Role,
         events: Vec<(
             clank_core::agent_config::WaitEventSource,
-            crate::cli::github::supervisor::SourceOrigin,
+            crate::cli::event_source::SourceOrigin,
         )>,
     ) -> Self {
         // Master's open PR reviews get a draft watch each, derived from
@@ -796,7 +798,7 @@ impl WakeSources {
                 .all(|(_, origin)| {
                     matches!(
                         origin,
-                        crate::cli::github::supervisor::SourceOrigin::Config
+                        crate::cli::event_source::SourceOrigin::Config
                     )
                 })
     }
@@ -1014,10 +1016,10 @@ pub(crate) fn resolve_wait_event_sources(
 ) -> anyhow::Result<
     Vec<(
         clank_core::agent_config::WaitEventSource,
-        crate::cli::github::supervisor::SourceOrigin,
+        crate::cli::event_source::SourceOrigin,
     )>,
 > {
-    use crate::cli::github::supervisor::SourceOrigin;
+    use crate::cli::event_source::SourceOrigin;
     // Provenance rides the merge (github-watch-prompts, codex
     // 16ea191): who declared a source decides who stores its prompt.
     let mut sources: Vec<_> = crate::agent_store::load_agent_config(repo, author)?
@@ -1111,7 +1113,7 @@ fn beat_owed(mut owed: Owed, external: &mut Vec<WaitItem>) -> Owed {
 /// fuse that prevents a closed channel from hot-looping the wait
 /// (codex 1bbb61d). No-op once closed.
 fn drain_external(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::event_source::Emission>,
     open: &mut bool,
     out: &mut Vec<WaitItem>,
 ) {
@@ -1130,12 +1132,6 @@ fn drain_external(
     }
 }
 
-/// External wake sources, spawned when the wait PARKS (the initial
-/// pass never spawns them) and torn down on every return path:
-/// [`EventSources::shutdown`] aborts AND joins each task, and command
-/// children die by process-group kill via a drop guard — abort-safe,
-/// so a shell wrapper's grandchildren can't outlive the wait
-/// (extra-wait-events).
 /// What a source calls itself, for a message about it.
 fn source_name(source: &clank_core::agent_config::WaitEventSource) -> String {
     match source {
@@ -1144,49 +1140,46 @@ fn source_name(source: &clank_core::agent_config::WaitEventSource) -> String {
     }
 }
 
+#[cfg(test)]
+fn spawn_local(
+    sources: &[(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::event_source::SourceOrigin,
+    )],
+    events_dir: Option<&std::path::Path>,
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    drafts: &[(u32, String)],
+    invocation: Option<&str>,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<crate::cli::event_source::Emission>,
+    EventSources,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        rx,
+        EventSources::spawn(
+            sources,
+            events_dir,
+            repo,
+            author,
+            drafts,
+            invocation,
+            tx.into(),
+        ),
+    )
+}
+
+/// Source tasks belong to the lifecycle owner, not the delivery queue.
+/// Local waits shut down and join them on return; monitor hosts retain them
+/// until retirement. Aborting also drops command process-group guards.
 pub(crate) struct EventSources {
-    rx: tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl EventSources {
-    fn into_parts(
-        mut self,
-    ) -> (
-        tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
-        Vec<tokio::task::JoinHandle<()>>,
-    ) {
-        (
-            std::mem::replace(&mut self.rx, tokio::sync::mpsc::unbounded_channel().1),
-            std::mem::take(&mut self.tasks),
-        )
-    }
-    /// Hand this set's items to `into`, TAGGED with whose they are, and
-    /// return every task that must be aborted to stop them.
-    ///
-    /// The monitor runs one of these per author and merges them onto a
-    /// single channel, so the tag is what keeps one author's events
-    /// from reaching another. Aborting the returned tasks stops the
-    /// sources AND this forwarder — the source tasks' own drops are
-    /// what end their producers, which is why they are handed back
-    /// rather than detached.
-    pub(crate) fn tagged_into(
-        self,
-        author: AgentLabel,
-        into: tokio::sync::mpsc::UnboundedSender<(
-            AgentLabel,
-            crate::cli::command_source::Emission,
-        )>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let (mut rx, mut tasks) = self.into_parts();
-        tasks.push(tokio::spawn(async move {
-            while let Some(emission) = rx.recv().await {
-                if into.send((author.clone(), emission)).is_err() {
-                    return;
-                }
-            }
-        }));
-        tasks
+    pub(crate) fn into_tasks(mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.tasks)
     }
 
     /// `events_dir` is the agent's github event-WAL home
@@ -1196,17 +1189,17 @@ impl EventSources {
     pub(crate) fn spawn(
         sources: &[(
             clank_core::agent_config::WaitEventSource,
-            crate::cli::github::supervisor::SourceOrigin,
+            crate::cli::event_source::SourceOrigin,
         )],
         events_dir: Option<&std::path::Path>,
         repo: &std::path::Path,
         author: &AgentLabel,
         drafts: &[(u32, String)],
         invocation: Option<&str>,
+        tx: crate::cli::event_source::EmissionSink,
     ) -> Self {
-        use crate::cli::github::supervisor::SourceOrigin;
+        use crate::cli::event_source::SourceOrigin;
         use clank_core::agent_config::WaitEventSource;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = Vec::new();
         for (source, origin) in sources {
             // A `--event` source is ONE INVOCATION's, so it needs that
@@ -1261,7 +1254,7 @@ impl EventSources {
                 crate::cli::pr_review::DRAFT_POLL,
             )));
         }
-        Self { rx, tasks }
+        Self { tasks }
     }
 
     async fn shutdown(mut self) {
@@ -1385,7 +1378,7 @@ impl RingTail {
 /// producer that will never start should find out.
 async fn run_command_source(
     src: clank_core::agent_config::CommandSource,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
     key: String,
 ) {
@@ -1409,7 +1402,7 @@ async fn run_command_source(
 /// not something to arrange on a developer's machine.
 async fn run_command_source_with(
     src: clank_core::agent_config::CommandSource,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
     key: String,
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
@@ -1491,7 +1484,10 @@ async fn run_command_source_with(
                         }
                         let mut item = row.item;
                         cs::stamp_selector(&mut item, &key, row.seq);
-                        if tx.send((item, cs::Durability::Logged)).is_err() {
+                        if tx
+                            .send((item, crate::cli::event_source::Durability::Logged))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -1513,7 +1509,7 @@ async fn run_command_source_with(
 /// writes the log.
 async fn run_leased_command_source(
     src: &clank_core::agent_config::CommandSource,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: &crate::cli::event_source::EmissionSink,
     store_dir: &std::path::Path,
     key: &str,
     presented: &mut std::collections::HashSet<(u64, String)>,
@@ -1620,7 +1616,10 @@ async fn run_leased_command_source(
         }
         let mut item = entry.item;
         cs::stamp_selector(&mut item, &key, entry.seq);
-        if tx.send((item, cs::Durability::Logged)).is_err() {
+        if tx
+            .send((item, crate::cli::event_source::Durability::Logged))
+            .is_err()
+        {
             return;
         }
     }
@@ -1731,7 +1730,7 @@ async fn run_leased_command_source(
                                                 &key,
                                                 &mut log,
                                                 &mut seen,
-                                                |item| tx.send((item, cs::Durability::Logged)).is_ok(),
+                                                |item| tx.send((item, crate::cli::event_source::Durability::Logged)).is_ok(),
                                             ) {
                                                 break;
                                             }
@@ -1759,7 +1758,8 @@ async fn run_leased_command_source(
                     if !cs::apply(what, &key, &mut log, &mut seen, |item| {
                         // `apply` only reaches its send after the
                         // append RETURNED a seq, so this is logged.
-                        tx.send((item, cs::Durability::Logged)).is_ok()
+                        tx.send((item, crate::cli::event_source::Durability::Logged))
+                            .is_ok()
                     }) {
                         return;
                     }
@@ -1787,7 +1787,10 @@ async fn run_leased_command_source(
                     "`{}` has stopped {failures} times in a row and is being restarted",
                     src.command.join(" ")
                 ),
-                |item| tx.send((item, cs::Durability::Logged)).is_ok(),
+                |item| {
+                    tx.send((item, crate::cli::event_source::Durability::Logged))
+                        .is_ok()
+                },
             );
             if !live {
                 return;
@@ -2843,7 +2846,7 @@ mod shared_tests {
         .unwrap();
         assert_eq!(both.len(), 2, "one configured and one invocation's");
 
-        let spawned = EventSources::spawn(
+        let (mut rx, spawned) = spawn_local(
             &both,
             Some(&events),
             dir.path(),
@@ -2851,7 +2854,7 @@ mod shared_tests {
             &[],
             Some("inv-7"),
         );
-        let (mut rx, tasks) = spawned.into_parts();
+        let tasks = spawned.into_tasks();
         let mut seen: Vec<String> = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while seen.len() < 2 {
@@ -2977,7 +2980,7 @@ mod shared_tests {
             !sources.may_share(),
             "an invocation's source keeps this wait watching for itself"
         );
-        let spawned = EventSources::spawn(
+        let (mut rx, spawned) = spawn_local(
             &mine,
             Some(&codex_dir.join("events")),
             dir.path(),
@@ -2988,7 +2991,7 @@ mod shared_tests {
 
         // Its own channel receives BOTH: the configured event and the
         // invocation's.
-        let (mut rx, tasks) = spawned.into_parts();
+        let tasks = spawned.into_tasks();
         let mut heard: Vec<String> = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while heard.len() < 2 {
@@ -3017,7 +3020,7 @@ mod shared_tests {
             WakeSources::derive(dir.path(), Role::Master, theirs.clone()).may_share(),
             "config only, so the monitor covers everything that wakes it"
         );
-        let claude_spawned = EventSources::spawn(
+        let (mut claude_rx, claude_spawned) = spawn_local(
             &theirs,
             Some(&claude_dir.join("events")),
             dir.path(),
@@ -3025,7 +3028,7 @@ mod shared_tests {
             &[],
             None,
         );
-        let (mut claude_rx, claude_tasks) = claude_spawned.into_parts();
+        let claude_tasks = claude_spawned.into_tasks();
         let claude_heard = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match claude_rx.recv().await {
@@ -3078,7 +3081,7 @@ mod shared_tests {
 
         let arm = |body: String, scope: &'static str| {
             let declared = resolve_wait_event_sources(dir.path(), &author, &[body]).unwrap();
-            EventSources::spawn(
+            spawn_local(
                 &declared,
                 Some(&events),
                 dir.path(),
@@ -3087,11 +3090,11 @@ mod shared_tests {
                 Some(scope),
             )
         };
-        let first = arm(emits("one"), "inv-1");
-        let second = arm(emits("two"), "inv-2");
+        let (first_rx, first) = arm(emits("one"), "inv-1");
+        let (second_rx, second) = arm(emits("two"), "inv-2");
 
         let heard = |mut rx: tokio::sync::mpsc::UnboundedReceiver<
-            crate::cli::command_source::Emission,
+            crate::cli::event_source::Emission,
         >| async move {
             tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -3105,8 +3108,8 @@ mod shared_tests {
             .await
             .unwrap_or_default()
         };
-        let (first_rx, first_tasks) = first.into_parts();
-        let (second_rx, second_tasks) = second.into_parts();
+        let first_tasks = first.into_tasks();
+        let second_tasks = second.into_tasks();
         let tasks: Vec<_> = first_tasks.into_iter().chain(second_tasks).collect();
         let (a, b) = tokio::join!(heard(first_rx), heard(second_rx));
 
@@ -3136,12 +3139,12 @@ mod shared_tests {
 
         let one = cs::storage_key(
             src.source_key(),
-            crate::cli::github::supervisor::SourceOrigin::Cli,
+            crate::cli::event_source::SourceOrigin::Cli,
             "inv-1",
         );
         let two = cs::storage_key(
             src.source_key(),
-            crate::cli::github::supervisor::SourceOrigin::Cli,
+            crate::cli::event_source::SourceOrigin::Cli,
             "inv-2",
         );
         assert_ne!(one, two);
@@ -3172,14 +3175,14 @@ mod shared_tests {
         assert_eq!(cli.len(), 1);
 
         // No invocation to give: what the monitor passes.
-        let spawned = EventSources::spawn(&cli, None, dir.path(), &author, &[], None);
+        let (_rx, spawned) = spawn_local(&cli, None, dir.path(), &author, &[], None);
         assert!(
             spawned.tasks.is_empty(),
             "an invocation's source is refused, not pooled under the author"
         );
 
         // With one, it runs.
-        let spawned = EventSources::spawn(&cli, None, dir.path(), &author, &[], Some("inv-1"));
+        let (_rx, spawned) = spawn_local(&cli, None, dir.path(), &author, &[], Some("inv-1"));
         assert_eq!(spawned.tasks.len(), 1);
         spawned.shutdown().await;
     }
@@ -3499,6 +3502,7 @@ mod shared_tests {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -3634,10 +3638,10 @@ mod tests {
         );
         let declared = vec![(
             clank_core::agent_config::WaitEventSource::Command(source),
-            crate::cli::github::supervisor::SourceOrigin::Config,
+            crate::cli::event_source::SourceOrigin::Config,
         )];
-        let mut sources = EventSources::spawn(&declared, None, repo.path(), &author, &[], None);
-        let (item, _) = tokio::time::timeout(Duration::from_secs(5), sources.rx.recv())
+        let (mut rx, sources) = spawn_local(&declared, None, repo.path(), &author, &[], None);
+        let (item, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -3668,6 +3672,7 @@ mod tests {
         want: usize,
     ) -> Vec<WaitItem> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let key = src.source_key();
         let task = tokio::spawn(run_command_source(src, tx, dir, key));
         let mut out = Vec::new();
@@ -3715,10 +3720,11 @@ mod tests {
         ]);
         let key = crate::cli::command_source::storage_key(
             source.source_key(),
-            crate::cli::github::supervisor::SourceOrigin::Cli,
+            crate::cli::event_source::SourceOrigin::Cli,
             "fixture-invocation",
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let producer = tokio::spawn(run_command_source(
             source,
             tx,
@@ -3895,6 +3901,7 @@ mod tests {
 
         let defer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let task = {
             let defer = defer.clone();
             let key = src.source_key();
@@ -3968,6 +3975,8 @@ mod tests {
         let key = src.source_key();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let task = tokio::spawn(run_command_source(
             src,
             tx,
@@ -4368,7 +4377,9 @@ mod tests {
 
         // SEPARATE channels, so "who received what" is answerable.
         let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let tx_a = crate::cli::event_source::EmissionSink::from(tx_a);
         let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let tx_b = crate::cli::event_source::EmissionSink::from(tx_b);
 
         let holder = tokio::spawn(run_command_source(
             producer("owned"),
@@ -4999,6 +5010,7 @@ mod tests {
         // the select branch stays off and can't hot-loop), while a live
         // channel drains its queued items and stays open.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         tx.send((
             WaitItem::CommandEvent {
                 name: "a".into(),
@@ -5011,7 +5023,7 @@ mod tests {
                 reply_route: None,
                 selector: None,
             },
-            crate::cli::command_source::Durability::Logged,
+            crate::cli::event_source::Durability::Logged,
         ))
         .unwrap();
         let mut open = true;

@@ -526,7 +526,7 @@ pub(crate) async fn run_draft_source(
     slug: String,
     pr: u32,
     author: AgentLabel,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: crate::cli::event_source::EmissionSink,
     interval: std::time::Duration,
 ) {
     let reader = crate::cli::github::draft::production_reader(slug);
@@ -546,7 +546,7 @@ async fn drive_draft_source<R: crate::cli::github::draft::DraftReader, F: Fn() -
     author: &AgentLabel,
     still_mine: &F,
     reader: &R,
-    tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: crate::cli::event_source::EmissionSink,
     interval: std::time::Duration,
 ) {
     use crate::cli::github::log::{EventLog, IngestLease};
@@ -602,7 +602,7 @@ async fn drive_draft_source<R: crate::cli::github::draft::DraftReader, F: Fn() -
 fn present_draft_rows(
     log: &crate::cli::github::log::EventLog,
     key: &str,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: &crate::cli::event_source::EmissionSink,
     presented: &mut std::collections::HashSet<(u64, String)>,
 ) -> bool {
     let Ok(Some(read)) = log.read_rows() else {
@@ -618,7 +618,7 @@ fn present_draft_rows(
         }
         // Read back OUT of the log, so the log has it.
         if tx
-            .send((item, crate::cli::command_source::Durability::Logged))
+            .send((item, crate::cli::event_source::Durability::Logged))
             .is_err()
         {
             return false;
@@ -636,7 +636,7 @@ async fn ingest_draft<R: crate::cli::github::draft::DraftReader, F: Fn() -> bool
     reader: &R,
     events_dir: &Path,
     key: &str,
-    tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+    tx: &crate::cli::event_source::EmissionSink,
     presented: &mut std::collections::HashSet<(u64, String)>,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
@@ -1598,7 +1598,7 @@ mod tests {
     }
 
     async fn next_draft(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::event_source::Emission>,
     ) -> clank_core::wait::WaitItem {
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
@@ -1621,6 +1621,7 @@ mod tests {
         };
         let spawn = |repo: PathBuf, draft: MutableDraft| {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
             let task = tokio::spawn(async move {
                 let author = AgentLabel::parse("master").unwrap();
                 drive_draft_source(
@@ -1721,6 +1722,7 @@ mod tests {
         save_actor_horizon(&repo, 7, run, &author, &horizon).unwrap();
         // A process died after writing the stage but before the WAL.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let task = tokio::spawn({
             let repo = repo.clone();
             let reader = reader.clone();
@@ -1765,6 +1767,7 @@ mod tests {
         staged.stage(&observed, changes);
         save_actor_horizon(&repo, 7, run, &author, &staged).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let task = tokio::spawn({
             let repo = repo.clone();
             let reader = reader.clone();
@@ -1804,7 +1807,7 @@ mod tests {
         repo: &Path,
         pr: u32,
         reader: &R,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::cli::command_source::Emission>,
+        tx: crate::cli::event_source::EmissionSink,
     ) {
         tokio::time::timeout(
             std::time::Duration::from_secs(600),
@@ -1861,6 +1864,7 @@ mod tests {
     async fn a_review_ending_mid_read_neither_wakes_nor_resurrects() {
         let (repo, _run) = scratch(7);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let gone = {
             let repo = repo.clone();
             move || {
@@ -1883,6 +1887,7 @@ mod tests {
     async fn a_restarted_review_is_not_written_over_by_the_old_ones_watch() {
         let (repo, run) = scratch(7);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = crate::cli::event_source::EmissionSink::from(tx);
         let fresh_run = std::sync::Arc::new(std::sync::Mutex::new(0u64));
         let racer = {
             let repo = repo.clone();

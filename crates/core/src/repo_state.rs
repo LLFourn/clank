@@ -858,15 +858,6 @@ impl RepoState {
     }
 }
 
-/// Returns `Some(plan)` when the warning is plan-scoped.
-pub fn warning_plan_tag(w: &Warning) -> Option<PlanKey> {
-    match w {
-        Warning::DanglingPlanRef { plan } | Warning::RejectedPlanIntro { plan, .. } => {
-            Some(plan.clone())
-        }
-    }
-}
-
 /// True iff this warning belongs to `key`. Hard-forget clears that plan's
 /// warnings, but not a different rejected run's provenance merely because
 /// its diagnostic names `key` as the plan that prevented its introduction.
