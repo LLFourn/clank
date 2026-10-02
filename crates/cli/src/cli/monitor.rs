@@ -3756,6 +3756,8 @@ mod tests {
             content: "ci failed".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         let mut pending = vec![(claude.clone(), held)];
@@ -4119,6 +4121,8 @@ mod tests {
                     content: "ci failed".into(),
                     at: None,
                     failure: false,
+                    requires_reply: false,
+                    reply_route: None,
                     selector: None,
                 },
                 crate::cli::command_source::Durability::Transient,
@@ -4279,6 +4283,8 @@ mod tests {
                 content: "ci failed".into(),
                 at: None,
                 failure: false,
+                requires_reply: false,
+                reply_route: None,
                 selector: None,
             },
         )];
@@ -8143,6 +8149,8 @@ mod tests {
                     content: "shipped".into(),
                     at: None,
                     failure: false,
+                    requires_reply: false,
+                    reply_route: None,
                     selector: None,
                 },
             )
@@ -8258,6 +8266,8 @@ mod tests {
                     content: "ci failed".into(),
                     at: None,
                     failure: false,
+                    requires_reply: false,
+                    reply_route: None,
                     selector: None,
                 },
             )
@@ -8394,6 +8404,8 @@ mod tests {
             content: "ci failed".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         let mut pending = vec![(claude.clone(), held.clone())];
@@ -8442,6 +8454,8 @@ mod tests {
             content: "ci failed".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         let mut pending = vec![(codex.clone(), held.clone())];
@@ -8503,6 +8517,8 @@ mod tests {
             content: "ci failed".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         let mut pending = vec![(claude.clone(), held.clone())];
@@ -8595,6 +8611,8 @@ mod tests {
             content: "and then this".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         pending.push((claude.clone(), later.clone()));
@@ -8670,6 +8688,8 @@ mod tests {
             content: content.into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         EventLog::open(&events, &configured)
@@ -8761,6 +8781,8 @@ mod tests {
                         content: content.into(),
                         at: None,
                         failure: false,
+                        requires_reply: false,
+                        reply_route: None,
                         selector: None,
                     },
                 )

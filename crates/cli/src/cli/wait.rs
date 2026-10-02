@@ -992,6 +992,12 @@ pub(crate) fn resolve_wait_event_sources(
                         c.name
                     );
                 }
+                if c.reply_command
+                    .as_ref()
+                    .is_some_and(|argv| argv.is_empty() || argv[0].trim().is_empty())
+                {
+                    anyhow::bail!("command source `{}` has an empty reply_command", c.name);
+                }
                 if let Some(why) = c
                     .glyph
                     .as_deref()
@@ -1195,8 +1201,8 @@ impl EventSources {
 }
 
 /// Kill the child's PROCESS GROUP on drop — grandchildren included.
-/// Sync `kill` subprocess, not libc: Drop must be sync and this runs
-/// on task abort too (the drop is the cancellation-safety story).
+/// A synchronous signal through the typed process boundary also works on
+/// task abort, without starting a cleanup subprocess.
 ///
 /// Holds a validated [`crate::signal::Pgid`] rather than a
 /// bare number. `kill -9 -1` is every process this user may signal, and
@@ -1210,17 +1216,46 @@ impl GroupKill {
     pub(crate) fn over(child: Option<u32>) -> Self {
         Self(child.and_then(|pid| crate::signal::Pgid::new(pid as i32)))
     }
+
+    /// End an explicitly bounded invocation without launching another process.
+    pub(crate) fn terminate(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            crate::signal::signal_group(pgid, libc::SIGKILL);
+        }
+    }
 }
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
-        if let Some(pgid) = self.0.take() {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(format!("-{pgid}"))
-                .output();
-        }
+        self.terminate();
     }
+}
+
+/// A recording error is returned only after the unrecordable child is ended
+/// and reaped. The caller cannot enter its restart backoff holding that child.
+async fn record_producer_or_end(
+    mut child: tokio::process::Child,
+    store_dir: &std::path::Path,
+    key: &str,
+) -> std::io::Result<(tokio::process::Child, GroupKill)> {
+    use crate::cli::command_source as cs;
+    let mut group = GroupKill::over(child.id());
+    // Record before reading any event: SIGKILL must leave recovery evidence.
+    let recorded = match child.id() {
+        Some(pid) => cs::started_at(pid as i32)
+            .ok_or_else(|| std::io::Error::other("the system would not say when it started"))
+            .and_then(|started| cs::record_producer(store_dir, key, pid as i32, &started)),
+        None => Err(std::io::Error::other(
+            "it exited before it could be recorded",
+        )),
+    };
+    if let Err(error) = recorded {
+        group.terminate();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
+    Ok((child, group))
 }
 
 /// Last-`cap`-bytes ring for a command source's interleaved output —
@@ -1427,6 +1462,23 @@ async fn run_leased_command_source(
         .as_deref()
         .and_then(|d| d.parent())
         .map(|agent| cs::backend_state_dir(agent, &key));
+    let reply_route =
+        src.reply_command
+            .as_ref()
+            .and_then(|command| match std::env::current_dir() {
+                Ok(cwd) => Some(clank_core::wait::CommandReplyRoute {
+                    command: command.clone(),
+                    cwd,
+                    state_dir: state_dir.clone(),
+                }),
+                Err(e) => {
+                    eprintln!(
+                        "wait: source `{}` cannot capture reply routing: {e}",
+                        src.name
+                    );
+                    None
+                }
+            });
     if let Some(dir) = state_dir.as_deref() {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!(
@@ -1536,50 +1588,20 @@ async fn run_leased_command_source(
                 None
             }
         };
-        if let Some(mut child) = child {
-            let _group = GroupKill::over(child.id());
-            // Written down BEFORE anything is read from it: a SIGKILL
-            // between spawn and the first line is exactly the case
-            // this record exists for.
-            //
-            // A child that CANNOT be recorded is ended again rather
-            // than run. Leaving it would reinstate precisely the leak
-            // this exists to close — a SIGKILL would strand it with
-            // nothing written down that could ever end it — and
-            // retrying costs one backoff (codex on 8d3d669).
-            let recorded = match child.id() {
-                Some(pid) => cs::started_at(pid as i32)
-                    .ok_or_else(|| {
-                        std::io::Error::other("the system would not say when it started")
-                    })
-                    .and_then(|started| {
-                        cs::record_producer(&store_dir, &key, pid as i32, &started)
-                    }),
-                None => Err(std::io::Error::other(
-                    "it exited before it could be recorded",
-                )),
+        if let Some(child) = child {
+            let (mut child, _group) = match record_producer_or_end(child, &store_dir, &key).await {
+                Ok(owned) => owned,
+                Err(e) => {
+                    eprintln!(
+                        "wait: command source `{}` could not record its producer ({e}); ended it \
+                         rather than leaving one a SIGKILL would strand",
+                        src.name
+                    );
+                    failures = failures.saturating_add(1);
+                    tokio::time::sleep(cs::backoff(failures)).await;
+                    continue;
+                }
             };
-            if let Err(e) = recorded {
-                eprintln!(
-                    "wait: command source `{}` could not record its producer ({e}); ending it \
-                     rather than leaving one a SIGKILL would strand",
-                    src.name
-                );
-                // Ended and REAPED before the backoff, not merely on
-                // the way out of this block. The backoff reaches
-                // BACKOFF_CAP, so letting the guard fall out of scope
-                // at the `continue` would leave an unrecorded producer
-                // running for up to five minutes — and this wait being
-                // killed during that sleep strands it for good, which
-                // is the leak the record exists to close (codex on
-                // 14ab92e).
-                drop(_group);
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                failures = failures.saturating_add(1);
-                tokio::time::sleep(cs::backoff(failures)).await;
-                continue;
-            }
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             if let Some(err) = stderr {
@@ -1617,7 +1639,7 @@ async fn run_leased_command_source(
                                 async {
                                     while let Ok(Some(raw)) = lines.next_line().await {
                                         if let Some(what) =
-                                            cs::ingest_line(&src, &seen, &raw)
+                                            cs::ingest_line_with_route(&src, &seen, &raw, reply_route.as_ref())
                                         {
                                             if !cs::apply(
                                                 what,
@@ -1636,7 +1658,9 @@ async fn run_leased_command_source(
                             break;
                         }
                     };
-                    let Some(what) = cs::ingest_line(&src, &seen, &raw) else {
+                    let Some(what) =
+                        cs::ingest_line_with_route(&src, &seen, &raw, reply_route.as_ref())
+                    else {
                         continue;
                     };
                     if let cs::Ingested::Refuse(why) = &what {
@@ -1986,6 +2010,8 @@ pub(crate) enum WaitJsonItem<'a> {
         at: Option<u64>,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         failure: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        requires_reply: bool,
         /// What to pass `clank events ack`. Absent only when the
         /// event was never logged, and then there is nothing to ack.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -2152,7 +2178,9 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             content,
             at,
             failure,
+            requires_reply,
             selector,
+            ..
         } => WaitJsonItem::CommandEvent {
             name,
             id,
@@ -2160,6 +2188,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             content,
             at: *at,
             failure: *failure,
+            requires_reply: *requires_reply,
             selector: selector.as_deref(),
         },
         WaitItem::ForCommit { sha, subject } => WaitJsonItem::ForCommit {
@@ -2360,7 +2389,13 @@ fn render_human(item: &WaitItem) -> String {
             // The line that says an event is owed should say how to
             // finish it.
             if let Some(s) = v.selector {
-                parts.push(format!("(ack {s})"));
+                if v.requires_reply {
+                    parts.push(format!(
+                        "(reply required; use clank events ack {s} --reply <text>)"
+                    ));
+                } else {
+                    parts.push(format!("(ack {s})"));
+                }
             }
             let mut line = parts.join("  ");
             // The operator's per-watch prompt rides as ONE indented
@@ -3101,6 +3136,7 @@ mod shared_tests {
         let src = clank_core::agent_config::CommandSource {
             name: "deploys".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         };
         let agent_dir = std::path::Path::new("/a/.clank/agents/claude");
@@ -3554,6 +3590,7 @@ mod tests {
         clank_core::agent_config::CommandSource {
             name: name.into(),
             command: argv.iter().map(|s| s.to_string()).collect(),
+            reply_command: None,
             glyph: None,
         }
     }
@@ -3591,6 +3628,94 @@ mod tests {
         out
     }
 
+    #[tokio::test]
+    async fn an_invocation_event_can_be_answered_after_its_producer_exits_without_config_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path();
+        let dir = crate::agent_store::agents_root(repo)
+            .join("alpha")
+            .join("events");
+        let mut source = command_source(
+            "questions",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' '{\"id\":\"question/雪\",\"content\":\"Which option?\",\"requires_reply\":true}'; sleep 300",
+            ],
+        );
+        source.reply_command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat > \"$CLANK_SOURCE_STATE_DIR/answer\"; pwd > \"$CLANK_SOURCE_STATE_DIR/cwd\""
+                .into(),
+        ]);
+        let key = crate::cli::command_source::storage_key(
+            source.source_key(),
+            crate::cli::github::supervisor::SourceOrigin::Cli,
+            "fixture-invocation",
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let producer = tokio::spawn(run_command_source(
+            source,
+            tx,
+            Some(dir.clone()),
+            key.clone(),
+        ));
+        let (item, _) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        producer.abort();
+        let _ = producer.await;
+        let WaitItem::CommandEvent {
+            selector: Some(selector),
+            reply_route: Some(route),
+            requires_reply: true,
+            ..
+        } = item
+        else {
+            panic!("event lost its required reply route");
+        };
+        assert!(selector.contains("-inv-fixture-invocation@"));
+        assert_eq!(
+            route.state_dir,
+            Some(crate::cli::command_source::backend_state_dir(
+                dir.parent().unwrap(),
+                &key
+            ))
+        );
+        // No agent source config exists; --event ownership must be sufficient.
+        assert!(!dir.parent().unwrap().join("config.json").exists());
+        let args = crate::cli::EventsArgs {
+            command: crate::cli::EventsCmd::Ack(crate::cli::EventsAckArgs {
+                repo: Some(repo.into()),
+                author: Some("alpha".into()),
+                ids: vec![selector],
+                reply: Some("  β\n".into()),
+            }),
+        };
+        crate::cli::events::run(args).await.unwrap();
+        let state = route.state_dir.unwrap();
+        let reply: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.join("answer")).unwrap()).unwrap();
+        assert_eq!(reply["id"], "question/雪");
+        assert_eq!(reply["reply"], "  β\n");
+        assert_eq!(reply["author"], "alpha");
+        assert_eq!(
+            dunce::canonicalize(std::fs::read_to_string(state.join("cwd")).unwrap().trim())
+                .unwrap(),
+            dunce::canonicalize(route.cwd).unwrap()
+        );
+        let row = crate::cli::github::log::EventLog::open(&dir, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert!(row.acked && row.reply_accepted);
+    }
+
     /// Block until the source's ingest lease is free again.
     ///
     /// A re-arm is a fresh PROCESS in production, so the previous
@@ -3620,16 +3745,6 @@ mod tests {
         }
     }
 
-    /// TWO ARMS of the real supervisor: the second must not re-issue
-    /// the first's sequence.
-    ///
-    /// `EventLog::open` starts the allocator at 1, and only `load`
-    /// restores it from the persisted records. A supervisor that read
-    /// rows without loading handed arm 2's event the same seq as arm
-    /// 1's — one selector for two events, and the plain ack of the
-    /// first marking the second handled before anyone saw it (codex
-    /// 43f5ed8).
-    ///
     /// A producer that cannot be recorded is ended BEFORE the backoff.
     ///
     /// Leaving it running reinstates exactly the leak the record
@@ -3639,84 +3754,38 @@ mod tests {
     /// an unrecorded producer alive for up to five minutes (codex on
     /// 14ab92e).
     ///
-    /// Asserted on the CHILD'S LIFETIME, which an earlier version did
-    /// not: it checked only that no event was delivered, and stdout
-    /// going unread says nothing about whether the process ended. The
-    /// child reports its own pid, and the window is shorter than the
-    /// first backoff, so a child that merely falls out of scope at the
-    /// retry fails here.
-    ///
-    /// Recording is made to fail by putting a DIRECTORY where its temp
-    /// file goes, which leaves the event log perfectly usable — so
-    /// what this drives is the record's failure and not a broken
-    /// source directory.
+    /// The spawn handle identifies the child even if cleanup beats its first
+    /// instruction. A record failure must return with that process ended and
+    /// reaped, before the supervisor can choose a restart backoff.
     #[tokio::test]
     async fn a_producer_that_cannot_be_recorded_is_ended_before_the_backoff() {
         use crate::cli::command_source as cs;
-
         let dir = tempfile::tempdir().unwrap();
-        let events = dir.path().to_path_buf();
-        let pidfile = dir.path().join("pid");
-        let src = command_source(
-            "deploys",
-            &[
-                "sh",
-                "-c",
-                Box::leak(
-                    format!(r#"echo $$ > '{}'; sleep 300"#, pidfile.display()).into_boxed_str(),
-                ),
-            ],
-        );
-        let key = src.source_key();
-        std::fs::create_dir_all(cs::producer_path(&events, &key).with_extension("producer.tmp"))
+        let key = command_source("deploys", &["true"]).source_key();
+        std::fs::create_dir_all(cs::producer_path(dir.path(), &key).with_extension("producer.tmp"))
             .unwrap();
-
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(run_command_source(
-            src,
-            tx,
-            Some(events.clone()),
-            key.clone(),
-        ));
-
-        // Which pid it was. The child writes this before sleeping.
-        let pid = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(raw) = std::fs::read_to_string(&pidfile)
-                    && let Ok(pid) = raw.trim().parse::<i32>()
-                {
-                    return pid;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the producer never started");
-
-        // Gone well inside the first backoff, so "it was ended" and
-        // "it fell out of scope at the retry" are different answers.
-        let window = cs::BACKOFF_FIRST / 2;
-        let began = std::time::Instant::now();
-        loop {
-            let group = crate::signal::Pgid::new(pid).expect("a real child is a real group");
-            if cs::group_of(group) == cs::Group::Empty {
-                break;
-            }
-            assert!(
-                began.elapsed() < window,
-                "an unrecordable producer is still running {:?} later; it must be ended \
-                 before the backoff, not left for the retry",
-                began.elapsed()
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let result = record_producer_or_end(child, dir.path(), &key).await;
         assert!(
-            !cs::producer_path(&events, &key).exists(),
-            "and nothing was recorded, which is why it was ended"
+            result.is_err(),
+            "the injected recording failure must be reached"
         );
-
-        task.abort();
-        let _ = task.await;
+        assert_eq!(
+            crate::signal::probe_process(pid),
+            crate::signal::Probe::Gone,
+            "a recording error must not return a still-running child to the backoff caller"
+        );
+        assert_eq!(
+            cs::group_of(crate::signal::Pgid::new(pid).unwrap()),
+            cs::Group::Empty
+        );
+        assert!(!cs::producer_path(dir.path(), &key).exists());
     }
 
     /// A deferral withholds the launch, and does not overwrite the
@@ -4032,6 +4101,8 @@ mod tests {
             content: "prod is live".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: Some("command-deploys-0000abcd@7".into()),
         };
 
@@ -4079,6 +4150,8 @@ mod tests {
             content: "`sh -c ...` has stopped 3 times in a row".into(),
             at: None,
             failure: true,
+            requires_reply: false,
+            reply_route: None,
             selector: Some("command-deploys-0000abcd@9".into()),
         };
         let broken_line = render_human(&broken);
@@ -4445,6 +4518,8 @@ mod tests {
             content: "from the last arm".into(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         };
         let seq = log
@@ -4733,6 +4808,8 @@ mod tests {
             content: String::new(),
             at: None,
             failure: false,
+            requires_reply: false,
+            reply_route: None,
             selector: None,
         }
     }
@@ -4866,6 +4943,8 @@ mod tests {
                 content: String::new(),
                 at: None,
                 failure: false,
+                requires_reply: false,
+                reply_route: None,
                 selector: None,
             },
             crate::cli::command_source::Durability::Logged,
@@ -5220,6 +5299,23 @@ mod tests {
                 "and it parses back"
             );
         }
+    }
+
+    #[test]
+    fn a_required_reply_is_explicit_in_the_human_wait_output() {
+        let item: WaitItem = serde_json::from_value(serde_json::json!({
+            "kind": "command_event", "name": "questions", "id": "utt/a",
+            "event": "question", "content": "Which option?",
+            "requires_reply": true, "selector": "command-questions-abcd@7"
+        }))
+        .unwrap();
+        let line = render_human(&item);
+        assert!(line.contains("reply required"), "{line}");
+        assert!(
+            line.contains("clank events ack command-questions-abcd@7 --reply <text>"),
+            "{line}"
+        );
+        assert!(!line.contains("(ack command-questions-abcd@7)"), "{line}");
     }
 
     #[test]

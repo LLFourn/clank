@@ -107,6 +107,16 @@ impl ContentRef {
     }
 }
 
+/// Backend routing captured when a command event is ingested. A later config
+/// edit must not send its answer to a different command or state directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReplyRoute {
+    pub command: Vec<String>,
+    pub cwd: std::path::PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<std::path::PathBuf>,
+}
+
 /// Flat tagged list `wait` returns from one refold round.
 /// Empty list at the call site means "no outcome, keep blocking."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +261,13 @@ pub enum WaitItem {
         /// it: the kind is clank's own.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         failure: bool,
+        /// This event stays owed until an answer is accepted by its backend.
+        /// Older producers and stored rows do not require an answer.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        requires_reply: bool,
+        /// Trusted source configuration, never supplied by the producer's line.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_route: Option<CommandReplyRoute>,
         /// What to pass `clank events ack` to finish this one.
         ///
         /// Stamped at PRESENTATION time from the row's own sequence,
@@ -485,6 +502,8 @@ pub struct EventView<'a> {
     pub selector: Option<&'a str>,
     /// The SOURCE is broken, rather than something it observed.
     pub failure: bool,
+    /// Whether a plain acknowledgement is insufficient to finish this event.
+    pub requires_reply: bool,
     /// The carve-out: what only github has.
     pub github: Option<GithubBits<'a>>,
 }
@@ -559,6 +578,7 @@ impl WaitItem {
                 instructions: instructions.as_deref(),
                 selector: None,
                 failure: false,
+                requires_reply: false,
                 github: Some(GithubBits {
                     detail: detail.as_deref(),
                     number: *number,
@@ -573,6 +593,7 @@ impl WaitItem {
                 content,
                 at,
                 failure,
+                requires_reply,
                 selector,
                 ..
             } => Some(EventView {
@@ -584,6 +605,7 @@ impl WaitItem {
                 instructions: None,
                 selector: selector.as_deref(),
                 failure: *failure,
+                requires_reply: *requires_reply,
                 github: None,
             }),
             WaitItem::DraftChanged {
@@ -600,6 +622,7 @@ impl WaitItem {
                 instructions: None,
                 selector: selector.as_deref(),
                 failure: false,
+                requires_reply: false,
                 github: None,
             }),
             // A message is an event like any other, so it has a view
@@ -621,6 +644,7 @@ impl WaitItem {
                 instructions: None,
                 selector: selector.as_deref(),
                 failure: false,
+                requires_reply: false,
                 github: None,
             }),
             _ => None,

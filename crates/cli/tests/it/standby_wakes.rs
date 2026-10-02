@@ -160,6 +160,7 @@ async fn a_standby_agents_messages_and_own_sources_still_wake_it() {
     // was given.
     clank::cli::events::run(clank::cli::EventsArgs {
         command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            reply: None,
             repo: Some(repo.to_path_buf()),
             author: Some("sb".to_string()),
             ids: vec![selector],

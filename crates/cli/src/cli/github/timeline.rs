@@ -619,6 +619,8 @@ mod tests {
                 content: "prod is live".into(),
                 at: None,
                 failure: false,
+                requires_reply: false,
+                reply_route: None,
                 selector: None,
             },
         )
@@ -703,6 +705,8 @@ mod tests {
                     content: "the command one".into(),
                     at: Some(200),
                     failure: false,
+                    requires_reply: false,
+                    reply_route: None,
                     selector: None,
                 },
             )
@@ -750,11 +754,13 @@ mod tests {
         let glyphed = clank_core::agent_config::CommandSource {
             name: "deploys".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: Some("*".into()),
         };
         let plain = clank_core::agent_config::CommandSource {
             name: "builds".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         };
         let cfg = clank_core::agent_config::AgentConfig {
@@ -785,6 +791,8 @@ mod tests {
                         content: "x".into(),
                         at: Some(100),
                         failure: false,
+                        requires_reply: false,
+                        reply_route: None,
                         selector: None,
                     },
                 )
@@ -851,6 +859,7 @@ mod tests {
         let src = clank_core::agent_config::CommandSource {
             name: "deploys".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: Some("*".into()),
         };
         EventLog::open(&events, &src.source_key())
@@ -867,6 +876,8 @@ mod tests {
                     content: "x".into(),
                     at: Some(100),
                     failure: false,
+                    requires_reply: false,
+                    reply_route: None,
                     selector: None,
                 },
             )
@@ -876,6 +887,7 @@ mod tests {
             let cfg = clank_core::agent_config::AgentConfig {
                 wait_events: vec![clank_core::agent_config::WaitEventSource::Command(
                     clank_core::agent_config::CommandSource {
+                        reply_command: None,
                         glyph: Some(g.to_string()),
                         ..src.clone()
                     },
@@ -984,6 +996,8 @@ mod tests {
                     content: "prod is live".into(),
                     at: Some(123),
                     failure: false,
+                    requires_reply: false,
+                    reply_route: None,
                     selector: None,
                 },
             )

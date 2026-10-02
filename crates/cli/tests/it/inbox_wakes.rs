@@ -86,6 +86,7 @@ fn selector_of(items: &[WaitItem], subject: &str) -> String {
 async fn ack(repo: &Path, to: &str, selector: &str) {
     clank::cli::events::run(clank::cli::EventsArgs {
         command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            reply: None,
             repo: Some(repo.to_path_buf()),
             author: Some(to.to_string()),
             ids: vec![selector.to_string()],

@@ -4025,7 +4025,14 @@ pub(crate) async fn run_tui(
                                         // (best-effort: a failed
                                         // fanout leaves rows
                                         // unhandled and visible).
-                                        let _ = crate::cli::events::ack_members(&repo, &keys);
+                                        if let Err(e) =
+                                            crate::cli::events::ack_members(&repo, &keys)
+                                        {
+                                            detail = Some(Overlay::error(
+                                                "Event acknowledgement refused".into(),
+                                                format!("{e:#}"),
+                                            ));
+                                        }
                                         refresh_pending = true;
                                     }
                                     EventEffect::RetryContent => {

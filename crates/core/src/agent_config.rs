@@ -522,6 +522,10 @@ pub struct CommandSource {
     /// `["sh", "-c", "…"]` to get one). Runs in its own process
     /// group; the group is killed when the wait exits without it.
     pub command: Vec<String>,
+    /// Optional backend that accepts answers to this source's events. Receives
+    /// one JSON object on stdin; subscription argv and source identity stay put.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_command: Option<Vec<String>>,
     /// The single character the log and the TUI draw this source's
     /// events with. Config, not per-line, so an untrusted producer
     /// cannot reach the renderer's layout; validated at load for a
@@ -831,8 +835,44 @@ mod tests {
         CommandSource {
             name: name.into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         }
+    }
+
+    #[test]
+    fn reply_handlers_round_trip_without_rekeying_existing_command_sources() {
+        let legacy: WaitEventSource = serde_json::from_value(serde_json::json!({
+            "kind":"command", "name":"questions", "command":["backend","subscribe"]
+        }))
+        .unwrap();
+        let with_reply: WaitEventSource = serde_json::from_value(serde_json::json!({
+            "kind":"command", "name":"questions", "command":["backend","subscribe"],
+            "reply_command":["backend","answer","--verbatim"]
+        }))
+        .unwrap();
+        let (WaitEventSource::Command(old), WaitEventSource::Command(new)) = (&legacy, &with_reply)
+        else {
+            panic!("command sources");
+        };
+        assert!(old.reply_command.is_none());
+        assert!(
+            !serde_json::to_value(&legacy)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("reply_command")
+        );
+        assert_eq!(old.source_key(), new.source_key());
+        assert_eq!(
+            new.reply_command.as_ref().unwrap(),
+            &["backend", "answer", "--verbatim"]
+        );
+        assert_eq!(
+            serde_json::from_value::<WaitEventSource>(serde_json::to_value(&with_reply).unwrap())
+                .unwrap(),
+            with_reply
+        );
     }
 
     /// Names that SLUG the same must not key the same.

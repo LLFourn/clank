@@ -782,6 +782,9 @@ pub struct EventsListArgs {
 
 #[derive(Args, Debug)]
 pub struct EventsAckArgs {
+    /// Answer one logical event. Its backend must accept the answer before ack.
+    #[arg(long, value_name = "TEXT")]
+    pub reply: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -1903,6 +1906,37 @@ pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
     clank_core::ids::RepoBasename::from_repo_root(repo)
         .map(|b| b.as_str().to_string())
         .ok_or_else(|| anyhow::anyhow!("repo path has no usable basename: {}", repo.display()))
+}
+
+#[cfg(test)]
+mod reply_cli_parse_tests {
+    use crate::cli::command::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn event_answers_survive_the_production_argument_parser_verbatim() {
+        let answer = "  Answer β.\nKeep whitespace.  ";
+        let cli = Cli::try_parse_from([
+            "clank",
+            "events",
+            "ack",
+            "questions@7",
+            "--reply",
+            answer,
+            "--author",
+            "codex",
+        ])
+        .unwrap();
+        let Command::Events(super::EventsArgs {
+            command: super::EventsCmd::Ack(args),
+        }) = cli.command
+        else {
+            panic!("events ack");
+        };
+        assert_eq!(args.ids, ["questions@7"]);
+        assert_eq!(args.reply.as_deref(), Some(answer));
+        assert_eq!(args.author.as_deref(), Some("codex"));
+    }
 }
 
 #[cfg(test)]

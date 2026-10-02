@@ -2179,6 +2179,7 @@ pub(crate) struct WaitItem {
     /// `title` above are shared with the github item.
     content: Option<String>,
     failure: Option<bool>,
+    requires_reply: Option<bool>,
     /// What `clank events ack` takes for this one.
     selector: Option<String>,
     /// A draft change's payload (the-review-session-watches-its-pr).
@@ -2581,7 +2582,13 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 let ack = item
                     .selector
                     .as_deref()
-                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .map(|s| {
+                        if item.requires_reply.unwrap_or(false) {
+                            format!(" — reply required; use `clank events ack {s} --reply <text>`")
+                        } else {
+                            format!(" — ack `clank events ack {s}`")
+                        }
+                    })
                     .unwrap_or_default();
                 out.push_str(&format!("  - {lead}: {name} {event}{content}{ack}\n"));
             }
@@ -4890,6 +4897,8 @@ mod tests {
                         content: "`sh -c ...` has stopped 3 times in a row".into(),
                         at: None,
                         failure,
+                        requires_reply: false,
+                        reply_route: None,
                         selector: Some("command-deploys-0000abcd@2".into()),
                     },
                 ))
@@ -4916,6 +4925,22 @@ mod tests {
             broken.contains("clank events ack command-deploys-0000abcd@2"),
             "{broken}",
         );
+    }
+
+    #[test]
+    fn a_required_reply_wake_does_not_instruct_a_plain_ack() {
+        let item: clank_core::wait::WaitItem = serde_json::from_value(serde_json::json!({
+            "kind": "command_event", "name": "questions", "id": "utt/a",
+            "event": "question", "content": "Which option?",
+            "requires_reply": true, "selector": "command-questions-abcd@7"
+        }))
+        .unwrap();
+        let wire = serde_json::json!({"items": [crate::cli::wait::render_json(&item)]});
+        let items = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        let reason = render_wait_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Master);
+        assert!(reason.contains("reply required"), "{reason}");
+        assert!(reason.contains("command-questions-abcd@7"), "{reason}");
+        assert!(!reason.contains("— ack `clank events ack"), "{reason}");
     }
 
     #[test]
@@ -4949,6 +4974,8 @@ mod tests {
                         content: "prod is live".into(),
                         at: None,
                         failure: false,
+                        requires_reply: false,
+                        reply_route: None,
                         selector: Some("command-signal-0000abcd@7".into()),
                     },
                 ))

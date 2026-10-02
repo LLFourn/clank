@@ -22,9 +22,10 @@
 //!   feed-id cursor and the coordinator's action-key horizon rebuild
 //!   from the log alone.
 //! - **All writers share one sidecar-lock protocol** (codex 899f915):
-//!   every append (ingest and ack alike) holds the sidecar lock
-//!   SHARED and opens the log AFTER acquiring it; compaction holds it
-//!   EXCLUSIVE and replaces the file by rename. Locking a sidecar —
+//!   ingest appends hold the sidecar lock SHARED and open the log AFTER
+//!   acquiring it. User acknowledgements and reply transactions hold it
+//!   EXCLUSIVE for their read/check/append; compaction holds it EXCLUSIVE
+//!   and replaces the file by rename. Locking a sidecar —
 //!   never the log inode itself — means an appender can't write
 //!   through a stale fd into a file the compactor just replaced.
 //! - **Failure domains are separate** (codex 899f915): `state.json`
@@ -116,6 +117,17 @@ impl Transport {
 /// never bump it (event-log-format-compat).
 const CURRENT_V: u64 = 1;
 
+/// One immutable answer attempt. Routing is captured here too, so retries made
+/// through another stored copy still answer using the original transaction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EventReply {
+    pub(crate) id: String,
+    pub(crate) text: String,
+    pub(crate) author: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) route: clank_core::wait::CommandReplyRoute,
+}
+
 /// One parsed log line: a record this version owns, or a FOREIGN one
 /// (unknown `t`, future `v`, or a known `t` whose fields drifted) —
 /// preserved byte-verbatim, skipped for semantics, but its envelope
@@ -126,7 +138,7 @@ enum Line {
     Foreign { raw: String, seq: Option<u64> },
 }
 
-/// One JSONL line. `t`-tagged so a reader can never confuse the three
+/// One JSONL line. `t`-tagged so a reader can never confuse its record
 /// forms, whatever optional fields they share. `t`, `v`, and `seq`
 /// are the VERSION-STABLE ENVELOPE: framing keys owned by every
 /// version forever; all other keys are private to their `t`.
@@ -180,13 +192,27 @@ enum Record {
         at: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ident: Option<String>,
+        /// Backend acceptance and local retirement are one record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<EventReply>,
+    },
+    /// Persisted before calling the backend. It does not acknowledge the event.
+    ReplyIntent {
+        v: u64,
+        seq: u64,
+        ident: String,
+        at: u64,
+        reply: EventReply,
     },
 }
 
 impl Record {
     fn version(&self) -> u64 {
         match self {
-            Record::Inbox { v, .. } | Record::Obs { v, .. } | Record::Ack { v, .. } => *v,
+            Record::Inbox { v, .. }
+            | Record::Obs { v, .. }
+            | Record::Ack { v, .. }
+            | Record::ReplyIntent { v, .. } => *v,
         }
     }
 }
@@ -224,6 +250,14 @@ pub(crate) fn logical_ident(
 /// The one ack-selector matcher: does this ack cover a row?
 fn ack_covers(ack_seq: u64, ack_ident: Option<&str>, row_seq: u64, row_ident: &str) -> bool {
     ack_seq == row_seq && ack_ident.is_none_or(|i| i == row_ident)
+}
+
+/// An optional answer becomes owed once submitted, even if its original event
+/// allowed plain ack. Presentation must give the same policy as the writer.
+fn mark_pending_reply(item: &mut WaitItem) {
+    if let WaitItem::CommandEvent { requires_reply, .. } = item {
+        *requires_reply = true;
+    }
 }
 
 /// Cache metadata sidecar — NEVER load-bearing for at-least-once.
@@ -278,6 +312,10 @@ pub(crate) struct EventRow {
     pub(crate) event_at: Option<u64>,
     pub(crate) transport: Transport,
     pub(crate) acked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reply: Option<EventReply>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) reply_accepted: bool,
     /// Pre-watch history logged at baseline (born handled).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) baseline: bool,
@@ -649,6 +687,7 @@ impl EventLog {
         let mut action_keys = Vec::new();
         let mut max_seq = 0u64;
         let mut foreign = 0usize;
+        let mut pending_replies = Vec::new();
         let lines = lines_in.len();
         for l in lines_in {
             let r = match l {
@@ -716,6 +755,15 @@ impl EventLog {
                     }
                 }
                 Record::Ack { .. } => {}
+                Record::ReplyIntent { seq, ident, .. } => {
+                    max_seq = max_seq.max(seq);
+                    pending_replies.push((seq, ident));
+                }
+            }
+        }
+        for key in pending_replies {
+            if let Some(&index) = by_key.get(&key) {
+                mark_pending_reply(&mut groups[index].item);
             }
         }
         let mut unhandled: Vec<InboxEntry> = groups
@@ -771,8 +819,12 @@ impl EventLog {
     /// ingest side's artifacts); interior corruption is `Ok(None)` for
     /// the caller to report.
     pub(crate) fn read_rows(&self) -> std::io::Result<Option<ReadRows>> {
+        let _lock = SidecarLock::acquire(&self.lock_path, false).ok();
+        self.read_rows_unlocked()
+    }
+
+    fn read_rows_unlocked(&self) -> std::io::Result<Option<ReadRows>> {
         let text = {
-            let _lock = SidecarLock::acquire(&self.lock_path, false).ok();
             match std::fs::read_to_string(&self.log_path) {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -801,6 +853,29 @@ impl EventLog {
             .iter()
             .filter(|l| matches!(l, Line::Foreign { .. }))
             .count();
+        let mut replies = std::collections::HashMap::new();
+        for line in &lines_in {
+            if let Line::Known(record) = line {
+                match record.as_ref() {
+                    Record::ReplyIntent {
+                        seq, ident, reply, ..
+                    } => {
+                        replies
+                            .entry((*seq, ident.clone()))
+                            .or_insert((reply.clone(), false));
+                    }
+                    Record::Ack {
+                        seq,
+                        ident: Some(ident),
+                        reply: Some(reply),
+                        ..
+                    } => {
+                        replies.insert((*seq, ident.clone()), (reply.clone(), true));
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Grouped by the (seq, ident) event key like fold: one display
         // row per logical event, identities unioned (first Some wins),
         // baseline aggregated over all copies, acked only when
@@ -838,6 +913,8 @@ impl EventLog {
                             event_at,
                             transport,
                             acked: false, // resolved below
+                            reply: None,
+                            reply_accepted: false,
                             baseline,
                             ident,
                             feed_id,
@@ -866,6 +943,13 @@ impl EventLog {
                 .iter()
                 .any(|(a, i)| ack_covers(*a, i.as_deref(), row.seq, &row.ident));
             row.acked = row.baseline || covered;
+            if let Some((reply, accepted)) = replies.remove(&(row.seq, row.ident.clone())) {
+                row.reply = Some(reply);
+                row.reply_accepted = accepted;
+                if !row.acked {
+                    mark_pending_reply(&mut row.item);
+                }
+            }
         }
         rows.sort_by_key(|r| r.seq);
         Ok(Some(ReadRows { rows, foreign }))
@@ -942,6 +1026,10 @@ impl EventLog {
 
     fn append(&mut self, record: &Record) -> std::io::Result<()> {
         let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        self.append_unlocked(record)
+    }
+
+    fn append_unlocked(&mut self, record: &Record) -> std::io::Result<()> {
         // Open AFTER the lock: the fd must name the current inode,
         // never one a compactor just renamed away.
         let mut f = std::fs::OpenOptions::new()
@@ -1027,23 +1115,167 @@ impl EventLog {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn append_ack(&mut self, seq: u64) -> std::io::Result<()> {
         self.append_ack_selector(seq, None)
     }
 
     /// A DISCRIMINATED ack: covers only rows whose logical identity
     /// equals `ident` (damaged same-seq-distinct-events logs).
+    #[cfg(test)]
     pub(crate) fn append_ack_ident(&mut self, seq: u64, ident: &str) -> std::io::Result<()> {
         self.append_ack_selector(seq, Some(ident))
     }
 
+    /// Revalidate under the write lock. An answer may have started since a
+    /// batch was resolved; plain ack must not retire that pending transaction.
+    pub(crate) fn append_checked_ack(&mut self, seq: u64, ident: &str) -> std::io::Result<()> {
+        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let row = self.reply_target(seq, ident)?;
+        if row.acked {
+            return Ok(());
+        }
+        if row.reply.is_some()
+            || row
+                .item
+                .event_view()
+                .is_some_and(|view| view.requires_reply)
+        {
+            return Err(std::io::Error::other(
+                "event requires a reply; plain acknowledgement is refused",
+            ));
+        }
+        self.append_unlocked(&Record::Ack {
+            v: CURRENT_V,
+            seq,
+            at: now_epoch(),
+            ident: Some(ident.into()),
+            reply: None,
+        })
+    }
+
+    #[cfg(test)]
     fn append_ack_selector(&mut self, seq: u64, ident: Option<&str>) -> std::io::Result<()> {
         self.append(&Record::Ack {
             v: CURRENT_V,
             seq,
             at: now_epoch(),
             ident: ident.map(str::to_owned),
+            reply: None,
         })
+    }
+
+    /// Caller holds the logical event's dispatch lease, not the data lock.
+    /// Keep the read/check/append atomic against compaction and other writers.
+    pub(crate) fn append_reply_intent(
+        &mut self,
+        seq: u64,
+        ident: &str,
+        reply: &EventReply,
+    ) -> std::io::Result<bool> {
+        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let row = self.reply_target(seq, ident)?;
+        if row.reply.as_ref().is_some_and(|stored| stored != reply) {
+            return Err(std::io::Error::other(
+                "event already has a different reply intent",
+            ));
+        }
+        if row.acked && !row.reply_accepted {
+            return Err(std::io::Error::other(
+                "event was acknowledged before its reply was recorded",
+            ));
+        }
+        if row.acked || row.reply.is_some() {
+            // A prior append may have written a complete record but failed its
+            // sync. Seeing it on retry does not yet make it durable.
+            self.sync_existing_log()?;
+            return Ok(false);
+        }
+        self.append_durable_unlocked(&Record::ReplyIntent {
+            v: CURRENT_V,
+            seq,
+            ident: ident.into(),
+            at: now_epoch(),
+            reply: reply.clone(),
+        })?;
+        Ok(true)
+    }
+
+    pub(crate) fn accept_reply(
+        &mut self,
+        seq: u64,
+        ident: &str,
+        reply: &EventReply,
+    ) -> std::io::Result<bool> {
+        let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        let row = self.reply_target(seq, ident)?;
+        if row.reply.as_ref() != Some(reply) {
+            return Err(std::io::Error::other(
+                "reply intent changed or disappeared; refusing retirement",
+            ));
+        }
+        if row.reply_accepted {
+            self.sync_existing_log()?;
+            return Ok(false);
+        }
+        self.append_durable_unlocked(&Record::Ack {
+            v: CURRENT_V,
+            seq,
+            at: now_epoch(),
+            ident: Some(ident.into()),
+            reply: Some(reply.clone()),
+        })?;
+        Ok(true)
+    }
+
+    fn reply_target(&self, seq: u64, ident: &str) -> std::io::Result<EventRow> {
+        self.read_rows_unlocked()?
+            .ok_or_else(|| std::io::Error::other("event log is corrupt"))?
+            .rows
+            .into_iter()
+            .find(|row| row.seq == seq && row.ident == ident)
+            .ok_or_else(|| std::io::Error::other("event disappeared; refusing reply"))
+    }
+
+    fn sync_existing_log(&self) -> std::io::Result<()> {
+        self.repaired_log_file()?.sync_data()?;
+        if let Some(parent) = self.log_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Explicit reply transactions are synced before their external effect.
+    /// Repair a crash-torn final line before appending a retry or acceptance.
+    fn append_durable_unlocked(&mut self, record: &Record) -> std::io::Result<()> {
+        let mut file = self.repaired_log_file()?;
+        let mut encoded = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        encoded.push(b'\n');
+        file.write_all(&encoded)?;
+        file.sync_data()?;
+        if let Some(parent) = self.log_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        self.lines += 1;
+        Ok(())
+    }
+
+    /// Caller holds the exclusive append lock. Even a no-op retry repairs the
+    /// framing before another producer can append after a crash-torn tail.
+    fn repaired_log_file(&self) -> std::io::Result<std::fs::File> {
+        let bytes = std::fs::read(&self.log_path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log_path)?;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            let start = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            if serde_json::from_slice::<serde_json::Value>(&bytes[start..]).is_ok() {
+                file.write_all(b"\n")?;
+            } else {
+                file.set_len(start as u64)?;
+            }
+        }
+        Ok(file)
     }
 
     /// Atomic rewrite (tmp + rename); failed ticks simply don't call
@@ -1123,6 +1355,7 @@ impl EventLog {
             std::collections::HashMap::new();
         let mut identities: Vec<(Option<String>, Option<String>, u64, bool)> = Vec::new();
         let mut foreign: Vec<(String, Option<u64>)> = Vec::new();
+        let mut intents = Vec::new();
         for l in lines_in {
             let r = match l {
                 Line::Known(r) => *r,
@@ -1173,6 +1406,7 @@ impl EventLog {
                     }
                 }
                 Record::Ack { .. } => {}
+                Record::ReplyIntent { .. } => intents.push(r),
             }
         }
         let covered = |g: &CGroup| {
@@ -1224,10 +1458,16 @@ impl EventLog {
         // rewrite (deduped by selector); acks whose groups folded or
         // never existed are dropped.
         let mut kept_acks: Vec<Record> = Vec::new();
-        let mut seen_selectors: std::collections::HashSet<(u64, Option<String>)> =
+        let mut seen_selectors: std::collections::HashSet<(u64, Option<String>, Option<String>)> =
             std::collections::HashSet::new();
         for (a_seq, a_ident, rec) in &acks {
-            if !seen_selectors.insert((*a_seq, a_ident.clone())) {
+            let reply_key = match rec {
+                Record::Ack {
+                    reply: Some(reply), ..
+                } => Some(reply.idempotency_key.clone()),
+                _ => None,
+            };
+            if !seen_selectors.insert((*a_seq, a_ident.clone(), reply_key)) {
                 continue;
             }
             let needed = cgroups.iter().enumerate().any(|(gi, g)| {
@@ -1304,14 +1544,31 @@ impl EventLog {
             out.push('\n');
             kept_lines += 1;
         }
+        for intent in intents {
+            if let Record::ReplyIntent { seq, ref ident, .. } = intent
+                && cgroups
+                    .iter()
+                    .enumerate()
+                    .any(|(gi, g)| !handled_set.contains(&gi) && g.seq == seq && &g.ident == ident)
+            {
+                out.push_str(&serde_json::to_string(&intent).map_err(std::io::Error::other)?);
+                out.push('\n');
+                kept_lines += 1;
+            }
+        }
         for (raw, _) in kept_foreign {
             out.push_str(raw);
             out.push('\n');
             kept_lines += 1;
         }
         let tmp = self.log_path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, out.as_bytes())?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(out.as_bytes())?;
+        file.sync_data()?;
         std::fs::rename(&tmp, &self.log_path)?;
+        if let Some(parent) = self.log_path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         self.lines = kept_lines;
         Ok(dropped_foreign)
     }
@@ -1333,6 +1590,158 @@ pub(super) mod tests {
             instructions: None,
             content: None,
         }
+    }
+
+    fn reply_fixture() -> EventReply {
+        EventReply {
+            id: "question/雪".into(),
+            text: "  answer\n".into(),
+            author: "alpha".into(),
+            idempotency_key: "stable-key".into(),
+            route: clank_core::wait::CommandReplyRoute {
+                command: vec!["backend".into(), "--answer".into()],
+                cwd: PathBuf::from("/original/cwd"),
+                state_dir: Some(PathBuf::from("/original/state")),
+            },
+        }
+    }
+
+    #[test]
+    fn pending_and_accepted_replies_survive_compaction_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = log_in(dir.path());
+        let seq = log
+            .append_inbox(Transport::Poll, Some("question"), None, None, &item(1))
+            .unwrap();
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        let reply = reply_fixture();
+        assert!(log.append_reply_intent(seq, &ident, &reply).unwrap());
+        assert!(!log.append_reply_intent(seq, &ident, &reply).unwrap());
+        let mut conflicting = reply.clone();
+        conflicting.text = "different".into();
+        assert!(log.append_reply_intent(seq, &ident, &conflicting).is_err());
+        assert!(log.accept_reply(seq, &ident, &conflicting).is_err());
+        assert!(log.append_checked_ack(seq, &ident).is_err());
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let mut restarted = log_in(dir.path());
+        assert_eq!(restarted.load().unhandled.len(), 1);
+        let pending = restarted.read_rows().unwrap().unwrap().rows.remove(0);
+        assert_eq!(pending.reply.as_ref(), Some(&reply));
+        assert!(!pending.acked && !pending.reply_accepted);
+        assert!(restarted.accept_reply(seq, &ident, &reply).unwrap());
+        assert!(!restarted.accept_reply(seq, &ident, &reply).unwrap());
+        restarted.lines = COMPACT_AT;
+        restarted.maybe_compact().unwrap();
+        let mut restarted = log_in(dir.path());
+        assert!(restarted.load().unhandled.is_empty());
+        let accepted = restarted.read_rows().unwrap().unwrap().rows.remove(0);
+        assert!(accepted.acked && accepted.reply_accepted);
+        assert_eq!(accepted.reply.as_ref(), Some(&reply));
+        let text = std::fs::read_to_string(&restarted.log_path).unwrap();
+        assert!(
+            text.lines().any(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["t"] == "ack" && value["reply"]["text"] == reply.text
+            }),
+            "acceptance and retirement must be the same record"
+        );
+    }
+
+    #[test]
+    fn reply_acceptance_repairs_a_crash_torn_tail_without_losing_owed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = log_in(dir.path());
+        let seq = log
+            .append_inbox(Transport::Poll, Some("question"), None, None, &item(1))
+            .unwrap();
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        let reply = reply_fixture();
+        log.append_reply_intent(seq, &ident, &reply).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log.log_path)
+            .unwrap();
+        file.write_all(br#"{"t":"ack","v":1,"seq":1,"reply":{"text":"ans"#)
+            .unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let mut restarted = log_in(dir.path());
+        assert_eq!(restarted.load().unhandled.len(), 1);
+        assert_eq!(
+            restarted.read_rows().unwrap().unwrap().rows[0]
+                .reply
+                .as_ref(),
+            Some(&reply)
+        );
+        restarted.accept_reply(seq, &ident, &reply).unwrap();
+        let mut restarted = log_in(dir.path());
+        let loaded = restarted.load();
+        assert!(!loaded.log_quarantined);
+        assert!(loaded.unhandled.is_empty());
+        assert!(restarted.read_rows().unwrap().unwrap().rows[0].reply_accepted);
+    }
+
+    #[test]
+    fn retrying_a_visible_intent_repairs_its_missing_newline_before_other_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = log_in(dir.path());
+        let seq = log
+            .append_inbox(Transport::Poll, Some("question"), None, None, &item(1))
+            .unwrap();
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        let reply = reply_fixture();
+        log.append_reply_intent(seq, &ident, &reply).unwrap();
+        // The intent is valid JSON, but its newline did not reach storage.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log.log_path)
+            .unwrap();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let mut restarted = log_in(dir.path());
+        restarted.load();
+        assert!(!restarted.append_reply_intent(seq, &ident, &reply).unwrap());
+        restarted
+            .append_inbox(Transport::Poll, Some("unrelated"), None, None, &item(2))
+            .unwrap();
+        let read = restarted
+            .read_rows()
+            .unwrap()
+            .expect("retry must restore framing for the producer");
+        assert_eq!(read.rows.len(), 2);
+        assert_eq!(read.rows[0].reply.as_ref(), Some(&reply));
+        assert!(!read.rows[0].acked);
+        restarted.accept_reply(seq, &ident, &reply).unwrap();
+        assert!(restarted.read_rows().unwrap().unwrap().rows[0].reply_accepted);
+    }
+
+    #[test]
+    fn a_reused_sequence_cannot_substitute_a_different_event_during_reply_or_plain_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = log_in(dir.path());
+        let seq = log
+            .append_inbox(Transport::Poll, Some("first"), None, None, &item(1))
+            .unwrap();
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        let reply = reply_fixture();
+        log.append_reply_intent(seq, &ident, &reply).unwrap();
+        // Replace the WAL with another event at the same display sequence.
+        std::fs::remove_file(&log.log_path).unwrap();
+        let mut replacement = log_in(dir.path());
+        assert_eq!(
+            replacement
+                .append_inbox(Transport::Poll, Some("replacement"), None, None, &item(2))
+                .unwrap(),
+            seq
+        );
+        let before = std::fs::read(&replacement.log_path).unwrap();
+        assert!(log.accept_reply(seq, &ident, &reply).is_err());
+        assert!(log.append_reply_intent(seq, &ident, &reply).is_err());
+        assert!(log.append_checked_ack(seq, &ident).is_err());
+        assert_eq!(std::fs::read(&replacement.log_path).unwrap(), before);
+        assert!(!replacement.read_rows().unwrap().unwrap().rows[0].acked);
     }
 
     /// The WAL says whether a write LANDED, which is the one thing a
@@ -1410,6 +1819,52 @@ pub(super) mod tests {
         assert_eq!(
             loaded.action_keys,
             vec!["review#1".to_string(), "review#2".into()]
+        );
+    }
+
+    #[test]
+    fn reply_requirements_survive_compaction_and_old_rows_default_to_plain_ack() {
+        let dir = tempdir();
+        let mut log = log_in(&dir);
+        let legacy = serde_json::json!({
+            "kind": "command_event", "name": "questions", "id": "old",
+            "event": "question", "content": "Which option?"
+        });
+        let ordinary: WaitItem = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!ordinary.event_view().unwrap().requires_reply);
+        assert!(
+            serde_json::to_value(&ordinary)
+                .unwrap()
+                .get("requires_reply")
+                .is_none()
+        );
+        let mut required_wire = legacy;
+        required_wire["id"] = "new".into();
+        required_wire["requires_reply"] = true.into();
+        let required: WaitItem = serde_json::from_value(required_wire).unwrap();
+        log.append_inbox(Transport::Command, Some("old"), None, None, &ordinary)
+            .unwrap();
+        log.append_inbox(Transport::Command, Some("new"), None, None, &required)
+            .unwrap();
+        // Force the real rewrite without thousands of unrelated fixture rows.
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let mut fresh = log_in(&dir);
+        let loaded = fresh.load();
+        assert_eq!(loaded.unhandled.len(), 2);
+        assert!(
+            !loaded.unhandled[0]
+                .item
+                .event_view()
+                .unwrap()
+                .requires_reply
+        );
+        assert!(
+            loaded.unhandled[1]
+                .item
+                .event_view()
+                .unwrap()
+                .requires_reply
         );
     }
 

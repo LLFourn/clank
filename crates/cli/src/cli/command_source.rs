@@ -195,6 +195,9 @@ pub(crate) struct Line {
     /// The producer's own timestamp; ingest time when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) at: Option<u64>,
+    /// An answer must be accepted by the backend before this event is handled.
+    #[serde(default)]
+    pub(crate) requires_reply: bool,
 }
 
 /// Why a line was refused. Refusing is loud and per-line: one bad
@@ -431,6 +434,8 @@ pub(crate) fn ingest_line(
             ),
             at: line.at,
             failure: false,
+            requires_reply: line.requires_reply,
+            reply_route: None,
             // Stamped by `apply` once the row it names exists.
             selector: None,
         }),
@@ -701,8 +706,37 @@ fn failure_event(
         content: crate::cli::status_tui::text::one_line(why, usize::MAX),
         at: None,
         failure: true,
+        requires_reply: false,
+        reply_route: None,
         selector: None,
     }
+}
+
+/// Attach the configuration of the producer that supplied this event, before
+/// its single durable inbox append. Backlog and config edits never replace it.
+pub(crate) fn ingest_line_with_route(
+    src: &clank_core::agent_config::CommandSource,
+    seen: &Seen,
+    raw: &str,
+    route: Option<&clank_core::wait::CommandReplyRoute>,
+) -> Option<Ingested> {
+    let mut what = ingest_line(src, seen, raw)?;
+    if let Ingested::Emit { item, .. } = &mut what
+        && let clank_core::wait::WaitItem::CommandEvent {
+            requires_reply,
+            reply_route,
+            ..
+        } = item.as_mut()
+    {
+        *reply_route = route.cloned();
+        if *requires_reply && reply_route.is_none() {
+            eprintln!(
+                "wait: source `{}` emitted an event requiring a reply without a reply_command; it stays owed",
+                src.name
+            );
+        }
+    }
+    Some(what)
 }
 
 #[cfg(test)]
@@ -719,6 +753,7 @@ mod tests {
         clank_core::agent_config::CommandSource {
             name: name.into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         }
     }
@@ -1880,6 +1915,8 @@ mod producer_tests {
             event_at: None,
             transport: crate::cli::github::log::Transport::Command,
             acked,
+            reply: None,
+            reply_accepted: false,
             baseline: false,
             ident: ident.into(),
             feed_id: None,
@@ -1891,6 +1928,8 @@ mod producer_tests {
                 content: ident.into(),
                 at: None,
                 failure: false,
+                requires_reply: false,
+                reply_route: None,
                 selector: None,
             },
         }
@@ -1960,6 +1999,8 @@ mod producer_tests {
             event_at: None,
             transport: crate::cli::github::log::Transport::Poll,
             acked: false,
+            reply: None,
+            reply_accepted: false,
             baseline: false,
             ident: format!("i{seq}"),
             feed_id: None,

@@ -14,6 +14,9 @@ use crate::cli::github::log::{EventLog, EventRow};
 use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
 
+mod reply;
+use reply::ack_with_reply;
+
 pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
     match args.command {
         super::EventsCmd::List(a) => {
@@ -24,7 +27,13 @@ pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
         super::EventsCmd::Ack(a) => {
             let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
-            ack(&dir, rows, &a.ids)
+            match a.reply.as_deref() {
+                Some(text) => {
+                    let repo = super::resolve_repo(a.repo.as_deref())?;
+                    ack_with_reply(&repo, &dir, rows, &a.ids, text).await
+                }
+                None => ack(&dir, rows, &a.ids),
+            }
         }
         super::EventsCmd::Show(a) => {
             let (dir, prompts) = events_context(a.repo.as_deref(), a.author.as_deref())?;
@@ -365,6 +374,9 @@ fn describe(item: &WaitItem) -> String {
     if v.failure {
         out.push_str("  (this SOURCE is broken, not the world)");
     }
+    if v.requires_reply {
+        out.push_str("  (reply required)");
+    }
     if let Some(c) = v.content {
         out.push_str(&format!("  “{c}”"));
     }
@@ -444,6 +456,9 @@ fn list(
         }
     }
     println!("\nack with: clank events ack <id> …   (unacked events keep waking the wait)");
+    if shown.iter().any(|s| needs_reply(&s.row.item)) {
+        println!("events marked reply required cannot be handled with a plain ack");
+    }
     Ok(())
 }
 
@@ -456,7 +471,7 @@ fn ack(dir: &Path, rows: Vec<Sourced>, ids: &[String]) -> anyhow::Result<()> {
         // The SHARED resolution seam judges collision + handled
         // state; `None` here can only mean already handled (the row
         // was just resolved, so it cannot have vanished).
-        match resolve_ack_target(dir, &rows, &s.source, s.row.seq, &s.row.ident) {
+        match resolve_ack_target(dir, &rows, &s.source, s.row.seq, &s.row.ident)? {
             Some(t) => targets.push((t, id)),
             None => println!("{id}: already handled"),
         }
@@ -464,6 +479,31 @@ fn ack(dir: &Path, rows: Vec<Sourced>, ids: &[String]) -> anyhow::Result<()> {
     for (t, id) in targets {
         append_ack_target(&t)?;
         println!("{id}: handled");
+    }
+    Ok(())
+}
+
+fn needs_reply(item: &WaitItem) -> bool {
+    item.event_view().is_some_and(|v| v.requires_reply)
+}
+
+/// Shared policy for user acknowledgements. This runs in the resolution phase
+/// of both CLI and TUI batches, so a required reply aborts before any append.
+fn ensure_plain_ack_allowed(dir: &Path, rows: &[Sourced], s: &Sourced) -> anyhow::Result<()> {
+    if needs_reply(&s.row.item) || s.row.reply.is_some() {
+        let mut selector = display_id(rows, s);
+        selector.source = Some(s.source.clone());
+        let author = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str());
+        let author_arg = author
+            .map(|label| format!(" --author {}", crate::shell_quote::shell_quote(label)))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "{selector} requires a reply; use `clank events ack{author_arg} {} --reply <text>`",
+            crate::shell_quote::shell_quote(&selector.to_string()),
+        );
     }
     Ok(())
 }
@@ -479,40 +519,39 @@ pub(crate) struct AckTarget {
     source: String,
     seq: u64,
     ident: String,
-    discriminate: bool,
 }
 
 /// Resolve one copy against ITS WAL's rows: `None` is an explicit
-/// no-op (vanished or already handled), `Some` carries the selector.
+/// no-op (vanished or already handled), `Some` carries the selector,
+/// and an event that needs a reply refuses a plain acknowledgement.
 fn resolve_ack_target(
     dir: &Path,
     rows: &[Sourced],
     source: &str,
     seq: u64,
     ident: &str,
-) -> Option<AckTarget> {
-    let s = rows
+) -> anyhow::Result<Option<AckTarget>> {
+    let Some(s) = rows
         .iter()
-        .find(|s| s.source == source && s.row.seq == seq && s.row.ident == ident)?;
+        .find(|s| s.source == source && s.row.seq == seq && s.row.ident == ident)
+    else {
+        return Ok(None);
+    };
     if s.row.acked {
-        return None;
+        return Ok(None);
     }
-    Some(AckTarget {
+    ensure_plain_ack_allowed(dir, rows, s)?;
+    Ok(Some(AckTarget {
         dir: dir.to_path_buf(),
         source: source.to_string(),
         seq,
         ident: ident.to_string(),
-        discriminate: seq_collides(rows, s),
-    })
+    }))
 }
 
 fn append_ack_target(t: &AckTarget) -> anyhow::Result<()> {
     let mut log = EventLog::open(&t.dir, &t.source)?;
-    if t.discriminate {
-        log.append_ack_ident(t.seq, &t.ident)?;
-    } else {
-        log.append_ack(t.seq)?;
-    }
+    log.append_checked_ack(t.seq, &t.ident)?;
     drop(log);
     // Every other source is compacted by the loop that owns it. The
     // message source has no such loop, so both of its write paths have
@@ -557,7 +596,7 @@ pub(crate) fn ack_members(
         let rows = read_all(&dir)
             .with_context(|| format!("reading `{agent}`'s event WALs for the ack fanout"))?;
         for k in keys {
-            if let Some(t) = resolve_ack_target(&dir, &rows, &k.source, k.seq, &k.ident) {
+            if let Some(t) = resolve_ack_target(&dir, &rows, &k.source, k.seq, &k.ident)? {
                 targets.push(t);
             }
         }
@@ -618,6 +657,16 @@ fn show(
         println!("action:    {key}");
     }
     println!("event:     {}", describe(&s.row.item));
+    if needs_reply(&s.row.item) {
+        println!("reply:     required; plain acknowledgement is refused");
+    }
+    if let Some(reply) = &s.row.reply {
+        println!(
+            "answer:    {}",
+            sanitize_multiline(&reply.text).replace('\n', "\n           ")
+        );
+        println!("accepted:  {}", s.row.reply_accepted);
+    }
     if let Some(url) = s.row.item.event_view().and_then(|v| v.github?.url) {
         println!("url:       {url}");
     }
@@ -761,7 +810,9 @@ mod tests {
         assert!(!rows[0].row.acked);
         assert_eq!(rows[0].row.item, draft);
         assert!(describe(&rows[0].row.item).contains("PR #7"));
-        let target = resolve_ack_target(&dir, &rows, key, seq, &rows[0].row.ident).unwrap();
+        let target = resolve_ack_target(&dir, &rows, key, seq, &rows[0].row.ident)
+            .unwrap()
+            .unwrap();
         append_ack_target(&target).unwrap();
         let rows = read_all(&dir).unwrap();
         assert!(rows[0].row.acked);
@@ -829,6 +880,146 @@ mod tests {
         assert!(fresh.load().unhandled.is_empty());
     }
 
+    #[test]
+    fn a_required_reply_survives_ingestion_wake_restart_and_producer_replay() {
+        use crate::cli::command_source as cs;
+        let dir = tempdir();
+        let src = clank_core::agent_config::CommandSource {
+            name: "questions".into(),
+            command: vec!["true".into()],
+            reply_command: None,
+            glyph: None,
+        };
+        let key = src.source_key();
+        let mut log = EventLog::open(&dir, &key).unwrap();
+        let mut seen = cs::Seen::at(&dir, &key);
+        let raw = r#"{"id":"utt/a","content":"Which option?","requires_reply":true}"#;
+        let what = cs::ingest_line(&src, &seen, raw).unwrap();
+        let mut wake = None;
+        assert!(cs::apply(what, &key, &mut log, &mut seen, |item| {
+            wake = Some(item);
+            true
+        }));
+        let wake = wake.unwrap();
+        let view = wake.event_view().unwrap();
+        let selector = view.selector.unwrap().to_owned();
+        assert!(view.requires_reply);
+        let wire = serde_json::to_value(crate::cli::wait::render_json(&wake)).unwrap();
+        assert_eq!(wire["requires_reply"], true);
+
+        let rows = read_all(&dir).unwrap();
+        let required = resolve(&rows, &selector).unwrap();
+        assert!(describe(&required.row.item).contains("reply required"));
+        let json = serde_json::to_value(json_row(&rows, required, &Default::default())).unwrap();
+        assert_eq!(json["item"]["requires_reply"], true);
+        let err = ack(&dir, rows, &[selector.clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a reply"), "{err}");
+
+        let mut fresh = EventLog::open(&dir, &key).unwrap();
+        let loaded = fresh.load();
+        assert_eq!(loaded.unhandled.len(), 1);
+        assert!(needs_reply(&loaded.unhandled[0].item));
+        let mut replay_seen = cs::Seen::at(&dir, &key);
+        replay_seen.recover(loaded.feed_ids);
+        let weaker = r#"{"id":"utt/a","requires_reply":false}"#;
+        assert!(matches!(
+            cs::ingest_line(&src, &replay_seen, weaker),
+            Some(cs::Ingested::Duplicate)
+        ));
+        let rows = read_all(&dir).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(needs_reply(&rows[0].row.item));
+        assert!(!rows[0].row.acked);
+    }
+
+    #[test]
+    fn a_required_reply_aborts_cli_and_cross_agent_batches_before_any_ack() {
+        use crate::cli::github::timeline::MemberKey;
+        let root = tempdir();
+        let repo = root.as_path();
+        let dirs: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|agent| {
+                crate::agent_store::agents_root(repo)
+                    .join(agent)
+                    .join("events")
+            })
+            .collect();
+        let command = |id: &str, requires_reply| WaitItem::CommandEvent {
+            name: "questions".into(),
+            id: id.into(),
+            event: "question".into(),
+            content: "Which option?".into(),
+            at: None,
+            failure: false,
+            requires_reply,
+            reply_route: None,
+            selector: None,
+        };
+        let key = "command-questions-abcd";
+        for (dir, id, required) in [(&dirs[0], "ordinary", false), (&dirs[1], "required", true)] {
+            let mut log = EventLog::open(dir, key).unwrap();
+            log.append_inbox(
+                Transport::Command,
+                Some(id),
+                None,
+                None,
+                &command(id, required),
+            )
+            .unwrap();
+        }
+        // CLI batch: even an ordinary event selected first must remain owed.
+        let mut alpha = EventLog::open(&dirs[0], key).unwrap();
+        alpha.load();
+        alpha
+            .append_inbox(
+                Transport::Command,
+                Some("required"),
+                None,
+                None,
+                &command("required", true),
+            )
+            .unwrap();
+        let before: Vec<_> = dirs
+            .iter()
+            .map(|d| std::fs::read(d.join(format!("{key}.jsonl"))).unwrap())
+            .collect();
+        let err = ack(
+            &dirs[0],
+            read_all(&dirs[0]).unwrap(),
+            &["1".into(), "2".into()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires a reply"));
+
+        // The TUI's fanout uses the same policy across every member's WAL.
+        let mut members = Vec::new();
+        for (agent, dir) in ["alpha", "beta"].into_iter().zip(&dirs) {
+            members.extend(read_all(dir).unwrap().into_iter().map(|s| MemberKey {
+                agent: agent.into(),
+                source: s.source,
+                seq: s.row.seq,
+                ident: s.row.ident,
+            }));
+        }
+        let err = ack_members(repo, &members).unwrap_err();
+        assert!(err.to_string().contains("requires a reply"));
+        for (dir, bytes) in dirs.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(dir.join(format!("{key}.jsonl"))).unwrap(),
+                bytes
+            );
+            assert!(read_all(dir).unwrap().iter().all(|s| !s.row.acked));
+        }
+        // An ordinary event is still independently acknowledgeable.
+        ack(&dirs[0], read_all(&dirs[0]).unwrap(), &["1".into()]).unwrap();
+        let rows = read_all(&dirs[0]).unwrap();
+        assert!(rows[0].row.acked);
+        assert!(!rows[1].row.acked);
+    }
+
     /// A command source's event walks the WHOLE public surface:
     /// listed, addressed by the selector the WAKE handed the agent,
     /// acked, and then gone for good — including against the
@@ -848,6 +1039,7 @@ mod tests {
         let src = clank_core::agent_config::CommandSource {
             name: "deploys".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         };
         let key = src.source_key();
@@ -945,6 +1137,7 @@ mod tests {
         let src = clank_core::agent_config::CommandSource {
             name: "deploys".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         };
         let key = src.source_key();
@@ -1000,6 +1193,7 @@ mod tests {
         let src = clank_core::agent_config::CommandSource {
             name: "deploys".into(),
             command: vec!["true".into()],
+            reply_command: None,
             glyph: None,
         };
         let key = src.source_key();

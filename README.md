@@ -286,7 +286,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `tui` | The full-screen pane: the way you drive a running team |
 | `status` | Repo state; `--watch` live (Enter on a github row opens the event page: preview, ack, open-in-browser), `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
-| `events` | Github event inbox: `list` / `ack` / `show` (see below) |
+| `events` | Event inbox: `list` / `ack` / `show` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo) |
 | `feedback` | `write` / `read` review feedback via a typed surface |
 | `queue` | `add` / `promote` / `remove` / `reprioritise` queued plans |
@@ -396,8 +396,8 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
   repeatable `--event '<json>'`): `github` entries watch any repo
   (PRs opened/updated/merged, comments, issues, branch pushes — your
   own actions filtered by default — and CI conclusions,
-  `ci_passed` / `ci_failed`), and `command` entries spawn an argv whose
-  completion is the wake. `"prs":[7,9]` scopes a watch to named PRs —
+  `ci_passed` / `ci_failed`), and `command` entries run an argv that
+  streams JSONL events (see the reply protocol below). `"prs":[7,9]` scopes a watch to named PRs —
   every kind that names one, comments and updates and merges and CI
   alike; `pr_opened`, issues and branch pushes are outside it. A watch can carry a `"prompt"`
   — operator instructions stamped onto every wake item it produces,
@@ -461,6 +461,80 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
   nothing was armed is not recoverable.
   `clank events list` / `show` inspect it; the `clank-github` skill
   teaches agents the react-then-ack loop.
+
+Command producers write one JSON object per stdout line, with an `id` unique
+within their source, and optional `content`, `kind`, `at` and `requires_reply`.
+Replaying an ID preserves its original event. To ask for an answer, configure
+the source with a separate reply handler:
+
+```json
+{
+  "kind": "command",
+  "name": "questions",
+  "command": ["question-backend", "subscribe"],
+  "reply_command": ["question-backend", "answer"]
+}
+```
+
+The producer can emit:
+
+```json
+{"id":"question/42","content":"Which option?","requires_reply":true}
+```
+
+Use the selector printed by `clank events list` or the wake:
+
+```sh
+clank events ack command-questions-<hash>@1 --reply 'Use option B.'
+```
+
+Plain acknowledgement, including bulk or TUI acknowledgement, refuses an
+event requiring a reply. The TUI shows the CLI recipe; it has no reply editor.
+`--reply` takes one event selector and a nonempty answer; the supplied text is
+preserved verbatim. Ordinary command events can also receive an explicit reply
+if they have a handler. Other backends currently refuse `--reply`.
+
+Clank invokes `reply_command` directly with its configured argv, without shell
+interpolation or added arguments. Stdin carries one JSON object, then EOF:
+
+```json
+{"version":1,"id":"question/42","reply":"Use option B.","author":"codex","idempotency_key":"<opaque stable key>"}
+```
+
+The original producer ID and answer can contain Unicode, slashes or newlines.
+The handler receives the producer's saved working directory and resolved
+`CLANK_SOURCE_STATE_DIR`. These and its argv are captured with the event, so
+editing the source configuration cannot redirect an outstanding reply, and an
+invocation-only `--event` source remains answerable after its producer ends.
+A missing handler leaves a required event owed, with a diagnostic; configure
+the handler before emitting such events.
+
+The event log durably stores an immutable reply intent before delivery. Exit
+zero accepts the answer; acceptance and acknowledgement share one durable log
+record. Failed launch, nonzero exit, blocked stdin or a hanging handler leaves
+the event unhandled. The callback and its process-group cleanup have a total
+five-second budget, with bounded diagnostics. Reply commands to the same saved
+backend are serialized by one nonblocking lease, keeping its callback count
+bounded. A concurrent submission is refused. After failure or interruption,
+retry explicitly
+with the original answer; different text is refused while that intent exists.
+`clank events show <selector> --json` includes the saved reply and acceptance.
+
+Callback attempts are **at least once**: a crash after backend acceptance but
+before its local record can repeat delivery. The backend must persist and
+deduplicate `idempotency_key`, return zero for a previously accepted identical
+submission, and refuse conflicting content for that key. The author, key and
+text remain the same on retry. Copies sharing the same resolved source key,
+producer ID and saved route use one transaction and callback; same-named
+sources with different routes remain independent. A recorded acceptance lets
+an interrupted fanout finish retiring other copies without another callback.
+
+Replies add no idle worker, watcher or periodic retry. An explicit command
+owns delivery and cleanup. A later explicit retry checks any saved callback
+owner by kernel process birth identity before ending a surviving process
+group; uncertain ownership refuses a new launch and names the record to inspect.
+Use updated Clank binaries for all agents, the monitor and the TUI before
+enabling required replies; an older client does not enforce this new policy.
 
 ## Troubleshooting
 
