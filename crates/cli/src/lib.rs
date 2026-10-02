@@ -24,6 +24,7 @@ pub mod proc_identity;
 pub mod repo_watch;
 pub mod runtime;
 pub mod shell_quote;
+pub mod signal;
 pub mod state_cache;
 pub mod worktree_facts;
 

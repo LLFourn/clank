@@ -1160,17 +1160,17 @@ impl EventSources {
 /// Sync `kill` subprocess, not libc: Drop must be sync and this runs
 /// on task abort too (the drop is the cancellation-safety story).
 ///
-/// Holds a validated [`crate::cli::command_source::Pgid`] rather than a
+/// Holds a validated [`crate::signal::Pgid`] rather than a
 /// bare number. `kill -9 -1` is every process this user may signal, and
 /// this is a tuple struct anybody can write — `GroupKill(Some(1))` was
 /// one keystroke from the same catastrophe `Pgid` exists to make
 /// unrepresentable, so it is spelled in that type too.
-pub(crate) struct GroupKill(pub(crate) Option<crate::cli::command_source::Pgid>);
+pub(crate) struct GroupKill(pub(crate) Option<crate::signal::Pgid>);
 
 impl GroupKill {
     /// The guard for a child, or none when there is no group to name.
     pub(crate) fn over(child: Option<u32>) -> Self {
-        Self(child.and_then(|pid| crate::cli::command_source::Pgid::new(pid as i32)))
+        Self(child.and_then(|pid| crate::signal::Pgid::new(pid as i32)))
     }
 }
 
@@ -2476,7 +2476,7 @@ pub(crate) fn parse_duration_str(raw: &str) -> anyhow::Result<Option<Duration>> 
 #[cfg(test)]
 mod shared_tests {
     use super::*;
-    use crate::cli::monitor::{Conn, Fold, Note};
+    use crate::cli::monitor::{Conn, Note};
 
     /// A monitor's end of a pair, writing frames a test chooses.
     fn monitor_saying(frames: Vec<Note>) -> Conn {
@@ -2495,11 +2495,6 @@ mod shared_tests {
         });
         Conn::over(mine)
     }
-
-    fn fold() -> Fold {
-        Fold { tick: 1, at_ms: 2 }
-    }
-
     fn promote() -> WaitItem {
         WaitItem::PromoteFromQueue {
             name: "next".into(),
@@ -2513,11 +2508,10 @@ mod shared_tests {
     async fn a_beat_is_not_a_wake_but_items_are() {
         let repo = tempfile::tempdir().unwrap();
         let conn = monitor_saying(vec![
-            Note::Beat { fold: fold() },
-            Note::Beat { fold: fold() },
+            Note::Beat,
+            Note::Beat,
             Note::Items {
                 items: vec![promote()],
-                fold: fold(),
             },
         ]);
 
@@ -2545,13 +2539,9 @@ mod shared_tests {
     async fn an_empty_items_frame_is_skipped() {
         let repo = tempfile::tempdir().unwrap();
         let conn = monitor_saying(vec![
-            Note::Items {
-                items: Vec::new(),
-                fold: fold(),
-            },
+            Note::Items { items: Vec::new() },
             Note::Items {
                 items: vec![promote()],
-                fold: fold(),
             },
         ]);
 
@@ -2588,7 +2578,6 @@ mod shared_tests {
                 pid: 4242,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: socket.to_string_lossy().to_string(),
-                fold: fold(),
             },
         )
         .unwrap();
@@ -2599,7 +2588,6 @@ mod shared_tests {
                 let _ = reader.read_line(&mut line);
                 let welcome = crate::cli::monitor::Welcome::Ok {
                     proto: crate::cli::monitor::PROTO,
-                    fold: fold(),
                 };
                 let _ = writeln!(
                     reader.into_inner(),
@@ -3155,17 +3143,39 @@ mod shared_tests {
             resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
         );
 
-        // The willing monitor, re-announced as the version that does
-        // NOT host sources.
-        let socket = crate::cli::monitor::socket_path(dir.path(), 4242).unwrap();
+        // A monitor of the version that does NOT host sources, which
+        // ANSWERS as that version. The descriptor alone is not enough
+        // any more and should not be: it is a hint about where to
+        // knock, and the handshake is what settles the version — so a
+        // fixture that published one number and answered with another
+        // was describing a monitor that cannot exist.
+        let socket = crate::cli::monitor::socket_path(dir.path(), 4343).unwrap();
+        let older = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            while let Ok((stream, _)) = older.accept() {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                let decline = crate::cli::monitor::Welcome::Decline {
+                    proto: crate::cli::monitor::PROTO - 1,
+                    why: "this monitor does not host sources".into(),
+                };
+                let _ = writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::to_string(&decline).unwrap()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
         crate::cli::monitor::publish(
             repo.path(),
             &crate::cli::monitor::Descriptor {
                 proto: crate::cli::monitor::PROTO - 1,
-                pid: 4242,
+                pid: 4343,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: socket.to_string_lossy().to_string(),
-                fold: fold(),
             },
         )
         .unwrap();
@@ -3342,12 +3352,9 @@ mod shared_tests {
         .unwrap();
 
         let conn = monitor_saying(vec![
-            Note::Beat { fold: fold() },
-            Note::Items {
-                items: Vec::new(),
-                fold: fold(),
-            },
-            Note::Beat { fold: fold() },
+            Note::Beat,
+            Note::Items { items: Vec::new() },
+            Note::Beat,
         ]);
 
         let err = tokio::time::timeout(
@@ -3398,7 +3405,6 @@ mod shared_tests {
                 name: "next".into(),
                 priority: 500,
             }],
-            fold: fold(),
         };
         writeln!(peer, "{}", serde_json::to_string(&note).unwrap()).unwrap();
 
@@ -3655,7 +3661,7 @@ mod tests {
         let window = cs::BACKOFF_FIRST / 2;
         let began = std::time::Instant::now();
         loop {
-            let group = cs::Pgid::new(pid).expect("a real child is a real group");
+            let group = crate::signal::Pgid::new(pid).expect("a real child is a real group");
             if cs::group_of(group) == cs::Group::Empty {
                 break;
             }

@@ -1469,41 +1469,6 @@ pub(crate) enum Look {
     Unknown,
 }
 
-/// A process group id that is safe to address.
-///
-/// `kill(-1, …)` is POSIX for "every process this user may signal",
-/// not group 1, and `kill(0, …)` is the caller's own group. Both are
-/// catastrophic to reach by accident, and a validating `if` inside the
-/// signalling function was NOT enough: a mutation check deleted that
-/// `if`, the run was interrupted before it restored the file, and the
-/// test written to prove the guard worked — which called
-/// `signal_group(1, SIGKILL)` — then ran `kill(-1, SIGKILL)` and took
-/// down a developer's entire login session, twice.
-///
-/// So the rule lives in the type, where there is no statement to
-/// delete and no test has to issue a real signal to check it:
-/// `signal_group(1, …)` does not compile, and the only way to obtain
-/// one of these is through a constructor that refuses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Pgid(i32);
-
-impl Pgid {
-    /// `None` for the ids that do not name a group we may address.
-    pub(crate) fn new(pgid: i32) -> Option<Self> {
-        (pgid > 1).then_some(Self(pgid))
-    }
-
-    pub(crate) fn get(self) -> i32 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for Pgid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// Whether anything remains in a recorded process group.
 ///
 /// The GROUP is what a producer owns, what gets signalled, and
@@ -1584,14 +1549,10 @@ pub(crate) fn clear_producer(store_dir: &std::path::Path, key: &str) {
 /// and a failed comparison signals nothing — which is the direction to
 /// be wrong in.
 pub(crate) fn look(pid: i32) -> Look {
-    if pid <= 0 {
-        // Not a process: 0 is our own group and -1 is every process.
-        return Look::Gone;
-    }
-    // SAFETY: signal 0 checks for the process without delivering one.
-    if unsafe { libc::kill(pid, 0) } != 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    {
+    // `Theirs` is not `Gone`: a pid that exists and is somebody else's
+    // must not be read as a spent record, and `ps` below is what says
+    // whether it is the incarnation we recorded.
+    if crate::signal::probe_process(pid) == crate::signal::Probe::Gone {
         return Look::Gone;
     }
     let Ok(out) = std::process::Command::new("ps")
@@ -1622,25 +1583,21 @@ pub(crate) fn look(pid: i32) -> Look {
 /// counterpart of the `ESRCH` check above and needs no enumeration.
 /// `EPERM` counts as OCCUPIED: it means the group exists and is
 /// somebody else's, which is every reason not to call it empty.
-pub(crate) fn group_of(pgid: Pgid) -> Group {
-    // SAFETY: a negative pid addresses the process group; `Pgid` has
-    // already refused the ids for which that would mean something else,
-    // and signal 0 only checks for the group rather than delivering.
-    let rc = unsafe { libc::kill(-pgid.get(), 0) };
-    group_from((rc != 0).then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))
+pub(crate) fn group_of(pgid: crate::signal::Pgid) -> Group {
+    group_from(crate::signal::probe_group(pgid))
 }
 
-/// Read a `kill(-pgid, 0)` outcome, with `None` meaning it succeeded.
+/// Read a group probe as occupancy.
 ///
-/// Separated from the call so that `EPERM` — a group that exists and
-/// belongs to somebody else — is reachable without another user's
-/// process to point at, which a test has no way to arrange.
-fn group_from(errno: Option<i32>) -> Group {
-    match errno {
-        None => Group::Occupied,
-        Some(e) if e == libc::ESRCH => Group::Empty,
-        Some(e) if e == libc::EPERM => Group::Occupied,
-        Some(_) => Group::Unknown,
+/// A group that is somebody ELSE's counts as occupied: that it exists
+/// at all is every reason not to call it empty, and whether we may end
+/// it is a separate question with a separate answer.
+fn group_from(probe: crate::signal::Probe) -> Group {
+    use crate::signal::Probe;
+    match probe {
+        Probe::Ours | Probe::Theirs => Group::Occupied,
+        Probe::Gone => Group::Empty,
+        Probe::Unknown(_) => Group::Unknown,
     }
 }
 
@@ -1742,7 +1699,7 @@ pub(crate) fn reap_previous_producer(store_dir: &std::path::Path, key: &str) -> 
         key,
         look,
         group_of,
-        signal_group,
+        crate::signal::signal_group,
         ESCALATE_AFTER,
         std::time::Instant::now,
     )
@@ -1797,8 +1754,8 @@ pub(crate) fn reap_previous_producer_with(
     store_dir: &std::path::Path,
     key: &str,
     look: impl Fn(i32) -> Look,
-    group_of: impl Fn(Pgid) -> Group,
-    signal: impl Fn(Pgid, libc::c_int),
+    group_of: impl Fn(crate::signal::Pgid) -> Group,
+    signal: impl Fn(crate::signal::Pgid, libc::c_int),
     escalate_after: std::time::Duration,
     clock: impl Fn() -> std::time::Instant,
 ) -> Retired {
@@ -1829,7 +1786,7 @@ pub(crate) fn reap_previous_producer_with(
     // record naming one of the special ids cannot have come from
     // `record_producer` — a child's pid is never 0 or 1 — so it is
     // evidence from somewhere else, and nothing here will act on it.
-    let Some(pgid) = Pgid::new(record.pgid) else {
+    let Some(pgid) = crate::signal::Pgid::new(record.pgid) else {
         return Retired::Deferred(format!(
             "{} names pgid {}, which is not a process group; remove it",
             path.display(),
@@ -1893,22 +1850,10 @@ pub(crate) fn reap_previous_producer_with(
     }
 }
 
-/// Signal a whole process group, so a producer's own children go too.
-///
-/// No validation here, and none needed: [`Pgid`] carries the proof,
-/// and a guard at this boundary is exactly the thing that turned out
-/// to be deletable.
-fn signal_group(pgid: Pgid, sig: libc::c_int) {
-    // SAFETY: a negative pid addresses the process group; the signal is
-    // valid and has no memory effects.
-    unsafe {
-        libc::kill(-pgid.get(), sig);
-    }
-}
-
 #[cfg(test)]
 mod producer_tests {
     use super::*;
+    use crate::signal::Pgid;
     use std::time::Duration;
 
     const WHEN: &str = "Thu 1 Oct 16:58:08 2026";
@@ -2236,40 +2181,20 @@ mod producer_tests {
         );
     }
 
-    /// The special ids cannot be addressed, because they cannot be
-    /// CONSTRUCTED.
-    ///
-    /// Asserted on the constructor and never by signalling: the test
-    /// this replaces called `signal_group(1, SIGKILL)` to show the
-    /// guard held, which meant its safety depended on the very code it
-    /// was checking. A mutation run deleted that guard, was interrupted
-    /// before restoring it, and the test then issued
-    /// `kill(-1, SIGKILL)` — every process this user may signal —
-    /// twice. There is nothing to delete here, and nothing is sent.
-    #[test]
-    fn a_special_id_is_not_a_group_that_can_be_addressed() {
-        assert_eq!(Pgid::new(1), None, "`kill(-1, …)` is every process");
-        assert_eq!(Pgid::new(0), None, "`kill(0, …)` is our own group");
-        assert_eq!(Pgid::new(-1), None);
-        assert_eq!(Pgid::new(-4242), None);
-        assert_eq!(Pgid::new(2).map(Pgid::get), Some(2), "and 2 is a group");
-        assert_eq!(Pgid::new(4242).map(Pgid::get), Some(4242));
-    }
-
     #[test]
     fn a_group_we_may_not_signal_is_not_an_empty_one() {
-        assert_eq!(group_from(None), Group::Occupied);
-        assert_eq!(group_from(Some(libc::ESRCH)), Group::Empty);
+        use crate::signal::Probe;
+        assert_eq!(group_from(Probe::Ours), Group::Occupied);
+        assert_eq!(group_from(Probe::Gone), Group::Empty);
         assert_eq!(
-            group_from(Some(libc::EPERM)),
+            group_from(Probe::Theirs),
             Group::Occupied,
-            "it exists and is somebody else's, which is every reason not \
-             to call it empty"
+            "it exists and is somebody else's, which is not empty"
         );
         assert_eq!(
-            group_from(Some(libc::EINVAL)),
+            group_from(Probe::Unknown(libc::EINVAL)),
             Group::Unknown,
-            "and an answer we do not understand is not absence"
+            "an unexpected errno is not an answer"
         );
     }
 

@@ -23,7 +23,7 @@ use clank_core::wait::WaitItem;
 /// Skew is routine rather than exceptional here: monitors outlive
 /// `cargo install`, so a fresh client meeting an old monitor is the
 /// expected case and must degrade rather than fail.
-pub(crate) const PROTO: u32 = 4;
+pub(crate) const PROTO: u32 = 5;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -35,6 +35,18 @@ pub(crate) const PROTO: u32 = 4;
 /// only projected repo work, and the client would have stopped
 /// tailing its own sources: configured events missed for as long as
 /// that monitor lives (codex on a135276).
+///
+/// 5 adds the STAND-DOWN: a holder on 5 can be ASKED to retire by a
+/// successor, over the socket, and answers. Anything older cannot be
+/// asked at all — proto 3 and 4 both exit only on their own fold
+/// watchdog — so "the live peer answered with a number below ours" is
+/// the positive evidence that a cooperative retirement is unavailable,
+/// and it is the ONLY thing that may be read that way. The bump is
+/// forced rather than chosen: proto-4 monitors were already running
+/// when this was written, so putting the capability on 4 would have
+/// made `proto: 4` ambiguous between a peer that can be asked and one
+/// that cannot, which is exactly the inference the bootstrap must not
+/// make (codex on b1d5d27).
 ///
 /// So a capability change is a version change. The client refuses a
 /// monitor on any other number and watches for itself, which is the
@@ -120,23 +132,8 @@ pub(crate) struct Hello {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub(crate) enum Welcome {
-    Ok { proto: u32, fold: Fold },
+    Ok { proto: u32 },
     Decline { proto: u32, why: String },
-}
-
-/// Evidence that the FOLD is progressing, written by the fold loop.
-///
-/// Not by the accept loop. A stamp from the socket task proves only
-/// that the process breathes, which is exactly what a wedged monitor
-/// does — and a wedged monitor answering pings while folding nothing is
-/// the failure this has to catch (codex on ca7a4c2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Fold {
-    /// Advances on every completed loop tick, whether or not the fold
-    /// changed. A quiet repo produces no new state, so the TICK is the
-    /// evidence of life and the state is not.
-    pub(crate) tick: u64,
-    pub(crate) at_ms: u64,
 }
 
 /// What the monitor pushes to a client.
@@ -145,10 +142,27 @@ pub(crate) struct Fold {
 pub(crate) enum Note {
     /// What this client's author is owed. Empty is never sent; a client
     /// blocks until it has something, as a park does today.
-    Items { items: Vec<WaitItem>, fold: Fold },
-    /// Proof of life. Carries the fold so silence and staleness are the
-    /// same signal to a client.
-    Beat { fold: Fold },
+    Items { items: Vec<WaitItem> },
+    /// Proof of life, and nothing else.
+    ///
+    /// It carried the monitor's fold counter so a client could tell a
+    /// WEDGED monitor from a quiet one. Two separate signals already
+    /// answer that, and neither needs the number:
+    ///
+    /// - A CLIENT watches arrival. It gives up on silence past
+    ///   `BEAT_GRACE` and goes back to watching for itself, which is
+    ///   the same answer for a wedged monitor and a dead one — and
+    ///   both are the answer it can act on.
+    /// - The WATCHDOG, inside the monitor, compares successive reads
+    ///   of a private counter that only a COMPLETED fold advances.
+    ///   That is the one place two of these were ever compared.
+    ///
+    /// A beat does not stand for a fresh fold, and the first version
+    /// of this comment said it did (codex on 258d979): `admit_into`
+    /// and the author-source branch both serve against the CACHED
+    /// folded state, so beats and counter advances are not one for
+    /// one.
+    Beat,
 }
 
 /// Where monitor sockets live, in the order they are tried.
@@ -237,10 +251,6 @@ pub(crate) struct Descriptor {
     /// since moved is recognised rather than trusted.
     pub(crate) repo: String,
     pub(crate) socket: String,
-    /// The last fold the monitor completed, so a client can see
-    /// staleness without connecting — as `status` in Claude Code's
-    /// session descriptor does.
-    pub(crate) fold: Fold,
 }
 
 /// Whether a monitor serving `theirs` may answer a client from `ours`.
@@ -270,8 +280,7 @@ pub(crate) fn admits(ours: u32, theirs: u32) -> bool {
 /// milliseconds and invited exactly the bug that shape invites: a
 /// clock rollback postpones the timeout until the clock catches up,
 /// and saturating arithmetic hides it rather than fixing it (codex on
-/// adb5453). `Fold::at_ms` stays for diagnostics and is never the
-/// basis of this decision.
+/// adb5453).
 pub(crate) fn beat_overdue(since_last: Duration, grace: Duration) -> bool {
     since_last > grace
 }
@@ -495,7 +504,7 @@ fn bind_listener_with(
         }
         // Safe only because the lease is held: nothing live owns this.
         let _ = std::fs::remove_file(&path);
-        sweep_dead_sockets(dir, pid, pid_is_live);
+        sweep_dead_sockets(dir, pid, crate::signal::alive);
         let listener = match std::os::unix::net::UnixListener::bind(&path) {
             Ok(listener) => listener,
             Err(e) => {
@@ -557,19 +566,6 @@ fn sweep_dead_sockets(dir: &std::path::Path, mine: i32, live: impl Fn(i32) -> bo
     swept
 }
 
-/// Whether a pid still names a running process.
-///
-/// `EPERM` counts as live: it means the process exists but belongs to
-/// somebody else, which is every reason to leave its socket alone.
-fn pid_is_live(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 checks for the process without delivering one.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 /// Read a client's opening frame, VERSION FIRST.
 ///
 /// The order is the point. A body decoded under the wrong version can
@@ -603,6 +599,122 @@ pub(crate) fn accept_hello(line: &str, repo: &std::path::Path) -> Result<Hello, 
         ));
     }
     Ok(hello)
+}
+
+/// What an opening frame turns out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Greeting {
+    Client(Hello),
+    /// Declined, and the decline says this monitor is OBSOLETE: the
+    /// client speaks a NEWER version than it does.
+    ///
+    /// Which means it should go, and it is the only thing entitled to
+    /// decide that — it is acting on its own process, in its own repo,
+    /// so there is no identity to establish, no signal to aim and no
+    /// permission to negotiate. All of that belonged to an earlier
+    /// design where a STRANGER ended the holder, and all of it is
+    /// deleted.
+    Obsolete(Welcome),
+    Decline(Welcome),
+}
+
+/// The compatibility FLOOR: what a monitor may rely on reading from
+/// ANY version's opening frame, past or future.
+///
+/// Separate from [`Hello`] because `Hello` is the version-gated WORK
+/// body and may change shape; these three fields are the contract that
+/// does not. A frame that cannot produce one of these is a frame this
+/// monitor knows nothing about, and nothing is decided from it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct Opening {
+    pub(crate) proto: u32,
+    pub(crate) repo: String,
+    pub(crate) who: OpeningWho,
+}
+
+/// The floor's view of who is asking.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "as", rename_all = "snake_case")]
+pub(crate) enum OpeningWho {
+    Agent {
+        author: String,
+    },
+    Observer,
+    /// A kind this build does not know. Decided AGAINST, never for: a
+    /// client we cannot identify is not one whose word ends a repo's
+    /// owner.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Read an opening frame, and notice when answering it means this
+/// monitor is finished.
+///
+/// A client stays version-gated exactly as before — a body decoded
+/// under the wrong version is the hazard that gate exists for. The ONE
+/// addition is which side of the mismatch we are on, and it is reached
+/// only after the frame has been VALIDATED as something addressed to
+/// this repo by somebody this repo knows.
+///
+/// That validation is the correction, and it was a real hole: the
+/// first version re-read `Envelope.proto` alone, so a bare
+/// `{"proto":6}` — no repo, no identity, from anyone who could reach
+/// the socket — retired the monitor, as did a higher-version frame
+/// asking for a different repo entirely (codex on c4b5899). I had
+/// claimed an unknown author could not reach this decision; that was
+/// true only of the equal-version path, which is not the path that
+/// matters.
+pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
+    let decline = |why: String| Greeting::Decline(Welcome::Decline { proto: PROTO, why });
+    let Ok(open) = serde_json::from_str::<Opening>(line) else {
+        // Not even the floor. Whatever it is, it decides nothing.
+        return match accept_hello(line, repo) {
+            Ok(hello) => Greeting::Client(hello),
+            Err(d) => Greeting::Decline(d),
+        };
+    };
+    if !serves(repo, &open.repo) {
+        return decline(format!(
+            "this monitor serves {}, the client asked for {}",
+            repo.display(),
+            open.repo
+        ));
+    }
+    if open.proto > PROTO {
+        // Older than the client, and the client is addressed to this
+        // repo and known to it. We are what an install replaced.
+        return match &open.who {
+            OpeningWho::Observer => Greeting::Obsolete(Welcome::Decline {
+                proto: PROTO,
+                why: format!(
+                    "this monitor speaks proto {PROTO}, the client speaks {}",
+                    open.proto
+                ),
+            }),
+            OpeningWho::Agent { author } => match AgentLabel::parse(author)
+                .ok()
+                .filter(|a| crate::agent_store::resolve_role(repo, a).is_ok())
+            {
+                Some(_) => Greeting::Obsolete(Welcome::Decline {
+                    proto: PROTO,
+                    why: format!(
+                        "this monitor speaks proto {PROTO}, the client speaks {}",
+                        open.proto
+                    ),
+                }),
+                // On this repo's socket, for this repo, but not one of
+                // its agents. Refused, and this monitor stays.
+                None => decline(format!("`{author}` is not on this repo's roster")),
+            },
+            OpeningWho::Unknown => {
+                decline("a client kind this monitor does not recognise".to_string())
+            }
+        };
+    }
+    match accept_hello(line, repo) {
+        Ok(hello) => Greeting::Client(hello),
+        Err(d) => Greeting::Decline(d),
+    }
 }
 
 /// How long attaching may take, start to finish.
@@ -1016,6 +1128,46 @@ fn read_frame(
     }
 }
 
+/// What ONE attach attempt established, for a caller that has to
+/// decide whether starting a monitor would help.
+///
+/// `Alone(String)` could not carry that. Every failure looked alike,
+/// so the client forked a monitor at each retry — four doomed children
+/// per park against a healthy newer owner, and four that had all lost
+/// and exited before a legitimate retirement (`RETIRE_BUDGET` plus
+/// settlement) could even finish, leaving nobody to start the
+/// replacement after the lease freed (codex on 9413783).
+#[derive(Debug)]
+pub(crate) enum Seen {
+    /// Compatible, and attached.
+    Shared(Conn),
+    /// A monitor that should KEEP the repo: newer than us, or it
+    /// refused this client on its merits. Starting one would add a
+    /// monitor that cannot own anything.
+    Theirs(String),
+    /// Nothing usable is published. Starting one is the answer.
+    Vacant(String),
+    /// An older peer answered, and has now been greeted by a newer
+    /// client. Retirement is UNCONFIRMED: proto 3 and 4 cannot
+    /// self-exit, and the wire does not distinguish a refusal from
+    /// retirement progress. The lease is what settles it.
+    OlderPeer(String),
+    /// Nothing was established. Not evidence of anything, and never a
+    /// reason to fork.
+    Unproven(String),
+}
+
+impl From<Seen> for Attached {
+    fn from(seen: Seen) -> Self {
+        match seen {
+            Seen::Shared(conn) => Attached::Shared(conn),
+            Seen::Theirs(why) | Seen::Vacant(why) | Seen::OlderPeer(why) | Seen::Unproven(why) => {
+                Attached::Alone(why)
+            }
+        }
+    }
+}
+
 /// Attach to this repo's monitor, or report why we are on our own.
 ///
 /// Test-only: production always connects-or-SPAWNS, so attaching
@@ -1046,22 +1198,76 @@ pub(crate) fn attach_by(
         std::time::Instant,
     ) -> std::io::Result<std::os::unix::net::UnixStream>,
 ) -> Attached {
+    look_at(repo, who, budget, connect).into()
+}
+
+/// [`attach_by`], keeping what it ESTABLISHED rather than a sentence
+/// about it.
+pub(crate) fn look_at(
+    repo: &std::path::Path,
+    who: Who,
+    budget: Duration,
+    connect: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream>,
+) -> Seen {
     let deadline = std::time::Instant::now() + budget;
-    let Some(d) = read_published(repo) else {
-        return Attached::Alone(format!("no monitor published for {}", repo.display()));
+    // The descriptor is a HINT about where to knock, not a gate.
+    //
+    // It used to decide the version too, and that is what stopped this
+    // whole mechanism working: a newer client read an older
+    // descriptor, returned without connecting, and the holder never
+    // heard the greeting that would have told it to go (codex on
+    // c4b5899). The repo still gates — a descriptor outlives the repo
+    // it describes — and the VERSION is settled by the handshake,
+    // where both ends can act on it.
+    let (socket, hint) = match published(repo) {
+        Published::Nothing => {
+            return Seen::Vacant(format!("no monitor published for {}", repo.display()));
+        }
+        Published::Ours(d) if !serves(repo, &d.repo) => {
+            // A descriptor for a repo this is not. Nothing is serving
+            // THIS one, so starting is right.
+            return Seen::Vacant(format!(
+                "the monitor at {} serves {}, not {}",
+                d.socket,
+                d.repo,
+                repo.display()
+            ));
+        }
+        Published::Ours(d) => (d.socket, PROTO),
+        Published::Other {
+            proto,
+            socket: Some(s),
+        } => (s, proto),
+        Published::Other {
+            proto,
+            socket: None,
+        } => {
+            // Something is there and cannot be addressed. Not an
+            // absence, so not a reason to start a second one.
+            return Seen::Unproven(format!(
+                "a proto {proto} monitor is published for {} with no socket we can read",
+                repo.display()
+            ));
+        }
     };
-    if !usable(&d, repo, PROTO) {
-        return Attached::Alone(format!(
-            "the monitor at {} serves {} on proto {} — not ours",
-            d.socket, d.repo, d.proto
-        ));
-    }
+    let d = Descriptor {
+        proto: hint,
+        pid: 0,
+        repo: repo.to_string_lossy().to_string(),
+        socket,
+    };
     let stream = match connect(std::path::Path::new(&d.socket), deadline) {
         Ok(s) => s,
         // A descriptor outlives its monitor: a refused connection is
         // the ordinary way a dead one is noticed, and a connect that
         // cannot finish in the budget is the same answer.
-        Err(e) => return Attached::Alone(format!("cannot reach {}: {e}", d.socket)),
+        // A descriptor outlives its monitor, so a refused connection
+        // is the ordinary way a dead one is noticed — and then nothing
+        // holds the repo.
+        Err(e) => return Seen::Vacant(format!("cannot reach {}: {e}", d.socket)),
     };
 
     let hello = Hello {
@@ -1071,35 +1277,230 @@ pub(crate) fn attach_by(
     };
     let line = match serde_json::to_string(&hello) {
         Ok(line) => line,
-        Err(e) => return Attached::Alone(format!("cannot compose a hello: {e}")),
+        Err(e) => return Seen::Unproven(format!("cannot compose a hello: {e}")),
     };
 
     let mut conn = Conn::over_reader(std::io::BufReader::new(stream));
     if let Err(e) = write_frame(conn.io.get_ref(), format!("{line}\n").as_bytes(), deadline) {
-        return Attached::Alone(format!("cannot greet {}: {e}", d.socket));
+        return Seen::Unproven(format!("cannot greet {}: {e}", d.socket));
     }
 
     let answer = match read_frame(&mut conn.io, &mut conn.partial, deadline) {
         Ok(answer) => answer,
-        Err(e) => return Attached::Alone(format!("the handshake with {} failed: {e}", d.socket)),
+        Err(e) => {
+            return Seen::Unproven(format!("the handshake with {} failed: {e}", d.socket));
+        }
     };
     // Version before body here too: the descriptor said what the
     // monitor WAS, and the process answering now is what matters.
     let Ok(envelope) = serde_json::from_str::<Envelope>(answer.trim_end()) else {
-        return Attached::Alone(format!("the monitor's answer did not parse: {answer:?}"));
+        return Seen::Unproven(format!("the monitor's answer did not parse: {answer:?}"));
     };
     if !admits(PROTO, envelope.proto) {
-        return Attached::Alone(format!(
-            "the monitor answered on proto {}, we speak {PROTO}",
-            envelope.proto
-        ));
+        let theirs = envelope.proto;
+        let why = format!("the monitor answered on proto {theirs}, we speak {PROTO}");
+        if theirs > PROTO {
+            // Newer, and it keeps the repo. We are the stale client
+            // and go it alone; starting one would only add a monitor
+            // that cannot own anything.
+            return Seen::Theirs(why);
+        }
+        // Older. The REPLY still has to be one we understand before it
+        // means anything: a bare `{"proto":4}`, an unknown body, or an
+        // older peer refusing us for the repo or the roster is not
+        // evidence about retirement, and the first version read all of
+        // them as "standing down" (codex on 88b6234).
+        //
+        // And even a well-formed one does not establish it. Proto 3
+        // and 4 cannot self-exit at all, and the wire does not
+        // distinguish a refusal from retirement progress. What is
+        // established is an older peer that has now been greeted; the
+        // LEASE is what says whether it left.
+        return match serde_json::from_str::<Welcome>(answer.trim_end()) {
+            Ok(Welcome::Decline { .. }) => Seen::OlderPeer(why),
+            _ => Seen::Unproven(format!(
+                "a proto {theirs} monitor answered something this build cannot read"
+            )),
+        };
     }
     match serde_json::from_str::<Welcome>(answer.trim_end()) {
-        Ok(Welcome::Ok { .. }) => Attached::Shared(conn),
+        Ok(Welcome::Ok { .. }) => Seen::Shared(conn),
+        // Our own version, refusing us on our merits — the roster, the
+        // repo. A second monitor would refuse us the same way.
         Ok(Welcome::Decline { proto, why }) => {
-            Attached::Alone(format!("the monitor declined (proto {proto}): {why}"))
+            Seen::Theirs(format!("the monitor declined (proto {proto}): {why}"))
         }
-        Err(e) => Attached::Alone(format!("the monitor's answer did not parse: {e}")),
+        Err(e) => Seen::Unproven(format!("the monitor's answer did not parse: {e}")),
+    }
+}
+
+/// The right to try a REPAIR of this repo's monitor, held while one
+/// client does it.
+///
+/// Not the canonical lease. That one stops two monitors OWNING a repo
+/// and says nothing about how many clients may poll for it or fork a
+/// child at it: each could take and drop it and each then start one,
+/// which is a poller and a fork per waiting client (codex on
+/// cf29219). This coalesces them to one useful repair per repo.
+///
+/// Flocked, so it coalesces ACROSS processes — every parked wait is
+/// its own — and held until startup and classification are done,
+/// including the failing and expiring paths, because a permit
+/// released early is one the next client takes while this one is
+/// still working.
+///
+/// It lives beside the SOCKET rather than under `.clank/`: it is
+/// process state with no meaning once the process is gone, and the
+/// repo is not where such things belong.
+#[derive(Debug)]
+pub(crate) struct RepairPermit {
+    _file: std::fs::File,
+}
+
+/// Where a repair gate lives, for a uid.
+///
+/// FIXED, and deliberately independent of the environment. Socket
+/// allocation may try candidates because the published descriptor then
+/// tells everyone which was chosen; a coordination lock has no such
+/// discovery, so every caller must derive the SAME path or the gate is
+/// not a gate. Two clients differing only in `XDG_RUNTIME_DIR` each
+/// took a permit in a different directory, locked different inodes,
+/// and both forked (codex on 88b6234).
+pub(crate) fn repair_dir(me: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/tmp/clank-repair-{me}"))
+}
+
+/// What asking for the repair gate established.
+///
+/// `Busy` and `Unavailable` are different facts and were one: every
+/// open, create and lock failure reported as "another client is
+/// already starting one", which is not established when the namespace
+/// itself could not be used.
+#[derive(Debug)]
+pub(crate) enum Repair {
+    Acquired(RepairPermit),
+    /// Somebody else is repairing this repo.
+    Busy,
+    /// The gate could not be used at all, and why.
+    Unavailable(String),
+}
+
+/// Take this repo's repair gate.
+pub(crate) fn take_repair_permit(repo: &std::path::Path) -> Repair {
+    let me = unsafe { libc::getuid() };
+    take_repair_permit_in(repo, &repair_dir(me), me)
+}
+
+/// [`take_repair_permit`] with the namespace supplied, so a test can
+/// drive an unusable one — and so the production choice of `repair_dir`
+/// is observable rather than assumed.
+pub(crate) fn take_repair_permit_in(
+    repo: &std::path::Path,
+    dir: &std::path::Path,
+    me: u32,
+) -> Repair {
+    // The same vetting the socket boundary does, for a reason that
+    // belongs to this lock rather than to security in general: a gate
+    // file replaced while a holder keeps its old fd lets the next
+    // caller lock a DIFFERENT inode at the same path, and then both
+    // are repairing.
+    if let Err(why) = ensure_dir(dir, me) {
+        return Repair::Unavailable(why);
+    }
+    match repair_permit(repo, dir) {
+        Ok(Some(permit)) => Repair::Acquired(permit),
+        Ok(None) => Repair::Busy,
+        Err(why) => Repair::Unavailable(why),
+    }
+}
+
+/// Take the repair permit in `dir`.
+pub(crate) fn repair_permit(
+    repo: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<Option<RepairPermit>, String> {
+    use std::os::fd::AsRawFd;
+    let path = dir.join(format!("{}.repair", repo_tag(repo)));
+    // Never unlinked: the held fd and its flock ARE the state, and
+    // removing the file on release would let the next caller create a
+    // new inode at the same name beside a holder still on the old one.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open the repair gate at {}: {e}", path.display()))?;
+    // SAFETY: valid owned fd; flock has no memory effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    Ok((rc == 0).then_some(RepairPermit { _file: file }))
+}
+
+/// A stable digest of a canonical repo path.
+///
+/// blake3 over the path's RAW BYTES. `DefaultHasher` was wrong twice
+/// over: its algorithm is explicitly unspecified across Rust releases,
+/// which bites exactly when binaries from two installs contend during
+/// an upgrade, and `to_string_lossy` is not the path. The scheme must
+/// not vary with `PROTO`, the compiler, or the standard library.
+pub(crate) fn repo_tag(repo: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    blake3::hash(repo.as_os_str().as_bytes()).to_hex()[..32].to_string()
+}
+
+/// Whether this repo's ownership became available./// Whether this repo's ownership became available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    /// The lease was taken and released, so the next monitor started
+    /// can hold it.
+    Ready,
+    /// Still held when the deadline passed. Not permission.
+    Busy,
+}
+
+/// Wait, within one deadline, for this repo's ownership to free.
+///
+/// Probing by TAKING the lease is the canonical proof and needs no
+/// timer: it is non-blocking, and dropping it immediately hands the
+/// repo to whichever monitor is started next. Several clients racing
+/// here is fine — whoever wins serves the rest.
+pub(crate) async fn wait_for_ownership(
+    repo: &std::path::Path,
+    by: std::time::Instant,
+    step: Duration,
+) -> Ownership {
+    wait_for_ownership_by(repo, by, step, |r| acquire_lease(r).is_ok()).await
+}
+
+/// [`wait_for_ownership`] with the probe supplied.
+///
+/// A seam, because the boundary that matters cannot be reached
+/// otherwise: ownership becoming available and then the deadline
+/// passing BEFORE anything is started. Taking the real lease is
+/// fast, so a test cannot arrange that gap by scheduling — and a
+/// guard nothing can drive is a guard nobody has checked.
+pub(crate) async fn wait_for_ownership_by(
+    repo: &std::path::Path,
+    by: std::time::Instant,
+    step: Duration,
+    took_it: impl Fn(&std::path::Path) -> bool,
+) -> Ownership {
+    loop {
+        // Expiry BEFORE readiness. Taking the lease first meant an
+        // already-expired deadline still returned Ready when the lease
+        // happened to be free, and so did a timer that resumed after
+        // `by` — and the caller then started a child with no further
+        // check (codex on cf29219).
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ownership::Busy;
+        }
+        if took_it(repo) {
+            return Ownership::Ready;
+        }
+        // Async, so a client waiting for a monitor to go does not park
+        // the runtime thread it is waiting on.
+        tokio::time::sleep(step.min(left)).await;
     }
 }
 
@@ -1170,6 +1571,7 @@ pub(crate) async fn attach_or_spawn_with(
         SHARE_ATTEMPTS,
         spawn,
         connect_within,
+        |r| acquire_lease(r).is_ok(),
     )
     .await
 }
@@ -1191,11 +1593,81 @@ pub(crate) async fn attach_or_spawn_by(
         std::time::Instant,
     ) -> std::io::Result<std::os::unix::net::UnixStream>
     + Copy,
+    took_it: impl Fn(&std::path::Path) -> bool,
 ) -> Attached {
-    let mut why = match attach_by(repo, who.clone(), budget, connect) {
-        Attached::Shared(conn) => return Attached::Shared(conn),
-        Attached::Alone(why) => why,
+    // ONE deadline over the whole handoff: notify, wait for ownership
+    // to free, start, attach. The retries used to take a fresh budget
+    // each, so the count was the bound rather than any deadline.
+    let by = std::time::Instant::now() + settle + budget;
+    let mut why = match look_at(repo, who.clone(), budget, connect) {
+        Seen::Shared(conn) => return Attached::Shared(conn),
+        // A monitor that should keep the repo. Starting one would add
+        // a monitor that cannot own anything, and doing it on every
+        // park is the cost this classification exists to remove.
+        Seen::Theirs(why) | Seen::Unproven(why) => return Attached::Alone(why),
+        Seen::Vacant(why) | Seen::OlderPeer(why) => why,
     };
+
+    // The repo is ours when its LEASE frees, and nothing sooner says
+    // so — so whether it freed has to be an ANSWER, not a fall-through.
+    // All three ways out of the old loop reached the start below:
+    // acquired, retries exhausted, deadline gone. Only the first is
+    // permission (codex on 1c0ce9d).
+    //
+    // Bounded by the DEADLINE and not by a retry count, because the
+    // count ended the wait after about 450ms while a holder standing
+    // down legitimately has its retirement budget plus settlement. A
+    // child started at 450ms loses the lease and exits, and nothing
+    // creates the replacement once the lease finally frees.
+    // ONE repair per repo, not one per waiting client. The permit is
+    // taken before any lease polling and held through startup — if
+    // another client holds it, this one is not a second repairer and
+    // does its own work (codex on cf29219).
+    let permit = match take_repair_permit(repo) {
+        Repair::Acquired(permit) => permit,
+        Repair::Busy => {
+            return Attached::Alone(format!("{why}, and another client is already starting one"));
+        }
+        // Not established that anybody is repairing — only that we
+        // cannot ask. Saying otherwise would be a guess reported as a
+        // fact.
+        Repair::Unavailable(gate) => {
+            return Attached::Alone(format!("{why}, and the repair gate is unusable: {gate}"));
+        }
+    };
+
+    // A winner may have appeared while we queued for the permit, so
+    // the answer from before it is stale. Attaching to a compatible
+    // one, or leaving a newer one serving, is cheaper and more correct
+    // than starting anything.
+    let left = by.saturating_duration_since(std::time::Instant::now());
+    if !left.is_zero() {
+        match look_at(repo, who.clone(), left, connect) {
+            Seen::Shared(conn) => return Attached::Shared(conn),
+            Seen::Theirs(next) | Seen::Unproven(next) => return Attached::Alone(next),
+            Seen::Vacant(next) | Seen::OlderPeer(next) => why = next,
+        }
+    }
+
+    match wait_for_ownership_by(repo, by, settle / limit, took_it).await {
+        Ownership::Ready => {}
+        // Still held when time ran out. This client does its own work;
+        // a monitor that cannot own the repo helps nobody.
+        Ownership::Busy => {
+            return Attached::Alone(format!("{why}, and its lease is still held"));
+        }
+    }
+
+    // Expiry again, immediately before starting. Checking it before
+    // the lease probe is necessary and does not cover a probe that
+    // finished after `by`, or this task resuming past it (codex on
+    // 06021ee). The permit goes with the early return.
+    if by
+        .saturating_duration_since(std::time::Instant::now())
+        .is_zero()
+    {
+        return Attached::Alone(format!("{why}, and the handoff ran out of time"));
+    }
 
     match spawn(repo) {
         // Handed over BEFORE any attach can return, so no exit path
@@ -1204,21 +1676,32 @@ pub(crate) async fn attach_or_spawn_by(
         Err(e) => return Attached::Alone(format!("{why}, and starting one failed: {e}")),
     }
 
-    // ONE spawn, then retries against it: a second would only lose the
-    // lease race to the first. The attempts are bounded because a
-    // holder that is merely suspended keeps its lease, so no amount of
-    // retrying takes it (codex on ca7a4c2).
     let mut attempts = 1;
     while !give_up_sharing(attempts, limit) {
-        // Async, so a client waiting for the monitor to come up does
-        // not park the runtime thread it is waiting on.
-        tokio::time::sleep(settle / limit).await;
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        tokio::time::sleep((settle / limit).min(left)).await;
         attempts += 1;
-        match attach_by(repo, who.clone(), budget, connect) {
-            Attached::Shared(conn) => return Attached::Shared(conn),
-            Attached::Alone(next) => why = next,
+        // What is LEFT of the one deadline, never a fresh budget: an
+        // attempt entering its handshake just before `by` could
+        // otherwise block for another whole `ATTACH_BUDGET`, and an
+        // outer check cannot make that bounded.
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match look_at(repo, who.clone(), left, connect) {
+            Seen::Shared(conn) => return Attached::Shared(conn),
+            Seen::Theirs(next) | Seen::Unproven(next) => return Attached::Alone(next),
+            Seen::Vacant(next) | Seen::OlderPeer(next) => why = next,
         }
     }
+    // Held until here: startup and classification are both done, and a
+    // permit released sooner is one the next client takes while this
+    // one is still working.
+    drop(permit);
     Attached::Alone(format!(
         "started a monitor for {}, but {why}",
         repo.display()
@@ -1479,8 +1962,62 @@ pub(crate) fn publish(repo: &std::path::Path, d: &Descriptor) -> std::io::Result
 
 /// What a repo's monitor published, if anything readable.
 pub(crate) fn read_published(repo: &std::path::Path) -> Option<Descriptor> {
-    let raw = std::fs::read(descriptor_path(repo)).ok()?;
-    serde_json::from_slice(&raw).ok()
+    match published(repo) {
+        Published::Ours(d) => Some(d),
+        _ => None,
+    }
+}
+
+/// What a repo's published descriptor turns out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Published {
+    /// Ours, and its body parsed.
+    Ours(Descriptor),
+    /// A monitor of ANOTHER version published this. The number is
+    /// trusted because it was read first; the socket only when the
+    /// rest of the body happened to parse, which is why it is
+    /// optional. Without one there is no way to reach the holder, and
+    /// a successor must say that rather than guess a path.
+    Other { proto: u32, socket: Option<String> },
+    /// Nothing there, or nothing readable even as a version.
+    Nothing,
+}
+
+/// Read the descriptor VERSION FIRST, as every frame on the socket is.
+///
+/// Serde parses a struct whole, so a descriptor whose SHAPE changed
+/// fails before its `proto` can be read, and the reader cannot tell "a
+/// monitor of another version is here" from "no monitor is here". The
+/// first is a candidate to replace; the second is a reason to start
+/// one. Collapsing them is how a successor would spawn against a live
+/// holder for ever (codex on 258d979).
+pub(crate) fn published(repo: &std::path::Path) -> Published {
+    let Ok(raw) = std::fs::read(descriptor_path(repo)) else {
+        return Published::Nothing;
+    };
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(&raw) else {
+        return Published::Nothing;
+    };
+    let body = serde_json::from_slice::<Descriptor>(&raw).ok();
+    if !admits(PROTO, envelope.proto) {
+        return Published::Other {
+            proto: envelope.proto,
+            // An older descriptor still parses here when it only ADDED
+            // fields we now ignore, which is how a successor reaches
+            // the holders this plan exists for.
+            socket: body.map(|d| d.socket),
+        };
+    }
+    match body {
+        Some(d) => Published::Ours(d),
+        // Our own number on a body we cannot read. Not a candidate and
+        // not an absence: something is there and it is not what it
+        // says it is.
+        None => Published::Other {
+            proto: envelope.proto,
+            socket: None,
+        },
+    }
 }
 
 /// Whether a client in `repo` may use what it found.
@@ -1519,6 +2056,18 @@ enum Served {
 struct Client {
     who: Served,
     out: tokio::sync::mpsc::Sender<String>,
+    /// The task that owns this client's socket.
+    ///
+    /// Retained so a retirement can tell TRANSMISSION from queue
+    /// admission. `send_note` only `try_send`s into `out`; the frame
+    /// is written by this task, and a detached handle is cancelled
+    /// when the runtime shuts down — so returning from `start` could
+    /// lose the final frame, and a transient in it has no WAL row to
+    /// replay from (codex on 294c18d).
+    ///
+    /// `None` only in the tests that read a queue directly and have no
+    /// socket for anyone to write to.
+    writer: Option<tokio::task::JoinHandle<Wrote>>,
     /// What THIS client has been handed from its author's source logs.
     ///
     /// Per client, not per monitor: the monitor outlives every client,
@@ -1588,13 +2137,14 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let (listener, socket) = bind_listener(&socket_dirs(me, xdg.as_deref()), pid, me, &lease)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Published with tick 0: nothing has been folded yet, and the
-    // stamp may only ever claim a fold that COMPLETED.
-    let mut fold = Fold {
-        tick: 0,
-        at_ms: now_ms(),
-    };
-    publish(&repo, &describe(&repo, pid, &socket, fold))?;
+    // The monitor's own fold counter. Private on purpose: it was
+    // once published and put on every frame, and no reader ever
+    // compared two of them — `beat_overdue`'s own doc says comparing
+    // ticks "would add nothing a client can act on". What needs it is
+    // the watchdog, in this process, and a stalled fold reaches a
+    // client as silence rather than as a number that failed to move.
+    let mut fold: u64 = 0;
+    publish(&repo, &describe(&repo, pid, &socket))?;
     println!(
         "monitor for {} listening on {}",
         repo.display(),
@@ -1603,13 +2153,20 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
 
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
-    let (joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Client>();
+    let (joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
     let mut clients: Vec<Client> = Vec::new();
+    // Writers of clients already retired — on a wake, or for falling
+    // behind — whose last frame may still be unwritten. Pruned as they
+    // finish, so this never grows with the number of wakes a long-lived
+    // monitor serves, and awaited by `retire` so a stand-down does not
+    // cut one short.
+    let mut leaving: Vec<tokio::task::JoinHandle<Wrote>> = Vec::new();
 
     // THE watcher for this repo. One, here, instead of one per parked
     // wait and two per `clank tui` — the whole point of the plan: ~170
     // of them were attached on the machine this was measured on, each
     // refolding the repo on every change.
+    use futures_util::StreamExt;
     let (fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
     let _watcher = crate::repo_watch::RepoStateWatcher::attach(&repo, false, fs_tx)?;
     let mut beats = beats(fs_rx, FOLD_TICK);
@@ -1617,7 +2174,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // Stamped by the fold loop below and by nothing else. A stamp from
     // the accept loop would prove only that the process breathes —
     // which is precisely the wedged monitor it has to detect.
-    let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(fold.tick));
+    let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(fold));
     watch_the_fold(heartbeat.clone(), WATCHDOG_TICK, WATCHDOG_MISSES);
 
     // THE producers for this repo. One set per author, owned by this
@@ -1641,7 +2198,13 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // loses it outright (codex on aa3d9a5).
     let mut pending: Vec<(AgentLabel, WaitItem)> = Vec::new();
     let mut hosted: std::collections::BTreeMap<AgentLabel, Hosted> = Default::default();
-    reconcile_hosting(&repo, &mut hosted, &source_items);
+    // Collected by the owner loop below as they end, and handed whole
+    // to the retirement: `abort` only asks, and a producer or a
+    // handshake live at the cutoff still owns its resources.
+    let mut owned = OwnedTasks::default();
+    owned
+        .departing
+        .extend(reconcile_hosting(&repo, &mut hosted, &source_items));
 
     loop {
         tokio::select! {
@@ -1652,16 +2215,84 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 // Handshaking OFF this loop is the point: a peer that
                 // connects and says nothing must not stall folding or
                 // anyone else's registration.
-                tokio::spawn(async move {
+                owned.greeting.push(tokio::spawn(async move {
                     match greet(stream, &repo).await {
-                        Ok(client) => {
-                            let _ = joined.send(client);
+                        // Ownership transfers on a SUCCESSFUL send. A
+                        // failed one means the receiver is gone, and
+                        // dropping the `Greeted` there would detach
+                        // the writer `admit` just spawned — a socket
+                        // task nothing accounts for, after the
+                        // admission cutoff (codex on b37b6b6). So the
+                        // greeting tears down what it could not hand
+                        // over, and the cutoff observes THIS task
+                        // ending.
+                        Ok(greeted) => {
+                            if let Err(returned) = joined.send(greeted) {
+                                if let Greeted::Client(c) = returned.0
+                                    && let Some(writer) = c.writer
+                                {
+                                    writer.abort();
+                                    let _ = writer.await;
+                                }
+                            }
                         }
                         Err(e) => eprintln!("monitor: a client was not admitted: {e}"),
                     }
-                });
+                }));
             }
-            Some(client) = arrivals.recv() => {
+            Some(greeted) = arrivals.recv() => {
+                let client = match greeted {
+                    Greeted::Client(client) => client,
+                    // Already acknowledged on its own connection, so
+                    // nothing is owed to the successor here.
+                    //
+                    // The drain is one presentation opportunity for
+                    // the clients attached right now, each bounded by
+                    // `WRITE_BUDGET`, and then this process goes
+                    // whether or not anyone read it. Waiting for
+                    // quiescence instead would never finish: an
+                    // observer holds its connection for as long as its
+                    // panel is open. The ones that get nothing read
+                    // EOF, which is the recovery door they already
+                    // have.
+                    Greeted::StandDown => {
+                        let decision = stand_down(
+                            &repo,
+                            std::mem::take(&mut clients),
+                            std::mem::take(&mut leaving),
+                            std::mem::take(&mut hosted),
+                            std::mem::take(&mut owned),
+                            &mut arrivals,
+                            &mut from_sources,
+                            folded_state.as_ref(),
+                            &mut pending,
+                            RETIRE_BUDGET,
+                            SETTLE_BUDGET,
+                        )
+                        .await;
+                        match decision {
+                            // The lease is held for the life of this
+                            // process, so returning IS the handoff —
+                            // and it is only safe once nothing this
+                            // monitor owned is still running.
+                            Shutdown::ReadyToRelease(_) => break Ok(()),
+                            // Exit WITH the lease held rather than
+                            // unwind it. An ordinary return would drop
+                            // it first and let a successor take the
+                            // repo on top of a task that still owns
+                            // its resources; the kernel releases the
+                            // flock when this process dies, which is
+                            // the one release that cannot race.
+                            Shutdown::RequiresProcessExit(_) => {
+                                eprintln!(
+                                    "monitor: cancellation had not taken effect after \
+                                     {SETTLE_BUDGET:?}; exiting with the lease held"
+                                );
+                                std::process::exit(STOOD_DOWN_EXIT);
+                            }
+                        }
+                    }
+                };
                 // Served at once rather than at the next tick — the
                 // producers have been running since the monitor
                 // started, so a newcomer may already be owed what they
@@ -1670,14 +2301,14 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 // each arrival would let a burst of joins retire
                 // established readers that were keeping up perfectly
                 // well (codex on 0555c8f).
-                admit_into(
+                leaving.retain(|w| !w.is_finished());
+                leaving.extend(admit_into(
                     &repo,
                     &mut clients,
                     client,
-                    fold,
                     folded_state.as_ref(),
                     &mut pending,
-                );
+                ));
             }
             // A source produced something. WHAT that author is owed is
             // decided from their logs, not from this item — except
@@ -1690,9 +2321,18 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         .map(|item| (author.clone(), item)),
                 );
                 if let Some(state) = &folded_state {
-                    serve_to(&repo, &mut clients, fold, state, Some(&author), &mut pending);
+                    leaving.extend(serve_to(&repo, &mut clients, state, Some(&author), &mut pending));
                 }
             }
+            // A cancelled producer finished winding down. Nothing to
+            // do but stop owning it — which is the point: this set is
+            // what a retirement would otherwise have to wait for, and
+            // collecting here keeps it from growing with the number of
+            // config changes a long-lived monitor sees.
+            Some(_) = owned.departing.next(), if !owned.departing.is_empty() => {}
+            // A handshake finished. Whatever it decided has already
+            // gone to `arrivals`; this only stops us owning the task.
+            Some(_) = owned.greeting.next(), if !owned.greeting.is_empty() => {}
             // A beat: the FS event or the heartbeat, whichever landed.
             // Receiving from a channel is cancel-safe and carries no
             // state, which is the point — see `beats`.
@@ -1700,28 +2340,32 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 if beat.is_none() {
                     anyhow::bail!("the repo watcher stopped");
                 }
-                // Fold BEFORE claiming one. The stamp means a fold
-                // completed, so publishing it first and then failing
-                // the rebuild would advertise progress that never
+                // Fold BEFORE claiming one. The counter means a fold
+                // completed, so moving it first and then failing the
+                // rebuild would show the watchdog progress that never
                 // happened — the invariant this plan set for itself
                 // (codex on 13e9fa7).
-                match advance(&repo, pid, &socket, fold, &heartbeat).await {
+                match advance(&repo, fold, &heartbeat).await {
                     Some((next, state)) => {
                         fold = next;
                         // `.clank/` is a wake dir, so an edited
                         // `wait_events` takes effect here rather than
                         // on a restart.
-                        reconcile_hosting(&repo, &mut hosted, &source_items);
+                        owned
+                            .departing
+                            .extend(reconcile_hosting(&repo, &mut hosted, &source_items));
                         // ONE presentation, carrying the projection,
                         // the durable rows and anything held from
                         // before there was a state to present it
                         // against.
-                        serve_to(&repo, &mut clients, fold, &state, None, &mut pending);
+                        leaving.extend(serve_to(&repo, &mut clients, &state, None, &mut pending));
                         folded_state = Some(state);
                     }
-                    // The stamp stays where it is. A client reading a
-                    // stale fold is exactly how it should notice.
-                    None => eprintln!("monitor: fold failed, stamp held at {}", fold.tick),
+                    // The counter stays where it is, so the
+                    // watchdog keeps counting this as a still look —
+                    // which is how a repeatedly failing fold ends up
+                    // standing the monitor down.
+                    None => eprintln!("monitor: fold failed, held at {fold}"),
                 }
             }
         }
@@ -1775,10 +2419,19 @@ struct Hosted {
 }
 
 impl Hosted {
-    fn stop(self) {
-        for task in self.tasks {
+    /// Cancel this author's producers and hand back their handles.
+    ///
+    /// `abort` only REQUESTS cancellation; it does not establish that
+    /// the task's future and the resources it owns have been dropped.
+    /// A retirement that discarded these could release the lease while
+    /// that was still pending (codex on d2b012d), so the handles come
+    /// back and the caller observes them end.
+    #[must_use = "a cancelled task has not necessarily stopped; observe these"]
+    fn stop(self) -> Vec<tokio::task::JoinHandle<()>> {
+        for task in &self.tasks {
             task.abort();
         }
+        self.tasks
     }
 }
 
@@ -1820,11 +2473,13 @@ fn roster_authors(repo: &std::path::Path) -> Vec<AgentLabel> {
 /// `wait_events` must take effect without restarting the monitor. An
 /// author whose spec is unchanged is left alone — restarting a healthy
 /// producer on an unrelated commit would be its own churn.
+#[must_use = "a cancelled producer may still be winding down; keep its handle"]
 fn reconcile_hosting(
     repo: &std::path::Path,
     hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
     into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::command_source::Emission)>,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut departing = Vec::new();
     let authors = roster_authors(repo);
     for author in &authors {
         let spec = hostable(repo, author);
@@ -1833,7 +2488,7 @@ fn reconcile_hosting(
             _ => {}
         }
         if let Some(previous) = hosted.remove(author) {
-            previous.stop();
+            departing.extend(previous.stop());
         }
         if spec.is_empty() {
             continue;
@@ -1866,9 +2521,10 @@ fn reconcile_hosting(
         .collect();
     for author in gone {
         if let Some(running) = hosted.remove(&author) {
-            running.stop();
+            departing.extend(running.stop());
         }
     }
+    departing
 }
 
 /// What a client is owed from its author's source logs.
@@ -1954,10 +2610,9 @@ fn admit_into(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     client: Client,
-    fold: Fold,
     state: Option<&crate::repo_state::RepoState>,
     pending: &mut Vec<(AgentLabel, WaitItem)>,
-) {
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut arriving = vec![client];
     if let Some(state) = state {
         // The REAL buffer: a transient retained while its author had
@@ -1965,9 +2620,12 @@ fn admit_into(
         // a newcomer that returns on admission work without it would
         // leave it waiting for a tick that may never find an eligible
         // client (codex on 1552f66).
-        serve_to(repo, &mut arriving, fold, state, None, pending);
+        let leaving = serve_to(repo, &mut arriving, state, None, pending);
+        clients.append(&mut arriving);
+        return leaving;
     }
     clients.append(&mut arriving);
+    Vec::new()
 }
 
 /// Beats, produced independently of client traffic.
@@ -2006,31 +2664,29 @@ fn beats(fs_rx: std::sync::mpsc::Receiver<()>, tick: Duration) -> tokio::sync::m
     rx
 }
 
-fn describe(repo: &std::path::Path, pid: i32, socket: &std::path::Path, fold: Fold) -> Descriptor {
+fn describe(repo: &std::path::Path, pid: i32, socket: &std::path::Path) -> Descriptor {
     Descriptor {
         proto: PROTO,
         pid,
         repo: repo.to_string_lossy().to_string(),
         socket: socket.to_string_lossy().to_string(),
-        fold,
     }
 }
 
-/// Fold, and publish the stamp ONLY if that succeeded.
+/// Fold, and move the heartbeat ONLY if that succeeded.
 ///
-/// The stamp means a fold completed. Advancing it first and then
-/// failing the rebuild would publish progress that never happened, and
-/// a loop that kept failing would keep advertising freshness — the
-/// invariant this plan set for itself, inverted (codex on 13e9fa7).
+/// The heartbeat means a fold completed. Advancing it first and then
+/// failing the rebuild would advertise progress that never happened,
+/// and a loop that kept failing would keep looking fresh to the
+/// watchdog — the invariant this plan set for itself, inverted
+/// (codex on 13e9fa7).
 async fn advance(
     repo: &std::path::Path,
-    pid: i32,
-    socket: &std::path::Path,
-    fold: Fold,
+    fold: u64,
     heartbeat: &std::sync::atomic::AtomicU64,
-) -> Option<(Fold, crate::repo_state::RepoState)> {
+) -> Option<(u64, crate::repo_state::RepoState)> {
     let outcome = folded(repo).await;
-    advance_with(repo, pid, socket, fold, heartbeat, outcome)
+    advance_with(fold, heartbeat, outcome)
 }
 
 /// The ORDERING, with the fold's outcome supplied.
@@ -2048,13 +2704,10 @@ async fn advance(
 /// process breathes, which is exactly the wedged monitor the watchdog
 /// exists to catch. The caller is given no opportunity to stamp it.
 fn advance_with(
-    repo: &std::path::Path,
-    pid: i32,
-    socket: &std::path::Path,
-    fold: Fold,
+    fold: u64,
     heartbeat: &std::sync::atomic::AtomicU64,
     outcome: anyhow::Result<crate::repo_state::RepoState>,
-) -> Option<(Fold, crate::repo_state::RepoState)> {
+) -> Option<(u64, crate::repo_state::RepoState)> {
     let state = match outcome {
         Ok(state) => state,
         Err(e) => {
@@ -2062,20 +2715,9 @@ fn advance_with(
             return None;
         }
     };
-    let next = Fold {
-        tick: fold.tick + 1,
-        at_ms: now_ms(),
-    };
-    let _ = publish(repo, &describe(repo, pid, socket, next));
-    heartbeat.store(next.tick, std::sync::atomic::Ordering::Release);
+    let next = fold + 1;
+    heartbeat.store(next, std::sync::atomic::Ordering::Release);
     Some((next, state))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 /// One completed fold of the repo.
@@ -2099,38 +2741,12 @@ fn revoked(err: &anyhow::Error) -> bool {
     )
 }
 
-/// Read a client's hello and answer it, bounded and asynchronous.
-async fn greet(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow::Result<Client> {
-    greet_within(stream, repo, ATTACH_BUDGET).await
-}
-
-/// [`greet`] with the budget supplied, so the timeout is testable
-/// without waiting the production five seconds.
-async fn greet_within(
-    stream: tokio::net::UnixStream,
-    repo: &std::path::Path,
-    budget: Duration,
-) -> anyhow::Result<Client> {
-    tokio::time::timeout(budget, admit(stream, repo))
-        .await
-        .map_err(|_| anyhow::anyhow!("a client did not finish its hello within {budget:?}"))?
-}
-
-async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow::Result<Client> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-    let mut io = tokio::io::BufReader::new(stream);
-    let mut line = String::new();
-    if io.read_line(&mut line).await? == 0 {
-        anyhow::bail!("a client closed before saying hello");
-    }
-
-    // An agent's author is resolved BEFORE admission: welcoming one the
-    // roster does not know would register a connection nothing can ever
-    // serve. An observer asks for no projection, so there is nothing to
-    // resolve and nothing a roster could authorise — refusing it for
-    // lacking an identity would only mean a panel could not subscribe.
-    let admitted = accept_hello(line.trim_end(), repo).and_then(|hello| match hello.who {
+/// Which [`Served`] a client's declared identity earns, or why not.
+///
+/// A named function rather than the closure this was, so the roster
+/// decision is reachable from a test without a socket.
+fn served_for(repo: &std::path::Path, who: Who) -> Result<Served, Welcome> {
+    match who {
         Who::Observer => Ok(Served::Observer),
         Who::Agent {
             author,
@@ -2152,16 +2768,82 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
                 }),
             }
         }
-    });
+    }
+}
+
+/// What an accepted connection turned out to want.
+#[derive(Debug)]
+enum Greeted {
+    Client(Client),
+    /// A successor asked, and was told this monitor is retiring. The
+    /// answer is already sent; what remains is to do it.
+    StandDown,
+}
+
+#[cfg(test)]
+impl Greeted {
+    /// The client, for the tests that are about admission rather than
+    /// about retirement.
+    fn client(self) -> Client {
+        match self {
+            Greeted::Client(c) => c,
+            Greeted::StandDown => panic!("a hello was answered as a successor's ask"),
+        }
+    }
+}
+
+/// Read an opening frame and answer it, bounded and asynchronous.
+async fn greet(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow::Result<Greeted> {
+    greet_within(stream, repo, ATTACH_BUDGET).await
+}
+
+/// [`greet`] with the budget supplied, so the timeout is testable
+/// without waiting the production five seconds.
+async fn greet_within(
+    stream: tokio::net::UnixStream,
+    repo: &std::path::Path,
+    budget: Duration,
+) -> anyhow::Result<Greeted> {
+    tokio::time::timeout(budget, admit(stream, repo))
+        .await
+        .map_err(|_| anyhow::anyhow!("a client did not finish its hello within {budget:?}"))?
+}
+
+async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow::Result<Greeted> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut io = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    if io.read_line(&mut line).await? == 0 {
+        anyhow::bail!("a client closed before saying hello");
+    }
+
+    let greeting = greeting_of(line.trim_end(), repo);
+    if let Greeting::Obsolete(decline) = &greeting {
+        // Told WHY before this process goes, so the client is not left
+        // reading an abrupt EOF and guessing at it. Then the monitor
+        // stands down, and the client's ordinary connect-or-spawn
+        // starts the current one.
+        let line = serde_json::to_string(decline)?;
+        io.get_mut()
+            .write_all(format!("{line}\n").as_bytes())
+            .await?;
+        return Ok(Greeted::StandDown);
+    }
+
+    // An agent's author is resolved BEFORE admission: welcoming one the
+    // roster does not know would register a connection nothing can ever
+    // serve. An observer asks for no projection, so there is nothing to
+    // resolve and nothing a roster could authorise — refusing it for
+    // lacking an identity would only mean a panel could not subscribe.
+    let admitted = match greeting {
+        Greeting::Decline(d) => Err(d),
+        Greeting::Obsolete(_) => unreachable!("returned above"),
+        Greeting::Client(hello) => served_for(repo, hello.who),
+    };
 
     let welcome = match &admitted {
-        Ok(_) => Welcome::Ok {
-            proto: PROTO,
-            fold: Fold {
-                tick: 0,
-                at_ms: now_ms(),
-            },
-        },
+        Ok(_) => Welcome::Ok { proto: PROTO },
         Err(decline) => decline.clone(),
     };
     io.get_mut()
@@ -2170,12 +2852,13 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
 
     let who = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
     let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
-    tokio::spawn(write_to(io.into_inner(), queued, who.name()));
-    Ok(Client {
+    let writer = tokio::spawn(write_to(io.into_inner(), queued, who.name()));
+    Ok(Greeted::Client(Client {
         who,
         out,
+        writer: Some(writer),
         shown: Default::default(),
-    })
+    }))
 }
 
 impl Served {
@@ -2194,11 +2877,30 @@ impl Served {
 /// non-blocking. A write that times out or fails ends the task, which
 /// closes the queue — and a closed queue is how the owner learns the
 /// client is gone, without ever touching the socket itself.
+/// How a client's writer ended.
+///
+/// Returned rather than inferred. A task that TERMINATED is not a
+/// frame that was WRITTEN, and the ways it can terminate are different
+/// answers a retirement has to report separately — counting every
+/// awaited handle as a success called a closed peer's lost frame a
+/// delivery (codex on d2b012d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Wrote {
+    /// The queue emptied and the sender was gone: everything queued
+    /// reached the socket.
+    Drained,
+    /// The peer errored. What was still queued did not land.
+    Failed,
+    /// The peer stopped reading and a write did not finish inside
+    /// `WRITE_BUDGET`.
+    TimedOut,
+}
+
 async fn write_to(
     socket: tokio::net::UnixStream,
     queued: tokio::sync::mpsc::Receiver<String>,
     author: String,
-) {
+) -> Wrote {
     write_to_within(socket, queued, author, WRITE_BUDGET).await
 }
 
@@ -2209,7 +2911,7 @@ async fn write_to_within(
     mut queued: tokio::sync::mpsc::Receiver<String>,
     author: String,
     budget: Duration,
-) {
+) -> Wrote {
     use tokio::io::AsyncWriteExt;
 
     while let Some(line) = queued.recv().await {
@@ -2217,13 +2919,354 @@ async fn write_to_within(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 eprintln!("monitor: `{author}` closed: {e}");
-                return;
+                return Wrote::Failed;
             }
             Err(_) => {
                 eprintln!("monitor: `{author}` stopped reading");
-                return;
+                return Wrote::TimedOut;
             }
         }
+    }
+    Wrote::Drained
+}
+
+/// What a retirement established before it released the repo.
+///
+/// Four outcomes for the writers rather than a success count, because
+/// "the task ended" is not "the bytes left" and the ways it can end
+/// are different answers: a closed peer, a peer that stopped reading,
+/// a task that panicked or was cancelled, and one still going when
+/// the budget ran out. Counting them together reported a lost frame
+/// as a delivery (codex on d2b012d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Retired {
+    /// Queue emptied, socket closed: everything queued landed.
+    pub(crate) drained: usize,
+    /// Reached a terminal state without draining — the peer errored or
+    /// stopped reading.
+    pub(crate) failed: usize,
+    /// Ended without reporting at all: panicked, or cancelled by
+    /// something other than this retirement.
+    pub(crate) lost: usize,
+    /// Not collected during the grace, so cancelled here.
+    ///
+    /// Deliberately not "still writing": the deadline can win while a
+    /// terminal outcome is already sitting ready, so this counts what
+    /// was NOT ACCOUNTED FOR rather than what was definitely still
+    /// going (codex on dd67677).
+    pub(crate) abandoned: usize,
+    /// Transients still held when the cutoff came.
+    ///
+    /// Reported because they are the one thing a retirement cannot
+    /// make good: a durable row replays from the WAL for whoever
+    /// connects next, and a transient has no row. Silence here would
+    /// hide a lost wake.
+    pub(crate) undelivered: usize,
+    /// Every task this monitor owned was observed TERMINATED. Decides
+    /// whether the lease may be released by unwinding; see
+    /// [`Shutdown`].
+    pub(crate) settled: bool,
+}
+
+/// Whether a retirement earned the right to give the repo up quietly.
+///
+/// Exhaustive, and returned rather than reported. The first version
+/// made this a `bool` on [`Retired`]: the unsettled case printed
+/// "releasing anyway" and then released anyway, which is a log line
+/// where a contract was wanted (codex on dd67677).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shutdown {
+    /// Everything this monitor owned has ended. Returning from `start`
+    /// drops the lease, and nothing is left to race the successor.
+    ReadyToRelease(Retired),
+    /// Something cancelled has not stopped. The lease must NOT unwind:
+    /// a successor taking the repo while a task still owns its
+    /// resources is the thing ownership exists to prevent.
+    RequiresProcessExit(Retired),
+}
+
+impl Shutdown {
+    pub(crate) fn report(self) -> Retired {
+        match self {
+            Shutdown::ReadyToRelease(r) | Shutdown::RequiresProcessExit(r) => r,
+        }
+    }
+}
+
+/// How long a retirement waits for its clients' last frames.
+///
+/// A whole-step budget, not per client: retiring must be FINITE, and a
+/// peer that has stopped reading cannot extend it by the number of its
+/// peers. Each writer also bounds its own `write_all` with
+/// `WRITE_BUDGET`, so this is the outer limit on all of them together.
+const RETIRE_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long cancellation is given to actually take effect.
+///
+/// Separate from `RETIRE_BUDGET` and much shorter: by this point every
+/// task has been asked to stop, so this covers only the time between
+/// `abort` and the task's future being dropped. Exceeding it means the
+/// process exits with the lease still held, because an orderly return
+/// would unwind that lease first.
+const SETTLE_BUDGET: Duration = Duration::from_millis(500);
+
+/// The tasks this monitor owns besides its clients' writers.
+///
+/// One place rather than two locals, because a retirement has to take
+/// ALL of them and "all of them" was spelled at a call site inside
+/// `start`'s loop — which no test reaches, so a mutation that left one
+/// set behind survived. Here [`OwnedTasks::take_all`] is the whole
+/// rule and a test can hold it to it.
+#[derive(Default)]
+struct OwnedTasks {
+    /// Producers a reconcile cancelled, still winding down.
+    departing: futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
+    /// Handshakes still running. One mid-greeting at the cutoff has a
+    /// socket, and if it completes it puts a CLIENT with a live writer
+    /// into `arrivals`.
+    greeting: futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
+}
+
+impl OwnedTasks {
+    /// Cancel every live handshake and wait for it to END.
+    ///
+    /// Before the admission queue closes, and before anything else:
+    /// these are what PRODUCE admissions, and one still running when
+    /// the queue shuts can welcome a peer and spawn a writer that
+    /// nothing owns. `false` means one would not stop, which leaves a
+    /// live admission path and forbids an orderly release.
+    ///
+    /// One bound for the whole phase rather than one per greeting, so
+    /// a crowd of slow peers cannot multiply the time this takes.
+    async fn end_greetings(&mut self, within: Duration) -> bool {
+        use futures_util::StreamExt;
+        if self.greeting.is_empty() {
+            return true;
+        }
+        for g in self.greeting.iter_mut() {
+            g.abort();
+        }
+        let ended = async { while self.greeting.next().await.is_some() {} };
+        tokio::time::timeout(within, ended).await.is_ok()
+    }
+
+    fn take_all(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut self.departing)
+            .into_iter()
+            .chain(std::mem::take(&mut self.greeting))
+            .collect()
+    }
+}
+
+/// Everything a stand-down does, from the cutoff to the decision.
+///
+/// Extracted from `start`'s arm so the whole transition is reachable
+/// from a test. It was inline, and a mutation that skipped claiming
+/// late arrivals SURVIVED: the helper was proven and its only caller
+/// was not, which is the shape of gap that keeps producing these.
+/// What stays in the loop is the match on the returned decision.
+#[allow(clippy::too_many_arguments)]
+async fn stand_down(
+    repo: &std::path::Path,
+    mut clients: Vec<Client>,
+    mut leaving: Vec<tokio::task::JoinHandle<Wrote>>,
+    hosted: std::collections::BTreeMap<AgentLabel, Hosted>,
+    mut owned: OwnedTasks,
+    arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<Greeted>,
+    from_sources: &mut tokio::sync::mpsc::UnboundedReceiver<(
+        AgentLabel,
+        crate::cli::command_source::Emission,
+    )>,
+    folded: Option<&crate::repo_state::RepoState>,
+    pending: &mut Vec<(AgentLabel, WaitItem)>,
+    budget: Duration,
+    settle: Duration,
+) -> Shutdown {
+    // ONE deadline across the stages, not one budget each. Giving
+    // every phase a fresh `budget` made the cooperative worst case
+    // `2 * budget + settle`, so a caller timing out on `budget` would
+    // be wrong about its own contract (codex on 5f7bc36).
+    let by = tokio::time::Instant::now() + budget;
+    let left = |by: tokio::time::Instant| by.saturating_duration_since(tokio::time::Instant::now());
+    // ONE: stop the things that PRODUCE admissions, with the receiver
+    // still open. A greeting that already handed its client over must
+    // still land, and one cancelled mid-handshake must not be able to
+    // welcome a peer and spawn a writer after admission closed
+    // (codex on b37b6b6). One bound for the phase, not one per
+    // greeting.
+    let greetings_ended = owned.end_greetings(left(by)).await;
+
+    // TWO: with the producers of admissions stopped, draining the
+    // queue is finite. It is the COMPLETE set only when the phase
+    // above succeeded; when it did not, the decision at the end
+    // forbids an orderly release for exactly that reason.
+    let late = claim_late_arrivals(arrivals, &mut clients);
+    if late > 0 {
+        eprintln!("monitor: {late} admission(s) arrived during the cutoff");
+    }
+
+    // THREE: stop the sources, then take what they already handed
+    // over. Aborting the forwarder together with its producers without
+    // reading its buffer would discard accepted emissions and then
+    // report nothing about them — a durable row replays from the WAL
+    // for whoever connects next, a transient has no row at all
+    // (codex on 5f7bc36).
+    let mut producers: Vec<tokio::task::JoinHandle<()>> = owned.take_all();
+    for (_, running) in hosted {
+        producers.extend(running.stop());
+    }
+    from_sources.close();
+    while let Ok((author, emission)) = from_sources.try_recv() {
+        pending.extend(
+            transient_of(emission)
+                .into_iter()
+                .map(|item| (author.clone(), item)),
+        );
+    }
+
+    // FOUR: present ONCE, to the whole set. This used to run in the
+    // caller, BEFORE the late clients were claimed — so a transient
+    // whose only eligible recipient was still in the queue was
+    // retained, then dropped unpresented when that client's sender
+    // went. Both the item and its recipient were in hand and the item
+    // was reported lost anyway. Nothing to present before the first
+    // fold: what a client is owed is read against folded state.
+    if let Some(state) = folded {
+        leaving.extend(serve_to(repo, &mut clients, state, None, pending));
+    }
+
+    let decision = retire(clients, leaving, producers, left(by), settle, pending.len()).await;
+    let got = decision.report();
+    eprintln!(
+        "monitor: standing down for {} ({} drained, {} failed, {} lost, {} abandoned)",
+        repo.display(),
+        got.drained,
+        got.failed,
+        got.lost,
+        got.abandoned
+    );
+    if got.undelivered > 0 {
+        eprintln!(
+            "monitor: {} transient(s) reached no client; they have no log row to replay from",
+            got.undelivered
+        );
+    }
+    // A greeting that could not be stopped is a live admission path,
+    // which is the one thing an orderly release must not leave behind.
+    match (greetings_ended, decision) {
+        (true, d) => d,
+        (false, d) => Shutdown::RequiresProcessExit(d.report()),
+    }
+}
+
+/// Take what was admitted while the stand-down was being decided.
+///
+/// A client whose handshake completed moments ago is in the CHANNEL,
+/// not in `clients`. Left there it is dropped with its writer still
+/// owning a socket — the detached task the whole inventory exists to
+/// prevent (codex on 056c991). Closing first is what makes this
+/// finite: no further sender can add to it while we drain.
+fn claim_late_arrivals(
+    arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<Greeted>,
+    clients: &mut Vec<Client>,
+) -> usize {
+    arrivals.close();
+    let mut took = 0;
+    while let Ok(late) = arrivals.try_recv() {
+        match late {
+            Greeted::Client(c) => {
+                clients.push(c);
+                took += 1;
+            }
+            // A second successor, asking for what is already
+            // happening. It was acknowledged on its own connection.
+            Greeted::StandDown => {}
+        }
+    }
+    took
+}
+
+/// Give up ownership: no more admissions, the queued frames out, the
+/// producers stopped, and every owned task observed to have ended.
+///
+/// The ORDER is the contract. Hosting is cancelled first so no source
+/// can submit another emission; then each client's sender is dropped,
+/// which is what ends `write_to`'s loop AFTER it has written what is
+/// queued; then outcomes are collected as they arrive rather than in
+/// handle order, because a stalled writer must not hide the peers
+/// behind it that finished long ago. Only when every handle — the
+/// writers and the cancelled producers alike — has been observed to
+/// end does the caller release the lease.
+async fn retire(
+    clients: Vec<Client>,
+    leaving: Vec<tokio::task::JoinHandle<Wrote>>,
+    producers: Vec<tokio::task::JoinHandle<()>>,
+    budget: Duration,
+    settle: Duration,
+    undelivered: usize,
+) -> Shutdown {
+    // Producers arrive already cancelled, by the caller: stopping
+    // them is what makes the source buffer finite, and that has to
+    // happen before the final presentation rather than here.
+    // The already-retired first: a client woken on the very frame that
+    // retired it is the likeliest to still have bytes in flight.
+    let mut writers: Vec<tokio::task::JoinHandle<Wrote>> = leaving;
+    writers.extend(clients.into_iter().filter_map(|c| {
+        // Dropping the sender is what ends `write_to`'s loop, AFTER it
+        // has written what is already queued.
+        let Client { out, writer, .. } = c;
+        drop(out);
+        writer
+    }));
+
+    // A set this function OWNS across the deadline, rather than a
+    // combinator future it hands the handles to. `select_all` takes
+    // them by value, and `tokio::select!` builds its arms eagerly — so
+    // when the deadline won, that future was dropped with the
+    // unfinished handles inside it and those tasks DETACHED instead of
+    // being cancelled. The retirement then reported them as neither
+    // delivered nor abandoned. Found by the test for the stalled peer.
+    use futures_util::StreamExt;
+    let mut running: futures_util::stream::FuturesUnordered<_> = writers.into_iter().collect();
+
+    let mut got = Retired {
+        undelivered,
+        ..Default::default()
+    };
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+    while !running.is_empty() {
+        tokio::select! {
+            _ = &mut deadline => break,
+            Some(ended) = running.next() => match ended {
+                Ok(Wrote::Drained) => got.drained += 1,
+                Ok(Wrote::Failed | Wrote::TimedOut) => got.failed += 1,
+                // Panicked, or cancelled by something that is not this
+                // retirement. Either way it never reported.
+                Err(_) => got.lost += 1,
+            },
+        }
+    }
+
+    got.abandoned = running.len();
+    for w in running.iter_mut() {
+        w.abort();
+    }
+    // `abort` only REQUESTS cancellation. Awaiting afterwards is what
+    // establishes that the future was dropped and its resources with
+    // it — which has to happen before the lease frees, or a successor
+    // takes the repo while this one is still winding down.
+    let settling = async {
+        while running.next().await.is_some() {}
+        for p in producers {
+            let _ = p.await;
+        }
+    };
+    got.settled = tokio::time::timeout(settle, settling).await.is_ok();
+    if got.settled {
+        Shutdown::ReadyToRelease(got)
+    } else {
+        Shutdown::RequiresProcessExit(got)
     }
 }
 
@@ -2238,13 +3281,10 @@ async fn write_to_within(
 /// Test-only: production always has a pending buffer to pass, and
 /// passing a fresh one would be the bug this plan spent two rounds on.
 #[cfg(test)]
-fn serve(
-    repo: &std::path::Path,
-    clients: &mut Vec<Client>,
-    fold: Fold,
-    state: &crate::repo_state::RepoState,
-) {
-    serve_to(repo, clients, fold, state, None, &mut Vec::new())
+fn serve(repo: &std::path::Path, clients: &mut Vec<Client>, state: &crate::repo_state::RepoState) {
+    // Dropped: this is for the tests that assert on what a client
+    // RECEIVED, and they hold the runtime open around the call.
+    drop(serve_to(repo, clients, state, None, &mut Vec::new()));
 }
 
 /// [`serve`], optionally scoped to ONE author's clients.
@@ -2254,17 +3294,19 @@ fn serve(
 /// source logged something would put a frame in every other client's
 /// queue, and a burst would retire readers that were keeping up
 /// perfectly well.
+#[must_use = "a departing client's last frame is still in its writer; drop these only \
+              where the runtime is certain to outlive them"]
 fn serve_to(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
-    fold: Fold,
     state: &crate::repo_state::RepoState,
     only: Option<&AgentLabel>,
     pending: &mut Vec<(AgentLabel, WaitItem)>,
-) {
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
     if clients.is_empty() {
-        return;
+        return Vec::new();
     }
+    let mut leaving: Vec<tokio::task::JoinHandle<Wrote>> = Vec::new();
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
 
@@ -2284,7 +3326,7 @@ fn serve_to(
             // point: it asked to know the fold moved, and deriving
             // somebody's work to tell it that would be the duplicated
             // refold this plan exists to delete.
-            Served::Observer => Note::Beat { fold },
+            Served::Observer => Note::Beat,
             Served::Agent { author, .. } => {
                 let inputs = match crate::cli::wait::derive_wait_inputs(repo, author) {
                     Ok(inputs) => inputs,
@@ -2332,9 +3374,9 @@ fn serve_to(
                     &mut external,
                 );
                 if items.is_empty() {
-                    Note::Beat { fold }
+                    Note::Beat
                 } else {
-                    Note::Items { items, fold }
+                    Note::Items { items }
                 }
             }
         };
@@ -2357,16 +3399,25 @@ fn serve_to(
             Served::Agent { author, .. } => Some(author.clone()),
             Served::Observer => None,
         };
-        if send_note(&client, &note) {
-            if woke {
-                if let Some(author) = author
-                    && !delivered.contains(&author)
-                {
-                    delivered.push(author);
-                }
-            } else {
-                keep.push(client);
-            }
+        let sent = send_note(&client, &note);
+        if sent && !woke {
+            keep.push(client);
+            continue;
+        }
+        if sent
+            && woke
+            && let Some(author) = author
+            && !delivered.contains(&author)
+        {
+            delivered.push(author);
+        }
+        // This client is going, and its LAST frame may still be in its
+        // queue. The writer drains it as the sender drops — while the
+        // runtime lives. Handing the handle back is what lets a
+        // retirement wait for that instead of assuming it (codex on
+        // 294c18d).
+        if let Some(writer) = client.writer {
+            leaving.push(writer);
         }
     }
     *clients = keep;
@@ -2375,6 +3426,7 @@ fn serve_to(
     // client must keep waiting rather than be dropped, since nothing
     // else will ever hold it.
     pending.retain(|(author, _)| !delivered.contains(author));
+    leaving
 }
 
 /// Send one note, and say whether that client may be kept.
@@ -2408,8 +3460,1131 @@ fn send_note(client: &Client, note: &Note) -> bool {
 mod tests {
     use super::*;
 
-    fn fold(tick: u64, at_ms: u64) -> Fold {
-        Fold { tick, at_ms }
+    /// The descriptor is read VERSION FIRST, so a monitor of another
+    /// version is a candidate rather than an absence.
+    ///
+    /// Serde parses a struct whole: a body whose shape changed fails
+    /// before its `proto` can be read, and the reader cannot then tell
+    /// "something is here that I cannot serve" from "nothing is here".
+    /// The first is a holder to replace, the second a reason to start
+    /// one, and a successor that confused them would spawn against a
+    /// live monitor for ever.
+    #[test]
+    fn a_descriptor_of_another_version_is_a_holder_not_an_absence() {
+        let repo = repo_with_roster();
+        assert_eq!(published(repo.path()), Published::Nothing, "nothing yet");
+
+        let d = describe(repo.path(), 4242, std::path::Path::new("/tmp/x.sock"));
+        publish(repo.path(), &d).unwrap();
+        assert_eq!(published(repo.path()), Published::Ours(d));
+
+        // A shape this build does not share, carrying a number it can.
+        std::fs::write(
+            repo.path().join(".clank/monitor.json"),
+            r#"{"proto":3,"pid":7,"repo":"/w","socket":"/tmp/old.sock","fold":{"tick":1,"at_ms":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            published(repo.path()),
+            Published::Other {
+                proto: 3,
+                socket: Some("/tmp/old.sock".to_string()),
+            },
+            "an older monitor is something to replace, not nothing"
+        );
+        assert_eq!(
+            read_published(repo.path()),
+            None,
+            "and an ordinary client still refuses it"
+        );
+
+        // Our own number on a body we cannot read is also not an
+        // absence: something is there and it is not what it says.
+        std::fs::write(
+            repo.path().join(".clank/monitor.json"),
+            format!(r#"{{"proto":{PROTO},"wrong":"shape"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            published(repo.path()),
+            Published::Other {
+                proto: PROTO,
+                socket: None
+            }
+        );
+    }
+
+    /// A source channel nothing ever produced on, for the fixtures
+    /// whose subject is not the source buffer.
+    fn no_sources()
+    -> tokio::sync::mpsc::UnboundedReceiver<(AgentLabel, crate::cli::command_source::Emission)>
+    {
+        tokio::sync::mpsc::unbounded_channel().1
+    }
+
+    /// A retirement gets the last frame OUT, transient included.
+    ///
+    /// The failure it excludes: `serve_to` only `try_send`s into a
+    /// client's queue, the writer task does the writing, and a
+    /// detached handle dies with the runtime — so returning from
+    /// `start` right after serving could lose the frame. A durable row
+    /// would replay from the WAL; a TRANSIENT has no row, and
+    /// `serve_to` clears it from `pending` on send. An orderly
+    /// retirement must not be the thing that manufactures a lost wake
+    /// (codex on 294c18d).
+    ///
+    /// Driven over a real socket pair with the production `write_to`,
+    /// and the proof is `drained`: only the writer REPORTING that its
+    /// queue emptied says the bytes left.
+    #[tokio::test]
+    async fn a_retirement_writes_the_last_frame_before_it_goes() {
+        use tokio::io::AsyncReadExt;
+
+        let repo = repo_with_roster();
+        let claude = AgentLabel::parse("claude").unwrap();
+        let held = WaitItem::CommandEvent {
+            name: "deploys".into(),
+            id: "a".into(),
+            event: "deploys".into(),
+            content: "ci failed".into(),
+            at: None,
+            failure: false,
+            selector: None,
+        };
+        let mut pending = vec![(claude.clone(), held)];
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let writer = tokio::spawn(write_to(ours, queued, "claude".to_string()));
+        let mut clients = vec![Client {
+            who: Served::Agent {
+                author: claude.clone(),
+                has_cli_sources: false,
+            },
+            out,
+            writer: Some(writer),
+            shown: Default::default(),
+        }];
+
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let leaving = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        assert!(
+            pending.is_empty(),
+            "the transient left `pending` on send, so only this retirement can still \
+             deliver it"
+        );
+        assert!(
+            clients.is_empty() && leaving.len() == 1,
+            "the frame that WAKES a client also retires it, so its writer leaves \
+             `clients` on that very frame — which is where the last frame was being \
+             lost, one step earlier than it looked"
+        );
+
+        let decision = retire(
+            clients,
+            leaving,
+            Vec::new(),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+        assert_eq!(
+            decision,
+            Shutdown::ReadyToRelease(Retired {
+                drained: 1,
+                settled: true,
+                ..Default::default()
+            })
+        );
+
+        // Read AFTER the retirement returned: the bytes are already
+        // there, which is what `drained` claims.
+        let mut buf = Vec::new();
+        theirs.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("ci failed"),
+            "the transient must be in what was written: {text:?}"
+        );
+    }
+
+    /// A writer that never finishes cannot hold the repo, and one that
+    /// ENDED BADLY is not a delivery.
+    ///
+    /// The three non-success outcomes, each driven, because the first
+    /// version counted every awaited handle as a success — so a
+    /// panicked task and a peer that errored both reported as frames
+    /// delivered (codex on d2b012d). The writers here are synthetic:
+    /// a socket wedged or torn down at exactly the right moment is not
+    /// portably arrangeable, and what is under test is the
+    /// CLASSIFICATION, not the kernel.
+    #[tokio::test]
+    async fn a_task_that_ended_badly_is_never_counted_as_delivered() {
+        let client = |writer: tokio::task::JoinHandle<Wrote>| {
+            let (out, _queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+            Client {
+                who: Served::Observer,
+                out,
+                writer: Some(writer),
+                shown: Default::default(),
+            }
+        };
+
+        let began = std::time::Instant::now();
+        let decision = retire(
+            vec![
+                client(tokio::spawn(async { Wrote::Failed })),
+                client(tokio::spawn(async { Wrote::TimedOut })),
+                client(tokio::spawn(async { panic!("a writer came apart") })),
+                client(tokio::spawn(std::future::pending::<Wrote>())),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            decision,
+            Shutdown::ReadyToRelease(Retired {
+                drained: 0,
+                failed: 2,
+                lost: 1,
+                abandoned: 1,
+                undelivered: 0,
+                settled: true,
+            }),
+            "not one of these wrote a frame"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "and the one that was never going to finish did not hold the repo"
+        );
+    }
+
+    /// A peer that finished long ago is not abandoned because another
+    /// one is stalled.
+    ///
+    /// Outcomes are collected as they ARRIVE, not in handle order.
+    /// Awaiting the vector in sequence would block on the stalled
+    /// writer for the whole budget and then class the finished one as
+    /// abandoned at the deadline — reporting a delivered frame as a
+    /// lost one (codex on 258d979).
+    #[tokio::test]
+    async fn a_finished_writer_behind_a_stalled_one_is_still_counted() {
+        let client = |writer: tokio::task::JoinHandle<Wrote>| {
+            let (out, _queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+            Client {
+                who: Served::Observer,
+                out,
+                writer: Some(writer),
+                shown: Default::default(),
+            }
+        };
+
+        let decision = retire(
+            vec![
+                // The stalled one FIRST, so sequence order is the
+                // wrong order.
+                client(tokio::spawn(std::future::pending::<Wrote>())),
+                client(tokio::spawn(async { Wrote::Drained })),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            decision,
+            Shutdown::ReadyToRelease(Retired {
+                drained: 1,
+                abandoned: 1,
+                settled: true,
+                ..Default::default()
+            }),
+            "the second writer's frame landed and must be reported as landed"
+        );
+    }
+
+    /// A retirement with NO clients still waits for its producers.
+    ///
+    /// `abort` requests cancellation; it does not establish that the
+    /// future and the resources it owns have been dropped. With no
+    /// writers to await, a retirement could return immediately and
+    /// `start` would release the lease while a producer was still
+    /// winding down — a successor taking the repo on top of it
+    /// (codex on d2b012d). The guard's `Drop` is the evidence.
+    #[tokio::test]
+    async fn a_retirement_with_no_clients_still_sees_its_producers_stop() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = dropped.clone();
+        let producer = tokio::spawn(async move {
+            let _guard = Guard(held);
+            std::future::pending::<()>().await
+        });
+        // Let it reach its await point, so the guard is live inside the
+        // task rather than still on this one's stack.
+        tokio::task::yield_now().await;
+
+        // As the transition does: stop them, then hand the handles on.
+        let producers = Hosted {
+            spec: Vec::new(),
+            tasks: vec![producer],
+        }
+        .stop();
+
+        let decision = retire(
+            Vec::new(),
+            Vec::new(),
+            producers,
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+        assert_eq!(
+            decision,
+            Shutdown::ReadyToRelease(Retired {
+                settled: true,
+                ..Default::default()
+            })
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the producer's resources must be gone BEFORE the lease is released, and \
+             nothing but awaiting the cancelled handle establishes that"
+        );
+    }
+
+    /// A retirement takes EVERY kind of task the owner holds.
+    ///
+    /// The rule lives here rather than at the call site because the
+    /// call site is inside `start`'s loop, which no test reaches: a
+    /// mutation that left the handshakes behind survived until this
+    /// moved. Both sets are drained, and what comes back is what the
+    /// retirement will wait for.
+    #[tokio::test]
+    async fn the_owner_hands_over_both_kinds_of_task() {
+        let mut owned = OwnedTasks::default();
+        owned.departing.push(tokio::spawn(async {}));
+        owned.departing.push(tokio::spawn(async {}));
+        owned.greeting.push(tokio::spawn(async {}));
+
+        let all = owned.take_all();
+        assert_eq!(
+            all.len(),
+            3,
+            "a cancelled producer and a running handshake both count"
+        );
+        assert!(
+            owned.departing.is_empty() && owned.greeting.is_empty(),
+            "and the owner keeps nothing back, or the retirement waits for less than it owns"
+        );
+
+        let decision = retire(
+            Vec::new(),
+            Vec::new(),
+            all,
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+        assert!(
+            matches!(decision, Shutdown::ReadyToRelease(_)),
+            "{decision:?}"
+        );
+    }
+
+    /// An admission that lands DURING the cutoff is still owned.
+    ///
+    /// A handshake that completed moments before the stand-down puts
+    /// its client in the channel, not in `clients`. Left there it is
+    /// dropped with a live writer still owning a socket — the detached
+    /// task the whole inventory exists to prevent (codex on 056c991).
+    ///
+    /// Closing the channel first is what makes the drain finite, and
+    /// the retirement afterwards is what proves the claim was worth
+    /// making: the late client's writer reports `drained`, which only
+    /// a writer this retirement OWNED could do.
+    #[tokio::test]
+    async fn an_admission_arriving_during_the_cutoff_is_claimed_and_flushed() {
+        use tokio::io::AsyncReadExt;
+
+        let (joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let writer = tokio::spawn(write_to(ours, queued, "late".to_string()));
+        out.try_send("{\"t\":\"beat\"}\n".to_string()).unwrap();
+
+        // As a finishing handshake does, after the stand-down was
+        // decided but before anything was taken.
+        joined
+            .send(Greeted::Client(Client {
+                who: Served::Observer,
+                out,
+                writer: Some(writer),
+                shown: Default::default(),
+            }))
+            .unwrap();
+        // And a second successor, which is answered on its own
+        // connection and owes this one nothing.
+        joined.send(Greeted::StandDown).unwrap();
+
+        // Through the WHOLE transition, which is what `start` calls:
+        // the cutoff and the retirement together. Driving the claim
+        // alone left its only caller unproven.
+        let decision = stand_down(
+            std::path::Path::new("/w/proj"),
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+            OwnedTasks::default(),
+            &mut arrivals,
+            &mut no_sources(),
+            None,
+            &mut Vec::new(),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(
+            decision,
+            Shutdown::ReadyToRelease(Retired {
+                drained: 1,
+                settled: true,
+                ..Default::default()
+            }),
+            "a client claimed at the cutoff gets the same orderly flush as any other"
+        );
+
+        let mut buf = Vec::new();
+        theirs.read_to_end(&mut buf).await.unwrap();
+        assert!(
+            String::from_utf8(buf).unwrap().contains("beat"),
+            "and its queued frame actually went out"
+        );
+    }
+
+    /// An emission the sources already handed over is still presented.
+    ///
+    /// Aborting the forwarder together with its producers without
+    /// reading its buffer discards work the monitor ACCEPTED and then
+    /// says nothing about it. A durable row replays from the WAL for
+    /// whoever connects next; a transient has no row, so this is the
+    /// one the cutoff has to carry (codex on 5f7bc36).
+    ///
+    /// The ordering is the content: production stops, the buffer is
+    /// drained into `pending`, and only then is the presentation made
+    /// — so the item is in hand before the set it is presented to is
+    /// decided.
+    #[tokio::test]
+    async fn an_emission_accepted_before_the_cutoff_still_reaches_its_client() {
+        use tokio::io::AsyncReadExt;
+
+        let repo = repo_with_roster();
+        let claude = AgentLabel::parse("claude").unwrap();
+        let (_joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
+
+        // Accepted by the monitor and sitting in the channel, which is
+        // where an emission is between its producer and the loop.
+        let (tx, mut from_sources) = tokio::sync::mpsc::unbounded_channel();
+        tx.send((
+            claude.clone(),
+            (
+                WaitItem::CommandEvent {
+                    name: "deploys".into(),
+                    id: "a".into(),
+                    event: "deploys".into(),
+                    content: "ci failed".into(),
+                    at: None,
+                    failure: false,
+                    selector: None,
+                },
+                crate::cli::command_source::Durability::Transient,
+            ),
+        ))
+        .unwrap();
+        drop(tx);
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let writer = tokio::spawn(write_to(ours, queued, "claude".to_string()));
+        let clients = vec![Client {
+            who: Served::Agent {
+                author: claude,
+                has_cli_sources: false,
+            },
+            out,
+            writer: Some(writer),
+            shown: Default::default(),
+        }];
+
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let mut pending = Vec::new();
+        let decision = stand_down(
+            repo.path(),
+            clients,
+            Vec::new(),
+            Default::default(),
+            OwnedTasks::default(),
+            &mut arrivals,
+            &mut from_sources,
+            Some(&state),
+            &mut pending,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        let got = decision.report();
+        assert_eq!(got.drained, 1, "the client's writer flushed: {got:?}");
+        assert_eq!(
+            got.undelivered, 0,
+            "and the accepted emission is not residual work: it was presented"
+        );
+
+        let mut buf = Vec::new();
+        theirs.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("ci failed"),
+            "an emission taken off the channel must actually reach the peer: {text:?}"
+        );
+    }
+
+    /// A greeting still running at the cutoff cannot welcome a peer
+    /// and leave its writer behind.
+    ///
+    /// The race this excludes: the queue closes while the tasks that
+    /// PRODUCE admissions are still live, so one finishes afterwards,
+    /// sends `Welcome::Ok`, spawns a socket writer, fails to hand the
+    /// client over, and the wrapper drops it — a child task nothing
+    /// owns, after admission was supposed to be shut
+    /// (codex on b37b6b6).
+    ///
+    /// Driven with a greeting held at a barrier, which is what an
+    /// in-progress handshake IS to this transition: a task that has
+    /// not finished and cannot be allowed to.
+    #[tokio::test]
+    async fn a_greeting_running_at_the_cutoff_leaves_no_writer_behind() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let (_joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
+        let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = torn_down.clone();
+
+        let mut owned = OwnedTasks::default();
+        owned.greeting.push(tokio::spawn(async move {
+            // Stands for everything a handshake owns while it runs.
+            let _socket = Guard(held);
+            std::future::pending::<()>().await
+        }));
+        tokio::task::yield_now().await;
+
+        let decision = stand_down(
+            std::path::Path::new("/w/proj"),
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+            owned,
+            &mut arrivals,
+            &mut no_sources(),
+            None,
+            &mut Vec::new(),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(
+            matches!(decision, Shutdown::ReadyToRelease(_)),
+            "the greeting was cancellable, so the release is orderly: {decision:?}"
+        );
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "and what it held is gone BEFORE the lease could be released — a greeting \
+             still live past the cutoff is an open admission path"
+        );
+    }
+
+    /// A client admitted DURING the cutoff still receives the
+    /// transient it is the only recipient for.
+    ///
+    /// The ordering error this excludes: the final presentation used
+    /// to run in the caller, BEFORE late arrivals were claimed. A
+    /// transient whose only eligible client was still in the queue was
+    /// retained by that presentation, then dropped unpresented when
+    /// the claim took the client and the retirement dropped its
+    /// sender. Both the item and its recipient were in hand, and the
+    /// item was reported undelivered (codex on b37b6b6).
+    ///
+    /// The client's queue starts EMPTY, as a real greeting leaves it:
+    /// nothing is pre-queued, so the bytes at the peer can only come
+    /// from the presentation this transition makes.
+    #[tokio::test]
+    async fn a_client_admitted_during_the_cutoff_still_gets_its_transient() {
+        use tokio::io::AsyncReadExt;
+
+        let repo = repo_with_roster();
+        let claude = AgentLabel::parse("claude").unwrap();
+        let (joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
+
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let writer = tokio::spawn(write_to(ours, queued, "claude".to_string()));
+        joined
+            .send(Greeted::Client(Client {
+                who: Served::Agent {
+                    author: claude.clone(),
+                    has_cli_sources: false,
+                },
+                out,
+                writer: Some(writer),
+                shown: Default::default(),
+            }))
+            .unwrap();
+
+        let mut pending = vec![(
+            claude,
+            WaitItem::CommandEvent {
+                name: "deploys".into(),
+                id: "a".into(),
+                event: "deploys".into(),
+                content: "ci failed".into(),
+                at: None,
+                failure: false,
+                selector: None,
+            },
+        )];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+
+        let decision = stand_down(
+            repo.path(),
+            // No client attached: the only eligible one is the
+            // admission still sitting in the queue.
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+            OwnedTasks::default(),
+            &mut arrivals,
+            &mut no_sources(),
+            Some(&state),
+            &mut pending,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        let got = decision.report();
+        assert_eq!(got.drained, 1, "the late client's writer flushed: {got:?}");
+        assert_eq!(
+            got.undelivered, 0,
+            "and nothing is owed: the transition had both the item and its recipient"
+        );
+
+        let mut buf = Vec::new();
+        theirs.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("ci failed"),
+            "the transient must actually reach the peer, not merely be counted: {text:?}"
+        );
+    }
+
+    /// A task cancellation cannot reach forbids an orderly release.
+    ///
+    /// `settled: false` used to be a boolean: the unsettled path
+    /// printed "releasing anyway" and then released anyway, which is a
+    /// log line where a contract was wanted (codex on dd67677). The
+    /// decision is exhaustive now, and this is the branch `start`
+    /// answers by exiting WITH the lease held rather than unwinding
+    /// it.
+    ///
+    /// The producer is a BLOCKING task parked on a channel, because
+    /// `abort` only takes effect at an await point and a blocking task
+    /// has none — which is precisely the case the contract exists for.
+    /// It is released at the end so no thread is left behind.
+    #[tokio::test]
+    async fn a_task_cancellation_cannot_reach_forbids_an_orderly_release() {
+        let (let_go, parked) = std::sync::mpsc::channel::<()>();
+        let (running, started) = std::sync::mpsc::channel::<()>();
+        let producer = tokio::task::spawn_blocking(move || {
+            let _ = running.send(());
+            let _ = parked.recv();
+        });
+        // It must be RUNNING before the retirement: a blocking task
+        // the pool has not picked up yet is cancellable like any
+        // other, which is the opposite of the case under test.
+        tokio::task::spawn_blocking(move || started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // As the transition does: stop them, then hand the handles on.
+        let producers = Hosted {
+            spec: Vec::new(),
+            tasks: vec![producer],
+        }
+        .stop();
+
+        let decision = retire(
+            Vec::new(),
+            Vec::new(),
+            producers,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            0,
+        )
+        .await;
+
+        assert!(
+            matches!(decision, Shutdown::RequiresProcessExit(_)),
+            "a producer that has not stopped must not permit the orderly release that \
+             drops the lease: {decision:?}"
+        );
+        let _ = let_go.send(());
+    }
+
+    /// What a reconcile CANCELS, it hands back.
+    ///
+    /// Both paths: an author whose spec changed, and one revoked from
+    /// the roster. The previous body dropped these handles, so a
+    /// source removed moments before a stand-down was still winding
+    /// down while the retirement — looking only at the CURRENT map —
+    /// reported everything settled (codex on dd67677).
+    #[tokio::test]
+    async fn a_reconcile_hands_back_the_producers_it_cancels() {
+        let repo = repo_with_roster();
+        with_source(repo.path(), "codex", "deploys");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = std::collections::BTreeMap::new();
+
+        let first = reconcile_hosting(repo.path(), &mut hosted, &tx);
+        assert!(first.is_empty(), "nothing was running to cancel yet");
+        assert_eq!(hosted.len(), 1, "and codex's source is hosted");
+
+        // An edited spec replaces that author's set.
+        with_source(repo.path(), "codex", "builds");
+        let replaced = reconcile_hosting(repo.path(), &mut hosted, &tx);
+        assert!(
+            !replaced.is_empty(),
+            "the producers it just cancelled are the caller's to see out"
+        );
+
+        // A revoked author's set goes the same way.
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+        )
+        .unwrap();
+        let revoked = reconcile_hosting(repo.path(), &mut hosted, &tx);
+        assert!(hosted.is_empty(), "a revoked agent hosts nothing");
+        assert!(
+            !revoked.is_empty(),
+            "and its producer is still winding down, so it comes back too"
+        );
+
+        // Retiring with that inventory observes them end, which is the
+        // whole point of carrying it.
+        let decision = retire(
+            Vec::new(),
+            Vec::new(),
+            replaced.into_iter().chain(revoked).collect(),
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+        assert!(
+            matches!(decision, Shutdown::ReadyToRelease(_)),
+            "they stopped, so the release is orderly: {decision:?}"
+        );
+    }
+
+    /// A producer removed JUST BEFORE a retirement is still this
+    /// monitor's to see out.
+    ///
+    /// `reconcile_hosting` cancels it and the current hosted map stops
+    /// mentioning it, so a retirement that looked only at that map
+    /// would report everything settled while the removed one was still
+    /// The whole mechanism: a monitor that declines a NEWER client is
+    /// what an install replaced, so it goes — and one that declines an
+    /// OLDER client keeps the repo.
+    ///
+    /// Both directions in one test, because getting them backwards is
+    /// the only way this can be dangerous. The stale party is whoever
+    /// speaks the lower number: older monitor, it leaves; older
+    /// client, it does its own local wait exactly as before.
+    #[test]
+    fn a_monitor_leaves_for_a_newer_client_and_stays_for_an_older_one() {
+        let repo = repo_with_roster();
+        let hello = |proto: u32| {
+            serde_json::to_string(&Hello {
+                proto,
+                repo: repo.path().to_string_lossy().to_string(),
+                who: agent("codex"),
+            })
+            .unwrap()
+        };
+
+        for newer in [PROTO + 1, PROTO + 9] {
+            match greeting_of(&hello(newer), repo.path()) {
+                Greeting::Obsolete(Welcome::Decline { proto, .. }) => {
+                    assert_eq!(proto, PROTO, "it answers as itself before it goes")
+                }
+                other => panic!("a client on {newer} replaces a monitor on {PROTO}: {other:?}"),
+            }
+        }
+
+        for older in [PROTO - 1, 1] {
+            assert!(
+                matches!(
+                    greeting_of(&hello(older), repo.path()),
+                    Greeting::Decline(_)
+                ),
+                "an older client is the stale one; the monitor keeps the repo"
+            );
+        }
+
+        // And our own version is served, which is the ordinary case
+        // this must not disturb.
+        assert!(matches!(
+            greeting_of(&hello(PROTO), repo.path()),
+            Greeting::Client(_)
+        ));
+    }
+
+    /// A higher version alone retires NOTHING.
+    ///
+    /// The hole this closes, and it was real: the first version
+    /// re-read `Envelope.proto` and converted any greater number into
+    /// a retirement, so a bare `{"proto":6}` — no repo, no identity,
+    /// from anyone who could reach the socket — ended the repo's owner
+    /// (codex on c4b5899). Each frame here carries a HIGHER proto, so
+    /// the version is never what distinguishes them; only the routing
+    /// and the identity differ.
+    ///
+    /// I had claimed an unknown author could not reach this decision.
+    /// That was true of the equal-version path and false of the one
+    /// that matters, which is why these all use `PROTO + 1`.
+    #[test]
+    fn a_higher_version_alone_retires_nothing() {
+        let repo = repo_with_roster();
+        let newer = PROTO + 1;
+        let here = repo.path().to_string_lossy().to_string();
+
+        // No repo and no identity at all.
+        assert!(
+            matches!(
+                greeting_of(&format!(r#"{{"proto":{newer}}}"#), repo.path()),
+                Greeting::Decline(_)
+            ),
+            "a bare version is not a client, and ends nothing"
+        );
+
+        // Addressed to a DIFFERENT repo.
+        let elsewhere = serde_json::to_string(&Hello {
+            proto: newer,
+            repo: "/some/other/repo".into(),
+            who: agent("codex"),
+        })
+        .unwrap();
+        assert!(
+            matches!(greeting_of(&elsewhere, repo.path()), Greeting::Decline(_)),
+            "a newer client asking for another repo must not end this one's monitor"
+        );
+
+        // This repo, but nobody this repo knows.
+        let ghost = format!(
+            r#"{{"proto":{newer},"repo":{here:?},"who":{{"as":"agent","author":"ghost","holder":null,"has_cli_sources":false}}}}"#
+        );
+        match greeting_of(&ghost, repo.path()) {
+            Greeting::Decline(Welcome::Decline { why, .. }) => {
+                assert!(why.contains("roster"), "{why}")
+            }
+            other => panic!("an unknown author must not end a monitor: {other:?}"),
+        }
+
+        // A client KIND this build does not know.
+        let alien =
+            format!(r#"{{"proto":{newer},"repo":{here:?},"who":{{"as":"something_later"}}}}"#);
+        assert!(
+            matches!(greeting_of(&alien, repo.path()), Greeting::Decline(_)),
+            "a client we cannot identify is not one whose word ends a repo's owner"
+        );
+
+        // And the one that SHOULD: this repo, a known agent, newer.
+        let known = serde_json::to_string(&Hello {
+            proto: newer,
+            repo: here.clone(),
+            who: agent("codex"),
+        })
+        .unwrap();
+        assert!(
+            matches!(greeting_of(&known, repo.path()), Greeting::Obsolete(_)),
+            "addressed here, by somebody this repo knows, on a newer version"
+        );
+        // An observer too: it has no author to check, and it is still
+        // a client of this repo on a newer build.
+        let watcher = format!(r#"{{"proto":{newer},"repo":{here:?},"who":{{"as":"observer"}}}}"#);
+        assert!(matches!(
+            greeting_of(&watcher, repo.path()),
+            Greeting::Obsolete(_)
+        ));
+    }
+
+    /// The client REACHES an older holder, which is the whole point.
+    ///
+    /// `attach_by` used to refuse a descriptor whose proto differed
+    /// before it connected, so the greeting that tells a holder to go
+    /// was never sent and the self-exit clause never ran in production
+    /// (codex on c4b5899). The descriptor is a hint about where to
+    /// knock; the handshake settles the version.
+    ///
+    /// Driven through `attach_by` — the production discovery path —
+    /// rather than by opening a socket by hand, which is what hid
+    /// this.
+    #[test]
+    fn a_client_greets_a_holder_whose_descriptor_is_older() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let repo = repo_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_path(dir.path(), 4499).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        publish(
+            repo.path(),
+            &Descriptor {
+                proto: PROTO - 1,
+                pid: 4499,
+                repo: repo.path().to_string_lossy().to_string(),
+                socket: socket.to_string_lossy().to_string(),
+            },
+        )
+        .unwrap();
+
+        // Bounded, because a test must not be able to WAIT FOR EVER on
+        // the thing it is checking. A mutation that stopped the client
+        // connecting left this `accept` blocked, the join with it, and
+        // the mutation run hung holding the mutant in the tree — which
+        // is the state this repo has learned to fear.
+        listener
+            .set_nonblocking(false)
+            .and_then(|()| listener.try_clone())
+            .unwrap();
+        let heard = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let stream = loop {
+                listener.set_nonblocking(true).unwrap();
+                match listener.accept() {
+                    Ok((s, _)) => break Some(s),
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(stream) = stream else {
+                return String::new();
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let decline = Welcome::Decline {
+                proto: PROTO - 1,
+                why: "older".into(),
+            };
+            let _ = writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::to_string(&decline).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+            line
+        });
+
+        let got = attach_by(repo.path(), agent("codex"), ATTACH_BUDGET, connect_within);
+        assert!(
+            matches!(&got, Attached::Alone(_)),
+            "an older monitor cannot serve us: {got:?}"
+        );
+
+        let greeting = heard.join().unwrap();
+        assert!(
+            !greeting.is_empty(),
+            "the client must actually have connected and greeted the older holder"
+        );
+        let open: Opening = serde_json::from_str(greeting.trim_end())
+            .expect("the holder received a greeting it can read at the floor");
+        assert_eq!(
+            open.proto, PROTO,
+            "and it carries OUR version, which is what tells it to go"
+        );
+    }
+
+    /// ONLY a version mismatch ends it.
+    ///
+    /// A client turned away for its repo, or for anything else,
+    /// says nothing about this monitor — and if such a decline
+    /// ended it, any stranger could end a repo's owner by asking
+    /// wrongly. The declines here are all for OUR OWN proto, so the
+    /// version is never in question and the reason is the only thing
+    /// that differs.
+    #[test]
+    fn only_a_version_mismatch_ends_a_monitor() {
+        let repo = repo_with_roster();
+        let elsewhere = serde_json::to_string(&Hello {
+            proto: PROTO,
+            repo: "/some/other/repo".into(),
+            who: agent("codex"),
+        })
+        .unwrap();
+        assert!(
+            matches!(greeting_of(&elsewhere, repo.path()), Greeting::Decline(_)),
+            "asking for another repo must not retire this one's monitor"
+        );
+
+        let ghost = serde_json::to_string(&Hello {
+            proto: PROTO,
+            repo: repo.path().to_string_lossy().to_string(),
+            who: agent("ghost"),
+        })
+        .unwrap();
+        // An author off the roster is refused LATER, by `served_for`,
+        // so it never reaches this decision at all — the same
+        // guarantee arrived at from the other side.
+        assert!(
+            matches!(greeting_of(&ghost, repo.path()), Greeting::Client(_)),
+            "the roster is not this decision's business"
+        );
+
+        assert!(
+            matches!(
+                greeting_of("not a frame at all", repo.path()),
+                Greeting::Decline(_)
+            ),
+            "and an unreadable frame carries no version, so it decides nothing"
+        );
+    }
+
+    /// Over a real socket: the client is TOLD why, and the accept path
+    /// reports a retirement rather than a client.
+    ///
+    /// The answer goes out before the process does, so a client is not
+    /// left reading an abrupt EOF and guessing whether it was refused
+    /// or the monitor died.
+    #[tokio::test]
+    async fn an_obsolete_monitor_answers_before_it_stands_down() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let repo = repo_with_roster();
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_path(dir.path(), 4488).unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let line = serde_json::to_string(&Hello {
+            proto: PROTO + 1,
+            repo: repo.path().to_string_lossy().to_string(),
+            who: agent("codex"),
+        })
+        .unwrap();
+
+        let heard = tokio::spawn(async move {
+            let mut c = tokio::net::UnixStream::connect(&path).await.unwrap();
+            c.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+            let mut answer = String::new();
+            tokio::io::BufReader::new(c)
+                .read_line(&mut answer)
+                .await
+                .unwrap();
+            answer
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let greeted = greet(stream, repo.path()).await.expect("it answers");
+        assert!(
+            matches!(greeted, Greeted::StandDown),
+            "a newer client is not a client this monitor can serve: {greeted:?}"
+        );
+
+        let answer = heard.await.unwrap();
+        match serde_json::from_str::<Welcome>(answer.trim_end()) {
+            Ok(Welcome::Decline { proto, why }) => {
+                assert_eq!(proto, PROTO);
+                assert!(
+                    why.contains("proto"),
+                    "it says what the mismatch was: {why}"
+                );
+            }
+            other => panic!("the client must be told, not dropped: {other:?}"),
+        }
+    }
+
+    /// winding down (codex on dd67677). The handles it hands back are
+    /// the inventory that closes it.
+    #[tokio::test]
+    async fn a_producer_removed_just_before_a_retirement_is_still_waited_for() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = dropped.clone();
+        let producer = tokio::spawn(async move {
+            let _guard = Guard(held);
+            std::future::pending::<()>().await
+        });
+        tokio::task::yield_now().await;
+
+        // Exactly what `reconcile_hosting` returns when an author's
+        // sources change or its roster entry goes.
+        let departing = Hosted {
+            spec: Vec::new(),
+            tasks: vec![producer],
+        }
+        .stop();
+
+        let decision = retire(
+            Vec::new(),
+            Vec::new(),
+            departing,
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+            0,
+        )
+        .await;
+
+        assert!(
+            matches!(decision, Shutdown::ReadyToRelease(_)),
+            "it did stop, so the release is orderly: {decision:?}"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "and a producer the CURRENT map no longer mentions must still have been \
+             seen out before the lease could go"
+        );
     }
 
     #[test]
@@ -2596,7 +4771,6 @@ mod tests {
             pid: 4242,
             repo: "/w/proj".into(),
             socket: "/tmp/clank-socks-501/4242.sock".into(),
-            fold: fold(9, 10),
         };
         let back: Descriptor = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back, d);
@@ -2614,7 +4788,6 @@ mod tests {
             pid: 4242,
             repo: repo.to_string_lossy().to_string(),
             socket: "/tmp/clank-socks-501/4242.sock".into(),
-            fold: fold(1, 2),
         }
     }
 
@@ -2784,10 +4957,7 @@ mod tests {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 let welcome = match accept_hello(line.trim_end(), &repo) {
-                    Ok(_) => Welcome::Ok {
-                        proto: PROTO,
-                        fold: fold(1, 2),
-                    },
+                    Ok(_) => Welcome::Ok { proto: PROTO },
                     Err(decline) => decline,
                 };
                 let mut out = reader.into_inner();
@@ -3113,7 +5283,6 @@ mod tests {
                 pid: 4242,
                 repo: repo.to_string_lossy().to_string(),
                 socket: path.to_string_lossy().to_string(),
-                fold: fold(1, 2),
             },
         )
         .unwrap();
@@ -3149,11 +5318,7 @@ mod tests {
     fn welcome_line() -> String {
         format!(
             "{}\n",
-            serde_json::to_string(&Welcome::Ok {
-                proto: PROTO,
-                fold: fold(3, 4),
-            })
-            .unwrap()
+            serde_json::to_string(&Welcome::Ok { proto: PROTO }).unwrap()
         )
     }
 
@@ -3227,7 +5392,6 @@ mod tests {
                 pid: 1,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: "/tmp/clank-socks-501/nobody-home.sock".into(),
-                fold: fold(1, 2),
             },
         )
         .unwrap();
@@ -3245,13 +5409,12 @@ mod tests {
                 pid: 1,
                 repo: "/w/elsewhere".into(),
                 socket: "/tmp/clank-socks-501/elsewhere.sock".into(),
-                fold: fold(1, 2),
             },
         )
         .unwrap();
         let foreign = attach(repo.path(), agent("codex"));
         assert!(
-            matches!(&foreign, Attached::Alone(why) if why.contains("not ours")),
+            matches!(&foreign, Attached::Alone(why) if why.contains("serves /w/elsewhere")),
             "{foreign:?}"
         );
     }
@@ -3269,7 +5432,6 @@ mod tests {
                 name: "next".into(),
                 priority: 500,
             }],
-            fold: fold(5, 6),
         };
         let coalesced = format!(
             "{}{}\n",
@@ -3344,8 +5506,8 @@ mod tests {
         mine.set_nonblocking(true).unwrap();
         let mut conn = Conn::over(mine);
 
-        let first = serde_json::to_string(&Note::Beat { fold: fold(7, 8) }).unwrap();
-        let second = serde_json::to_string(&Note::Beat { fold: fold(9, 10) }).unwrap();
+        let first = serde_json::to_string(&Note::Beat).unwrap();
+        let second = serde_json::to_string(&Note::Beat).unwrap();
         let (head, tail) = first.split_at(first.len() / 2);
 
         // Half a frame, then a deadline passes with nothing more.
@@ -3363,13 +5525,13 @@ mod tests {
         assert_eq!(
             conn.note(std::time::Instant::now() + Duration::from_secs(2))
                 .expect("the frame resumed where it left off"),
-            Note::Beat { fold: fold(7, 8) },
+            Note::Beat,
             "the prefix survived the deadline"
         );
         assert_eq!(
             conn.note(std::time::Instant::now() + Duration::from_secs(2))
                 .expect("and the next frame is intact"),
-            Note::Beat { fold: fold(9, 10) },
+            Note::Beat,
         );
     }
 
@@ -3470,9 +5632,12 @@ mod tests {
 
     #[test]
     fn our_own_pid_is_live() {
-        assert!(pid_is_live(std::process::id() as i32));
-        assert!(!pid_is_live(0), "no process is pid 0");
-        assert!(!pid_is_live(-1), "and -1 is every process, not one");
+        assert!(crate::signal::alive(std::process::id() as i32));
+        assert!(!crate::signal::alive(0), "no process is pid 0");
+        assert!(
+            !crate::signal::alive(-1),
+            "and -1 is every process, not one"
+        );
     }
 
     /// Binding clears the litter, which is the only place that can.
@@ -3520,7 +5685,6 @@ mod tests {
             pid: 4343,
             repo: repo.to_string_lossy().to_string(),
             socket: path.to_string_lossy().to_string(),
-            fold: fold(1, 2),
         };
         (dir, d)
     }
@@ -3586,6 +5750,7 @@ mod tests {
                 publish(r, &d).map(|()| Box::new(NotStarted) as Box<dyn Started>)
             },
             connect_within,
+            |r| acquire_lease(r).is_ok(),
         )
         .await;
 
@@ -3593,9 +5758,765 @@ mod tests {
         assert_eq!(
             starts.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "ONE start, then retries against it: a second would only \
-             lose the lease race to the first"
+            "one start is enough when it works: the retry attaches rather than \
+             starting again"
         );
+    }
+
+    /// The gate has ONE identity, whatever the environment says.
+    ///
+    /// Socket allocation may try candidates because the published
+    /// descriptor then tells everyone which was chosen. A coordination
+    /// lock has no such discovery, so two clients differing only in
+    /// `XDG_RUNTIME_DIR` each took a permit in a different directory,
+    /// locked different inodes, and both forked (codex on 88b6234).
+    #[test]
+    fn the_repair_gate_does_not_move_with_the_environment() {
+        assert_eq!(
+            repair_dir(501),
+            std::path::PathBuf::from("/tmp/clank-repair-501"),
+            "fixed per uid, and derived from nothing else"
+        );
+        assert_ne!(
+            repair_dir(501),
+            repair_dir(502),
+            "but not shared between users"
+        );
+
+        // The socket's candidates DO move with the environment, which
+        // is exactly why the gate must not be derived from them.
+        let with = socket_dirs(501, Some(std::path::Path::new("/run/user/501")));
+        let without = socket_dirs(501, None);
+        assert_ne!(with, without, "the socket list is environment-dependent");
+
+        // And the production path USES that fixed namespace: the gate
+        // file lands there. Asserting only that `repair_dir` is fixed
+        // left the wiring free to derive the directory some other way,
+        // which a mutation duly did.
+        let repo = repo_dir();
+        let me = unsafe { libc::getuid() };
+        let gate = repair_dir(me).join(format!("{}.repair", repo_tag(repo.path())));
+        let _ = std::fs::remove_file(&gate);
+        let held = take_repair_permit(repo.path());
+        assert!(matches!(held, Repair::Acquired(_)), "{held:?}");
+        assert!(
+            gate.exists(),
+            "the gate every contender must find is at {}",
+            gate.display()
+        );
+    }
+
+    /// A namespace that cannot be trusted is UNAVAILABLE, not busy.
+    ///
+    /// The vetting is part of this lock's correctness rather than a
+    /// security aside: a gate file replaced while a holder keeps its
+    /// old fd lets the next caller lock a different inode at the same
+    /// name, and then both are repairing. And "unusable" is not
+    /// "somebody else has it" — reporting one as the other is a guess
+    /// stated as a fact.
+    #[test]
+    fn an_untrusted_namespace_is_unavailable_rather_than_busy() {
+        let repo = repo_dir();
+        let me = unsafe { libc::getuid() };
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        // World-writable: anyone could replace the gate beside us.
+        std::fs::set_permissions(&shared, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+            .unwrap();
+
+        match take_repair_permit_in(repo.path(), &shared, me) {
+            Repair::Unavailable(why) => assert!(!why.is_empty(), "it says what was wrong"),
+            other => panic!("a directory anyone can write is not a gate: {other:?}"),
+        }
+    }
+
+    /// The repo digest is stable across builds.
+    ///
+    /// `DefaultHasher` was wrong twice over: Rust leaves its algorithm
+    /// unspecified between releases — which bites exactly when two
+    /// installed binaries contend during an upgrade — and
+    /// `to_string_lossy` is not the path. Pinned to a known value so a
+    /// change to the scheme has to be deliberate.
+    #[test]
+    fn the_repo_digest_is_pinned_and_byte_exact() {
+        let tag = repo_tag(std::path::Path::new("/w/proj"));
+        assert_eq!(tag.len(), 32);
+        assert_eq!(
+            tag,
+            blake3::hash(b"/w/proj").to_hex()[..32].to_string(),
+            "blake3 over the path's raw bytes, and nothing else"
+        );
+        assert_ne!(tag, repo_tag(std::path::Path::new("/w/proj2")));
+    }
+
+    /// An older peer's reply must be READABLE before it means
+    /// anything.
+    ///
+    /// A bare `{"proto":4}` and an unknown body are not evidence about
+    /// retirement, and the first version read every older envelope as
+    /// "standing down" — then started a monitor on the strength of it.
+    /// Even a well-formed decline only establishes an older peer:
+    /// proto 3 and 4 cannot self-exit, and the wire does not
+    /// distinguish refusal from retirement progress.
+    #[test]
+    fn an_unreadable_older_reply_establishes_nothing() {
+        let repo = repo_dir();
+        let older = PROTO - 1;
+
+        for answer in [
+            format!("{{\"proto\":{older}}}\n"),
+            format!("{{\"proto\":{older},\"t\":\"something_later\"}}\n"),
+        ] {
+            let (_dir, _served) = fake_monitor(repo.path(), Some(answer.clone()));
+            match look_at(repo.path(), agent("codex"), ATTACH_BUDGET, connect_within) {
+                Seen::Unproven(why) => assert!(why.contains("cannot read"), "{answer}: {why}"),
+                other => panic!("{answer} establishes nothing: {other:?}"),
+            }
+        }
+
+        // A decline we CAN read is an older peer — named for what it
+        // is, not for a retirement nobody confirmed.
+        let decline = format!(
+            "{}\n",
+            serde_json::to_string(&Welcome::Decline {
+                proto: older,
+                why: "older".into(),
+            })
+            .unwrap()
+        );
+        let (_dir, _served) = fake_monitor(repo.path(), Some(decline));
+        assert!(matches!(
+            look_at(repo.path(), agent("codex"), ATTACH_BUDGET, connect_within),
+            Seen::OlderPeer(_)
+        ));
+    }
+
+    /// ONE repair per repo: a second client does not also start one.
+    ///
+    /// The canonical lease stops two monitors OWNING a repo and says
+    /// nothing about how many clients may poll for it or fork a child
+    /// at it — each could take and drop it and each then start one,
+    /// which is a poller and a fork per waiting client (codex on
+    /// cf29219). The permit is flocked so it coalesces ACROSS
+    /// processes, every parked wait being its own.
+    #[tokio::test]
+    async fn only_one_client_repairs_a_repo_at_a_time() {
+        let repo = repo_dir();
+        let dir = tempfile::tempdir().unwrap();
+
+        let mine = repair_permit(repo.path(), dir.path())
+            .expect("the gate is usable")
+            .expect("nobody else is on it");
+        assert!(
+            repair_permit(repo.path(), dir.path()).unwrap().is_none(),
+            "a second client must not become a second repairer"
+        );
+
+        // Another repo is another repair, which is the point of the
+        // tag: one in flight must not block an unrelated one.
+        let other = repo_dir();
+        assert!(repair_permit(other.path(), dir.path()).unwrap().is_some());
+
+        drop(mine);
+        assert!(
+            repair_permit(repo.path(), dir.path()).unwrap().is_some(),
+            "and it frees when the repairer is done"
+        );
+    }
+
+    /// The permit is HELD while the startup it covers is happening.
+    ///
+    /// Releasing it when the lease is taken rather than when the work
+    /// is done lets the next client in while this one is still
+    /// starting a monitor — which is the fork-per-client this exists
+    /// to prevent, arriving a few milliseconds later. Asked from
+    /// INSIDE the spawn, which is the only moment that distinguishes
+    /// the two.
+    #[tokio::test]
+    async fn the_permit_is_still_held_while_the_startup_runs() {
+        let repo = repo_dir();
+        let free_during_spawn = std::sync::atomic::AtomicBool::new(false);
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            Duration::from_millis(40),
+            Duration::from_millis(40),
+            SHARE_ATTEMPTS,
+            |r| {
+                if matches!(take_repair_permit(r), Repair::Acquired(_)) {
+                    free_during_spawn.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        assert!(matches!(got, Attached::Alone(_)), "{got:?}");
+        assert!(
+            !free_during_spawn.load(std::sync::atomic::Ordering::SeqCst),
+            "another client could have become a second repairer mid-startup"
+        );
+    }
+
+    /// A deadline already gone is never readiness.
+    ///
+    /// The wait took the lease BEFORE checking the time, so an
+    /// expired deadline with a free lease returned Ready and the
+    /// caller started a child with no further check — as could a timer
+    /// that resumed after the deadline with the lease freed meanwhile
+    /// (codex on cf29219).
+    #[tokio::test]
+    async fn an_expired_deadline_is_never_ready_however_free_the_lease_is() {
+        let repo = repo_dir();
+        // Nothing holds it: the ONLY thing that can say Busy here is
+        // the expiry, which is the point.
+        assert!(acquire_lease(repo.path()).is_ok());
+
+        let gone = std::time::Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            wait_for_ownership(repo.path(), gone, Duration::from_millis(5)).await,
+            Ownership::Busy,
+            "a free lease past the deadline is still not permission to start"
+        );
+    }
+
+    /// Waiting for ownership is bounded by the DEADLINE, with no
+    /// count in it.
+    ///
+    /// A retry count ended the wait after about 450ms with production
+    /// settings, while a holder standing down legitimately has its
+    /// retirement budget plus settlement. Here the lease is released
+    /// well past any small number of steps, and the wait must still
+    /// see it.
+    #[tokio::test]
+    async fn waiting_for_ownership_is_bounded_by_time_not_by_tries() {
+        let repo = repo_dir();
+        let held = acquire_lease(repo.path()).expect("the test owns it first");
+        let releasing = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+        });
+
+        // Twenty-odd steps before the release: a wait that gave up on
+        // a handful of tries would never reach it.
+        let by = std::time::Instant::now() + Duration::from_secs(3);
+        let got = wait_for_ownership(repo.path(), by, Duration::from_millis(15)).await;
+        assert_eq!(got, Ownership::Ready);
+        releasing.await.unwrap();
+
+        // And a lease that never frees is Busy rather than a wait
+        // without end.
+        let still = acquire_lease(repo.path()).unwrap();
+        let began = std::time::Instant::now();
+        let by = std::time::Instant::now() + Duration::from_millis(80);
+        assert_eq!(
+            wait_for_ownership(repo.path(), by, Duration::from_millis(15)).await,
+            Ownership::Busy
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+        drop(still);
+    }
+
+    /// The whole handoff fits ONE deadline, including its last
+    /// handshake.
+    ///
+    /// Each attach used to take a fresh budget, so an attempt entering
+    /// its handshake just before the deadline could block for another
+    /// whole `ATTACH_BUDGET` — and an outer check on the deadline
+    /// could not make that bounded (codex on 1c0ce9d). The connect
+    /// here outlasts any budget a test sets, so a fresh one is
+    /// measurable.
+    #[tokio::test]
+    async fn the_handoff_fits_one_deadline_including_its_last_handshake() {
+        let repo = repo_dir();
+        let (_dir, d) = unannounced_monitor(repo.path());
+
+        let began = std::time::Instant::now();
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            // A big per-attach budget against a small overall one, so
+            // the two are far apart.
+            Duration::from_millis(400),
+            Duration::from_millis(60),
+            SHARE_ATTEMPTS,
+            |r| publish(r, &d).map(|()| Box::new(NotStarted) as Box<dyn Started>),
+            |_path, deadline: std::time::Instant| {
+                // Stands in for a connect against a full backlog: it
+                // uses the whole deadline it was GIVEN and then
+                // reports the timeout. That is what makes a fresh
+                // budget measurable — a connect that slept a fixed
+                // time would take the same either way, which is how
+                // the first version of this fixture missed it.
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the connect did not finish",
+                ))
+            },
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+        let took = began.elapsed();
+
+        assert!(matches!(got, Attached::Alone(_)), "{got:?}");
+        assert!(
+            took < Duration::from_millis(650),
+            "the retries share what is LEFT of one deadline; a fresh 400ms budget each \
+             would run far past it: {took:?}"
+        );
+    }
+
+    /// Ownership that frees and then the deadline passing starts
+    /// NOTHING — through the production path, not just the probe.
+    ///
+    /// The probe is a seam because taking the real lease is too fast
+    /// to arrange that gap by scheduling, and a guard nothing can
+    /// drive is a guard nobody has checked.
+    #[tokio::test]
+    async fn readiness_arriving_past_the_deadline_starts_no_monitor() {
+        let repo = repo_dir();
+        let started = std::sync::atomic::AtomicUsize::new(0);
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            SHARE_ATTEMPTS,
+            |_r| {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            // Succeeds, but only after the deadline has gone.
+            |_r| {
+                std::thread::sleep(Duration::from_millis(120));
+                true
+            },
+        )
+        .await;
+
+        match got {
+            Attached::Alone(why) => assert!(why.contains("ran out of time"), "{why}"),
+            other => panic!("nothing was started, so nothing can be shared: {other:?}"),
+        }
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "ownership confirmed after the deadline is not permission to start"
+        );
+    }
+
+    /// Ownership that frees and then the deadline passing starts
+    /// NOTHING.
+    ///
+    /// Checking expiry before the probe is necessary and does not
+    /// cover a probe that FINISHED after the deadline, or this task
+    /// resuming past it before startup (codex on 06021ee). The probe
+    /// is a seam because taking the real lease is too fast to arrange
+    /// that gap by scheduling, and a guard nothing can drive is a
+    /// guard nobody has checked.
+    #[tokio::test]
+    async fn readiness_that_arrives_too_late_is_not_permission() {
+        let repo = repo_dir();
+        let by = std::time::Instant::now() + Duration::from_millis(40);
+
+        // Succeeds — but only after the deadline has gone.
+        let got = wait_for_ownership_by(repo.path(), by, Duration::from_millis(5), |_| {
+            std::thread::sleep(Duration::from_millis(60));
+            true
+        })
+        .await;
+        assert_eq!(
+            got,
+            Ownership::Ready,
+            "the probe did take it, which is what makes the guard after it necessary"
+        );
+        assert!(
+            by.saturating_duration_since(std::time::Instant::now())
+                .is_zero(),
+            "and the deadline is gone by the time it says so"
+        );
+    }
+
+    /// The whole handoff, end to end: an older holder goes and this
+    /// client ends up SHARING a current one.
+    ///
+    /// The acceptance demonstrated here, in order: the old holder is
+    /// NOTIFIED; it keeps the canonical lease well beyond the obsolete
+    /// count-based give-up for the parameters actually supplied; it
+    /// releases; exactly one useful replacement starts; the client
+    /// gets `Shared`.
+    ///
+    /// Both halves of that mattered and the first version had neither.
+    /// It released at 250ms while passing `settle = 2000` — so the
+    /// old four-step wait would have had 500ms steps and reached it
+    /// on the first one, meaning a restored retry count would still
+    /// have passed (codex on 685e022). And it started its countdown
+    /// from the test's own clock, so a slow start could find the
+    /// holder already gone before any notification: the interval is
+    /// tied to an observed GREETING now.
+    #[tokio::test]
+    async fn an_older_holder_goes_and_the_client_shares_its_replacement() {
+        use std::io::{BufRead, BufReader, Write};
+
+        // budget 800ms + settle 400ms = a 1200ms deadline; the
+        // obsolete count window is 4 steps of settle/4 = 400ms. The
+        // release at 600ms is past that and leaves 600ms for startup
+        // and a handshake.
+        let budget = Duration::from_millis(800);
+        let settle = Duration::from_millis(400);
+        let holds_for = Duration::from_millis(600);
+
+        let repo = repo_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let old_sock = socket_path(dir.path(), 4801).unwrap();
+        let old = std::os::unix::net::UnixListener::bind(&old_sock).unwrap();
+        publish(
+            repo.path(),
+            &Descriptor {
+                proto: PROTO - 1,
+                pid: 4801,
+                repo: repo.path().to_string_lossy().to_string(),
+                socket: old_sock.to_string_lossy().to_string(),
+            },
+        )
+        .unwrap();
+        // The old monitor OWNS the repo, as a real one does.
+        let lease = acquire_lease(repo.path()).expect("the old holder owns it");
+
+        let greeted_at = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let noticed = greeted_at.clone();
+        let serving = std::thread::spawn(move || {
+            // It keeps answering until it goes: a client greets it
+            // more than once — on discovery, and again after taking
+            // the repair gate — and a holder that answered only the
+            // first would look like one that died mid-frame.
+            old.set_nonblocking(true).unwrap();
+            let decline = serde_json::to_string(&Welcome::Decline {
+                proto: PROTO - 1,
+                why: "older".into(),
+            })
+            .unwrap();
+            loop {
+                match old.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line);
+                        // A valid greeting from a newer client is what
+                        // starts the clock: the retirement interval is
+                        // measured from NOTIFICATION, not from the
+                        // test's own start.
+                        if serde_json::from_str::<Opening>(line.trim_end())
+                            .is_ok_and(|o| o.proto > PROTO - 1)
+                        {
+                            let mut at = noticed.lock().unwrap();
+                            at.get_or_insert_with(std::time::Instant::now);
+                        }
+                        let _ = writeln!(reader.get_mut(), "{decline}");
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+                let go = noticed
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|at| at.elapsed() >= holds_for);
+                if go {
+                    break;
+                }
+            }
+            // Stands down: the lease is what says it has gone.
+            drop(lease);
+            drop(old);
+        });
+
+        // The replacement: takes ownership and serves this version.
+        let new_dir = tempfile::tempdir().unwrap();
+        let new_sock = socket_path(new_dir.path(), 4802).unwrap();
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let replacement = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let keep = replacement.clone();
+        let halt = stop.clone();
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            budget,
+            settle,
+            SHARE_ATTEMPTS,
+            |r| {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let held = acquire_lease(r).map_err(std::io::Error::other)?;
+                let listener = std::os::unix::net::UnixListener::bind(&new_sock)?;
+                listener.set_nonblocking(true)?;
+                publish(
+                    r,
+                    &Descriptor {
+                        proto: PROTO,
+                        pid: 4802,
+                        repo: r.to_string_lossy().to_string(),
+                        socket: new_sock.to_string_lossy().to_string(),
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+                let halt = halt.clone();
+                let handle = std::thread::spawn(move || {
+                    let _own = held;
+                    while !halt.load(std::sync::atomic::Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false).unwrap();
+                                let mut reader = BufReader::new(stream);
+                                let mut line = String::new();
+                                let _ = reader.read_line(&mut line);
+                                let ok =
+                                    serde_json::to_string(&Welcome::Ok { proto: PROTO }).unwrap();
+                                let _ = writeln!(reader.get_mut(), "{ok}");
+                            }
+                            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                        }
+                    }
+                });
+                *keep.lock().unwrap() = Some(handle);
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        assert!(
+            matches!(got, Attached::Shared(_)),
+            "the client must end up sharing the replacement: {got:?}"
+        );
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "and exactly one monitor was started to get there"
+        );
+        let held_for = greeted_at.lock().unwrap().map(|at| at.elapsed());
+        assert!(
+            held_for.is_some_and(|d| d >= holds_for),
+            "the old holder must have kept the lease past the obsolete give-up: {held_for:?}"
+        );
+
+        // Both fixture servers are owned and ended, so neither
+        // outlives the test holding a lease or a socket.
+        serving.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = replacement.lock().unwrap().take() {
+            h.join().unwrap();
+        }
+    }
+
+    /// A second contender does not become a second repairer.
+    ///
+    /// It takes the documented local fallback while the first holds
+    /// the gate, and starts nothing — the whole point of coalescing.
+    #[tokio::test]
+    async fn a_second_contender_starts_nothing_while_the_first_repairs() {
+        let repo = repo_dir();
+        let me = unsafe { libc::getuid() };
+        let gate = match take_repair_permit_in(repo.path(), &repair_dir(me), me) {
+            Repair::Acquired(p) => p,
+            other => panic!("the first contender takes it: {other:?}"),
+        };
+
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            SHARE_ATTEMPTS,
+            |_r| {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        match got {
+            Attached::Alone(why) => assert!(why.contains("already starting one"), "{why}"),
+            other => panic!("it has nothing to share yet: {other:?}"),
+        }
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a second repairer is the fork-per-client this gate exists to prevent"
+        );
+        drop(gate);
+    }
+
+    /// Ownership that never frees starts NOTHING.
+    ///
+    /// This fixture used to hold the lease for the whole call and
+    /// REQUIRE a start, which is exactly the bug: all three ways out
+    /// of the wait — acquired, retries exhausted, deadline gone — fell
+    /// through to the same spawn, so a failed ownership confirmation
+    /// started a monitor that could not own anything (codex on
+    /// 1c0ce9d). The right answer for a lease that stays held is a
+    /// bounded local fallback.
+    #[tokio::test]
+    async fn ownership_that_never_frees_starts_nothing() {
+        let repo = repo_dir();
+        let held = acquire_lease(repo.path()).expect("the test owns it first");
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+
+        let began = std::time::Instant::now();
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            Duration::from_millis(50),
+            Duration::from_millis(40),
+            SHARE_ATTEMPTS,
+            |_r| {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+        let took = began.elapsed();
+
+        match got {
+            Attached::Alone(why) => assert!(why.contains("lease is still held"), "{why}"),
+            other => panic!("nothing can serve this repo yet: {other:?}"),
+        }
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a monitor started against a held lease loses it and exits, having \
+             helped nobody"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "and it gave up inside its own deadline: {took:?}"
+        );
+        drop(held);
+    }
+
+    /// Ownership that frees DURING the wait is taken.
+    ///
+    /// The case the wait exists for: a holder standing down may keep
+    /// its lease well past the old retry count, and the client must
+    /// still be the one that starts the replacement once it goes.
+    #[tokio::test]
+    async fn ownership_that_frees_during_the_wait_starts_one() {
+        let repo = repo_dir();
+        let held = acquire_lease(repo.path()).expect("the test owns it first");
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+
+        // Released well after the old 450ms retry budget would have
+        // given up, and well inside the deadline.
+        let releasing = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(held);
+        });
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            Duration::from_millis(50),
+            Duration::from_millis(600),
+            SHARE_ATTEMPTS,
+            |_r| {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        assert!(matches!(got, Attached::Alone(_)), "{got:?}");
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the repo became free, so this client is the one that starts its monitor"
+        );
+        releasing.await.unwrap();
+    }
+
+    /// A monitor that should KEEP the repo gets no replacement at all.
+    ///
+    /// Newer than us, or refusing this client on its merits: either
+    /// way a second monitor would own nothing and refuse us the same
+    /// way. Starting one per park against a healthy newer owner was
+    /// the cost that made this classification necessary.
+    #[tokio::test]
+    async fn a_holder_that_keeps_the_repo_gets_no_replacement() {
+        use std::io::{BufRead, BufReader, Write};
+
+        for answer in [
+            Welcome::Decline {
+                proto: PROTO + 1,
+                why: "we are newer".into(),
+            },
+            Welcome::Decline {
+                proto: PROTO,
+                why: "`codex` is not on this repo's roster".into(),
+            },
+        ] {
+            let repo = repo_dir();
+            let dir = tempfile::tempdir().unwrap();
+            let socket = socket_path(dir.path(), 4777).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            publish(
+                repo.path(),
+                &Descriptor {
+                    proto: PROTO,
+                    pid: 4777,
+                    repo: repo.path().to_string_lossy().to_string(),
+                    socket: socket.to_string_lossy().to_string(),
+                },
+            )
+            .unwrap();
+            let line = serde_json::to_string(&answer).unwrap();
+            std::thread::spawn(move || {
+                while let Ok((stream, _)) = listener.accept() {
+                    let mut reader = BufReader::new(stream);
+                    let mut discard = String::new();
+                    let _ = reader.read_line(&mut discard);
+                    let _ = writeln!(reader.get_mut(), "{line}");
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            });
+
+            let starts = std::sync::atomic::AtomicUsize::new(0);
+            let got = attach_or_spawn_by(
+                repo.path(),
+                agent("codex"),
+                Duration::from_millis(200),
+                Duration::from_millis(40),
+                SHARE_ATTEMPTS,
+                |_r| {
+                    starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Box::new(NotStarted) as Box<dyn Started>)
+                },
+                connect_within,
+                |r| acquire_lease(r).is_ok(),
+            )
+            .await;
+
+            assert!(matches!(got, Attached::Alone(_)), "{got:?}");
+            assert_eq!(
+                starts.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{answer:?} means the repo has an owner; starting one helps nobody"
+            );
+        }
     }
 
     /// A monitor that exits AFTER the attach returned is still reaped.
@@ -3626,6 +6547,7 @@ mod tests {
                     as Box<dyn Started>)
             },
             connect_within,
+            |r| acquire_lease(r).is_ok(),
         )
         .await;
         assert!(matches!(got, Attached::Shared(_)), "{got:?}");
@@ -3659,6 +6581,7 @@ mod tests {
             SHARE_ATTEMPTS,
             forbidden,
             connect_within,
+            |r| acquire_lease(r).is_ok(),
         )
         .await;
         assert!(matches!(got, Attached::Shared(_)), "{got:?}");
@@ -3676,6 +6599,7 @@ mod tests {
             SHARE_ATTEMPTS,
             |_| Err(std::io::Error::other("fork failed")),
             connect_within,
+            |r| acquire_lease(r).is_ok(),
         )
         .await;
         match got {
@@ -3711,7 +6635,6 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .to_string(),
-                fold: fold(1, 2),
             },
         )
         .unwrap();
@@ -3728,14 +6651,17 @@ mod tests {
                 tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 connect_within(path, deadline)
             },
+            |r| acquire_lease(r).is_ok(),
         )
         .await;
 
         assert!(matches!(got, Attached::Alone(_)), "{got:?}");
         assert_eq!(
             tries.load(std::sync::atomic::Ordering::SeqCst),
-            SHARE_ATTEMPTS as usize,
-            "bounded by the limit, not by the park's patience"
+            SHARE_ATTEMPTS as usize + 1,
+            "bounded by the limit, not by the park's patience — plus the ONE re-read \
+             after taking the repair permit, which exists because a winner may have \
+             appeared while this client queued for it"
         );
     }
 
@@ -4002,7 +6928,8 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let client = greet(stream, repo.path())
             .await
-            .expect("a fragmented hello is still a hello");
+            .expect("a fragmented hello is still a hello")
+            .client();
         assert_eq!(
             client.who,
             Served::Agent {
@@ -4042,7 +6969,10 @@ mod tests {
 
         let began = std::time::Instant::now();
         let (healthy, _) = listener.accept().await.unwrap();
-        let admitted = greet(healthy, repo.path()).await.expect("admitted");
+        let admitted = greet(healthy, repo.path())
+            .await
+            .expect("admitted")
+            .client();
         let took = began.elapsed();
 
         assert_eq!(admitted.who.name(), "claude");
@@ -4105,71 +7035,43 @@ mod tests {
         assert!(!revoked(&other), "an unreadable config is transient");
     }
 
-    /// A fold that fails may not publish a fresh completed-fold stamp.
+    /// A fold that FAILED must not advertise progress.
     ///
-    /// The outcome is supplied because the rebuild is fail-soft — it
-    /// returns `Ok` for a repo with no git, a broken `.git` file and an
-    /// empty `.git` directory, all three probed. The ordering is the
-    /// invariant, not the rebuild's own failure modes.
+    /// The heartbeat is what the watchdog reads, and a failing loop
+    /// that kept it fresh is exactly the wedge the watchdog could then
+    /// never see. Tested on the ORDERING with the fold's outcome
+    /// supplied, because the rebuild is fail-soft — it returns `Ok`
+    /// for a repo with no git, a broken `.git` file and an empty
+    /// `.git` directory — so a failing fold cannot be provoked
+    /// through it.
     #[test]
     fn a_failed_fold_does_not_advertise_progress() {
-        let repo = repo_with_roster();
-        let socket = std::path::Path::new("/tmp/clank-socks-501/4242.sock");
-        let at_zero = Fold { tick: 0, at_ms: 1 };
-        publish(repo.path(), &describe(repo.path(), 4242, socket, at_zero)).unwrap();
-
+        let at_zero = 0;
         let heartbeat = std::sync::atomic::AtomicU64::new(0);
         let beat = || heartbeat.load(std::sync::atomic::Ordering::Acquire);
 
         let failed = advance_with(
-            repo.path(),
-            4242,
-            socket,
             at_zero,
             &heartbeat,
             Err(anyhow::anyhow!("the fold did not complete")),
         );
         assert!(failed.is_none(), "a failed fold yields nothing to serve");
-        assert_eq!(
-            read_published(repo.path()).map(|d| d.fold.tick),
-            Some(0),
-            "and the stamp still claims only the fold that completed"
-        );
-        assert_eq!(
-            beat(),
-            0,
-            "nor may the watchdog's heartbeat move: a failing fold that \
-             kept it fresh is the wedge the watchdog cannot then see"
-        );
+        assert_eq!(beat(), 0, "and the watchdog's heartbeat does not move");
 
-        // Repeated failure must not creep the stamp either.
         for _ in 0..3 {
-            let _ = advance_with(
-                repo.path(),
-                4242,
-                socket,
-                at_zero,
-                &heartbeat,
-                Err(anyhow::anyhow!("still failing")),
-            );
+            let _ = advance_with(at_zero, &heartbeat, Err(anyhow::anyhow!("still failing")));
         }
-        assert_eq!(read_published(repo.path()).map(|d| d.fold.tick), Some(0));
         assert_eq!(beat(), 0, "repeated failure must not creep it either");
 
-        // And a fold that DOES complete advances and publishes.
         let ok = advance_with(
-            repo.path(),
-            4242,
-            socket,
             at_zero,
             &heartbeat,
             Ok(crate::repo_state::RepoState::empty(
-                repo.path().to_path_buf(),
+                std::path::PathBuf::from("/w/proj"),
             )),
         )
         .expect("a completed fold serves");
-        assert_eq!(ok.0.tick, 1);
-        assert_eq!(read_published(repo.path()).map(|d| d.fold.tick), Some(1));
+        assert_eq!(ok.0, 1);
         assert_eq!(beat(), 1, "and the watchdog sees the fold that completed");
     }
 
@@ -4216,6 +7118,7 @@ mod tests {
             let label = AgentLabel::parse(author).unwrap();
             tokio::spawn(write_to(mine, queued, label.to_string()));
             clients.push(Client {
+                writer: None,
                 who: Served::Agent {
                     author: label,
                     has_cli_sources: false,
@@ -4415,17 +7318,12 @@ mod tests {
         let (mut clients, peers) = registry(&[("codex", true), ("codex", true), ("claude", false)]);
 
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        let mut fold = Fold { tick: 0, at_ms: 0 };
 
         // More ticks than the queue holds, so a reader that cannot keep
         // up is retired instead of buffered forever.
         let began = std::time::Instant::now();
         for _ in 0..(CLIENT_QUEUE + 2) {
-            fold = Fold {
-                tick: fold.tick + 1,
-                at_ms: now_ms(),
-            };
-            serve(repo.path(), &mut clients, fold, &state);
+            serve(repo.path(), &mut clients, &state);
             // Let the writer tasks run, as the owner's select would.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -4502,9 +7400,8 @@ mod tests {
         let repo = repo_with_roster();
         let (mut clients, _keep) = registry(&[("codex", false)]);
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        let fold = Fold { tick: 1, at_ms: 2 };
 
-        serve(repo.path(), &mut clients, fold, &state);
+        serve(repo.path(), &mut clients, &state);
         assert_eq!(clients.len(), 1, "a registered author is served");
 
         std::fs::write(
@@ -4512,7 +7409,7 @@ mod tests {
             r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
         )
         .unwrap();
-        serve(repo.path(), &mut clients, fold, &state);
+        serve(repo.path(), &mut clients, &state);
         assert!(
             clients.is_empty(),
             "a revoked author must not keep a connection"
@@ -4531,7 +7428,7 @@ mod tests {
     /// only that the frame parses, which the mutation check caught.
     #[tokio::test]
     async fn an_observer_is_admitted_without_being_on_the_roster() {
-        async fn admitted(repo: &std::path::Path, who: Who, pid: i32) -> anyhow::Result<Client> {
+        async fn admitted(repo: &std::path::Path, who: Who, pid: i32) -> anyhow::Result<Greeted> {
             use tokio::io::AsyncWriteExt;
             let dir = tempfile::tempdir().unwrap();
             let path = socket_path(dir.path(), pid).unwrap();
@@ -4557,7 +7454,8 @@ mod tests {
         let repo = repo_with_roster();
         let client = admitted(repo.path(), Who::Observer, 4401)
             .await
-            .expect("an observer is welcome");
+            .expect("an observer is welcome")
+            .client();
         assert_eq!(client.who, Served::Observer);
 
         // `nobody` is emphatically not on that roster, and the same
@@ -4753,6 +7651,7 @@ mod tests {
 
         let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: codex.clone(),
                 has_cli_sources: false,
@@ -4762,14 +7661,7 @@ mod tests {
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         let present = |clients: &mut Vec<Client>| {
-            serve_to(
-                repo.path(),
-                clients,
-                fold(1, 2),
-                &state,
-                Some(&codex),
-                &mut Vec::new(),
-            );
+            serve_to(repo.path(), clients, &state, Some(&codex), &mut Vec::new());
         };
 
         // The first presentation owes it, and WAKES the client — which
@@ -4790,6 +7682,7 @@ mod tests {
         // client that has since gone is not being handled.
         let (out, mut later) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let fresh = |out| Client {
+            writer: None,
             who: Served::Agent {
                 author: codex.clone(),
                 has_cli_sources: false,
@@ -4873,6 +7766,7 @@ mod tests {
 
         let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: codex.clone(),
                 has_cli_sources: false,
@@ -4884,7 +7778,6 @@ mod tests {
         serve_to(
             repo.path(),
             &mut clients,
-            fold(1, 2),
             &state,
             Some(&codex),
             &mut Vec::new(),
@@ -4934,6 +7827,7 @@ mod tests {
 
         let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: codex.clone(),
                 has_cli_sources: false,
@@ -4945,7 +7839,6 @@ mod tests {
         serve_to(
             repo.path(),
             &mut clients,
-            fold(1, 2),
             &state,
             Some(&codex),
             &mut vec![(codex.clone(), unlogged.clone())],
@@ -5008,6 +7901,7 @@ mod tests {
 
         let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: claude.clone(),
                 has_cli_sources: false,
@@ -5016,14 +7910,7 @@ mod tests {
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut pending,
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
 
         let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
         let Note::Items { items, .. } = note else {
@@ -5063,6 +7950,7 @@ mod tests {
         // Only ANOTHER author is connected.
         let (out, mut other) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse("claude").unwrap(),
                 has_cli_sources: false,
@@ -5071,14 +7959,7 @@ mod tests {
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut pending,
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
 
         assert_eq!(
             pending,
@@ -5134,6 +8015,7 @@ mod tests {
             repo.path(),
             &mut clients,
             Client {
+                writer: None,
                 who: Served::Agent {
                     author: claude.clone(),
                     has_cli_sources: false,
@@ -5141,7 +8023,6 @@ mod tests {
                 out,
                 shown: Default::default(),
             },
-            fold(1, 2),
             Some(&state),
             &mut pending,
         );
@@ -5186,6 +8067,7 @@ mod tests {
         // is exactly what made this look safe.
         let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: claude.clone(),
                 has_cli_sources: false,
@@ -5196,14 +8078,7 @@ mod tests {
         let mut pending = Vec::new();
 
         // One ordinary wake.
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut pending,
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
         assert!(
             matches!(
                 serde_json::from_str::<Note>(heard.recv().await.unwrap().trim_end()).unwrap(),
@@ -5224,14 +8099,7 @@ mod tests {
             selector: None,
         };
         pending.push((claude.clone(), later.clone()));
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut pending,
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
         assert_eq!(
             pending,
             vec![(claude.clone(), later.clone())],
@@ -5248,6 +8116,7 @@ mod tests {
             repo.path(),
             &mut clients,
             Client {
+                writer: None,
                 who: Served::Agent {
                     author: claude.clone(),
                     has_cli_sources: false,
@@ -5255,7 +8124,6 @@ mod tests {
                 out,
                 shown: Default::default(),
             },
-            fold(1, 2),
             Some(&state),
             &mut pending,
         );
@@ -5325,6 +8193,7 @@ mod tests {
 
         let (out, mut heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: claude.clone(),
                 has_cli_sources: false,
@@ -5333,14 +8202,7 @@ mod tests {
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut Vec::new(),
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
 
         let Note::Items { items, .. } =
             serde_json::from_str::<Note>(heard.recv().await.unwrap().trim_end()).unwrap()
@@ -5411,6 +8273,7 @@ mod tests {
         let (a, mut codex_heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let (b, mut claude_heard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let agent = |who: &str, out| Client {
+            writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse(who).unwrap(),
                 // Both are plain shared clients. An earlier version set
@@ -5426,14 +8289,7 @@ mod tests {
         };
         let mut clients = vec![agent("codex", a), agent("claude", b)];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut Vec::new(),
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
 
         let content = |line: String| -> Vec<String> {
             let Note::Items { items, .. } = serde_json::from_str(line.trim_end()).unwrap() else {
@@ -5476,6 +8332,7 @@ mod tests {
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         let (out, mut established) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse("claude").unwrap(),
                 has_cli_sources: false,
@@ -5496,6 +8353,7 @@ mod tests {
                 repo.path(),
                 &mut clients,
                 Client {
+                    writer: None,
                     who: Served::Agent {
                         author: AgentLabel::parse("codex").unwrap(),
                         has_cli_sources: false,
@@ -5503,7 +8361,6 @@ mod tests {
                     out,
                     shown: Default::default(),
                 },
-                fold(1, 2),
                 Some(&state),
                 &mut Vec::new(),
             );
@@ -5534,6 +8391,7 @@ mod tests {
         let (theirs, mut unheard) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let (watching, mut observer) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let agent = |author: &str, out| Client {
+            writer: None,
             who: Served::Agent {
                 author: AgentLabel::parse(author).unwrap(),
                 has_cli_sources: false,
@@ -5545,6 +8403,7 @@ mod tests {
             agent("codex", mine),
             agent("claude", theirs),
             Client {
+                writer: None,
                 who: Served::Observer,
                 out: watching,
                 shown: Default::default(),
@@ -5555,7 +8414,6 @@ mod tests {
         serve_to(
             repo.path(),
             &mut clients,
-            fold(1, 2),
             &state,
             Some(&AgentLabel::parse("codex").unwrap()),
             &mut Vec::new(),
@@ -5578,14 +8436,7 @@ mod tests {
         // Unscoped, everybody is presented to — which is what a fold
         // tick does and why the scope is a parameter rather than the
         // rule.
-        serve_to(
-            repo.path(),
-            &mut clients,
-            fold(1, 2),
-            &state,
-            None,
-            &mut Vec::new(),
-        );
+        serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
         assert!(unheard.try_recv().is_ok());
         assert!(observer.try_recv().is_ok());
     }
@@ -5600,6 +8451,7 @@ mod tests {
         let repo = repo_with_roster();
         let (out, mut queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let mut clients = vec![Client {
+            writer: None,
             who: Served::Observer,
             out,
             shown: Default::default(),
@@ -5617,14 +8469,13 @@ something to promote
         )
         .unwrap();
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        let fold = Fold { tick: 9, at_ms: 2 };
 
-        serve(repo.path(), &mut clients, fold, &state);
+        serve(repo.path(), &mut clients, &state);
         assert_eq!(clients.len(), 1, "an observer stays registered");
         let line = queued.recv().await.expect("it was sent something");
         assert_eq!(
             serde_json::from_str::<Note>(line.trim_end()).unwrap(),
-            Note::Beat { fold },
+            Note::Beat,
             "the fold moved, and that is all an observer is told"
         );
     }
@@ -5761,13 +8612,12 @@ something to promote
         assert_eq!(back, hello);
 
         for note in [
-            Note::Beat { fold: fold(1, 2) },
+            Note::Beat,
             Note::Items {
                 items: vec![WaitItem::PromoteFromQueue {
                     name: "next".into(),
                     priority: 500,
                 }],
-                fold: fold(3, 4),
             },
         ] {
             let back: Note = serde_json::from_str(&serde_json::to_string(&note).unwrap()).unwrap();
@@ -5775,10 +8625,7 @@ something to promote
         }
 
         for welcome in [
-            Welcome::Ok {
-                proto: PROTO,
-                fold: fold(5, 6),
-            },
+            Welcome::Ok { proto: PROTO },
             Welcome::Decline {
                 proto: PROTO,
                 why: "proto 2".into(),

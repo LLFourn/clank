@@ -165,7 +165,7 @@ fn relocate_wait(
 fn resolve_kill_target(
     page: &crate::cli::status_tui::input::WaitPage,
     repo: &std::path::Path,
-) -> Result<i32, String> {
+) -> Result<crate::signal::Pid, String> {
     // Removing an agent leaves its local `attended` file behind, so
     // the file alone is not authority to signal: an agent taken off
     // the roster while the confirm was open would still be killable
@@ -3848,15 +3848,12 @@ pub(crate) async fn run_tui(
                                             .and_then(|p| resolve_kill_target(p, &repo))
                                         {
                                             Ok(pid) => {
-                                                // SIGTERM the recorded pid ALONE.
-                                                // Its group is unverified, and
-                                                // signalling one we did not
-                                                // identify is the same mistake as
-                                                // signalling a reused pid.
-                                                // SAFETY: `pid` was just validated
-                                                // as a live process this token
-                                                // still identifies.
-                                                unsafe { libc::kill(pid, libc::SIGTERM) };
+                                                // The recorded pid ALONE: its group
+                                                // is unverified, and signalling one
+                                                // we did not identify is the same
+                                                // mistake as signalling a reused
+                                                // pid.
+                                                crate::signal::signal_process(pid, libc::SIGTERM);
                                                 refresh_pending = true;
                                             }
                                             Err(why) => {
@@ -8401,7 +8398,7 @@ pub(crate) mod tests {
             &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
         );
         assert_eq!(
-            resolve_kill_target(&p, repo.path()),
+            resolve_kill_target(&p, repo.path()).map(crate::signal::Pid::get),
             Ok(me),
             "valid while on the roster"
         );
@@ -8432,7 +8429,8 @@ pub(crate) mod tests {
             &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
         );
         assert_eq!(
-            resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path()),
+            resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path())
+                .map(crate::signal::Pid::get),
             Ok(me)
         );
     }
@@ -8453,7 +8451,7 @@ pub(crate) mod tests {
             &attended("t1", "2026-08-20T14:51:09Z", Some(me), true),
         );
         assert_eq!(
-            resolve_kill_target(&p, repo.path()),
+            resolve_kill_target(&p, repo.path()).map(crate::signal::Pid::get),
             Ok(me),
             "valid when opened"
         );

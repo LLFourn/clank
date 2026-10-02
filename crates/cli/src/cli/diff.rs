@@ -461,11 +461,10 @@ async fn wait_with_sigint_forward(c: ComposedDiffLaunch) -> anyhow::Result<()> {
                 return Ok(());
             }
             _ = sigint.recv() => {
-                // Forward SIGINT to the child; keep waiting.
-                // The editor decides cleanup. Per OQ6 of the
-                // plan body.
-                if let Some(pid) = child_id {
-                    unsafe { libc::kill(pid as i32, libc::SIGINT) };
+                // The editor decides its own cleanup, so this forwards
+                // and keeps waiting rather than tearing down.
+                if let Some(pid) = child_id.and_then(|p| crate::signal::Pid::new(p as i32)) {
+                    crate::signal::signal_process(pid, libc::SIGINT);
                 }
             }
         }

@@ -1217,7 +1217,7 @@ impl Attending {
     /// `false` for a record that cannot say — no pid, no token.
     pub(crate) fn work_alive(&self) -> bool {
         match (self.pid, self.token.as_ref()) {
-            (Some(pid), Some(token)) => pid_is_alive(pid) && token.still_holds(pid),
+            (Some(pid), Some(token)) => crate::signal::alive(pid) && token.still_holds(pid),
             _ => false,
         }
     }
@@ -1252,23 +1252,6 @@ pub(crate) struct Attended {
 
 /// Does this process exist?
 ///
-/// `kill(pid, 0)` runs the existence and permission checks without
-/// delivering a signal. `EPERM` means the process EXISTS but belongs
-/// to another user — the question here is existence, so that is ALIVE.
-///
-/// Non-positive pids are rejected rather than passed through: `kill`
-/// reads 0 as "every process in my group" and -1 as "every process I
-/// may signal", so a corrupt marker holding one must not reach it.
-pub(crate) fn pid_is_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 impl Attended {
     /// Whether the recorded process still exists, or `None` when the
     /// record carries no pid and the question cannot be answered.
@@ -1276,7 +1259,7 @@ impl Attended {
     /// Saying nothing is the correct answer without a pid — never a
     /// guess.
     pub(crate) fn process_alive(&self) -> Option<bool> {
-        self.pid.map(pid_is_alive)
+        self.pid.map(crate::signal::alive)
     }
 
     /// How the decision reads on a status surface: the pid a human can
@@ -1343,10 +1326,10 @@ impl Attended {
     /// whose process has exited can come back held by a stranger that
     /// is both alive and killable. The token is what distinguishes
     /// them, and no token means no signal.
-    pub(crate) fn killable_pid(&self) -> Option<i32> {
-        let pid = self.pid?;
+    pub(crate) fn killable_pid(&self) -> Option<crate::signal::Pid> {
+        let pid = crate::signal::Pid::new(self.pid?)?;
         let token = self.token.as_ref()?;
-        token.still_holds(pid).then_some(pid)
+        token.still_holds(pid.get()).then_some(pid)
     }
 
     /// Why this wait cannot be killed, phrased for the page. `None`
@@ -1362,7 +1345,7 @@ impl Attended {
                  so the pid cannot be trusted to still be the same process",
             );
         };
-        if !pid_is_alive(pid) {
+        if !crate::signal::alive(pid) {
             return Some("that process has already ended");
         }
         (!token.still_holds(pid)).then_some(
@@ -2875,26 +2858,6 @@ mod tests {
         let full = r#"{"task":"br9711ewy","desc":"test run","at":"2026-08-20T14:51:09Z"}"#;
         let rec: Attended = serde_json::from_str(full).unwrap();
         assert_eq!(rec.subject(), "test run");
-    }
-
-    #[test]
-    fn liveness_is_existence_not_permission() {
-        assert!(pid_is_alive(std::process::id() as i32), "our own process");
-        // pid 1 always exists and is root-owned, so a non-root test
-        // run takes the EPERM branch — which must read as ALIVE, since
-        // the question is existence. Running as root takes the rc == 0
-        // branch and must agree.
-        assert!(pid_is_alive(1), "existing but foreign-owned");
-        assert!(!pid_is_alive(i32::MAX), "cannot be a live pid");
-    }
-
-    /// `kill` reads 0 as "my whole process group" and -1 as "every
-    /// process I may signal". A corrupt record holding one must be
-    /// rejected before it reaches the syscall.
-    #[test]
-    fn non_positive_pids_never_reach_kill() {
-        assert!(!pid_is_alive(0));
-        assert!(!pid_is_alive(-1));
     }
 
     /// Suppression may only ever hand off to a wake that PROVABLY
