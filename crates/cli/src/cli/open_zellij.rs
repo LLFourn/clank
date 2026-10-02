@@ -11,7 +11,8 @@ use anyhow::Context;
 use super::OpenZellijArgs;
 use super::{repo_basename, resolve_repo};
 
-/// Whether this process runs inside a live zellij session.
+/// Whether the environment indicates a Zellij session. This is not a
+/// reachability check: only an answered query establishes the live tab state.
 ///
 /// The ONLY reader of `$ZELLIJ`. Everything else asks this, so "am I
 /// in zellij" has one definition and the ownership gate can forbid
@@ -27,26 +28,29 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         require_zellij()?;
     }
     let source = resolve_repo(args.repo.as_deref())?;
-    let in_zellij = in_session();
+    // Capture the route once. Both lookup and creation use the current session
+    // implicitly, or the same deterministic named session outside Zellij.
+    let current = in_session().then(|| SessionTarget::Current {
+        name: std::env::var("ZELLIJ_SESSION_NAME").ok(),
+    });
+    let mut io = RealOpenIo;
 
     // --all = the pwd repo AND all its worktrees (`git worktree list`),
     // regardless of which session/worktree we're in.
     if args.all {
         let targets = worktree_paths(&source)?;
-        if in_zellij {
+        if let Some(current) = &current {
             // Inside a session: reconcile — add each target's tab to the
             // CURRENT session, skipping any already open. `open_one`'s
             // in-session tab spawn is non-blocking, so the loop runs to
             // completion (unlike an outside attach/create per target,
             // which would block on the first — codex 03be1fb).
-            for target in &targets {
-                open_one(target, args.print)?;
-            }
+            open_current_targets(&mut io, current, &targets, args.print).await?;
         } else {
             // Outside: reconcile the worktree tabs into the
             // `clank-<repo>` session (create it, or add the missing
             // tabs to a live one), then attach.
-            open_all(&source, &targets, args.print)?;
+            open_all(&mut io, &source, &targets, args.print).await?;
         }
         return Ok(());
     }
@@ -60,7 +64,238 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     } else {
         source
     };
-    open_one(&target, args.print)
+    let session = current.unwrap_or(SessionTarget::Named(session_name(&repo_basename(&target)?)));
+    open_one(&mut io, &session, &target, args.print, None).await
+}
+
+/// `Current` deliberately retains Zellij's implicit in-session routing for
+/// both query and creation. The optional name is diagnostic context only; it
+/// does not select a different server or authorize a fallback session.
+#[derive(Debug)]
+enum SessionTarget {
+    Current { name: Option<String> },
+    Named(String),
+}
+
+impl SessionTarget {
+    fn description(&self) -> String {
+        match self {
+            Self::Current { name: Some(name) } => format!("the shell's current session `{name}`"),
+            Self::Current { name: None } => "the shell's current session ($ZELLIJ is set)".into(),
+            Self::Named(name) => format!("session `{name}`"),
+        }
+    }
+
+    fn tab_query_argv(&self) -> Vec<String> {
+        let mut argv = vec!["zellij".into()];
+        if let Self::Named(name) = self {
+            argv.extend(["-s".into(), name.clone()]);
+        }
+        argv.extend(["action".into(), "query-tab-names".into()]);
+        argv
+    }
+}
+
+#[derive(Debug)]
+struct QueryOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// A narrow seam for the actual open path. Fixtures exercise lookup, layout
+/// writes and spawn decisions together without starting a Zellij server.
+trait OpenIo {
+    async fn query(&mut self, argv: &[String]) -> anyhow::Result<QueryOutput>;
+    fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()>;
+    fn user_template(&self) -> anyhow::Result<Option<String>> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        user_layout_template(home.as_deref())
+    }
+    fn term_size(&self) -> (u16, u16) {
+        layout_term_size()
+    }
+}
+
+struct RealOpenIo;
+
+impl OpenIo for RealOpenIo {
+    async fn query(&mut self, argv: &[String]) -> anyhow::Result<QueryOutput> {
+        run_open_query(argv, std::time::Duration::from_secs(3)).await
+    }
+
+    fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()> {
+        spawn_zellij(argv)
+    }
+}
+
+fn display_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| crate::shell_quote::shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Explicit-open queries are bounded in time and memory. Drain both streams
+/// concurrently with wait, without reader tasks, threads or an idle worker.
+/// An oversized stdout is unknown, never a truncated listing authorizing tabs.
+async fn run_open_query(
+    argv: &[String],
+    budget: std::time::Duration,
+) -> anyhow::Result<QueryOutput> {
+    use tokio::io::AsyncReadExt;
+    const STDOUT_CAP: usize = 1024 * 1024;
+    const STDERR_CAP: usize = 4096;
+    let mut command = tokio::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not run `{}`", display_argv(argv)))?;
+    let mut group = super::wait::GroupKill::over(child.id());
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    let mut tail = super::wait::RingTail::new(STDERR_CAP);
+    let result = tokio::time::timeout(budget, async {
+        let out = async {
+            let mut buf = [0; 8192];
+            loop {
+                let n = stdout.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                let keep = n.min(STDOUT_CAP - bytes.len());
+                bytes.extend_from_slice(&buf[..keep]);
+                oversized |= keep != n;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let err = async {
+            let mut buf = [0; 8192];
+            loop {
+                let n = stderr.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                tail.push(&buf[..n]);
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        tokio::try_join!(child.wait(), out, err).map(|(status, _, _)| status)
+    })
+    .await;
+    // Includes descendants retaining pipe writers after their parent exits.
+    group.terminate();
+    if !matches!(result, Ok(Ok(_))) {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await;
+    }
+    let stderr = tail.into_string();
+    let status = match result {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => anyhow::bail!(
+            "`{}` failed: {error}; stderr (last {STDERR_CAP} bytes): {stderr}",
+            display_argv(argv)
+        ),
+        Err(_) => anyhow::bail!(
+            "`{}` timed out after {budget:?}; stderr (last {STDERR_CAP} bytes): {stderr}",
+            display_argv(argv)
+        ),
+    };
+    if oversized {
+        anyhow::bail!(
+            "`{}` exited {status}, but stdout exceeded {STDOUT_CAP} bytes; listing is unknown; stderr (last {STDERR_CAP} bytes): {stderr}",
+            display_argv(argv)
+        );
+    }
+    let stdout = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "`{}` returned non-UTF-8 stdout; listing is unknown; stderr: {stderr}",
+            display_argv(argv)
+        )
+    })?;
+    Ok(QueryOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn lookup_context(target: &SessionTarget, subject: &str) -> String {
+    format!(
+        "could not determine {subject} for {}. No tab/session creation was requested after this failed lookup; check this shell's Zellij session/socket access",
+        target.description()
+    )
+}
+
+async fn query_tabs(io: &mut impl OpenIo, target: &SessionTarget) -> anyhow::Result<Vec<String>> {
+    let argv = target.tab_query_argv();
+    let query = async {
+        let out = io.query(&argv).await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "`{}` exited {}; stderr (last 4096 bytes): {}",
+                display_argv(&argv),
+                out.status,
+                out.stderr
+            );
+        }
+        Ok(out.stdout.lines().map(str::to_string).collect())
+    }
+    .await;
+    query.with_context(|| lookup_context(target, "whether the tab already exists"))
+}
+
+async fn query_session_plan(
+    io: &mut impl OpenIo,
+    target: &SessionTarget,
+) -> anyhow::Result<SessionPlan> {
+    let SessionTarget::Named(name) = target else {
+        unreachable!("listing is only used outside a session")
+    };
+    let argv = vec!["zellij".into(), "list-sessions".into(), "-n".into()];
+    let query: anyhow::Result<SessionPlan> = async {
+        let out = io.query(&argv).await?;
+        let listing = interpret_listing(out.status.success(), &out.stdout, &out.stderr)
+            .with_context(|| {
+                format!(
+                    "`{}` exited {}; stderr (last 4096 bytes): {}",
+                    display_argv(&argv),
+                    out.status,
+                    out.stderr
+                )
+            })?;
+        Ok(decide_session(&listing, name))
+    }
+    .await;
+    query.with_context(|| lookup_context(target, "whether the session exists"))
+}
+
+async fn open_current_targets(
+    io: &mut impl OpenIo,
+    session: &SessionTarget,
+    targets: &[PathBuf],
+    print: bool,
+) -> anyhow::Result<()> {
+    let mut tabs = if print {
+        Vec::new()
+    } else {
+        query_tabs(io, session).await?
+    };
+    for target in targets {
+        open_one(io, session, target, print, Some(&tabs)).await?;
+        // A successfully requested tab is known locally. Reuse this one query
+        // throughout --all rather than querying the same session per worktree.
+        tabs.push(repo_basename(target)?);
+    }
+    Ok(())
 }
 
 /// Resolve an EXISTING fork by name through THE shared model
@@ -105,27 +340,6 @@ struct TabSpec {
     repo_path: String,
     master: String,
     reviewers: Vec<String>,
-}
-
-/// Open tab names in the (possibly detached) session `name`, or empty
-/// when the session doesn't exist / can't be queried. Unlike the
-/// in-session [`zellij_tab_names`], this DEGRADES to empty: for `--all`
-/// an absent session is the normal "create it fresh" case, not an
-/// error. (`zellij -s <name> action` targets a named session even when
-/// we're not attached to it.)
-fn session_tab_names(name: &str) -> Vec<String> {
-    std::process::Command::new("zellij")
-        .args(["-s", name, "action", "query-tab-names"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The target basenames whose tab isn't already open in the session —
@@ -181,16 +395,27 @@ fn plan_all(session: SessionPlan, target_basenames: &[String], open_tabs: &[Stri
 /// layout, leaving a one-tab session short — codex a0c53c9); a live
 /// session that already has every tab is just attached. Teamless
 /// worktrees are skipped with a notice.
-fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<()> {
+async fn open_all(
+    io: &mut impl OpenIo,
+    source: &Path,
+    targets: &[PathBuf],
+    print: bool,
+) -> anyhow::Result<()> {
     let name = session_name(&repo_basename(source)?);
     let basenames: Vec<String> = targets
         .iter()
         .map(|t| repo_basename(t))
         .collect::<anyhow::Result<_>>()?;
-    let session = decide_session(&zellij_list_sessions(), &name);
+    let target = SessionTarget::Named(name.clone());
+    // --print is a layout preview, not a query against the user's server.
+    let session = if print {
+        SessionPlan::Create
+    } else {
+        query_session_plan(io, &target).await?
+    };
     // Only a live session needs a tab query to compute what's missing.
     let open_tabs = match session {
-        SessionPlan::Attach => session_tab_names(&name),
+        SessionPlan::Attach => query_tabs(io, &target).await?,
         _ => Vec::new(),
     };
     let plan = plan_all(session, &basenames, &open_tabs);
@@ -202,7 +427,7 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
             eprintln!("spawn: {}", argv.join(" "));
         } else {
             eprintln!("session `{name}` already has every worktree tab; attaching");
-            spawn_zellij(&argv)?;
+            io.spawn(&argv)?;
         }
         return Ok(());
     }
@@ -218,7 +443,7 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
         anyhow::bail!("no openable worktrees (none have clank agents configured)");
     }
 
-    let (rows, cols) = layout_term_size();
+    let (rows, cols) = io.term_size();
     let kdl = compose_multitab(&tabs, (cols, rows))?;
     let layout_path = layout_file_path(source);
     let (pre, spawn) = match plan {
@@ -240,9 +465,9 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
     }
     write_layout_file(source, &kdl)?;
     if let Some(pre) = &pre {
-        let _ = std::process::Command::new(&pre[0]).args(&pre[1..]).status();
+        let _ = io.spawn(pre);
     }
-    spawn_zellij(&spawn)
+    io.spawn(&spawn)
 }
 
 /// Resolve target worktrees to tab specs, skipping teamless ones with a
@@ -294,8 +519,8 @@ fn spawn_zellij(argv: &[String]) -> anyhow::Result<()> {
     if !status.success() {
         anyhow::bail!(
             "zellij failed to {what} (exit {status}) — its own error is printed \
-             above. If the session exists but its server is dead, \
-             `zellij delete-session <name>` and re-run `clank open`."
+             above. This result alone does not establish whether a tab/session \
+             was created; inspect the selected session before retrying."
         );
     }
     Ok(())
@@ -356,7 +581,13 @@ fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String
 
 /// Open (or, inside a session, idempotently ensure) the agent
 /// workspace for one repo/worktree.
-fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
+async fn open_one(
+    io: &mut impl OpenIo,
+    target: &SessionTarget,
+    repo: &Path,
+    print: bool,
+    known_tabs: Option<&[String]>,
+) -> anyhow::Result<()> {
     let repo = repo.to_path_buf();
     let basename = repo_basename(&repo)?;
     // Registration is the resolved roster
@@ -379,14 +610,13 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
     // User-authored layout chrome from `~/.clank/config.json`
     // (`zellij-layout-config-around-agent-panes`); None → the
     // built-in template.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let user_template = user_layout_template(home.as_deref())?;
+    let user_template = io.user_template()?;
     // Orientation from the real WINDOW's dimensions — the client
     // tty when inside a session, the spawning terminal otherwise
     // (zellij-default-layout, zellij-in-session-orientation);
     // measurement stays at the shell, compose stays pure over
     // (cols, rows).
-    let (rows, cols) = layout_term_size();
+    let (rows, cols) = io.term_size();
     let kdl = compose_kdl(
         &basename,
         &repo_path_str,
@@ -396,20 +626,36 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
         Orientation::detect((cols, rows)),
     )?;
     let layout_path = layout_file_path(&repo);
-    let name = session_name(&basename);
-
-    // Inside zellij: new tab in the current session (no dedup —
-    // see in_session_tab_argv). Outside: attach-or-create against
-    // the deterministic session name.
-    let (pre_argv, spawn_argv) = if in_session() {
-        (None, in_session_tab_argv(&layout_path))
-    } else {
-        let listing = zellij_list_sessions();
-        match decide_session(&listing, &name) {
-            SessionPlan::Attach => (None, attach_argv(&name)),
-            SessionPlan::Create => (None, create_argv(&layout_path, &name)),
-            SessionPlan::DeleteDeadThenCreate => {
-                (Some(delete_argv(&name)), create_argv(&layout_path, &name))
+    let (pre_argv, spawn_argv) = match target {
+        SessionTarget::Current { .. } => {
+            if !print {
+                let queried;
+                let tabs = match known_tabs {
+                    Some(tabs) => tabs,
+                    None => {
+                        queried = query_tabs(io, target).await?;
+                        &queried
+                    }
+                };
+                if tab_is_open(&basename, tabs) {
+                    eprintln!("tab `{basename}` already open");
+                    return Ok(());
+                }
+            }
+            (None, in_session_tab_argv(&layout_path))
+        }
+        SessionTarget::Named(name) => {
+            let session = if print {
+                SessionPlan::Create
+            } else {
+                query_session_plan(io, target).await?
+            };
+            match session {
+                SessionPlan::Attach => (None, attach_argv(name)),
+                SessionPlan::Create => (None, create_argv(&layout_path, name)),
+                SessionPlan::DeleteDeadThenCreate => {
+                    (Some(delete_argv(name)), create_argv(&layout_path, name))
+                }
             }
         }
     };
@@ -423,60 +669,19 @@ fn open_one(repo: &Path, print: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Idempotent open (open-and-fork-idempotent): inside a session,
-    // don't spawn a second tab for a worktree that already has one.
-    // The tab name is the repo basename; `tab_is_open` matches it
-    // glyph-stripped against the live tab list. The `?` only runs when
-    // `$ZELLIJ` is set (short-circuit), so a failure to query is a
-    // real in-session misconfiguration and surfaces as an error.
-    if in_session() && tab_is_open(&basename, &zellij_tab_names()?) {
-        eprintln!("tab `{basename}` already open");
-        return Ok(());
-    }
-
     write_layout_file(&repo, &kdl)?;
 
     if let Some(pre) = &pre_argv {
         // Best-effort: a failed delete of a dead session just means
         // the create below errors visibly.
-        let _ = std::process::Command::new(&pre[0]).args(&pre[1..]).status();
+        let _ = io.spawn(pre);
     }
-    if spawn_argv[1] == "attach" {
+    if let SessionTarget::Named(name) = target
+        && spawn_argv[1] == "attach"
+    {
         eprintln!("attaching to existing session `{name}`");
     }
-    spawn_zellij(&spawn_argv)
-}
-
-/// `zellij action query-tab-names` → one open tab name per line.
-///
-/// ERRORS rather than degrading: this is only ever called when we're
-/// already INSIDE a session (`$ZELLIJ` set), so `zellij` must be
-/// runnable — if it isn't, silently returning "no tabs" would make the
-/// dedup reconcile (open-and-fork-idempotent) misbehave (always "not
-/// open" → double-open), masking a real misconfiguration. The caller
-/// propagates with `?` so the operator sees a clear message. (Contrast
-/// `zellij_list_sessions`, which degrades on purpose: outside a session
-/// a non-zero exit legitimately means "no sessions".)
-fn zellij_tab_names() -> anyhow::Result<Vec<String>> {
-    let out = std::process::Command::new("zellij")
-        .args(["action", "query-tab-names"])
-        .output()
-        .context("could not run `zellij action query-tab-names`")?;
-    // By here the binary is proven present, so a failure is the
-    // SESSION: `$ZELLIJ` is set but the server behind it does not
-    // answer — a dead or stale session, not a missing install.
-    if !out.status.success() {
-        anyhow::bail!(
-            "the zellij session this shell belongs to did not answer \
-             (`query-tab-names` exited {}). `$ZELLIJ` is set but the server \
-             behind it may be dead; open a fresh terminal and re-run `clank open`.",
-            out.status
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect())
+    io.spawn(&spawn_argv)
 }
 
 /// True if a tab for worktree `tab` (its basename / fork name) is
@@ -489,12 +694,10 @@ fn tab_is_open(tab: &str, open_names: &[String]) -> bool {
 }
 
 /// `zellij list-sessions -n` stdout, or `None` when the command could
-/// not be RUN.
+/// not run or returned an unrecognized failure.
 ///
-/// A non-zero exit is NOT a failure here: zellij exits non-zero when no
-/// sessions exist, which is an answer. Only an `Err` from `output()`
-/// means nothing was learned — and a caller that must not mistake "I
-/// could not ask" for "there are none" needs to see the difference.
+/// A non-zero exit is an answer only for the recognized no-sessions
+/// response. Other exits and spawn failures mean nothing was learned.
 fn zellij_list_sessions_checked() -> Option<String> {
     let out = std::process::Command::new("zellij")
         .args(["list-sessions", "-n"])
@@ -523,16 +726,15 @@ fn interpret_listing(ok: bool, stdout: &str, stderr: &str) -> Option<String> {
     if ok {
         return Some(stdout.to_string());
     }
-    if stdout.contains(NO_SESSIONS) || stderr.contains(NO_SESSIONS) {
+    // Match the answer, not a fragment of an otherwise failed diagnostic.
+    let out = stdout.trim();
+    let err = stderr.trim();
+    if (out == NO_SESSIONS && (err.is_empty() || err == NO_SESSIONS))
+        || (err == NO_SESSIONS && out.is_empty())
+    {
         return Some(String::new());
     }
     None
-}
-
-/// The listing, degrading to "no sessions" when it could not be run —
-/// which is right for the Create path and wrong for a nudge.
-fn zellij_list_sessions() -> String {
-    zellij_list_sessions_checked().unwrap_or_default()
 }
 
 fn layout_file_path(repo: &Path) -> PathBuf {
@@ -2505,12 +2707,9 @@ fn delete_argv(name: &str) -> Vec<String> {
     ]
 }
 
-/// Inside an existing zellij session ($ZELLIJ set) the layout
-/// opens as a new TAB in the current session — no --session flag
-/// (zellij ignores/conflicts it in-session). NOTE: a re-run
-/// INSIDE a clank session still adds a duplicate tab of agents —
-/// within-session dedup is OUT OF SCOPE here (concern 3); the
-/// per-agent pidfile guard is the future cover for that path.
+/// Retain the existing implicit current-session layout routing. The caller
+/// queries that same current session before issuing this argv, and skips
+/// creation when the tab is already present.
 fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
     vec![
         "zellij".to_string(),
@@ -2525,11 +2724,420 @@ fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
 
+    #[derive(Default)]
+    struct FakeOpenIo {
+        replies: std::collections::VecDeque<anyhow::Result<QueryOutput>>,
+        calls: Vec<(&'static str, Vec<String>)>,
+    }
+
+    impl FakeOpenIo {
+        fn with(replies: impl IntoIterator<Item = anyhow::Result<QueryOutput>>) -> Self {
+            Self {
+                replies: replies.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+        fn spawned(&self) -> Vec<&[String]> {
+            self.calls
+                .iter()
+                .filter(|(kind, _)| *kind == "spawn")
+                .map(|(_, argv)| argv.as_slice())
+                .collect()
+        }
+    }
+
+    impl OpenIo for FakeOpenIo {
+        async fn query(&mut self, argv: &[String]) -> anyhow::Result<QueryOutput> {
+            self.calls.push(("query", argv.to_vec()));
+            self.replies.pop_front().expect("unexpected query")
+        }
+        fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()> {
+            self.calls.push(("spawn", argv.to_vec()));
+            Ok(())
+        }
+        fn user_template(&self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn term_size(&self) -> (u16, u16) {
+            (40, 120)
+        }
+    }
+
+    fn query_output(code: i32, stdout: &str, stderr: &str) -> anyhow::Result<QueryOutput> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(QueryOutput {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    fn current_session() -> SessionTarget {
+        SessionTarget::Current {
+            name: Some("user-workspace".into()),
+        }
+    }
+
+    fn openable_repo(root: &Path, name: &str) -> PathBuf {
+        use crate::cli::teams_config::{RepoConfigFile, RosterAgent, RosterRole};
+        let repo = root.join(name);
+        let mut cfg = RepoConfigFile::default();
+        cfg.agents.insert(
+            clank_core::ids::AgentLabel::parse("codex").unwrap(),
+            RosterAgent {
+                tool: clank_core::vocab::Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+                role: RosterRole::Master,
+            },
+        );
+        crate::agent_store::write_typed_config(&repo.join(".clank/config.json"), &cfg).unwrap();
+        repo
+    }
+
+    #[tokio::test]
+    async fn explicit_query_failure_after_auto_open_does_not_undo_the_visible_tab() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = openable_repo(root.path(), "changeless-hub-research");
+        let session = current_session();
+        let mut io = FakeOpenIo::with([
+            query_output(0, "other-tab\n", ""),
+            query_output(1, "", "permission denied opening session socket"),
+        ]);
+        super::super::fork::open_created_fork(&repo, true, false, |args| {
+            assert_eq!(args.repo.as_deref(), Some(repo.as_path()));
+            open_one(&mut io, &session, &repo, args.print, None)
+        })
+        .await
+        .unwrap();
+        let first_layout = std::fs::read(layout_file_path(&repo)).unwrap();
+        let error = open_one(&mut io, &session, &repo, false, None)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("user-workspace") && text.contains("query-tab-names"),
+            "{text}"
+        );
+        assert!(
+            text.contains("exit status: 1") && text.contains("permission denied"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("dead") && !text.contains("fresh terminal"),
+            "{text}"
+        );
+        assert_eq!(
+            io.calls.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            ["query", "spawn", "query"]
+        );
+        assert_eq!(
+            io.spawned(),
+            [in_session_tab_argv(&layout_file_path(&repo)).as_slice()]
+        );
+        assert_eq!(
+            std::fs::read(layout_file_path(&repo)).unwrap(),
+            first_layout
+        );
+        assert!(repo.exists());
+    }
+
+    #[tokio::test]
+    async fn a_current_session_query_failure_never_writes_or_spawns() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = openable_repo(root.path(), "fork");
+        for reply in [
+            query_output(1, "", "session socket does not exist"),
+            query_output(1, "", "permission denied"),
+            Err(anyhow::anyhow!(
+                "could not start zellij: executable missing"
+            )),
+            Err(anyhow::anyhow!("query timed out")),
+        ] {
+            let mut io = FakeOpenIo::with([reply]);
+            let error = open_one(&mut io, &current_session(), &repo, false, None)
+                .await
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("could not determine whether the tab already exists"),
+                "{text}"
+            );
+            assert!(io.spawned().is_empty());
+            assert!(!layout_file_path(&repo).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answered_current_tab_is_skipped_and_an_absent_tab_is_created_once() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = openable_repo(root.path(), "fork");
+        let mut io = FakeOpenIo::with([query_output(0, "👀 fork\n", "")]);
+        open_one(&mut io, &current_session(), &repo, false, None)
+            .await
+            .unwrap();
+        assert!(io.spawned().is_empty());
+        assert!(!layout_file_path(&repo).exists());
+        let mut io = FakeOpenIo::with([query_output(0, "unrelated\n", "")]);
+        open_one(&mut io, &current_session(), &repo, false, None)
+            .await
+            .unwrap();
+        assert_eq!(io.calls[0].1, current_session().tab_query_argv());
+        assert_eq!(
+            io.spawned(),
+            [in_session_tab_argv(&layout_file_path(&repo)).as_slice()]
+        );
+        assert!(layout_file_path(&repo).exists());
+    }
+
+    #[tokio::test]
+    async fn outside_all_does_not_turn_an_unanswered_live_session_into_missing_tabs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let fork = openable_repo(root.path(), "fork");
+        let mut io = FakeOpenIo::with([
+            query_output(0, "clank-proj [Created 1m ago]\n", ""),
+            query_output(1, "", "permission denied opening clank-proj socket"),
+        ]);
+        let error = open_all(&mut io, &source, &[source.clone(), fork], false)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("session `clank-proj`") && text.contains("permission denied"),
+            "{text}"
+        );
+        assert_eq!(
+            io.calls[1].1,
+            SessionTarget::Named("clank-proj".into()).tab_query_argv()
+        );
+        assert!(io.spawned().is_empty());
+        assert!(!layout_file_path(&source).exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_outside_listing_does_not_authorize_single_or_all_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let mut io = FakeOpenIo::with([query_output(1, "", "socket directory: permission denied")]);
+        open_one(
+            &mut io,
+            &SessionTarget::Named("clank-proj".into()),
+            &source,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(io.spawned().is_empty());
+        let mut io = FakeOpenIo::with([query_output(1, "", "socket directory: permission denied")]);
+        open_all(&mut io, &source, &[source.clone()], false)
+            .await
+            .unwrap_err();
+        assert!(io.spawned().is_empty());
+        assert!(!layout_file_path(&source).exists());
+    }
+
+    #[tokio::test]
+    async fn outside_single_preserves_answered_create_attach_and_dead_session_routes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let layout = layout_file_path(&source);
+        for (response, expected) in [
+            (
+                query_output(1, "", NO_SESSIONS),
+                vec![create_argv(&layout, "clank-proj")],
+            ),
+            (
+                query_output(0, "clank-proj [Created 1m ago]\n", ""),
+                vec![attach_argv("clank-proj")],
+            ),
+            (
+                query_output(0, "clank-proj [Created 1m ago] (EXITED)\n", ""),
+                vec![
+                    delete_argv("clank-proj"),
+                    create_argv(&layout, "clank-proj"),
+                ],
+            ),
+        ] {
+            let mut io = FakeOpenIo::with([response]);
+            open_one(
+                &mut io,
+                &SessionTarget::Named("clank-proj".into()),
+                &source,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                io.spawned(),
+                expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn outside_all_adds_only_answered_missing_tabs_or_just_attaches() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let fork = openable_repo(root.path(), "fork");
+        let targets = [source.clone(), fork];
+        let mut io = FakeOpenIo::with([
+            query_output(0, "clank-proj [Created 1m ago]\n", ""),
+            query_output(0, "🔨 proj\n", ""),
+        ]);
+        open_all(&mut io, &source, &targets, false).await.unwrap();
+        assert_eq!(
+            io.spawned(),
+            [add_tabs_argv(&layout_file_path(&source), "clank-proj").as_slice()]
+        );
+        let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
+        assert!(layout.contains("tab name=\"fork\""));
+        assert!(!layout.contains("tab name=\"proj\""));
+        std::fs::remove_file(layout_file_path(&source)).unwrap();
+        let mut io = FakeOpenIo::with([
+            query_output(0, "clank-proj [Created 1m ago]\n", ""),
+            query_output(0, "proj\nfork\n", ""),
+        ]);
+        open_all(&mut io, &source, &targets, false).await.unwrap();
+        assert_eq!(io.spawned(), [attach_argv("clank-proj").as_slice()]);
+        assert!(!layout_file_path(&source).exists());
+    }
+
+    #[tokio::test]
+    async fn outside_all_creates_every_tab_only_after_an_answered_empty_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let fork = openable_repo(root.path(), "fork");
+        let mut io = FakeOpenIo::with([query_output(1, NO_SESSIONS, "")]);
+        open_all(&mut io, &source, &[source.clone(), fork], false)
+            .await
+            .unwrap();
+        assert_eq!(io.calls.len(), 2, "one listing, one creation, no tab query");
+        assert_eq!(
+            io.spawned(),
+            [create_argv(&layout_file_path(&source), "clank-proj").as_slice()]
+        );
+        let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
+        assert!(layout.contains("tab name=\"fork\"") && layout.contains("tab name=\"proj\""));
+    }
+
+    #[tokio::test]
+    async fn current_all_queries_once_and_preserves_tab_idempotence() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let fork = openable_repo(root.path(), "fork");
+        let mut io = FakeOpenIo::with([query_output(0, "🔨 proj\n", "")]);
+        open_current_targets(
+            &mut io,
+            &current_session(),
+            &[source.clone(), fork.clone(), fork.clone()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            io.calls.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
+            ["query", "spawn"]
+        );
+        assert_eq!(
+            io.spawned(),
+            [in_session_tab_argv(&layout_file_path(&fork)).as_slice()]
+        );
+        assert!(!layout_file_path(&source).exists());
+    }
+
+    #[tokio::test]
+    async fn preview_does_not_query_write_or_spawn_for_any_open_route() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let mut io = FakeOpenIo::default();
+        open_one(&mut io, &current_session(), &source, true, None)
+            .await
+            .unwrap();
+        open_one(
+            &mut io,
+            &SessionTarget::Named("clank-proj".into()),
+            &source,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        open_all(&mut io, &source, &[source.clone()], true)
+            .await
+            .unwrap();
+        open_current_targets(&mut io, &current_session(), &[source.clone()], true)
+            .await
+            .unwrap();
+        assert!(io.calls.is_empty());
+        assert!(!layout_file_path(&source).exists());
+    }
+
+    // Real pipe/deadline tests use harmless shell fixtures, never Zellij.
+    #[tokio::test]
+    async fn open_query_drains_both_streams_without_unbounded_capture() {
+        let argv = ["/bin/sh", "-c", "i=0; while [ $i -lt 5000 ]; do printf 'stderr-line\n' >&2; i=$((i+1)); done; printf 'tab\n'; exit 1"].map(str::to_string);
+        let out = run_open_query(&argv, std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!out.status.success());
+        assert_eq!(out.stdout, "tab\n");
+        assert_eq!(out.stderr.len(), 4096);
+        assert!(out.stderr.ends_with("stderr-line\n"));
+    }
+
+    #[tokio::test]
+    async fn oversized_query_stdout_is_unknown_instead_of_a_partial_listing() {
+        let argv = ["/bin/sh", "-c", "head -c 1100000 /dev/zero"].map(str::to_string);
+        let error = run_open_query(&argv, std::time::Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stdout exceeded 1048576 bytes"));
+    }
+
+    #[tokio::test]
+    async fn open_query_times_out_even_when_a_descendant_retains_the_pipes() {
+        let argv = [
+            "/bin/sh",
+            "-c",
+            "printf 'socket query stalled\n' >&2; /bin/sleep 30 & exit 0",
+        ]
+        .map(str::to_string);
+        let started = std::time::Instant::now();
+        let error = run_open_query(&argv, std::time::Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("timed out") && text.contains("socket query stalled"),
+            "{text}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn a_query_that_cannot_start_retains_its_argv_and_spawn_error() {
+        let argv = vec![
+            "/clank-test/no-such-zellij-executable".into(),
+            "action".into(),
+            "query-tab-names".into(),
+        ];
+        let error = run_open_query(&argv, std::time::Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("query-tab-names") && text.contains("No such file"),
+            "{text}"
+        );
+    }
+
     /// "I could not ask" and "there are none" must not converge.
     ///
-    /// The ordinary listing folds a failed command into an empty one,
-    /// because zellij exits non-zero when no sessions exist. A scan
-    /// that inherited that would let `clank nudge` report a confident
+    /// Zellij exits non-zero when no sessions exist, but a scan must not
+    /// fold every failed command into an empty listing and report a confident
     /// absence after learning nothing (codex on 1eec51b). Neither case
     /// starts a zellij process: one never lists, the other lists none.
     #[test]
@@ -2589,6 +3197,20 @@ mod tests {
             interpret_listing(false, "", "error: permission denied"),
             None,
             "any other failure taught us nothing"
+        );
+        assert_eq!(
+            interpret_listing(false, NO_SESSIONS, "socket permission denied"),
+            None,
+            "a conflicting error is not proof of absence"
+        );
+        assert_eq!(
+            interpret_listing(
+                false,
+                "",
+                &format!("socket permission denied; {NO_SESSIONS}")
+            ),
+            None,
+            "a fragment in a failed diagnostic is not the no-sessions answer"
         );
         assert_eq!(
             interpret_listing(false, "", ""),

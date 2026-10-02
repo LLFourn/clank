@@ -315,16 +315,30 @@ async fn run_create(args: super::ForkCreateArgs) -> anyhow::Result<()> {
     println!("{}", dest.display());
 
     let inside_zellij = super::open_zellij::in_session();
-    if should_open(inside_zellij, args.no_open) {
-        super::open_zellij::run(super::OpenZellijArgs {
-            repo: Some(dest),
+    open_created_fork(&dest, inside_zellij, args.no_open, super::open_zellij::run).await
+}
+
+/// Fork creation has already succeeded when this phase begins. A tab failure
+/// must retain that fact and the original open error; never roll back the fork.
+pub(super) async fn open_created_fork<F: std::future::Future<Output = anyhow::Result<()>>>(
+    dest: &Path,
+    inside_zellij: bool,
+    no_open: bool,
+    open: impl FnOnce(super::OpenZellijArgs) -> F,
+) -> anyhow::Result<()> {
+    if should_open(inside_zellij, no_open) {
+        open(super::OpenZellijArgs {
+            repo: Some(dest.to_path_buf()),
             fork: None,
             pr: None,
             all: false,
             print: false,
         })
-        .await?;
-    } else if !args.no_open && !inside_zellij {
+        .await.with_context(|| format!(
+            "fork exists at {}; automatic tab opening failed. The fork was not rolled back; the query/open error below does not establish whether its tab exists",
+            dest.display()
+        ))?;
+    } else if !no_open && !inside_zellij {
         eprintln!("open it with: clank open --repo {}", dest.display());
     }
     Ok(())
@@ -1301,6 +1315,51 @@ detached
             no_open: true,
             review: false,
         }
+    }
+
+    #[tokio::test]
+    async fn failed_automatic_open_preserves_the_created_fork_and_original_error() {
+        use crate::cli::teams_config::{RepoConfigFile, RosterAgent, RosterRole};
+        let source = init_repo_with_commit();
+        let mut config = RepoConfigFile::default();
+        config.agents.insert(
+            AgentLabel::parse("codex").unwrap(),
+            RosterAgent {
+                tool: clank_core::vocab::Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+                role: RosterRole::Master,
+            },
+        );
+        crate::agent_store::write_typed_config(&source.path().join(".clank/config.json"), &config)
+            .unwrap();
+        let mut args = fork_args("open-fails", source.path());
+        args.fresh = true;
+        let dest = run_fork_with_review(&args, None).await.unwrap();
+        let error = open_created_fork(&dest, true, false, |open_args| {
+            assert_eq!(open_args.repo.as_deref(), Some(dest.as_path()));
+            assert!(!open_args.all && !open_args.print);
+            async { anyhow::bail!("query-tab-names exited 1: permission denied") }
+        })
+        .await
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("fork exists at") && text.contains(&dest.display().to_string()),
+            "{text}"
+        );
+        assert!(
+            text.contains("not rolled back") && text.contains("permission denied"),
+            "{text}"
+        );
+        assert!(dest.join("f").exists());
+        assert_eq!(
+            resolve_fork(source.path(), "open-fails")
+                .unwrap()
+                .unwrap()
+                .1,
+            dest
+        );
     }
 
     /// A HOME in which `sid` IS resumable for claude.

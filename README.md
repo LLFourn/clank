@@ -571,6 +571,21 @@ tab was closed keeps running as a background session; `clank agent
 start` notices and `claude attach`es to it instead of resuming, so the
 conversation carries on where it was.
 
+**`clank open` could not determine whether a tab/session exists:** the lookup
+failed; that does not prove the tab is absent or the server is dead. The error
+names the selected session, query argv, exit/timeout and bounded stderr. Check
+the failing shell's Zellij session/socket access against the terminal where you
+see the tab. Clank does not create tabs after an unanswered lookup. Session/tab
+lookups run during the explicit open operation, with a three-second limit each;
+inside-session `open --all` shares one tab query. `--print` previews a layout
+without querying the server (outside Zellij it previews a fresh session).
+
+`clank fork create` may open the fork automatically inside Zellij before a later
+explicit `clank open --fork …`. If automatic opening fails, the error states the
+fork's existing path; the fork remains created. A later query failure likewise
+does not undo a tab created by an earlier invocation. Inspect the selected
+session before retrying or deleting anything.
+
 **Building takes minutes and `cargo test` seems to hang before any
 test runs** — on macOS, that is Gatekeeper. `syspolicyd` assesses
 every freshly built executable on its first launch, and a big test
