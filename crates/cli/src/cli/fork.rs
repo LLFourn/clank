@@ -2,13 +2,15 @@
 //! so the WHOLE TEAM continues there in forked sessions
 //! (plan: clank-fork-worktree-sessions).
 //!
-//! Fork-on-launch: this command mints no session ids. It seeds a
+//! Fork-on-launch: this command seeds a
 //! one-shot fork spec per agent (`.clank/agents/<label>/fork.json`
 //! in the WORKTREE, gitignored); `clank agent start` consumes it
 //! on first launch (`claude --resume <src> --fork-session` /
 //! `codex fork <src> …`) and the forked id binds via the normal
 //! env-var hook. Both tools fork CLEANLY — verified against
-//! installed binaries 2026-06-10.
+//! installed binaries 2026-06-10. Grok instead reserves a child ID and
+//! prepares its history in the target cwd through ACP before interactive
+//! launch; its intent is consumed only when that child binds.
 //!
 //! Opening follows the bare-verb convention
 //! (clank-open-zellij-context): inside zellij the new tab opens by
@@ -40,6 +42,17 @@ pub struct ForkSpec {
     /// Orientation prompt delivered to the forked (or fresh) session
     /// on its first launch.
     pub prompt: String,
+    /// Grok's durable launch intent. Absent in legacy specs and other tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok: Option<GrokForkIntent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GrokForkIntent {
+    pub source_cwd: PathBuf,
+    pub child_id: String,
+    #[serde(default)]
+    pub prepared: bool,
 }
 
 /// Why a member's fork spec carries a source session or not.
@@ -53,7 +66,8 @@ pub struct ForkSpec {
 /// session to fork, 0 fresh" while persisting a fresh spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SeedSource {
-    /// A live binding: the session forks.
+    /// A retained binding: the session is intended to fork. Grok validates
+    /// its configured store during preparation; other probeable tools here.
     Resume,
     /// The source repo had no bound session for this member.
     FreshNoBinding,
@@ -89,7 +103,12 @@ pub(crate) fn classify_binding(
     match bound {
         None => (None, SeedSource::FreshNoBinding),
         Some(sid) => {
-            if crate::session_probe::session_jsonl_exists(&tool, &sid, home) == Some(false) {
+            // Grok preparation owns the authoritative lookup using the launch
+            // profile's GROK_HOME/HOME. The generic ~/.grok probe here could
+            // discard live history stored in a configured alternate home.
+            if tool != clank_core::vocab::Tool::Grok
+                && crate::session_probe::session_jsonl_exists(&tool, &sid, home) == Some(false)
+            {
                 (None, SeedSource::FreshStale { dead: sid })
             } else {
                 (Some(sid.clone()), SeedSource::Resume)
@@ -274,6 +293,26 @@ pub fn load_fork_spec(repo: &Path, label: &AgentLabel) -> anyhow::Result<Option<
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading `{}`", path.display()))),
     }
+}
+
+/// The intent survives failed preparation/exec. Atomic replacement plus the
+/// directory sync preserves its stable child ID across an interrupted launch.
+pub(crate) fn save_fork_spec(
+    repo: &Path,
+    label: &AgentLabel,
+    spec: &ForkSpec,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = fork_spec_path(repo, label);
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, spec)?;
+    temp.write_all(b"\n")?;
+    temp.as_file().sync_all()?;
+    temp.persist(&path).map_err(|e| e.error)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// CONSUME the fork spec: load it AND delete the file, enforcing the
@@ -862,6 +901,11 @@ pub async fn run_fork_pinned(
         let spec = ForkSpec {
             tool: seed.tool,
             from_session: seed.from_session.clone(),
+            grok: if seed.tool == clank_core::vocab::Tool::Grok {
+                Some(GrokForkIntent::new(&source)?)
+            } else {
+                None
+            },
             prompt: format!(
                 "You are `{label}` in {kind_word} `{name}` of {source_path} \
                  (branch `{name}` off {base}), session forked for: {purpose}. \
@@ -871,10 +915,7 @@ pub async fn run_fork_pinned(
                 source_path = source.display(),
             ),
         };
-        let path = fork_spec_path(&dest, label);
-        std::fs::create_dir_all(path.parent().expect("has parent"))?;
-        std::fs::write(&path, serde_json::to_string_pretty(&spec)?)
-            .with_context(|| format!("writing `{}`", path.display()))?;
+        save_fork_spec(&dest, label, &spec)?;
 
         // Carbon-copy the source's per-agent SETTINGS into the fork —
         // NOT the session (the fork mints its own via the spec +
@@ -1768,6 +1809,7 @@ detached
         assert!(take_fork_spec(repo, &label).unwrap().is_none());
 
         let spec = ForkSpec {
+            grok: None,
             tool: clank_core::vocab::Tool::Codex,
             from_session: Some("ancestor-id".into()),
             prompt: "orient".into(),

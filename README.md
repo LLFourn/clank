@@ -79,8 +79,16 @@ command for claude, the clank opencode plugin
 (`~/.config/opencode/plugin/clank.js` — session binding + work loop),
 and merges its Stop and SessionStart hooks into claude's
 `settings.json` and codex's `hooks.json`, replacing any entry that
-runs `clank stop-hook` (grok has no active hooks — its skill carries
-the work loop).
+runs `clank stop-hook`. Grok gets a native adapter at
+`$GROK_HOME/hooks/clank.json` (default `~/.grok/hooks/clank.json`): a fast Stop
+guard and terminal-only Pre/Post hooks protect one background handoff.
+For a custom Grok launch profile, use
+`clank setup --grok-agent <label> --repo <repo>` to install its hooks and
+skills in that profile's home. Setup probes the selected executable once;
+automatic launches require the complete adapter and Grok 1.x at least 1.0.46
+advertising native PreToolUse/Stop gates. `clank auto off` retains manual operation.
+These configuration/capability checks do not prove enabled completion
+notifications or a model wake; doctor reports that distinction explicitly.
 
 Re-run `clank setup` after upgrading the binary; `--force` refreshes
 skill files you have locally edited.
@@ -133,7 +141,7 @@ and clank's SessionStart hook binds that label to the session the tool
 just created — so work can be routed to it — and rebinds it when
 `/clear` hands the process a new session id. Nothing to type. Only a
 session you started yourself needs `clank as <label>` (claude and
-codex; opencode and grok still bind from a seed prompt).
+codex and native Grok; opencode binds through its plugin).
 
 **4. The master — write and promote a plan.**
 
@@ -336,6 +344,7 @@ committed. Everything else is per-user state.
 ~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
 ~/.claude/settings.json             # claude Stop + SessionStart hooks merged in
 ~/.codex/hooks.json                 # codex Stop + SessionStart hooks merged in
+~/.grok/hooks/clank.json             # native lifecycle adapter; custom GROK_HOME supported
 ~/.clank/config.json                # agent library, teams, hooks, defaults
 ```
 
@@ -366,9 +375,15 @@ auto-mode drives it:
   kitty-protocol Enter press. That fallback can leave a submitted
   message queued behind the held Stop hook; use the remote Stop button
   to release it.
-- **grok** — has no active hooks; its skill (and the auto-on launch
-  prompt from `clank agent start`) teach it to arm the background
-  wait itself.
+- **grok** — native PreToolUse tags one `clank grok-wait` requested with
+  `run_terminal_command` and `block_until_ms: 0`; PostToolUse confirms its
+  background task before the existing Clank wait can deliver. Background
+  completion carries new work turns; Stop only checks or requests bounded
+  repair. Existing ordinary waits require an explicit migration choice.
+  There is no new idle helper or polling cadence. Corrected fork preparation,
+  setup, capability gates and deterministic lifecycle fixtures are implemented;
+  authenticated native payload and model wake/reaction acceptance remain
+  unverified. See [the integration contract](GROK-INTEGRATION.md).
 - **opencode** — the clank plugin long-polls in-hook on
   `session.idle` and injects the items as a new prompt; the agent
   never arms anything. The launch profile carries the model: after

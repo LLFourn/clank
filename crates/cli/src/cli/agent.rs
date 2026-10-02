@@ -37,7 +37,7 @@ use crate::shell_quote::shell_quote;
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
         AgentCmd::List(a) => list(a),
-        AgentCmd::Start(a) => start(a),
+        AgentCmd::Start(a) => start(a).await,
         AgentCmd::Add(a) => add(a),
         AgentCmd::Promote(a) => promote(a),
         AgentCmd::Remove(a) => remove(a),
@@ -179,7 +179,7 @@ fn print_human(rows: &[AgentRow]) {
 /// Launch profile source: the merged declaration's `launch`
 /// field (per `agent-add-cli-and-repo-scope`). Session binding
 /// state comes from the per-agent skeleton.
-fn start(args: AgentStartArgs) -> anyhow::Result<()> {
+async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
@@ -203,27 +203,51 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
 
     let cfg = load_agent_config(&repo, &label)?;
     let bound_session = cfg.as_ref().and_then(|c| c.session.as_ref());
+    if bound_session.map_or(desc.tool, |s| s.tool) == Tool::Grok {
+        super::grok_launch::validate_profile(desc.launch.as_ref())?;
+    }
 
     // Each arm captures the tool ITS composer runs — the fork spec's or
     // the bound session's tool wins over the roster description, which
     // can be stale (a codex session under a since-changed claude roster
     // entry must still get codex launch side effects; codex ff3ca44).
+    let mut grok_checked = false;
     let (composed, launch_tool) = match bound_session {
         // A seeded fork spec (clank fork) takes precedence over the
         // plain bootstrap on first launch: fork the source session
         // with the orientation prompt; the forked id then binds via
         // the env-var hook and later starts hit the resume path. The
-        // spec is ONE-SHOT — consume (delete) it on a real launch so
+        // Non-Grok spec is ONE-SHOT — consume (delete) on a real launch so
         // a later relaunch with a lost binding can't re-fork the
-        // ancestor (fork-session-id-chaining). `--print` only peeks.
+        // ancestor (fork-session-id-chaining). Grok retains its stable
+        // preparation intent until the intended child binds. `--print` peeks.
         None => {
-            let spec = if args.print {
-                crate::cli::fork::load_fork_spec(&repo, &label)?
-            } else {
-                crate::cli::fork::take_fork_spec(&repo, &label)?
-            };
+            let spec = crate::cli::fork::load_fork_spec(&repo, &label)?;
             match spec {
+                Some(spec) if spec.tool == Tool::Grok => {
+                    if args.print {
+                        eprintln!(
+                            "Grok fork: prepare history in {} through ACP, then launch the child; preview does not prepare or consume the intent",
+                            repo.display()
+                        );
+                        print_composed(&compose_grok_preview(&repo, &label));
+                        return Ok(());
+                    }
+                    let provider =
+                        super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
+                    super::grok_setup::launch_ready(&repo, &label, &provider).await?;
+                    grok_checked = true;
+                    let prepared = super::grok_launch::prepare(&repo, &label, &provider).await
+                        .with_context(|| format!("Grok fork preparation failed; worktree `{}` and launch intent remain available", repo.display()))?;
+                    (
+                        compose_prepared_grok(&repo, &label, &desc, &prepared),
+                        Tool::Grok,
+                    )
+                }
                 Some(spec) => {
+                    if !args.print {
+                        crate::cli::fork::take_fork_spec(&repo, &label)?;
+                    }
                     let tool = spec.tool;
                     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                     (
@@ -256,6 +280,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 session.tool,
             ),
             Holder::Nobody => {
+                if session.tool == Tool::Grok {
+                    let provider =
+                        super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
+                    super::grok_launch::validate_resume(&provider, &repo, session.id.as_str())?;
+                }
                 let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let auto_mode =
                     crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
@@ -280,6 +309,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if launch_tool == Tool::Grok && !grok_checked {
+        let provider = super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
+        super::grok_setup::launch_ready(&repo, &label, &provider).await?;
+    }
+
     // Codex shows an interactive "do you trust this directory?" prompt
     // for any repo root not recorded in `~/.codex/config.toml` — and
     // every codex launch in the codebase flows through THIS exec
@@ -291,7 +325,10 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     pre_launch_codex_trust(launch_tool, &repo, home.as_deref());
 
-    exec_composed(composed)
+    exec_composed(
+        composed,
+        (launch_tool == Tool::Grok).then_some(repo.as_path()),
+    )
 }
 
 /// The `--repo` this process was GIVEN, not the resolved path: the
@@ -399,7 +436,7 @@ fn ensure_codex_project_trust(home: &Path, root: &Path) -> anyhow::Result<()> {
 
 /// Find an agent's resolved `AgentDescription` in the registered
 /// set, whether it's the master or a reviewer in either tier.
-fn find_in_set(
+pub(super) fn find_in_set(
     set: &crate::cli::teams_config::RegisteredSet,
     label: &AgentLabel,
 ) -> Option<AgentDescription> {
@@ -439,6 +476,9 @@ fn compose_bootstrap_launch(
         .as_ref()
         .map(|l| l.args.clone())
         .unwrap_or_default();
+    if desc.tool == Tool::Grok {
+        args.extend(["--cwd".to_string(), repo.to_string_lossy().into_owned()]);
+    }
     push_grok_trust(desc.tool, &mut args);
     let name = session_display_name(repo, label);
     set_session_name(desc.tool, &mut args, &name);
@@ -475,6 +515,11 @@ fn compose_fork_launch(
     worktree: &Path,
     home: Option<&Path>,
 ) -> ComposedLaunch {
+    // A Grok preview must describe the preparation owner, never print the
+    // unsafe interactive --fork-session command. Real starts prepare first.
+    if spec.tool == Tool::Grok {
+        return compose_grok_preview(worktree, label);
+    }
     let program = desc
         .launch
         .as_ref()
@@ -519,14 +564,7 @@ fn compose_fork_launch(
             args.push(worktree.display().to_string());
             args.push(sid.clone());
         }
-        // Grok forks like claude: resume the source session and branch
-        // it under a fresh id grok generates (grok-first-class). The
-        // new id binds later via `clank as` (newest-session-for-cwd).
-        (Some(sid), Tool::Grok) => {
-            args.push("--resume".into());
-            args.push(sid.clone());
-            args.push("--fork-session".into());
-        }
+        (Some(_), Tool::Grok) => unreachable!("Grok is composed through preparation above"),
         // opencode: `--session <src> --fork` — the TUI resumes a COPY
         // and mints a fresh `ses_` id; the source is untouched. The
         // new id binds later via the plugin + `clank as` (same as a
@@ -559,6 +597,69 @@ fn compose_fork_launch(
         program,
         args,
         env_overrides: launch_env(spec.tool, label, desc.launch.as_ref()),
+    }
+}
+
+fn compose_grok_preview(repo: &Path, label: &AgentLabel) -> ComposedLaunch {
+    ComposedLaunch {
+        program: "clank".into(),
+        args: vec![
+            "agent".into(),
+            "start".into(),
+            label.as_str().into(),
+            "--repo".into(),
+            repo.to_string_lossy().into_owned(),
+        ],
+        env_overrides: BTreeMap::new(),
+    }
+}
+
+fn compose_prepared_grok(
+    repo: &Path,
+    label: &AgentLabel,
+    desc: &AgentDescription,
+    prepared: &super::grok_launch::Prepared,
+) -> ComposedLaunch {
+    let mut args = desc
+        .launch
+        .as_ref()
+        .map(|l| l.args.clone())
+        .unwrap_or_default();
+    args.extend([
+        if prepared.resume {
+            "--resume".into()
+        } else {
+            "--session-id".into()
+        },
+        prepared.id.clone(),
+        "--cwd".into(),
+        repo.to_string_lossy().into_owned(),
+    ]);
+    push_grok_trust(Tool::Grok, &mut args);
+    let name = session_display_name(repo, label);
+    push_prompt(
+        Tool::Grok,
+        &mut args,
+        name_led_prompt(Tool::Grok, &name, prepared.prompt.clone()),
+    );
+    let mut env = launch_env(Tool::Grok, label, desc.launch.as_ref());
+    // The prepared child is known: pin detection as well as provider argv.
+    // This overrides any stale identity supplied by the launch profile.
+    for key in crate::agent_env::SESSION_IDENTITY_VARS {
+        env.remove(*key);
+    }
+    env.insert(
+        crate::agent_env::ENV_CLANK_AGENT.into(),
+        label.as_str().into(),
+    );
+    env.insert(
+        crate::agent_env::ENV_GROK_SESSION.into(),
+        prepared.id.clone(),
+    );
+    ComposedLaunch {
+        program: launch_program(Tool::Grok, desc.launch.as_ref()),
+        args,
+        env_overrides: env,
     }
 }
 
@@ -654,6 +755,12 @@ fn launch_env(
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = tool_env_defaults(tool);
     env.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
+    if tool == Tool::Grok {
+        // Grok profiles cannot override the launch's session ownership.
+        for key in crate::agent_env::SESSION_IDENTITY_VARS {
+            env.remove(*key);
+        }
+    }
     env.insert(
         crate::agent_env::ENV_CLANK_AGENT.to_string(),
         label.as_str().to_string(),
@@ -693,7 +800,7 @@ struct ComposedLaunch {
 ///   orchestrator reacts to the turn ending: claude/codex via their
 ///   stop hook, opencode via the clank plugin's `session.idle`
 ///   handler — opencode-agent-tool M1; a wait instruction here
-///   would double-trigger). Grok has no orchestrator and gets
+///   would double-trigger). Grok uses a native background handoff and gets
 ///   [`DEFAULT_AUTO_PROMPT_GROK`] instead.
 /// - Does NOT expose orchestration internals (no "stop hook",
 ///   no "work loop") — agent only learns contextual location.
@@ -703,15 +810,12 @@ struct ComposedLaunch {
 /// the test deliberately.
 pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
 
-/// Grok's default when `auto_mode == On`: unlike claude/codex, grok
-/// has NO clank stop hook (its hooks are passive — grok-first-class),
-/// so nothing orchestrates it after the ack turn. Without this
-/// instruction a freshly started grok ends its first turn with no
-/// wait armed and never wakes (grok-first-turn-orchestration). The
-/// arming instruction IS the orchestrator for grok.
-pub(super) const DEFAULT_AUTO_PROMPT_GROK: &str = "Session resumed. Arm your clank work loop \
-     now: run `clank wait` as a background terminal command (background: true), then end your \
-     turn. Its completion wakes you with work items.";
+/// A first/resumed turn reaches the native Stop guard before arming. Subsequent
+/// completion turns re-arm the canonical command through the installed skill.
+pub(super) const DEFAULT_AUTO_PROMPT_GROK: &str = "Session resumed. End your turn so the \
+    native Clank Stop guard can check your handoff. If it requests arming, run \
+    `clank grok-wait` with run_terminal_command and block_until_ms: 0. Keep exactly one \
+    automatic task; do not start a plain clank wait alongside it.";
 
 /// Resolve the initial prompt for an agent-start invocation.
 ///
@@ -738,8 +842,8 @@ pub(super) fn resolve_initial_prompt(
     if auto_mode == AutoMode::On {
         // Tool-aware: for claude/codex the STOP HOOK orchestrates
         // after the ack (a `clank wait` instruction here would
-        // double-trigger); grok has no hook, so its prompt must carry
-        // the arming itself (grok-first-turn-orchestration).
+        // double-trigger); Grok reaches its fast native Stop guard.
+        // Background completion, rather than Stop, carries delivered work.
         return Some(match tool {
             Tool::Grok => DEFAULT_AUTO_PROMPT_GROK.to_string(),
             // opencode joined the hook-driven side once the M1 spike
@@ -779,6 +883,12 @@ fn compose_launch(
     }
 
     let mut env_overrides = launch_env(tool, label, launch);
+    if tool == Tool::Grok {
+        env_overrides.insert(
+            crate::agent_env::ENV_GROK_SESSION.into(),
+            session.id.as_str().into(),
+        );
+    }
     if tool == Tool::OpenCode {
         // The resume path knows the exact session at composition time;
         // the plugin arms its bootstrap wait for THIS identity only.
@@ -812,8 +922,8 @@ fn session_restore_args(tool: Tool, session_id: &str, repo: &Path) -> Vec<String
             "--cd".into(),
             repo.to_string_lossy().into_owned(),
         ],
-        // Grok resumes by id; --cwd pins the working directory (its
-        // session store groups by cwd, but --resume finds ids anywhere).
+        // Grok resumes a session already validated in this cwd. The flag
+        // alone cannot relocate a saved session from another directory.
         Tool::Grok => vec![
             "--resume".into(),
             session_id.into(),
@@ -851,8 +961,8 @@ fn print_composed(c: &ComposedLaunch) {
 /// ConflictingSessions or silently binds as the parent — observed
 /// live with opencode under a claude shell (opencode-agent-tool M1).
 /// Each tool re-exports its own identity to its children, so
-/// scrubbing is always safe; deliberate `launch.env` overrides are
-/// applied after and win.
+/// scrubbing is always safe. Profile env follows; Grok composition removes
+/// foreign identity overrides and pins a known child's own ID.
 fn scrub_inherited_identity(cmd: &mut std::process::Command) {
     for var in crate::agent_env::SESSION_IDENTITY_VARS {
         cmd.env_remove(var);
@@ -860,9 +970,12 @@ fn scrub_inherited_identity(cmd: &mut std::process::Command) {
 }
 
 #[cfg(unix)]
-fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
+fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&c.program);
+    if let Some(repo) = repo {
+        cmd.current_dir(repo);
+    }
     cmd.args(&c.args);
     scrub_inherited_identity(&mut cmd);
     for (k, v) in &c.env_overrides {
@@ -876,11 +989,14 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
+fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
     // Non-unix fallback: spawn + wait. Process replacement isn't
     // available on Windows; the calling shell sees clank exit
     // with the child's status.
     let mut cmd = std::process::Command::new(&c.program);
+    if let Some(repo) = repo {
+        cmd.current_dir(repo);
+    }
     cmd.args(&c.args);
     scrub_inherited_identity(&mut cmd);
     let status = cmd
@@ -1873,6 +1989,7 @@ mod tests {
         assert!(!fresh.env_overrides.contains_key(BOOTSTRAP_VAR));
 
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::OpenCode,
             from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
             prompt: "orient".into(),
@@ -2754,6 +2871,7 @@ mod tests {
 
         // claude takes it as a flag, so the prompt is untouched.
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Claude,
             from_session: Some("src-session".into()),
             prompt: orient.into(),
@@ -2778,6 +2896,7 @@ mod tests {
         // which buries the fork name where truncation cuts it off.
         for tool in [Tool::Codex, Tool::OpenCode] {
             let spec = crate::cli::fork::ForkSpec {
+                grok: None,
                 tool,
                 from_session: Some("src-session".into()),
                 prompt: orient.into(),
@@ -2859,8 +2978,7 @@ mod tests {
     fn compose_launch_grok_auto_start_carries_the_arming_prompt() {
         // End-to-end shape of the grok-first-turn-orchestration fix:
         // a grok session started under effective auto-on composes a
-        // launch whose prompt IS the arming instruction (grok has no
-        // hook to orchestrate it after a bare ack).
+        // launch that reaches the native guard before requesting a handoff.
         let session = grok_session();
         let prompt = resolve_initial_prompt(None, AutoMode::On, session.tool)
             .expect("auto-on default prompt");
@@ -2873,7 +2991,7 @@ mod tests {
         );
         let last = c.args.last().map(|s| s.as_str()).unwrap_or("");
         assert!(
-            last.contains("clank wait") && last.contains("background"),
+            last.contains("clank grok-wait") && last.contains("End your turn"),
             "the composed grok launch must instruct arming: {:?}",
             c.args
         );
@@ -2901,21 +3019,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_initial_prompt_grok_default_carries_the_arming_instruction() {
-        // grok-first-turn-orchestration: grok has NO clank hook, so
-        // the bare ack ends its first turn with nothing armed and it
-        // never wakes. Its default must instruct the arming. Pinned
-        // exactly, like the claude/codex constant.
-        let out = resolve_initial_prompt(None, AutoMode::On, Tool::Grok);
-        assert_eq!(
-            out,
-            Some(
-                "Session resumed. Arm your clank work loop now: run `clank wait` as a \
-                 background terminal command (background: true), then end your turn. Its \
-                 completion wakes you with work items."
-                    .to_string()
-            )
-        );
+    fn resolve_initial_prompt_grok_default_reaches_native_guard() {
+        let out = resolve_initial_prompt(None, AutoMode::On, Tool::Grok).unwrap();
+        assert_eq!(out, DEFAULT_AUTO_PROMPT_GROK);
+        assert!(out.contains("End your turn"));
+        assert!(out.contains("clank grok-wait"));
+        assert!(!out.contains("background: true"));
     }
 
     #[test]
@@ -2989,6 +3098,7 @@ mod tests {
         // opencode launch.
         let desc = desc_with(Tool::OpenCode, None);
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::OpenCode,
             from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
             prompt: "orient".into(),
@@ -3294,6 +3404,7 @@ mod tests {
         // The spec's tool is what flows to the trust step (captured in
         // the same match arm that picks the composer).
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Codex,
             from_session: None,
             prompt: "orient".into(),
@@ -3365,8 +3476,8 @@ mod tests {
         let c = compose_bootstrap_launch(Path::new("/repo"), &label("fresh-grok"), &desc)
             .expect("compose");
         assert_eq!(c.program, "grok");
-        assert_eq!(c.args.first().map(|s| s.as_str()), Some("--trust"));
-        assert_eq!(c.args.len(), 2, "trust + bind prompt only");
+        assert_eq!(&c.args[..3], &["--cwd", "/repo", "--trust"]);
+        assert_eq!(c.args.len(), 4, "cwd + trust + bind prompt");
     }
 
     /// A fixture HOME in which `sid` IS resumable for `tool`, so a
@@ -3396,11 +3507,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_fork_resumes_and_branches_with_trust() {
-        // grok-first-class: fork = --resume <sid> --fork-session (grok
-        // names the child; binding lands later via `clank as`), plus
-        // the grok-only --trust, then the orientation prompt. Without
-        // a source session: fresh launch, still trusted + oriented.
+    fn grok_fork_preview_uses_preparation_owner() {
         let desc = AgentDescription {
             tool: Tool::Grok,
             launch: None,
@@ -3408,31 +3515,91 @@ mod tests {
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Grok,
             from_session: Some("cccccccc-1111-2222-3333-444444444444".into()),
             prompt: "orient".into(),
         };
         let home = home_with_session(Tool::Grok, "cccccccc-1111-2222-3333-444444444444");
         let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, Some(home.path()));
-        assert_eq!(c.program, "grok");
+        assert_eq!(c.program, "clank");
         assert_eq!(
             c.args,
             vec![
-                "--resume",
-                "cccccccc-1111-2222-3333-444444444444",
-                "--fork-session",
-                "--trust",
-                "x · tester — orient",
+                "agent",
+                "start",
+                "tester",
+                "--repo",
+                "/repo/.clank/worktrees/x",
             ]
         );
 
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Grok,
             from_session: None,
             prompt: "orient".into(),
         };
         let c = compose_fork_launch(&lbl("tester"), &spec, &desc, wt, None);
-        assert_eq!(c.args, vec!["--trust", "x · tester — orient"]);
+        assert_eq!(c.program, "clank");
+        assert_eq!(
+            c.args,
+            vec![
+                "agent",
+                "start",
+                "tester",
+                "--repo",
+                "/repo/.clank/worktrees/x"
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_grok_launch_uses_child_cwd_and_identity_for_fresh_and_resume() {
+        let repo = Path::new("/child");
+        let id = "22222222-2222-4222-8222-222222222222";
+        let desc = AgentDescription {
+            tool: Tool::Grok,
+            launch: Some(LaunchConfig {
+                command: Some("configured-grok".into()),
+                args: vec!["--model".into(), "chosen".into()],
+                env: BTreeMap::from([
+                    ("GROK_SESSION_ID".into(), "ancestor".into()),
+                    ("CODEX_THREAD_ID".into(), "foreign".into()),
+                ]),
+            }),
+            initial_prompt: None,
+        };
+        for resume in [false, true] {
+            let c = compose_prepared_grok(
+                repo,
+                &lbl("grok"),
+                &desc,
+                &super::super::grok_launch::Prepared {
+                    id: id.into(),
+                    resume,
+                    prompt: "orient".into(),
+                },
+            );
+            assert_eq!(c.program, "configured-grok");
+            assert_eq!(
+                c.args,
+                vec![
+                    "--model",
+                    "chosen",
+                    if resume { "--resume" } else { "--session-id" },
+                    id,
+                    "--cwd",
+                    "/child",
+                    "--trust",
+                    "child · grok — orient"
+                ]
+            );
+            assert_eq!(c.env_overrides.get("GROK_SESSION_ID").unwrap(), id);
+            assert_eq!(c.env_overrides.get("CLANK_AGENT").unwrap(), "grok");
+            assert!(!c.env_overrides.contains_key("CODEX_THREAD_ID"));
+            assert!(!c.args.iter().any(|a| a == "--fork-session"));
+        }
     }
 
     #[test]
@@ -3446,6 +3613,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Claude,
             from_session: None,
             prompt: "You are `claude` in worktree `x`…".into(),
@@ -3459,6 +3627,7 @@ mod tests {
         );
 
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Codex,
             from_session: None,
             prompt: "orient".into(),
@@ -3486,13 +3655,14 @@ mod tests {
         // a reviewer that never started.
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
         let empty = tempfile::tempdir().unwrap();
-        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+        for tool in [Tool::Claude, Tool::Codex] {
             let desc = AgentDescription {
                 tool,
                 launch: None,
                 initial_prompt: None,
             };
             let spec = crate::cli::fork::ForkSpec {
+                grok: None,
                 tool,
                 from_session: Some("gone-999".into()),
                 prompt: "orient".into(),
@@ -3525,6 +3695,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::OpenCode,
             from_session: Some("ses_0af1b2c3d4e5f607".into()),
             prompt: "orient".into(),
@@ -3557,6 +3728,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Claude,
             from_session: Some("abc-123".into()),
             prompt: "You are `claude` in worktree `x`…".into(),
@@ -3585,6 +3757,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            grok: None,
             tool: Tool::Codex,
             from_session: Some("def-456".into()),
             prompt: "orient".into(),

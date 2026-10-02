@@ -123,23 +123,26 @@ const WORK_LOOP_CODEX: WorkLoop = WorkLoop {
   there is work. You WILL be woken; do not spin.",
 };
 
-/// Grok wakes on background-task completion like claude
-/// (grok-first-class P1), but its hooks are passive — no reminder
-/// nudge exists, so the arming discipline is carried entirely here.
+/// Native Stop guards one provider-owned background completion channel.
 const WORK_LOOP_GROK: WorkLoop = WorkLoop {
     arrival: "\
-- **Keep a `clank wait` armed.** End every turn with `clank wait`
-  running as a background terminal command (`background: true`).
-  Its completion wakes you: act on the items it printed IMMEDIATELY,
-  then re-arm `clank wait` and end your turn. Nothing reminds you if
-  you forget — arming the wait is YOUR responsibility, every turn. Run
-  `clank status` if you need more than the hint carries (short SHAs
-  resolve wherever a `<sha>` is wanted).
-  Each item is a one-line hint: kind, plan, short sha.",
+- **Use the native guarded handoff.** On first start/resume, end your
+  turn so the native Stop hook can check the existing handoff. If it
+  requests arming, run `clank grok-wait` with `run_terminal_command`
+  and `block_until_ms: 0`. Clank's PreToolUse hook tags that call and
+  PostToolUse confirms its background task before any work is delivered.
+  Keep exactly one such task. Its completion wakes you: act on the
+  printed items immediately, then re-arm the same bare command and end
+  your turn. Do not copy its generated key/generation or tagged command.
+  A hook error is a failed handoff, not proof that work was handled.
+  Run `clank doctor` to diagnose setup; actual completion notifications
+  must be enabled in Grok. Each item names its kind, plan and short sha.",
     prohibition: "\
-- **NEVER poll.** Do not run `clank wait` in the foreground and do not
-  re-run `clank status` waiting for state to change. The armed
-  background wait wakes you; do not spin.",
+- **NEVER poll.** Do not use a foreground wait, a positive task timeout,
+  or repeated status/task checks. Do not start ordinary `clank wait`
+  alongside the automatic handoff. To keep an existing manual waiter,
+  explicitly use `clank auto off`; to migrate, terminate that specific
+  native task before arming the guarded one. No handoff acknowledges work.",
 };
 
 /// opencode is plugin-driven (opencode-agent-tool M1/M2): the clank
@@ -353,27 +356,33 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // ONE probe drives the skills AND the hook entries — the
     // installed teaching and the installed loop cannot disagree.
     let claude_async = probe_claude_asyncrewake() == Some(true);
-    let mut manifest = load_manifest(&home);
+    let (grok, grok_repo) = super::grok_setup::installation(&args, &home)?;
+    let mut manifests = std::collections::BTreeMap::new();
     for asset in user_asset_inventory(claude_async) {
+        let (root, asset) = super::grok_setup::asset_location(&home, &grok.root, asset);
+        let manifest = manifests
+            .entry(root.clone())
+            .or_insert_with(|| load_manifest(&root));
         install_skill(
-            &home,
+            &root,
             &asset.rel,
             &asset.expected,
             &asset.canonical_alternates,
             args.force,
             args.dry_run,
-            &mut manifest,
+            manifest,
             &mut summary,
         )?;
     }
     // Drop the pre-split single `clank` skill so it can't shadow the
     // role skills with stale, role-jamming guidance.
-    for (_, tool_dir) in TOOL_SKILL_DIRS {
-        remove_obsolete_skill(
-            &home.join(format!("{tool_dir}/skills/{OBSOLETE_SKILL}")),
-            args.dry_run,
-            &mut summary,
-        )?;
+    for (tool, tool_dir) in TOOL_SKILL_DIRS {
+        let obsolete = if tool == Tool::Grok {
+            grok.root.join(format!("skills/{OBSOLETE_SKILL}"))
+        } else {
+            home.join(format!("{tool_dir}/skills/{OBSOLETE_SKILL}"))
+        };
+        remove_obsolete_skill(&obsolete, args.dry_run, &mut summary)?;
     }
     // The delivery mode is decided HERE, once, and encoded in the
     // installed entry's argv (claude-asyncrewake-work-loop): probe
@@ -385,6 +394,19 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         &mut summary,
     )?;
     install_codex_hooks(&home.join(".codex/hooks.json"), args.dry_run, &mut summary)?;
+    install_grok_hooks(
+        &super::grok_setup::hook_path(&grok),
+        args.dry_run,
+        &mut summary,
+    )?;
+    // Native initialize may create provider cache directories. A dry run must
+    // not invoke it in the user's home; real setup probes once, never at idle.
+    if args.dry_run {
+        summary.push("  Grok: capability probe skipped during dry-run; real setup/launch/doctor checks the configured executable".into());
+    } else {
+        let capabilities = super::grok_setup::probe(&grok, &grok_repo).await;
+        summary.push(format!("  Grok: {}", capabilities.description()));
+    }
     install_codex_rule(
         &home.join(".codex/rules/default.rules"),
         args.dry_run,
@@ -799,6 +821,8 @@ struct HookEntry<'a> {
 
 #[derive(serde::Serialize)]
 struct HookWrapper<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matcher: Option<&'a str>,
     hooks: [HookEntry<'a>; 1],
 }
 
@@ -823,6 +847,9 @@ trait HookKind {
     }
     fn timeout(&self) -> u64 {
         HOOK_TIMEOUT_SECS
+    }
+    fn matcher(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -987,6 +1014,34 @@ fn merge_hook_into_settings(
         Err(e) => return Err(e.into()),
     };
 
+    let removed = merge_hook_value(&mut value, path, &kind)?;
+    let event = kind.event();
+
+    if !dry_run {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating `{}`", parent.display()))?;
+        }
+        let serialized = serde_json::to_string_pretty(&value)?;
+        std::fs::write(path, format!("{serialized}\n"))
+            .with_context(|| format!("writing `{}`", path.display()))?;
+    }
+
+    let action = if removed > 0 { "merge" } else { "add  " };
+    summary.push(format!(
+        "  {action} {path} ({tool} {event} hook)",
+        path = path.display(),
+        tool = kind.tool_name(),
+    ));
+    Ok(())
+}
+
+/// Apply one owned fragment in memory, shared by legacy and native files.
+fn merge_hook_value(
+    value: &mut serde_json::Value,
+    path: &Path,
+    kind: &impl HookKind,
+) -> anyhow::Result<usize> {
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
@@ -1023,23 +1078,75 @@ fn merge_hook_into_settings(
         status_message: kind.status_message(),
         async_rewake: kind.async_rewake(),
     };
-    wrappers.push(serde_json::to_value(HookWrapper { hooks: [entry] })?);
+    wrappers.push(serde_json::to_value(HookWrapper {
+        matcher: kind.matcher(),
+        hooks: [entry],
+    })?);
 
-    if !dry_run {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating `{}`", parent.display()))?;
-        }
-        let serialized = serde_json::to_string_pretty(&value)?;
-        std::fs::write(path, format!("{serialized}\n"))
-            .with_context(|| format!("writing `{}`", path.display()))?;
+    Ok(removed)
+}
+
+struct GrokHook {
+    event: &'static str,
+    terminal: bool,
+}
+impl HookKind for GrokHook {
+    fn command(&self) -> &'static str {
+        super::grok_setup::COMMAND
     }
+    fn tool_name(&self) -> &'static str {
+        "grok"
+    }
+    fn event(&self) -> &'static str {
+        self.event
+    }
+    fn timeout(&self) -> u64 {
+        5
+    }
+    fn matcher(&self) -> Option<&'static str> {
+        self.terminal.then_some(super::grok_setup::TERMINALS)
+    }
+}
 
-    let action = if removed > 0 { "merge" } else { "add  " };
+/// Publish the complete native adapter atomically; a partial set of guards is
+/// never a successful installation. Unrelated hooks and fields are preserved.
+pub(super) fn install_grok_hooks(
+    path: &Path,
+    dry_run: bool,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let mut value = match super::grok_setup::read_hooks(path) {
+        Ok(v) => v,
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(e) => return Err(e),
+    };
+    let before = value.clone();
+    for (event, terminal) in super::grok_setup::EVENTS {
+        merge_hook_value(&mut value, path, &GrokHook { event, terminal })?;
+    }
+    if value == before {
+        summary.push(format!("  ok    {} (native Grok adapter)", path.display()));
+        return Ok(());
+    }
+    if !dry_run {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .context("native Grok hook path needs a parent")?;
+        std::fs::create_dir_all(parent)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        writeln!(tmp, "{}", serde_json::to_string_pretty(&value)?)?;
+        tmp.as_file_mut().sync_all()?;
+        tmp.persist(path).map_err(|e| anyhow::anyhow!(e.error))?;
+    }
     summary.push(format!(
-        "  {action} {path} ({tool} {event} hook)",
-        path = path.display(),
-        tool = kind.tool_name(),
+        "  write {} (complete native Grok adapter)",
+        path.display()
     ));
     Ok(())
 }
@@ -1254,16 +1361,12 @@ mod tests {
     }
 
     #[test]
-    fn grok_skill_teaches_the_armed_wait_loop_without_a_nudge_crutch() {
-        // grok-first-class: grok wakes on background-task completion
-        // (P1) but has NO nudge channel (passive hooks) — the skill
-        // alone carries the arming discipline, in grok's vocabulary.
+    fn grok_skill_teaches_the_native_guarded_handoff() {
         let mg = compose_skill(Role::Master, Tool::Grok);
-        assert!(mg.contains("background: true"), "grok bg phrasing");
-        assert!(
-            mg.contains("Nothing reminds you"),
-            "the no-nudge discipline is stated"
-        );
+        assert!(mg.contains("clank grok-wait"));
+        assert!(mg.contains("block_until_ms: 0"));
+        assert!(mg.contains("clank auto off"));
+        assert!(!mg.contains("Nothing reminds you"));
         assert!(
             mg.contains("run_terminal_command"),
             "grok shell name substituted"

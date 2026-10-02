@@ -50,6 +50,9 @@ pub enum Command {
     /// instead; `--event` adds ad-hoc wake sources (github repos,
     /// commands) alongside the agent config's `wait_events`.
     Wait(crate::cli::WaitArgs),
+    /// Grok's provider-owned automatic handoff (native hooks required).
+    #[command(hide = true)]
+    GrokWait(crate::cli::GrokWaitArgs),
     /// Manage the plan queue
     ///
     /// `queue add` consumes a draft from `.clank/drafts/`; `promote`
@@ -270,6 +273,7 @@ pub async fn dispatch_with(
         Command::Rewire(args) => crate::cli::rewire::run(args).await,
         Command::Status(args) => crate::cli::status::run(args).await,
         Command::Wait(args) => crate::cli::wait::run(args).await,
+        Command::GrokWait(args) => crate::cli::grok_handoff::wait(args).await,
         Command::Feedback(args) => crate::cli::feedback::run(args).await,
         Command::Events(args) => crate::cli::events::run(args).await,
         Command::Send(args) => crate::cli::send::run(args),

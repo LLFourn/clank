@@ -24,7 +24,7 @@ const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
 /// Grok's marker is present in tool subprocesses. Older versions did
 /// not export the id; those still use the newest session dir for cwd.
 const ENV_GROK_MARKER: &str = "GROK_AGENT";
-const ENV_GROK_SESSION: &str = "GROK_SESSION_ID";
+pub(crate) const ENV_GROK_SESSION: &str = "GROK_SESSION_ID";
 /// Injected by the clank opencode PLUGIN via opencode's `shell.env`
 /// hook — opencode itself exports no session id
 /// (opencode-agent-tool M0). Present iff the shell call carried the

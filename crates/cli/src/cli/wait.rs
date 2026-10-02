@@ -32,7 +32,18 @@ use clank_core::wait::WaitItem;
 /// exact tool/session still holds the label. A terminal wait with no
 /// session remains a direct, unclaimed observer.
 #[derive(Debug, Clone)]
-struct WaitBinding(Option<(clank_core::Tool, clank_core::SessionId)>);
+struct WaitBinding(
+    Option<(clank_core::Tool, clank_core::SessionId)>,
+    WaitPolicy,
+);
+
+#[derive(Debug, Clone)]
+enum WaitPolicy {
+    Manual,
+    // Check effective auto-mode on existing monitor notes/local beats too,
+    // including manual/global edits. Manual waits never inherit this policy.
+    AutomaticGrok { home: Option<std::path::PathBuf> },
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -71,18 +82,36 @@ impl WaitBinding {
                 .into());
             }
         }
-        Ok(Self(detected))
+        Ok(Self(detected, WaitPolicy::Manual))
     }
 
     fn ensure_current(&self, repo: &Path, author: &AgentLabel) -> anyhow::Result<()> {
+        if self.0.is_none() && matches!(self.1, WaitPolicy::Manual) {
+            return Ok(());
+        }
+        // Auto policy shares the binding check's read. No second config read
+        // is added to the existing idle monitor notes/local beats.
+        let loaded = crate::agent_store::load_agent_config(repo, author);
+        if let WaitPolicy::AutomaticGrok { home } = &self.1 {
+            let cfg = loaded
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            anyhow::ensure!(
+                crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
+                    == clank_core::AutoMode::On,
+                "automatic Grok wait cancelled: Clank auto mode is off"
+            );
+        }
         let Some((tool, session)) = &self.0 else {
             return Ok(());
         };
-        let bound = crate::agent_store::binding_matches(repo, author, *tool, session.as_str());
+        let cfg = loaded.ok().flatten();
+        let bound = cfg
+            .as_ref()
+            .and_then(|cfg| cfg.session.as_ref())
+            .is_some_and(|current| current.tool == *tool && &current.id == session);
         if !bound {
-            let current = crate::agent_store::load_agent_config(repo, author)
-                .ok()
-                .flatten()
+            let current = cfg
                 .and_then(|cfg| cfg.session)
                 .map(|s| format!("{} session {}", s.tool.as_str(), s.id.as_str()))
                 .unwrap_or_else(|| "no current session".into());
@@ -186,6 +215,27 @@ pub async fn items_observing(
     args: WaitArgs,
     starts: &SourceStarts,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    items_with_policy(args, starts, None).await
+}
+
+pub(super) async fn automatic_grok_items(
+    args: WaitArgs,
+    session: clank_core::SessionId,
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    use crate::agent_env::Ambient;
+    items_with_policy(
+        args,
+        &SourceStarts::default(),
+        Some((session, crate::agent_env::Process.home())),
+    )
+    .await
+}
+
+async fn items_with_policy(
+    args: WaitArgs,
+    starts: &SourceStarts,
+    automatic: Option<(clank_core::SessionId, Option<std::path::PathBuf>)>,
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
     // Before ANY setup: the fold and the watcher attach can block for
     // seconds, and an owner that dies in that window must still reap
     // this process (remove-wait-timeout).
@@ -228,7 +278,15 @@ pub async fn items_observing(
     // is fail-soft there (wait-reloads-config-per-refold).
     let mut inputs = derive_wait_inputs(&repo, &author)?;
 
-    let binding = WaitBinding::capture(&args)?;
+    // The native adapter already validated Grok's actual session. Inherited
+    // Claude/Codex variables cannot override that identity or prevent arming.
+    let binding = match automatic {
+        Some((session, home)) => WaitBinding(
+            Some((clank_core::Tool::Grok, session)),
+            WaitPolicy::AutomaticGrok { home },
+        ),
+        None => WaitBinding::capture(&args)?,
+    };
     binding.ensure_current(&repo, &author)?;
 
     let policy = if args.no_cache {
@@ -792,7 +850,12 @@ async fn share_with(
     )
     .await
     {
-        crate::cli::monitor::Attached::Shared(conn) => Some(conn),
+        crate::cli::monitor::Attached::Shared(conn) => {
+            // One debug event at the accepted-subscription boundary, useful
+            // when diagnosing a parked wait. No new idle work or timer.
+            tracing::debug!(author = %author, "monitor subscription registered");
+            Some(conn)
+        }
         crate::cli::monitor::Attached::Alone(why) => {
             tracing::debug!("watching {} locally: {why}", repo.display());
             None
@@ -1087,6 +1150,17 @@ pub(crate) struct EventSources {
 }
 
 impl EventSources {
+    fn into_parts(
+        mut self,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<crate::cli::command_source::Emission>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        (
+            std::mem::replace(&mut self.rx, tokio::sync::mpsc::unbounded_channel().1),
+            std::mem::take(&mut self.tasks),
+        )
+    }
     /// Hand this set's items to `into`, TAGGED with whose they are, and
     /// return every task that must be aborted to stop them.
     ///
@@ -1104,7 +1178,7 @@ impl EventSources {
             crate::cli::command_source::Emission,
         )>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
-        let Self { mut rx, mut tasks } = self;
+        let (mut rx, mut tasks) = self.into_parts();
         tasks.push(tokio::spawn(async move {
             while let Some(emission) = rx.recv().await {
                 if into.send((author.clone(), emission)).is_err() {
@@ -1190,12 +1264,23 @@ impl EventSources {
         Self { rx, tasks }
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(mut self) {
         for task in &self.tasks {
             task.abort();
         }
-        for task in self.tasks {
+        for task in self.tasks.drain(..) {
             let _ = task.await;
+        }
+    }
+}
+
+impl Drop for EventSources {
+    fn drop(&mut self) {
+        // A lifecycle owner may cancel the wait future itself. Dropping join
+        // handles detaches tasks; aborting them preserves process-group cleanup.
+        // Normal returns still use shutdown to abort AND join.
+        for task in &self.tasks {
+            task.abort();
         }
     }
 }
@@ -1899,7 +1984,7 @@ struct SupersededEnvelope {
     superseded: bool,
 }
 
-fn emit(items: &[WaitItem], json: bool) {
+pub(crate) fn emit(items: &[WaitItem], json: bool) {
     if json {
         let envelope = WaitEnvelope {
             items: items.iter().map(render_json).collect(),
@@ -2592,7 +2677,7 @@ mod shared_tests {
             conn,
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
-            &WaitBinding(None),
+            &WaitBinding(None, WaitPolicy::Manual),
         )
         .await
         .expect("the items arrive");
@@ -2622,7 +2707,7 @@ mod shared_tests {
             conn,
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
-            &WaitBinding(None),
+            &WaitBinding(None, WaitPolicy::Manual),
         )
         .await
         .unwrap();
@@ -2744,7 +2829,7 @@ mod shared_tests {
     async fn a_wait_shares_when_the_monitor_covers_all_of_its_sources() {
         let (repo, _dir) = repo_with_a_willing_monitor();
         let author = AgentLabel::parse("claude").unwrap();
-        let binding = WaitBinding(None);
+        let binding = WaitBinding(None, WaitPolicy::Manual);
 
         let nothing = WakeSources::derive(repo.path(), Role::Reviewer, Vec::new());
         assert!(nothing.may_share());
@@ -2860,7 +2945,7 @@ mod shared_tests {
             &[],
             Some("inv-7"),
         );
-        let mut rx = spawned.rx;
+        let (mut rx, tasks) = spawned.into_parts();
         let mut seen: Vec<String> = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while seen.len() < 2 {
@@ -2907,7 +2992,7 @@ mod shared_tests {
             );
         }
 
-        for task in spawned.tasks {
+        for task in tasks {
             task.abort();
             let _ = task.await;
         }
@@ -2997,7 +3082,7 @@ mod shared_tests {
 
         // Its own channel receives BOTH: the configured event and the
         // invocation's.
-        let mut rx = spawned.rx;
+        let (mut rx, tasks) = spawned.into_parts();
         let mut heard: Vec<String> = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while heard.len() < 2 {
@@ -3034,7 +3119,7 @@ mod shared_tests {
             &[],
             None,
         );
-        let mut claude_rx = claude_spawned.rx;
+        let (mut claude_rx, claude_tasks) = claude_spawned.into_parts();
         let claude_heard = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match claude_rx.recv().await {
@@ -3052,7 +3137,7 @@ mod shared_tests {
              invocation of anybody else's"
         );
 
-        for task in spawned.tasks.into_iter().chain(claude_spawned.tasks) {
+        for task in tasks.into_iter().chain(claude_tasks) {
             task.abort();
             let _ = task.await;
         }
@@ -3114,8 +3199,10 @@ mod shared_tests {
             .await
             .unwrap_or_default()
         };
-        let tasks: Vec<_> = first.tasks.into_iter().chain(second.tasks).collect();
-        let (a, b) = tokio::join!(heard(first.rx), heard(second.rx));
+        let (first_rx, first_tasks) = first.into_parts();
+        let (second_rx, second_tasks) = second.into_parts();
+        let tasks: Vec<_> = first_tasks.into_iter().chain(second_tasks).collect();
+        let (a, b) = tokio::join!(heard(first_rx), heard(second_rx));
 
         assert_eq!(a, "one", "the first invocation's own command ran");
         assert_eq!(
@@ -3202,7 +3289,7 @@ mod shared_tests {
     async fn a_config_source_wait_refuses_a_monitor_that_cannot_host() {
         let (repo, dir) = repo_with_a_willing_monitor();
         let author = AgentLabel::parse("claude").unwrap();
-        let binding = WaitBinding(None);
+        let binding = WaitBinding(None, WaitPolicy::Manual);
         let agent_dir = crate::agent_store::agents_root(repo.path()).join("claude");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
@@ -3274,7 +3361,7 @@ mod shared_tests {
     async fn an_open_pr_review_keeps_master_watching_itself() {
         let (repo, _dir) = repo_with_a_willing_monitor();
         let author = AgentLabel::parse("claude").unwrap();
-        let binding = WaitBinding(None);
+        let binding = WaitBinding(None, WaitPolicy::Manual);
         std::fs::create_dir_all(repo.path().join(".clank/pr-reviews/42")).unwrap();
         std::fs::write(
             repo.path().join(".clank/pr-reviews/42/pr.json"),
@@ -3325,7 +3412,7 @@ mod shared_tests {
                 Conn::over(mine),
                 repo.path(),
                 &AgentLabel::parse("claude").unwrap(),
-                &WaitBinding(None),
+                &WaitBinding(None, WaitPolicy::Manual),
                 std::time::Duration::from_millis(150),
             ),
         )
@@ -3369,7 +3456,7 @@ mod shared_tests {
                         Conn::over(mine),
                         &repo,
                         &AgentLabel::parse("claude").unwrap(),
-                        &WaitBinding(None),
+                        &WaitBinding(None, WaitPolicy::Manual),
                         std::time::Duration::from_millis(200),
                     )
                     .await
@@ -3413,7 +3500,10 @@ mod shared_tests {
         let label = AgentLabel::parse("codex").unwrap();
         let ours = clank_core::SessionId::parse("session-a1").unwrap();
         let successor = clank_core::SessionId::parse("session-b2").unwrap();
-        let binding = WaitBinding(Some((clank_core::Tool::Codex, ours.clone())));
+        let binding = WaitBinding(
+            Some((clank_core::Tool::Codex, ours.clone())),
+            WaitPolicy::Manual,
+        );
         crate::agent_store::bind_session_to_agent(repo, &label, clank_core::Tool::Codex, &ours)
             .unwrap();
         crate::agent_store::bind_session_to_agent(
@@ -3459,7 +3549,10 @@ mod shared_tests {
         let label = AgentLabel::parse("codex").unwrap();
         let ours = clank_core::SessionId::parse("session-a1").unwrap();
         let successor = clank_core::SessionId::parse("session-b2").unwrap();
-        let binding = WaitBinding(Some((clank_core::Tool::Codex, ours.clone())));
+        let binding = WaitBinding(
+            Some((clank_core::Tool::Codex, ours.clone())),
+            WaitPolicy::Manual,
+        );
         crate::agent_store::bind_session_to_agent(repo, &label, clank_core::Tool::Codex, &ours)
             .unwrap();
         // The rebind the fold cannot have seen.
@@ -3509,7 +3602,10 @@ mod tests {
         let label = AgentLabel::parse("codex").unwrap();
         let a = clank_core::SessionId::parse("session-a1").unwrap();
         let b = clank_core::SessionId::parse("session-b2").unwrap();
-        let ours = WaitBinding(Some((clank_core::Tool::Codex, a.clone())));
+        let ours = WaitBinding(
+            Some((clank_core::Tool::Codex, a.clone())),
+            WaitPolicy::Manual,
+        );
         let another = ours.clone();
         crate::agent_store::bind_session_to_agent(repo, &label, clank_core::Tool::Codex, &a)
             .unwrap();
@@ -3528,7 +3624,10 @@ mod tests {
                 .unwrap_err()
                 .is::<WaitSuperseded>()
         );
-        let successor = WaitBinding(Some((clank_core::Tool::Codex, b.clone())));
+        let successor = WaitBinding(
+            Some((clank_core::Tool::Codex, b.clone())),
+            WaitPolicy::Manual,
+        );
         successor.ensure_current(repo, &label).unwrap();
         crate::agent_store::release_binding(repo, &label, &b).unwrap();
         assert!(successor.ensure_current(repo, &label).is_err());
@@ -3593,6 +3692,65 @@ mod tests {
             reply_command: None,
             glyph: None,
         }
+    }
+
+    #[test]
+    fn automatic_wait_checks_auto_off_on_existing_beats_without_cancelling_manual_waits() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("grok").unwrap();
+        crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::Off).unwrap();
+        let automatic = WaitBinding(None, WaitPolicy::AutomaticGrok { home: None });
+        assert!(
+            automatic
+                .ensure_current(repo.path(), &author)
+                .unwrap_err()
+                .to_string()
+                .contains("auto mode is off")
+        );
+        assert!(
+            WaitBinding(None, WaitPolicy::Manual)
+                .ensure_current(repo.path(), &author)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_sources_ends_the_running_command_instead_of_detaching_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("grok").unwrap();
+        let source = command_source(
+            "cleanup",
+            &[
+                "sh",
+                "-c",
+                r#"printf '{"id":"started","content":"%s"}\n' $$; sleep 300"#,
+            ],
+        );
+        let declared = vec![(
+            clank_core::agent_config::WaitEventSource::Command(source),
+            crate::cli::github::supervisor::SourceOrigin::Config,
+        )];
+        let mut sources = EventSources::spawn(&declared, None, repo.path(), &author, &[], None);
+        let (item, _) = tokio::time::timeout(Duration::from_secs(5), sources.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let WaitItem::CommandEvent { content, .. } = item else {
+            panic!("expected the producer's start event");
+        };
+        let pid = content.parse::<i32>().unwrap();
+        assert_eq!(
+            crate::signal::probe_process(pid),
+            crate::signal::Probe::Ours
+        );
+        drop(sources);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::signal::probe_process(pid) != crate::signal::Probe::Gone {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelling the wait must not leave its command source running");
     }
 
     /// Run a supervised source until `want` items arrive, then stop

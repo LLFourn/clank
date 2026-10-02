@@ -4,6 +4,9 @@
 //! TWO adapters live here, for two different hook events with two
 //! different contracts. Each is a short algorithm, and the code below
 //! is those algorithms in order.
+//! Grok's native lifecycle dispatches to [`super::grok_handoff`] before either
+//! algorithm: its Stop checks a provider-owned background handoff and never
+//! runs the hook-owned poll below.
 //!
 //! # A Stop turn
 //!
@@ -99,6 +102,15 @@ use clank_core::{
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
+    // Grok imports Claude hook files too. Suppress only Clank's imported
+    // adapter; the native adapter below owns this lifecycle. Other user hooks
+    // are unaffected. Never park Grok inside the Claude hook protocol.
+    if std::env::var_os("GROK_HOOK_EVENT").is_some() && Tool::from(args.tool) != Tool::Grok {
+        return Ok(());
+    }
+    if Tool::from(args.tool) == Tool::Grok {
+        return super::grok_handoff::hook(args);
+    }
     if args.session_start {
         return run_session_start(args).await;
     }
@@ -291,7 +303,7 @@ async fn compute_outcome_with(
                 .await
             }
             TurnRoute::Undrivable => outcome_of(&TurnDecision::Failed(
-                "hook: grok has no stop-hook adapter (grok hooks are passive)".into(),
+                "hook: Grok native handoffs do not use the in-hook wait route".into(),
             )),
         }
     }
@@ -2668,9 +2680,8 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
             }
             std::process::exit(HOOK_OK_EXIT);
         }
-        // Grok hooks are passive — nothing we print can continue the
-        // agent, so a Continue degrades to a stderr note + exit 0
-        // (unreachable while no grok adapter is installed).
+        // Native Grok payloads are handled before this generic adapter.
+        // This legacy hook-owned route cannot produce a native continuation.
         (HookOutcome::Continue { reason }, Tool::Grok) => {
             eprintln!("{reason}");
             std::process::exit(HOOK_OK_EXIT);

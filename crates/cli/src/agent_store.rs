@@ -59,7 +59,10 @@ pub(crate) fn binding_matches(repo: &Path, label: &AgentLabel, tool: Tool, sessi
 /// dirs if needed.
 pub fn save_agent_config(repo: &Path, label: &AgentLabel, cfg: &AgentConfig) -> anyhow::Result<()> {
     let path = agent_config_path(repo, label);
-    save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))
+    let previous = load_agent_config(repo, label).ok().flatten();
+    save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))?;
+    crate::cli::grok_handoff::config_changed(repo, label, previous.as_ref(), cfg);
+    Ok(())
 }
 
 /// Read-modify-write one agent's config, defaulting a missing file.
@@ -667,6 +670,11 @@ pub fn bind_session_to_agent(
     // Under the label's lock, so a release that read this binding a
     // moment ago cannot land its clear on top of the claim.
     let owned = binding_lock(repo, label)?;
+    let consume_grok_fork = if tool == Tool::Grok {
+        crate::cli::grok_launch::check_binding(repo, label, session_id.as_str())?
+    } else {
+        false
+    };
     let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -678,6 +686,10 @@ pub fn bind_session_to_agent(
         transcript: None,
     });
     save_agent_config(repo, label, &cfg)?;
+    if consume_grok_fork {
+        std::fs::remove_file(crate::cli::fork::fork_spec_path(repo, label))
+            .context("Grok child bound, but its launch intent could not be consumed")?;
+    }
     // Dropped before any OTHER label is touched: one lock at a time is
     // what keeps two crossing binds from deadlocking on each other.
     drop(owned);

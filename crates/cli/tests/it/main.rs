@@ -18,6 +18,7 @@ mod feedback_write_integration;
 mod finish_integration;
 mod fork_integration;
 mod git_boundary;
+mod grok_launch_acceptance;
 mod html_integration;
 mod identity_env_boundary;
 mod inbox_wakes;

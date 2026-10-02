@@ -134,6 +134,61 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 #[test]
+fn grok_fork_reserves_child_intent_without_copying_or_binding() {
+    use clank_core::vocab::Tool;
+    let env = source_with_bound_team();
+    let source_id = "33333333-3333-4333-8333-333333333333";
+    bind_session(&env, "claude", Tool::Grok, source_id);
+    let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+    let source_config = clank::agent_store::agent_config_path(env.repo(), &label);
+    let before = std::fs::read(&source_config).unwrap();
+    let dest = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "grok-child"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    let spec = clank::cli::fork::load_fork_spec(&dest, &label)
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.tool, Tool::Grok);
+    assert_eq!(spec.from_session.as_deref(), Some(source_id));
+    let intent = spec.grok.unwrap();
+    assert_eq!(intent.source_cwd, env.repo().canonicalize().unwrap());
+    assert_eq!(intent.child_id.len(), 36);
+    assert_ne!(intent.child_id, source_id);
+    assert!(!intent.prepared);
+    assert!(
+        clank::agent_store::load_agent_config(&dest, &label)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read(&source_config).unwrap(), before);
+    let groups = std::fs::read_dir(env.home().join(".grok/sessions")).unwrap();
+    assert!(
+        groups
+            .into_iter()
+            .all(|g| !g.unwrap().path().join(&intent.child_id).exists())
+    );
+    let path = clank::cli::fork::fork_spec_path(&dest, &label);
+    let preview_before = std::fs::read(&path).unwrap();
+    block_on(clank::cli::agent::run(clank::cli::AgentArgs {
+        command: clank::cli::AgentCmd::Start(clank::cli::AgentStartArgs {
+            name: "claude".into(),
+            repo: Some(dest.clone()),
+            print: true,
+        }),
+    }))
+    .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), preview_before);
+    assert_eq!(std::fs::read(source_config).unwrap(), before);
+    assert!(
+        clank::agent_store::load_agent_config(&dest, &label)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn fork_creates_worktree_and_seeds_team() {
     let env = source_with_bound_team();
     let repo = env.repo();

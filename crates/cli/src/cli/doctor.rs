@@ -104,6 +104,10 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     // User scope — independent of repo.
     results.extend(user_checks());
 
+    // Explicit command boundary only: bounded native handshake per distinct
+    // configured Grok provider. No probe runs in an idle lifecycle callback.
+    results.extend(grok_checks(repo.as_deref(), home.as_deref()).await);
+
     // Session scope — only meaningful inside an agent.
     results.extend(session_checks(repo.as_deref()));
 
@@ -116,6 +120,168 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         return Err(DoctorFailed.into());
     }
     Ok(())
+}
+
+async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResult> {
+    use clank_core::{AutoMode, Tool};
+    let mut out = Vec::new();
+    let mut profiles = Vec::new();
+    if let Some(repo) = repo {
+        if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, home) {
+            let mut members = vec![(set.master.clone(), set.master_desc.clone())];
+            members.extend(
+                set.members
+                    .iter()
+                    .map(|m| (m.label.clone(), m.desc.clone())),
+            );
+            for (label, desc) in members {
+                let cfg = match load_agent_config(repo, &label) {
+                    Ok(cfg) => cfg,
+                    Err(_) => continue, // repo checks already report invalid agent state
+                };
+                let tool = cfg
+                    .as_ref()
+                    .and_then(|c| c.session.as_ref())
+                    .map(|s| s.tool)
+                    .or_else(|| {
+                        super::fork::load_fork_spec(repo, &label)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.tool)
+                    })
+                    .unwrap_or(desc.tool);
+                if tool != Tool::Grok {
+                    continue;
+                }
+                let automatic =
+                    super::team::resolve_effective_auto_mode(cfg.as_ref(), home) == AutoMode::On;
+                let state = super::grok_handoff::diagnose(
+                    repo,
+                    &label,
+                    cfg.as_ref().and_then(|c| c.session.as_ref()).map(|s| &s.id),
+                );
+                out.push(match state {
+                    Ok(message) => {
+                        CheckResult::warn("repo", format!("Grok {label} handoff snapshot"), message)
+                    }
+                    Err(e) => CheckResult::fail(
+                        "repo",
+                        format!("Grok {label} handoff snapshot"),
+                        format!("{e:#}"),
+                    ),
+                });
+                match super::grok_launch::Provider::resolve(desc.launch.as_ref(), repo) {
+                    Ok(provider) => profiles.push((label.to_string(), repo.to_owned(), provider, automatic)),
+                    Err(_) => out.push(CheckResult::fail("repo", format!("Grok {label} profile"), "invalid managed session/cwd options or missing provider home; check this launch profile")),
+                }
+            }
+        }
+    }
+    if profiles.is_empty() {
+        let cwd = repo
+            .map(Path::to_owned)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = cwd {
+            if let Ok(provider) = super::grok_launch::Provider::resolve(None, &cwd) {
+                profiles.push(("default".into(), cwd, provider, false));
+            }
+        }
+    }
+    let mut probes = std::collections::BTreeMap::new();
+    let mut asset_roots = std::collections::BTreeSet::new();
+    for (label, cwd, provider, automatic) in profiles {
+        // Reuse one probe for identical executable/options/env/cwd, without
+        // exposing any profile values or initialize account metadata.
+        let key = (
+            provider.program.clone(),
+            provider.args.clone(),
+            provider.env.clone(),
+            cwd.clone(),
+        );
+        let capabilities = if let Some(cap) = probes.get(&key) {
+            cap
+        } else {
+            probes.insert(key.clone(), super::grok_setup::probe(&provider, &cwd).await);
+            probes.get(&key).unwrap()
+        };
+        out.extend(grok_report(&label, &provider, automatic, capabilities));
+        if let Some(home) = home.filter(|_| asset_roots.insert(provider.root.clone())) {
+            let obsolete = provider.root.join("skills/clank/SKILL.md");
+            if obsolete.exists() {
+                out.push(CheckResult::warn("user", format!("Grok {label} obsolete skill"), "pre-split clank skill can shadow current role guidance; re-run setup for this profile"));
+            }
+            for asset in super::setup::user_asset_inventory(false)
+                .into_iter()
+                .filter(|a| a.rel.starts_with(".grok/"))
+            {
+                let (root, asset) = super::grok_setup::asset_location(home, &provider.root, asset);
+                out.push(check_setup_asset(
+                    &root,
+                    &asset,
+                    &super::setup::load_manifest(&root),
+                ));
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn grok_report(
+    label: &str,
+    provider: &super::grok_launch::Provider,
+    automatic: bool,
+    capabilities: &super::grok_setup::Capabilities,
+) -> Vec<CheckResult> {
+    let section = if label == "default" { "user" } else { "repo" };
+    let failure = |name, message| {
+        if automatic {
+            CheckResult::fail(section, name, message)
+        } else {
+            CheckResult::warn(section, name, message)
+        }
+    };
+    let adapter = match super::grok_setup::validate_hooks(provider) {
+        Ok(()) => CheckResult::ok(
+            section,
+            format!("Grok {label} native adapter"),
+            format!(
+                "complete adapter configured at {}; runtime loading has not been verified",
+                super::grok_setup::hook_path(provider).display()
+            ),
+        ),
+        Err(e) => failure(
+            format!("Grok {label} native adapter"),
+            format!(
+                "{e:#}; run clank setup{}",
+                if label == "default" {
+                    String::new()
+                } else {
+                    format!(" --grok-agent {label} --repo <repo>")
+                }
+            ),
+        ),
+    };
+    let advertised = if capabilities.candidate {
+        CheckResult::ok(
+            section,
+            format!("Grok {label} advertised gates"),
+            capabilities.description(),
+        )
+    } else {
+        failure(
+            format!("Grok {label} advertised gates"),
+            capabilities.description(),
+        )
+    };
+    vec![
+        adapter,
+        advertised,
+        CheckResult::warn(
+            section,
+            format!("Grok {label} continuation evidence"),
+            "initialize does not advertise enabled background completion notifications or prove model reaction. Verify Grok's completion-to-model channel and a real delivered-work reaction before treating automatic wake as healthy; no delivery acknowledges work.",
+        ),
+    ]
 }
 
 /// Repo-scope checks. `home` is explicit (not read from `$HOME`)
@@ -579,13 +745,21 @@ fn user_checks() -> Vec<CheckResult> {
     // opencode agents never bind and never receive work, silently
     // (the wire is exit-0/empty by design).
     let claude_async = crate::cli::setup::probe_claude_asyncrewake() == Some(true);
+    // Grok assets follow the actual configured profiles below, rather than
+    // reporting a missing default home when setup targeted a custom home.
     let setup_manifest = crate::cli::setup::load_manifest(&home);
-    for asset in crate::cli::setup::user_asset_inventory(claude_async) {
+    for asset in crate::cli::setup::user_asset_inventory(claude_async)
+        .into_iter()
+        .filter(|a| !a.rel.starts_with(".grok/"))
+    {
         out.push(check_setup_asset(&home, &asset, &setup_manifest));
     }
     // The pre-split `clank` skill must be gone — left in place it
     // shadows the role skills with stale, role-jamming guidance.
-    for (_, tool_dir) in crate::cli::setup::TOOL_SKILL_DIRS {
+    for (tool, tool_dir) in crate::cli::setup::TOOL_SKILL_DIRS {
+        if tool == clank_core::Tool::Grok {
+            continue;
+        }
         let obsolete = home.join(format!("{tool_dir}/skills/clank"));
         if obsolete.join("SKILL.md").exists() {
             out.push(CheckResult::warn(

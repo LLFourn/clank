@@ -26,6 +26,9 @@ pub mod feedback;
 pub mod finish;
 pub mod fork;
 pub mod github;
+pub(crate) mod grok_handoff;
+pub(crate) mod grok_launch;
+pub(crate) mod grok_setup;
 pub mod html;
 pub mod html_highlight;
 pub mod init;
@@ -504,6 +507,13 @@ pub struct StatusArgs {
     /// says so on stderr. Conflicts with --json/--watch/--plan.
     #[arg(long, conflicts_with_all = ["json", "watch", "plan"])]
     pub tui: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct GrokWaitArgs {
+    /// Filled by the native PreToolUse adapter, never guessed by the model.
+    pub key: Option<String>,
+    pub generation: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1057,6 +1067,12 @@ pub struct DoctorArgs {
 
 #[derive(Args, Debug)]
 pub struct SetupArgs {
+    /// Install Grok assets for this repo's configured Grok agent/profile.
+    #[arg(long, value_name = "LABEL")]
+    pub grok_agent: Option<String>,
+    /// Repo used by --grok-agent. Defaults to the current repo.
+    #[arg(long, value_name = "PATH", requires = "grok_agent")]
+    pub repo: Option<PathBuf>,
     /// Overwrite skill/command files even if they've drifted
     /// from the embedded content (e.g. user manually edited).
     /// Hook entries in settings.json / hooks.json are always

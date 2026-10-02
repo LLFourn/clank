@@ -480,7 +480,7 @@ fn ensure_dir_with(
 /// published anyway (codex on dab07ce). The achieved mode is read back
 /// rather than assumed, because a chmod that reports success on an
 /// unusual filesystem still has to produce the mode we need.
-fn restrict(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn restrict(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
