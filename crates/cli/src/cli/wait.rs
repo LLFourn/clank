@@ -2563,11 +2563,10 @@ mod shared_tests {
     ///
     /// Sharing refusals must be the GUARD talking and not a failure to
     /// connect, so the fixture is a monitor that would say yes.
-    fn repo_with_a_willing_monitor() -> (tempfile::TempDir, tempfile::TempDir) {
+    fn repo_with_a_willing_monitor() -> (crate::cli::monitor::TempRepo, tempfile::TempDir) {
         use std::io::{BufRead, BufReader, Write};
 
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        let repo = crate::cli::monitor::TempRepo::new();
         let dir = tempfile::tempdir().unwrap();
         let socket = crate::cli::monitor::socket_path(dir.path(), 4242).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();

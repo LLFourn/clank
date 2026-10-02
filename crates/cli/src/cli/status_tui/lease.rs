@@ -53,7 +53,10 @@ impl Holder {
 }
 
 fn lock_path(repo: &Path) -> std::path::PathBuf {
-    repo.join(".clank").join("status-tui.lock")
+    // Beside the monitor's runtime state rather than in the repo: it
+    // has no meaning once this process is gone, and in the repo its
+    // visibility to git depended on each one's `.clank/.gitignore`.
+    crate::cli::monitor::runtime_path(repo, "status")
 }
 
 /// Take the repo's status lease, or report who has it.
@@ -66,9 +69,7 @@ pub(super) fn acquire(repo: &Path) -> Result<StatusLease, String> {
     use std::io::Write;
     use std::os::fd::AsRawFd;
     let path = lock_path(repo);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    crate::cli::monitor::ensure_runtime_dir()?;
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -130,10 +131,80 @@ pub(super) fn busy_message(holder: Option<Holder>) -> String {
 mod tests {
     use super::*;
 
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
-        dir
+    use crate::cli::monitor::TempRepo;
+
+    fn repo() -> TempRepo {
+        TempRepo::new()
+    }
+
+    /// A repo with NO `.clank/.gitignore` stays clean while BOTH a
+    /// monitor and a panel hold their state.
+    ///
+    /// The shape that produced the plan: a fork from a repo that never
+    /// had that file. It propagates by being TRACKED, so the new
+    /// worktree had no ignore rule and nothing in it could add one,
+    /// and two untracked runtime files appeared in every such team.
+    /// No ignore rule here, deliberately — the point is that none is
+    /// needed.
+    ///
+    /// Composed HERE, in the status lease's own module, because the
+    /// real `acquire` is what has to be driven. The first version of
+    /// this lived beside the monitor and stood the panel in with a
+    /// bare `fs::write` to the path the lease was expected to use —
+    /// which asserts the test's own belief about that path and nothing
+    /// about the code. A regression putting the status lease back
+    /// under `.clank/status-tui.lock` passed it (codex on 9dfc3e3).
+    #[test]
+    fn a_repo_with_no_ignore_rules_stays_clean_while_both_guards_are_held() {
+        use crate::cli::monitor;
+
+        let repo = TempRepo::new();
+        assert!(
+            !repo.path().join(".clank/.gitignore").exists(),
+            "the fixture is the repo that has none"
+        );
+        let before: Vec<String> = entries(repo.path());
+
+        // Both real holders, at once, in the order a session takes
+        // them.
+        let _monitor = monitor::acquire_lease(repo.path()).expect("the monitor owns it");
+        monitor::publish(
+            repo.path(),
+            &monitor::describe(repo.path(), 4242, Path::new("/tmp/x.sock")),
+        )
+        .expect("and publishes where a client will look");
+        let _panel = acquire(repo.path()).expect("and the panel takes its lease");
+
+        assert!(
+            entries(&repo.path().join(".clank")).is_empty(),
+            "a running monitor and a live panel left {:?} in `.clank/`",
+            entries(&repo.path().join(".clank"))
+        );
+        assert_eq!(
+            entries(repo.path()),
+            before,
+            "and nothing new anywhere else in the working tree either"
+        );
+        // The state still EXISTS, outside the repo, or this would pass
+        // for a build that simply stopped keeping any.
+        assert!(monitor::read_published(repo.path()).is_some(), "findable");
+        assert!(
+            acquire(repo.path()).is_err(),
+            "and the panel's lease is really held"
+        );
+    }
+
+    /// What a directory holds, sorted, or nothing when it is absent.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
     }
 
     /// One TUI per repo, and the second is told where the first is.
@@ -193,15 +264,20 @@ mod tests {
     #[test]
     fn an_unusable_lock_refuses_out_loud() {
         let dir = tempfile::tempdir().unwrap();
-        // `.clank` as a FILE: the lock path cannot be created under it.
-        std::fs::write(dir.path().join(".clank"), b"not a directory").unwrap();
+        // A DIRECTORY where this repo's lock file belongs, so the lock
+        // cannot be opened. Scoped to this repo's own runtime path
+        // rather than to the shared namespace, which other tests use.
+        crate::cli::monitor::ensure_runtime_dir().unwrap();
+        let at = crate::cli::monitor::runtime_path(dir.path(), "status");
+        std::fs::create_dir_all(&at).unwrap();
         let refused = acquire(dir.path()).expect_err("no lock, no lease");
+        // Before the assertions, so a failing one does not leave a
+        // DIRECTORY in the shared namespace at a name a later caller
+        // would then find unopenable.
+        std::fs::remove_dir(&at).unwrap();
+        assert!(refused.contains(".status"), "names the path: {refused}");
         assert!(
-            refused.contains("status-tui.lock"),
-            "names the path: {refused}"
-        );
-        assert!(
-            refused.len() > "status-tui.lock".len() + 20,
+            refused.len() > at.display().to_string().len() + 20,
             "and the cause, not a bare path: {refused}"
         );
         assert!(

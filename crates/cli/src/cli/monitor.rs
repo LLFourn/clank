@@ -241,8 +241,10 @@ pub(crate) fn dir_is_acceptable(owner_uid: u32, mode: u32, me: u32) -> bool {
 /// can carry the version and the fold a client needs before it even
 /// connects.
 ///
-/// It lives in the repo (`.clank/monitor.json`), where PATH_MAX applies
-/// rather than `sun_path`, so depth is not a problem for a plain file.
+/// It lives OUTSIDE the repo, in this uid's [`runtime_dir`] keyed by
+/// [`repo_tag`], because it means nothing once its monitor is gone. As
+/// a plain file it is bound by PATH_MAX rather than `sun_path`, so
+/// neither the repo's depth nor the namespace's costs anything.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Descriptor {
     pub(crate) proto: u32,
@@ -373,6 +375,51 @@ fn vet_dir(dir: &std::path::Path, md: &std::fs::Metadata, me: u32) -> Result<(),
         md.uid(),
         md.mode() & 0o777
     ))
+}
+
+/// What a READ-ONLY look at a runtime namespace established.
+///
+/// Separate from [`ensure_dir`] because discovery must not create. A
+/// client asking where a monitor is has no business making a directory,
+/// and requiring write access to find out would make a read-only repo
+/// undiscoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Trust {
+    /// Ours, and the same ownership/mode policy a mutation demands.
+    Ours,
+    /// Not there. An ordinary absence: nothing is published.
+    Absent,
+    /// There and NOT ours. The string says why.
+    Theirs(String),
+}
+
+/// Whether a runtime namespace is ours to trust, creating nothing.
+///
+/// The read half of the boundary, and the half this plan nearly
+/// shipped without. Moving the descriptor out of a repo we own and
+/// into a PREDICTABLE path under world-writable `/tmp` means another
+/// uid can get there first: create `/tmp/clank-run-<our-uid>`, leave a
+/// descriptor naming the right repo and proto, and point `socket` at
+/// theirs. Matching fields are not evidence of who wrote them. Our
+/// client would then read it and connect before any mutation guard ran
+/// — refusing to PUBLISH into a planted namespace does nothing about
+/// consuming what is already in it (codex on 9dfc3e3).
+///
+/// Vetted with `vet_dir`, so it is the one policy and not a second
+/// opinion: `symlink_metadata` refuses an indirection, and for a real
+/// directory we own `/tmp`'s sticky bit stops anyone else replacing it
+/// between this answer and the read that follows.
+pub(crate) fn trusted_dir(dir: &std::path::Path, me: u32) -> Trust {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) => match vet_dir(dir, &md, me) {
+            Ok(()) => Trust::Ours,
+            Err(why) => Trust::Theirs(why),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Trust::Absent,
+        // Not an absence: something is there that cannot be vetted,
+        // and reading through it is the thing being prevented.
+        Err(e) => Trust::Theirs(format!("cannot stat {}: {e}", dir.display())),
+    }
 }
 
 /// Create a socket directory, or accept an existing one.
@@ -1212,6 +1259,28 @@ pub(crate) fn look_at(
         std::time::Instant,
     ) -> std::io::Result<std::os::unix::net::UnixStream>,
 ) -> Seen {
+    look_at_in(
+        &runtime_dir(unsafe { libc::getuid() }),
+        repo,
+        who,
+        budget,
+        connect,
+    )
+}
+
+/// [`look_at`] with the namespace supplied, so a test can plant a
+/// descriptor in one we must not read and watch `connect` stay
+/// untouched.
+pub(crate) fn look_at_in(
+    namespace: &std::path::Path,
+    repo: &std::path::Path,
+    who: Who,
+    budget: Duration,
+    connect: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream>,
+) -> Seen {
     let deadline = std::time::Instant::now() + budget;
     // The descriptor is a HINT about where to knock, not a gate.
     //
@@ -1222,9 +1291,18 @@ pub(crate) fn look_at(
     // c4b5899). The repo still gates — a descriptor outlives the repo
     // it describes — and the VERSION is settled by the handshake,
     // where both ends can act on it.
-    let (socket, hint) = match published(repo) {
+    let (socket, hint) = match published_in(namespace, repo, unsafe { libc::getuid() }) {
         Published::Nothing => {
             return Seen::Vacant(format!("no monitor published for {}", repo.display()));
+        }
+        // An address from a namespace we do not own is not an address.
+        // Unproven rather than Vacant: starting a monitor would need
+        // the lease, which lives in the same namespace and is refused
+        // for the same reason, so the honest answer is to go alone.
+        Published::Untrusted(why) => {
+            return Seen::Unproven(format!(
+                "this uid's runtime namespace is not ours to read: {why}"
+            ));
         }
         Published::Ours(d) if !serves(repo, &d.repo) => {
             // A descriptor for a repo this is not. Nothing is serving
@@ -1357,17 +1435,100 @@ pub(crate) struct RepairPermit {
     _file: std::fs::File,
 }
 
-/// Where a repair gate lives, for a uid.
+/// Where this uid's RUNTIME state lives: the descriptor, the monitor
+/// lease, the repair gate and the status lease.
+///
+/// Outside the repo, because none of it means anything once its
+/// process is gone — and because whether git could see it depended on
+/// each repo's `.clank/.gitignore`, a file that propagates by being
+/// TRACKED. A fork from a repo that never had one started dirty and
+/// nothing in the new worktree fixed it.
 ///
 /// FIXED, and deliberately independent of the environment. Socket
 /// allocation may try candidates because the published descriptor then
-/// tells everyone which was chosen; a coordination lock has no such
-/// discovery, so every caller must derive the SAME path or the gate is
-/// not a gate. Two clients differing only in `XDG_RUNTIME_DIR` each
-/// took a permit in a different directory, locked different inodes,
+/// tells everyone which was chosen; a rendezvous has no such
+/// discovery, so every caller must derive the SAME path or it is not
+/// one. Two clients differing only in `XDG_RUNTIME_DIR` each took a
+/// repair permit in a different directory, locked different inodes,
 /// and both forked (codex on 88b6234).
-pub(crate) fn repair_dir(me: u32) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("/tmp/clank-repair-{me}"))
+pub(crate) fn runtime_dir(me: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/tmp/clank-run-{me}"))
+}
+
+/// Vet and create this uid's runtime directory.
+///
+/// For the MUTATION boundaries only. Discovery derives a path without
+/// it, so a read-only lookup never has to make a directory to find out
+/// where something would be.
+pub(crate) fn ensure_runtime_dir() -> Result<(), String> {
+    let me = unsafe { libc::getuid() };
+    ensure_dir(&runtime_dir(me), me)
+}
+
+/// This repo's runtime path with the given extension.
+///
+/// Derivation ONLY: it creates nothing and needs no write access, so a
+/// read-only lookup — which is what discovery is — can ask where a
+/// descriptor would be without making a directory to find out. The
+/// mutation boundaries vet and create (codex on 2a0c59a).
+pub(crate) fn runtime_path(repo: &std::path::Path, ext: &str) -> std::path::PathBuf {
+    runtime_path_in(&runtime_dir(unsafe { libc::getuid() }), repo, ext)
+}
+
+/// [`runtime_path`] with the namespace supplied.
+///
+/// The derivation itself, so a test can hand it a directory that does
+/// NOT exist and watch it stay that way. Asking against the real
+/// namespace proves nothing: other tests have already created it.
+pub(crate) fn runtime_path_in(
+    dir: &std::path::Path,
+    repo: &std::path::Path,
+    ext: &str,
+) -> std::path::PathBuf {
+    dir.join(format!("{}.{ext}", repo_tag(repo)))
+}
+
+/// A temp repo that takes its RUNTIME entries with it.
+///
+/// The namespace outlives the repo it is keyed by, which is the whole
+/// point — and which means a tempdir that used to carry its lock away
+/// now leaves one behind. Production's set is bounded by the repos on
+/// the machine; a suite that makes a fresh repo per test is bounded by
+/// nothing, and left about four hundred entries per run.
+///
+/// Lives here rather than in each test module because there is one
+/// namespace, and a second copy of this list would be a second answer
+/// to the same question.
+///
+/// Unlinking is safe HERE and not in production: the name is derived
+/// from this tempdir's own path, so no other repo's lease can be at it,
+/// and drop order releases a lease declared after the repo before this
+/// runs. In production, unlinking a lock a holder still has open would
+/// let the next caller lock a different inode at the same name — which
+/// is why nothing sweeps this directory.
+#[cfg(test)]
+pub(crate) struct TempRepo(tempfile::TempDir);
+
+#[cfg(test)]
+impl TempRepo {
+    pub(crate) fn new() -> Self {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".clank")).unwrap();
+        Self(d)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempRepo {
+    fn drop(&mut self) {
+        for ext in ["json", "lock", "status", "repair"] {
+            let _ = std::fs::remove_file(runtime_path(self.0.path(), ext));
+        }
+    }
 }
 
 /// What asking for the repair gate established.
@@ -1388,7 +1549,7 @@ pub(crate) enum Repair {
 /// Take this repo's repair gate.
 pub(crate) fn take_repair_permit(repo: &std::path::Path) -> Repair {
     let me = unsafe { libc::getuid() };
-    take_repair_permit_in(repo, &repair_dir(me), me)
+    take_repair_permit_in(repo, &runtime_dir(me), me)
 }
 
 /// [`take_repair_permit`] with the namespace supplied, so a test can
@@ -1887,16 +2048,6 @@ pub(crate) fn spawn_monitor(repo: &std::path::Path) -> std::io::Result<Box<dyn S
         .map(|child| Box::new(Spawned(child)) as Box<dyn Started>)
 }
 
-/// Where a repo's lease and descriptor live. Plain files, bound by
-/// PATH_MAX rather than `sun_path`, so the repo's depth costs nothing.
-fn lock_path(repo: &std::path::Path) -> std::path::PathBuf {
-    repo.join(".clank").join("monitor.lock")
-}
-
-fn descriptor_path(repo: &std::path::Path) -> std::path::PathBuf {
-    repo.join(".clank").join("monitor.json")
-}
-
 /// Held for the life of the monitor. Dropping it — including by dying —
 /// frees it, so there is no stale-holder protocol to get wrong.
 #[derive(Debug)]
@@ -1911,12 +2062,31 @@ pub(crate) struct MonitorLease {
 /// The pid in the descriptor is for diagnostics and is never the
 /// authority — a pid can be reused, a lease cannot.
 pub(crate) fn acquire_lease(repo: &std::path::Path) -> Result<MonitorLease, String> {
+    let me = unsafe { libc::getuid() };
+    acquire_lease_in(repo, &runtime_dir(me), me)
+}
+
+/// [`acquire_lease`] with the namespace supplied, so a test can hand it
+/// one it must refuse.
+///
+/// A namespace we cannot vet is an ERROR here, not a fallback to
+/// somewhere else. The socket may try candidates because the published
+/// descriptor then says which was chosen; a lease has no such
+/// discovery, so a second path is not a degraded lease but a second
+/// lease. The monitor therefore refuses to start and says why — and the
+/// CLIENT is what degrades, to `Attached::Alone`, watching the repo
+/// itself exactly as it does when no socket directory is usable.
+pub(crate) fn acquire_lease_in(
+    repo: &std::path::Path,
+    dir: &std::path::Path,
+    me: u32,
+) -> Result<MonitorLease, String> {
     use std::os::fd::AsRawFd;
 
-    let path = lock_path(repo);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Err(why) = ensure_dir(dir, me) {
+        return Err(format!("cannot use this uid's runtime directory: {why}"));
     }
+    let path = runtime_path_in(dir, repo, "lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1949,10 +2119,30 @@ pub(crate) fn acquire_lease(repo: &std::path::Path) -> Result<MonitorLease, Stri
 /// Rename is atomic within a directory, so a reader sees one whole
 /// descriptor or the previous one (codex on 06ccd66).
 pub(crate) fn publish(repo: &std::path::Path, d: &Descriptor) -> std::io::Result<()> {
-    let final_path = descriptor_path(repo);
-    if let Some(parent) = final_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let me = unsafe { libc::getuid() };
+    publish_in(repo, &runtime_dir(me), me, d)
+}
+
+/// [`publish`] with the namespace supplied, so a test can hand it one
+/// it must refuse.
+///
+/// Vetted, like every other mutation boundary in this namespace, and
+/// for a sharper reason than the others: the descriptor is how a
+/// client FINDS the socket. A directory another uid planted in
+/// world-writable `/tmp` would take a descriptor naming THEIR socket,
+/// and every client would connect to it. An unvetted `create_dir_all`
+/// was also a way to create the namespace at the umask's mode — 0o775
+/// under 002 — which `dir_is_acceptable` then refuses forever, so the
+/// first publish on such a machine locked every later lease out of its
+/// own directory.
+pub(crate) fn publish_in(
+    repo: &std::path::Path,
+    dir: &std::path::Path,
+    me: u32,
+    d: &Descriptor,
+) -> std::io::Result<()> {
+    ensure_dir(dir, me).map_err(std::io::Error::other)?;
+    let final_path = runtime_path_in(dir, repo, "json");
     // Named for the writer so a stray temp from a dead monitor cannot
     // be mistaken for this one's.
     let tmp = final_path.with_extension(format!("json.tmp.{}", std::process::id()));
@@ -1981,6 +2171,11 @@ pub(crate) enum Published {
     Other { proto: u32, socket: Option<String> },
     /// Nothing there, or nothing readable even as a version.
     Nothing,
+    /// The NAMESPACE is not ours, so nothing read from it is evidence
+    /// of anything. Distinct from `Nothing` because an absence invites
+    /// starting a monitor and this does not: the lease lives in the
+    /// same namespace and cannot be taken either.
+    Untrusted(String),
 }
 
 /// Read the descriptor VERSION FIRST, as every frame on the socket is.
@@ -1992,7 +2187,19 @@ pub(crate) enum Published {
 /// one. Collapsing them is how a successor would spawn against a live
 /// holder for ever (codex on 258d979).
 pub(crate) fn published(repo: &std::path::Path) -> Published {
-    let Ok(raw) = std::fs::read(descriptor_path(repo)) else {
+    let me = unsafe { libc::getuid() };
+    published_in(&runtime_dir(me), repo, me)
+}
+
+/// [`published`] with the namespace supplied, so a test can hand it one
+/// it must refuse.
+pub(crate) fn published_in(dir: &std::path::Path, repo: &std::path::Path, me: u32) -> Published {
+    match trusted_dir(dir, me) {
+        Trust::Ours => {}
+        Trust::Absent => return Published::Nothing,
+        Trust::Theirs(why) => return Published::Untrusted(why),
+    }
+    let Ok(raw) = std::fs::read(runtime_path_in(dir, repo, "json")) else {
         return Published::Nothing;
     };
     let Ok(envelope) = serde_json::from_slice::<Envelope>(&raw) else {
@@ -2664,7 +2871,7 @@ fn beats(fs_rx: std::sync::mpsc::Receiver<()>, tick: Duration) -> tokio::sync::m
     rx
 }
 
-fn describe(repo: &std::path::Path, pid: i32, socket: &std::path::Path) -> Descriptor {
+pub(crate) fn describe(repo: &std::path::Path, pid: i32, socket: &std::path::Path) -> Descriptor {
     Descriptor {
         proto: PROTO,
         pid,
@@ -3480,7 +3687,7 @@ mod tests {
 
         // A shape this build does not share, carrying a number it can.
         std::fs::write(
-            repo.path().join(".clank/monitor.json"),
+            runtime_path(repo.path(), "json"),
             r#"{"proto":3,"pid":7,"repo":"/w","socket":"/tmp/old.sock","fold":{"tick":1,"at_ms":2}}"#,
         )
         .unwrap();
@@ -3501,7 +3708,7 @@ mod tests {
         // Our own number on a body we cannot read is also not an
         // absence: something is there and it is not what it says.
         std::fs::write(
-            repo.path().join(".clank/monitor.json"),
+            runtime_path(repo.path(), "json"),
             format!(r#"{{"proto":{PROTO},"wrong":"shape"}}"#),
         )
         .unwrap();
@@ -4776,10 +4983,8 @@ mod tests {
         assert_eq!(back, d);
     }
 
-    fn repo_dir() -> tempfile::TempDir {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join(".clank")).unwrap();
-        d
+    fn repo_dir() -> TempRepo {
+        TempRepo::new()
     }
 
     fn descriptor_for(repo: &std::path::Path) -> Descriptor {
@@ -5763,6 +5968,248 @@ mod tests {
         );
     }
 
+    /// The runtime namespace is derived, not created, by a LOOKUP.
+    ///
+    /// Discovery is read-only: it must be able to ask where a
+    /// descriptor would be without making a directory to find out, and
+    /// without write access (codex on 2a0c59a).
+    #[test]
+    fn a_lookup_creates_nothing() {
+        let repo = repo_dir();
+        let at = runtime_path(repo.path(), "json");
+        assert!(at.is_absolute());
+        assert!(!at.starts_with(repo.path()), "and never inside the repo");
+
+        // Against a namespace that does NOT exist, because the real
+        // one does: other tests created it, so asking there proves
+        // nothing either way.
+        let fresh = tempfile::tempdir().unwrap();
+        let absent = fresh.path().join("not-made-yet");
+        let at = runtime_path_in(&absent, repo.path(), "json");
+        assert!(
+            !absent.exists(),
+            "deriving a path must not create the directory it is in"
+        );
+        assert!(at.starts_with(&absent));
+        // And a read of a missing descriptor is an absence, not a
+        // reason to make anything.
+        assert_eq!(published(repo.path()), Published::Nothing);
+    }
+
+    /// A descriptor from a namespace that is not ours never becomes an
+    /// address.
+    ///
+    /// The read half of the trust boundary, and the half this plan
+    /// nearly shipped without. The descriptor used to live in a repo
+    /// we owned; it now lives at a PREDICTABLE path under
+    /// world-writable `/tmp`, so another uid can get there first and
+    /// leave one naming the right repo and proto with `socket`
+    /// pointing at theirs. Matching fields are not evidence of who
+    /// wrote them, and refusing to PUBLISH into a planted namespace
+    /// does nothing about consuming what is already in it (codex on
+    /// 9dfc3e3).
+    ///
+    /// Driven through `look_at_in` with a connect SPY, because the vet
+    /// returning the right answer proves nothing about whether
+    /// discovery asks it: the bug is a client that connects.
+    #[test]
+    fn a_planted_descriptor_never_reaches_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let repo = repo_dir();
+        let me = unsafe { libc::getuid() };
+        let d = describe(repo.path(), 4242, std::path::Path::new("/tmp/planted.sock"));
+        let home = tempfile::tempdir().unwrap();
+
+        let tries = AtomicUsize::new(0);
+        let spy = |_: &std::path::Path, _: std::time::Instant| {
+            tries.fetch_add(1, SeqCst);
+            Err::<std::os::unix::net::UnixStream, _>(std::io::Error::other("the spy never dials"))
+        };
+        let budget = Duration::from_millis(50);
+        let plant = |dir: &std::path::Path, mode: u32| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                runtime_path_in(dir, repo.path(), "json"),
+                serde_json::to_vec(&d).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        // Writable by anyone, so anyone could have left that descriptor.
+        let open = home.path().join("open");
+        plant(&open, 0o777);
+        assert!(
+            matches!(
+                published_in(&open, repo.path(), me),
+                Published::Untrusted(_)
+            ),
+            "a namespace others can write is not evidence"
+        );
+        assert!(matches!(
+            look_at_in(&open, repo.path(), agent("codex"), budget, &spy),
+            Seen::Unproven(_)
+        ));
+
+        // A symlink INTO a directory we own, which reads back as ours
+        // unless the final component is left unfollowed — and whose
+        // owner may replace it later even under a sticky `/tmp`.
+        let real = home.path().join("real");
+        plant(&real, 0o700);
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            matches!(
+                published_in(&link, repo.path(), me),
+                Published::Untrusted(_)
+            ),
+            "an indirection is refused on the strength of the link, not its target"
+        );
+        assert!(matches!(
+            look_at_in(&link, repo.path(), agent("codex"), budget, &spy),
+            Seen::Unproven(_)
+        ));
+
+        // Missing is an ordinary absence, and reading makes nothing.
+        let absent = home.path().join("absent");
+        assert_eq!(published_in(&absent, repo.path(), me), Published::Nothing);
+        assert!(!absent.exists(), "a read must not create the namespace");
+        assert!(matches!(
+            look_at_in(&absent, repo.path(), agent("codex"), budget, &spy),
+            Seen::Vacant(_)
+        ));
+
+        assert_eq!(
+            tries.load(SeqCst),
+            0,
+            "no descriptor from an untrusted or absent namespace may be dialled"
+        );
+
+        // And one we DO own is still used, so the refusals above are
+        // the boundary working rather than discovery being broken.
+        assert!(matches!(
+            published_in(&real, repo.path(), me),
+            Published::Ours(_)
+        ));
+        let _ = look_at_in(&real, repo.path(), agent("codex"), budget, &spy);
+        assert!(
+            tries.load(SeqCst) > 0,
+            "a trusted descriptor is an address, and gets knocked on"
+        );
+    }
+
+    /// EVERY mutation boundary in the runtime namespace vets it.
+    ///
+    /// One rule, driven at all three call sites rather than at the
+    /// helper, because a boundary that skips the vet is the bug and the
+    /// helper cannot tell you whether anyone called it.
+    ///
+    /// It matters more here than it did in the repo. `/tmp` is
+    /// world-writable, so a directory another uid plants there is a
+    /// directory we would otherwise write into — and the descriptor is
+    /// the DISCOVERY record, so theirs would name their socket and
+    /// every client would connect to it. 0o777 is also what a 002
+    /// umask leaves behind, so the same fixture is both the attack and
+    /// the accident: an unvetted `create_dir_all` could make the
+    /// namespace at a mode every vetted caller then refuses forever.
+    #[test]
+    fn every_mutation_boundary_refuses_a_namespace_it_cannot_vet() {
+        let repo = repo_dir();
+        let me = unsafe { libc::getuid() };
+        let d = describe(repo.path(), 4242, std::path::Path::new("/tmp/x.sock"));
+
+        let home = tempfile::tempdir().unwrap();
+        let open = home.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            !dir_is_acceptable(me, 0o777, me),
+            "the fixture plants a mode the vet rejects"
+        );
+
+        let refused = publish_in(repo.path(), &open, me, &d).expect_err("no descriptor");
+        assert!(
+            format!("{refused}").contains("mode"),
+            "and it says what was wrong: {refused}"
+        );
+        let refused = acquire_lease_in(repo.path(), &open, me).expect_err("no lease");
+        assert!(refused.contains("mode"), "{refused}");
+        let refused = take_repair_permit_in(repo.path(), &open, me);
+        assert!(
+            matches!(&refused, Repair::Unavailable(why) if why.contains("mode")),
+            "{refused:?}"
+        );
+
+        assert!(
+            std::fs::read_dir(&open).unwrap().next().is_none(),
+            "and not one of them left a file there: no client can be pointed at a \
+             planted socket, and no lease was taken beside somebody else's"
+        );
+
+        // A namespace they accept gets everything, so the refusals
+        // above are the vet working and not these three being broken.
+        let mine = home.path().join("mine");
+        publish_in(repo.path(), &mine, me, &d).expect("its own 0o700 namespace is fine");
+        let _lease = acquire_lease_in(repo.path(), &mine, me).expect("and the lease");
+        assert!(matches!(
+            take_repair_permit_in(repo.path(), &mine, me),
+            Repair::Acquired(_)
+        ));
+        assert!(runtime_path_in(&mine, repo.path(), "json").exists());
+    }
+
+    /// The supported upgrade, and the rollback's HONEST limit.
+    ///
+    /// This is a cutover: after it, a binary predating it is not
+    /// supported running concurrently, and two monitors could own one
+    /// repo in that configuration. The plan does not claim otherwise,
+    /// so the test does not either — it records what rollback actually
+    /// does rather than leaving the limitation to a sentence somebody
+    /// may not read (codex on c0ebe23).
+    #[test]
+    fn the_cutover_is_exclusive_among_supported_binaries_and_not_across_it() {
+        let repo = repo_dir();
+        ensure_runtime_dir().unwrap();
+
+        // Supported: two of THIS version cannot both own a repo.
+        let held = acquire_lease(repo.path()).expect("the first owns it");
+        assert!(
+            acquire_lease(repo.path()).is_err(),
+            "one monitor per repo, which is the whole authority"
+        );
+        drop(held);
+        assert!(
+            acquire_lease(repo.path()).is_ok(),
+            "and it frees when the owner goes"
+        );
+
+        // Across the cutover: a pre-cutover binary locked
+        // `.clank/monitor.lock`, which this one never touches. Both
+        // can hold their own. Asserted so the limitation is a recorded
+        // fact rather than a claim nobody checked.
+        let legacy = repo.path().join(".clank").join("monitor.lock");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let old = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&legacy)
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: valid owned fd; flock has no memory effects.
+        let rc = unsafe { libc::flock(old.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "a pre-cutover binary takes the old path");
+        assert!(
+            acquire_lease(repo.path()).is_ok(),
+            "and this one takes the new one regardless — which is why a pre-cutover \
+             binary must be retired at install rather than left running"
+        );
+    }
+
     /// The gate has ONE identity, whatever the environment says.
     ///
     /// Socket allocation may try candidates because the published
@@ -5771,15 +6218,15 @@ mod tests {
     /// `XDG_RUNTIME_DIR` each took a permit in a different directory,
     /// locked different inodes, and both forked (codex on 88b6234).
     #[test]
-    fn the_repair_gate_does_not_move_with_the_environment() {
+    fn the_runtime_namespace_does_not_move_with_the_environment() {
         assert_eq!(
-            repair_dir(501),
-            std::path::PathBuf::from("/tmp/clank-repair-501"),
+            runtime_dir(501),
+            std::path::PathBuf::from("/tmp/clank-run-501"),
             "fixed per uid, and derived from nothing else"
         );
         assert_ne!(
-            repair_dir(501),
-            repair_dir(502),
+            runtime_dir(501),
+            runtime_dir(502),
             "but not shared between users"
         );
 
@@ -5795,7 +6242,7 @@ mod tests {
         // which a mutation duly did.
         let repo = repo_dir();
         let me = unsafe { libc::getuid() };
-        let gate = repair_dir(me).join(format!("{}.repair", repo_tag(repo.path())));
+        let gate = runtime_dir(me).join(format!("{}.repair", repo_tag(repo.path())));
         let _ = std::fs::remove_file(&gate);
         let held = take_repair_permit(repo.path());
         assert!(matches!(held, Repair::Acquired(_)), "{held:?}");
@@ -6325,7 +6772,7 @@ mod tests {
     async fn a_second_contender_starts_nothing_while_the_first_repairs() {
         let repo = repo_dir();
         let me = unsafe { libc::getuid() };
-        let gate = match take_repair_permit_in(repo.path(), &repair_dir(me), me) {
+        let gate = match take_repair_permit_in(repo.path(), &runtime_dir(me), me) {
             Repair::Acquired(p) => p,
             other => panic!("the first contender takes it: {other:?}"),
         };
