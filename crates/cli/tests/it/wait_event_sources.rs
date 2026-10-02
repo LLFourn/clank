@@ -162,17 +162,70 @@ async fn a_command_event_during_the_refold_is_not_lost() {
         .expect("returns a combined result");
 }
 
+/// `--peek` returns the DELIBERATE no-work outcome and starts nothing.
+///
+/// Two claims, and the first is what makes the second mean anything.
+/// This test used to assert only that a marker file was absent, after
+/// an `.expect("peek returns")` that had already stopped holding —
+/// an empty peek is `WaitNoWork` BY DESIGN, so the test failed before
+/// reaching the assertion it is named for. Making the verdict "either
+/// outcome" would have been worse: a broken fixture, an identity it
+/// could not resolve or a fold that failed all leave the marker absent
+/// too, so the test would pass without ever entering the peek branch
+/// (codex on fbb84e3).
+///
+/// The outcome is identified by the code it EXITS with rather than by
+/// its message: 3 is `WaitNoWork` and every other failure is 1, so
+/// this distinguishes the intended answer from an arbitrary one without
+/// reading an error chain that carries our own argv.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peek_starts_no_command_source() {
-    // --peek returns from the initial pass, before sources spawn.
     let env = idle_env();
     let repo = env.repo();
     let marker = repo.join("source_ran.marker");
     let ev = cmd_event("touch", &["touch", marker.to_str().unwrap()]);
+
+    // The projection itself, positively: empty, and reached before any
+    // source derivation, monitor attach or watcher setup.
+    let starts = clank::cli::wait::SourceStarts::default();
+    let mut args = wait_args(repo, vec![ev.clone()]);
+    args.peek = true;
+    match clank::cli::wait::items_observing(args, &starts)
+        .await
+        .expect("peek projects rather than failing")
+    {
+        Some(items) => assert!(
+            items.is_empty(),
+            "an idle repo has no work to peek at, got {} item(s)",
+            items.len()
+        ),
+        None => panic!("peek must project; `None` is observer mode, which this is not"),
+    }
+
+    // And the command's verdict is the one the peek branch produces.
     let mut args = wait_args(repo, vec![ev]);
     args.peek = true;
-    clank::cli::wait::run(args).await.expect("peek returns");
-    // Give any (erroneously) spawned source a moment to run.
+    let refused = clank::cli::wait::run(args)
+        .await
+        .expect_err("an empty peek is an error by design, so the hook can branch on it");
+    assert_eq!(
+        clank::cli::command::exit_code_for(&refused),
+        3,
+        "the deliberate no-work exit, not an arbitrary failure: {refused:#}"
+    );
+
+    // The boundary itself, which is the only thing that can tell
+    // "never started" from "started and torn down before its command
+    // ran". The marker below cannot: with the peek return moved under
+    // the spawn, it caught the detached variant and missed the one
+    // that shut the tasks down.
+    assert_eq!(
+        starts.count(),
+        0,
+        "--peek must not reach the source-start boundary"
+    );
+
+    // And the child's own evidence, which agrees when it can.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!marker.exists(), "--peek must spawn no source");
 }

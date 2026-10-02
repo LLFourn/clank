@@ -2454,6 +2454,54 @@ fn attendance_changed(
     changed
 }
 
+/// What a turn asks for once its input has been processed.
+///
+/// Returned rather than applied, so a test can see what the turn
+/// DECIDED. The attendance check used to sit inline in the loop with
+/// its answer assigned straight to a local, which left the decision
+/// invisible from outside: the helper had six assertions and its call
+/// site had none, and deleting the call changed no test's verdict
+/// (codex on fbb84e3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnClose {
+    /// Whether a snapshot rebuild is owed after this turn.
+    refresh_pending: bool,
+    /// How many times the fingerprint was actually read. Zero when the
+    /// rate limit was not due, which is the property that keeps a key
+    /// storm from turning this into real work.
+    observed: usize,
+}
+
+/// Close a turn: the one input with no event behind it.
+///
+/// Runs on EVERY turn — timeout, key, resize and data wake alike —
+/// because a waiter being killed changes no file, so nothing else
+/// raises `refresh_pending` and the loop would repaint the snapshot it
+/// already holds. That is the bug this exists for: the panel showed a
+/// healthy row after the waiter had died, including across key
+/// repaints.
+///
+/// `refresh_pending` goes in and comes back so a rebuild already owed
+/// from this turn's own input cannot be lost here, and so the probe is
+/// visibly NOT conditional on whether one was.
+fn close_turn(
+    probe: &mut AttendanceProbe,
+    now: std::time::Instant,
+    every: Duration,
+    refresh_pending: bool,
+    observe: impl FnOnce() -> u64,
+) -> TurnClose {
+    let mut observed = 0usize;
+    let changed = attendance_changed(probe, now, every, || {
+        observed += 1;
+        observe()
+    });
+    TurnClose {
+        refresh_pending: refresh_pending || changed,
+        observed,
+    }
+}
+
 /// The loop's recv timeout: the `base` cadence (spinner tick when one is
 /// visible, else the idle backstop), shortened to the time left before a
 /// DEFERRED refresh may run — so a coalesced burst still rebuilds within
@@ -4458,15 +4506,15 @@ pub(crate) async fn run_tui(
             }
         }
 
-        // The one input with no event behind it. See `attendance_changed`.
-        if attendance_changed(
+        // Every turn ends here, whatever woke it. See `close_turn`.
+        refresh_pending = close_turn(
             &mut waker_probe,
             std::time::Instant::now(),
             REBUILD_MIN,
+            refresh_pending,
             || crate::cli::status::attendance_fingerprint(&repo),
-        ) {
-            refresh_pending = true;
-        }
+        )
+        .refresh_pending;
 
         // Trailing-edge refresh flush: the COALESCED snapshot rebuild, run
         // at most once per REBUILD_MIN (the only throttled work; keys and
@@ -6556,6 +6604,541 @@ pub(crate) mod tests {
             IDLE_TICK.as_secs(),
             crate::age::COARSE_RESOLUTION_SECS
         );
+    }
+
+    /// One significant token of Rust source.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Tok<'a> {
+        text: &'a str,
+        at: usize,
+    }
+
+    /// Production source as the TOKENS it is made of.
+    ///
+    /// The point is that every part of the wiring witness below reads
+    /// the same representation. The previous version counted braces
+    /// through a literal-aware scanner but LOCATED its landmarks with
+    /// `find` on raw text, and those two disagree: wrapping the whole
+    /// production assignment in `/* … */` stopped it executing while
+    /// the gate still found it, parsed its parentheses and read its
+    /// fields — restoring exactly the missing-call defect this is for.
+    /// The same split rejected valid code, because a comment inserted
+    /// between `status::` and `attendance_fingerprint` is the same
+    /// dependency and failed a `contains` (codex on 8045e76).
+    ///
+    /// So comments are DROPPED, not skipped-while-counting, and each
+    /// string or char literal collapses to one opaque token: a literal
+    /// containing an example call must not witness a call either.
+    /// Whitespace between tokens stops mattering by construction,
+    /// which is what makes a reflow harmless.
+    fn tokens(src: &str) -> Vec<Tok<'_>> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_whitespace() {
+                i += 1;
+            } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                i += b[i..]
+                    .iter()
+                    .position(|c| *c == b'\n')
+                    .unwrap_or(b.len() - i);
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                // Rust block comments nest.
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if let Some(next) = literal_end(b, i) {
+                out.push(Tok {
+                    text: "<lit>",
+                    at: i,
+                });
+                i = next;
+            } else if c.is_ascii_alphanumeric() || c == b'_' {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                out.push(Tok {
+                    text: &src[start..i],
+                    at: start,
+                });
+            } else {
+                out.push(Tok {
+                    text: &src[i..i + 1],
+                    at: i,
+                });
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Just past a string, byte-string, raw-string or char literal
+    /// starting at `i`, if one does.
+    ///
+    /// A lifetime is not a char literal: `'a` must stay two tokens, or
+    /// everything after it on the line is swallowed.
+    fn literal_end(b: &[u8], i: usize) -> Option<usize> {
+        let mut j = i;
+        if b[j] == b'b' {
+            j += 1;
+        }
+        if b.get(j) == Some(&b'r') {
+            let mut k = j + 1;
+            let mut hashes = 0;
+            while b.get(k) == Some(&b'#') {
+                hashes += 1;
+                k += 1;
+            }
+            if b.get(k) == Some(&b'"') {
+                let close: Vec<u8> = std::iter::once(b'"')
+                    .chain(std::iter::repeat_n(b'#', hashes))
+                    .collect();
+                let mut m = k + 1;
+                while m < b.len() && !b[m..].starts_with(&close) {
+                    m += 1;
+                }
+                return Some((m + close.len()).min(b.len()));
+            }
+            return None;
+        }
+        match b.get(j) {
+            Some(b'"') => {
+                let mut m = j + 1;
+                while m < b.len() && b[m] != b'"' {
+                    m += if b[m] == b'\\' { 2 } else { 1 };
+                }
+                Some((m + 1).min(b.len()))
+            }
+            Some(b'\'') => char_end(b, j),
+            _ => None,
+        }
+    }
+
+    /// Just past the char literal whose opening `'` is at `j`, or
+    /// `None` when that quote starts a LIFETIME instead.
+    ///
+    /// Scanned to the closing quote rather than assumed to be one
+    /// escape wide. `'\\n'` is four bytes but `'\\x7d'` is six and
+    /// `'\\u{7d}'` is eight — and both of those encode a BRACE, so
+    /// mis-lexing one emits a stray `}` that moves `pair_end`'s block
+    /// extent and with it the receive's end (ruthless on d1b9375).
+    ///
+    /// The lifetime case is why this cannot simply scan for the next
+    /// quote: `&'a str, '}'` would otherwise read as one literal
+    /// spanning both.
+    fn char_end(b: &[u8], j: usize) -> Option<usize> {
+        match b.get(j + 1)? {
+            // An escape. Bounded: the longest is `'\\u{10FFFF}'`.
+            b'\\' => {
+                // From j+3, not j+2: the character right after the
+                // backslash belongs to the escape, so in `'\\''` it is
+                // the quote being escaped and not the terminator.
+                let mut m = j + 3;
+                while m < b.len() && m <= j + 13 {
+                    if b[m] == b'\'' {
+                        return Some(m + 1);
+                    }
+                    m += 1;
+                }
+                None
+            }
+            // One ASCII character.
+            _ if b.get(j + 2) == Some(&b'\'') => Some(j + 3),
+            // One multi-byte character, whose width its lead byte gives.
+            lead if *lead >= 0x80 => {
+                let wide = match lead {
+                    0xF0..=0xF7 => 4,
+                    0xE0..=0xEF => 3,
+                    _ => 2,
+                };
+                (b.get(j + 1 + wide) == Some(&b'\'')).then_some(j + 2 + wide)
+            }
+            // `'a` and friends: a lifetime or a loop label.
+            _ => None,
+        }
+    }
+
+    /// Where `pattern` occurs as a run of tokens, if it does.
+    fn find_seq(toks: &[Tok<'_>], pattern: &[&str]) -> Option<usize> {
+        toks.windows(pattern.len())
+            .position(|w| w.iter().zip(pattern).all(|(t, p)| t.text == *p))
+    }
+
+    /// The token index just past the `lo`…`hi` pair opened at `open`.
+    fn pair_end(toks: &[Tok<'_>], open: usize, lo: &str, hi: &str) -> Option<usize> {
+        let mut depth = 0usize;
+        for (k, t) in toks.iter().enumerate().skip(open) {
+            if t.text == lo {
+                depth += 1;
+            } else if t.text == hi {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k + 1);
+                }
+            }
+        }
+        None
+    }
+
+    /// Net brace depth across the tokens in `range`.
+    fn depth_of(toks: &[Tok<'_>]) -> isize {
+        toks.iter().fold(0isize, |d, t| match t.text {
+            "{" => d + 1,
+            "}" => d - 1,
+            _ => d,
+        })
+    }
+
+    /// The tokeniser the wiring witness rests on, checked on the
+    /// decoys that would otherwise witness a call that cannot run.
+    #[test]
+    fn the_tokeniser_sees_only_executable_code() {
+        let texts = |s: &str| {
+            tokens(s)
+                .into_iter()
+                .map(|t| t.text.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(texts("a = b(c);"), ["a", "=", "b", "(", "c", ")", ";"]);
+        // Whitespace and comments BETWEEN tokens are insignificant, so
+        // a reflow or an inserted note cannot change the match.
+        assert_eq!(
+            texts("crate :: cli /* note */ :: status"),
+            ["crate", ":", ":", "cli", ":", ":", "status"]
+        );
+        assert_eq!(texts("a\n  .b()"), ["a", ".", "b", "(", ")"]);
+
+        // A commented-out call contributes NOTHING. This is the false
+        // green: the call no longer executes, and must no longer be
+        // findable.
+        assert!(texts("/* x = close_turn(y); */").is_empty());
+        assert!(texts("// x = close_turn(y);").is_empty());
+        assert_eq!(texts("/* a /* b */ c */ d"), ["d"], "block comments nest");
+
+        // A literal containing an example call is one opaque token, so
+        // it cannot witness one either.
+        assert_eq!(
+            texts(r#"let s = "close_turn(x)";"#),
+            ["let", "s", "=", "<lit>", ";"]
+        );
+        assert_eq!(texts("let c = '}';"), ["let", "c", "=", "<lit>", ";"]);
+        assert_eq!(
+            texts(r##"let s = r#"close_turn(x)"#;"##),
+            ["let", "s", "=", "<lit>", ";"],
+            "a RAW literal collapses too, whatever its hash count"
+        );
+
+        // Escaped char literals of every width. `'\\x7d'` and
+        // `'\\u{7d}'` are a closing BRACE, so mis-lexing one emits a
+        // stray `}` and moves every block measurement after it.
+        for lit in [
+            "'\\n'",
+            "'\\''",
+            "'\\x7d'",
+            "'\\u{7d}'",
+            "'é'",
+            "'\u{1f600}'",
+        ] {
+            assert_eq!(
+                texts(&format!("let c = {lit};")),
+                ["let", "c", "=", "<lit>", ";"],
+                "{lit} must be ONE token"
+            );
+        }
+        assert_eq!(
+            depth_of(&tokens("if x { let c = '\\u{7d}'; }")),
+            0,
+            "a braces-encoding escape must not look like a brace"
+        );
+
+        // A lifetime is not a literal, or the rest of the line is lost.
+        assert_eq!(
+            texts("fn f<'a>(x: &'a str) {}"),
+            [
+                "fn", "f", "<", "'", "a", ">", "(", "x", ":", "&", "'", "a", "str", ")", "{", "}"
+            ]
+        );
+
+        // Depth and block extent are over the same tokens.
+        let t = tokens("if x { a; } b");
+        assert_eq!(depth_of(&t), 0);
+        let open = t.iter().position(|k| k.text == "{").unwrap();
+        assert_eq!(t[pair_end(&t, open, "{", "}").unwrap()].text, "b");
+        assert_eq!(depth_of(&tokens("if x {")), 1, "an OPEN block is nesting");
+        assert_eq!(
+            depth_of(&tokens(r#"let s = "{";"#)),
+            0,
+            "not a brace in a literal"
+        );
+    }
+
+    /// The loop closes every turn AFTER its receive and BEFORE the
+    /// flush, outside every arm.
+    ///
+    /// The behavioural tests cover what the operation decides; this
+    /// covers the ordering they cannot, because they call `close_turn`
+    /// directly and so witness no receive at all. The loop owns a
+    /// terminal and cannot be driven from here, so the witness is
+    /// structural — but structural about the TURN, not about spelling.
+    ///
+    /// Each clause is a placement that reintroduces the bug:
+    ///
+    /// - BEFORE the receive: an attendance change arriving during the
+    ///   blocking receive is not observed until the turn after next, so
+    ///   the panel repaints a dead waiter as healthy. The scanner this
+    ///   replaced rejected that placement explicitly, and its own
+    ///   comment recorded a regression where a misplaced probe passed
+    ///   an incorrectly anchored check. The first version of THIS test
+    ///   lost that clause and would have passed the same mutation
+    ///   (codex on fcee1e7).
+    /// - INSIDE an arm: the check becomes conditional on which input
+    ///   arrived, and a dead waiter changes no file — so the data-wake
+    ///   arm is exactly the one it would be skipped on.
+    /// - AFTER the flush: its answer arrives one rebuild too late.
+    ///
+    /// Offsets and balanced delimiters only: no character windows and
+    /// no indentation, so a reflow cannot switch it off and a comment
+    /// cannot make it red.
+    #[test]
+    fn the_loop_closes_every_turn_after_its_receive_and_before_the_flush() {
+        // Compiler anchors for every name the token patterns below
+        // spell, the fingerprint dependency included. A rename must
+        // stop this test BUILDING rather than leave it hunting a dead
+        // string: that is how its predecessor was red for months while
+        // guarding nothing.
+        type Close =
+            fn(&mut AttendanceProbe, std::time::Instant, Duration, bool, fn() -> u64) -> TurnClose;
+        type Fingerprint = fn(&std::path::Path) -> u64;
+        let _close: Close = close_turn;
+        let _fingerprint: Fingerprint = crate::cli::status::attendance_fingerprint;
+
+        const RECV: &[&str] = &["match", "ev_rx", ".", "recv_timeout", "(", "wait", ")", "{"];
+        const CLOSE: &[&str] = &["refresh_pending", "=", "close_turn", "("];
+        const FLUSH: &[&str] = &[
+            "if",
+            "refresh_pending",
+            "&",
+            "&",
+            "last_rebuild",
+            ".",
+            "elapsed",
+            "(",
+            ")",
+            ">",
+            "=",
+            "REBUILD_MIN",
+            "{",
+        ];
+        const CARRIED: &[&str] = &[".", "refresh_pending", ";"];
+
+        let whole = include_str!("mod.rs");
+        // Production only. Without this the patterns could be
+        // satisfied by the strings in this very test.
+        let prod = &whole[..whole
+            .find("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("the test module still opens with that attribute")];
+        let toks = tokens(prod);
+
+        // The MAIN receive. Not the detail overlay's earlier
+        // `recv_timeout`, which belongs to a different loop.
+        let recv = find_seq(&toks, RECV).expect("the panel's own receive");
+        let arms = recv + RECV.len() - 1;
+        let arms_end = pair_end(&toks, arms, "{", "}").expect("the match block closes");
+
+        let close = find_seq(&toks, CLOSE)
+            .expect("the turn's completion, assigned back to refresh_pending");
+        let flush = find_seq(&toks, FLUSH).expect("the trailing refresh flush");
+
+        assert!(
+            recv < close,
+            "the completion must come AFTER the receive, or a change arriving during \
+             the blocking receive is not seen until the turn after next"
+        );
+        assert!(
+            arms_end <= close,
+            "and OUTSIDE every arm, or it is conditional on which input arrived"
+        );
+        assert!(
+            close < flush,
+            "and BEFORE the flush, or its answer reaches the rebuild one turn late"
+        );
+        // Ordering is not enough: `if refresh_pending { … }` wrapped
+        // around the call also sits between the two. Depth is what
+        // separates "at the turn's end" from "inside a branch there".
+        assert_eq!(
+            depth_of(&toks[arms_end..close]),
+            0,
+            "no block may open between the receive's end and the completion, or the \
+             probe is conditional on which input arrived"
+        );
+
+        // The call's own arguments, by balancing its parentheses over
+        // the same tokens — no character window.
+        let paren = close + CLOSE.len() - 1;
+        let args_end = pair_end(&toks, paren, "(", ")").expect("the call's arguments close");
+        let args = &toks[paren..args_end];
+        for needed in [
+            &["&", "mut", "waker_probe"][..],
+            &["REBUILD_MIN"][..],
+            &["refresh_pending"][..],
+            &[
+                "crate",
+                ":",
+                ":",
+                "cli",
+                ":",
+                ":",
+                "status",
+                ":",
+                ":",
+                "attendance_fingerprint",
+                "(",
+                "&",
+                "repo",
+                ")",
+            ][..],
+        ] {
+            assert!(
+                find_seq(args, needed).is_some(),
+                "the loop's own {} must be what it closes the turn with",
+                needed.join("")
+            );
+        }
+        // And the answer is carried, pinned to THIS call's closing
+        // paren rather than searched for between here and the flush: a
+        // span search passes as long as some `.refresh_pending;`
+        // exists in it, which is true today only because there happens
+        // to be exactly one (ruthless on d1b9375). Nothing legitimate
+        // reflows between `)` and `.refresh_pending;`, and the rewrite
+        // that would — binding the result to a local first — already
+        // fails the CLOSE pattern.
+        let carried: Vec<&str> = toks[args_end..]
+            .iter()
+            .take(CARRIED.len())
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(
+            carried, CARRIED,
+            "close_turn's refresh decision must be read off THIS call and assigned, \
+             not merely mentioned somewhere before the flush"
+        );
+    }
+
+    /// A turn's CLOSE is what raises the rebuild, and these drive the
+    /// production operation rather than the helper beside it.
+    ///
+    /// `attendance_changed` was already well covered and its call site
+    /// was not: deleting the call from the loop left every test green,
+    /// including the one that names the helper through the compiler
+    /// (codex on fbb84e3). The decision now has a return value, so a
+    /// test can assert what the turn decided instead of reading the
+    /// source to see whether it asked.
+    #[test]
+    fn a_turn_closes_by_asking_whether_attendance_changed() {
+        let every = Duration::from_secs(1);
+        let t0 = std::time::Instant::now();
+        let due = t0 + every;
+        let probe = |fp: u64| AttendanceProbe {
+            at: t0,
+            fingerprint: fp,
+        };
+
+        // A due flip on an idle turn asks for the rebuild.
+        let mut p = probe(7);
+        let close = close_turn(&mut p, due, every, false, || 9);
+        assert_eq!(
+            close,
+            TurnClose {
+                refresh_pending: true,
+                observed: 1
+            },
+            "a changed attendance is the one input with no event behind it"
+        );
+
+        // Unchanged attendance asks for nothing. The nothing-changed
+        // gate downstream is not what should be absorbing this.
+        let mut p = probe(7);
+        let close = close_turn(&mut p, due, every, false, || 7);
+        assert_eq!(
+            close,
+            TurnClose {
+                refresh_pending: false,
+                observed: 1
+            },
+            "unchanged attendance must not request a rebuild"
+        );
+
+        // A rebuild already owed by this turn's own input SURVIVES.
+        // Handing `refresh_pending` through is what makes that true;
+        // assigning the probe's answer over it would drop the request.
+        let mut p = probe(7);
+        let close = close_turn(&mut p, due, every, true, || 7);
+        assert!(
+            close.refresh_pending,
+            "a pending rebuild cannot be cancelled by an unchanged probe"
+        );
+
+        // Not yet due: no read at all. The reads are cheap, not free,
+        // and a key storm turns this loop many times.
+        let mut p = probe(7);
+        let close = close_turn(&mut p, t0, every, false, || {
+            panic!("a probe that is not due must not read")
+        });
+        assert_eq!(
+            close,
+            TurnClose {
+                refresh_pending: false,
+                observed: 0
+            }
+        );
+        let mut p = probe(7);
+        assert!(
+            close_turn(&mut p, t0, every, true, || 7).refresh_pending,
+            "and it still carries an owed rebuild through"
+        );
+    }
+
+    /// The probe is NOT conditional on this turn having had a
+    /// filesystem refresh.
+    ///
+    /// Separated because it is the mutation that would otherwise look
+    /// harmless: wrapping the check so it only runs when something
+    /// already changed restores the original bug exactly — a dead
+    /// waiter changes no file, so that turn is the one turn the check
+    /// would never run on.
+    #[test]
+    fn a_turn_probes_whether_or_not_its_input_asked_for_a_rebuild() {
+        let every = Duration::from_secs(1);
+        let t0 = std::time::Instant::now();
+        let due = t0 + every;
+        for already in [false, true] {
+            let mut p = AttendanceProbe {
+                at: t0,
+                fingerprint: 7,
+            };
+            let close = close_turn(&mut p, due, every, already, || 9);
+            assert_eq!(
+                close.observed, 1,
+                "the fingerprint must be read on a turn whose refresh_pending was \
+                 {already}, or a dead waiter is invisible on exactly the turns that \
+                 matter"
+            );
+            assert!(close.refresh_pending);
+        }
     }
 
     /// THE PANEL ASKS, on its own turns, whether a waker died.

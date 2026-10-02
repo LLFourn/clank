@@ -6613,13 +6613,22 @@ mod tests {
     async fn an_older_holder_goes_and_the_client_shares_its_replacement() {
         use std::io::{BufRead, BufReader, Write};
 
-        // budget 800ms + settle 400ms = a 1200ms deadline; the
-        // obsolete count window is 4 steps of settle/4 = 400ms. The
-        // release at 600ms is past that and leaves 600ms for startup
-        // and a handshake.
-        let budget = Duration::from_millis(800);
-        let settle = Duration::from_millis(400);
-        let holds_for = Duration::from_millis(600);
+        // Ordered, not timed. This used to be budget 800ms + settle
+        // 400ms against a release at 600ms, leaving ~600ms for the
+        // client to take the lease, bind, publish and handshake — and
+        // it duly failed once in four full-suite runs, on the run that
+        // coincided with two heavy concurrent builds. A margin chosen
+        // to survive contention asserts this machine's arithmetic, not
+        // the rule, and widening it would have hidden a real slowdown
+        // (codex on fbb84e3).
+        //
+        // The holder now stands down because the CLIENT asked one
+        // time more than the old retry count would have, so the thing
+        // under test is the ordering and the deadline is only a
+        // backstop against a wedge.
+        let budget = Duration::from_secs(5);
+        let settle = Duration::from_millis(40);
+        let stand_down_on = SHARE_ATTEMPTS as usize + 1;
 
         let repo = repo_dir();
         let dir = tempfile::tempdir().unwrap();
@@ -6640,6 +6649,9 @@ mod tests {
 
         let greeted_at = std::sync::Arc::new(std::sync::Mutex::new(None));
         let noticed = greeted_at.clone();
+        // Raised by the client's own ownership probe, below.
+        let retire_now = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asked = retire_now.clone();
         let serving = std::thread::spawn(move || {
             // It keeps answering until it goes: a client greets it
             // more than once — on discovery, and again after taking
@@ -6672,11 +6684,13 @@ mod tests {
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
-                let go = noticed
-                    .lock()
-                    .unwrap()
-                    .is_some_and(|at| at.elapsed() >= holds_for);
-                if go {
+                // It goes when the client has asked for ownership
+                // once more than the old count would have allowed —
+                // and only after it has actually been greeted, so the
+                // retirement is still something this monitor LEARNED
+                // rather than something the test did to it.
+                let greeted = noticed.lock().unwrap().is_some();
+                if greeted && asked.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
             }
@@ -6689,6 +6703,7 @@ mod tests {
         let new_dir = tempfile::tempdir().unwrap();
         let new_sock = socket_path(new_dir.path(), 4802).unwrap();
         let started = std::sync::atomic::AtomicUsize::new(0);
+        let probes = std::sync::atomic::AtomicUsize::new(0);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let replacement = std::sync::Arc::new(std::sync::Mutex::new(None));
         let keep = replacement.clone();
@@ -6736,7 +6751,14 @@ mod tests {
                 Ok(Box::new(NotStarted) as Box<dyn Started>)
             },
             connect_within,
-            |r| acquire_lease(r).is_ok(),
+            |r| {
+                // The ASK is the signal: one probe past the count the
+                // old implementation stopped at.
+                if probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == stand_down_on {
+                    retire_now.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                acquire_lease(r).is_ok()
+            },
         )
         .await;
 
@@ -6749,10 +6771,16 @@ mod tests {
             1,
             "and exactly one monitor was started to get there"
         );
-        let held_for = greeted_at.lock().unwrap().map(|at| at.elapsed());
         assert!(
-            held_for.is_some_and(|d| d >= holds_for),
-            "the old holder must have kept the lease past the obsolete give-up: {held_for:?}"
+            greeted_at.lock().unwrap().is_some(),
+            "the holder retired because a newer client GREETED it, not because the \
+             test reached in and dropped its lease"
+        );
+        let asks = probes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            asks > SHARE_ATTEMPTS as usize,
+            "and the client kept asking past the old retry count, which is the bound \
+             the deadline replaced: {asks} ask(s)"
         );
 
         // Both fixture servers are owned and ended, so neither
@@ -6857,43 +6885,67 @@ mod tests {
     /// Ownership that frees DURING the wait is taken.
     ///
     /// The case the wait exists for: a holder standing down may keep
-    /// its lease well past the old retry count, and the client must
+    /// its lease well past the old retry COUNT, and the client must
     /// still be the one that starts the replacement once it goes.
+    ///
+    /// The release is ordered, not timed. It used to be a 250ms
+    /// `thread::sleep` racing a 650ms deadline, which asserted the
+    /// arithmetic of this machine rather than the rule: the lease
+    /// frees on the probe after the old count would have given up, so
+    /// a build that went back to count-bounding returns `Busy` before
+    /// the release can happen and this test fails for the right reason
+    /// (codex on fbb84e3).
     #[tokio::test]
     async fn ownership_that_frees_during_the_wait_starts_one() {
-        let repo = repo_dir();
-        let held = acquire_lease(repo.path()).expect("the test owns it first");
-        let starts = std::sync::atomic::AtomicUsize::new(0);
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-        // Released well after the old 450ms retry budget would have
-        // given up, and well inside the deadline.
-        let releasing = tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            drop(held);
-        });
+        let repo = repo_dir();
+        let held = std::sync::Mutex::new(Some(
+            acquire_lease(repo.path()).expect("the test owns it first"),
+        ));
+        let starts = AtomicUsize::new(0);
+        let probes = AtomicUsize::new(0);
+
+        // One past the count, so "waited longer than the old budget"
+        // is a fact about ORDER rather than about how loaded the
+        // machine is.
+        let release_on = SHARE_ATTEMPTS as usize + 1;
 
         let got = attach_or_spawn_by(
             repo.path(),
             agent("codex"),
-            Duration::from_millis(50),
-            Duration::from_millis(600),
+            // Generous and bounded: the deadline exists so a hung
+            // handoff cannot wedge the suite, and it is deliberately
+            // far from the decision this test makes.
+            Duration::from_secs(5),
+            Duration::from_millis(40),
             SHARE_ATTEMPTS,
             |_r| {
-                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                starts.fetch_add(1, SeqCst);
                 Ok(Box::new(NotStarted) as Box<dyn Started>)
             },
             connect_within,
-            |r| acquire_lease(r).is_ok(),
+            |r| {
+                if probes.fetch_add(1, SeqCst) + 1 == release_on {
+                    drop(held.lock().unwrap().take());
+                }
+                acquire_lease(r).is_ok()
+            },
         )
         .await;
 
         assert!(matches!(got, Attached::Alone(_)), "{got:?}");
         assert_eq!(
-            starts.load(std::sync::atomic::Ordering::SeqCst),
+            starts.load(SeqCst),
             1,
             "the repo became free, so this client is the one that starts its monitor"
         );
-        releasing.await.unwrap();
+        assert!(
+            probes.load(SeqCst) > SHARE_ATTEMPTS as usize,
+            "and it kept asking past the old retry count, which is the bound this \
+             replaced: {} probe(s)",
+            probes.load(SeqCst)
+        );
     }
 
     /// A monitor that should KEEP the repo gets no replacement at all.

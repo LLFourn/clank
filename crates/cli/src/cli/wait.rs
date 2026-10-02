@@ -149,9 +149,43 @@ fn superseded_error(error: anyhow::Error, json: bool) -> anyhow::Result<()> {
     Err(error)
 }
 
+/// How many times one invocation reached the source-start boundary.
+///
+/// A test needs this because the CHILD cannot answer it. A source that
+/// is spawned and then torn down before its command execs leaves
+/// exactly what never spawning leaves — nothing — so a marker file
+/// cannot tell the two apart, and one of them is a side-effect-free
+/// `--peek` while the other is not. Measured: with the peek return
+/// moved below the spawn, the marker assertion caught the variant that
+/// left the tasks detached and MISSED the variant that shut them down
+/// (codex on fbb84e3).
+///
+/// Scoped to one call rather than process-wide, so concurrent tests
+/// cannot contaminate each other.
+#[derive(Clone, Default, Debug)]
+pub struct SourceStarts(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl SourceStarts {
+    pub fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// What this wait wakes with — the same items `run` prints — or `None`
 /// when an observer (`--for`) already reported its own.
 pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    items_observing(args, &SourceStarts::default()).await
+}
+
+/// [`items`] with the source-start boundary observed.
+pub async fn items_observing(
+    args: WaitArgs,
+    starts: &SourceStarts,
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
     // Before ANY setup: the fold and the watcher attach can block for
     // seconds, and an owner that dies in that window must still reap
     // this process (remove-wait-timeout).
@@ -304,6 +338,10 @@ pub async fn items(args: WaitArgs) -> anyhow::Result<Option<Vec<WaitItem>>> {
     // durable state away from the author's configured ones and away
     // from any other invocation of the same name.
     let invocation = clank_core::pr_review::PrReviewState::new_instance().to_string();
+    // The source-start boundary. Recorded here rather than inside
+    // `EventSources::spawn`, because the claim under test is about this
+    // PATH reaching it, not about that function's own behaviour.
+    starts.record();
     let mut spawned = EventSources::spawn(
         &sources.events,
         Some(&events_dir),

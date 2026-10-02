@@ -198,6 +198,7 @@ pub fn strip_test_code(src: &str) -> String {
     let mut in_test = false;
     let mut depth = 0i32;
     let mut entered = false; // seen the item's opening brace yet?
+    let mut lexer = Lexer::default();
     for line in src.lines() {
         if !in_test {
             if line.trim_start().starts_with("#[cfg(test)]") {
@@ -206,27 +207,236 @@ pub fn strip_test_code(src: &str) -> String {
                 entered = false;
                 // fall through: count this attr line's braces (usually none)
             } else {
+                lexer.scan(line, &mut |_| {});
                 out.push_str(line);
                 out.push('\n');
                 continue;
             }
         }
-        for c in line.chars() {
-            match c {
-                '{' => {
-                    depth += 1;
-                    entered = true;
-                }
-                '}' => depth -= 1,
-                _ => {}
+        lexer.scan(line, &mut |c| match c {
+            '{' => {
+                depth += 1;
+                entered = true;
             }
-        }
+            '}' => depth -= 1,
+            _ => {}
+        });
         if entered && depth <= 0 {
             in_test = false;
         }
         // lines while `in_test` are dropped
     }
     out
+}
+
+/// Enough Rust lexing to count braces that are actually CODE.
+///
+/// The stripper used to count every `{` and `}` character, so a test
+/// containing a brace inside a literal drove its depth negative, ended
+/// the test module early, and handed the rest of that file's TEST code
+/// to every gate as production. Measured: `git_boundary` reported five
+/// such sites in `status_tui`, then two more in `open_zellij` and
+/// `agent` once the single-line cases were handled. A standing red gate
+/// is the failure this plan exists to end, so this is fixed in the
+/// shared stripper rather than worked around in the files that trip it.
+#[derive(Default)]
+struct Lexer {
+    /// What is still open from a previous line. All three of these span
+    /// lines in Rust, and the multi-line RAW string is the one that
+    /// actually bit: `open_zellij` and `agent` both embed brace-heavy
+    /// JSON fixtures that way, and a fixture's braces are not code.
+    inside: Option<Inside>,
+}
+
+enum Inside {
+    BlockComment,
+    Str,
+    Raw(usize),
+}
+
+impl Lexer {
+    /// Feed one line, calling `code` for each character that is outside
+    /// strings, chars and comments.
+    fn scan(&mut self, line: &str, code: &mut impl FnMut(char)) {
+        let b = line.as_bytes();
+        let mut i = 0;
+        loop {
+            match self.inside {
+                Some(Inside::BlockComment) => match find(b, i, b"*/") {
+                    Some(at) => {
+                        self.inside = None;
+                        i = at + 2;
+                    }
+                    None => return,
+                },
+                Some(Inside::Str) => {
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    if i >= b.len() {
+                        return;
+                    }
+                    self.inside = None;
+                    i += 1;
+                }
+                Some(Inside::Raw(hashes)) => {
+                    let close: Vec<u8> = std::iter::once(b'"')
+                        .chain(std::iter::repeat_n(b'#', hashes))
+                        .collect();
+                    match find(b, i, &close) {
+                        Some(at) => {
+                            self.inside = None;
+                            i = at + close.len();
+                        }
+                        None => return,
+                    }
+                }
+                None => {
+                    if i >= b.len() {
+                        return;
+                    }
+                    match b[i] {
+                        b'/' if b.get(i + 1) == Some(&b'/') => return,
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            self.inside = Some(Inside::BlockComment);
+                            i += 2;
+                        }
+                        b'"' => {
+                            self.inside = Some(Inside::Str);
+                            i += 1;
+                        }
+                        // A char literal, not a lifetime: `'}'` must
+                        // not count, and `'a` must not swallow the line.
+                        b'\'' if b.get(i + 1) == Some(&b'\\') => i += 4,
+                        b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+                        b'r' if raw_opens(b, i).is_some() => {
+                            let (hashes, after) = raw_opens(b, i).unwrap();
+                            self.inside = Some(Inside::Raw(hashes));
+                            i = after;
+                        }
+                        c => {
+                            code(c as char);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The hash count and the index just past `r#*"`, if one opens at `i`.
+fn raw_opens(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    let mut hashes = 0;
+    let mut j = i + 1;
+    while b.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    (b.get(j) == Some(&b'"')).then_some((hashes, j + 1))
+}
+
+fn find(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    (from..b.len().saturating_sub(needle.len() - 1)).find(|&k| b[k..].starts_with(needle))
+}
+
+/// The stripper keeps production and drops tests, and is not fooled by
+/// braces that are not code.
+///
+/// Every case here is one that made it end a test module early and
+/// hand that file's tests to the gates as production. The multi-line
+/// RAW string is the one that actually bit, twice.
+#[test]
+fn the_stripper_counts_only_code_braces() {
+    let kept = |src: &str| strip_test_code(src);
+
+    // The baseline shape: production survives, the test module goes.
+    let out = kept("fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn after() {}\n");
+    assert!(out.contains("fn prod()"), "{out}");
+    assert!(
+        out.contains("fn after()"),
+        "production AFTER the module: {out}"
+    );
+    assert!(!out.contains("fn t()"), "test code must be dropped: {out}");
+
+    // A brace inside a literal must not close the module early, or the
+    // lines after it are handed over as production.
+    for literal in [
+        r#"    let s = "}";"#,
+        r#"    let s = "{";"#,
+        "    let c = '}';",
+        r#"    let s = "{a}";"#,
+        "    // }",
+        "    /* } */",
+    ] {
+        let src = format!(
+            "fn prod() {{}}\n#[cfg(test)]\nmod tests {{\n{literal}\n    fn leak() {{}}\n}}\n"
+        );
+        let out = kept(&src);
+        assert!(
+            !out.contains("fn leak()"),
+            "a brace in `{literal}` ended the module early:\n{out}"
+        );
+    }
+
+    // A RAW string spanning lines, carrying braces. This is the shape
+    // that was still broken after the single-line cases were handled.
+    let src = concat!(
+        "fn prod() {}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    const J: &str = r#\"{\n",
+        "      \"agents\": { \"a\": {} }\n",
+        "    }\"#;\n",
+        "    fn leak() {}\n",
+        "}\n",
+    );
+    let out = kept(src);
+    assert!(
+        !out.contains("fn leak()"),
+        "a multi-line raw string ended the module early:\n{out}"
+    );
+
+    // And a normal string spanning lines, which Rust also allows.
+    let src = concat!(
+        "fn prod() {}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    const S: &str = \"{\n",
+        "      }\";\n",
+        "    fn leak() {}\n",
+        "}\n",
+    );
+    assert!(
+        !kept(src).contains("fn leak()"),
+        "a multi-line string ended the module early:\n{}",
+        kept(src)
+    );
+
+    // A block comment spanning lines.
+    let src = concat!(
+        "fn prod() {}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    /* {\n",
+        "       } */\n",
+        "    fn leak() {}\n",
+        "}\n",
+    );
+    assert!(
+        !kept(src).contains("fn leak()"),
+        "a multi-line block comment ended the module early"
+    );
+
+    // A lifetime is not a char literal: `'a` must not swallow the rest
+    // of the line and lose its braces.
+    let src = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t<'a>(x: &'a str) {}\n    fn leak() {}\n}\nfn after() {}\n";
+    let out = kept(src);
+    assert!(!out.contains("fn leak()"), "{out}");
+    assert!(
+        out.contains("fn after()"),
+        "and the module still ends: {out}"
+    );
 }
 
 pub fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
