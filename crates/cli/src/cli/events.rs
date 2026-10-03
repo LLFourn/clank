@@ -149,13 +149,16 @@ fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
             continue; // state/lock/corrupt/tmp sidecars
         };
         let log = EventLog::open(dir, stem)?;
-        match log.read_rows()? {
-            Some(read) => out.extend(read.rows.into_iter().map(|row| Sourced {
+        match log.read_rows() {
+            Ok(Some(read)) => out.extend(read.rows.into_iter().map(|row| Sourced {
                 source: stem.to_string(),
                 row,
             })),
-            None => {
+            Ok(None) => {
                 eprintln!("events: {name} is corrupt — skipping (the next wait quarantines it)")
+            }
+            Err(error) => {
+                eprintln!("events: {name}: {error} — skipping; custody preserved for repair")
             }
         }
     }
@@ -378,6 +381,9 @@ fn describe(item: &WaitItem) -> String {
     if v.requires_reply {
         out.push_str("  (reply required)");
     }
+    if let Some(recurrence) = v.recurrence {
+        out.push_str(&format!("  ({})", recurrence_summary(recurrence)));
+    }
     if let Some(c) = v.content {
         out.push_str(&format!("  “{}”", clean(c)));
     }
@@ -391,6 +397,35 @@ fn describe(item: &WaitItem) -> String {
 
 pub(crate) fn age(at: u64) -> String {
     crate::age::short(crate::age::elapsed(at as i64))
+}
+
+/// Shared safe provenance summary; the original event content stays lossless.
+pub(crate) fn recurrence_summary(r: &clank_core::agent_config::TimerRecurrence) -> String {
+    let instant = |slot: u64| {
+        let due = slot
+            .checked_mul(r.generation.interval)
+            .and_then(|n| r.generation.anchor.checked_add(n));
+        due.and_then(|at| i64::try_from(at).ok())
+            .and_then(|at| time::OffsetDateTime::from_unix_timestamp(at).ok())
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                due.map_or_else(
+                    || "unrepresentable".into(),
+                    |at| format!("{at}s since epoch"),
+                )
+            })
+    };
+    format!(
+        "recurring: {} scheduled occurrence{}; due {}..{}; every {}s",
+        r.count,
+        if r.count == 1 { "" } else { "s" },
+        instant(r.first_slot),
+        instant(r.last_slot),
+        r.generation.interval
+    )
 }
 
 /// The one JSON envelope for both `list -j` and `show -j`: the
@@ -704,11 +739,39 @@ mod tests {
     use crate::cli::github::log::Transport;
 
     #[test]
+    fn refused_recurring_generation_does_not_hide_healthy_event_logs() {
+        let dir = tempdir();
+        let mut healthy =
+            crate::cli::github::log::EventLog::open(&dir, "timer-config-healthy").unwrap();
+        let item = WaitItem::TimerEvent {
+            name: "healthy".into(),
+            id: "timer/1".into(),
+            due_at: 1,
+            content: "work".into(),
+            selector: None,
+            recurrence: None,
+        };
+        healthy
+            .append_inbox(Transport::Timer, Some("timer/1"), None, Some(1), &item)
+            .unwrap();
+        let bad_key = format!("timer-config-recurring-{}", "a".repeat(64));
+        std::fs::write(
+            dir.join(format!("{bad_key}.jsonl")),
+            "{\"t\":\"future\",\"v\":2,\"seq\":1}\n",
+        )
+        .unwrap();
+        let rows = read_all(&dir).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "timer-config-healthy");
+    }
+
+    #[test]
     fn timer_list_summary_is_safe_and_show_keeps_the_full_body() {
         let dir = tempdir();
         let content = "Check \u{1b}[31mdeployment\u{1b}[0m\t\nReport result\r\nFull body";
         let timer = WaitItem::TimerEvent {
             name: "deploy\nextra name".into(),
+            recurrence: None,
             id: "timer/100".into(),
             due_at: 100,
             content: content.into(),
@@ -729,6 +792,7 @@ mod tests {
         assert_eq!(json["item"]["content"], content);
         let plain = WaitItem::TimerEvent {
             name: "deploy".into(),
+            recurrence: None,
             id: "timer/100".into(),
             due_at: 100,
             content: "one line".into(),

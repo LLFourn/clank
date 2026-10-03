@@ -5300,6 +5300,7 @@ pub(crate) mod tests {
         members: Vec<crate::cli::github::timeline::MemberRef>,
     ) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 1,
             backend: crate::cli::github::timeline::Backend::Github,
             glyph: None,

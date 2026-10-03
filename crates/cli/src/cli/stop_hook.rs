@@ -2305,6 +2305,7 @@ pub(crate) struct WaitItem {
     /// `title` above are shared with the github item.
     content: Option<String>,
     due_at: Option<u64>,
+    recurrence: Option<clank_core::agent_config::TimerRecurrence>,
     failure: Option<bool>,
     requires_reply: Option<bool>,
     /// What `clank events ack` takes for this one.
@@ -2683,7 +2684,14 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                     .as_deref()
                     .map(|s| format!(" — ack `clank events ack {s}`"))
                     .unwrap_or_default();
-                out.push_str(&format!("  - timer: {name} due at {due}{content}{ack}\n"));
+                let recurrence = item
+                    .recurrence
+                    .as_ref()
+                    .map(|r| format!(" ({})", crate::cli::events::recurrence_summary(r)))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - timer: {name} due at {due}{recurrence}{content}{ack}\n"
+                ));
             }
             K::CommandEvent => {
                 let name = item.name.as_deref().unwrap_or("?");
@@ -5447,9 +5455,44 @@ mod tests {
     }
 
     #[test]
+    fn recurring_timer_hint_preserves_snapshot_and_plain_ack_recipe() {
+        use crate::cli::{
+            github::log::{EventLog, RecurringTransition},
+            timer_source::recurrence::Recurrence,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let r = Recurrence::from_generation(clank_core::agent_config::TimerGeneration {
+            name: "deploy\nextra".into(),
+            scope: None,
+            anchor: 100,
+            interval: 10,
+        })
+        .unwrap();
+        let RecurringTransition::Accepted { seq, mut item } =
+            EventLog::open(dir.path(), &r.source_key())
+                .unwrap()
+                .accept_recurring(&r, "check\nnow\u{1b}", 140)
+                .unwrap()
+        else {
+            panic!("not accepted")
+        };
+        crate::cli::command_source::stamp_selector(&mut item, &r.source_key(), seq);
+        let wire = serde_json::json!({"items":[crate::cli::wait::render_json(&item)]});
+        let parsed = parse_wait_json(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        let hint = render_wait_items(&parsed, &AgentLabel::parse("codex").unwrap(), Role::Master);
+        assert!(hint.contains("5 scheduled occurrences"), "{hint}");
+        assert!(hint.contains("1970-01-01T00:01:40Z..1970-01-01T00:02:20Z"));
+        assert!(hint.contains("every 10s"));
+        assert!(hint.contains(&format!("clank events ack {}@{seq}", r.source_key())));
+        assert!(!hint.contains('\u{1b}'));
+        assert_eq!(wire["items"][0]["content"], "check\nnow\u{1b}");
+    }
+
+    #[test]
     fn timer_hint_uses_the_actual_wait_wire_and_retains_ack_recipe() {
         let item = clank_core::wait::WaitItem::TimerEvent {
             name: "deploy".into(),
+            recurrence: None,
             id: "timer/1".into(),
             due_at: 1,
             content: "check\nnow\u{1b}".into(),

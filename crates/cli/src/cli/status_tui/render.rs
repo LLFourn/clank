@@ -3108,6 +3108,15 @@ pub(super) fn render_event_detail(
         .unwrap_or_default();
     fact(&mut body, "event", format!("{}{detail}", clean(&ev.kind)));
     fact(&mut body, "age", crate::cli::events::age(ev.at));
+    if let Some(r) = &ev.recurrence {
+        body.push(emit(&[dim("  schedule".to_string())], "", cols));
+        for line in super::text::wrap(
+            &crate::cli::events::recurrence_summary(r),
+            cols.saturating_sub(4).max(1),
+        ) {
+            body.push(emit(&[plain(format!("  {line}"))], "", cols));
+        }
+    }
     if let Some(n) = ev.number {
         fact(&mut body, "number", format!("#{n}"));
     }
@@ -4879,6 +4888,7 @@ mod tests {
             );
         }
         let voice = [MergedEvent {
+            recurrence: None,
             at: 190,
             backend: Backend::Command,
             glyph: Some("♪".into()),
@@ -7679,6 +7689,7 @@ mod tests {
         use clank_core::wait::ContentRef;
 
         let ev = crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 0,
             backend: crate::cli::github::timeline::Backend::Github,
             glyph: None,
@@ -7739,6 +7750,48 @@ mod tests {
     }
 
     #[test]
+    fn recurring_timer_detail_shows_due_range_and_lossless_content_lines() {
+        use crate::cli::{
+            github::{log::EventLog, timeline},
+            timer_source::recurrence::Recurrence,
+        };
+        let repo = tempfile::tempdir().unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("rev/events");
+        let r = Recurrence::from_generation(clank_core::agent_config::TimerGeneration {
+            name: "deploy".into(),
+            scope: None,
+            anchor: 100,
+            interval: 10,
+        })
+        .unwrap();
+        EventLog::open(&dir, &r.source_key())
+            .unwrap()
+            .accept_recurring(&r, "Check deployment\nReport result\u{1b}[31m", 140)
+            .unwrap();
+        let event = timeline::timeline_snapshot(repo.path()).events.remove(0);
+        let ep = super::super::input::EventPage {
+            target: event.members[0].key.clone(),
+            retained: event
+                .members
+                .iter()
+                .map(|member| member.key.clone())
+                .collect(),
+            event,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+        let (lines, _) = render_event_detail(&ep, &[], 0, 40, 200);
+        let text = lines.join("\n");
+        assert!(text.contains("5 scheduled occurrences"), "{text}");
+        assert!(text.contains("every 10s"));
+        assert!(text.contains("1970-01-01T00:01:40Z..1970-01-01T00:02:20Z"));
+        assert!(text.contains("Check deployment"));
+        assert!(text.contains("Report result"));
+        assert!(!text.contains("\u{1b}[31m"));
+    }
+
+    #[test]
     fn a_timer_detail_from_the_wal_has_its_origin_content_and_handled_state() {
         use crate::cli::github::{
             log::{EventLog, Transport},
@@ -7755,6 +7808,7 @@ mod tests {
                 Some(100),
                 &clank_core::wait::WaitItem::TimerEvent {
                     name: "deploy".into(),
+                    recurrence: None,
                     id: "timer/100".into(),
                     due_at: 100,
                     content: "Check deployment\nReport result\u{1b}[31m".into(),
@@ -7800,6 +7854,7 @@ mod tests {
     fn a_body_bearing_event_shows_all_of_it() {
         let text = "# Rebase please\n\nonto master, then run the suite.\n\nThanks.";
         let mut ev = crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 0,
             backend: crate::cli::github::timeline::Backend::Message,
             glyph: None,
@@ -7880,6 +7935,7 @@ mod tests {
     fn a_command_events_content_keeps_its_lines() {
         let page = |content: &str, cols: usize| {
             let ev = crate::cli::github::timeline::MergedEvent {
+                recurrence: None,
                 at: 0,
                 backend: crate::cli::github::timeline::Backend::Command,
                 glyph: None,
@@ -8028,6 +8084,7 @@ mod tests {
     #[test]
     fn the_event_page_renders_a_command_event_without_githubs_extras() {
         let ev = crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 0,
             backend: crate::cli::github::timeline::Backend::Command,
             glyph: None,
@@ -8119,6 +8176,7 @@ mod tests {
             content: None,
         };
         let ev = MergedEvent {
+            recurrence: None,
             at: 1,
             backend: crate::cli::github::timeline::Backend::Github,
             glyph: None,
@@ -8613,6 +8671,7 @@ mod tests {
             content: None,
         };
         let event = |members: Vec<MemberRef>| MergedEvent {
+            recurrence: None,
             backend: Backend::Github,
             glyph: None,
             at: 1,

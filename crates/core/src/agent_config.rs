@@ -66,14 +66,38 @@ pub enum WaitEventSource {
     Timer(TimerSource),
 }
 
-/// An absolute, one-shot deadline. The CLI validates the RFC3339 instant;
+/// An absolute deadline with optional fixed elapsed-time recurrence.
+/// The CLI validates the RFC3339 instant and duration;
 /// core configuration remains free of clocks and I/O.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerSource {
     pub name: String,
     pub due_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_every: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+/// Normalized recurring definition. Its enclosing inbox supplies repo/author
+/// ownership; content and roster roles do not change occurrence identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerGeneration {
+    pub name: String,
+    pub scope: Option<String>,
+    pub anchor: u64,
+    pub interval: u64,
+}
+
+/// Immutable recurring catch-up snapshot. Later pending ticks are covered by
+/// acknowledgement, without rewriting this metadata or the producer ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerRecurrence {
+    pub generation: TimerGeneration,
+    pub generation_id: String,
+    pub first_slot: u64,
+    pub last_slot: u64,
+    pub count: u64,
 }
 
 impl TimerSource {
@@ -884,6 +908,20 @@ mod watch_grammar_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timer_recurrence_is_additive_and_one_shot_bytes_stay_unchanged() {
+        let legacy = r#"{"kind":"timer","name":"deploy","due_at":"2026-10-04T09:00:00+11:00"}"#;
+        let source: super::WaitEventSource = serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&source).unwrap(), legacy);
+        let recurring = r#"{"kind":"timer","name":"deploy","due_at":"2026-10-04T09:00:00+11:00","repeat_every":"24h"}"#;
+        let source: super::WaitEventSource = serde_json::from_str(recurring).unwrap();
+        assert_eq!(serde_json::to_string(&source).unwrap(), recurring);
+        let super::WaitEventSource::Timer(timer) = source else {
+            panic!("not a timer")
+        };
+        assert_eq!(timer.repeat_every.as_deref(), Some("24h"));
+    }
+
     fn cmd(name: &str) -> CommandSource {
         CommandSource {
             name: name.into(),

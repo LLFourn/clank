@@ -416,7 +416,7 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
 
 ## Extra wake sources
 
-### One-shot scheduled events
+### Scheduled and recurring events
 
 An agent can declare a native timer in `.clank/agents/<label>/config.json`:
 
@@ -430,11 +430,32 @@ An agent can declare a native timer in `.clank/agents/<label>/config.json`:
 }
 ```
 
-Timers are one-shot occurrences, with a nonempty name and an absolute RFC3339
+Timers default to one-shot occurrences, with a nonempty name and an absolute RFC3339
 deadline containing an explicit UTC offset. Deadlines must be at or after the Unix
 epoch, with whole-second precision; `.000` is accepted, nonzero fractions and leap
 seconds are refused. Duplicate timer names in one scope are refused. Equivalent
-offset spellings identify the same instant. There is no cron or recurrence engine.
+offset spellings identify the same instant.
+
+Add `"repeat_every":"24h"` to repeat on a fixed elapsed-time interval. The duration
+uses positive whole seconds: a bare number, `s`, `m`, or `h`; zero, empty values,
+fractions and unsupported units are refused. `due_at` anchors the first occurrence;
+restart and acknowledgement never reset that phase. This is not cron or a timezone
+calendar: 24 hours remains 24 elapsed hours across daylight-saving changes.
+
+Both one-shot and recurring schedules catch up when Clank next arms after offline
+time. Recurrence accepts **one** catch-up event for the elapsed slots, even after
+years offline. While that event remains unhandled, later ticks coalesce without
+new events or scheduled wakes. Reading it or sending a wake receipt is not completion.
+Acknowledgement covers all slots through its recorded durable timestamp, including
+ticks that elapsed while work was pending; the next deadline is the first anchored
+slot strictly after that boundary. An exact-boundary acknowledgement covers that
+slot. This avoids an immediate replay storm after completing a long-running task.
+
+CLI/hook hints and log/TUI detail show the accepted snapshot's count, represented
+due range and interval. Web event state and JSON retain the complete `recurrence`
+metadata: normalized generation descriptor/ID, `first_slot`, `last_slot`, and `count`.
+The original content remains lossless. The count is frozen at acceptance; additional
+pending ticks are covered by acknowledgement without rewriting the delivered event.
 
 An armed wait wakes at the deadline with a `timer_event` and a qualified selector.
 Handle the task, then run `clank events ack <selector>`. Reading or receiving it does
@@ -444,6 +465,13 @@ deadline. Editing the deadline creates another occurrence; changing only its con
 does not replace already-accepted work. Removing a future definition cancels it when
 the monitor observes the edit. Invalid edits retain the last accepted host and emit
 a diagnostic; a valid empty `wait_events` array removes its future schedules.
+For recurrence, changing the anchor or interval creates a new generation. Accepted
+old-generation work still needs acknowledgement, which cannot suppress the new
+generation. Restoring an identical definition resumes after its proven coverage.
+Storage does not grow per missed tick: compaction keeps one coverage record per
+generation, pending work and bounded recent display history. Removed generations
+keep small coverage tombstones so restoring them cannot replay completed work;
+the number of distinct historical definitions can therefore grow storage.
 
 Configured timers belong to their named agent across roster role changes. A timer
 does not automatically follow whoever becomes master. An invocation-only
@@ -463,9 +491,16 @@ next configuration rearm, without periodic clock checks.
 Install a timer-capable binary **before** adding timer definitions, on every client
 and monitor host. From this checkout use `cargo install --path crates/cli --locked`,
 then ensure `command -v clank` resolves to that installation. Existing configurations
-need no migration. Timer-capable clients use monitor protocol 8 and the existing
-exclusive handoff when encountering an older monitor; an old binary cannot parse a
-new timer configuration. This feature does not install or start an agent provider.
+need no migration. Recurrence-capable clients use monitor protocol 9 and the existing
+exclusive monitor handoff. Deploy the current binary on every client/monitor host
+and retire or restart old monitors and waiters **before** enabling recurring
+definitions. Updating the binary does not update a process already running it.
+Earlier timer-capable binaries may ignore `repeat_every` and treat recurrence as
+one-shot, and old writers cannot preserve the new compacted coverage records.
+Mixed-version custody and downgrade are unsupported; disable recurrence and retain
+its WAL for a supporting binary before downgrading. This feature does not install
+or start an agent provider. Native timer sleeps add no polling; the existing bounded
+repository watcher uses `notify::PollWatcher`, and its cadence is unchanged.
 
 - `clank wait --peek` — non-blocking, side-effect-free "is there work
   right now?" probe.

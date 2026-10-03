@@ -105,6 +105,8 @@ pub(crate) enum Backend {
 /// One merged timeline entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct MergedEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recurrence: Option<clank_core::agent_config::TimerRecurrence>,
     /// What KIND of backend produced it — the carve-out's presence is
     /// a payload fact, not provenance.
     pub(crate) backend: Backend,
@@ -456,6 +458,13 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 .collect();
             member_refs.sort_by(|a, b| a.key.cmp(&b.key));
             let merged = MergedEvent {
+                recurrence: members.iter().find_map(|&i| {
+                    copies[i]
+                        .item
+                        .event_view()
+                        .and_then(|v| v.recurrence)
+                        .cloned()
+                }),
                 at: copies[members[0]].display_at,
                 // Provenance, from the first member in the same total
                 // order every other field uses.

@@ -42,6 +42,15 @@ use std::path::{Path, PathBuf};
 
 use clank_core::wait::WaitItem;
 
+mod timer;
+
+#[derive(Debug)]
+pub(crate) enum RecurringTransition {
+    Future(u64),
+    Pending,
+    Accepted { seq: u64, item: WaitItem },
+}
+
 /// Newest identities kept for dedup horizons. The github `/events`
 /// feed retains only ~300 events, so identities beyond this are dead
 /// weight for reconciliation.
@@ -147,6 +156,16 @@ enum Line {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Record {
+    /// Compacted recurring acknowledgement evidence and allocator reservation.
+    /// Never a selector or a separate completion transaction.
+    TimerProgress {
+        v: u64,
+        seq: u64,
+        generation: clank_core::agent_config::TimerGeneration,
+        generation_id: String,
+        #[serde(deserialize_with = "timer::deserialize_coverage")]
+        covered_through: Option<u64>,
+    },
     /// Primary record of a PRESENTABLE event: the complete wake
     /// payload, re-presented byte-faithfully as backlog.
     Inbox {
@@ -214,6 +233,7 @@ impl Record {
             Record::Inbox { v, .. }
             | Record::Obs { v, .. }
             | Record::Ack { v, .. }
+            | Record::TimerProgress { v, .. }
             | Record::ReplyIntent { v, .. } => *v,
         }
     }
@@ -587,6 +607,15 @@ pub(crate) struct EventLog {
     /// compaction trigger. Approximate is fine: compaction re-reads
     /// under the exclusive lock.
     lines: usize,
+    #[cfg(test)]
+    sync_fault: std::cell::Cell<Option<DurableSync>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum DurableSync {
+    File,
+    Directory,
 }
 
 fn now_epoch() -> u64 {
@@ -608,6 +637,8 @@ impl EventLog {
             lock_path: events_dir.join(format!("{source_key}.lock")),
             next_seq: Some(1),
             lines: 0,
+            #[cfg(test)]
+            sync_fault: std::cell::Cell::new(None),
         })
     }
 
@@ -757,6 +788,9 @@ impl EventLog {
                     }
                 }
                 Record::Ack { .. } => {}
+                Record::TimerProgress { seq, .. } => {
+                    max_seq = max_seq.max(seq);
+                }
                 Record::ReplyIntent { seq, ident, .. } => {
                     max_seq = max_seq.max(seq);
                     pending_replies.push((seq, ident));
@@ -890,6 +924,9 @@ impl EventLog {
         let Ok(lines_in) = Self::parse(&text) else {
             return Ok(None);
         };
+        if self.is_recurring_key() && !lines_in.is_empty() {
+            self.validate_recurring_inspection(&lines_in)?;
+        }
         let acks: Vec<(u64, Option<String>)> = lines_in
             .iter()
             .filter_map(|l| match l {
@@ -1183,6 +1220,15 @@ impl EventLog {
     pub(crate) fn append_checked_ack(&mut self, seq: u64, ident: &str) -> std::io::Result<()> {
         let _lock = SidecarLock::acquire(&self.lock_path, true)?;
         let row = self.reply_target(seq, ident)?;
+        if matches!(
+            &row.item,
+            WaitItem::TimerEvent {
+                recurrence: Some(_),
+                ..
+            }
+        ) {
+            return self.append_recurring_ack_unlocked(seq, ident, now_epoch());
+        }
         if row.acked {
             return Ok(());
         }
@@ -1289,7 +1335,27 @@ impl EventLog {
     }
 
     fn sync_existing_log(&self) -> std::io::Result<()> {
-        self.repaired_log_file()?.sync_data()?;
+        self.sync_durable_file(&self.repaired_log_file()?)?;
+        self.sync_durable_directory()
+    }
+
+    #[cfg(test)]
+    fn check_sync(&self, boundary: DurableSync) -> std::io::Result<()> {
+        if self.sync_fault.get() == Some(boundary) {
+            return Err(std::io::Error::other("injected durability sync failure"));
+        }
+        Ok(())
+    }
+
+    fn sync_durable_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(test)]
+        self.check_sync(DurableSync::File)?;
+        file.sync_data()
+    }
+
+    fn sync_durable_directory(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        self.check_sync(DurableSync::Directory)?;
         if let Some(parent) = self.log_path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
@@ -1303,10 +1369,8 @@ impl EventLog {
         let mut encoded = serde_json::to_vec(record).map_err(std::io::Error::other)?;
         encoded.push(b'\n');
         file.write_all(&encoded)?;
-        file.sync_data()?;
-        if let Some(parent) = self.log_path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
+        self.sync_durable_file(&file)?;
+        self.sync_durable_directory()?;
         self.lines += 1;
         Ok(())
     }
@@ -1314,9 +1378,14 @@ impl EventLog {
     /// Caller holds the exclusive append lock. Even a no-op retry repairs the
     /// framing before another producer can append after a crash-torn tail.
     fn repaired_log_file(&self) -> std::io::Result<std::fs::File> {
-        let bytes = std::fs::read(&self.log_path)?;
+        let bytes = match std::fs::read(&self.log_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
         let mut file = std::fs::OpenOptions::new()
             .append(true)
+            .create(true)
             .open(&self.log_path)?;
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             let start = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
@@ -1366,6 +1435,9 @@ impl EventLog {
             return Ok(0);
         }
         let _lock = SidecarLock::acquire(&self.lock_path, true)?;
+        if self.is_recurring_key() {
+            return self.compact_recurring_unlocked();
+        }
         let text = match std::fs::read_to_string(&self.log_path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -1457,6 +1529,11 @@ impl EventLog {
                     }
                 }
                 Record::Ack { .. } => {}
+                Record::TimerProgress { .. } => {
+                    return Err(std::io::Error::other(
+                        "recurrence progress in non-recurring WAL",
+                    ));
+                }
                 Record::ReplyIntent { .. } => intents.push(r),
             }
         }
@@ -1612,16 +1689,21 @@ impl EventLog {
             out.push('\n');
             kept_lines += 1;
         }
+        self.rewrite_compacted_unlocked(out.as_bytes(), kept_lines)?;
+        Ok(dropped_foreign)
+    }
+
+    /// Caller holds the exclusive sidecar lock. Both ordinary history and
+    /// recurring progress use this one crash-safe WAL replacement boundary.
+    fn rewrite_compacted_unlocked(&mut self, bytes: &[u8], lines: usize) -> std::io::Result<()> {
         let tmp = self.log_path.with_extension("jsonl.tmp");
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(out.as_bytes())?;
-        file.sync_data()?;
+        file.write_all(bytes)?;
+        self.sync_durable_file(&file)?;
         std::fs::rename(&tmp, &self.log_path)?;
-        if let Some(parent) = self.log_path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        self.lines = kept_lines;
-        Ok(dropped_foreign)
+        self.sync_durable_directory()?;
+        self.lines = lines;
+        Ok(())
     }
 }
 

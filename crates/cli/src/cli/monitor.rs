@@ -26,7 +26,7 @@ use clank_core::wait::WaitItem;
 // Version 7 also makes single-tag diagnostics scalar.
 // Version 8 hosts native timers and presents their additive event variant.
 // Old monitors must not keep serving the previous lifecycle after an upgrade.
-pub(crate) const PROTO: u32 = 8;
+pub(crate) const PROTO: u32 = 9;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -2569,7 +2569,8 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 if beat.is_none() {
                     anyhow::bail!("the repo watcher stopped");
                 }
-                if timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
+                if timers_changed {
                     for backlog in timer_backlogs.values_mut() { backlog.invalidate(); }
                 }
                 // Fold BEFORE claiming one. The counter means a fold
@@ -2585,7 +2586,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         // on a restart.
                         owned
                             .departing
-                            .extend(reconcile_hosting(&repo, &mut hosted, &source_items));
+                            .extend(reconcile_hosting_changed(&repo, &mut hosted, &source_items, timers_changed));
                         // ONE presentation, carrying the projection,
                         // the durable rows and anything held from
                         // before there was a state to present it
@@ -2597,7 +2598,12 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     // watchdog keeps counting this as a still look —
                     // which is how a repeatedly failing fold ends up
                     // standing the monitor down.
-                    None => eprintln!("monitor: fold failed, held at {fold}"),
+                    None => {
+                        // Keep an observed ack/config invalidation until a fold
+                        // can apply it; clearing dirty must not strand Pending.
+                        if timers_changed { timer_dirty.store(true, std::sync::atomic::Ordering::Release); }
+                        eprintln!("monitor: fold failed, held at {fold}");
+                    }
                 }
             }
         }
@@ -2721,6 +2727,24 @@ fn reconcile_hosting(
     hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
     into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    reconcile_hosting_changed(repo, hosted, into, false)
+}
+
+#[must_use = "a cancelled producer may still be winding down; keep its handle"]
+fn reconcile_hosting_changed(
+    repo: &std::path::Path,
+    hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
+    timers_changed: bool,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let retry_timers = |timers: &mut crate::cli::timer_source::TimerSet| {
+        if timers_changed {
+            timers.refresh();
+            timers.retry_one_shots();
+        } else {
+            timers.retry();
+        }
+    };
     let mut departing = Vec::new();
     let authors = roster_authors(repo);
     for author in &authors {
@@ -2733,7 +2757,7 @@ fn reconcile_hosting(
                 if let Some(running) = hosted.get_mut(author)
                     && let Some(timers) = &mut running.timers
                 {
-                    timers.retry();
+                    retry_timers(timers);
                 }
                 continue;
             }
@@ -2743,7 +2767,7 @@ fn reconcile_hosting(
                 // One retry per existing reconciliation wake. New/replaced
                 // sets already attempted catchup; do not try them twice.
                 if let Some(timers) = &mut running.timers {
-                    timers.retry();
+                    retry_timers(timers);
                 }
                 continue;
             }
@@ -2767,7 +2791,7 @@ fn reconcile_hosting(
                     if let Some(running) = hosted.get_mut(author)
                         && let Some(timers) = &mut running.timers
                     {
-                        timers.retry();
+                        retry_timers(timers);
                     }
                     continue;
                 }
@@ -2777,7 +2801,7 @@ fn reconcile_hosting(
         if let Some(previous) = hosted.remove(author) {
             departing.extend(previous.stop());
         }
-        timers.due();
+        timers.arm();
         let tasks = crate::cli::wait::EventSources::spawn(
             &spec,
             Some(&events_dir),
@@ -7474,6 +7498,7 @@ mod tests {
             config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
                 clank_core::agent_config::TimerSource {
                     name: name.into(),
+                    repeat_every: None,
                     due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)
                         .unwrap()
                         .format(&time::format_description::well_known::Rfc3339)
@@ -7483,6 +7508,77 @@ mod tests {
             )];
         })
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recurring_timer_host_rearms_on_ack_invalidation_and_cancels_on_removal() {
+        use crate::cli::github::log::EventLog;
+        let repo = repo_with_roster();
+        let author = AgentLabel::parse("codex").unwrap();
+        with_timer(repo.path(), "recurring", 100);
+        crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+            let clank_core::agent_config::WaitEventSource::Timer(timer) =
+                &mut config.wait_events[0]
+            else {
+                unreachable!()
+            };
+            timer.repeat_every = Some("10s".into());
+        })
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = Default::default();
+        assert!(reconcile_hosting(repo.path(), &mut hosted, &tx).is_empty());
+        let (_, (item, _)) = rx.try_recv().unwrap();
+        let selector = item.event_view().unwrap().selector.unwrap();
+        let key = selector.split_once('@').unwrap().0;
+        let dir = crate::agent_store::agents_root(repo.path()).join("codex/events");
+        let mut log = EventLog::open(&dir, key).unwrap();
+        let row = log.read_rows().unwrap().unwrap().rows.remove(0);
+        assert!(matches!(
+            &row.item,
+            WaitItem::TimerEvent {
+                selector: None,
+                recurrence: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            hosted[&author]
+                .timers
+                .as_ref()
+                .unwrap()
+                .next_deadline()
+                .is_none()
+        );
+        // Record an ack while the wall clock is forward, then refresh after
+        // retreat; proven coverage must still arm a future anchored deadline.
+        log.ack_recurring_at(
+            row.seq,
+            &row.ident,
+            crate::cli::timer_source::wall_now() + 60,
+        )
+        .unwrap();
+        assert!(reconcile_hosting_changed(repo.path(), &mut hosted, &tx, true).is_empty());
+        let deadline = hosted[&author]
+            .timers
+            .as_ref()
+            .unwrap()
+            .next_deadline()
+            .unwrap();
+        assert!(deadline > tokio::time::Instant::now());
+        assert!(reconcile_hosting(repo.path(), &mut hosted, &tx).is_empty());
+        assert_eq!(
+            hosted[&author].timers.as_ref().unwrap().next_deadline(),
+            Some(deadline)
+        );
+        crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+            config.wait_events.clear();
+        })
+        .unwrap();
+        assert!(reconcile_hosting_changed(repo.path(), &mut hosted, &tx, true).is_empty());
+        assert!(hosted.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(log.read_rows().unwrap().unwrap().rows.len(), 1);
     }
 
     #[tokio::test]

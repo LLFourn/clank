@@ -219,13 +219,16 @@ pub enum WaitItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<ContentRef>,
     },
-    /// An accepted one-shot occurrence. The deadline is provenance;
+    /// An accepted timer occurrence with optional recurring catch-up metadata.
+    /// The deadline is provenance;
     /// the qualified selector addresses its authoritative WAL row.
     TimerEvent {
         name: String,
         id: String,
         due_at: u64,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recurrence: Option<crate::agent_config::TimerRecurrence>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
     },
@@ -494,6 +497,7 @@ pub struct EventView<'a> {
     pub failure: bool,
     /// Whether a plain acknowledgement is insufficient to finish this event.
     pub requires_reply: bool,
+    pub recurrence: Option<&'a crate::agent_config::TimerRecurrence>,
     /// The carve-out: what only github has.
     pub github: Option<GithubBits<'a>>,
 }
@@ -552,6 +556,7 @@ impl WaitItem {
                 due_at,
                 content,
                 selector,
+                recurrence,
                 ..
             } => Some(EventView {
                 source: name,
@@ -563,6 +568,7 @@ impl WaitItem {
                 selector: selector.as_deref(),
                 failure: false,
                 requires_reply: false,
+                recurrence: recurrence.as_ref(),
                 github: None,
             }),
             WaitItem::GithubEvent {
@@ -587,6 +593,7 @@ impl WaitItem {
                 selector: None,
                 failure: false,
                 requires_reply: false,
+                recurrence: None,
                 github: Some(GithubBits {
                     detail: detail.as_deref(),
                     number: *number,
@@ -614,6 +621,7 @@ impl WaitItem {
                 selector: selector.as_deref(),
                 failure: *failure,
                 requires_reply: *requires_reply,
+                recurrence: None,
                 github: None,
             }),
             WaitItem::DraftChanged {
@@ -631,6 +639,7 @@ impl WaitItem {
                 selector: selector.as_deref(),
                 failure: false,
                 requires_reply: false,
+                recurrence: None,
                 github: None,
             }),
             // A message is an event like any other, so it has a view
@@ -653,6 +662,7 @@ impl WaitItem {
                 selector: selector.as_deref(),
                 failure: false,
                 requires_reply: false,
+                recurrence: None,
                 github: None,
             }),
             _ => None,

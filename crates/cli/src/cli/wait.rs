@@ -316,7 +316,7 @@ async fn items_with_policy(
             invocation.as_deref(),
             source_tx.clone().into(),
         )?;
-        timers.due();
+        timers.arm();
         Some(timers)
     };
     let invocation_keys = timers
@@ -325,6 +325,9 @@ async fn items_with_policy(
         .unwrap_or_default();
     let mut timer_backlog =
         crate::cli::timer_source::Backlog::new(events_dir.clone(), invocation_keys);
+    if args.peek {
+        timer_backlog = timer_backlog.inspection();
+    }
 
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
@@ -428,6 +431,12 @@ async fn items_with_policy(
         tx,
         Some(timer_dirty.clone()),
     )?;
+    // Close the admission race: ack may have happened after the initial fold
+    // but before this watcher existed. Later writes leave dirty set for a wake.
+    if let Some(timers) = &mut timers {
+        timers.refresh();
+    }
+    timer_backlog.invalidate();
 
     // Refold cadence. Native mode uses a 1.5s heartbeat as the
     // finalize-race safety net (the watcher carries the load).
@@ -499,11 +508,15 @@ async fn items_with_policy(
                     true
                 }
             };
-            if existing_wake && let Some(timers) = &mut timers {
-                timers.retry();
-            }
-            if poll_mode || timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
+            if poll_mode || timers_changed {
+                if let Some(timers) = &mut timers {
+                    timers.refresh();
+                    timers.retry_one_shots();
+                }
                 timer_backlog.invalidate();
+            } else if existing_wake && let Some(timers) = &mut timers {
+                timers.retry();
             }
             // The same beat that notices repo changes also notices a
             // new incarnation. No second hook-side poller is needed.
@@ -2195,6 +2208,8 @@ pub(crate) enum WaitJsonItem<'a> {
         due_at: u64,
         content: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
+        recurrence: Option<&'a clank_core::agent_config::TimerRecurrence>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         selector: Option<&'a str>,
     },
     #[serde(rename = "command_event")]
@@ -2364,12 +2379,14 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             id,
             due_at,
             content,
+            recurrence,
             selector,
         } => WaitJsonItem::TimerEvent {
             name,
             id,
             due_at: *due_at,
             content,
+            recurrence: recurrence.as_ref(),
             selector: selector.as_deref(),
         },
         WaitItem::CommandEvent {
@@ -2544,7 +2561,15 @@ fn render_human(item: &WaitItem) -> String {
                 .unwrap_or_default();
             // Segments joined uniformly so absent optionals leave no
             // dangling separators.
-            let mut parts = vec![format!("{lead} {}{detail}", v.kind), v.source.to_string()];
+            let source = if matches!(e, WaitItem::TimerEvent { .. }) {
+                one_line(v.source, 80)
+            } else {
+                v.source.to_string()
+            };
+            let mut parts = vec![format!("{lead} {}{detail}", v.kind), source];
+            if let Some(recurrence) = v.recurrence {
+                parts.push(crate::cli::events::recurrence_summary(recurrence));
+            }
             if let Some(g) = &v.github {
                 if let Some(n) = g.number {
                     parts.push(format!("#{n}"));
@@ -3670,6 +3695,31 @@ mod shared_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recurring_timer_human_hint_is_one_line_and_reports_immutable_range() {
+        let r = crate::cli::timer_source::recurrence::Recurrence::from_generation(
+            clank_core::agent_config::TimerGeneration {
+                name: "deploy\nextra\u{1b}".into(),
+                scope: None,
+                anchor: 100,
+                interval: 10,
+            },
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let super::super::github::log::RecurringTransition::Accepted { item, .. } =
+            super::super::github::log::EventLog::open(dir.path(), &r.source_key())
+                .unwrap()
+                .accept_recurring(&r, "check\nnow\u{1b}", 140)
+                .unwrap()
+        else {
+            panic!("not accepted")
+        };
+        let hint = super::render_human(&item);
+        assert!(hint.contains("5 scheduled occurrences"), "{hint}");
+        assert!(hint.contains("every 10s"));
+        assert!(!hint.chars().any(char::is_control));
+    }
 
     use super::*;
 

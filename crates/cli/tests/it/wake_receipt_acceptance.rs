@@ -440,6 +440,184 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_native_deadline() {
+    let fixture = Fixture::new(Tool::Codex, false);
+    clank::agent_store::update_agent_config(&fixture.repo, &fixture.author, |cfg| {
+        cfg.wait_events.clear();
+    })
+    .unwrap();
+    let mut monitor = fixture
+        .command()
+        .args(["monitor", "start", "--repo", fixture.repo.to_str().unwrap()])
+        .env("RUST_LOG", "clank::cli::monitor=debug")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(monitor.stdout.take().unwrap()).lines();
+    assert!(
+        tokio::time::timeout(LIMIT, stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .contains("listening on")
+    );
+    let mut stderr = BufReader::new(monitor.stderr.take().unwrap()).lines();
+    let first_hook = fixture.hook_child(false).await;
+    async fn admitted(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>) {
+        tokio::time::timeout(LIMIT, async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("monitor agent wait admitted") {
+                    return;
+                }
+            }
+            panic!("monitor closed before admission");
+        })
+        .await
+        .expect("waiter must attach to shared monitor");
+    }
+    admitted(&mut stderr).await;
+    let anchor = time::OffsetDateTime::now_utc() - time::Duration::seconds(100);
+    let anchor = anchor.replace_nanosecond(0).unwrap();
+    clank::agent_store::update_agent_config(&fixture.repo, &fixture.author, |cfg| {
+        cfg.wait_events = vec![WaitEventSource::Timer(
+            clank_core::agent_config::TimerSource {
+                name: "recurring-monitor".into(),
+                due_at: anchor
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+                repeat_every: Some("10s".into()),
+                content: Some("recurring work".into()),
+            },
+        )];
+    })
+    .unwrap();
+    let first = tokio::time::timeout(LIMIT, first_hook.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(first["reason"].as_str().unwrap().contains("recurring work"));
+    let list = fixture
+        .run(&[
+            "events",
+            "list",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(list.status.success());
+    let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "offline slots coalesce");
+    let row = &rows[0];
+    let previous_last = row["item"]["recurrence"]["last_slot"].as_u64().unwrap();
+    assert!(row["item"]["recurrence"]["count"].as_u64().unwrap() >= 11);
+    let selector = row["id"].as_str().unwrap();
+    let key = row["source"].as_str().unwrap();
+    let wal = clank::agent_store::agents_root(&fixture.repo)
+        .join("codex/events")
+        .join(format!("{key}.jsonl"));
+    let accepted_bytes = std::fs::read(&wal).unwrap();
+    let replay = fixture.hook_child(false).await;
+    let replay = tokio::time::timeout(LIMIT, replay.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replay.status.success());
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        accepted_bytes,
+        "pending replay appends nothing"
+    );
+    let ack = fixture
+        .run(&[
+            "events",
+            "ack",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            selector,
+        ])
+        .await;
+    assert!(
+        ack.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ack.stderr)
+    );
+    let second_hook = fixture.hook_child(false).await;
+    admitted(&mut stderr).await;
+    let second = tokio::time::timeout(LIMIT, second_hook.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(
+        second["reason"]
+            .as_str()
+            .unwrap()
+            .contains("recurring work")
+    );
+    let list = fixture
+        .run(&[
+            "events",
+            "list",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+    let pending: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["acked"] == false)
+        .collect();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0]["item"]["recurrence"]["first_slot"]
+            .as_u64()
+            .unwrap()
+            > previous_last
+    );
+    assert_ne!(pending[0]["id"].as_str().unwrap(), selector);
+    assert!(
+        !fixture.output.exists(),
+        "timer delivery has no command receipt effect"
+    );
+    let descriptor: Value = serde_json::from_slice(
+        &std::fs::read(runtime_dir().join(format!("{}.json", repo_tag(&fixture.repo)))).unwrap(),
+    )
+    .unwrap();
+    let mut socket = tokio::net::UnixStream::connect(descriptor["socket"].as_str().unwrap())
+        .await
+        .unwrap();
+    let greeting = json!({"proto":u32::MAX,"repo":fixture.repo,"who":{"as":"observer"}});
+    socket
+        .write_all(format!("{greeting}\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(LIMIT, monitor.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_monitor_delivery_preserves_monitor_cwd_and_does_not_own_receipts() {
     let mut fixture = Fixture::new(Tool::Codex, true);
     let mut monitor = fixture

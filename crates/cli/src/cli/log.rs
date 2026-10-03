@@ -442,6 +442,12 @@ fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
     if g.failure {
         out.push_str("  (this SOURCE is broken, not the world)");
     }
+    if let Some(r) = &g.recurrence {
+        out.push_str(&format!(
+            "  ({})",
+            crate::cli::events::recurrence_summary(r)
+        ));
+    }
     if let Some(t) = &g.content {
         out.push_str(&format!("  “{}”", clean(t)));
     }
@@ -1388,6 +1394,8 @@ enum LogJsonRow<'a> {
     Timer {
         ts: i64,
         due_at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recurrence: Option<&'a clank_core::agent_config::TimerRecurrence>,
         source: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<&'a str>,
@@ -1468,6 +1476,7 @@ fn json_items<'a>(
                     },
                     crate::cli::github::timeline::Backend::Timer => LogJsonRow::Timer {
                         ts,
+                        recurrence: g.recurrence.as_ref(),
                         due_at: g.at,
                         source: &g.source,
                         content: g.content.as_deref(),
@@ -1575,6 +1584,48 @@ mod json_output_tests {
     use super::*;
 
     #[test]
+    fn recurring_timer_provenance_reaches_log_json_and_web_event_state() {
+        use crate::cli::{
+            github::{log::EventLog, timeline},
+            timer_source::recurrence::Recurrence,
+        };
+        let repo = tempfile::tempdir().unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("rev/events");
+        let r = Recurrence::from_generation(clank_core::agent_config::TimerGeneration {
+            name: "deploy\nextra".into(),
+            scope: None,
+            anchor: 100,
+            interval: 10,
+        })
+        .unwrap();
+        let content = "Check deployment\nReport result\u{1b}[31m";
+        EventLog::open(&dir, &r.source_key())
+            .unwrap()
+            .accept_recurring(&r, content, 140)
+            .unwrap();
+        let snapshot = timeline::timeline_snapshot(repo.path());
+        assert!(snapshot.notices.is_empty());
+        assert_eq!(snapshot.events.len(), 1);
+        let event = &snapshot.events[0];
+        let summary = gh_describe(event);
+        assert!(summary.contains("5 scheduled occurrences"), "{summary}");
+        assert!(summary.contains("every 10s"));
+        assert!(!summary.chars().any(char::is_control));
+        assert_eq!(event.body.as_deref(), Some(content));
+        let web = serde_json::to_value(event).unwrap();
+        assert_eq!(web["recurrence"]["generation_id"], r.id);
+        assert_eq!(web["recurrence"]["first_slot"], 0);
+        assert_eq!(web["recurrence"]["last_slot"], 4);
+        assert_eq!(web["body"], content);
+        let items = interleave(&[], &snapshot.events);
+        let reviews = Default::default();
+        let json = serde_json::to_value(json_items(&items, &reviews)).unwrap();
+        assert_eq!(json[0]["recurrence"], web["recurrence"]);
+        assert_eq!(json[0]["due_at"], 140);
+        assert_eq!(json[0]["content"], content);
+    }
+
+    #[test]
     fn a_timer_wal_projects_as_a_timer_in_log_and_web_state_and_ack_refreshes_it() {
         use crate::cli::github::{
             log::{EventLog, Transport},
@@ -1584,6 +1635,7 @@ mod json_output_tests {
         let dir = crate::agent_store::agents_root(repo.path()).join("rev/events");
         let source = clank_core::agent_config::TimerSource {
             name: "check-deploy".into(),
+            repeat_every: None,
             due_at: "1970-01-01T00:01:40Z".into(),
             content: Some(
                 "Check \u{1b}[31mdeployment\u{1b}[0m\t\nReport result\r\nFull body".into(),
@@ -1598,6 +1650,7 @@ mod json_output_tests {
                 Some(100),
                 &clank_core::wait::WaitItem::TimerEvent {
                     name: source.name.clone(),
+                    recurrence: None,
                     id: "timer/100".into(),
                     due_at: 100,
                     content: source.content.clone().unwrap(),
@@ -1655,6 +1708,7 @@ mod json_output_tests {
 
     fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at,
             backend: crate::cli::github::timeline::Backend::Github,
             glyph: None,
@@ -1911,6 +1965,7 @@ mod json_output_tests {
     #[test]
     fn no_github_hides_github_events_and_keeps_command_ones() {
         let ev = |backend, source: &str| crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 150,
             backend,
             glyph: None,
@@ -1958,6 +2013,7 @@ mod json_output_tests {
     #[test]
     fn a_command_events_row_and_json_are_not_dressed_up_as_github() {
         let cmd = crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 150,
             backend: crate::cli::github::timeline::Backend::Command,
             glyph: None,
@@ -2289,6 +2345,7 @@ mod tests {
             subject: "[split] wrap up".into(),
         };
         let event = crate::cli::github::timeline::MergedEvent {
+            recurrence: None,
             at: 2,
             backend: crate::cli::github::timeline::Backend::Github,
             glyph: None,

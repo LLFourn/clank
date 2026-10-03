@@ -72,6 +72,121 @@ fn timer_event(name: &str, due: u64) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recurring_timer_catches_up_once_replays_and_ack_covers_offline_ticks() {
+    use clank_core::wait::WaitItem;
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo();
+    let mut timer: serde_json::Value = serde_json::from_str(&timer_event("daily", 1)).unwrap();
+    timer["repeat_every"] = "24h".into();
+    let config = serde_json::json!({"wait_events":[timer]}).to_string();
+    write(repo, ".clank/agents/master/config.json", &config);
+    write(repo, ".clank/queue/500-ready.md", "# ready\n");
+    let args = |peek| {
+        let mut args = wait_args(repo, Vec::new());
+        args.author = Some("master".into());
+        args.peek = peek;
+        args
+    };
+    let peek = clank::cli::wait::items(args(true)).await.unwrap().unwrap();
+    assert!(
+        !peek
+            .iter()
+            .any(|item| matches!(item, WaitItem::TimerEvent { .. }))
+    );
+    let starts = clank::cli::wait::SourceStarts::default();
+    let got = clank::cli::wait::items_observing(args(false), &starts)
+        .await
+        .unwrap()
+        .unwrap();
+    let accepted: Vec<_> = got
+        .into_iter()
+        .filter(|item| matches!(item, WaitItem::TimerEvent { .. }))
+        .collect();
+    assert_eq!(accepted.len(), 1);
+    let WaitItem::TimerEvent {
+        recurrence: Some(metadata),
+        selector: Some(selector),
+        ..
+    } = &accepted[0]
+    else {
+        panic!("missing recurrence custody")
+    };
+    assert_eq!(metadata.first_slot, 0);
+    assert!(
+        metadata.count > 10_000,
+        "decades offline coalesce into one event"
+    );
+    assert_eq!(starts.count(), 0, "catch-up needs no producer drivers");
+    let key = selector.split_once('@').unwrap().0;
+    let path = repo.join(format!(".clank/agents/master/events/{key}.jsonl"));
+    let bytes = std::fs::read(&path).unwrap();
+    let replay = clank::cli::wait::items(args(false)).await.unwrap().unwrap();
+    assert!(replay.contains(&accepted[0]));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "pending ticks do not append"
+    );
+    write(repo, ".clank/agents/master/config.json", "{}");
+    let removed = clank::cli::wait::items(args(true)).await.unwrap().unwrap();
+    assert!(
+        removed.contains(&accepted[0]),
+        "removed definition still owes accepted work"
+    );
+    clank::cli::events::run(clank::cli::EventsArgs {
+        command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            reply: None,
+            repo: Some(repo.to_path_buf()),
+            author: Some("master".into()),
+            ids: vec![selector.clone()],
+        }),
+    })
+    .await
+    .unwrap();
+    write(repo, ".clank/agents/master/config.json", &config);
+    let restored = clank::cli::wait::items(args(false)).await.unwrap().unwrap();
+    assert!(
+        !restored
+            .iter()
+            .any(|item| matches!(item, WaitItem::TimerEvent { .. })),
+        "restored generation preserves ack coverage"
+    );
+    assert!(
+        !repo
+            .join(format!(".clank/agents/master/events/{key}.seen"))
+            .exists()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recurring_timer_deadline_wakes_real_local_wait_without_an_extra_producer() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let due = time::OffsetDateTime::now_utc().unix_timestamp() as u64 + 2;
+    let mut timer: serde_json::Value =
+        serde_json::from_str(&timer_event("recurring-future", due)).unwrap();
+    timer["repeat_every"] = "1h".into();
+    let mut args = wait_args(env.repo(), vec![timer.to_string()]);
+    args.poll = false;
+    args.no_poll = true;
+    let got = tokio::time::timeout(
+        common::race_deadline(env.repo()),
+        clank::cli::wait::items(args),
+    )
+    .await
+    .expect("recurring native deadline wakes local wait")
+    .unwrap()
+    .unwrap();
+    assert!(time::OffsetDateTime::now_utc().unix_timestamp() as u64 >= due);
+    assert!(
+        matches!(got.as_slice(), [clank_core::wait::WaitItem::TimerEvent {
+        recurrence: Some(metadata), due_at, selector: Some(_), ..
+    }] if *due_at == due && metadata.first_slot == 0 && metadata.last_slot == 0 && metadata.count == 1)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timer_peek_is_read_only_and_normal_catchup_precedes_ready_work() {
     use clank_core::wait::WaitItem;
     let _serial = common::serial();

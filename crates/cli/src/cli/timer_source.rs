@@ -1,6 +1,8 @@
 //! Passive native deadlines. The lifecycle owner selects one absolute sleep;
 //! this module owns no task, producer, watcher or idle ingest lease.
 
+pub(crate) mod recurrence;
+
 use super::event_source::{Durability, EmissionSink, SourceOrigin};
 use super::github::log::{EventLog, IngestLease, Transport};
 use super::source_ids::{Known, Seen};
@@ -55,6 +57,13 @@ pub(crate) fn parse(source: &TimerSource) -> anyhow::Result<u64> {
     );
     let due = u64::try_from(instant.unix_timestamp())
         .map_err(|_| anyhow::anyhow!("timer `{}` due_at precedes the Unix epoch", source.name))?;
+    if let Some(interval) = recurrence::interval(source)? {
+        anyhow::ensure!(
+            due.checked_add(interval).is_some(),
+            "timer `{}` recurrence exceeds the timestamp range",
+            source.name
+        );
+    }
     Ok(due)
 }
 
@@ -63,6 +72,7 @@ struct Entry {
     key: String,
     due: u64,
     failure: Option<String>,
+    recurrence: Option<recurrence::Recurrence>,
 }
 
 /// Ordered deadlines plus failed entries awaiting an *existing* owner wake.
@@ -70,6 +80,7 @@ struct Entry {
 pub(crate) struct TimerSet {
     entries: BTreeMap<(Instant, String), Entry>,
     recovery: Vec<Entry>,
+    pending: BTreeMap<String, Entry>,
     dir: PathBuf,
     sink: EmissionSink,
     invocation_keys: BTreeSet<String>,
@@ -100,13 +111,28 @@ impl TimerSet {
                     anyhow::anyhow!("invocation timer requires an invocation identity")
                 })?),
             };
-            let key = source.source_key(scope);
+            let recurrence = source
+                .repeat_every
+                .as_ref()
+                .map(|_| recurrence::Recurrence::parse(source, scope))
+                .transpose()?;
+            let key = recurrence
+                .as_ref()
+                .map_or_else(|| source.source_key(scope), |r| r.source_key());
             anyhow::ensure!(
                 names.insert((scope, source.name.clone())) && keys.insert(key.clone()),
                 "duplicate timer name or storage key `{}` in one scope",
                 source.name
             );
             let due = parse(source)?;
+            if let Some(r) = &recurrence {
+                anyhow::ensure!(
+                    now.checked_add(Duration::from_secs(r.generation.interval))
+                        .is_some(),
+                    "timer `{}` recurrence interval outside monotonic range",
+                    source.name
+                );
+            }
             let deadline = now
                 .checked_add(Duration::from_secs(due).saturating_sub(wall))
                 .ok_or_else(|| anyhow::anyhow!("timer deadline outside monotonic range"))?;
@@ -120,12 +146,14 @@ impl TimerSet {
                     key,
                     due,
                     failure: None,
+                    recurrence,
                 },
             );
         }
         Ok(Self {
             entries,
             recovery: Vec::new(),
+            pending: BTreeMap::new(),
             dir: dir.to_owned(),
             sink,
             invocation_keys,
@@ -137,6 +165,50 @@ impl TimerSet {
     }
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.entries.first_key_value().map(|(key, _)| key.0)
+    }
+
+    /// Constructors are passive, so a complete replacement can be validated
+    /// before disturbing a running host. Arm once after taking ownership.
+    pub(crate) fn arm(&mut self) {
+        self.refresh();
+        self.due();
+    }
+
+    /// Refresh only on admission or existing event-directory invalidation.
+    /// Pending entries have no deadline and never enter heartbeat retries.
+    pub(crate) fn refresh(&mut self) {
+        self.refresh_at(wall_now(), Instant::now());
+    }
+
+    fn refresh_at(&mut self, wall: u64, now: Instant) {
+        let keys: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.recurrence.is_some())
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut refresh = Vec::new();
+        for key in keys {
+            refresh.push((
+                self.entries.remove(&key).expect("collected key"),
+                Some(key.0),
+            ));
+        }
+        refresh.extend(
+            std::mem::take(&mut self.pending)
+                .into_values()
+                .map(|entry| (entry, None)),
+        );
+        for entry in std::mem::take(&mut self.recovery) {
+            if entry.recurrence.is_some() {
+                refresh.push((entry, None));
+            } else {
+                self.recovery.push(entry);
+            }
+        }
+        for (entry, deadline) in refresh {
+            self.try_entry(entry, wall, now, deadline);
+        }
     }
 
     pub(crate) fn due(&mut self) {
@@ -161,27 +233,39 @@ impl TimerSet {
         }
         ready.sort_by(|a, b| (a.due, &a.key).cmp(&(b.due, &b.key)));
         for entry in ready {
-            if entry.due > wall {
+            if entry.recurrence.is_none() && entry.due > wall {
                 // Backward wall-clock movement: never ingest early.
                 if let Some(deadline) = now.checked_add(Duration::from_secs(entry.due - wall)) {
                     self.entries.insert((deadline, entry.key.clone()), entry);
                 } else {
                     self.recovery.push(entry);
                 }
-            } else if let Some(entry) = self.try_entry(entry) {
-                self.recovery.push(entry);
+            } else {
+                self.try_entry(entry, wall, now, None);
             }
         }
     }
 
     /// Healthy future timers do not read clocks or files on heartbeats.
     pub(crate) fn retry(&mut self) {
+        self.retry_entries(true);
+    }
+
+    pub(crate) fn retry_one_shots(&mut self) {
+        self.retry_entries(false);
+    }
+
+    fn retry_entries(&mut self, recurring: bool) {
         if self.recovery.is_empty() {
             return;
         }
         let wall = wall_now();
         for entry in std::mem::take(&mut self.recovery) {
-            if entry.due > wall {
+            if !recurring && entry.recurrence.is_some() {
+                self.recovery.push(entry);
+                continue;
+            }
+            if entry.recurrence.is_none() && entry.due > wall {
                 if let Some(deadline) =
                     Instant::now().checked_add(Duration::from_secs(entry.due - wall))
                 {
@@ -191,22 +275,70 @@ impl TimerSet {
                 }
                 continue;
             }
-            if let Some(entry) = self.try_entry(entry) {
-                self.recovery.push(entry);
-            }
+            self.try_entry(entry, wall, Instant::now(), None);
         }
     }
 
-    fn try_entry(&self, mut entry: Entry) -> Option<Entry> {
-        match accept(&self.dir, &entry.key, &entry.source, entry.due, &self.sink) {
-            Ok(()) => None,
+    fn try_entry(&mut self, mut entry: Entry, wall: u64, now: Instant, previous: Option<Instant>) {
+        let result = match &entry.recurrence {
+            None => {
+                accept(&self.dir, &entry.key, &entry.source, entry.due, &self.sink).map(|_| None)
+            }
+            Some(r) => (|| {
+                let mut log = EventLog::open(&self.dir, &entry.key)?;
+                let transition = log.accept_recurring(
+                    r,
+                    entry.source.content.as_deref().unwrap_or_default(),
+                    wall,
+                )?;
+                let next = match transition {
+                    super::github::log::RecurringTransition::Future(due) => Some(due),
+                    super::github::log::RecurringTransition::Pending => None,
+                    super::github::log::RecurringTransition::Accepted { seq, mut item } => {
+                        // Selectors are projection metadata, never persisted payload.
+                        super::command_source::stamp_selector(&mut item, &entry.key, seq);
+                        let _ = self.sink.send((item, Durability::Logged));
+                        None
+                    }
+                };
+                log.maybe_compact()?;
+                Ok(next)
+            })(),
+        };
+        match result {
+            Ok(Some(due)) => {
+                let deadline = previous
+                    .filter(|deadline| entry.due == due && *deadline > now)
+                    .or_else(|| now.checked_add(Duration::from_secs(due.saturating_sub(wall))));
+                entry.due = due;
+                if let Some(deadline) = deadline {
+                    entry.failure = None;
+                    self.entries.insert((deadline, entry.key.clone()), entry);
+                } else {
+                    if entry.failure.as_deref()
+                        != Some("recurring deadline outside monotonic range")
+                    {
+                        eprintln!(
+                            "wait: timer `{}`: recurring deadline outside monotonic range",
+                            entry.source.name
+                        );
+                    }
+                    entry.failure = Some("recurring deadline outside monotonic range".into());
+                    self.recovery.push(entry);
+                }
+            }
+            Ok(None) if entry.recurrence.is_some() => {
+                entry.failure = None;
+                self.pending.insert(entry.key.clone(), entry);
+            }
+            Ok(None) => {}
             Err(error) => {
                 let failure = error.to_string();
                 if entry.failure.as_ref() != Some(&failure) {
                     eprintln!("wait: timer `{}`: {failure}", entry.source.name);
                     entry.failure = Some(failure);
                 }
-                Some(entry)
+                self.recovery.push(entry);
             }
         }
     }
@@ -219,6 +351,7 @@ mod tests {
     fn source(name: &str, due: u64) -> TimerSource {
         TimerSource {
             name: name.into(),
+            repeat_every: None,
             due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)
                 .unwrap()
                 .format(&time::format_description::well_known::Rfc3339)
@@ -247,6 +380,240 @@ mod tests {
             .unwrap()
             .unwrap()
             .rows
+    }
+
+    fn recurring_source(name: &str) -> TimerSource {
+        let mut source = source(name, 100);
+        source.repeat_every = Some("10s".into());
+        source
+    }
+
+    #[tokio::test]
+    async fn recurring_owner_sleeps_while_pending_and_ack_refresh_preserves_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = recurring_source("deploy");
+        let r = recurrence::Recurrence::parse(&source, None).unwrap();
+        let key = r.source_key();
+        let (mut timers, mut rx) = set(dir.path(), vec![source]);
+        let now = Instant::now();
+        timers.refresh_at(100, now);
+        let (item, _) = rx.try_recv().unwrap();
+        assert!(
+            item.event_view()
+                .unwrap()
+                .selector
+                .unwrap()
+                .starts_with(&key)
+        );
+        let row = rows(dir.path(), &key).remove(0);
+        assert!(matches!(
+            &row.item,
+            WaitItem::TimerEvent { selector: None, .. }
+        ));
+        assert_eq!(timers.pending.len(), 1);
+        assert!(timers.next_deadline().is_none());
+        let path = dir.path().join(format!("{key}.jsonl"));
+        let original = std::fs::read(&path).unwrap();
+        // A heartbeat would expose this poison if it read the healthy pending
+        // WAL. Neither retry nor due may perform that read or arm a deadline.
+        std::fs::write(&path, "poison\n").unwrap();
+        for _ in 0..20 {
+            timers.retry();
+            timers.due();
+        }
+        assert!(timers.recovery.is_empty());
+        assert!(timers.next_deadline().is_none());
+        assert!(rx.try_recv().is_err());
+        std::fs::write(&path, original).unwrap();
+        EventLog::open(dir.path(), &key)
+            .unwrap()
+            .ack_recurring_at(row.seq, &row.ident, 140)
+            .unwrap();
+        // Represents the final admission refresh after attaching a watcher,
+        // including an ack that preceded that attachment.
+        timers.refresh_at(145, now);
+        assert!(timers.pending.is_empty());
+        assert_eq!(timers.next_deadline(), Some(now + Duration::from_secs(5)));
+        timers.due_at(149, now + Duration::from_secs(5));
+        assert!(rx.try_recv().is_err(), "backward wall: no early acceptance");
+        timers.due_at(150, now + Duration::from_secs(6));
+        let (item, _) = rx.try_recv().unwrap();
+        let WaitItem::TimerEvent {
+            recurrence: Some(metadata),
+            ..
+        } = item
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (metadata.first_slot, metadata.last_slot, metadata.count),
+            (5, 5, 1)
+        );
+        assert!(timers.next_deadline().is_none());
+        assert_eq!(rows(dir.path(), &key).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recurring_unrepresentable_next_deadline_disables_sleep_and_preserves_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = recurring_source("range");
+        let key = recurrence::Recurrence::parse(&source, None)
+            .unwrap()
+            .source_key();
+        let (mut timers, mut rx) = set(dir.path(), vec![source]);
+        timers.refresh_at(100, Instant::now());
+        rx.try_recv().unwrap();
+        let row = rows(dir.path(), &key).remove(0);
+        EventLog::open(dir.path(), &key)
+            .unwrap()
+            .ack_recurring_at(row.seq, &row.ident, u64::MAX - 200)
+            .unwrap();
+        timers.refresh_at(100, Instant::now());
+        assert!(timers.next_deadline().is_none());
+        assert_eq!(timers.recovery.len(), 1);
+        let failure = timers.recovery[0].failure.clone();
+        assert!(failure.is_some());
+        timers.retry();
+        assert_eq!(timers.recovery.len(), 1);
+        assert_eq!(timers.recovery[0].failure, failure);
+        assert!(timers.next_deadline().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recurring_future_is_stable_and_pending_takeover_does_not_emit_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = recurring_source("phase");
+        let key = recurrence::Recurrence::parse(&source, None)
+            .unwrap()
+            .source_key();
+        let (mut timers, mut rx) = set(dir.path(), vec![source.clone()]);
+        let now = Instant::now();
+        timers.refresh_at(95, now);
+        assert_eq!(timers.next_deadline(), Some(now + Duration::from_secs(5)));
+        for n in 0..4 {
+            timers.refresh_at(95 + n, now + Duration::from_secs(n));
+            assert_eq!(timers.next_deadline(), Some(now + Duration::from_secs(5)));
+        }
+        assert!(rx.try_recv().is_err());
+        timers.due_at(100, now + Duration::from_secs(5));
+        rx.try_recv().unwrap();
+        drop(timers);
+        let (mut successor, mut successor_rx) = set(dir.path(), vec![source]);
+        successor.refresh_at(1_000_000, now);
+        assert!(successor.next_deadline().is_none());
+        assert_eq!(successor.pending.len(), 1);
+        assert!(successor_rx.try_recv().is_err());
+        assert_eq!(rows(dir.path(), &key).len(), 1);
+        let mut removed = Backlog::new(dir.path().to_owned(), BTreeSet::new());
+        assert_eq!(removed.owed(&mut HashSet::new()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recurring_backlog_caches_without_io_and_peek_does_not_repair_tails() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = recurring_source("cached");
+        let r = recurrence::Recurrence::parse(&source, None).unwrap();
+        let key = r.source_key();
+        let (mut timers, mut rx) = set(dir.path(), vec![source]);
+        timers.refresh_at(120, Instant::now());
+        rx.try_recv().unwrap();
+        let path = dir.path().join(format!("{key}.jsonl"));
+        let mut original = std::fs::read(&path).unwrap();
+        assert_eq!(original.pop(), Some(b'\n'));
+        std::fs::write(&path, &original).unwrap();
+        let mut inspection = Backlog::new(dir.path().to_owned(), BTreeSet::new()).inspection();
+        assert_eq!(inspection.owed(&mut HashSet::new()).len(), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "peek does not sync/repair"
+        );
+        let mut recovering = Backlog::new(dir.path().to_owned(), BTreeSet::new());
+        let mut shown = HashSet::new();
+        assert_eq!(recovering.owed(&mut shown).len(), 1);
+        assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
+        std::fs::write(&path, "poison\n").unwrap();
+        for _ in 0..20 {
+            assert!(recovering.owed(&mut shown).is_empty());
+        }
+        assert!(
+            recovering.failures.is_empty(),
+            "healthy cache does not reread WAL on beats"
+        );
+        recovering.invalidate();
+        assert!(recovering.owed(&mut HashSet::new()).is_empty());
+        assert_eq!(recovering.failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recurring_owner_runs_automatic_compaction_without_per_tick_seen_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = recurring_source("compact");
+        let r = recurrence::Recurrence::parse(&source, None).unwrap();
+        let key = r.source_key();
+        let completed = super::super::github::log::COMPACT_AT as u64 / 2;
+        // Seed prior real-shaped completed transitions in one fixture write;
+        // the owner must hit its production threshold on the next acceptance.
+        let mut bytes = Vec::new();
+        for slot in 0..completed {
+            let id = r.producer_id(slot).unwrap();
+            let due = r.due_at(slot).unwrap();
+            let item = WaitItem::TimerEvent {
+                name: source.name.clone(),
+                id: id.clone(),
+                due_at: due,
+                content: "old".into(),
+                selector: None,
+                recurrence: Some(clank_core::agent_config::TimerRecurrence {
+                    generation: r.generation.clone(),
+                    generation_id: r.id.clone(),
+                    first_slot: slot,
+                    last_slot: slot,
+                    count: 1,
+                }),
+            };
+            let ident = super::super::github::log::logical_ident(
+                Some(&id),
+                None,
+                Some(due),
+                Transport::Timer,
+                &item,
+            );
+            for record in [
+                serde_json::json!({"t":"inbox","v":1,"seq":slot+1,"at":due,"event_at":due,"transport":"timer","feed_id":id,"item":item}),
+                serde_json::json!({"t":"ack","v":1,"seq":slot+1,"at":due,"ident":ident}),
+            ] {
+                serde_json::to_writer(&mut bytes, &record).unwrap();
+                bytes.push(b'\n');
+            }
+        }
+        let path = dir.path().join(format!("{key}.jsonl"));
+        std::fs::write(&path, bytes).unwrap();
+        let (mut timers, mut rx) = set(dir.path(), vec![source]);
+        timers.refresh_at(r.due_at(completed).unwrap(), Instant::now());
+        let (item, _) = rx.try_recv().unwrap();
+        assert!(
+            item.event_view()
+                .unwrap()
+                .selector
+                .unwrap()
+                .ends_with(&format!("@{}", completed + 1))
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents.lines().count(),
+            2 + 2 * super::super::github::log::DISPLAY_CAP
+        );
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| line.contains("\"t\":\"timer_progress\""))
+                .count(),
+            1
+        );
+        assert!(!dir.path().join(format!("{key}.seen")).exists());
+        assert!(timers.next_deadline().is_none());
     }
 
     #[test]
@@ -430,6 +797,7 @@ mod tests {
             let id = format!("timer/{due}");
             let item = WaitItem::TimerEvent {
                 name: src.name.clone(),
+                recurrence: None,
                 id: id.clone(),
                 due_at: due,
                 content: "old".into(),
@@ -602,6 +970,7 @@ fn accept(
     }
     let mut item = WaitItem::TimerEvent {
         name: source.name.clone(),
+        recurrence: None,
         id: id.clone(),
         due_at: due,
         content: source.content.clone().unwrap_or_default(),
@@ -623,6 +992,9 @@ pub(crate) struct Backlog {
     dir: PathBuf,
     invocation_keys: BTreeSet<String>,
     pending: Option<BTreeSet<String>>,
+    recurring: BTreeMap<String, Vec<super::github::log::EventRow>>,
+    failures: BTreeMap<String, String>,
+    recover: bool,
 }
 
 impl Backlog {
@@ -631,10 +1003,19 @@ impl Backlog {
             dir,
             invocation_keys,
             pending: None,
+            recurring: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            recover: true,
         }
     }
     pub(crate) fn invalidate(&mut self) {
         self.pending = None;
+        self.recurring.clear();
+    }
+
+    pub(crate) fn inspection(mut self) -> Self {
+        self.recover = false;
+        self
     }
 
     pub(crate) fn owed(&mut self, shown: &mut HashSet<(String, u64, String)>) -> Vec<WaitItem> {
@@ -662,14 +1043,40 @@ impl Backlog {
         }
         let mut items = Vec::new();
         self.pending.as_mut().expect("initialized").retain(|key| {
+            if let Some(rows) = self.recurring.get(key) {
+                let fresh = rows
+                    .iter()
+                    .filter(|row| !shown.contains(&(key.clone(), row.seq, row.ident.clone())))
+                    .cloned()
+                    .collect();
+                items.extend(super::command_source::owed_from_log(
+                    fresh, key, None, shown,
+                ));
+                return !rows.is_empty();
+            }
             if !self.dir.exists() {
                 return false;
             }
-            let Ok(log) = EventLog::open(&self.dir, key) else {
+            let Ok(mut log) = EventLog::open(&self.dir, key) else {
                 return true;
             };
-            let Ok(Some(read)) = log.read_rows() else {
-                return true;
+            let read = match log.read_timer_backlog(self.recover) {
+                Ok(Some(read)) => {
+                    self.failures.remove(key);
+                    read
+                }
+                result => {
+                    let failure = match result {
+                        Ok(None) => "corrupt timer custody; repair required".to_owned(),
+                        Err(error) => error.to_string(),
+                        Ok(Some(_)) => unreachable!(),
+                    };
+                    if self.failures.get(key) != Some(&failure) {
+                        eprintln!("wait: timer `{key}`: {failure}");
+                        self.failures.insert(key.clone(), failure);
+                    }
+                    return true;
+                }
             };
             let rows: Vec<_> = read
                 .rows
@@ -681,6 +1088,9 @@ impl Backlog {
                 })
                 .collect();
             let pending = !rows.is_empty();
+            if log.is_recurring_key() {
+                self.recurring.insert(key.clone(), rows.clone());
+            }
             items.extend(super::command_source::owed_from_log(rows, key, None, shown));
             pending
         });
