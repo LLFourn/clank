@@ -516,10 +516,14 @@ pub struct StatusArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct GrokWaitArgs {
-    /// Filled by the native PreToolUse adapter, never guessed by the model.
-    pub key: Option<String>,
-    pub generation: Option<String>,
+pub struct WaitCommandArgs {
+    #[command(flatten)]
+    pub wait: WaitArgs,
+    /// Native hook correlation; never supplied by the model.
+    #[arg(long, hide = true, requires = "handoff_generation", conflicts_with_all = ["peek", "for", "die_with_owner"])]
+    pub handoff_key: Option<String>,
+    #[arg(long, hide = true, requires = "handoff_key")]
+    pub handoff_generation: Option<String>,
 }
 
 #[derive(Args, Debug)]

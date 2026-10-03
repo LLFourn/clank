@@ -8,6 +8,7 @@
 
 mod common;
 
+mod agent_setup_acceptance;
 mod agent_swap_integration;
 mod block_blast_radius;
 mod clank_dir_boundary;

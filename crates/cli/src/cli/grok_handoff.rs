@@ -1,14 +1,15 @@
 //! Native Grok handoff, deliberately separate from the hook-owned Stop wait.
 //!
-//! PreToolUse reserves one generation and rewrites a background `grok-wait`.
+//! PreToolUse reserves one generation and rewrites a background `wait`.
 //! PostToolUse confirms the provider's typed BackgroundTaskStarted result.
 //! The same waiter process then runs the existing Clank wait. It cannot deliver
 //! before confirmation, so even immediately pending work has a background
-//! completion channel. Stop only checks/repairs; it never parks or spawns.
+//! completion channel. Stop only checks/repairs; it never waits for work or spawns.
 //!
 //! One fixed slot per repository/label lives in the existing uid runtime dir.
 //! A short metadata lock serializes transitions; a lifetime lease excludes a
-//! second worker. Both are nonblocking. A Unix datagram wakes the worker after
+//! second worker. Metadata contenders park in the kernel; the lifetime lease
+//! remains nonblocking. A Unix datagram wakes the worker after
 //! a persisted transition, with read-after-bind closing the startup race.
 //! Only registration has a one-shot deadline. Idle delivery adds no timer,
 //! task-list polling, filesystem watcher or helper process.
@@ -26,14 +27,14 @@ use clank_core::{AutoMode, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{GrokWaitArgs, StopHookArgs, WaitArgs};
+use super::{StopHookArgs, WaitArgs, WaitCommandArgs};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::agent_store::{binding_matches, load_agent_config};
 
 const MAX_INPUT: u64 = 1024 * 1024;
 const MAX_RECORD: u64 = 64 * 1024;
 const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const ARM: &str = "Run `clank grok-wait` as one background terminal task (block_until_ms: 0, with no positive timeout), then finish the turn. Do not poll it or launch a second automatic wait.";
+const ARM: &str = "Run `clank wait` as one background terminal task (block_until_ms: 0, with no positive timeout), then finish the turn. Do not poll it or launch a second automatic wait.";
 
 /// Native envelope only. Compatibility aliases are intentionally not used as
 /// evidence of a supported native lifecycle. Missing required fields fail loud.
@@ -203,7 +204,7 @@ impl Runtime {
         ensure!(is_hex(key, 24), "invalid Grok handoff key");
         Ok(self.root.join(format!("g_{key}.{extension}")))
     }
-    fn lock(&self, key: &str, kind: &str) -> Result<Option<Lease>> {
+    fn lock_file(&self, key: &str, kind: &str) -> Result<File> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -214,6 +215,10 @@ impl Runtime {
             file.metadata()?.is_file(),
             "Grok handoff lock is not a regular file"
         );
+        Ok(file)
+    }
+    fn lock(&self, key: &str, kind: &str) -> Result<Option<Lease>> {
+        let file = self.lock_file(key, kind)?;
         // SAFETY: valid owned descriptor, nonblocking advisory lease.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             Ok(Some(Lease(file)))
@@ -227,8 +232,21 @@ impl Runtime {
         }
     }
     fn metadata_lock(&self, key: &str) -> Result<Lease> {
-        self.lock(key, "lock")?
-            .context("Grok handoff transition is busy; no transition was assumed")
+        let file = self.lock_file(key, "lock")?;
+        // Every holder covers only synchronous local read/transition/publication.
+        // Never hold this lock across await, provider execution, or lease waits.
+        // The lifetime lease is tried nonblocking even under this lock, avoiding
+        // a metadata/worker lock cycle. Normal contention is not a failed hook.
+        loop {
+            // SAFETY: this owned descriptor is a checked regular lock file.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Lease(file));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error).context("locking Grok handoff transition");
+            }
+        }
     }
     fn read(&self, key: &str) -> Result<Option<Record>> {
         let file = match OpenOptions::new()
@@ -290,7 +308,7 @@ impl Runtime {
             .to_str()
             .context("Clank executable path is not UTF-8")?;
         let command = format!(
-            "exec {} grok-wait {key} {generation}",
+            "exec {} wait --handoff-key {key} --handoff-generation {generation}",
             shell_words::quote(executable)
         );
         ensure!(
@@ -302,13 +320,15 @@ impl Runtime {
     fn command_args(&self, command: &str) -> Option<(String, String)> {
         let words = shell_words::split(command).ok()?;
         let words = words.strip_prefix(&["exec".to_owned()]).unwrap_or(&words);
-        if words.len() == 4
+        if words.len() == 6
             && words[0] == self.executable.to_str()?
-            && words[1] == "grok-wait"
-            && is_hex(&words[2], 24)
-            && is_hex(&words[3], 32)
+            && words[1] == "wait"
+            && words[2] == "--handoff-key"
+            && is_hex(&words[3], 24)
+            && words[4] == "--handoff-generation"
+            && is_hex(&words[5], 32)
         {
-            Some((words[2].clone(), words[3].clone()))
+            Some((words[3].clone(), words[5].clone()))
         } else {
             None
         }
@@ -320,13 +340,21 @@ impl Runtime {
         let words = words.strip_prefix(&["exec".to_owned()]).unwrap_or(&words);
         words.len() == 2
             && (words[0] == "clank" || Some(words[0].as_str()) == self.executable.to_str())
-            && words[1] == "grok-wait"
+            && words[1] == "wait"
     }
     fn cancel(&self, owner: &Owner) -> Result<()> {
+        self.cancel_with(owner, false)
+    }
+    fn cancel_with(&self, owner: &Owner, new_session: bool) -> Result<()> {
         let key = owner.key();
         let _lock = self.metadata_lock(&key)?;
         if let Some(mut record) = self.read(&key)?.filter(|r| &r.owner == owner) {
             record.phase = Phase::Cancelled;
+            if new_session {
+                record.repairs = 0;
+                record.repair_prompt = None;
+                record.manual_task = None;
+            }
             self.write(&key, &record)?;
         }
         Ok(())
@@ -373,7 +401,10 @@ fn pre(runtime: &Runtime, owner: &Owner, input: &Input, env: &dyn Ambient) -> Re
                 &r.owner == owner
                     && r.generation == generation
                     && matches!(r.phase, Phase::Offered)
-                    && input.prompt_id.as_ref() == Some(&r.prompt)
+                    && input
+                        .prompt_id
+                        .as_ref()
+                        .is_none_or(|prompt| prompt == &r.prompt)
                     && input.tool_use_id.as_ref() == Some(&r.tool_use)
                     && input.tool_name.as_ref() == Some(&r.tool_name)
                     && !input.tool_input_truncated
@@ -400,20 +431,12 @@ fn pre(runtime: &Runtime, owner: &Owner, input: &Input, env: &dyn Ambient) -> Re
             "The automatic Grok handoff requires the native terminal tool. This tool name is unsupported; use `run_terminal_command` or check Grok's native lifecycle capability.",
         ));
     }
+    if !owner.automatic(env)? {
+        return Ok(Output::default());
+    }
     if input.tool_input_truncated || !background(&input.tool_input) {
         return Ok(Output::decision("deny", ARM));
     }
-    if !owner.automatic(env)? {
-        return Ok(Output::decision(
-            "deny",
-            "Clank auto mode is off. An explicit manual `clank wait` remains available.",
-        ));
-    }
-    let prompt = input
-        .prompt_id
-        .as_ref()
-        .filter(|p| !p.is_empty())
-        .context("native Grok promptId is absent; automatic handoff is unsupported")?;
     let tool_use = input
         .tool_use_id
         .as_ref()
@@ -422,6 +445,21 @@ fn pre(runtime: &Runtime, owner: &Owner, input: &Input, env: &dyn Ambient) -> Re
     let key = owner.key();
     let _lock = runtime.metadata_lock(&key)?;
     let previous = runtime.read(&key)?;
+    // Grok's actual Pre/PostToolUse envelopes omit promptId. The native
+    // toolUseId binds registration and replay; Stop's prompt is only a turn
+    // hint for delivery/recovery, never a replacement for tool-call identity.
+    let prompt = input
+        .prompt_id
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .or_else(|| {
+            previous
+                .as_ref()
+                .filter(|r| &r.owner == owner)
+                .and_then(|r| r.repair_prompt.clone())
+        })
+        .unwrap_or_else(|| tool_use.clone());
     if let Some(task) = previous
         .as_ref()
         .filter(|r| &r.owner == owner)
@@ -509,7 +547,10 @@ fn post(runtime: &Runtime, owner: &Owner, input: &Input) -> Result<Output> {
     let valid = input.hook_event_name == "post_tool_use"
         && !input.tool_input_truncated
         && !input.tool_result_truncated
-        && input.prompt_id.as_ref() == Some(&record.prompt)
+        && input
+            .prompt_id
+            .as_ref()
+            .is_none_or(|prompt| prompt == &record.prompt)
         && input.tool_use_id.as_ref() == Some(&record.tool_use)
         && input.tool_name.as_ref() == Some(&record.tool_name)
         && result.get("type").and_then(Value::as_str) == Some("BackgroundTaskStarted")
@@ -524,10 +565,12 @@ fn post(runtime: &Runtime, owner: &Owner, input: &Input) -> Result<Output> {
         record.phase = Phase::Registered {
             task: task.unwrap().to_owned(),
         };
+        record.repairs = 0;
+        record.repair_prompt = None;
         runtime.write(&key, &record)?;
         Ok(Output::default())
     } else {
-        let message = "Grok did not confirm the owned wait as a native background task. Automatic delivery is disabled for this attempt; pending work is preserved. Check native hook support or use an explicit manual `clank wait`.";
+        let message = "Grok did not confirm the owned wait as a native background task. Automatic delivery is disabled for this attempt; pending work is preserved. Check native hook support or run `clank auto off` before manual `clank wait`.";
         record.phase = Phase::Failed {
             message: message.to_owned(),
         };
@@ -542,6 +585,7 @@ fn manual_wait_command(command: &str) -> bool {
     };
     let words = words.strip_prefix(&["exec".to_owned()]).unwrap_or(&words);
     matches!(words, [program, subcommand, ..] if Path::new(program).file_name() == Some(std::ffi::OsStr::new("clank")) && subcommand == "wait")
+        && !words.iter().any(|word| word.starts_with("--handoff-"))
 }
 
 fn stop(runtime: &Runtime, owner: &Owner, input: &Input, env: &dyn Ambient) -> Result<Output> {
@@ -581,11 +625,13 @@ fn stop(runtime: &Runtime, owner: &Owner, input: &Input, env: &dyn Ambient) -> R
         if matches!(record.phase, Phase::Delivered { .. }) && &record.prompt == prompt {
             return Ok(Output::default());
         }
-        if record.repair_prompt.as_ref() == Some(prompt) && record.repairs >= 2 {
-            return Ok(Output::decision(
-                "allow",
-                "Clank could not establish the automatic Grok handoff after two repairs. Pending work remains intact. Check native lifecycle hooks; use an explicit manual `clank wait` to recover.",
-            ));
+        if record.repairs >= 2 {
+            // Failed background completions create fresh synthetic prompt ids.
+            // They must not reset this budget and start an endless re-arm loop.
+            return Ok(Output {
+                reason: Some("Clank could not establish the automatic Grok handoff after two repairs. Pending work remains intact. Check native lifecycle hooks or run `clank auto off` before manual `clank wait`.".into()),
+                ..Default::default()
+            });
         }
     }
     let mut record = previous.filter(|r| &r.owner == owner).unwrap_or(Record {
@@ -612,17 +658,13 @@ fn stop(runtime: &Runtime, owner: &Owner, input: &Input, env: &dyn Ambient) -> R
             })
             .map(|task| task.id.clone());
     }
-    record.repairs = if record.repair_prompt.as_ref() == Some(prompt) {
-        record.repairs.saturating_add(1)
-    } else {
-        1
-    };
+    record.repairs = record.repairs.saturating_add(1);
     record.repair_prompt = Some(prompt.clone());
     record.phase = Phase::Cancelled;
     runtime.write(&key, &record)?;
     let reason = match &record.manual_task {
         Some(task) => format!(
-            "Native task `{task}` is already running a manual clank wait. Choose explicitly: terminate that task and end your turn so Stop can confirm its absence, or run `clank auto off` to retain manual operation. Do not start clank grok-wait alongside it; Clank will not cancel your manual task."
+            "Native task `{task}` is already running a manual clank wait. Choose explicitly: terminate that task and end your turn so Stop can confirm its absence, or run `clank auto off` to retain manual operation. Do not start another clank wait alongside it; Clank will not cancel your manual task."
         ),
         None => ARM.to_owned(),
     };
@@ -656,7 +698,7 @@ fn handle(runtime: &Runtime, input: &Input, repo: &Path, env: &dyn Ambient) -> R
                     &owner.session,
                 )?;
             }
-            runtime.cancel(&owner)?;
+            runtime.cancel_with(&owner, true)?;
             Ok(Output::default())
         }
         "session_end" | "stop_cancelled" | "stop_failure" => {
@@ -696,7 +738,7 @@ pub(super) fn hook(args: StopHookArgs) -> Result<()> {
     })();
     match result {
         Ok(output) => {
-            if output.decision == Some("allow") {
+            if output.decision.is_none() {
                 if let Some(reason) = &output.reason {
                     eprintln!("clank: {reason}");
                 }
@@ -854,27 +896,67 @@ impl Drop for Worker<'_> {
     }
 }
 
-pub(super) async fn wait(args: GrokWaitArgs) -> Result<()> {
-    let (Some(key), Some(generation)) = (args.key, args.generation) else {
-        bail!(
-            "`clank grok-wait` requires native Grok PreToolUse hooks. Re-run `clank setup` after the native adapter rollout; an explicit manual `clank wait` is available."
+/// Select the provider lifecycle once at the CLI boundary; worker calls use the
+/// existing items pipeline directly and never redispatch through this command.
+pub(super) async fn run_wait(args: WaitCommandArgs) -> Result<()> {
+    let tagged = args.handoff_key.is_some() || args.handoff_generation.is_some();
+    let automatic = automatic_wait(&args.wait, &Process)?;
+    if tagged {
+        ensure!(
+            automatic,
+            "native handoff parameters require the current automatic Grok session"
         );
+        return wait(
+            args.handoff_key.context("missing native handoff key")?,
+            args.handoff_generation
+                .context("missing native handoff generation")?,
+            args.wait,
+        )
+        .await;
+    }
+    ensure!(
+        !automatic,
+        "Grok's native PreToolUse adapter did not tag this `clank wait`. This does not establish that hooks are missing. End the turn so Stop can recover the handoff; use `clank auto off` before manual operation."
+    );
+    super::wait::run(args.wait).await
+}
+
+fn automatic_wait(args: &WaitArgs, env: &dyn Ambient) -> Result<bool> {
+    if args.peek || args.r#for.is_some() || args.die_with_owner {
+        return Ok(false);
+    }
+    let Some((Tool::Grok, session)) = crate::agent_env::detect_session_in(env)? else {
+        return Ok(false);
     };
+    let repo = super::resolve_repo(args.repo.as_deref())?;
+    let label = resolve_identity_for_hook_in(&repo, Tool::Grok, &session, env)?;
+    if let Some(author) = args.author.as_deref() {
+        ensure!(
+            author == label.as_str(),
+            "automatic Grok wait cannot override its session's agent"
+        );
+    }
+    Owner {
+        repo,
+        label,
+        session,
+    }
+    .automatic(env)
+}
+
+async fn wait(key: String, generation: String, mut args: WaitArgs) -> Result<()> {
     let runtime = Runtime::production()?;
     let worker = Worker::start(&runtime, key, generation, &Process)?;
-    let args = WaitArgs {
-        repo: Some(worker.owner.repo.clone()),
-        author: Some(worker.owner.label.as_str().to_owned()),
-        die_with_owner: false,
-        deliver_to_session: None,
-        json: false,
-        events: Vec::new(),
-        r#for: None,
-        peek: false,
-        no_cache: false,
-        poll: false,
-        no_poll: true,
-    };
+    ensure!(
+        args.repo.as_ref().is_none_or(
+            |repo| super::resolve_repo(Some(repo)).ok().as_ref() == Some(&worker.owner.repo)
+        ),
+        "automatic Grok wait belongs to another repository"
+    );
+    args.repo = Some(worker.owner.repo.clone());
+    args.author = Some(worker.owner.label.as_str().to_owned());
+    args.no_poll = true;
+    let json = args.json;
     let result = worker
         .run(
             &Process,
@@ -884,7 +966,7 @@ pub(super) async fn wait(args: GrokWaitArgs) -> Result<()> {
     match result {
         Ok(Some(items)) => {
             worker.authorize_delivery(&Process)?;
-            super::wait::emit(&items, false);
+            super::wait::emit(&items, json);
             Ok(())
         }
         Ok(None) => bail!("automatic Grok handoff produced no work"),

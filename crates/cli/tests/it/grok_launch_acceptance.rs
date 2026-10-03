@@ -184,7 +184,7 @@ impl Fixture {
             let body =
                 std::fs::read_to_string(self.grok.join("skills").join(role).join("SKILL.md"))
                     .unwrap();
-            assert!(body.contains("clank grok-wait"));
+            assert!(body.contains("clank wait"));
             assert!(body.contains("block_until_ms: 0"));
         }
         assert!(
@@ -200,7 +200,7 @@ impl Fixture {
             .collect()
     }
     async fn preview_is_read_only(&self) {
-        let audit = std::fs::read(self.grok.join("audit.jsonl")).unwrap();
+        let audit = std::fs::read(self.grok.join("audit.jsonl")).ok();
         let cfg =
             std::fs::read(clank::agent_store::agent_config_path(&self.root, &label())).unwrap();
         let intent = std::fs::read(clank::cli::fork::fork_spec_path(&self.root, &label())).ok();
@@ -213,7 +213,7 @@ impl Fixture {
             "--print",
         ])
         .await;
-        assert_eq!(std::fs::read(self.grok.join("audit.jsonl")).unwrap(), audit);
+        assert_eq!(std::fs::read(self.grok.join("audit.jsonl")).ok(), audit);
         assert_eq!(
             std::fs::read(clank::agent_store::agent_config_path(&self.root, &label())).unwrap(),
             cfg
@@ -399,6 +399,10 @@ impl Drop for Fixture {
 
 async fn cycles(f: &Fixture, expected: Option<&str>) {
     f.setup().await;
+    cycles_after_setup(f, expected, 2).await;
+}
+
+async fn cycles_after_setup(f: &Fixture, expected: Option<&str>, expected_probes: usize) {
     f.preview_is_read_only().await;
     let mut pending = f.deliver(0);
     let mut actor = f.actor().await;
@@ -432,11 +436,14 @@ async fn cycles(f: &Fixture, expected: Option<&str>) {
             "each cycle must own a new generation"
         );
         let words = shell_words::split(offered["command"].as_str().unwrap()).unwrap();
-        assert_eq!(words.len(), 5);
+        assert_eq!(words.len(), 7);
+        assert_eq!(words[2], "wait");
+        assert_eq!(words[3], "--handoff-key");
+        assert_eq!(words[5], "--handoff-generation");
         if let Some(previous) = &slot {
-            assert_eq!(&words[3], previous, "cycles must reuse one runtime slot");
+            assert_eq!(&words[4], previous, "cycles must reuse one runtime slot");
         } else {
-            slot = Some(words[3].clone());
+            slot = Some(words[4].clone());
         }
         // A pending event remains unhandled, even while a process was armed.
         if cycle == 0 {
@@ -516,7 +523,7 @@ async fn cycles(f: &Fixture, expected: Option<&str>) {
     let copied = calls.contains(&"_x.ai/session/fork");
     assert_eq!(
         calls.iter().filter(|m| **m == "initialize").count(),
-        if copied { 3 } else { 2 },
+        expected_probes + usize::from(copied),
         "capabilities are probed only during setup/launch, never per idle turn"
     );
     assert_eq!(
@@ -536,6 +543,18 @@ async fn fresh_launch_delivers_pending_work_and_ten_background_completion_turns(
         !f.rows()
             .iter()
             .any(|r| r["request"]["method"] == "_x.ai/session/fork")
+    );
+}
+
+#[tokio::test]
+async fn missing_setup_is_repaired_before_native_grok_launch_and_handoff() {
+    let f = Fixture::new();
+    assert!(!f.grok.join("hooks/clank.json").exists());
+    cycles_after_setup(&f, None, 1).await;
+    assert!(f.grok.join("hooks/clank.json").exists());
+    assert!(
+        !f.home.join(".codex/hooks.json").exists(),
+        "only the selected provider is installed"
     );
 }
 

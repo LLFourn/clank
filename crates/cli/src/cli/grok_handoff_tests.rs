@@ -60,7 +60,7 @@ impl Fixture {
             "cwd":self.owner.repo, "promptId":"turn-1", "reason":"end_turn",
             "toolName":"run_terminal_command",
             "toolUseId":"call-1",
-            "toolInput":{"command":"clank grok-wait", "block_until_ms":0, "description":"Clank automatic wait"}
+            "toolInput":{"command":"clank wait", "block_until_ms":0, "description":"Clank automatic wait"}
         })).unwrap()
     }
     fn offer(&self) -> Input {
@@ -106,6 +106,36 @@ impl Drop for Fixture {
             let _ = std::fs::remove_file(self.runtime.path(&self.owner.key(), extension).unwrap());
         }
     }
+}
+
+#[test]
+fn metadata_contention_serializes_transitions_without_failing_or_replacing_the_lock() {
+    let f = Fixture::new();
+    let key = f.owner.key();
+    let held = f.runtime.metadata_lock(&key).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let inode = held.0.metadata().unwrap().ino();
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let runtime = &f.runtime;
+        let key = &key;
+        let contender = scope.spawn(move || {
+            assert!(runtime.lock(key, "lock").unwrap().is_none());
+            busy_tx.send(()).unwrap();
+            let _next = runtime.metadata_lock(key).unwrap();
+        });
+        busy_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        drop(held);
+        contender.join().unwrap();
+    });
+    // No unlink/recreate shortcut: reacquisition uses the same lock inode.
+    let again = f.runtime.metadata_lock(&key).unwrap();
+    assert_eq!(again.0.metadata().unwrap().ino(), inode);
+    assert!(f.runtime.lock(&key, "lock").unwrap().is_none());
+    drop(again);
+    assert!(f.runtime.lock(&key, "lock").unwrap().is_some());
 }
 
 #[tokio::test]
@@ -394,22 +424,41 @@ fn post_fn(fixture: &Fixture, input: &Input) -> Output {
 }
 
 #[test]
-fn repairs_are_bounded_per_turn_and_never_block_observe_only_stop() {
+fn repairs_stay_bounded_across_failed_completion_turns_and_observe_only_stop() {
     let fixture = Fixture::new();
     let mut input = fixture.input("stop");
-    for decision in ["block", "block", "allow"] {
+    for decision in [Some("block"), Some("block"), None] {
         assert_eq!(
             stop(&fixture.runtime, &fixture.owner, &input, &fixture.env)
                 .unwrap()
                 .decision,
-            Some(decision)
+            decision
         );
     }
-    input.prompt_id = Some("new-turn".into());
-    assert_eq!(
+    input.prompt_id = Some("task-completed-new-turn".into());
+    assert!(
         stop(&fixture.runtime, &fixture.owner, &input, &fixture.env)
             .unwrap()
-            .decision,
+            .decision
+            .is_none()
+    );
+    handle(
+        &fixture.runtime,
+        &fixture.input("session_start"),
+        &fixture.owner.repo,
+        &fixture.env,
+    )
+    .unwrap();
+    assert_eq!(fixture.record().repairs, 0);
+    assert_eq!(
+        stop(
+            &fixture.runtime,
+            &fixture.owner,
+            &fixture.input("stop"),
+            &fixture.env
+        )
+        .unwrap()
+        .decision,
         Some("block")
     );
     input.reason = Some("shutdown".into());
@@ -422,12 +471,85 @@ fn repairs_are_bounded_per_turn_and_never_block_observe_only_stop() {
 }
 
 #[test]
+fn native_tool_calls_without_prompt_ids_register_by_tool_use_id() {
+    let f = Fixture::new();
+    handle(&f.runtime, &f.input("stop"), &f.owner.repo, &f.env).unwrap();
+    let mut offer = f.input("pre_tool_use");
+    offer.prompt_id = None;
+    offer.tool_input = handle(&f.runtime, &offer, &f.owner.repo, &f.env)
+        .unwrap()
+        .specific
+        .unwrap()
+        .updated_input
+        .unwrap();
+    assert_eq!(f.record().prompt, "turn-1");
+    assert!(
+        handle(&f.runtime, &offer, &f.owner.repo, &f.env)
+            .unwrap()
+            .decision
+            .is_none()
+    );
+    let mut post = f.registration(&offer);
+    post.prompt_id = None;
+    post.tool_use_id = Some("another-call".into());
+    let rejected = post_fn(&f, &post);
+    assert!(rejected.specific.is_some());
+    assert!(matches!(f.record().phase, Phase::Failed { .. }));
+
+    let f = Fixture::new();
+    let mut offer = f.input("pre_tool_use");
+    offer.prompt_id = None;
+    offer.tool_input = handle(&f.runtime, &offer, &f.owner.repo, &f.env)
+        .unwrap()
+        .specific
+        .unwrap()
+        .updated_input
+        .unwrap();
+    let mut post = f.registration(&offer);
+    post.prompt_id = None;
+    assert!(post_fn(&f, &post).specific.is_none());
+    assert!(matches!(f.record().phase, Phase::Registered { .. }));
+    assert_eq!(f.record().repairs, 0);
+}
+
+#[test]
+fn wait_selects_native_handoff_only_for_automatic_grok_sessions() {
+    use clap::Parser;
+    let f = Fixture::new();
+    let parse = |argv: Vec<&str>| {
+        let crate::cli::command::Command::Wait(args) =
+            crate::cli::command::Cli::try_parse_from(argv)
+                .unwrap()
+                .command
+        else {
+            panic!("expected wait");
+        };
+        args.wait
+    };
+    let repo = f.owner.repo.to_str().unwrap();
+    let args = parse(vec!["clank", "wait", "--repo", repo]);
+    assert!(automatic_wait(&args, &f.env).unwrap());
+    assert!(!automatic_wait(&args, &Stated::default()).unwrap());
+    for mode in [
+        vec!["--peek"],
+        vec!["--for", "commit"],
+        vec!["--die-with-owner"],
+    ] {
+        let mut argv = vec!["clank", "wait", "--repo", repo];
+        argv.extend(mode);
+        assert!(!automatic_wait(&parse(argv), &f.env).unwrap());
+    }
+    crate::agent_store::set_auto_mode(&f.owner.repo, &f.owner.label, AutoMode::Off).unwrap();
+    assert!(!automatic_wait(&args, &f.env).unwrap());
+}
+
+#[test]
 fn background_request_requires_native_mode_and_no_positive_timeout() {
     let fixture = Fixture::new();
     for input in [
-        serde_json::json!({"command":"clank grok-wait"}),
-        serde_json::json!({"command":"clank grok-wait", "block_until_ms":100, "background":true}),
-        serde_json::json!({"command":"clank grok-wait", "block_until_ms":0, "timeout":1000}),
+        serde_json::json!({"command":"clank wait"}),
+        serde_json::json!({"command":"clank wait", "block_until_ms":100, "background":true}),
+        serde_json::json!({"command":"clank wait", "block_until_ms":0, "timeout":1000}),
     ] {
         let mut pre_input = fixture.input("pre_tool_use");
         pre_input.tool_input = input;
@@ -459,10 +581,10 @@ fn background_request_requires_native_mode_and_no_positive_timeout() {
 fn unrelated_tasks_manual_waits_and_subagents_are_not_automatic_proof() {
     let fixture = Fixture::new();
     for command in [
-        "clank wait",
-        "echo clank grok-wait",
-        "clank grok-wait; echo done",
-        "monitor clank grok-wait",
+        "clank wait --peek",
+        "echo clank wait",
+        "clank wait; echo done",
+        "monitor clank wait",
     ] {
         let mut input = fixture.input("pre_tool_use");
         input.tool_input["command"] = command.into();
@@ -544,7 +666,7 @@ async fn ownership_and_file_shape_fail_closed() {
 }
 
 #[test]
-fn missing_native_identity_or_turn_is_not_compatibility_support() {
+fn missing_native_tool_call_identity_or_stop_turn_is_not_compatibility_support() {
     assert!(
         serde_json::from_value::<Input>(
             serde_json::json!({"hook_event_name":"Stop", "session_id":SESSION,"cwd":"/tmp"})
@@ -553,8 +675,11 @@ fn missing_native_identity_or_turn_is_not_compatibility_support() {
     );
     let fixture = Fixture::new();
     let mut input = fixture.input("pre_tool_use");
-    input.prompt_id = None;
+    input.tool_use_id = None;
     assert!(pre(&fixture.runtime, &fixture.owner, &input, &fixture.env).is_err());
+    let mut input = fixture.input("stop");
+    input.prompt_id = None;
+    assert!(stop(&fixture.runtime, &fixture.owner, &input, &fixture.env).is_err());
     let cfg: AgentConfig = load_agent_config(&fixture.owner.repo, &fixture.owner.label)
         .unwrap()
         .unwrap();
@@ -812,7 +937,9 @@ fn absent_task_snapshot_cannot_clear_known_manual_task() {
         "exec '/path with spaces/clank' wait --json"
     ));
     assert!(!manual_wait_command("echo clank wait"));
-    assert!(!manual_wait_command("clank grok-wait"));
+    assert!(!manual_wait_command(
+        "clank wait --handoff-key deadbeef --handoff-generation deadbeef"
+    ));
 }
 
 #[test]

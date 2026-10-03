@@ -203,20 +203,31 @@ provider tool-call ID identify one handoff within that tuple. No role is stored
 in the handoff. Native SessionStart binds the actual Grok session and cancels
 the previous generation; its passive stdout is never treated as a wake.
 
-The automatic command is `clank grok-wait`, with `block_until_ms: 0` and no
+The automatic command is `clank wait`, with `block_until_ms: 0` and no
 positive timeout. The supported legacy background flags are accepted too.
 PreToolUse recognizes the native terminal tool and this exact simple command,
 reserves the generation, and rewrites only its `command` field to:
 
 ```text
-exec <this Clank executable> grok-wait <repository/label key> <generation>
+exec <this Clank executable> wait --handoff-key <repository/label key> --handoff-generation <generation>
 ```
 
 The actual executable path is shell-quoted. The command must fit Grok's 1000-byte
 task-command bound. Compound shell commands, unrelated tasks and ordinary
-manual `clank wait` calls are not promoted to automatic ownership. Unknown
+manual `clank wait` calls in auto-off mode are not promoted to automatic ownership. Unknown
 terminal tool names/background parameter layouts are unsupported, not guessed.
 A tagged command cannot be replayed under a different provider tool-call ID.
+The CLI selects Grok's handoff from the session environment; there is no separate
+provider-specific wait command. `--peek`, observer waits and hook-owned waits
+retain their existing behavior. An untagged automatic Grok wait reports a missing
+native rewrite rather than asserting that hook files are missing.
+
+Grok's actual native PreToolUse and PostToolUse dispatch omits `promptId`, despite
+the common-envelope documentation. Registration therefore uses the exact native
+`toolUseId`, tool name, generation, session and command. A supplied prompt ID must
+still match. A preceding Stop prompt supplies a turn hint when available; it does
+not substitute for tool-call identity. Fixtures deliberately omit tool-event
+prompt IDs to exercise this provider contract.
 The native cwd must also match the resolved repository: an argv override cannot
 relocate a live session or authorize binding in another worktree.
 
@@ -231,7 +242,7 @@ task_type = bash
 status = running
 task_id = nonempty
 command = the exact rewritten command
-promptId, toolUseId, toolName = the reserving call
+toolUseId, toolName = the reserving call; promptId, when present, must match
 ```
 
 Input/result truncation invalidates confirmation. A foreground result, dispatch
@@ -253,7 +264,7 @@ for this task, not proof that Grok has received or acted on it.
 | --- | --- |
 | First launch/fork/resume, auto on | Bind in the correct repo, handle immediately pending work, then reach the same Stop guard. No resume-only arming policy. |
 | Stop, correctly owned handoff running or starting | Allow after typed PostToolUse confirmation plus the live worker lease, or an exact matching running shell task in the Stop snapshot during process startup. Keep provider registration distinct from monitor subscription. |
-| Stop, auto on, no handoff | Cancel an incomplete attempt and request the canonical background tool. At most two repair blocks per `promptId`; then allow with a visible diagnostic. An instruction is never proof of arming. |
+| Stop, auto on, no handoff | Cancel an incomplete attempt and request the canonical background tool. At most two consecutive unsuccessful repair blocks, across synthetic completion turns; then omit the Stop decision and emit a stderr diagnostic. Successful native registration resets the budget. An instruction is never proof of arming. |
 | Background completion with work | Grok starts a new turn containing the wait output. React using the current role, acknowledge/write feedback through the usual commands, then guard the next idle transition. |
 | Work arrives while no wait is armed | Durable work remains pending. The next wait derives it immediately. Never synthesize acknowledgement to suppress repeated delivery. |
 | Session binding replaced | The config mutation cancels/notifies the old automatic slot; generation/session checks fence it before delivery. Its completion cannot restore the old binding. |
@@ -282,8 +293,13 @@ The runtime namespace has one fixed record, metadata lock, lifetime lease and
 socket path per repository/label. Records contain the full session/generation;
 the path does not grow per turn or historical session. A replaced worker must
 release its lease before another can own the slot. All transitions are atomic
-under nonblocking metadata locks. Busy/corrupt state is diagnosed, never treated
-as successful registration. File reads are bounded, do not follow symlinks and
+under short metadata locks. A metadata contender parks in the kernel until the
+holder releases it; ordinary contention is not a failed handoff. Only interrupted
+syscalls retry. No lock is held across an await, provider execution, network call,
+or a blocking acquisition of the worker lease. The lifetime lease stays
+nonblocking, so a duplicate worker is refused rather than queued. Lock files are
+never unlinked/replaced. Corrupt state and actual lock failures are diagnosed,
+never treated as successful registration. File reads are bounded, do not follow symlinks and
 require regular files in the vetted uid runtime directory outside the repo.
 
 Auto-off and binding replacement notify the slot at the existing config write
@@ -386,7 +402,7 @@ provider task and reach Stop again, or choose auto-off and retain manual
 operation. PreToolUse refuses an automatic offer while that evidence remains.
 Only a later native task snapshot with no matching manual wait clears it;
 an absent snapshot does not. Clank never relabels or cancels a manual wait and
-still bounds repairs to two per prompt. This is native snapshot evidence, not a
+still bounds consecutive unsuccessful repairs to two across prompt IDs. This is native snapshot evidence, not a
 process scan or proof that an arbitrary custom/compound wrapper is a manual wait.
 
 Expose distinct diagnoses: unbound, bound but no handoff, provider task starting,
@@ -420,7 +436,7 @@ rebinding over another live session.
    prompt/skill assumptions once their replacement is exercised. If validation
    fails, revise this decision explicitly before building a workaround.
    Implemented core: native envelopes, Pre/Post registration handshake, owned
-   `grok-wait`, finite Stop repair, actual-provider binding and cancellation.
+   `wait`, finite Stop repair, actual-provider binding and cancellation.
    Fixtures exercise the production state/IPC/wait seams. Native hook setup,
    capability/doctor surfaces and new skill/launch instructions are implemented.
    Installed authenticated native payload validation remains required before

@@ -93,6 +93,18 @@ advertising native PreToolUse/Stop gates. `clank auto off` retains manual operat
 These configuration/capability checks do not prove enabled completion
 notifications or a model wake; doctor reports that distinction explicitly.
 
+Managed agent launches inspect and repair missing or older setup-owned integration
+for the provider they actually launch. This includes profile-specific HOME and
+configuration directories, and an existing global OpenCode plugin loaded alongside
+a custom profile. Locally edited integration files are preserved and reported;
+launch does not force an overwrite. Preview commands remain read-only. Repair runs
+at launch, with no idle polling or setup daemon.
+
+`clank doctor` follows the configured launch profiles and reports their actual
+asset paths. It probes the selected Claude executable for hook mode and the
+selected Grok executable for native capabilities. Diagnosis does not install
+anything; tools without a configured profile retain default user-scope checks.
+
 Re-run `clank setup` after upgrading the binary; `--force` refreshes
 skill files you have locally edited.
 
@@ -388,7 +400,7 @@ auto-mode drives it:
   kitty-protocol Enter press. That fallback can leave a submitted
   message queued behind the held Stop hook; use the remote Stop button
   to release it.
-- **grok** — native PreToolUse tags one `clank grok-wait` requested with
+- **grok** — native PreToolUse tags one `clank wait` requested with
   `run_terminal_command` and `block_until_ms: 0`; PostToolUse confirms its
   background task before the existing Clank wait can deliver. Background
   completion carries new work turns; Stop only checks or requests bounded
@@ -399,7 +411,10 @@ auto-mode drives it:
   unverified. See [the integration contract](GROK-INTEGRATION.md).
 - **opencode** — the clank plugin long-polls in-hook on
   `session.idle` and injects the items as a new prompt; the agent
-  never arms anything. The launch profile carries the model: after
+  never arms anything. Global and custom configuration directories load
+  additively; multiple Clank plugin copies run one loop per client. Launch
+  repair also upgrades an existing setup-owned global copy, preserving local
+  edits through the usual non-force ownership checks. The launch profile carries the model: after
   `clank agent add kimi --tool opencode`, edit the agent's entry in
   `.clank/config.json` (or `~/.clank/config.json` for `--global`):
 

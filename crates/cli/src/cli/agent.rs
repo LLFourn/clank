@@ -235,6 +235,8 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                     }
                     let provider =
                         super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
+                    super::setup::ensure_launch_setup(&repo, spec.tool, desc.launch.as_ref())
+                        .await?;
                     super::grok_setup::launch_ready(&repo, &label, &provider).await?;
                     grok_checked = true;
                     let prepared = super::grok_launch::prepare(&repo, &label, &provider).await
@@ -246,6 +248,8 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 }
                 Some(spec) => {
                     if !args.print {
+                        super::setup::ensure_launch_setup(&repo, spec.tool, desc.launch.as_ref())
+                            .await?;
                         crate::cli::fork::take_fork_spec(&repo, &label)?;
                     }
                     let tool = spec.tool;
@@ -255,7 +259,13 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                         tool,
                     )
                 }
-                None => (compose_bootstrap_launch(&repo, &label, &desc)?, desc.tool),
+                None => {
+                    if !args.print {
+                        super::setup::ensure_launch_setup(&repo, desc.tool, desc.launch.as_ref())
+                            .await?;
+                    }
+                    (compose_bootstrap_launch(&repo, &label, &desc)?, desc.tool)
+                }
             }
         }
         Some(session) => match session_holder::find(
@@ -280,6 +290,10 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 session.tool,
             ),
             Holder::Nobody => {
+                if !args.print {
+                    super::setup::ensure_launch_setup(&repo, session.tool, desc.launch.as_ref())
+                        .await?;
+                }
                 if session.tool == Tool::Grok {
                     let provider =
                         super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
@@ -315,15 +329,15 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     }
 
     // Codex shows an interactive "do you trust this directory?" prompt
-    // for any repo root not recorded in `~/.codex/config.toml` — and
+    // for any repo root not recorded in the selected profile's config.toml — and
     // every codex launch in the codebase flows through THIS exec
     // (every zellij pane runs `clank agent start`),
     // so ensuring trust here ensures it everywhere
     // (codex-trust-at-launch). Best-effort: a failure degrades to the
     // prompt, never a failed launch. Sits AFTER the `--print` return —
     // previews must not write.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    pre_launch_codex_trust(launch_tool, &repo, home.as_deref());
+    let codex_root = codex_launch_root(&composed, &crate::agent_env::Process);
+    pre_launch_codex_trust(launch_tool, &repo, codex_root.as_deref());
 
     exec_composed(
         composed,
@@ -375,15 +389,40 @@ fn push_grok_trust(tool: Tool, args: &mut Vec<String>) {
     }
 }
 
+/// Resolve the same effective environment and working directory as exec_composed.
+fn codex_launch_root(c: &ComposedLaunch, env: &dyn crate::agent_env::Ambient) -> Option<PathBuf> {
+    let cwd = env.cwd()?;
+    let effective = |key: &str| {
+        c.env_overrides
+            .get(key)
+            .map(std::ffi::OsString::from)
+            .or_else(|| env.var_os(key))
+    };
+    let home = effective("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env.home())?;
+    let home = if home.is_absolute() {
+        home
+    } else {
+        cwd.join(home)
+    };
+    Some(super::setup::resolve_provider_root(
+        &home,
+        Tool::Codex,
+        &cwd,
+        effective,
+    ))
+}
+
 /// The pre-exec trust step: codex launches record the MAIN repo root
 /// (codex's prompt applies trust to the repository root, so it covers
 /// every worktree under it) as trusted; claude has no such prompt and
 /// writes nothing.
-fn pre_launch_codex_trust(tool: Tool, repo: &Path, home: Option<&Path>) {
+fn pre_launch_codex_trust(tool: Tool, repo: &Path, codex_root: Option<&Path>) {
     if tool != Tool::Codex {
         return;
     }
-    let Some(home) = home else {
+    let Some(codex_root) = codex_root else {
         return;
     };
     let root = match crate::cli::fork::main_repo_root(repo) {
@@ -393,7 +432,7 @@ fn pre_launch_codex_trust(tool: Tool, repo: &Path, home: Option<&Path>) {
             return;
         }
     };
-    if let Err(e) = ensure_codex_project_trust(home, &root) {
+    if let Err(e) = ensure_codex_project_trust(codex_root, &root) {
         eprintln!(
             "warning: could not record codex trust for {}: {e}",
             root.display()
@@ -401,7 +440,7 @@ fn pre_launch_codex_trust(tool: Tool, repo: &Path, home: Option<&Path>) {
     }
 }
 
-/// Record `root` as a trusted codex project in `~/.codex/config.toml`
+/// Record `root` as a trusted project in the selected Codex profile config.toml
 /// — exactly the two-line table codex writes when the user answers Yes
 /// to its trust prompt. NO-OP when the root already has ANY
 /// `[projects."<root>"]` entry: an existing entry is a prior user
@@ -409,8 +448,11 @@ fn pre_launch_codex_trust(tool: Tool, repo: &Path, home: Option<&Path>) {
 /// Appends at the end of the file (TOML table headers are
 /// position-independent), preserving the existing content verbatim;
 /// creates the file when absent (codex-trust-at-launch).
-fn ensure_codex_project_trust(home: &Path, root: &Path) -> anyhow::Result<()> {
-    let path = home.join(".codex/config.toml");
+fn ensure_codex_project_trust(codex_root: &Path, root: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(codex_root)?;
+    let canonical_root = dunce::canonicalize(codex_root)?;
+    let _lock = super::setup::installation_lock(&canonical_root)?;
+    let path = codex_root.join("config.toml");
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -430,7 +472,7 @@ fn ensure_codex_project_trust(home: &Path, root: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, out).with_context(|| format!("writing `{}`", path.display()))?;
+    super::setup::publish_asset(&path, out.as_bytes())?;
     Ok(())
 }
 
@@ -814,7 +856,7 @@ pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
 /// completion turns re-arm the canonical command through the installed skill.
 pub(super) const DEFAULT_AUTO_PROMPT_GROK: &str = "Session resumed. End your turn so the \
     native Clank Stop guard can check your handoff. If it requests arming, run \
-    `clank grok-wait` with run_terminal_command and block_until_ms: 0. Keep exactly one \
+    `clank wait` with run_terminal_command and block_until_ms: 0. Keep exactly one \
     automatic task; do not start a plain clank wait alongside it.";
 
 /// Resolve the initial prompt for an agent-start invocation.
@@ -2971,7 +3013,7 @@ mod tests {
         );
         let last = c.args.last().map(|s| s.as_str()).unwrap_or("");
         assert!(
-            last.contains("clank grok-wait") && last.contains("End your turn"),
+            last.contains("clank wait") && last.contains("End your turn"),
             "the composed grok launch must instruct arming: {:?}",
             c.args
         );
@@ -3003,7 +3045,7 @@ mod tests {
         let out = resolve_initial_prompt(None, AutoMode::On, Tool::Grok).unwrap();
         assert_eq!(out, DEFAULT_AUTO_PROMPT_GROK);
         assert!(out.contains("End your turn"));
-        assert!(out.contains("clank grok-wait"));
+        assert!(out.contains("clank wait"));
         assert!(!out.contains("background: true"));
     }
 
@@ -3389,14 +3431,18 @@ mod tests {
             from_session: None,
             prompt: "orient".into(),
         };
-        pre_launch_codex_trust(spec.tool, repo.path(), Some(home.path()));
+        pre_launch_codex_trust(spec.tool, repo.path(), Some(&home.path().join(".codex")));
         let cfg = home.path().join(".codex/config.toml");
         let body = std::fs::read_to_string(&cfg).unwrap();
         assert!(body.contains("trust_level = \"trusted\""), "{body}");
 
         // A claude launch writes nothing.
         let home2 = tempfile::tempdir().unwrap();
-        pre_launch_codex_trust(Tool::Claude, repo.path(), Some(home2.path()));
+        pre_launch_codex_trust(
+            Tool::Claude,
+            repo.path(),
+            Some(&home2.path().join(".codex")),
+        );
         assert!(!home2.path().join(".codex/config.toml").exists());
     }
 
@@ -3412,13 +3458,13 @@ mod tests {
         let root_b = std::path::Path::new("/repos/beta");
 
         // Creates the file when absent.
-        ensure_codex_project_trust(home.path(), root_a).unwrap();
+        ensure_codex_project_trust(&home.path().join(".codex"), root_a).unwrap();
         let body = std::fs::read_to_string(&cfg).unwrap();
         assert!(body.contains("[projects.\"/repos/alpha\"]"));
         assert!(body.contains("trust_level = \"trusted\""));
 
         // Idempotent: a second ensure adds nothing.
-        ensure_codex_project_trust(home.path(), root_a).unwrap();
+        ensure_codex_project_trust(&home.path().join(".codex"), root_a).unwrap();
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
 
         // Existing content (including an explicit DISTRUST for beta)
@@ -3427,19 +3473,76 @@ mod tests {
             "model = \"gpt-5.5\"\n\n[projects.\"/repos/beta\"]\ntrust_level = \"untrusted\"\n"
         );
         std::fs::write(&cfg, &seeded).unwrap();
-        ensure_codex_project_trust(home.path(), root_b).unwrap();
+        ensure_codex_project_trust(&home.path().join(".codex"), root_b).unwrap();
         assert_eq!(
             std::fs::read_to_string(&cfg).unwrap(),
             seeded,
             "an existing entry is a prior user decision — untouched"
         );
-        ensure_codex_project_trust(home.path(), root_a).unwrap();
+        ensure_codex_project_trust(&home.path().join(".codex"), root_a).unwrap();
         let body = std::fs::read_to_string(&cfg).unwrap();
         assert!(
             body.starts_with(&seeded),
             "existing file preserved verbatim"
         );
         assert!(body.contains("[projects.\"/repos/alpha\"]\ntrust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn codex_trust_root_matches_launch_overrides_and_working_directory() {
+        let env = crate::agent_env::Stated::saying(&[("CODEX_HOME", "inherited")])
+            .at(Path::new("/calling-home"), Path::new("/launch-cwd"));
+        let mut launch = ComposedLaunch {
+            program: "codex".into(),
+            args: vec![],
+            env_overrides: Default::default(),
+        };
+        assert_eq!(
+            codex_launch_root(&launch, &env).unwrap(),
+            Path::new("/launch-cwd/inherited")
+        );
+        launch
+            .env_overrides
+            .insert("HOME".into(), "/selected-home".into());
+        launch
+            .env_overrides
+            .insert("CODEX_HOME".into(), "selected-profile".into());
+        assert_eq!(
+            codex_launch_root(&launch, &env).unwrap(),
+            Path::new("/launch-cwd/selected-profile")
+        );
+        launch.env_overrides.remove("CODEX_HOME");
+        let env = crate::agent_env::Stated::default()
+            .at(Path::new("/calling-home"), Path::new("/launch-cwd"));
+        assert_eq!(
+            codex_launch_root(&launch, &env).unwrap(),
+            Path::new("/selected-home/.codex")
+        );
+    }
+
+    #[test]
+    fn simultaneous_codex_trust_updates_preserve_each_project() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join("profile");
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let profile = &profile;
+                scope.spawn(move || {
+                    ensure_codex_project_trust(profile, Path::new(&format!("/repos/project-{n}")))
+                        .unwrap()
+                });
+            }
+        });
+        let config = std::fs::read_to_string(profile.join("config.toml")).unwrap();
+        for n in 0..8 {
+            assert_eq!(
+                config
+                    .matches(&format!("[projects.\"/repos/project-{n}\"]"))
+                    .count(),
+                1
+            );
+        }
+        assert!(!home.path().join(".codex").exists());
     }
 
     #[test]

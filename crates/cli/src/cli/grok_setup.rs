@@ -60,16 +60,10 @@ pub(super) fn asset_location(
     grok_home: &Path,
     asset: super::setup::OwnedAsset,
 ) -> (PathBuf, super::setup::OwnedAsset) {
-    if grok_home == home.join(".grok") || !asset.rel.starts_with(".grok/") {
+    if !asset.rel.starts_with(".grok/") {
         return (home.to_owned(), asset);
     }
-    let mut asset = asset;
-    asset.rel = asset
-        .rel
-        .strip_prefix(".grok/")
-        .expect("prefix checked")
-        .to_owned();
-    (grok_home.to_owned(), asset)
+    super::setup::provider_asset_location(home, grok_home, Tool::Grok, asset)
 }
 
 #[derive(Debug)]
@@ -211,7 +205,11 @@ pub(super) async fn launch_ready(
     provider: &Provider,
 ) -> Result<()> {
     let cfg = crate::agent_store::load_agent_config(repo, label)?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = provider
+        .env
+        .get("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     if super::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()) == AutoMode::Off {
         return Ok(());
     }

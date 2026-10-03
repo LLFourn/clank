@@ -62,6 +62,14 @@ const blanks = () =>
   Object.fromEntries(FOREIGN_IDENTITY_VARS.map((v) => [v, ""]))
 
 export const ClankPlugin = async ({ client, $, directory }) => {
+  // OpenCode loads global and custom/project directories additively and local
+  // files at different URLs are separate modules. The loader gives all plugins
+  // for this instance the same client; a weak process registry chooses one loop
+  // without retaining disposed instances or conflating different clients.
+  const key = Symbol.for("clank.opencode.clients")
+  const clients = globalThis[key] ??= new WeakSet()
+  if (clients.has(client)) return {}
+  clients.add(client)
   const inflight = new Set()
   // Per-session activity counter, counting only FIRST SIGHTINGS of
   // user message ids: a wait remembers the count at its triggering

@@ -49,10 +49,7 @@ pub enum Command {
     /// `--peek` probes without blocking; `--for` observes a repo
     /// instead; `--event` adds ad-hoc wake sources (github repos,
     /// commands) alongside the agent config's `wait_events`.
-    Wait(crate::cli::WaitArgs),
-    /// Grok's provider-owned automatic handoff (native hooks required).
-    #[command(hide = true)]
-    GrokWait(crate::cli::GrokWaitArgs),
+    Wait(crate::cli::WaitCommandArgs),
     /// Manage the plan queue
     ///
     /// `queue add` consumes a draft from `.clank/drafts/`; `promote`
@@ -272,8 +269,7 @@ pub async fn dispatch_with(
         Command::Rereview(args) => crate::cli::rereview::run(args).await,
         Command::Rewire(args) => crate::cli::rewire::run(args).await,
         Command::Status(args) => crate::cli::status::run(args).await,
-        Command::Wait(args) => crate::cli::wait::run(args).await,
-        Command::GrokWait(args) => crate::cli::grok_handoff::wait(args).await,
+        Command::Wait(args) => crate::cli::grok_handoff::run_wait(args).await,
         Command::Feedback(args) => crate::cli::feedback::run(args).await,
         Command::Events(args) => crate::cli::events::run(args).await,
         Command::Send(args) => crate::cli::send::run(args),
@@ -517,6 +513,31 @@ mod tests {
             Cli::try_parse_from(["clank", "wait"]).unwrap().command,
             Command::Wait(_)
         ));
+        assert!(Cli::try_parse_from(["clank", "grok-wait"]).is_err());
+        assert!(Cli::try_parse_from(["clank", "wait", "--handoff-key", "key"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "clank",
+                "wait",
+                "--handoff-key",
+                "key",
+                "--handoff-generation",
+                "generation",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "clank",
+                "wait",
+                "--handoff-key",
+                "key",
+                "--handoff-generation",
+                "generation",
+                "--peek",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -533,7 +554,7 @@ mod tests {
             let Command::Wait(w) = parsed.command else {
                 panic!("expected the wait command for --for {raw}");
             };
-            assert_eq!(w.r#for, Some(want));
+            assert_eq!(w.wait.r#for, Some(want));
         }
         assert!(Cli::try_parse_from(["clank", "wait", "--for", "commit", "--peek"]).is_err());
         assert!(

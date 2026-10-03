@@ -66,6 +66,15 @@ pub const SESSION_IDENTITY_VARS: &[&str] = &[
 /// room instead of its own setup.
 pub(crate) trait Ambient {
     fn var(&self, key: &str) -> Option<String>;
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        if let Some(value) = self.var(key) {
+            Some(value.into())
+        } else if key == "HOME" {
+            self.home().map(std::path::PathBuf::into_os_string)
+        } else {
+            None
+        }
+    }
     fn home(&self) -> Option<std::path::PathBuf>;
     fn cwd(&self) -> Option<std::path::PathBuf>;
 }
@@ -76,6 +85,9 @@ pub(crate) struct Process;
 impl Ambient for Process {
     fn var(&self, key: &str) -> Option<String> {
         env::var(key).ok()
+    }
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        env::var_os(key)
     }
     fn home(&self) -> Option<std::path::PathBuf> {
         env::var_os("HOME").map(std::path::PathBuf::from)

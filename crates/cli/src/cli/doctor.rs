@@ -101,8 +101,9 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         ));
     }
 
-    // User scope — independent of repo.
-    results.extend(user_checks());
+    // Installed assets follow configured launch profiles; unconfigured tools
+    // retain inherited/default user-scope checks.
+    results.extend(user_checks(repo.as_deref()).await);
 
     // Explicit command boundary only: bounded native handshake per distinct
     // configured Grok provider. No probe runs in an idle lifecycle callback.
@@ -153,8 +154,6 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
                 if tool != Tool::Grok {
                     continue;
                 }
-                let automatic =
-                    super::team::resolve_effective_auto_mode(cfg.as_ref(), home) == AutoMode::On;
                 let state = super::grok_handoff::diagnose(
                     repo,
                     &label,
@@ -171,7 +170,15 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
                     ),
                 });
                 match super::grok_launch::Provider::resolve(desc.launch.as_ref(), repo) {
-                    Ok(provider) => profiles.push((label.to_string(), repo.to_owned(), provider, automatic)),
+                    Ok(provider) => {
+                        let profile_home = provider.env.get("HOME").map(PathBuf::from)
+                            .or_else(|| home.map(Path::to_owned))
+                            .map(|path| if path.is_absolute() { path } else { repo.join(path) });
+                        let automatic = super::team::resolve_effective_auto_mode(
+                            cfg.as_ref(), profile_home.as_deref(),
+                        ) == AutoMode::On;
+                        profiles.push((label.to_string(), repo.to_owned(), provider, automatic));
+                    }
                     Err(_) => out.push(CheckResult::fail("repo", format!("Grok {label} profile"), "invalid managed session/cwd options or missing provider home; check this launch profile")),
                 }
             }
@@ -205,7 +212,22 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
             probes.get(&key).unwrap()
         };
         out.extend(grok_report(&label, &provider, automatic, capabilities));
-        if let Some(home) = home.filter(|_| asset_roots.insert(provider.root.clone())) {
+        let profile_home = provider
+            .env
+            .get("HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.map(Path::to_owned));
+        let profile_home = profile_home.map(|home| {
+            if home.is_absolute() {
+                home
+            } else {
+                cwd.join(home)
+            }
+        });
+        if let Some(home) = profile_home
+            .as_deref()
+            .filter(|_| asset_roots.insert(provider.root.clone()))
+        {
             let obsolete = provider.root.join("skills/clank/SKILL.md");
             if obsolete.exists() {
                 out.push(CheckResult::warn("user", format!("Grok {label} obsolete skill"), "pre-split clank skill can shadow current role guidance; re-run setup for this profile"));
@@ -607,7 +629,7 @@ pub(crate) fn claude_mode_drift(installed_async: bool, capable: bool) -> Option<
 /// The mode check against the LIVE settings + binary. `None` when
 /// the settings, a clank Stop hook or the claude binary is absent
 /// (other checks cover those).
-fn check_claude_loop_mode(settings: &Path) -> Option<CheckResult> {
+fn check_claude_loop_mode(settings: &Path, capable: Option<bool>) -> Option<CheckResult> {
     const SECTION: &str = "user";
     let raw = std::fs::read_to_string(settings).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -625,7 +647,7 @@ fn check_claude_loop_mode(settings: &Path) -> Option<CheckResult> {
             ));
         }
     };
-    let capable = crate::cli::setup::probe_claude_asyncrewake()?;
+    let capable = capable?;
     Some(match claude_mode_drift(installed_async, capable) {
         Some(msg) => CheckResult::warn(SECTION, "claude loop mode", msg),
         None => CheckResult::ok(
@@ -723,89 +745,177 @@ fn check_root_has_no_clank_rules(repo: &Path) -> CheckResult {
     }
 }
 
-fn user_checks() -> Vec<CheckResult> {
-    const SECTION: &str = "user";
-    let mut out = Vec::<CheckResult>::new();
-
-    let home = match std::env::var_os("HOME").map(PathBuf::from) {
-        Some(h) => h,
-        None => {
-            out.push(CheckResult::fail(
-                SECTION,
-                "home",
-                "HOME env var unset — can't locate ~/.claude or ~/.codex".to_string(),
-            ));
-            return out;
+async fn user_checks(repo: Option<&Path>) -> Vec<CheckResult> {
+    use crate::agent_env::{Ambient, Process};
+    use clank_core::Tool;
+    let mut profiles = Vec::new();
+    let mut out = Vec::new();
+    if let Some(repo) = repo {
+        if let Ok(Some(set)) =
+            crate::agent_store::try_resolve_via_team_with(repo, Process.home().as_deref())
+        {
+            let mut members = vec![(set.master.clone(), set.master_desc.clone())];
+            members.extend(
+                set.members
+                    .iter()
+                    .map(|m| (m.label.clone(), m.desc.clone())),
+            );
+            for (label, desc) in members {
+                let cfg = match load_agent_config(repo, &label) {
+                    Ok(cfg) => cfg,
+                    Err(_) => continue,
+                };
+                let tool = cfg
+                    .as_ref()
+                    .and_then(|c| c.session.as_ref())
+                    .map(|s| s.tool)
+                    .or_else(|| {
+                        super::fork::load_fork_spec(repo, &label)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.tool)
+                    })
+                    .unwrap_or(desc.tool);
+                if tool != Tool::Grok {
+                    profiles.push((label.to_string(), tool, desc.launch));
+                }
+            }
         }
-    };
-
-    // Every user-scope asset, from THE inventory setup installs from
-    // (setup/doctor parity by construction — codex 0c90514). This
-    // includes the opencode plugin: a missing or drifted plugin means
-    // opencode agents never bind and never receive work, silently
-    // (the wire is exit-0/empty by design).
-    let claude_async = crate::cli::setup::probe_claude_asyncrewake() == Some(true);
-    // Grok assets follow the actual configured profiles below, rather than
-    // reporting a missing default home when setup targeted a custom home.
-    let setup_manifest = crate::cli::setup::load_manifest(&home);
-    for asset in crate::cli::setup::user_asset_inventory(claude_async)
-        .into_iter()
-        .filter(|a| !a.rel.starts_with(".grok/"))
-    {
-        out.push(check_setup_asset(&home, &asset, &setup_manifest));
     }
-    // The pre-split `clank` skill must be gone — left in place it
-    // shadows the role skills with stale, role-jamming guidance.
-    for (tool, tool_dir) in crate::cli::setup::TOOL_SKILL_DIRS {
-        if tool == clank_core::Tool::Grok {
+    for (tool, _) in super::setup::TOOL_SKILL_DIRS {
+        if tool != Tool::Grok && !profiles.iter().any(|(_, selected, _)| *selected == tool) {
+            profiles.push(("default".into(), tool, None));
+        }
+    }
+    let Some(cwd) = Process.cwd() else {
+        return vec![CheckResult::fail(
+            "user",
+            "cwd",
+            "cannot resolve provider working directory",
+        )];
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for (label, tool, launch) in profiles {
+        let key = (
+            tool.as_str().to_owned(),
+            launch.as_ref().and_then(|l| l.command.clone()),
+            launch.as_ref().map(|l| l.args.clone()).unwrap_or_default(),
+            launch.as_ref().map(|l| l.env.clone()).unwrap_or_default(),
+        );
+        if !seen.insert(key) {
             continue;
         }
-        let obsolete = home.join(format!("{tool_dir}/skills/clank"));
-        if obsolete.join("SKILL.md").exists() {
+        out.extend(
+            provider_user_checks(
+                &label,
+                tool,
+                launch.as_ref(),
+                repo.unwrap_or(&cwd),
+                &Process,
+            )
+            .await,
+        );
+    }
+    out
+}
+
+async fn provider_user_checks(
+    label: &str,
+    tool: clank_core::Tool,
+    launch: Option<&clank_core::agent_config::LaunchConfig>,
+    repo: &Path,
+    ambient: &dyn crate::agent_env::Ambient,
+) -> Vec<CheckResult> {
+    use clank_core::Tool;
+    let mut out = Vec::new();
+    let name = format!("{} {label}", tool.as_str());
+    let (home, cwd, roots) = match super::setup::provider_launch_paths(repo, tool, launch, ambient)
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            return vec![CheckResult::fail(
+                "user",
+                format!("{name} profile"),
+                format!("{error:#}"),
+            )];
+        }
+    };
+    let capable = if tool == Tool::Claude {
+        match super::setup::probe_launch_claude(launch, &cwd).await {
+            Ok(capable) => Some(capable),
+            Err(error) => {
+                out.push(CheckResult::warn(
+                    "user",
+                    format!("{name} capability"),
+                    format!("{error:#}"),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    for root in roots {
+        let settings = root.join("settings.json");
+        let installed_async = std::fs::read_to_string(&settings)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .and_then(|value| installed_loop_mode(&value))
+            .is_some_and(|mode| matches!(mode, Ok(Some(super::LoopModeArg::Asyncrewake))));
+        for asset in
+            super::setup::provider_asset_inventory(tool, capable.unwrap_or(installed_async))
+        {
+            let (domain, asset) = super::setup::provider_asset_location(&home, &root, tool, asset);
+            out.push(check_setup_asset(
+                &domain,
+                &asset,
+                &super::setup::load_manifest(&domain),
+            ));
+        }
+        let obsolete = root.join("skills/clank/SKILL.md");
+        if obsolete.exists() {
             out.push(CheckResult::warn(
-                SECTION,
-                "skills",
+                "user",
+                "obsolete skill",
                 format!(
-                    "~/{tool_dir}/skills/clank is the obsolete pre-split skill; \
-                     run `clank setup --force` to remove it (now clank-master / clank-reviewer)"
+                    "{} can shadow current role skills; run setup for this profile",
+                    obsolete.display()
                 ),
             ));
         }
+        match tool {
+            Tool::Claude | Tool::Codex => {
+                let path = if tool == Tool::Claude {
+                    settings
+                } else {
+                    root.join("hooks.json")
+                };
+                if tool == Tool::Claude {
+                    if let Some(check) = check_claude_loop_mode(&path, capable) {
+                        out.push(check);
+                    }
+                }
+                out.push(check_hook_entry(
+                    &path,
+                    tool.as_str(),
+                    &path.display().to_string(),
+                ));
+                out.push(check_session_start(
+                    &path,
+                    tool.as_str(),
+                    &format!("{} SessionStart", path.display()),
+                ));
+                if tool == Tool::Codex {
+                    let path = root.join("rules/default.rules");
+                    out.push(check_codex_rule(&path, &path.display().to_string()));
+                }
+            }
+            _ => {}
+        }
     }
-    // claude-asyncrewake-work-loop: the installed entry's delivery
-    // mode is a durable setup-time decision — flag drift in BOTH
-    // directions (a stale async entry on a downgraded claude is a
-    // SYNCHRONOUS day-long hook; a legacy entry on a capable claude
-    // wastes the whole point).
-    if let Some(check) = check_claude_loop_mode(&home.join(".claude/settings.json")) {
-        out.push(check);
+    for check in &mut out {
+        check.name = format!("{name}: {}", check.name);
     }
-    // Hook entries.
-    out.push(check_hook_entry(
-        &home.join(".claude/settings.json"),
-        "claude",
-        "~/.claude/settings.json",
-    ));
-    out.push(check_session_start(
-        &home.join(".claude/settings.json"),
-        "claude",
-        "~/.claude/settings.json SessionStart",
-    ));
-    out.push(check_hook_entry(
-        &home.join(".codex/hooks.json"),
-        "codex",
-        "~/.codex/hooks.json",
-    ));
-    out.push(check_session_start(
-        &home.join(".codex/hooks.json"),
-        "codex",
-        "~/.codex/hooks.json SessionStart",
-    ));
-    out.push(check_codex_rule(
-        &home.join(".codex/rules/default.rules"),
-        "~/.codex/rules/default.rules",
-    ));
-
     out
 }
 
@@ -865,7 +975,7 @@ fn check_setup_asset(
 ) -> CheckResult {
     const SECTION: &str = "user";
     let path = home.join(&asset.rel);
-    let display = format!("~/{}", asset.rel);
+    let display = path.display().to_string();
     if let Ok(existing) = std::fs::read_to_string(&path) {
         match crate::cli::setup::classify_asset_state(
             &existing,
@@ -1219,6 +1329,150 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn custom_codex_doctor_uses_launch_home_relative_root_and_stays_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let calling_home = temp.path().join("caller");
+        let home = temp.path().join("selected-home");
+        let root = cwd.join("profile");
+        super::super::setup::install_provider(
+            &home,
+            clank_core::Tool::Codex,
+            &root,
+            false,
+            false,
+            false,
+            &mut vec![],
+        )
+        .unwrap();
+        let launch = clank_core::agent_config::LaunchConfig {
+            env: std::collections::BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into()),
+                ("CODEX_HOME".into(), "profile".into()),
+            ]),
+            ..Default::default()
+        };
+        let ambient = crate::agent_env::Stated::default().at(&calling_home, &cwd);
+        let hooks = root.join("hooks.json");
+        let before = std::fs::read(&hooks).unwrap();
+        let rows = provider_user_checks(
+            "selected",
+            clank_core::Tool::Codex,
+            Some(&launch),
+            temp.path(),
+            &ambient,
+        )
+        .await;
+        assert!(rows.iter().all(|r| r.status == CheckStatus::Ok), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.name.contains(&hooks.display().to_string()))
+        );
+        assert_eq!(std::fs::read(&hooks).unwrap(), before);
+        assert!(!calling_home.exists());
+        assert!(!home.join(".codex").exists());
+    }
+
+    #[tokio::test]
+    async fn claude_doctor_probes_selected_executable_and_checks_selected_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("profile");
+        let command = temp.path().join("claude-stub");
+        let calls = temp.path().join("calls");
+        std::fs::write(
+            &command,
+            "#!/bin/sh\necho selected >> \"$CALLS\"\necho '2.1.223 (Claude Code)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::setup::install_provider(
+            &home,
+            clank_core::Tool::Claude,
+            &root,
+            true,
+            false,
+            false,
+            &mut vec![],
+        )
+        .unwrap();
+        let launch = clank_core::agent_config::LaunchConfig {
+            command: Some(command.to_string_lossy().into()),
+            args: vec!["--profile".into(), "selected".into()],
+            env: std::collections::BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into()),
+                ("CLAUDE_CONFIG_DIR".into(), root.to_string_lossy().into()),
+                ("CALLS".into(), calls.to_string_lossy().into()),
+            ]),
+        };
+        let ambient = crate::agent_env::Stated::default().at(&home, temp.path());
+        let rows = provider_user_checks(
+            "selected",
+            clank_core::Tool::Claude,
+            Some(&launch),
+            temp.path(),
+            &ambient,
+        )
+        .await;
+        assert!(rows.iter().all(|r| r.status == CheckStatus::Ok), "{rows:?}");
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "selected\n");
+        assert!(!home.join(".claude").exists());
+    }
+
+    #[tokio::test]
+    async fn opencode_doctor_reports_both_loaded_roots_without_creating_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let global = home.join(".config/opencode");
+        let selected = temp.path().join("selected");
+        super::super::setup::install_provider(
+            &home,
+            clank_core::Tool::OpenCode,
+            &global,
+            false,
+            false,
+            false,
+            &mut vec![],
+        )
+        .unwrap();
+        let launch = clank_core::agent_config::LaunchConfig {
+            env: std::collections::BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    home.join(".config").to_string_lossy().into(),
+                ),
+                (
+                    "OPENCODE_CONFIG_DIR".into(),
+                    selected.to_string_lossy().into(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let ambient = crate::agent_env::Stated::default().at(&home, temp.path());
+        let rows = provider_user_checks(
+            "selected",
+            clank_core::Tool::OpenCode,
+            Some(&launch),
+            temp.path(),
+            &ambient,
+        )
+        .await;
+        assert!(
+            rows.iter()
+                .any(|r| r.status == CheckStatus::Ok
+                    && r.name.contains(&global.display().to_string()))
+        );
+        assert!(
+            rows.iter().any(|r| r.status == CheckStatus::Warn
+                && r.name.contains(&selected.display().to_string()))
+        );
+        assert!(!selected.exists());
+    }
 
     fn init_git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

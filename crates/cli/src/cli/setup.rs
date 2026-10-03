@@ -128,7 +128,7 @@ const WORK_LOOP_GROK: WorkLoop = WorkLoop {
     arrival: "\
 - **Use the native guarded handoff.** On first start/resume, end your
   turn so the native Stop hook can check the existing handoff. If it
-  requests arming, run `clank grok-wait` with `run_terminal_command`
+  requests arming, run `clank wait` with `run_terminal_command`
   and `block_until_ms: 0`. Clank's PreToolUse hook tags that call and
   PostToolUse confirms its background task before any work is delivered.
   Keep exactly one such task. Its completion wakes you: act on the
@@ -311,42 +311,237 @@ pub struct OwnedAsset {
 }
 
 pub fn user_asset_inventory(claude_async: bool) -> Vec<OwnedAsset> {
+    TOOL_SKILL_DIRS
+        .into_iter()
+        .flat_map(|(tool, _)| provider_asset_inventory(tool, claude_async))
+        .collect()
+}
+
+pub(super) fn provider_asset_inventory(tool: Tool, claude_async: bool) -> Vec<OwnedAsset> {
+    let tool_dir = TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1;
     let plain = |rel: String, expected: String| OwnedAsset {
         rel,
         expected,
         canonical_alternates: Vec::new(),
     };
     let mut out = Vec::new();
-    for (tool, tool_dir) in TOOL_SKILL_DIRS {
-        for (role, skill) in [
-            (Role::Master, MASTER_SKILL),
-            (Role::Reviewer, REVIEWER_SKILL),
-        ] {
-            let canonical_alternates = if tool == Tool::Claude {
-                vec![compose_skill_with(role, tool, !claude_async)]
-            } else {
-                Vec::new()
-            };
-            out.push(OwnedAsset {
-                rel: format!("{tool_dir}/skills/{skill}/SKILL.md"),
-                expected: compose_skill_with(role, tool, claude_async),
-                canonical_alternates,
-            });
-        }
-        out.push(plain(
-            format!("{tool_dir}/skills/clank-pr-review/SKILL.md"),
-            PR_REVIEW_SKILL_BODY.to_string(),
-        ));
-        out.push(plain(
-            format!("{tool_dir}/skills/clank-github/SKILL.md"),
-            GITHUB_SKILL_BODY.to_string(),
-        ));
+    for (role, skill) in [
+        (Role::Master, MASTER_SKILL),
+        (Role::Reviewer, REVIEWER_SKILL),
+    ] {
+        let canonical_alternates = if tool == Tool::Claude {
+            vec![compose_skill_with(role, tool, !claude_async)]
+        } else {
+            Vec::new()
+        };
+        out.push(OwnedAsset {
+            rel: format!("{tool_dir}/skills/{skill}/SKILL.md"),
+            expected: compose_skill_with(role, tool, claude_async),
+            canonical_alternates,
+        });
     }
     out.push(plain(
-        ".config/opencode/plugin/clank.js".to_string(),
-        OPENCODE_PLUGIN.to_string(),
+        format!("{tool_dir}/skills/clank-pr-review/SKILL.md"),
+        PR_REVIEW_SKILL_BODY.into(),
     ));
+    out.push(plain(
+        format!("{tool_dir}/skills/clank-github/SKILL.md"),
+        GITHUB_SKILL_BODY.into(),
+    ));
+    if tool == Tool::OpenCode {
+        out.push(plain(
+            format!("{tool_dir}/plugin/clank.js"),
+            OPENCODE_PLUGIN.into(),
+        ));
+    }
     out
+}
+
+pub(super) fn resolve_provider_root(
+    home: &Path,
+    tool: Tool,
+    cwd: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    let override_key = match tool {
+        Tool::Claude => "CLAUDE_CONFIG_DIR",
+        Tool::Codex => "CODEX_HOME",
+        Tool::Grok => "GROK_HOME",
+        Tool::OpenCode => "OPENCODE_CONFIG_DIR",
+    };
+    let path = env(override_key).map(PathBuf::from).unwrap_or_else(|| {
+        if tool == Tool::OpenCode {
+            env("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"))
+                .join("opencode")
+        } else {
+            home.join(TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1)
+        }
+    });
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Read-only path selection shared by launch repair and doctor.
+pub(super) fn provider_launch_paths(
+    repo: &Path,
+    tool: Tool,
+    launch: Option<&clank_core::agent_config::LaunchConfig>,
+    ambient: &dyn crate::agent_env::Ambient,
+) -> anyhow::Result<(PathBuf, PathBuf, Vec<PathBuf>)> {
+    let env = |name: &str| {
+        launch
+            .and_then(|l| l.env.get(name))
+            .map(std::ffi::OsString::from)
+            .or_else(|| ambient.var_os(name))
+    };
+    let cwd = if tool == Tool::Grok {
+        repo.to_owned()
+    } else {
+        ambient
+            .cwd()
+            .context("provider working directory is unset")?
+    };
+    let home = env("HOME")
+        .map(PathBuf::from)
+        .context("provider HOME is unset; cannot locate Clank integration")?;
+    let home = if home.is_absolute() {
+        home
+    } else {
+        cwd.join(home)
+    };
+    let root = resolve_provider_root(&home, tool, &cwd, env);
+    let mut roots = vec![root];
+    if tool == Tool::OpenCode {
+        let global = resolve_provider_root(&home, tool, &cwd, |key| {
+            if key == "OPENCODE_CONFIG_DIR" {
+                None
+            } else {
+                env(key)
+            }
+        });
+        match std::fs::symlink_metadata(global.join("plugin/clank.js")) {
+            Ok(_) => {
+                let same = dunce::canonicalize(&roots[0])
+                    .ok()
+                    .zip(dunce::canonicalize(&global).ok())
+                    .is_some_and(|(selected, global)| selected == global);
+                if !same && roots[0] != global {
+                    roots.insert(0, global);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok((home, cwd, roots))
+}
+
+/// Repair only at a real launch boundary. This never starts a provider or
+/// consumes a fork intent; failure leaves the caller's launch untouched.
+pub(super) async fn ensure_launch_setup(
+    repo: &Path,
+    tool: Tool,
+    launch: Option<&clank_core::agent_config::LaunchConfig>,
+) -> anyhow::Result<()> {
+    let (home, cwd, roots) = provider_launch_paths(repo, tool, launch, &crate::agent_env::Process)?;
+    let root = roots.last().context("provider root is absent")?;
+    let claude_async = if tool == Tool::Claude {
+        let path = root.join("settings.json");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let value: serde_json::Value = serde_json::from_str(&content)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let entries = clank_hook_entries(&value, "Stop");
+                if entries.is_empty() {
+                    probe_launch_claude(launch, &cwd).await?
+                } else {
+                    entries
+                        .iter()
+                        .filter_map(|entry| clank_hook_args(entry))
+                        .any(|args| {
+                            args.windows(2)
+                                .any(|pair| pair == ["--loop", "asyncrewake"])
+                        })
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                probe_launch_claude(launch, &cwd).await?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        false
+    };
+    // Inspect every setup-owned loaded root before repairing any: an old global
+    // plugin must join the same duplicate guard, and drift must stay untouched.
+    let repairs = roots
+        .into_iter()
+        .map(|root| inspect_provider(&home, tool, &root, claude_async).map(|ready| (root, ready)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for (root, ready) in repairs {
+        if ready {
+            continue;
+        }
+        eprintln!(
+            "clank: installing missing integration for {} in {}",
+            tool.as_str(),
+            root.display()
+        );
+        install_provider(
+            &home,
+            tool,
+            &root,
+            claude_async,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .with_context(|| {
+            format!(
+                "repairing {} integration in {}",
+                tool.as_str(),
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            inspect_provider(&home, tool, &root, claude_async)?,
+            "{} integration remains incomplete after setup in {}",
+            tool.as_str(),
+            root.display()
+        );
+    }
+
+    Ok(())
+}
+
+pub(super) async fn probe_launch_claude(
+    launch: Option<&clank_core::agent_config::LaunchConfig>,
+    cwd: &Path,
+) -> anyhow::Result<bool> {
+    let mut command = tokio::process::Command::new(
+        launch
+            .and_then(|l| l.command.as_deref())
+            .unwrap_or("claude"),
+    );
+    if let Some(launch) = launch {
+        command.args(&launch.args).envs(&launch.env);
+    }
+    command.arg("--version").current_dir(cwd).kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+        .await
+        .context("selected Claude version probe timed out")??;
+    anyhow::ensure!(
+        output.status.success(),
+        "selected Claude version probe failed"
+    );
+    Ok(claude_asyncrewake_capable(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
@@ -357,48 +552,24 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // installed teaching and the installed loop cannot disagree.
     let claude_async = probe_claude_asyncrewake() == Some(true);
     let (grok, grok_repo) = super::grok_setup::installation(&args, &home)?;
-    let mut manifests = std::collections::BTreeMap::new();
-    for asset in user_asset_inventory(claude_async) {
-        let (root, asset) = super::grok_setup::asset_location(&home, &grok.root, asset);
-        let manifest = manifests
-            .entry(root.clone())
-            .or_insert_with(|| load_manifest(&root));
-        install_skill(
+    for (tool, _) in TOOL_SKILL_DIRS {
+        let root = if tool == Tool::Grok {
+            grok.root.clone()
+        } else {
+            resolve_provider_root(&home, tool, &std::env::current_dir()?, |key| {
+                std::env::var_os(key)
+            })
+        };
+        install_provider(
+            &home,
+            tool,
             &root,
-            &asset.rel,
-            &asset.expected,
-            &asset.canonical_alternates,
+            claude_async,
             args.force,
             args.dry_run,
-            manifest,
             &mut summary,
         )?;
     }
-    // Drop the pre-split single `clank` skill so it can't shadow the
-    // role skills with stale, role-jamming guidance.
-    for (tool, tool_dir) in TOOL_SKILL_DIRS {
-        let obsolete = if tool == Tool::Grok {
-            grok.root.join(format!("skills/{OBSOLETE_SKILL}"))
-        } else {
-            home.join(format!("{tool_dir}/skills/{OBSOLETE_SKILL}"))
-        };
-        remove_obsolete_skill(&obsolete, args.dry_run, &mut summary)?;
-    }
-    // The delivery mode is decided HERE, once, and encoded in the
-    // installed entry's argv (claude-asyncrewake-work-loop): probe
-    // the installed Claude Code; no binary / too old → legacy loop.
-    install_claude_hooks(
-        &home.join(".claude/settings.json"),
-        claude_async,
-        args.dry_run,
-        &mut summary,
-    )?;
-    install_codex_hooks(&home.join(".codex/hooks.json"), args.dry_run, &mut summary)?;
-    install_grok_hooks(
-        &super::grok_setup::hook_path(&grok),
-        args.dry_run,
-        &mut summary,
-    )?;
     // Native initialize may create provider cache directories. A dry run must
     // not invoke it in the user's home; real setup probes once, never at idle.
     if args.dry_run {
@@ -407,12 +578,6 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         let capabilities = super::grok_setup::probe(&grok, &grok_repo).await;
         summary.push(format!("  Grok: {}", capabilities.description()));
     }
-    install_codex_rule(
-        &home.join(".codex/rules/default.rules"),
-        args.dry_run,
-        &mut summary,
-    )?;
-
     // Setup may seed product behavior defaults, but never personal/team
     // composition templates. `finish.autosquash` is a behavior default:
     // absent → true; an explicit true/false is preserved.
@@ -431,6 +596,238 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         println!("(dry-run — no changes written)");
     }
     Ok(())
+}
+
+/// One provider's installation, shared by explicit setup and launch repair.
+/// Probes are deliberately outside this filesystem transaction.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn install_provider(
+    home: &Path,
+    tool: Tool,
+    provider_root: &Path,
+    claude_async: bool,
+    force: bool,
+    dry_run: bool,
+    summary: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let prefix = TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1;
+    let domain = provider_domain(home, provider_root, tool);
+    let default = domain == home;
+    let _locks = if dry_run {
+        Vec::new()
+    } else {
+        // Protect both shared manifest and actual provider files. A profile
+        // alias must not acquire a different lock for the same hook files.
+        let mut roots = vec![domain.to_owned(), provider_root.to_owned()];
+        for root in &roots {
+            std::fs::create_dir_all(root)?;
+        }
+        roots = roots
+            .into_iter()
+            .map(dunce::canonicalize)
+            .collect::<Result<Vec<_>, _>>()?;
+        roots.sort();
+        roots.dedup();
+        roots
+            .iter()
+            .map(|root| installation_lock(root))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+    let mut manifest = load_manifest(domain);
+    for mut asset in provider_asset_inventory(tool, claude_async) {
+        if !default {
+            asset.rel = asset
+                .rel
+                .strip_prefix(&format!("{prefix}/"))
+                .unwrap()
+                .to_owned();
+        }
+        install_skill(
+            domain,
+            &asset.rel,
+            &asset.expected,
+            &asset.canonical_alternates,
+            force,
+            dry_run,
+            &mut manifest,
+            summary,
+        )?;
+    }
+    remove_obsolete_skill(
+        &provider_root.join(format!("skills/{OBSOLETE_SKILL}")),
+        dry_run,
+        summary,
+    )?;
+    match tool {
+        Tool::Claude => install_claude_hooks(
+            &provider_root.join("settings.json"),
+            claude_async,
+            dry_run,
+            summary,
+        )?,
+        Tool::Codex => {
+            install_codex_hooks(&provider_root.join("hooks.json"), dry_run, summary)?;
+            install_codex_rule(&provider_root.join("rules/default.rules"), dry_run, summary)?;
+        }
+        Tool::Grok => {
+            install_grok_hooks(&provider_root.join("hooks/clank.json"), dry_run, summary)?
+        }
+        Tool::OpenCode => {}
+    }
+    Ok(())
+}
+
+pub(super) fn provider_domain<'a>(home: &'a Path, root: &'a Path, tool: Tool) -> &'a Path {
+    let prefix = TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1;
+    let default = home.join(prefix);
+    if root == default
+        || dunce::canonicalize(root)
+            .ok()
+            .is_some_and(|actual| dunce::canonicalize(default).ok().as_ref() == Some(&actual))
+    {
+        home
+    } else {
+        root
+    }
+}
+
+pub(super) fn provider_asset_location(
+    home: &Path,
+    root: &Path,
+    tool: Tool,
+    mut asset: OwnedAsset,
+) -> (PathBuf, OwnedAsset) {
+    let domain = provider_domain(home, root, tool);
+    if domain != home {
+        let prefix = TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1;
+        asset.rel = asset
+            .rel
+            .strip_prefix(&format!("{prefix}/"))
+            .expect("selected provider asset")
+            .to_owned();
+    }
+    (domain.to_owned(), asset)
+}
+
+/// Read-only readiness. Missing/known old setup means repair; invalid or
+/// user-drifted assets are errors, never silently reclassified as missing.
+pub(super) fn inspect_provider(
+    home: &Path,
+    tool: Tool,
+    root: &Path,
+    claude_async: bool,
+) -> anyhow::Result<bool> {
+    let domain = provider_domain(home, root, tool);
+    let manifest = load_manifest(domain);
+    let mut ready = true;
+    for asset in provider_asset_inventory(tool, claude_async) {
+        let (domain, asset) = provider_asset_location(home, root, tool, asset);
+        let path = domain.join(&asset.rel);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match classify_asset_state(
+                &content,
+                &asset.expected,
+                &asset.canonical_alternates,
+                manifest.get(&asset.rel).map(String::as_str),
+            ) {
+                AssetState::Current => {}
+                AssetState::ModeAlternate | AssetState::OldSetup => ready = false,
+                AssetState::Drift => anyhow::bail!(
+                    "{} contains local changes; automatic setup will not overwrite them",
+                    path.display()
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ready = false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading setup asset {}", path.display()));
+            }
+        }
+    }
+    match std::fs::metadata(root.join(format!("skills/{OBSOLETE_SKILL}/SKILL.md"))) {
+        Ok(_) => ready = false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let (file, kinds): (&str, Vec<Box<dyn HookKind>>) = match tool {
+        Tool::Claude => (
+            "settings.json",
+            vec![
+                Box::new(ClaudeHook {
+                    async_mode: claude_async,
+                }),
+                Box::new(SessionStartHook),
+            ],
+        ),
+        Tool::Codex => (
+            "hooks.json",
+            vec![Box::new(CodexHook), Box::new(CodexSessionStartHook)],
+        ),
+        Tool::Grok => (
+            "hooks/clank.json",
+            super::grok_setup::EVENTS
+                .into_iter()
+                .map(|(event, terminal)| {
+                    Box::new(GrokHook { event, terminal }) as Box<dyn HookKind>
+                })
+                .collect(),
+        ),
+        Tool::OpenCode => return Ok(ready),
+    };
+    let path = root.join(file);
+    let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content)
+            .with_context(|| format!("parsing setup hooks {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let before = value.clone();
+    for kind in kinds {
+        merge_hook_value(&mut value, &path, kind.as_ref())?;
+    }
+    ready &= before == value;
+    if tool == Tool::Codex {
+        let path = root.join("rules/default.rules");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        ready &= codex_rule_ready(&path, content.as_deref())?;
+    }
+    Ok(ready)
+}
+
+/// The manifest domain is also the lock domain: default providers share the
+/// user manifest; custom homes have their own. Never unlink a locked inode.
+pub(super) fn installation_lock(domain: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = domain.join(".clank");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("setup-install.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("opening setup lock {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "setup lock is not a regular file"
+    );
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("locking setup installation");
+        }
+    }
 }
 
 /// Seed `finish.autosquash=true` into `user_config` on first setup. Returns
@@ -578,7 +975,7 @@ fn install_skill(
                 // OURS in a different mode — migrate freely.
                 AssetState::ModeAlternate => {
                     if !dry_run {
-                        std::fs::write(&path, expected)
+                        publish_asset(&path, expected.as_bytes())
                             .with_context(|| format!("writing `{}`", path.display()))?;
                     }
                     record_setup_write(home, manifest, rel, expected, dry_run)?;
@@ -588,7 +985,7 @@ fn install_skill(
                 // and the new hash goes on record for the next one.
                 AssetState::OldSetup if !force => {
                     if !dry_run {
-                        std::fs::write(&path, expected)
+                        publish_asset(&path, expected.as_bytes())
                             .with_context(|| format!("writing `{}`", path.display()))?;
                     }
                     record_setup_write(home, manifest, rel, expected, dry_run)?;
@@ -596,7 +993,7 @@ fn install_skill(
                 }
                 _ if force => {
                     if !dry_run {
-                        std::fs::write(&path, expected)
+                        publish_asset(&path, expected.as_bytes())
                             .with_context(|| format!("writing `{}`", path.display()))?;
                     }
                     record_setup_write(home, manifest, rel, expected, dry_run)?;
@@ -617,7 +1014,7 @@ fn install_skill(
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating `{}`", parent.display()))?;
                 }
-                std::fs::write(&path, expected)
+                publish_asset(&path, expected.as_bytes())
                     .with_context(|| format!("writing `{}`", path.display()))?;
             }
             record_setup_write(home, manifest, rel, expected, dry_run)?;
@@ -625,6 +1022,41 @@ fn install_skill(
         }
         Err(e) => return Err(e.into()),
     }
+    Ok(())
+}
+
+/// Atomic publication keeps a killed setup from leaving a partial asset.
+pub(super) fn publish_asset(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    // Match the old write-through behavior for user-config symlinks rather
+    // than replacing the link itself with an unrelated regular file.
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => dunce::canonicalize(path)?,
+        Ok(_) => path.to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let path = target.as_path();
+    let parent = path.parent().context("setup asset has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                !metadata.permissions().readonly(),
+                "setup asset {} is read-only",
+                path.display()
+            );
+            temp.as_file().set_permissions(metadata.permissions())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    temp.write_all(content)?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publishing setup asset {}", path.display()))?;
     Ok(())
 }
 
@@ -721,6 +1153,43 @@ fn validate_prefix_rule_line(path: &Path, lineno: usize, trimmed: &str) -> anyho
     Ok(())
 }
 
+fn codex_rule_ready(path: &Path, content: Option<&str>) -> anyhow::Result<bool> {
+    let Some(content) = content else {
+        return Ok(false);
+    };
+    let mut existing_clank_allow_seen = false;
+    for (idx, line) in content.lines().enumerate() {
+        let lineno = idx + 1;
+        let trimmed = line.trim();
+        if !trimmed.starts_with("prefix_rule(") {
+            continue;
+        }
+        // Any `prefix_rule(` line must be well-formed. The
+        // user's rules file is their space; if it's already
+        // broken, appending our line wouldn't fix it AND would
+        // leave us as the most recent edit on a broken file.
+        // Surface the diagnostic; let the user fix it manually.
+        validate_prefix_rule_line(path, lineno, trimmed)?;
+
+        if !trimmed.contains(CODEX_BARE_CLANK_PATTERN) {
+            continue;
+        }
+        if trimmed.contains(r#"decision="deny""#) {
+            anyhow::bail!(
+                "{}:{}: line `{}` denies the `clank` pattern; \
+                     remove or change it before re-running `clank setup`",
+                path.display(),
+                lineno,
+                trimmed,
+            );
+        }
+        if trimmed.contains(r#"decision="allow""#) {
+            existing_clank_allow_seen = true;
+        }
+    }
+    Ok(existing_clank_allow_seen)
+}
+
 /// Ensure the codex command-rules file contains a bare `clank`
 /// allow rule.
 ///
@@ -742,41 +1211,9 @@ fn install_codex_rule(path: &Path, dry_run: bool, summary: &mut Vec<String>) -> 
         }
     };
 
-    if let Some(content) = &existing {
-        let mut existing_clank_allow_seen = false;
-        for (idx, line) in content.lines().enumerate() {
-            let lineno = idx + 1;
-            let trimmed = line.trim();
-            if !trimmed.starts_with("prefix_rule(") {
-                continue;
-            }
-            // Any `prefix_rule(` line must be well-formed. The
-            // user's rules file is their space; if it's already
-            // broken, appending our line wouldn't fix it AND would
-            // leave us as the most recent edit on a broken file.
-            // Surface the diagnostic; let the user fix it manually.
-            validate_prefix_rule_line(path, lineno, trimmed)?;
-
-            if !trimmed.contains(CODEX_BARE_CLANK_PATTERN) {
-                continue;
-            }
-            if trimmed.contains(r#"decision="deny""#) {
-                anyhow::bail!(
-                    "{}:{}: line `{}` denies the `clank` pattern; \
-                     remove or change it before re-running `clank setup`",
-                    path.display(),
-                    lineno,
-                    trimmed,
-                );
-            }
-            if trimmed.contains(r#"decision="allow""#) {
-                existing_clank_allow_seen = true;
-            }
-        }
-        if existing_clank_allow_seen {
-            summary.push(format!("  ok    {}", path.display()));
-            return Ok(());
-        }
+    if codex_rule_ready(path, existing.as_deref())? {
+        summary.push(format!("  ok    {}", path.display()));
+        return Ok(());
     }
 
     if !dry_run {
@@ -790,7 +1227,7 @@ fn install_codex_rule(path: &Path, dry_run: bool, summary: &mut Vec<String>) -> 
         }
         new_content.push_str(CODEX_RULE_LINE);
         new_content.push('\n');
-        std::fs::write(path, new_content)
+        publish_asset(path, new_content.as_bytes())
             .with_context(|| format!("writing `{}`", path.display()))?;
     }
     summary.push(format!(
@@ -1023,7 +1460,7 @@ fn merge_hook_into_settings(
                 .with_context(|| format!("creating `{}`", parent.display()))?;
         }
         let serialized = serde_json::to_string_pretty(&value)?;
-        std::fs::write(path, format!("{serialized}\n"))
+        publish_asset(path, format!("{serialized}\n").as_bytes())
             .with_context(|| format!("writing `{}`", path.display()))?;
     }
 
@@ -1040,7 +1477,7 @@ fn merge_hook_into_settings(
 fn merge_hook_value(
     value: &mut serde_json::Value,
     path: &Path,
-    kind: &impl HookKind,
+    kind: &(impl HookKind + ?Sized),
 ) -> anyhow::Result<usize> {
     let obj = value
         .as_object_mut()
@@ -1208,6 +1645,409 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_inspection_is_read_only_and_shares_installer_hook_and_rule_definitions() {
+        for (tool, prefix) in TOOL_SKILL_DIRS {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = home.join(prefix);
+            assert!(!inspect_provider(&home, tool, &root, false).unwrap());
+            assert!(!home.exists());
+            install_provider(&home, tool, &root, false, false, false, &mut vec![]).unwrap();
+            let path = manifest_path(&home);
+            let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(inspect_provider(&home, tool, &root, false).unwrap());
+            assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), before);
+            let first = root.join("skills/clank-master/SKILL.md");
+            std::fs::remove_file(&first).unwrap();
+            assert!(!inspect_provider(&home, tool, &root, false).unwrap());
+            std::fs::write(&first, "local changes").unwrap();
+            assert!(inspect_provider(&home, tool, &root, false).is_err());
+        }
+    }
+
+    #[test]
+    fn inspection_refuses_invalid_hooks_and_explicit_codex_rule_denial_before_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".codex");
+        install_provider(
+            temp.path(),
+            Tool::Codex,
+            &root,
+            false,
+            false,
+            false,
+            &mut vec![],
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("rules/default.rules"),
+            "prefix_rule(pattern=[\"clank\"], decision=\"deny\")\n",
+        )
+        .unwrap();
+        assert!(inspect_provider(temp.path(), Tool::Codex, &root, false).is_err());
+        std::fs::write(root.join("hooks.json"), "broken").unwrap();
+        assert!(inspect_provider(temp.path(), Tool::Codex, &root, false).is_err());
+    }
+
+    #[test]
+    fn profile_roots_follow_selected_provider_overrides_and_relative_launch_cwd() {
+        let home = Path::new("/fixture/home");
+        let cwd = Path::new("/fixture/cwd");
+        for (tool, key) in [
+            (Tool::Claude, "CLAUDE_CONFIG_DIR"),
+            (Tool::Codex, "CODEX_HOME"),
+            (Tool::Grok, "GROK_HOME"),
+            (Tool::OpenCode, "OPENCODE_CONFIG_DIR"),
+        ] {
+            assert_eq!(
+                resolve_provider_root(home, tool, cwd, |name| (name == key)
+                    .then(|| "profile".into())),
+                cwd.join("profile")
+            );
+        }
+        assert_eq!(
+            resolve_provider_root(home, Tool::OpenCode, cwd, |name| (name
+                == "XDG_CONFIG_HOME")
+                .then(|| "/fixture/xdg".into())),
+            Path::new("/fixture/xdg/opencode")
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_setup_repairs_selected_custom_home_and_healthy_launch_does_not_write() {
+        for (tool, key) in [
+            (Tool::Codex, "CODEX_HOME"),
+            (Tool::Grok, "GROK_HOME"),
+            (Tool::OpenCode, "OPENCODE_CONFIG_DIR"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = temp.path().join("profile");
+            let mut launch = clank_core::agent_config::LaunchConfig::default();
+            launch
+                .env
+                .insert("HOME".into(), home.to_string_lossy().into());
+            launch.env.insert(key.into(), root.to_string_lossy().into());
+            ensure_launch_setup(temp.path(), tool, Some(&launch))
+                .await
+                .unwrap();
+            assert!(!home.exists(), "selected profile only");
+            let manifest = manifest_path(&root);
+            let modified = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+            ensure_launch_setup(temp.path(), tool, Some(&launch))
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(manifest).unwrap().modified().unwrap(),
+                modified
+            );
+            std::fs::write(root.join("skills/clank-master/SKILL.md"), "user edit").unwrap();
+            std::fs::remove_file(root.join("skills/clank-reviewer/SKILL.md")).unwrap();
+            assert!(
+                ensure_launch_setup(temp.path(), tool, Some(&launch))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !root.join("skills/clank-reviewer/SKILL.md").exists(),
+                "invalid inspection must precede repair"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_launch_setup_probes_selected_executable_once_before_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profile");
+        let program = temp.path().join("claude-fixture");
+        let calls = temp.path().join("calls");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nprintf '2.1.0 (Claude Code)\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut launch = clank_core::agent_config::LaunchConfig::default();
+        launch.command = Some(program.to_string_lossy().into());
+        launch.args = vec!["--profile".into(), "test".into()];
+        launch.env.insert(
+            "HOME".into(),
+            temp.path().join("home").to_string_lossy().into(),
+        );
+        launch
+            .env
+            .insert("CLAUDE_CONFIG_DIR".into(), root.to_string_lossy().into());
+        launch
+            .env
+            .insert("CALLS".into(), calls.to_string_lossy().into());
+        ensure_launch_setup(temp.path(), Tool::Claude, Some(&launch))
+            .await
+            .unwrap();
+        ensure_launch_setup(temp.path(), Tool::Claude, Some(&launch))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            "--profile test --version\n"
+        );
+    }
+
+    #[test]
+    fn scoped_install_covers_each_provider_without_installing_other_providers() {
+        for (tool, prefix) in TOOL_SKILL_DIRS {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let root = home.join(prefix);
+            install_provider(home, tool, &root, false, false, false, &mut vec![]).unwrap();
+            for asset in user_asset_inventory(false)
+                .into_iter()
+                .filter(|a| a.rel.starts_with(&format!("{prefix}/")))
+            {
+                assert_eq!(
+                    std::fs::read_to_string(home.join(asset.rel)).unwrap(),
+                    asset.expected
+                );
+            }
+            for (other, dir) in TOOL_SKILL_DIRS {
+                if other != tool {
+                    assert!(!home.join(dir).exists(), "unselected provider {other:?}");
+                }
+            }
+            let before = load_manifest(home);
+            install_provider(home, tool, &root, false, false, false, &mut vec![]).unwrap();
+            assert_eq!(load_manifest(home), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_launch_upgrades_owned_global_copy_and_preserves_drift_before_profile_repair()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let global = home.join(".config/opencode");
+        let selected = temp.path().join("selected");
+        install_provider(
+            &home,
+            Tool::OpenCode,
+            &global,
+            false,
+            false,
+            false,
+            &mut vec![],
+        )
+        .unwrap();
+        let old = "// previous setup-owned plugin\n";
+        let plugin = global.join("plugin/clank.js");
+        std::fs::write(&plugin, old).unwrap();
+        let mut manifest = load_manifest(&home);
+        manifest.insert(
+            ".config/opencode/plugin/clank.js".into(),
+            blake3::hash(old.as_bytes()).to_hex().to_string(),
+        );
+        save_manifest(&home, &manifest).unwrap();
+        let launch = clank_core::agent_config::LaunchConfig {
+            env: std::collections::BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    home.join(".config").to_string_lossy().into(),
+                ),
+                (
+                    "OPENCODE_CONFIG_DIR".into(),
+                    selected.to_string_lossy().into(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        ensure_launch_setup(temp.path(), Tool::OpenCode, Some(&launch))
+            .await
+            .unwrap();
+        for path in [&plugin, &selected.join("plugin/clank.js")] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), OPENCODE_PLUGIN);
+        }
+        let modified = std::fs::metadata(&plugin).unwrap().modified().unwrap();
+        ensure_launch_setup(temp.path(), Tool::OpenCode, Some(&launch))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&plugin).unwrap().modified().unwrap(),
+            modified
+        );
+        std::fs::write(&plugin, "user edit").unwrap();
+        let missing = selected.join("skills/clank-master/SKILL.md");
+        std::fs::remove_file(&missing).unwrap();
+        assert!(
+            ensure_launch_setup(temp.path(), Tool::OpenCode, Some(&launch))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), "user edit");
+        assert!(
+            !missing.exists(),
+            "all loaded roots must pass inspection before repair"
+        );
+    }
+
+    #[test]
+    fn scoped_custom_homes_keep_assets_and_manifest_in_the_selected_domain() {
+        for (tool, _) in TOOL_SKILL_DIRS {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = temp.path().join("profile");
+            install_provider(&home, tool, &root, false, false, false, &mut vec![]).unwrap();
+            assert!(!home.exists());
+            assert!(root.join("skills/clank-master/SKILL.md").is_file());
+            assert!(load_manifest(&root).contains_key("skills/clank-master/SKILL.md"));
+            if tool == Tool::OpenCode {
+                assert!(root.join("plugin/clank.js").is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_alias_of_default_home_uses_existing_manifest_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".grok");
+        install_provider(&home, Tool::Grok, &root, false, false, false, &mut vec![]).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        install_provider(&home, Tool::Grok, &alias, false, false, false, &mut vec![]).unwrap();
+        assert!(load_manifest(&home).contains_key(".grok/skills/clank-master/SKILL.md"));
+        assert!(!alias.join(".clank/setup-manifest.json").exists());
+    }
+
+    #[test]
+    fn scoped_dry_run_does_not_create_a_lock_or_installation_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("absent");
+        for (tool, dir) in TOOL_SKILL_DIRS {
+            install_provider(
+                &home,
+                tool,
+                &home.join(dir),
+                false,
+                false,
+                true,
+                &mut vec![],
+            )
+            .unwrap();
+        }
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn concurrent_scoped_installs_preserve_the_shared_manifest_and_user_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_owned();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let user_hook = serde_json::json!({"type":"command","command":"user-command"});
+        std::fs::write(
+            home.join(".codex/hooks.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"keep":true,"hooks":{"Stop":[{"hooks":[user_hook.clone()]}]}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut threads = vec![];
+        for _ in 0..2 {
+            for (tool, dir) in TOOL_SKILL_DIRS {
+                let home = home.clone();
+                let barrier = barrier.clone();
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    install_provider(
+                        &home,
+                        tool,
+                        &home.join(dir),
+                        false,
+                        false,
+                        false,
+                        &mut vec![],
+                    )
+                    .unwrap();
+                }));
+            }
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let manifest = load_manifest(&home);
+        for asset in user_asset_inventory(false) {
+            assert_eq!(
+                manifest.get(&asset.rel),
+                Some(&content_hash(&asset.expected))
+            );
+        }
+        let hooks: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join(".codex/hooks.json")).unwrap())
+                .unwrap();
+        assert_eq!(hooks["keep"], true);
+        assert!(
+            hooks["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap())
+                .any(|h| h == &user_hook)
+        );
+        assert_eq!(clank_hook_entries(&hooks, "Stop").len(), 1);
+    }
+
+    #[test]
+    fn scoped_non_force_setup_preserves_drift_and_malformed_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let root = home.join(".codex");
+        install_provider(home, Tool::Codex, &root, false, false, false, &mut vec![]).unwrap();
+        let skill = root.join("skills/clank-master/SKILL.md");
+        std::fs::write(&skill, "my local changes").unwrap();
+        assert!(
+            install_provider(home, Tool::Codex, &root, false, false, false, &mut vec![]).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), "my local changes");
+        std::fs::remove_file(skill).unwrap();
+        let hooks = root.join("hooks.json");
+        std::fs::write(&hooks, "not JSON").unwrap();
+        assert!(
+            install_provider(home, Tool::Codex, &root, false, false, false, &mut vec![]).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(hooks).unwrap(), "not JSON");
+    }
+
+    #[test]
+    fn scoped_install_preserves_symlinked_settings_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let root = home.join(".codex");
+        std::fs::create_dir(&root).unwrap();
+        let target = home.join("shared-hooks.json");
+        std::fs::write(&target, r#"{"keep":true}"#).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let hooks = root.join("hooks.json");
+        std::os::unix::fs::symlink(&target, &hooks).unwrap();
+        install_provider(home, Tool::Codex, &root, false, false, false, &mut vec![]).unwrap();
+        assert!(
+            std::fs::symlink_metadata(hooks)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+        assert_eq!(value["keep"], true);
+        assert_eq!(clank_hook_entries(&value, "Stop").len(), 1);
+    }
+
+    #[test]
     fn a_ci_watch_can_be_configured_from_the_docs_alone() {
         // The kinds, the scope, and the one filter that does not
         // apply to a conclusion — in the agent's own instructions.
@@ -1363,7 +2203,7 @@ mod tests {
     #[test]
     fn grok_skill_teaches_the_native_guarded_handoff() {
         let mg = compose_skill(Role::Master, Tool::Grok);
-        assert!(mg.contains("clank grok-wait"));
+        assert!(mg.contains("clank wait"));
         assert!(mg.contains("block_until_ms: 0"));
         assert!(mg.contains("clank auto off"));
         assert!(!mg.contains("Nothing reminds you"));

@@ -18,6 +18,9 @@
 //        crates/cli/src/cli/setup_assets/opencode_plugin.js
 
 import { pathToFileURL } from "node:url"
+import { mkdtemp, copyFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const assert = (cond, msg) => {
   if (!cond) {
@@ -89,6 +92,25 @@ const client = {
 }
 
 const hooks = await ClankPlugin({ client, $, directory: "/fake/repo" })
+// Two actual filesystem modules model additive global/custom loading. A second
+// invocation for the same client exports no hooks and must not bootstrap a wait.
+const duplicateDir = await mkdtemp(join(tmpdir(), "clank-opencode-"))
+const oldBootstrap = process.env.CLANK_BOOTSTRAP_SESSION_ID
+try {
+  const duplicateFile = join(duplicateDir, "clank.mjs")
+  await copyFile(pluginPath, duplicateFile)
+  const { ClankPlugin: otherCopy } = await import(pathToFileURL(duplicateFile))
+  const before = arms
+  process.env.CLANK_BOOTSTRAP_SESSION_ID = "ses_duplicate_bootstrap"
+  const duplicate = await otherCopy({ client, $, directory: "/fake/repo" })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert(Object.keys(duplicate).length === 0, "second plugin module must not install hooks")
+  assert(arms === before, "second plugin module must not bootstrap another wait")
+} finally {
+  if (oldBootstrap === undefined) delete process.env.CLANK_BOOTSTRAP_SESSION_ID
+  else process.env.CLANK_BOOTSTRAP_SESSION_ID = oldBootstrap
+  await rm(duplicateDir, { recursive: true })
+}
 const fire = (type, sessionID) => hooks.event({ event: { type, properties: { sessionID } } })
 const settle = () => new Promise((r) => setTimeout(r, 0))
 

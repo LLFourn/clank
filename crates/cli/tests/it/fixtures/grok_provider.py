@@ -95,6 +95,9 @@ def hook(event, turn="0", **values):
               "PostToolUse": "post_tool_use", "SessionEnd": "session_end"}[event]
     payload = dict(hookEventName=native, sessionId=sid, cwd=cwd, promptId=turn,
                    reason="end_turn", **values)
+    # Official native tool-call dispatch has no promptId; only Stop carries it.
+    if event in ("PreToolUse", "PostToolUse"):
+        payload.pop("promptId")
     env = dict(os.environ, GROK_HOOK_EVENT=native)
     entry = [entry for group in hooks[event] for entry in group["hooks"]
              if entry["command"] == "clank stop-hook --tool grok"]
@@ -116,13 +119,13 @@ try:
     for cycle in range(total):
         turn = str(cycle)
         tool = dict(toolName="run_terminal_command", toolUseId="call-" + turn,
-                    toolInput={"command": "clank grok-wait", "block_until_ms": 0})
+                    toolInput={"command": "clank wait", "block_until_ms": 0})
         offered = hook("PreToolUse", turn, **tool)
         rewritten = offered["hookSpecificOutput"]["updatedInput"]
         tool["toolInput"] = rewritten
         duplicate = hook("PreToolUse", turn, toolName=tool["toolName"],
                          toolUseId="duplicate-" + turn,
-                         toolInput={"command": "clank grok-wait", "block_until_ms": 0})
+                         toolInput={"command": "clank wait", "block_until_ms": 0})
         assert duplicate.get("decision") == "deny", duplicate
         command = shlex.split(rewritten["command"])
         assert command.pop(0) == "exec"
