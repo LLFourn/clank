@@ -119,24 +119,35 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     // where the waiting begins.
     let started = std::time::Instant::now();
     let tool: Tool = args.tool.into();
+    let mut capture = ReceiptCapture::default();
     let outcome = match read_hook_stdin() {
-        Ok(input) => stop_input(&args, input, started, &Process).await,
+        Ok(input) => stop_input_capturing(&args, input, started, &Process, &mut capture).await,
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
-    emit_and_exit(outcome, tool);
+    emit_and_exit(outcome, tool, capture).await;
 }
 
 /// The decoded Stop turn, shared by the installed hook and tests.
-async fn stop_input(
+async fn stop_input_capturing(
     args: &StopHookArgs,
     input: HookInput,
     started: std::time::Instant,
     env: &dyn Ambient,
+    capture: &mut ReceiptCapture,
 ) -> HookOutcome {
     let tool: Tool = args.tool.into();
     let async_loop =
         tool == Tool::Claude && args.loop_mode == Some(crate::cli::LoopModeArg::Asyncrewake);
-    compute_outcome_with(tool, args.repo.as_deref(), input, async_loop, started, env).await
+    compute_outcome_capturing(
+        tool,
+        args.repo.as_deref(),
+        input,
+        async_loop,
+        started,
+        env,
+        capture,
+    )
+    .await
 }
 
 /// Test-facing wrapper: production routes through
@@ -176,6 +187,7 @@ async fn compute_outcome_in(
     .await
 }
 
+#[cfg(test)]
 async fn compute_outcome_with(
     tool: Tool,
     repo_override: Option<&Path>,
@@ -183,6 +195,27 @@ async fn compute_outcome_with(
     async_loop: bool,
     started: std::time::Instant,
     env: &dyn Ambient,
+) -> HookOutcome {
+    compute_outcome_capturing(
+        tool,
+        repo_override,
+        input,
+        async_loop,
+        started,
+        env,
+        &mut ReceiptCapture::default(),
+    )
+    .await
+}
+
+async fn compute_outcome_capturing(
+    tool: Tool,
+    repo_override: Option<&Path>,
+    input: HookInput,
+    async_loop: bool,
+    started: std::time::Instant,
+    env: &dyn Ambient,
+    capture: &mut ReceiptCapture,
 ) -> HookOutcome {
     let live_ids = input.live_task_ids();
 
@@ -299,6 +332,15 @@ async fn compute_outcome_with(
                     deadline_action(tool),
                     input.session_id.as_str(),
                     tool,
+                    |items| {
+                        *capture = ReceiptCapture::selected(
+                            &repo,
+                            &label,
+                            tool,
+                            input.session_id.as_str(),
+                            items,
+                        );
+                    },
                 )
                 .await
             }
@@ -699,7 +741,11 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     let Ok(input) = serde_json::from_str::<SessionStartInput>(&raw) else {
         return Ok(());
     };
-    let Ok(repo) = crate::cli::resolve_repo(Some(Path::new(&input.cwd))) else {
+    // Match Stop's explicit repository override while preserving the
+    // session's execution cwd for its peek/callback subprocesses.
+    let Ok(repo) =
+        crate::cli::resolve_repo(Some(args.repo.as_deref().unwrap_or(Path::new(&input.cwd))))
+    else {
         return Ok(());
     };
     let tool: Tool = args.tool.into();
@@ -735,11 +781,42 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     if !crate::agent_store::binding_matches(&repo, &label, binding_tool, &input.session_id) {
         return Ok(());
     }
-    println!(
-        "{}",
-        session_start_payload(&render_wait_items(&items, &label, role))
-    );
+    let prepared = super::wake_receipt::prepare(&repo, &label, receipt_candidates(&items));
+    let payload = session_start_payload(&render_wait_items(&items, &label, role));
+    let binding = ReceiptBinding {
+        repo,
+        author: label,
+        tool: binding_tool,
+        session: input.session_id,
+    };
+    emit_session_delivery(&payload, binding, prepared, &mut std::io::stdout()).await;
     Ok(())
+}
+
+async fn emit_session_delivery(
+    payload: &serde_json::Value,
+    binding: ReceiptBinding,
+    prepared: super::wake_receipt::Prepared,
+    stdout: &mut impl std::io::Write,
+) {
+    if !binding.current() {
+        return;
+    }
+    let emitted = (|| -> std::io::Result<()> {
+        serde_json::to_writer(&mut *stdout, payload)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()
+    })();
+    if emitted.is_ok() && binding.tool == Tool::Claude {
+        super::wake_receipt::dispatch(
+            &binding.repo,
+            &binding.author,
+            prepared,
+            Tool::Claude,
+            || binding.current(),
+        )
+        .await;
+    }
 }
 
 /// The SessionStart hook-output wire (claude-asyncrewake-work-loop):
@@ -957,6 +1034,7 @@ async fn compute_wait_outcome(
     on_deadline: DeadlineAction,
     session: &str,
     tool: Tool,
+    capture: impl FnMut(&[WaitItem]),
 ) -> HookOutcome {
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
@@ -966,12 +1044,13 @@ async fn compute_wait_outcome(
         let mut cmd = wait_command(&exe, repo, label, session, tool);
         Ok(OwnedWait::spawn(&mut cmd)?.run())
     };
-    wait_then_present(
+    wait_then_present_capturing(
         await_wait_under_deadline(deadline, on_deadline, arm),
         label,
         live_ids,
         || crate::agent_store::binding_matches(repo, label, tool, session),
         || crate::agent_store::resolve_role(repo, label).map_err(|e| format!("{e:#}")),
+        capture,
     )
     .await
 }
@@ -979,12 +1058,31 @@ async fn compute_wait_outcome(
 /// Finish the wait before inspecting presentation state. The closures retain
 /// identity, not snapshots: a stale binding suppresses the reply, and the
 /// decoder reads the current role only for actionable work.
+#[cfg(test)]
 async fn wait_then_present(
     waiting: impl std::future::Future<Output = Result<std::process::Output, HookOutcome>>,
     label: &AgentLabel,
     live_ids: &[String],
     binding_matches: impl FnOnce() -> bool,
     resolve_role: impl FnOnce() -> Result<Role, String>,
+) -> HookOutcome {
+    wait_then_present_capturing(
+        waiting,
+        label,
+        live_ids,
+        binding_matches,
+        resolve_role,
+        |_| {},
+    )
+    .await
+}
+async fn wait_then_present_capturing(
+    waiting: impl std::future::Future<Output = Result<std::process::Output, HookOutcome>>,
+    label: &AgentLabel,
+    live_ids: &[String],
+    binding_matches: impl FnOnce() -> bool,
+    resolve_role: impl FnOnce() -> Result<Role, String>,
+    capture: impl FnMut(&[WaitItem]),
 ) -> HookOutcome {
     let result = waiting.await;
     if !binding_matches() {
@@ -993,7 +1091,9 @@ async fn wait_then_present(
         };
     }
     match result {
-        Ok(output) => outcome_from_wait_output(&output, label, resolve_role, live_ids),
+        Ok(output) => {
+            outcome_from_wait_output_capturing(&output, label, resolve_role, live_ids, capture)
+        }
         Err(outcome) => outcome,
     }
 }
@@ -1827,11 +1927,21 @@ fn record_attended(agent_dir: &Path, rec: &Attending) {
 ///
 /// A superseded wait carries a distinct control envelope even though
 /// its process exits nonzero. Other nonzero exits are diagnostics.
+#[cfg(test)]
 fn outcome_from_wait_output(
     output: &std::process::Output,
     label: &AgentLabel,
     resolve_role: impl FnOnce() -> Result<Role, String>,
     live_ids: &[String],
+) -> HookOutcome {
+    outcome_from_wait_output_capturing(output, label, resolve_role, live_ids, |_| {})
+}
+fn outcome_from_wait_output_capturing(
+    output: &std::process::Output,
+    label: &AgentLabel,
+    resolve_role: impl FnOnce() -> Result<Role, String>,
+    live_ids: &[String],
+    mut capture: impl FnMut(&[WaitItem]),
 ) -> HookOutcome {
     if matches!(parse_wait_reply(&output.stdout), Ok(WaitReply::Superseded)) {
         return HookOutcome::Silent {
@@ -1880,6 +1990,7 @@ fn outcome_from_wait_output(
                         live_ids.join(", "),
                     ));
                 }
+                capture(&items);
                 HookOutcome::Continue { reason }
             }
             Err(e) => HookOutcome::Diagnostic {
@@ -2092,6 +2203,8 @@ impl TurnDecision {
 struct WaitEnvelope {
     items: Vec<WaitItem>,
     #[serde(default)]
+    source_cwd: Option<PathBuf>,
+    #[serde(default)]
     superseded: bool,
 }
 
@@ -2160,6 +2273,8 @@ impl<'de, T: FromTag> serde::Deserialize<'de> for Tag<T> {
 
 #[derive(serde::Deserialize)]
 pub(crate) struct WaitItem {
+    #[serde(skip)]
+    source_cwd: Option<std::sync::Arc<PathBuf>>,
     pub(crate) kind: Option<Tag<clank_core::wait::WaitKind>>,
     pub(crate) plan: Option<String>,
     pub(crate) sha: Option<String>,
@@ -2168,6 +2283,7 @@ pub(crate) struct WaitItem {
     pub(crate) reason: Option<Tag<clank_core::vocab::WaitingReason>>,
     prompt: Option<String>,
     name: Option<String>,
+    id: Option<String>,
     priority: Option<u64>,
     agent: Option<String>,
     answer: Option<String>,
@@ -2239,7 +2355,7 @@ fn parse_wait_json(raw: &[u8]) -> Result<Vec<WaitItem>, String> {
 }
 
 fn parse_wait_reply(raw: &[u8]) -> Result<WaitReply, String> {
-    let envelope: WaitEnvelope =
+    let mut envelope: WaitEnvelope =
         serde_json::from_slice(raw).map_err(|e| format!("not valid JSON: {e}"))?;
     if envelope.superseded {
         if !envelope.items.is_empty() {
@@ -2247,6 +2363,14 @@ fn parse_wait_reply(raw: &[u8]) -> Result<WaitReply, String> {
         }
         Ok(WaitReply::Superseded)
     } else {
+        if let Some(cwd) = envelope.source_cwd {
+            let cwd = std::sync::Arc::new(cwd);
+            for item in &mut envelope.items {
+                if item.wake_kind() == Some(clank_core::wait::WaitKind::CommandEvent) {
+                    item.source_cwd = Some(cwd.clone());
+                }
+            }
+        }
         Ok(WaitReply::Items(envelope.items))
     }
 }
@@ -2640,56 +2764,166 @@ fn short_sha(s: &str) -> &str {
     &s[..s.len().min(12)]
 }
 
+#[derive(Default)]
+struct ReceiptCapture {
+    binding: Option<ReceiptBinding>,
+    prepared: super::wake_receipt::Prepared,
+}
+impl ReceiptCapture {
+    fn selected(
+        repo: &Path,
+        author: &AgentLabel,
+        tool: Tool,
+        session: &str,
+        items: &[WaitItem],
+    ) -> Self {
+        Self {
+            binding: Some(ReceiptBinding {
+                repo: repo.into(),
+                author: author.clone(),
+                tool,
+                session: session.into(),
+            }),
+            prepared: super::wake_receipt::prepare(repo, author, receipt_candidates(items)),
+        }
+    }
+}
+struct ReceiptBinding {
+    repo: PathBuf,
+    author: AgentLabel,
+    tool: Tool,
+    session: String,
+}
+impl ReceiptBinding {
+    fn current(&self) -> bool {
+        crate::agent_store::binding_matches(&self.repo, &self.author, self.tool, &self.session)
+    }
+}
+fn receipt_candidates(
+    items: &[WaitItem],
+) -> impl Iterator<Item = super::wake_receipt::Candidate<'_>> {
+    items.iter().filter_map(|item| {
+        if item.wake_kind() != Some(clank_core::wait::WaitKind::CommandEvent)
+            || item.failure == Some(true)
+        {
+            return None;
+        }
+        Some(super::wake_receipt::Candidate {
+            source: item.name.as_deref()?,
+            id: item.id.as_deref()?,
+            selector: item.selector.as_deref()?,
+            cwd: item.source_cwd.as_deref().map(|cwd| cwd.as_path()),
+        })
+    })
+}
+
+/// Writes and flushes the established wire. `presented` is true only for a
+/// successful continuation; diagnostics and plugin control cannot earn receipts.
+fn emit_wire(
+    outcome: &HookOutcome,
+    tool: Tool,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) -> std::io::Result<(i32, bool)> {
+    use std::io::Write;
+    let (stream, text, code, presented): (&mut dyn Write, std::borrow::Cow<'_, str>, i32, bool) =
+        match (outcome, tool) {
+            (HookOutcome::RenewWait, Tool::OpenCode) => {
+                (stdout, OPENCODE_RENEW_WAIT_WIRE.into(), HOOK_OK_EXIT, false)
+            }
+            (HookOutcome::RenewWait, _) => (
+                stderr,
+                "hook: renew-wait action reached an unsupported adapter".into(),
+                HOOK_OK_EXIT,
+                false,
+            ),
+            (HookOutcome::Continue { reason }, Tool::Claude) => (
+                stderr,
+                reason.as_str().into(),
+                CLAUDE_CONTINUATION_EXIT,
+                true,
+            ),
+            (HookOutcome::Continue { reason }, Tool::Codex) => (
+                stdout,
+                serde_json::to_string(&CodexBlockDecision::from_reason(reason))?.into(),
+                HOOK_OK_EXIT,
+                true,
+            ),
+            (HookOutcome::Continue { reason }, Tool::OpenCode) => {
+                (stdout, reason.as_str().into(), HOOK_OK_EXIT, true)
+            }
+            (HookOutcome::Continue { reason }, Tool::Grok) => {
+                (stderr, reason.as_str().into(), HOOK_OK_EXIT, false)
+            }
+            (HookOutcome::Silent { .. }, _) => return Ok((HOOK_OK_EXIT, false)),
+            (HookOutcome::Diagnostic { message }, _) => {
+                (stderr, message.as_str().into(), HOOK_OK_EXIT, false)
+            }
+        };
+    stream.write_all(text.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok((code, presented))
+}
+
 /// Render the outcome to the per-tool wire shape and exit.
 /// This is the ONLY place in the binary that calls
 /// `process::exit` directly — main()'s normal flow can't be
 /// trusted to pick the right code for the hook protocol.
-fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
-    match (outcome, tool) {
-        (HookOutcome::RenewWait, Tool::OpenCode) => {
-            println!("{OPENCODE_RENEW_WAIT_WIRE}");
-            std::process::exit(HOOK_OK_EXIT);
-        }
-        (HookOutcome::RenewWait, _) => {
-            eprintln!("hook: renew-wait action reached an unsupported adapter");
-            std::process::exit(HOOK_OK_EXIT);
-        }
-        (HookOutcome::Continue { reason }, Tool::Claude) => {
-            eprintln!("{reason}");
-            std::process::exit(CLAUDE_CONTINUATION_EXIT);
-        }
-        (HookOutcome::Continue { reason }, Tool::Codex) => {
-            let decision = CodexBlockDecision::from_reason(&reason);
-            // serde_json::to_string can't fail for this typed
-            // shape, but if it did somehow we'd exit silently
-            // rather than fail the agent.
-            match serde_json::to_string(&decision) {
-                Ok(json) => println!("{json}"),
-                Err(_) => {}
-            }
-            std::process::exit(HOOK_OK_EXIT);
-        }
-        // Native Grok payloads are handled before this generic adapter.
-        // This legacy hook-owned route cannot produce a native continuation.
-        (HookOutcome::Continue { reason }, Tool::Grok) => {
-            eprintln!("{reason}");
-            std::process::exit(HOOK_OK_EXIT);
-        }
-        // opencode wire (settled by the M1 spike): plain text on
-        // stdout = a continuation for the plugin to inject; EMPTY
-        // stdout (the Silent arm) = stay quiescent. Exit 0 either way.
-        (HookOutcome::Continue { reason }, Tool::OpenCode) => {
-            println!("{reason}");
-            std::process::exit(HOOK_OK_EXIT);
-        }
-        (HookOutcome::Silent { .. }, _) => {
-            std::process::exit(HOOK_OK_EXIT);
-        }
-        (HookOutcome::Diagnostic { message }, _) => {
-            eprintln!("{message}");
-            std::process::exit(HOOK_OK_EXIT);
-        }
+async fn emit_and_exit(outcome: HookOutcome, tool: Tool, capture: ReceiptCapture) -> ! {
+    let code = emit_delivery(
+        outcome,
+        tool,
+        capture,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+    .await;
+    std::process::exit(code)
+}
+async fn emit_delivery(
+    mut outcome: HookOutcome,
+    tool: Tool,
+    capture: ReceiptCapture,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) -> i32 {
+    if capture
+        .binding
+        .as_ref()
+        .is_some_and(|binding| !binding.current())
+    {
+        outcome = HookOutcome::Silent {
+            why: SilentReason::StaleBinding,
+        };
     }
+    let emission = emit_wire(&outcome, tool, stdout, stderr);
+    let fallback_code = if matches!(outcome, HookOutcome::Continue { .. }) && tool == Tool::Claude {
+        CLAUDE_CONTINUATION_EXIT
+    } else {
+        HOOK_OK_EXIT
+    };
+    let code = match emission {
+        Ok((code, presented)) => {
+            if presented {
+                if let Some(binding) = capture.binding {
+                    if binding.current() {
+                        super::wake_receipt::dispatch(
+                            &binding.repo,
+                            &binding.author,
+                            capture.prepared,
+                            tool,
+                            || binding.current(),
+                        )
+                        .await;
+                    }
+                }
+            }
+            code
+        }
+        Err(_) => fallback_code, // Fail-soft, but no receipt after any output failure.
+    };
+    code
 }
 
 /// Plugin-only control wire. It is intercepted before OpenCode's
@@ -2699,6 +2933,275 @@ const OPENCODE_RENEW_WAIT_WIRE: &str = r#"{"clank":"renew_wait"}"#;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReceiptWriter {
+        bytes: Vec<u8>,
+        marker: PathBuf,
+        fail_after: Option<usize>,
+        fail_flush: bool,
+    }
+    impl ReceiptWriter {
+        fn new(marker: PathBuf) -> Self {
+            Self {
+                bytes: Vec::new(),
+                marker,
+                fail_after: None,
+                fail_flush: false,
+            }
+        }
+    }
+    impl std::io::Write for ReceiptWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let limit = self.fail_after.unwrap_or(usize::MAX);
+            if self.bytes.len() >= limit {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let take = bytes.len().min(limit - self.bytes.len());
+            self.bytes.extend_from_slice(&bytes[..take]);
+            Ok(take)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            std::fs::write(&self.marker, &self.bytes)
+        }
+    }
+    fn receipt_binding(
+        fixture: &super::super::wake_receipt::fixtures::Fixture,
+        tool: Tool,
+    ) -> ReceiptBinding {
+        crate::agent_store::bind_session_to_agent(
+            &fixture.repo,
+            &fixture.author,
+            tool,
+            &clank_core::SessionId::parse(&fixture.session).unwrap(),
+        )
+        .unwrap();
+        ReceiptBinding {
+            repo: fixture.repo.clone(),
+            author: fixture.author.clone(),
+            tool,
+            session: fixture.session.clone(),
+        }
+    }
+    fn receipt_outcome(
+        fixture: &super::super::wake_receipt::fixtures::Fixture,
+        tool: Tool,
+    ) -> (HookOutcome, ReceiptCapture) {
+        use std::os::unix::process::ExitStatusExt;
+        receipt_binding(fixture, tool);
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0), stderr: Vec::new(),
+            stdout: serde_json::to_vec(&serde_json::json!({"items":[super::super::wait::render_json(&fixture.item)], "source_cwd": fixture.cwd})).unwrap(),
+        };
+        let mut capture = ReceiptCapture::default();
+        let outcome = outcome_from_wait_output_capturing(
+            &output,
+            &fixture.author,
+            || Ok(Role::Master),
+            &[],
+            |items| {
+                capture = ReceiptCapture::selected(
+                    &fixture.repo,
+                    &fixture.author,
+                    tool,
+                    &fixture.session,
+                    items,
+                );
+            },
+        );
+        (outcome, capture)
+    }
+
+    #[tokio::test]
+    async fn receipt_follows_successful_wake_flush_on_each_adapter_and_leaves_work_owed() {
+        for tool in [Tool::Codex, Tool::Claude, Tool::OpenCode] {
+            let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+            let (outcome, capture) = receipt_outcome(&fixture, tool);
+            let mut stdout = ReceiptWriter::new(fixture.marker());
+            let mut stderr = ReceiptWriter::new(fixture.marker());
+            let expected_reason = if let HookOutcome::Continue { reason } = &outcome {
+                reason.clone()
+            } else {
+                panic!("expected continuation")
+            };
+            let code = emit_delivery(outcome, tool, capture, &mut stdout, &mut stderr).await;
+            assert!(
+                fixture.output.exists(),
+                "callback must observe completed flush for {tool:?}"
+            );
+            assert!(!fixture.rows()[0].acked);
+            assert!(fixture.rows()[0].reply.is_none());
+            match tool {
+                Tool::Claude => {
+                    assert_eq!(code, CLAUDE_CONTINUATION_EXIT);
+                    assert!(stdout.bytes.is_empty());
+                    assert_eq!(stderr.bytes, format!("{expected_reason}\n").as_bytes());
+                }
+                Tool::Codex => {
+                    assert_eq!(code, HOOK_OK_EXIT);
+                    assert!(stderr.bytes.is_empty());
+                    let value: serde_json::Value = serde_json::from_slice(&stdout.bytes).unwrap();
+                    assert_eq!(value["reason"], expected_reason);
+                }
+                Tool::OpenCode => {
+                    assert_eq!(code, HOOK_OK_EXIT);
+                    assert!(stderr.bytes.is_empty());
+                    assert_eq!(stdout.bytes, format!("{expected_reason}\n").as_bytes());
+                }
+                _ => unreachable!(),
+            }
+            assert!(!String::from_utf8_lossy(&stdout.bytes).contains("callback stdout"));
+            assert!(!String::from_utf8_lossy(&stderr.bytes).contains("callback stderr"));
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_failure_preserves_claude_prompt_and_only_replaces_bounded_diagnostics() {
+        let mut fixture = super::super::wake_receipt::fixtures::Fixture::new();
+        fixture.update_source(|source| {
+            source.receipt_command = Some(vec![
+                "/usr/bin/python3".into(),
+                "-c".into(),
+                "import sys; sys.stderr.write('x'*100000); sys.exit(7)".into(),
+            ])
+        });
+        let (outcome, capture) = receipt_outcome(&fixture, Tool::Claude);
+        let reason = if let HookOutcome::Continue { reason } = &outcome {
+            reason.clone()
+        } else {
+            unreachable!()
+        };
+        let mut stdout = ReceiptWriter::new(fixture.marker());
+        let mut stderr = ReceiptWriter::new(fixture.marker());
+        let code = emit_delivery(outcome, Tool::Claude, capture, &mut stdout, &mut stderr).await;
+        assert_eq!(code, CLAUDE_CONTINUATION_EXIT);
+        assert_eq!(stderr.bytes, format!("{reason}\n").as_bytes());
+        assert!(stdout.bytes.is_empty());
+        let diagnostic = std::fs::read(super::super::wake_receipt::diagnostic_path(
+            &fixture.repo,
+            &fixture.author,
+        ))
+        .unwrap();
+        assert!(diagnostic.len() <= super::super::wake_receipt::DIAGNOSTIC_BYTES);
+        assert!(String::from_utf8(diagnostic).unwrap().contains("exited"));
+        assert!(!fixture.rows()[0].acked);
+        assert!(fixture.rows()[0].reply.is_none());
+    }
+
+    #[tokio::test]
+    async fn receipt_never_follows_partial_output_or_failed_flush() {
+        for tool in [Tool::Codex, Tool::Claude, Tool::OpenCode] {
+            for partial in [true, false] {
+                let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+                let (outcome, capture) = receipt_outcome(&fixture, tool);
+                let mut stdout = ReceiptWriter::new(fixture.marker());
+                let mut stderr = ReceiptWriter::new(fixture.marker());
+                let writer = if tool == Tool::Claude {
+                    &mut stderr
+                } else {
+                    &mut stdout
+                };
+                if partial {
+                    writer.fail_after = Some(5);
+                } else {
+                    writer.fail_flush = true;
+                }
+                let code = emit_delivery(outcome, tool, capture, &mut stdout, &mut stderr).await;
+                assert_eq!(
+                    code,
+                    if tool == Tool::Claude {
+                        CLAUDE_CONTINUATION_EXIT
+                    } else {
+                        HOOK_OK_EXIT
+                    }
+                );
+                assert!(!fixture.output.exists());
+                assert!(!fixture.marker().exists());
+                assert!(!fixture.rows()[0].acked);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nonpresentations_and_replaced_binding_never_dispatch_receipts() {
+        for outcome in [
+            HookOutcome::Silent {
+                why: SilentReason::StaleBinding,
+            },
+            HookOutcome::Diagnostic {
+                message: "diagnostic".into(),
+            },
+            HookOutcome::RenewWait,
+        ] {
+            let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+            let (_, capture) = receipt_outcome(&fixture, Tool::OpenCode);
+            emit_delivery(
+                outcome,
+                Tool::OpenCode,
+                capture,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .await;
+            assert!(!fixture.output.exists());
+        }
+        let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+        let (outcome, capture) = receipt_outcome(&fixture, Tool::Codex);
+        crate::agent_store::bind_session_to_agent(
+            &fixture.repo,
+            &fixture.author,
+            Tool::Codex,
+            &clank_core::SessionId::parse("replacement-session-b2").unwrap(),
+        )
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        emit_delivery(outcome, Tool::Codex, capture, &mut stdout, &mut stderr).await;
+        assert!(stdout.is_empty() && stderr.is_empty());
+        assert!(!fixture.output.exists());
+    }
+
+    #[tokio::test]
+    async fn session_start_receipt_follows_actual_additional_context_flush() {
+        for failure in [false, true] {
+            let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+            let binding = receipt_binding(&fixture, Tool::Claude);
+            let mut writer = ReceiptWriter::new(fixture.marker());
+            writer.fail_flush = failure;
+            let payload = session_start_payload("voice work");
+            emit_session_delivery(&payload, binding, fixture.prepared(), &mut writer).await;
+            assert_eq!(fixture.output.exists(), !failure);
+            let value: serde_json::Value = serde_json::from_slice(&writer.bytes).unwrap();
+            assert_eq!(value, payload);
+            assert!(!fixture.rows()[0].acked);
+        }
+    }
+
+    #[test]
+    fn receipt_candidates_require_selected_known_real_command_identity_and_context() {
+        let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+        let real = serde_json::to_value(super::super::wait::render_json(&fixture.item)).unwrap();
+        for variant in ["failure", "unknown", "missing-selector", "missing-id"] {
+            let mut item = real.clone();
+            let mut envelope = serde_json::json!({"source_cwd": fixture.cwd});
+            match variant {
+                "failure" => item["failure"] = true.into(),
+                "unknown" => item["kind"] = "future_command".into(),
+                "missing-selector" => {
+                    item.as_object_mut().unwrap().remove("selector");
+                }
+                "missing-id" => {
+                    item.as_object_mut().unwrap().remove("id");
+                }
+                _ => unreachable!(),
+            }
+            envelope["items"] = serde_json::json!([item]);
+            let items = parse_wait_json(&serde_json::to_vec(&envelope).unwrap()).unwrap();
+            assert_eq!(receipt_candidates(&items).count(), 0, "{variant}");
+        }
+    }
 
     /// The environment a test brings: nothing. Identity resolution
     /// must see the fixture's own setup and not the shell that

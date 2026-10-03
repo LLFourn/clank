@@ -2,7 +2,6 @@
 //! the callback, and the event WAL owns recovery of its immutable intent.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -200,190 +199,36 @@ fn copies_of(
     Ok(copies)
 }
 
-/// One owned process group. Stdin, stderr and exit run together; neither a
-/// blocked reader nor a chatty diagnostic stream can monopolize the caller.
+/// A reply keeps its existing immutable route and five-second budget; the
+/// common executor knows nothing about replies or event acknowledgement.
 async fn deliver_reply(
     reply: &EventReply,
     budget: Duration,
     owner_path: &Path,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let deadline = tokio::time::Instant::now() + budget;
-    let cleanup = budget.min(Duration::from_secs(1)) / 5;
-    let call_deadline = deadline - cleanup;
-    recover_owner(owner_path, call_deadline).await?;
-    if tokio::time::Instant::now() >= call_deadline {
-        anyhow::bail!("reply_command recovery exhausted its invocation budget; retry explicitly");
-    }
-    let mut command = tokio::process::Command::new(&reply.route.command[0]);
-    command
-        .args(&reply.route.command[1..])
-        .current_dir(&reply.route.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    match &reply.route.state_dir {
-        Some(dir) => {
-            command.env("CLANK_SOURCE_STATE_DIR", dir);
-        }
-        None => {
-            command.env_remove("CLANK_SOURCE_STATE_DIR");
-        }
-    }
+    let call_deadline = deadline - budget.min(Duration::from_secs(1)) / 5;
     let encoded = serde_json::to_vec(&serde_json::json!({
         "version": 1, "id": reply.id, "reply": reply.text,
         "author": reply.author, "idempotency_key": reply.idempotency_key,
     }))?;
-    let mut child = command.spawn().context("cannot start reply_command")?;
-    let mut group = crate::cli::wait::GroupKill::over(child.id());
-    let pgid = group.0;
-    let result = tokio::time::timeout_at(call_deadline, async {
-        // No answer bytes reach a child that cannot be recognised after our
-        // caller is SIGKILLed. ProcToken uses kernel birth identity, not ps.
-        let pid = child
-            .id()
-            .context("reply_command exited before it could be owned")?;
-        let token = crate::proc_identity::token_for(pid as i32)
-            .context("cannot capture reply_command process identity")?;
-        save_owner(
-            owner_path,
-            &ReplyOwner {
-                pgid: pid as i32,
-                token,
-            },
-        )?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        let write = async move {
-            stdin.write_all(&encoded).await?;
-            drop(stdin); // EOF is part of the protocol; shutdown alone need not close a pipe.
-            std::io::Result::Ok(())
-        };
-        let read = async {
-            let mut tail = crate::cli::wait::RingTail::new(4096);
-            let mut bytes = [0u8; 4096];
-            loop {
-                let got = stderr.read(&mut bytes).await?;
-                if got == 0 {
-                    break;
-                }
-                tail.push(&bytes[..got]);
-            }
-            std::io::Result::Ok(tail.into_string())
-        };
-        let (write, tail, status) = tokio::join!(write, read, child.wait());
-        write?;
-        let tail = tail?;
-        let status = status?;
-        if !status.success() {
-            anyhow::bail!(
-                "reply_command exited {status}: {}",
-                super::sanitize_multiline(&tail).trim()
-            );
-        }
-        Ok(())
-    })
-    .await;
-    // End descendants even if their parent exited zero. Reserve time for the
-    // reap inside the same absolute deadline, with no orphaned detached task.
-    group.terminate();
-    let _ = child.start_kill();
-    let reaped = tokio::time::timeout_at(deadline, child.wait()).await;
-    if !matches!(reaped, Ok(Ok(_))) {
-        anyhow::bail!("reply_command cleanup exceeded its deadline; acceptance is uncertain");
-    }
-    if let Some(pgid) = pgid {
-        wait_for_group_exit(pgid, deadline).await?;
-    }
-    remove_owner(owner_path)?;
-    match result {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!(
-            "reply_command did not complete within its {}ms invocation budget",
-            budget.as_millis()
-        ),
-    }
+    crate::cli::owned_callback::deliver(
+        crate::cli::owned_callback::Request {
+            argv: &reply.route.command,
+            cwd: &reply.route.cwd,
+            state_dir: &reply.route.state_dir,
+            stdin: &encoded,
+        },
+        call_deadline,
+        deadline,
+        owner_path,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("reply_command delivery failed: {error:#}"))
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ReplyOwner {
-    pgid: i32,
-    token: crate::proc_identity::ProcToken,
-}
-
-fn save_owner(path: &Path, owner: &ReplyOwner) -> anyhow::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec(owner)?)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    std::fs::File::open(path.parent().context("missing reply owner directory")?)?.sync_all()?;
-    Ok(())
-}
-
-fn read_owner(path: &Path) -> anyhow::Result<Option<ReplyOwner>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "{} is not a usable reply owner record; no callback started",
-                path.display()
-            )
-        })?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn remove_owner(path: &Path) -> anyhow::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Recovery runs only inside a new explicit submission holding the dispatch
-/// lease. A missing leader over an occupied group cannot be safely identified.
-async fn recover_owner(path: &Path, deadline: tokio::time::Instant) -> anyhow::Result<()> {
-    let Some(owner) = read_owner(path)? else {
-        return Ok(());
-    };
-    let pgid = crate::signal::Pgid::new(owner.pgid).context("invalid saved reply process group")?;
-    if crate::signal::probe_group(pgid) == crate::signal::Probe::Gone {
-        return remove_owner(path);
-    }
-    if !owner.token.still_holds(owner.pgid) {
-        anyhow::bail!(
-            "cannot identify the previous reply_command group; it stays owed; inspect {} before retrying",
-            path.display()
-        );
-    }
-    crate::signal::signal_group(pgid, libc::SIGKILL);
-    wait_for_group_exit(pgid, deadline).await?;
-    remove_owner(path)
-}
-
-/// A bounded cleanup wait, never an idle task or automatic callback retry.
-async fn wait_for_group_exit(
-    pgid: crate::signal::Pgid,
-    deadline: tokio::time::Instant,
-) -> anyhow::Result<()> {
-    loop {
-        if crate::signal::probe_group(pgid) == crate::signal::Probe::Gone {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("reply_command group cleanup exceeded its deadline; event stays owed");
-        }
-        tokio::time::sleep_until(
-            (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
-        )
-        .await;
-    }
-}
+#[cfg(test)]
+use crate::cli::owned_callback::{Owner as ReplyOwner, save_owner};
 
 #[cfg(test)]
 mod tests {
@@ -437,6 +282,7 @@ mod tests {
             name: "questions".into(),
             command: vec!["true".into()],
             reply_command: route.map(|r| r.command.clone()),
+            receipt_command: None,
             glyph: None,
         };
         let mut log = EventLog::open(&dir, KEY).unwrap();

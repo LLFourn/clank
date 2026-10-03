@@ -930,6 +930,7 @@ mod tests {
             name: "questions".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         };
         let key = src.source_key();
@@ -1082,6 +1083,7 @@ mod tests {
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         };
         let key = src.source_key();
@@ -1180,6 +1182,7 @@ mod tests {
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         };
         let key = src.source_key();
@@ -1236,6 +1239,7 @@ mod tests {
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         };
         let key = src.source_key();

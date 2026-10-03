@@ -751,12 +751,14 @@ mod tests {
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: Some("*".into()),
         };
         let plain = clank_core::agent_config::CommandSource {
             name: "builds".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         };
         let cfg = clank_core::agent_config::AgentConfig {
@@ -856,6 +858,7 @@ mod tests {
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: Some("*".into()),
         };
         EventLog::open(&events, &src.source_key())
@@ -884,6 +887,7 @@ mod tests {
                 wait_events: vec![clank_core::agent_config::WaitEventSource::Command(
                     clank_core::agent_config::CommandSource {
                         reply_command: None,
+                        receipt_command: None,
                         glyph: Some(g.to_string()),
                         ..src.clone()
                     },

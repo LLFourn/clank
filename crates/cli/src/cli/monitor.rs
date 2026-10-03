@@ -145,7 +145,11 @@ pub(crate) enum Welcome {
 pub(crate) enum Note {
     /// What this client's author is owed. Empty is never sent; a client
     /// blocks until it has something, as a park does today.
-    Items { items: Vec<WaitItem> },
+    Items {
+        items: Vec<WaitItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_cwd: Option<std::path::PathBuf>,
+    },
     /// Proof of life, and nothing else.
     ///
     /// It carried the monitor's fold counter so a client could tell a
@@ -2813,60 +2817,6 @@ fn reconcile_hosting(
     departing
 }
 
-/// What a client is owed from its author's source logs.
-///
-/// Read at ADMISSION, because the monitor's producers have been running
-/// since the monitor started and a client that arrives later has been
-/// shown none of it. Forwarding only what comes next would drop the
-/// backlog at exactly the moment an agent comes back.
-///
-/// The rows come from the durable log rather than from anything the
-/// monitor remembers, so an ack made by the agent — or by an earlier
-/// incarnation of it — is what retires a row, and nothing here can
-/// re-present one that was handled.
-fn owed_from_sources(
-    repo: &std::path::Path,
-    author: &AgentLabel,
-    sources: &[(
-        clank_core::agent_config::WaitEventSource,
-        crate::cli::event_source::SourceOrigin,
-    )],
-    shown: &mut std::collections::HashSet<(String, u64, String)>,
-) -> Vec<WaitItem> {
-    use clank_core::agent_config::WaitEventSource;
-
-    let events_dir = crate::agent_store::agents_root(repo)
-        .join(author.as_str())
-        .join("events");
-    let mut owed = Vec::new();
-    for (source, _) in sources {
-        let (key, prompt) = match &source {
-            WaitEventSource::Command(c) => (c.source_key(), None),
-            WaitEventSource::Timer(_) => continue,
-            WaitEventSource::Github(g) => (
-                crate::cli::github::supervisor::source_key(g),
-                g.prompt.clone(),
-            ),
-        };
-        // `read_rows` is the READ-ONLY inspector: the monitor holds the
-        // ingest lease for these logs, but a reader must never
-        // quarantine one, and admission is a read.
-        let Ok(log) = crate::cli::github::log::EventLog::open(&events_dir, &key) else {
-            continue;
-        };
-        let Ok(Some(read)) = log.read_rows() else {
-            continue;
-        };
-        owed.extend(crate::cli::command_source::owed_from_log(
-            read.rows,
-            &key,
-            prompt.as_deref(),
-            shown,
-        ));
-    }
-    owed
-}
-
 /// What of an emission the monitor must carry itself.
 ///
 /// Empty for anything the log holds, because the log is what decides
@@ -3144,6 +3094,9 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         .await?;
 
     let who = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
+    if let Served::Agent { author, .. } = &who {
+        tracing::debug!(%author, "monitor agent wait admitted");
+    }
     let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
     let writer = tokio::spawn(write_to(io.into_inner(), queued, who.name()));
     Ok(Greeted::Client(Client {
@@ -3679,7 +3632,12 @@ fn serve_to_cached(
                         &current
                     }
                 };
-                let mut external = owed_from_sources(repo, author, sources, &mut client.shown);
+                let mut external = crate::cli::event_source::owed_from_sources(
+                    repo,
+                    author,
+                    sources,
+                    &mut client.shown,
+                );
                 external.extend(
                     timer_backlogs
                         .entry(author.clone())
@@ -3719,7 +3677,10 @@ fn serve_to_cached(
                 if items.is_empty() {
                     Note::Beat
                 } else {
-                    Note::Items { items }
+                    Note::Items {
+                        items,
+                        source_cwd: std::env::current_dir().ok(),
+                    }
                 }
             }
         };
@@ -5754,6 +5715,7 @@ mod tests {
     fn a_note_written_with_the_welcome_is_not_lost() {
         let repo = repo_dir();
         let note = Note::Items {
+            source_cwd: None,
             items: vec![WaitItem::PromoteFromQueue {
                 name: "next".into(),
                 priority: 500,
@@ -7672,7 +7634,7 @@ mod tests {
                 .is_empty()
             );
             let note: Note = serde_json::from_str(&received.recv().await.unwrap()).unwrap();
-            let Note::Items { items } = note else {
+            let Note::Items { items, .. } = note else {
                 panic!("retained drivers' rows must stay deliverable")
             };
             assert_eq!(items.len(), 2);
@@ -7782,7 +7744,7 @@ mod tests {
         let mut selectors = Vec::new();
         for receiver in [&mut first, &mut second] {
             let note: Note = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
-            let Note::Items { items } = note else {
+            let Note::Items { items, .. } = note else {
                 panic!("accepted timer is owed")
             };
             assert_eq!(items.len(), 1);
@@ -9634,6 +9596,7 @@ something to promote
         for note in [
             Note::Beat,
             Note::Items {
+                source_cwd: None,
                 items: vec![WaitItem::PromoteFromQueue {
                     name: "next".into(),
                     priority: 500,

@@ -41,6 +41,7 @@ pub mod monitor;
 pub mod nudge;
 pub mod open;
 pub mod open_zellij;
+mod owned_callback;
 pub mod pick;
 pub(crate) mod plan_mutation;
 pub mod plan_resolve;
@@ -65,6 +66,7 @@ pub(crate) mod term;
 pub(crate) mod timer_source;
 pub mod unfinish;
 pub mod wait;
+mod wake_receipt;
 pub(crate) mod web;
 
 #[derive(Args, Debug)]

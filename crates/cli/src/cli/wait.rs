@@ -17,7 +17,7 @@
 //! plausibly flip the projection and refolds on each debounced
 //! event.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -144,7 +144,8 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         };
         Some((author, binding))
     };
-    let result = match items(args).await {
+    let mut source_cwd = None;
+    let result = match items_with_context(args, &mut source_cwd).await {
         Err(e) if e.is::<WaitSuperseded>() => return superseded_error(e, json),
         other => other?,
     };
@@ -160,7 +161,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
             }
             anyhow::bail!("wait ended without work; the waiter returned an empty result");
         }
-        emit(&items, json);
+        emit_with_context(&items, json, source_cwd.as_deref());
     }
     Ok(())
 }
@@ -215,7 +216,7 @@ pub async fn items_observing(
     args: WaitArgs,
     starts: &SourceStarts,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, starts, None).await
+    items_with_policy(args, starts, None, &mut None).await
 }
 
 pub(super) async fn automatic_grok_items(
@@ -227,15 +228,25 @@ pub(super) async fn automatic_grok_items(
         args,
         &SourceStarts::default(),
         Some((session, crate::agent_env::Process.home())),
+        &mut None,
     )
     .await
+}
+
+async fn items_with_context(
+    args: WaitArgs,
+    source_cwd: &mut Option<PathBuf>,
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    items_with_policy(args, &SourceStarts::default(), None, source_cwd).await
 }
 
 async fn items_with_policy(
     args: WaitArgs,
     starts: &SourceStarts,
     automatic: Option<(clank_core::SessionId, Option<std::path::PathBuf>)>,
+    source_cwd: &mut Option<PathBuf>,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    *source_cwd = std::env::current_dir().ok();
     // Before ANY setup: the fold and the watcher attach can block for
     // seconds, and an owner that dies in that window must still reap
     // this process (remove-wait-timeout).
@@ -348,6 +359,17 @@ async fn items_with_policy(
             );
             owed.events
                 .extend(timer_backlog.owed(&mut Default::default()));
+            if args.peek {
+                // The hook's SessionStart actually emits this catch-up.
+                // Peek inspects custody without starting producers or receipts.
+                owed.events
+                    .extend(crate::cli::event_source::owed_from_sources(
+                        &repo,
+                        &author,
+                        &event_sources,
+                        &mut Default::default(),
+                    ));
+            }
             owed
         });
         if !items.is_empty() {
@@ -386,7 +408,10 @@ async fn items_with_policy(
     let sources = WakeSources::derive(&repo, inputs.role, event_sources);
     if let Some(conn) = share(&repo, &author, &binding, &sources).await {
         match shared_wait(conn, &repo, &author, &binding).await? {
-            Shared::Woke(items) => return Ok(Some(items)),
+            Shared::Woke(items, cwd) => {
+                *source_cwd = cwd;
+                return Ok(Some(items));
+            }
             Shared::Alone(why) => tracing::debug!("watching {} locally: {why}", repo.display()),
         }
     }
@@ -925,7 +950,7 @@ async fn share_with(
 #[derive(Debug)]
 enum Shared {
     /// Work, decided at the monitor's fold.
-    Woke(Vec<WaitItem>),
+    Woke(Vec<WaitItem>, Option<PathBuf>),
     /// The sharing ended. The string says why, for the log.
     Alone(String),
 }
@@ -976,9 +1001,9 @@ async fn shared_wait_within(
                 // A fold that owes this author nothing, and the beat
                 // that says the monitor is alive, are both just "keep
                 // waiting".
-                if let crate::cli::monitor::Note::Items { items, .. } = note {
+                if let crate::cli::monitor::Note::Items { items, source_cwd } = note {
                     if !items.is_empty() {
-                        return Ok(Shared::Woke(items));
+                        return Ok(Shared::Woke(items, source_cwd));
                     }
                 }
             }
@@ -1125,6 +1150,15 @@ pub(crate) fn resolve_wait_event_sources(
                     .is_some_and(|argv| argv.is_empty() || argv[0].trim().is_empty())
                 {
                     anyhow::bail!("command source `{}` has an empty reply_command", c.name);
+                }
+                if let Some(why) = c.receipt_refusal() {
+                    anyhow::bail!("{why}");
+                }
+                if c.receipt_command.is_some() && *origin == SourceOrigin::Cli {
+                    anyhow::bail!(
+                        "command source `{}` receipt_command is supported only for configured sources, not invocation-only --event sources",
+                        c.name
+                    );
                 }
                 if let Some(why) = c
                     .glyph
@@ -2043,6 +2077,8 @@ fn queue_promote_outcome(queue: &[crate::cli::queue::QueueEntry]) -> Vec<WaitIte
 #[derive(serde::Serialize)]
 struct WaitEnvelope<'a> {
     items: Vec<WaitJsonItem<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_cwd: Option<&'a Path>,
 }
 
 /// A control result, not an empty successful wait. The hook must
@@ -2054,9 +2090,13 @@ struct SupersededEnvelope {
 }
 
 pub(crate) fn emit(items: &[WaitItem], json: bool) {
+    emit_with_context(items, json, None);
+}
+fn emit_with_context(items: &[WaitItem], json: bool, source_cwd: Option<&Path>) {
     if json {
         let envelope = WaitEnvelope {
             items: items.iter().map(render_json).collect(),
+            source_cwd,
         };
         println!(
             "{}",
@@ -2674,6 +2714,7 @@ mod shared_tests {
             Note::Beat,
             Note::Beat,
             Note::Items {
+                source_cwd: None,
                 items: vec![promote()],
             },
         ]);
@@ -2687,7 +2728,7 @@ mod shared_tests {
         .await
         .expect("the items arrive");
 
-        let Shared::Woke(got) = got else {
+        let Shared::Woke(got, _) = got else {
             panic!("items are a wake, got {got:?}")
         };
         assert!(
@@ -2696,14 +2737,40 @@ mod shared_tests {
         );
     }
 
+    #[tokio::test]
+    async fn shared_delivery_retains_source_host_cwd_instead_of_the_client_cwd() {
+        let repo = tempfile::tempdir().unwrap();
+        let host_cwd = std::path::PathBuf::from("/different/source-host/cwd");
+        let conn = monitor_saying(vec![Note::Items {
+            items: vec![promote()],
+            source_cwd: Some(host_cwd.clone()),
+        }]);
+        let got = shared_wait(
+            conn,
+            repo.path(),
+            &AgentLabel::parse("claude").unwrap(),
+            &WaitBinding(None, WaitPolicy::Manual),
+        )
+        .await
+        .unwrap();
+        let Shared::Woke(_, cwd) = got else {
+            panic!("expected shared work")
+        };
+        assert_eq!(cwd, Some(host_cwd));
+    }
+
     /// An empty Items frame is not a wake either — returning it would
     /// wake an agent with nothing to do.
     #[tokio::test]
     async fn an_empty_items_frame_is_skipped() {
         let repo = tempfile::tempdir().unwrap();
         let conn = monitor_saying(vec![
-            Note::Items { items: Vec::new() },
             Note::Items {
+                items: Vec::new(),
+                source_cwd: None,
+            },
+            Note::Items {
+                source_cwd: None,
                 items: vec![promote()],
             },
         ]);
@@ -2716,7 +2783,7 @@ mod shared_tests {
         )
         .await
         .unwrap();
-        let Shared::Woke(got) = got else {
+        let Shared::Woke(got, _) = got else {
             panic!("the frame that carried items is the wake, got {got:?}")
         };
         assert_eq!(got.len(), 1, "the empty frame was not a wake: {got:?}");
@@ -3229,6 +3296,7 @@ mod shared_tests {
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         };
         let agent_dir = std::path::Path::new("/a/.clank/agents/claude");
@@ -3521,7 +3589,10 @@ mod shared_tests {
 
         let conn = monitor_saying(vec![
             Note::Beat,
-            Note::Items { items: Vec::new() },
+            Note::Items {
+                items: Vec::new(),
+                source_cwd: None,
+            },
             Note::Beat,
         ]);
 
@@ -3572,6 +3643,7 @@ mod shared_tests {
         let (mine, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
         mine.set_nonblocking(true).unwrap();
         let note = crate::cli::monitor::Note::Items {
+            source_cwd: None,
             items: vec![WaitItem::PromoteFromQueue {
                 name: "next".into(),
                 priority: 500,
@@ -3696,6 +3768,7 @@ mod tests {
             name: name.into(),
             command: argv.iter().map(|s| s.to_string()).collect(),
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         }
     }
@@ -4371,6 +4444,47 @@ mod tests {
         ))
         .expect("a two-column glyph cannot sit in a one-column cell");
         assert!(wide.contains("noisy") && wide.contains("glyph"), "{wide}");
+    }
+
+    #[test]
+    fn receipt_handlers_arm_only_from_valid_configured_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("rev").unwrap();
+        let agent_dir = crate::agent_store::agents_root(dir.path()).join(author.as_str());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let source = serde_json::json!({"kind":"command","name":"voice","command":["anx","events","--flag"],"receipt_command":["anx","receipt","--verbatim"]});
+        let write = |value: &serde_json::Value| {
+            std::fs::write(
+                agent_dir.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({"wait_events":[value]})).unwrap(),
+            )
+            .unwrap();
+        };
+        write(&source);
+        let configured = resolve_wait_event_sources(dir.path(), &author, &[]).unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(
+            configured[0].1,
+            crate::cli::event_source::SourceOrigin::Config
+        );
+        std::fs::remove_file(agent_dir.join("config.json")).unwrap();
+        let error = resolve_wait_event_sources(dir.path(), &author, &[source.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invocation-only --event"), "{error}");
+        for argv in [serde_json::json!([]), serde_json::json!([" "])] {
+            let mut invalid = source.clone();
+            invalid["receipt_command"] = argv;
+            write(&invalid);
+            let error = resolve_wait_event_sources(dir.path(), &author, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("empty receipt_command"), "{error}");
+        }
+        std::fs::remove_file(agent_dir.join("config.json")).unwrap();
+        let mut legacy = source;
+        legacy.as_object_mut().unwrap().remove("receipt_command");
+        assert!(resolve_wait_event_sources(dir.path(), &author, &[legacy.to_string()]).is_ok());
     }
 
     /// A quarantined log takes its index with it.
@@ -5665,6 +5779,7 @@ mod tests {
         };
         let envelope = WaitEnvelope {
             items: vec![render_json(&item)],
+            source_cwd: None,
         };
         let got = serde_json::to_value(&envelope).unwrap();
         assert_eq!(

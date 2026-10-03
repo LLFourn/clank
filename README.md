@@ -615,6 +615,85 @@ group; uncertain ownership refuses a new launch and names the record to inspect.
 Use updated Clank binaries for all agents, the monitor and the TUI before
 enabling required replies; an older client does not enforce this new policy.
 
+Command sources can opt into **wake receipts**, independently of replies. Add
+`receipt_command` to an agent's configured `wait_events` source:
+
+```json
+{
+  "kind": "command",
+  "name": "voice",
+  "command": ["voice-backend", "events", "--flag"],
+  "receipt_command": ["voice-backend", "receipt", "--flag"]
+}
+```
+
+A receipt means Clank successfully wrote and flushed a hook wake containing the
+event. It does not prove that the provider accepted the continuation or that the
+model read or completed the instruction. It never acknowledges an event, submits
+an answer, or completes backend work. Receipt handlers should record delivery/read
+metadata only; for Anx, this must not invoke `anx ack` or `anx say --done`. Unfinished
+work remains owed and can still reach a replacement master.
+
+Clank invokes exactly the configured argv, without added arguments or an implicit
+shell. Stdin is one JSON object, followed by EOF:
+
+```json
+{"version":1,"kind":"wake","source":"voice","author":"codex","ids":["utt/42"]}
+```
+
+`ids` contains original producer IDs, preserving slashes, Unicode, quotes and
+newlines; these are not the selectors used for event acknowledgement. A wake batches
+and deduplicates IDs per source. Exit zero accepts the receipt batch. Handlers must
+consume the request before applying effects, be idempotent per source/producer ID,
+and keep their children in Clank's owned process group rather than daemonizing.
+Clank creates and supplies the source's resolved `CLANK_SOURCE_STATE_DIR`, without
+reading its private contents. The working directory is the current presentation
+host's: the monitor's cwd for shared waits, and the local wait's cwd for fallback
+or peek catch-up. It is not an immutable historical producer directory.
+
+The receipt route is captured from the presenting author's current configuration.
+Editing a handler changes later presentations; an in-flight batch keeps its captured
+argv/cwd/state directory. Adding a handler also covers an existing source backlog;
+removing it disables future receipts without retiring events. Source keys,
+subscription arguments and immutable saved reply routes do not change. Omitted
+handlers add no receipt callback, WAL reread, runtime coordination or child process.
+Invocation-only `--event` receipt handlers are refused; configure the source instead.
+
+Supported presentations are generic Codex, Claude and OpenCode Stop-hook wakes,
+and Claude SessionStart's actual additional-context output. Native Grok handoffs and
+arbitrary backend/file reads are outside this version. `events list`, `show`, `ack`,
+plain `wait`, and `wait --peek` do not notify. Peek includes pending configured source
+rows without starting producers; a SessionStart adapter that emits that result owns
+the receipt. Failed/partial output, failed flush, stale bindings, diagnostics, control
+messages and source-failure rows never produce a receipt.
+
+Receipts are **best effort**, with no idle polling, persistent dispatch queue,
+per-event child or retry worker. Across one wake, receipt work retains at most 256
+IDs and 64 KiB of encoded stdin, omitting whole IDs that do not fit. These are receipt
+cost budgets; they do not truncate or discard the underlying event or wake. At most
+one callback runs at a time per hook, sequentially across sources. A nonblocking
+per-source lease skips a busy callback rather than queueing behind it. One monotonic
+one-second phase budget covers all routes, including cleanup; the last 200 ms are
+reserved for cleanup, and later routes receive no fresh deadline. This bounds
+software waiting, not OS syscall latency or uninterruptible kernel activity.
+
+A callback failure never replaces the already emitted wake or its exit result.
+Clank isolates callback output, kills/reaps its process group including ordinary
+descendants, and retains birth-identity evidence when cleanup is uncertain. Another
+callback for that source requires safe recovery, attempted only on a later real
+presentation. Crashes, overload and failures can miss receipts, and a later wake can
+repeat them. There is no exactly-once or durable at-least-once receipt guarantee,
+especially after the event is acknowledged.
+
+Diagnostics are bounded to 4 KiB. Codex/OpenCode use diagnostic stderr; Claude's wake
+already occupies stderr, so its latest callback diagnostic replaces
+`/tmp/clank-run-<uid>/<repo-tag>.wake-receipt-<author>.diagnostic`. The repo tag is the
+first 32 hex characters of BLAKE3 over the canonical repo path bytes. This file is
+only diagnostic evidence, never acknowledgement, completion or retry authority.
+Update the Clank CLI and restart existing monitors before enabling receipt handlers.
+An older monitor's missing execution context skips receipts with a diagnostic rather
+than guessing a backend directory. No existing source is opted in automatically.
+
 ## Troubleshooting
 
 `clank doctor` is the first stop — per-section OK / WARN / FAIL with

@@ -38,6 +38,7 @@ mod tui_is_the_command;
 mod wait_config_reload;
 mod wait_event_sources;
 mod wait_for_observer;
+mod wake_receipt_acceptance;
 mod web_host_process;
 mod web_timeline_boundary;
 mod zellij_cost_boundary;

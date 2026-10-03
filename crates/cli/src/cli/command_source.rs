@@ -599,6 +599,7 @@ mod tests {
             name: name.into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         }
     }

@@ -123,3 +123,118 @@ mod tests {
         );
     }
 }
+
+/// What a client is owed from its author's source logs.
+///
+/// Read at monitor admission and side-effect-free peek. The producers may
+/// have run before this client arrived, and it has been shown none of that work. Forwarding only what comes next would drop the
+/// backlog at exactly the moment an agent comes back.
+///
+/// The rows come from the durable log rather than from anything the
+/// monitor remembers, so an ack made by the agent — or by an earlier
+/// incarnation of it — is what retires a row, and nothing here can
+/// re-present one that was handled.
+pub(crate) fn owed_from_sources(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    sources: &[(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::event_source::SourceOrigin,
+    )],
+    shown: &mut std::collections::HashSet<(String, u64, String)>,
+) -> Vec<WaitItem> {
+    use clank_core::agent_config::WaitEventSource;
+
+    let events_dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    let mut owed = Vec::new();
+    if !events_dir.is_dir() {
+        return owed;
+    }
+    for (source, origin) in sources {
+        // Invocation WALs use a separate resolved key and must never borrow
+        // the configured source's backlog just because their names match.
+        if *origin != crate::cli::event_source::SourceOrigin::Config {
+            continue;
+        }
+        let (key, prompt) = match &source {
+            WaitEventSource::Command(c) => (c.source_key(), None),
+            WaitEventSource::Timer(_) => continue,
+            WaitEventSource::Github(g) => (
+                crate::cli::github::supervisor::source_key(g),
+                g.prompt.clone(),
+            ),
+        };
+        if !events_dir.join(format!("{key}.jsonl")).is_file() {
+            continue;
+        }
+        // `read_rows` is the READ-ONLY inspector: the monitor holds the
+        // ingest lease for these logs, but a reader must never
+        // quarantine one, and admission is a read.
+        let Ok(log) = crate::cli::github::log::EventLog::open(&events_dir, &key) else {
+            continue;
+        };
+        let Ok(Some(read)) = log.read_rows() else {
+            continue;
+        };
+        owed.extend(crate::cli::command_source::owed_from_log(
+            read.rows,
+            &key,
+            prompt.as_deref(),
+            shown,
+        ));
+    }
+    owed
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+    #[test]
+    fn configured_backlog_is_read_only_and_invocation_scope_cannot_borrow_it() {
+        let fixture = crate::cli::wake_receipt::fixtures::Fixture::new();
+        let sources = [(
+            clank_core::agent_config::WaitEventSource::Command(fixture.source.clone()),
+            SourceOrigin::Config,
+        )];
+        let events = crate::agent_store::agents_root(&fixture.repo)
+            .join(fixture.author.as_str())
+            .join("events");
+        let wal = events.join(format!("{}.jsonl", fixture.key));
+        let before = std::fs::read(&wal).unwrap();
+        let mut shown = Default::default();
+        let owed = owed_from_sources(&fixture.repo, &fixture.author, &sources, &mut shown);
+        assert_eq!(owed, vec![fixture.item.clone()]);
+        assert!(owed_from_sources(&fixture.repo, &fixture.author, &sources, &mut shown).is_empty());
+        let invoked = [(sources[0].0.clone(), SourceOrigin::Cli)];
+        assert!(
+            owed_from_sources(
+                &fixture.repo,
+                &fixture.author,
+                &invoked,
+                &mut Default::default()
+            )
+            .is_empty()
+        );
+        assert_eq!(std::fs::read(wal).unwrap(), before);
+        assert!(!fixture.rows()[0].acked);
+        assert!(!fixture.output.exists());
+    }
+    #[test]
+    fn inspecting_absent_source_custody_creates_no_agent_event_directory() {
+        let fixture = crate::cli::wake_receipt::fixtures::Fixture::new();
+        let absent = AgentLabel::parse("absent-author").unwrap();
+        let dir = crate::agent_store::agents_root(&fixture.repo)
+            .join(absent.as_str())
+            .join("events");
+        let sources = [(
+            clank_core::agent_config::WaitEventSource::Command(fixture.source.clone()),
+            SourceOrigin::Config,
+        )];
+        assert!(
+            owed_from_sources(&fixture.repo, &absent, &sources, &mut Default::default()).is_empty()
+        );
+        assert!(!dir.exists());
+    }
+}

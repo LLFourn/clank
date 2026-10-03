@@ -563,6 +563,10 @@ pub struct CommandSource {
     /// one JSON object on stdin; subscription argv and source identity stay put.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_command: Option<Vec<String>>,
+    /// Optional best-effort callback after a configured event is presented
+    /// in a successfully emitted hook wake. This is not acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_command: Option<Vec<String>>,
     /// The single character the log and the TUI draw this source's
     /// events with. Config, not per-line, so an untrusted producer
     /// cannot reach the renderer's layout; validated at load for a
@@ -572,6 +576,18 @@ pub struct CommandSource {
 }
 
 impl CommandSource {
+    pub fn receipt_refusal(&self) -> Option<String> {
+        self.receipt_command
+            .as_ref()
+            .filter(|argv| argv.is_empty() || argv[0].trim().is_empty())
+            .map(|_| {
+                format!(
+                    "command source `{}` has an empty receipt_command",
+                    self.name
+                )
+            })
+    }
+
     /// The identity its durable state is filed under.
     ///
     /// The NAME alone. Not the argv (fixing a path in a command does
@@ -873,6 +889,7 @@ mod tests {
             name: name.into(),
             command: vec!["true".into()],
             reply_command: None,
+            receipt_command: None,
             glyph: None,
         }
     }
@@ -910,6 +927,31 @@ mod tests {
                 .unwrap(),
             with_reply
         );
+    }
+
+    #[test]
+    fn receipt_handlers_are_optional_and_do_not_change_subscription_identity() {
+        let old = cmd("voice");
+        let mut configured = old.clone();
+        configured.command = vec!["anx".into(), "events".into(), "--flag".into()];
+        configured.receipt_command = Some(vec!["anx".into(), "receipt".into(), "".into()]);
+        assert_eq!(old.source_key(), configured.source_key());
+        assert!(configured.receipt_refusal().is_none());
+        let old_json = serde_json::to_value(&old).unwrap();
+        assert!(old_json.get("receipt_command").is_none());
+        assert_eq!(
+            serde_json::from_value::<CommandSource>(old_json).unwrap(),
+            old
+        );
+        assert_eq!(
+            serde_json::from_value::<CommandSource>(serde_json::to_value(&configured).unwrap())
+                .unwrap(),
+            configured
+        );
+        for invalid in [vec![], vec!["".into()], vec![" ".into()]] {
+            configured.receipt_command = Some(invalid);
+            assert!(configured.receipt_refusal().unwrap().contains("voice"));
+        }
     }
 
     /// Names that SLUG the same must not key the same.
