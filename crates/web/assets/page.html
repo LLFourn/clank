@@ -111,7 +111,6 @@
   .state .modes button[aria-disabled="true"] { cursor: help; }
   .chat-reason { position: absolute; top: 100%; right: 8px; z-index: 5; width: min(330px, calc(100vw - 16px)); padding: 12px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 8px; box-shadow: 0 18px 44px rgba(0, 0, 0, .5); font-size: 13px; }
   .chat-reason button { display: block; margin: 9px 0 0 auto; color: var(--hue-deep); text-decoration: underline; }
-  .bridge-error { grid-column: 1 / -1; margin-top: 6px; padding: 7px 9px; color: var(--changes); background: var(--bezel); border: 1px solid var(--changes); border-radius: 5px; overflow-wrap: anywhere; }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
   @media (prefers-reduced-motion: reduce) { .dot, .away { animation: none; } }
 
@@ -398,7 +397,6 @@
     </div>
     <div class="chat-reason" id="chat-reason" role="dialog" aria-label="Why Chat is unavailable" hidden><span id="chat-reason-text"></span><button id="chat-reason-close" type="button">Close</button></div>
     <div class="picker" id="picker" role="listbox" aria-label="Choose an agent" hidden></div>
-    <div class="bridge-error" id="bridge-error" role="alert" hidden></div>
   </header>
   <div class="strip" id="strip" hidden></div>
   <div class="agent">
@@ -587,7 +585,6 @@
   const narrowTimeline = window.matchMedia('(max-width: 959px)');
   let timelineOpen = false;
   const chatReasonEl = $('chat-reason'), chatReasonText = $('chat-reason-text');
-  const bridgeErrorEl = $('bridge-error');
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
   /*__CLANK_COMPOSER__*/
   // The box's height is the script's to set: a textarea has none of
@@ -1963,7 +1960,7 @@
   // a stream, while an upgrade's frames come through at once. The
   // frames themselves are unchanged — `event: NAME\ndata: JSON` —
   // so the server side of the feed did not have to move.
-  const handlers = { status: onStatus, panes: onPanes, pane: onPane, turns: applyTurns, turn: applyTurn };
+  const handlers = { connection: (d) => { live = d.connected === true; paintHeader(); paintEmpty(); }, status: onStatus, panes: onPanes, pane: onPane, turns: applyTurns, turn: applyTurn };
   let socket = null, retry = 0, closedForGood = false;
 
   function deliver(text) {
@@ -1980,7 +1977,7 @@
     if (closedForGood) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${location.host}${route('/events')}`);
-    socket.onopen = () => { retry = 0; live = true; paintHeader(); paintEmpty(); };
+    socket.onopen = () => { retry = 0; live = false; paintHeader(); paintEmpty(); };
     socket.onmessage = (e) => deliver(e.data);
     // Unlike an EventSource, a socket does not retry itself. A close
     // the door caused — the session revoked or expired — must not be
@@ -2000,17 +1997,6 @@
           closedForGood = true;
           location.replace(web.login);
           return;
-        }
-        const bridgeReply = await fetch(route('/bridge/status'));
-        if (bridgeReply.ok) {
-          const status = await bridgeReply.json();
-          if (status.failure?.code === 'snapshot_too_large' || status.failure?.code === 'update_too_large') {
-            closedForGood = true;
-            bridgeErrorEl.textContent = status.failure.why;
-            bridgeErrorEl.hidden = false;
-            sentEl.textContent = status.failure.why;
-            return;
-          }
         }
       } catch (err) {}
       if (door.sealed) return;

@@ -90,11 +90,13 @@ pub(crate) fn repaint(viewport: &[String]) -> String {
     out
 }
 
-/// One Server-Sent Events frame. The data is compact JSON, which
-/// never contains a raw newline — that is what makes one event one
-/// frame, since the protocol ends a frame at a blank line.
-pub(crate) fn sse_frame(event: &str, data: &serde_json::Value) -> String {
-    format!("event: {event}\ndata: {data}\n\n")
+fn browser_frame(event: &str, data: &serde_json::Value) -> clank_web::service::BrowserFrame {
+    clank_web::service::BrowserFrame::new(event, data.clone())
+}
+
+#[cfg(test)]
+fn sse_frame(event: &str, data: &serde_json::Value) -> String {
+    browser_frame(event, data).to_sse()
 }
 
 /// Everything a browser needs to draw the page from nothing.
@@ -116,10 +118,13 @@ impl Retained {
     /// The frames that reconstruct this state, in the order the page
     /// wants them: the table first (so viewports have terms to land
     /// in), then status, then every viewport.
-    pub(crate) fn frames(&self) -> Vec<String> {
-        let mut out = vec![sse_frame("panes", &panes_data(&self.panes, &self.closed))];
+    pub(crate) fn frames(&self) -> Vec<clank_web::service::BrowserFrame> {
+        let mut out = vec![browser_frame(
+            "panes",
+            &panes_data(&self.panes, &self.closed),
+        )];
         if let Some(status) = &self.status {
-            out.push(sse_frame("status", status));
+            out.push(browser_frame("status", status));
         }
         // A `turns` frame REPLACES the agent's window on the page, so a
         // replay is never a duplicate — unlike a turn, which is why
@@ -138,15 +143,15 @@ impl Retained {
 /// table's to say (`panes` frames), never a viewport's: a retained
 /// viewport replayed to a late browser must not reopen a pane the
 /// table just said was closed (codex on 56d1e6a).
-fn pane_frame(id: &str, viewport: &[String]) -> String {
-    sse_frame(
+fn pane_frame(id: &str, viewport: &[String]) -> clank_web::service::BrowserFrame {
+    browser_frame(
         "pane",
         &serde_json::json!({ "pane_id": id, "screen": repaint(viewport) }),
     )
 }
 
-fn turns_frame(agent: &str, window: &AgentTurns) -> String {
-    sse_frame(
+fn turns_frame(agent: &str, window: &AgentTurns) -> clank_web::service::BrowserFrame {
+    browser_frame(
         "turns",
         &serde_json::json!({
             "agent": agent,
@@ -157,8 +162,13 @@ fn turns_frame(agent: &str, window: &AgentTurns) -> String {
     )
 }
 
-fn turn_frame(agent: &str, session: &str, generation: u32, turn: &Turn) -> String {
-    sse_frame(
+fn turn_frame(
+    agent: &str,
+    session: &str,
+    generation: u32,
+    turn: &Turn,
+) -> clank_web::service::BrowserFrame {
+    browser_frame(
         "turn",
         &serde_json::json!({
             "agent": agent,
@@ -222,8 +232,8 @@ impl Feed {
     /// A slow connector is resynced from retained state after two
     /// outstanding updates; browsers subscribe to the host's copy.
     pub(crate) fn new() -> Self {
-        // Each bridge update carries a full replacement image. Keep only
-        // two; a slow connector resubscribes and receives the latest image.
+        // Keep two live deltas; a slow connector replaces its backlog with
+        // an atomic retained image instead of accumulating old updates.
         let (bridge_tx, _) = broadcast::channel(2);
         Self {
             state: Arc::new(Mutex::new(Retained::default())),
@@ -240,7 +250,7 @@ impl Feed {
     /// read is in the state it reads; any publish that completes
     /// after is in the receiver it already holds. Nothing falls
     /// between.
-    fn publish(&self, apply: impl FnOnce(&mut Retained) -> Vec<String>) {
+    fn publish(&self, apply: impl FnOnce(&mut Retained) -> Vec<clank_web::service::BrowserFrame>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let live = apply(&mut state);
         if live.is_empty() {
@@ -283,7 +293,7 @@ impl Feed {
 
     pub(crate) fn status(&self, data: serde_json::Value) {
         self.publish(|s| {
-            let frame = sse_frame("status", &data);
+            let frame = browser_frame("status", &data);
             s.status = Some(data);
             vec![frame]
         });
@@ -303,7 +313,7 @@ impl Feed {
                     // content arrives, because content never carries
                     // lifecycle.
                     if s.closed.remove(&id) {
-                        frames.push(sse_frame("panes", &panes_data(&s.panes, &s.closed)));
+                        frames.push(browser_frame("panes", &panes_data(&s.panes, &s.closed)));
                     }
                     frames.push(pane_frame(&id, &viewport));
                     s.viewports.insert(id, viewport);
@@ -316,7 +326,7 @@ impl Feed {
                 };
                 self.publish(|s| {
                     s.closed.insert(id);
-                    vec![sse_frame("panes", &panes_data(&s.panes, &s.closed))]
+                    vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
                 });
             }
             _ => {}
@@ -336,7 +346,7 @@ impl Feed {
             s.viewports.retain(|id, _| ids.contains(id));
             s.closed.retain(|id| ids.contains(id));
             s.panes = table;
-            vec![sse_frame("panes", &panes_data(&s.panes, &s.closed))]
+            vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
         });
         change
     }
@@ -548,7 +558,8 @@ mod tests {
             let update = self.updates.try_recv()?;
             let delta: clank_web::service::BrowserDelta =
                 serde_json::from_value(update.state).expect("the shipping bridge delta");
-            self.pending.extend(delta.live);
+            self.pending
+                .extend(delta.live.into_iter().map(|frame| frame.to_sse()));
             self.pending
                 .pop_front()
                 .ok_or(broadcast::error::TryRecvError::Empty)
@@ -560,7 +571,11 @@ mod tests {
         let image: clank_web::service::BrowserFrames =
             serde_json::from_value(snapshot.state).expect("the shipping bridge image");
         (
-            image.replay,
+            image
+                .replay
+                .into_iter()
+                .map(|frame| frame.to_sse())
+                .collect(),
             Frames {
                 updates,
                 pending: VecDeque::new(),
@@ -686,7 +701,7 @@ mod tests {
         let (snapshot, mut updates) = feed.bridge_connect();
         let initial: clank_web::service::BrowserFrames =
             serde_json::from_value(snapshot.state).unwrap();
-        assert!(initial.replay[0].starts_with("event: panes\n"));
+        assert!(initial.replay[0].event == "panes");
         assert!(initial.live.is_empty());
 
         feed.status(serde_json::json!({"phase":"first"}));
@@ -694,14 +709,14 @@ mod tests {
         assert_eq!(first.sequence, snapshot.sequence + 1);
         let frames: clank_web::service::BrowserDelta = serde_json::from_value(first.state).unwrap();
         assert_eq!(frames.live.len(), 1);
-        assert!(frames.live[0].contains("first"));
+        assert!(frames.live[0].data["phase"] == "first");
 
         feed.status(serde_json::json!({"phase":"second"}));
         let second = updates.try_recv().unwrap();
         assert_eq!(second.sequence, first.sequence + 1);
         let frames: clank_web::service::BrowserDelta =
             serde_json::from_value(second.state).unwrap();
-        assert!(frames.live[0].contains("second"));
+        assert!(frames.live[0].data["phase"] == "second");
 
         for phase in ["third", "fourth", "fifth"] {
             feed.status(serde_json::json!({"phase":phase}));
@@ -714,7 +729,12 @@ mod tests {
         assert_eq!(resynced.sequence, second.sequence + 3);
         let frames: clank_web::service::BrowserFrames =
             serde_json::from_value(resynced.state).unwrap();
-        assert!(frames.replay.iter().any(|frame| frame.contains("fifth")));
+        assert!(
+            frames
+                .replay
+                .iter()
+                .any(|frame| frame.data["phase"] == "fifth")
+        );
     }
 
     /// The race the order exists for: a publish that lands between a
@@ -1112,8 +1132,8 @@ mod tests {
             page.apply(&f);
         }
         // The page enforces the same scope on its own.
-        page.apply(&turn_frame("claude", "s1", 0, &say("old-gen", "x")));
-        page.apply(&turn_frame("claude", "s0", 1, &say("old-session", "x")));
+        page.apply(&turn_frame("claude", "s1", 0, &say("old-gen", "x")).to_sse());
+        page.apply(&turn_frame("claude", "s0", 1, &say("old-session", "x")).to_sse());
         assert_eq!(page.agents["claude"].turns.len(), 1);
         // The file was re-read: generation 2 replaces the window.
         feed.turns_reset("claude", 1, "s1", 2, vec![say("z", "fresh")]);

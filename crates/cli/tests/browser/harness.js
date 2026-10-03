@@ -14,7 +14,7 @@ const PAGE = fs.readFileSync(path.join(__dirname, '../../../web/assets/page.html
 const STUB = `
   window.__frames = [];
   window.WebSocket = class {
-    constructor() { window.__sock = this; setTimeout(() => this.onopen && this.onopen(), 0); }
+    constructor() { window.__sock = this; setTimeout(() => { if (this.onopen) this.onopen(); if (this.onmessage) window.__send("connection", { connected: true }); }, 0); }
     close() {}
   };
   window.__send = (event, data) => window.__sock.onmessage({ data: 'event: ' + event + '\\ndata: ' + JSON.stringify(data) });

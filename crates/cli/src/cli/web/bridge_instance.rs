@@ -82,7 +82,7 @@ pub(crate) struct BridgeInstance {
     tails: Arc<Mutex<Tails>>,
     builder: Option<SiteBuilder>,
     feed: Feed,
-    connection_problem: Arc<Mutex<Option<String>>>,
+    connection_problem: watch::Receiver<clank_web::bridge::ConnectionStatus>,
     repo: PathBuf,
     home: Option<PathBuf>,
 }
@@ -285,8 +285,9 @@ impl BridgeInstance {
             cancelled.clone(),
         ));
         let mut tasks = JoinSet::new();
-        let (attached_tx, mut attached_rx) = tokio::sync::mpsc::channel(1);
-        let connection_problem = Arc::new(Mutex::new(None));
+        let (attached_tx, mut attached_rx) =
+            watch::channel(clank_web::bridge::ConnectionStatus::Connecting);
+        let connection_problem = attached_rx.clone();
         tasks.spawn(super::pane_poll(
             panes,
             feed.clone(),
@@ -301,8 +302,6 @@ impl BridgeInstance {
             credential,
             backend,
             attached_tx,
-            connection_problem.clone(),
-            wake.clone(),
             cancelled,
         ));
         let builder = SiteBuilder::start(repo.clone(), home.clone());
@@ -326,16 +325,19 @@ impl BridgeInstance {
             repo,
             home,
         };
-        match tokio::time::timeout(Duration::from_secs(10), attached_rx.recv()).await {
-            Ok(Some(())) => {
-                *instance
-                    .connection_problem
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = None;
-                let status = instance.connection_problem.clone();
+        // The first complete image may take any number of transport blocks.
+        // Connection/handshake failures are reported by the owning connector;
+        // a total image deadline would reject a valid progressing transfer.
+        while *attached_rx.borrow_and_update() == clank_web::bridge::ConnectionStatus::Connecting {
+            if attached_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        let status = attached_rx.borrow().clone();
+        match status {
+            clank_web::bridge::ConnectionStatus::Ready => {
                 instance.tasks.spawn(async move {
-                    while attached_rx.recv().await.is_some() {
-                        *status.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                    while attached_rx.changed().await.is_ok() {
                         if let Some(wake) = &wake {
                             wake();
                         }
@@ -343,9 +345,13 @@ impl BridgeInstance {
                 });
                 Ok(instance)
             }
-            _ => {
+            failure => {
                 instance.stop().await;
-                anyhow::bail!("the web host started but the repo did not attach within 10s")
+                let why = match failure {
+                    clank_web::bridge::ConnectionStatus::Disconnected(why) => why,
+                    _ => "connector ended before publishing its first image".into(),
+                };
+                anyhow::bail!("the web host started but the repo did not attach: {why}")
             }
         }
     }
@@ -377,10 +383,13 @@ impl BridgeInstance {
     }
 
     pub(crate) fn connection_problem(&self) -> Option<String> {
-        self.connection_problem
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
+        match &*self.connection_problem.borrow() {
+            clank_web::bridge::ConnectionStatus::Ready => None,
+            clank_web::bridge::ConnectionStatus::Connecting => {
+                Some("repo connector is connecting".into())
+            }
+            clank_web::bridge::ConnectionStatus::Disconnected(why) => Some(why.clone()),
+        }
     }
 
     pub(crate) fn owns_host(&self) -> bool {
@@ -543,9 +552,7 @@ async fn connector(
     session: String,
     credential: String,
     backend: Arc<super::repo_session::RepoSession>,
-    attached: tokio::sync::mpsc::Sender<()>,
-    problem: Arc<Mutex<Option<String>>>,
-    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    attached: watch::Sender<clank_web::bridge::ConnectionStatus>,
     mut cancelled: watch::Receiver<bool>,
 ) {
     loop {
@@ -554,26 +561,19 @@ async fn connector(
             result = clank_web::bridge::connect_signaled(&endpoint, &session, &credential, backend.clone(), Some(attached.clone())) => result,
         };
         if let Err(error) = result {
-            *problem.lock().unwrap_or_else(|poison| poison.into_inner()) =
-                Some(format!("connector: {error:#}"));
-            if let Some(wake) = &wake {
-                wake();
-            }
+            attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(format!(
+                "connector: {error:#}"
+            )));
             if error
-                .downcast_ref::<clank_web::bridge::SnapshotTooLarge>()
+                .downcast_ref::<clank_web::bridge::ProtocolMismatch>()
                 .is_some()
-                || error
-                    .downcast_ref::<clank_web::bridge::UpdateTooLarge>()
-                    .is_some()
             {
                 return;
             }
         } else {
-            *problem.lock().unwrap_or_else(|poison| poison.into_inner()) =
-                Some("repo connector disconnected".into());
-            if let Some(wake) = &wake {
-                wake();
-            }
+            attached.send_replace(clank_web::bridge::ConnectionStatus::Disconnected(
+                "repo connector disconnected".into(),
+            ));
         }
         tokio::select! {
             _ = cancelled.changed() => return,
@@ -873,6 +873,249 @@ mod tests {
         assert_eq!(sent.lock().unwrap().as_slice(), &["hello existing host"]);
         let response = reqwest::get(format!("{url}/instance")).await.unwrap();
         assert!(response.status().is_success());
+        host.stop().await;
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_a_large_image_without_a_total_deadline() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".clank")).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            socket
+                .send(Message::Text(r#"{"type":"ready","version":2}"#.into()))
+                .await
+                .unwrap();
+            let mut sequence = None;
+            let mut size = 0;
+            while let Some(Ok(Message::Binary(bytes))) = socket.next().await {
+                match bytes[0] {
+                    1 => {
+                        if sequence.is_none() {
+                            sequence = Some(u64::from_le_bytes(bytes[18..26].try_into().unwrap()));
+                        }
+                        size += bytes.len() - 17;
+                    }
+                    2 => break,
+                    _ => {}
+                }
+            }
+            assert!(size > 5 * 1024 * 1024);
+            // A slow host may take longer than the former 10-second CLI
+            // deadline to commit an otherwise complete valid image.
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            let header = |tag: u8, offset: u64| {
+                let mut bytes = vec![tag];
+                bytes.extend_from_slice(&1u64.to_le_bytes());
+                bytes.extend_from_slice(&offset.to_le_bytes());
+                bytes
+            };
+            socket
+                .send(Message::Binary(header(0, 0).into()))
+                .await
+                .unwrap();
+            let mut applied = header(1, 0);
+            applied.push(2);
+            applied.extend_from_slice(&sequence.unwrap().to_le_bytes());
+            socket.send(Message::Binary(applied.into())).await.unwrap();
+            socket
+                .send(Message::Binary(header(2, 9).into()))
+                .await
+                .unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let instance = tokio::time::timeout(
+            Duration::from_secs(20),
+            BridgeInstance::attach(
+                repo.path().to_path_buf(),
+                Some(home.path().to_path_buf()),
+                Arc::new(TestPanes {
+                    sent: Arc::new(Mutex::new(Vec::new())),
+                }),
+                Startup {
+                    tunnel: None,
+                    poll: Duration::from_secs(3600),
+                    grace: Duration::from_secs(2),
+                    seed: serde_json::json!({"text":"x".repeat(5*1024*1024)}),
+                    reopen: None,
+                    wake: None,
+                },
+                WebAttach {
+                    endpoint: format!("ws://{address}"),
+                    session: "slow".into(),
+                    credential: "fixture".into(),
+                    browser_url: format!("http://{address}"),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("a slow first image must complete");
+        assert!(instance.connection_problem().is_none());
+        instance.stop().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_harness_turns_reach_a_browser_and_survive_connector_outages() {
+        use crate::cli::web::{
+            Blocking, Feed,
+            repo_session::RepoSession,
+            transcript::{self, Parsed},
+        };
+        use clank_core::vocab::Tool;
+        use clank_web::bridge::Backend;
+        use tokio::net::TcpStream;
+        use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+        async fn event(
+            socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+            kind: &str,
+        ) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = socket.next().await.expect("socket remains open").unwrap();
+                    let Ok(text) = frame.to_text() else {
+                        continue;
+                    };
+                    let Some(data) = text.strip_prefix(&format!("event: {kind}\ndata: ")) else {
+                        continue;
+                    };
+                    return serde_json::from_str(data.trim()).unwrap();
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let host = clank_web_cloudflare::host::Host::start(
+            0,
+            "large-transcript".into(),
+            Some(home.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        let feed = Feed::new();
+        feed.panes(vec![PaneMeta {
+            id: "terminal_1".into(),
+            label: "grok".into(),
+            columns: 80,
+            rows: 24,
+            exited: false,
+        }]);
+        feed.status(serde_json::json!({"facts":{"agents":[{"label":"grok"}]}}));
+        feed.claim_turns("grok", 1, Some("session-one"));
+        let text = "🦀 \"quote\" \\\n".repeat(100_000);
+        // Drive the shipping harness parser and markdown renderer, not a
+        // transport-only JSON fixture. Text and rendered HTML both cross.
+        let line = serde_json::json!({"type":"response_item","payload":{"type":"message","id":"large-turn","role":"user","content":[{"type":"input_text","text":text}]}}).to_string();
+        let Parsed::Turn(turn) = transcript::parse(Tool::Codex, &line).pop().unwrap() else {
+            panic!("expected parsed turn")
+        };
+        let expected = serde_json::to_value(&turn).unwrap();
+        feed.turns_reset("grok", 1, "session-one", 0, vec![turn.clone()]);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let backend = Arc::new(RepoSession::new(
+            repo.path().to_path_buf(),
+            Some(home.path().to_path_buf()),
+            Arc::new(TestPanes {
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }),
+            feed.clone(),
+            None,
+            Arc::new(Blocking::default()),
+            cancelled,
+        ));
+        let start = || {
+            let endpoint = host.connector_url.clone();
+            let credential = host.credential.clone();
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                clank_web::bridge::connect(&endpoint, "large-transcript", &credential, backend)
+                    .await
+            })
+        };
+        let connector = start();
+        let (mut view, mut changes) = host.session.subscribe_with_snapshot().await;
+        while !view.connected {
+            clank_web::bridge::apply_event(
+                &mut view,
+                tokio::time::timeout(Duration::from_secs(10), changes.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let door = Door::new(Some(home.path().to_path_buf()));
+        let cookie = format!(
+            "{}={}",
+            crate::cli::web::door::COOKIE,
+            door.open_session("large").unwrap()
+        );
+        let mut request = format!("{}/events", host.local_url.replace("http://", "ws://"))
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("origin", host.local_url.parse().unwrap());
+        let mut browser = tokio_tungstenite::connect_async(request.clone())
+            .await
+            .unwrap()
+            .0;
+        let replay = event(&mut browser, "turns").await;
+        assert_eq!(replay["turns"][0], expected);
+        assert!(serde_json::to_vec(&replay).unwrap().len() > 1024 * 1024);
+        assert_eq!(event(&mut browser, "connection").await["connected"], true);
+        let mut live = turn;
+        live.id = "second-large-turn".into();
+        let expected_live = serde_json::to_value(&live).unwrap();
+        feed.turn("grok", 1, "session-one", 0, live);
+        assert_eq!(event(&mut browser, "turn").await["turn"], expected_live);
+        connector.abort();
+        let _ = connector.await;
+        assert_eq!(event(&mut browser, "connection").await["connected"], false);
+        let mut late = tokio_tungstenite::connect_async(request).await.unwrap().0;
+        let retained = event(&mut late, "turns").await;
+        assert_eq!(retained["turns"][0], expected);
+        assert_eq!(retained["turns"][1], expected_live);
+        assert_eq!(event(&mut late, "connection").await["connected"], false);
+        let restarted = start();
+        assert_eq!(
+            event(&mut browser, "turns").await["turns"],
+            retained["turns"]
+        );
+        assert_eq!(event(&mut browser, "connection").await["connected"], true);
+        assert_eq!(event(&mut late, "turns").await["turns"], retained["turns"]);
+        assert_eq!(event(&mut late, "connection").await["connected"], true);
+        let snapshot = backend.subscribe_with_snapshot().await.0;
+        assert_eq!(
+            snapshot.sequence,
+            host.session
+                .subscribe_with_snapshot()
+                .await
+                .0
+                .snapshot
+                .unwrap()
+                .sequence
+        );
+        restarted.abort();
+        let _ = restarted.await;
+        drop(cancel);
         host.stop().await;
     }
 

@@ -91,7 +91,10 @@ impl App {
                 if !hyper_tungstenite::is_upgrade_request(&request) {
                     return response(StatusCode::UPGRADE_REQUIRED, "upgrade to WebSocket");
                 }
-                let Ok((reply, upgrade)) = hyper_tungstenite::upgrade(&mut request, None) else {
+                let Ok((reply, upgrade)) = hyper_tungstenite::upgrade(
+                    &mut request,
+                    Some(clank_web::bridge::websocket_config()),
+                ) else {
                     return response(StatusCode::BAD_REQUEST, "invalid upgrade");
                 };
                 let session = self.session.clone();
@@ -298,7 +301,10 @@ mod tests {
                 Snapshot {
                     sequence: 0,
                     state: serde_json::to_value(BrowserFrames {
-                        replay: vec!["event: status\ndata: {\"phase\":\"ready\"}\n\n".into()],
+                        replay: vec![clank_web::service::BrowserFrame::new(
+                            "status",
+                            serde_json::json!({"phase":"ready"}),
+                        )],
                         live: vec![],
                     })
                     .unwrap(),
@@ -452,9 +458,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logout.status(), StatusCode::SEE_OTHER);
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), browser.next())
-            .await
-            .unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let message = browser.next().await;
+                if matches!(&message, Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) if text.starts_with("event: connection\n")) {
+                    continue;
+                }
+                break message;
+            }
+        }).await.unwrap();
         assert!(!matches!(
             closed,
             Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))

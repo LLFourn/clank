@@ -245,7 +245,10 @@ async fn route(mut request: Request<Incoming>, peer: IpAddr, context: Arc<Contex
             if !hyper_tungstenite::is_upgrade_request(&request) {
                 return text(StatusCode::UPGRADE_REQUIRED, "upgrade to a websocket");
             }
-            let Ok((answer, socket)) = hyper_tungstenite::upgrade(&mut request, None) else {
+            let Ok((answer, socket)) = hyper_tungstenite::upgrade(
+                &mut request,
+                Some(clank_web::bridge::websocket_config()),
+            ) else {
                 return text(StatusCode::BAD_REQUEST, "invalid websocket upgrade");
             };
             let expected = context.credential.clone();

@@ -4,18 +4,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::service::BrowserFrame;
 use serde_json::Value;
 
 #[derive(Default)]
 struct Replay {
-    panes: Option<String>,
-    status: Option<String>,
-    turns: BTreeMap<String, String>,
-    screens: BTreeMap<String, String>,
+    panes: Option<BrowserFrame>,
+    status: Option<BrowserFrame>,
+    turns: BTreeMap<String, BrowserFrame>,
+    screens: BTreeMap<String, BrowserFrame>,
 }
 
 impl Replay {
-    fn from_frames(frames: &[String]) -> anyhow::Result<Self> {
+    fn from_frames(frames: &[BrowserFrame]) -> anyhow::Result<Self> {
         let mut replay = Self::default();
         for frame in frames {
             replay.apply(frame)?;
@@ -23,8 +24,9 @@ impl Replay {
         Ok(replay)
     }
 
-    fn apply(&mut self, frame: &str) -> anyhow::Result<()> {
-        let (event, data) = parse(frame)?;
+    fn apply(&mut self, frame: &BrowserFrame) -> anyhow::Result<()> {
+        let event = frame.event.as_str();
+        let data = &frame.data;
         match event {
             "panes" => {
                 let ids: BTreeSet<String> = data["panes"]
@@ -34,7 +36,7 @@ impl Replay {
                     .filter_map(|pane| pane["id"].as_str().map(str::to_owned))
                     .collect();
                 self.screens.retain(|id, _| ids.contains(id));
-                self.panes = Some(frame.into());
+                self.panes = Some(frame.clone());
             }
             "status" => {
                 if let Some(agents) = data.pointer("/facts/agents").and_then(Value::as_array) {
@@ -45,22 +47,22 @@ impl Replay {
                     self.turns
                         .retain(|label, _| labels.contains(label.as_str()));
                 }
-                self.status = Some(frame.into());
+                self.status = Some(frame.clone());
             }
             "pane" => {
-                let id = string(&data, "pane_id")?;
-                self.screens.insert(id.into(), frame.into());
+                let id = string(data, "pane_id")?;
+                self.screens.insert(id.into(), frame.clone());
             }
             "turns" => {
-                let agent = string(&data, "agent")?;
-                self.turns.insert(agent.into(), frame.into());
+                let agent = string(data, "agent")?;
+                self.turns.insert(agent.into(), frame.clone());
             }
             "turn" => {
-                let agent = string(&data, "agent")?;
+                let agent = string(data, "agent")?;
                 let Some(previous) = self.turns.get(agent) else {
                     return Ok(());
                 };
-                let (_, mut window) = parse(previous)?;
+                let mut window = previous.data.clone();
                 if window["session"] != data["session"]
                     || window["generation"] != data["generation"]
                 {
@@ -82,14 +84,15 @@ impl Replay {
                 if list.len() > 200 {
                     list.drain(..list.len() - 200);
                 }
-                self.turns.insert(agent.into(), sse("turns", &window));
+                self.turns
+                    .insert(agent.into(), BrowserFrame::new("turns", window));
             }
             _ => anyhow::bail!("unknown browser frame: {event}"),
         }
         Ok(())
     }
 
-    fn frames(self) -> Vec<String> {
+    fn frames(self) -> Vec<BrowserFrame> {
         let mut frames = Vec::new();
         if let Some(panes) = self.panes {
             frames.push(panes);
@@ -103,27 +106,10 @@ impl Replay {
     }
 }
 
-fn parse(frame: &str) -> anyhow::Result<(&str, Value)> {
-    let (event, rest) = frame
-        .split_once('\n')
-        .ok_or_else(|| anyhow::anyhow!("frame has no data"))?;
-    let event = event
-        .strip_prefix("event: ")
-        .ok_or_else(|| anyhow::anyhow!("frame has no event"))?;
-    let data = rest
-        .strip_prefix("data: ")
-        .ok_or_else(|| anyhow::anyhow!("frame has no data field"))?;
-    Ok((event, serde_json::from_str(data.trim_end_matches('\n'))?))
-}
-
 fn string<'a>(data: &'a Value, field: &str) -> anyhow::Result<&'a str> {
     data[field]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("frame missing {field}"))
-}
-
-fn sse(event: &str, data: &Value) -> String {
-    format!("event: {event}\ndata: {data}\n\n")
 }
 
 /// Merge a live-frame delta into a retained browser replay. Other JSON
@@ -135,13 +121,13 @@ pub(crate) fn merge(previous: &Value, change: &Value) -> anyhow::Result<Value> {
     if change.get("replay").is_some() {
         return Ok(change.clone());
     }
-    let previous: Vec<String> = serde_json::from_value(
+    let previous: Vec<BrowserFrame> = serde_json::from_value(
         previous
             .get("replay")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("browser replay missing"))?,
     )?;
-    let live: Vec<String> = serde_json::from_value(live.clone())?;
+    let live: Vec<BrowserFrame> = serde_json::from_value(live.clone())?;
     let mut replay = Replay::from_frames(&previous)?;
     for frame in &live {
         replay.apply(frame)?;
@@ -151,7 +137,10 @@ pub(crate) fn merge(previous: &Value, change: &Value) -> anyhow::Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge, sse};
+    use super::merge;
+    fn sse(event: &str, data: &serde_json::Value) -> super::BrowserFrame {
+        super::BrowserFrame::new(event, data.clone())
+    }
 
     #[test]
     fn live_frames_update_the_retained_image_without_replacing_it() {
@@ -178,14 +167,14 @@ mod tests {
         );
         let changed = merge(&start, &serde_json::json!({"live":[turn]})).unwrap();
         assert_eq!(changed["replay"].as_array().unwrap().len(), 4);
-        assert!(changed["replay"][2].as_str().unwrap().contains("t1"));
+        assert!(changed["replay"][2]["data"]["turns"][0]["id"] == "t1");
         let newer = merge(
             &changed,
             &serde_json::json!({"live":[sse("status", &serde_json::json!({"phase":"second"}))]}),
         )
         .unwrap();
-        assert!(newer["replay"][1].as_str().unwrap().contains("second"));
-        assert!(!newer["replay"][1].as_str().unwrap().contains("first"));
+        assert!(newer["replay"][1]["data"]["phase"] == "second");
+        assert_ne!(newer["replay"][1]["data"]["phase"], "first");
         let removed = merge(
             &newer,
             &serde_json::json!({"live":[

@@ -50,21 +50,40 @@ pub trait BrowserAdmission: Send + Sync + 'static {
     async fn admit(&self, headers: &HeaderMap, session: &str) -> Option<BrowserLease>;
 }
 
+/// Structured browser data on the Rust bridge. JSON text is produced only
+/// when this frame reaches a browser, never nested inside bridge strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserFrame {
+    pub event: String,
+    pub data: serde_json::Value,
+}
+impl BrowserFrame {
+    pub fn new(event: impl Into<String>, data: serde_json::Value) -> Self {
+        Self {
+            event: event.into(),
+            data,
+        }
+    }
+    pub fn to_sse(&self) -> String {
+        format!("event: {}\ndata: {}\n\n", self.event, self.data)
+    }
+}
+
 /// The connector publishes a complete replay plus the frames caused by
 /// its latest update. Browser reconnects receive `replay`; existing
-/// browsers receive only `live`. Both are the page's SSE-shaped frames.
+/// browsers receive only `live`. Both carry structured event data.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrowserFrames {
-    pub replay: Vec<String>,
+    pub replay: Vec<BrowserFrame>,
     #[serde(default)]
-    pub live: Vec<String>,
+    pub live: Vec<BrowserFrame>,
 }
 
 /// A publication contains only the new frames. The host applies them
 /// to its retained replay for later browsers and reconnects.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BrowserDelta {
-    pub live: Vec<String>,
+    pub live: Vec<BrowserFrame>,
 }
 
 impl BrowserFrames {
@@ -515,14 +534,15 @@ async fn pump(
     session: Arc<Session>,
     mut lease: BrowserLease,
 ) -> anyhow::Result<()> {
+    use hyper_tungstenite::tungstenite::Utf8Bytes;
     use std::collections::VecDeque;
 
     let (mut view, mut events) = session.subscribe_with_snapshot().await;
-    if view.snapshot.is_none() {
-        return Ok(());
-    }
     let (mut outgoing, mut incoming) = socket.split();
-    let mut queue: VecDeque<String> = replay(&view)?.into();
+    let mut queue: VecDeque<Utf8Bytes> = replay(&view)?.into_iter().map(Utf8Bytes::from).collect();
+    queue.push_back(connection_frame(view.connected).into());
+    // Utf8Bytes clones share storage: a Ping interrupting `feed` must
+    // not copy a complete large transcript on every retry.
     // `feed` can be cancelled before a frame is accepted. After it
     // succeeds, remove that frame exactly once and retry only `flush`,
     // which is safe to interrupt for revocation or peer input.
@@ -537,7 +557,7 @@ async fn pump(
                     // A Ping can queue an automatic Pong inside the sink.
                     Some(Ok(_)) => unflushed = true,
                 },
-                sent = outgoing.feed(hyper_tungstenite::tungstenite::Message::Text(frame.into())) => {
+                sent = outgoing.feed(hyper_tungstenite::tungstenite::Message::Text(frame)) => {
                     sent?;
                     queue.pop_front();
                     unflushed = true;
@@ -570,24 +590,27 @@ async fn pump(
                         let mut next = view.clone();
                         if bridge::apply_event(&mut next, event.clone()).is_err() {
                             (view, events) = session.subscribe_with_snapshot().await;
-                            if view.snapshot.is_none() { return Ok(()); }
-                            queue.extend(replay(&view)?);
+                            queue = replay(&view)?.into_iter().map(Utf8Bytes::from).collect();
+                            queue.push_back(connection_frame(view.connected).into());
                             continue;
                         }
                         if next.revision == view.revision { continue; }
                         view = next;
                         match event {
-                            SessionEvent::Snapshot { .. } => queue.extend(replay(&view)?),
+                            SessionEvent::Snapshot { .. } => {
+                                queue = replay(&view)?.into_iter().map(Utf8Bytes::from).collect();
+                                queue.push_back(connection_frame(view.connected).into());
+                            },
                             SessionEvent::Update { update, .. } => {
-                                queue.extend(serde_json::from_value::<BrowserDelta>(update.state)?.live);
+                                queue.extend(serde_json::from_value::<BrowserDelta>(update.state)?.live.into_iter().map(|frame| Utf8Bytes::from(frame.to_sse())));
                             }
-                            SessionEvent::Disconnected { .. } => return Ok(()),
+                            SessionEvent::Disconnected { .. } => queue.push_back(connection_frame(false).into()),
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         (view, events) = session.subscribe_with_snapshot().await;
-                        if view.snapshot.is_none() { return Ok(()); }
-                        queue.extend(replay(&view)?);
+                        queue = replay(&view)?.into_iter().map(Utf8Bytes::from).collect();
+                        queue.push_back(connection_frame(view.connected).into());
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 },
@@ -596,11 +619,19 @@ async fn pump(
     }
 }
 
+fn connection_frame(connected: bool) -> String {
+    BrowserFrame::new("connection", serde_json::json!({"connected":connected})).to_sse()
+}
+
 fn replay(view: &SessionView) -> anyhow::Result<Vec<String>> {
     let Some(snapshot) = &view.snapshot else {
         return Ok(Vec::new());
     };
-    Ok(BrowserFrames::from_state(&snapshot.state)?.replay)
+    Ok(BrowserFrames::from_state(&snapshot.state)?
+        .replay
+        .into_iter()
+        .map(|frame| frame.to_sse())
+        .collect())
 }
 
 fn reply(status: StatusCode, body: impl Into<Bytes>, content_type: &'static str) -> Reply {
@@ -634,12 +665,29 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     use super::{
-        BrowserAdmission, BrowserDelta, BrowserFrames, BrowserLease, WebService, same_origin,
-        valid_site_path,
+        BrowserAdmission, BrowserDelta, BrowserFrame, BrowserFrames, BrowserLease, WebService,
+        same_origin, valid_site_path,
     };
     use crate::assets::{BrowserAuth, PageOptions};
     use crate::bridge::{Action, ActionResult, Backend, Session, Snapshot, Update};
     use crate::request::{BrowserReply, BrowserRequest, Content};
+
+    async fn next_page_frame(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    > {
+        while let Some(message) = socket.next().await {
+            if matches!(&message, Ok(tokio_tungstenite::tungstenite::Message::Text(text)) if text.starts_with("event: connection\n"))
+            {
+                continue;
+            }
+            return Some(message);
+        }
+        None
+    }
 
     struct Admission(watch::Sender<bool>);
 
@@ -664,7 +712,10 @@ mod tests {
                 Snapshot {
                     sequence: 0,
                     state: serde_json::to_value(BrowserFrames {
-                        replay: vec!["event: status\ndata: {\"phase\":\"first\"}\n\n".into()],
+                        replay: vec![BrowserFrame::new(
+                            "status",
+                            serde_json::json!({"phase":"first"}),
+                        )],
                         live: vec![],
                     })
                     .unwrap(),
@@ -719,7 +770,10 @@ mod tests {
                 snapshot: TokioMutex::new(Snapshot {
                     sequence: 0,
                     state: serde_json::to_value(BrowserFrames {
-                        replay: vec!["event: status\ndata: {\"phase\":\"first\"}\n\n".into()],
+                        replay: vec![BrowserFrame::new(
+                            "status",
+                            serde_json::json!({"phase":"first"}),
+                        )],
                         live: vec![],
                     })
                     .unwrap(),
@@ -729,9 +783,9 @@ mod tests {
         }
 
         async fn publish(&self, sequence: usize, large: &str) {
-            let frame = format!(
-                "event: status\ndata: {}\n\n",
-                serde_json::json!({"sequence":sequence,"text":large})
+            let frame = BrowserFrame::new(
+                "status",
+                serde_json::json!({"sequence":sequence,"text":large}),
             );
             let mut snapshot = self.snapshot.lock().await;
             snapshot.sequence += 1;
@@ -775,7 +829,7 @@ mod tests {
 
     #[test]
     fn browser_frames_require_a_complete_replay() {
-        let state = serde_json::json!({"replay":["event: status\ndata: {}\n\n"],"live":[]});
+        let state = serde_json::json!({"replay":[{"event":"status","data":{}}],"live":[]});
         assert_eq!(BrowserFrames::from_state(&state).unwrap().replay.len(), 1);
         assert!(BrowserFrames::from_state(&serde_json::json!({"live":[]})).is_err());
     }
@@ -952,7 +1006,7 @@ mod tests {
         let (mut browser, _) = tokio_tungstenite::connect_async(browser_request)
             .await
             .unwrap();
-        let first = tokio::time::timeout(Duration::from_secs(3), browser.next())
+        let first = tokio::time::timeout(Duration::from_secs(3), next_page_frame(&mut browser))
             .await
             .unwrap()
             .unwrap()
@@ -963,12 +1017,15 @@ mod tests {
             .send(Update {
                 sequence: 1,
                 state: serde_json::to_value(BrowserDelta {
-                    live: vec!["event: status\ndata: {\"phase\":\"second\"}\n\n".into()],
+                    live: vec![BrowserFrame::new(
+                        "status",
+                        serde_json::json!({"phase":"second"}),
+                    )],
                 })
                 .unwrap(),
             })
             .unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(3), browser.next())
+        let second = tokio::time::timeout(Duration::from_secs(3), next_page_frame(&mut browser))
             .await
             .unwrap()
             .unwrap()
@@ -1089,7 +1146,7 @@ mod tests {
             .unwrap();
         assert!(unknown.starts_with("HTTP/1.1 502"), "{unknown}");
         assert!(unknown.contains("outcome_unknown"), "{unknown}");
-        let closed = tokio::time::timeout(Duration::from_secs(3), browser.next())
+        let closed = tokio::time::timeout(Duration::from_secs(3), next_page_frame(&mut browser))
             .await
             .unwrap();
         assert!(!matches!(
@@ -1211,7 +1268,7 @@ mod tests {
             .insert("origin", format!("http://{addr}").parse().unwrap());
         let (mut browser, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_secs(3), browser.next())
+            tokio::time::timeout(Duration::from_secs(3), next_page_frame(&mut browser))
                 .await
                 .unwrap()
                 .unwrap()
@@ -1386,7 +1443,7 @@ mod tests {
         .expect("revocation stops a browser even when its writes cannot flush");
         let graceful_close = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match browser.next().await {
+                match next_page_frame(&mut browser).await {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return true,
                     None | Some(Err(_)) => return false,
                     Some(Ok(_)) => {}

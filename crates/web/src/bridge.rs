@@ -11,54 +11,46 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
-pub const VERSION: u32 = 1;
-pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
+pub const VERSION: u32 = 2;
+// Only the pre-authentication JSON hello is bounded. Publications have no
+// logical-size ceiling; BULK_CHUNK_BYTES controls transport buffering.
+pub const MAX_BOOTSTRAP_BYTES: usize = 1024 * 1024;
 pub const MAX_UPLOAD_BYTES: usize = 12 * 1024 * 1024;
 pub const BULK_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Both peers must understand the binary schema; retrying cannot upgrade one.
+#[derive(Debug)]
+pub struct ProtocolMismatch(pub String);
+impl std::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "bridge protocol mismatch: {}; upgrade the connector and host together",
+            self.0
+        )
+    }
+}
+impl std::error::Error for ProtocolMismatch {}
+
+/// Configure the Rust connector socket. The pre-authentication hello is the
+/// largest physical message; admitted transfers use smaller 64 KiB blocks.
+/// These are transport buffers, never logical publication limits.
+pub fn websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(BULK_CHUNK_BYTES)
+        .write_buffer_size(0)
+        .max_message_size(Some(MAX_BOOTSTRAP_BYTES))
+        .max_frame_size(Some(MAX_BOOTSTRAP_BYTES))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BridgeFailure {
     pub code: String,
     pub why: String,
 }
-
-#[derive(Debug)]
-pub struct SnapshotTooLarge {
-    pub bytes: usize,
-}
-
-#[derive(Debug)]
-pub struct UpdateTooLarge {
-    pub bytes: usize,
-}
-
-impl std::fmt::Display for SnapshotTooLarge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "session snapshot is {} bytes, above the {}-byte bridge limit; reduce retained content before reconnecting",
-            self.bytes, MAX_CONTROL_BYTES
-        )
-    }
-}
-
-impl std::error::Error for SnapshotTooLarge {}
-
-impl std::fmt::Display for UpdateTooLarge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "session update is {} bytes, above the {}-byte bridge limit; reduce the content of this update before reconnecting",
-            self.bytes, MAX_CONTROL_BYTES
-        )
-    }
-}
-
-impl std::error::Error for UpdateTooLarge {}
 
 /// A state image and its last included update number. The backend must
 /// return this together with a subscription that cannot miss later updates.
@@ -69,12 +61,14 @@ pub struct Snapshot {
 }
 
 /// A subscriber's authoritative position. The revision orders every
-/// host publication, including a disconnect with no image. A browser
+/// host publication, including a disconnect retaining the last image. A browser
 /// can discard already included events from its receiver.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionView {
     pub revision: u64,
     pub generation: u64,
+    /// Whether the retained image belongs to a currently ready connector.
+    pub connected: bool,
     pub snapshot: Option<Snapshot>,
 }
 
@@ -133,6 +127,7 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
             }
             view.generation = generation;
             view.snapshot = Some(snapshot);
+            view.connected = true;
         }
         SessionEvent::Update {
             generation, update, ..
@@ -140,7 +135,8 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
             let Some(previous) = view.snapshot.as_mut() else {
                 return Err(());
             };
-            if view.generation != generation
+            if !view.connected
+                || view.generation != generation
                 || previous.sequence.checked_add(1) != Some(update.sequence)
             {
                 return Err(());
@@ -156,7 +152,7 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
                 return Err(());
             }
             view.generation = generation;
-            view.snapshot = None;
+            view.connected = false;
         }
     }
     view.revision = revision;
@@ -178,7 +174,7 @@ pub enum ActionResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Wire {
+pub(crate) enum Wire {
     Hello {
         version: u32,
         session: String,
@@ -215,6 +211,10 @@ enum Wire {
     UploadEnd {
         id: u64,
     },
+    UploadChunk {
+        bytes: Vec<u8>,
+    },
+    Resync,
     Result {
         id: u64,
         result: ActionResult,
@@ -223,7 +223,6 @@ enum Wire {
 
 enum Incoming {
     Control(Wire),
-    Binary(Vec<u8>),
 }
 
 enum Outgoing {
@@ -236,51 +235,12 @@ where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let text = serde_json::to_string(wire)?;
-    anyhow::ensure!(text.len() <= MAX_CONTROL_BYTES, "control message too large");
+    anyhow::ensure!(
+        text.len() <= MAX_BOOTSTRAP_BYTES,
+        "control message too large"
+    );
     socket.send(Message::Text(text.into())).await?;
     Ok(())
-}
-
-async fn send_snapshot<S>(socket: &mut S, snapshot: Snapshot) -> anyhow::Result<()>
-where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    let wire = Wire::Snapshot { snapshot };
-    let bytes = serde_json::to_vec(&wire)?.len();
-    if bytes > MAX_CONTROL_BYTES {
-        let error = SnapshotTooLarge { bytes };
-        let _ = send(
-            socket,
-            &Wire::Failure {
-                code: "snapshot_too_large".into(),
-                why: error.to_string(),
-            },
-        )
-        .await;
-        return Err(error.into());
-    }
-    send(socket, &wire).await
-}
-
-async fn send_update<S>(socket: &mut S, update: Update) -> anyhow::Result<()>
-where
-    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    let wire = Wire::Update { update };
-    let bytes = serde_json::to_vec(&wire)?.len();
-    if bytes > MAX_CONTROL_BYTES {
-        let error = UpdateTooLarge { bytes };
-        let _ = send(
-            socket,
-            &Wire::Failure {
-                code: "update_too_large".into(),
-                why: error.to_string(),
-            },
-        )
-        .await;
-        return Err(error.into());
-    }
-    send(socket, &wire).await
 }
 
 async fn receive<S>(socket: &mut S) -> anyhow::Result<Option<Incoming>>
@@ -299,13 +259,16 @@ where
         };
         match frame {
             Message::Text(text) => {
-                anyhow::ensure!(text.len() <= MAX_CONTROL_BYTES, "control message too large");
+                anyhow::ensure!(
+                    text.len() <= MAX_BOOTSTRAP_BYTES,
+                    "control message too large"
+                );
                 return Ok(Some(Incoming::Control(serde_json::from_str(&text)?)));
             }
             Message::Close(_) => return Ok(None),
             Message::Binary(bytes) => {
                 anyhow::ensure!(bytes.len() <= BULK_CHUNK_BYTES, "bulk chunk too large");
-                return Ok(Some(Incoming::Binary(bytes.to_vec())));
+                anyhow::bail!("binary transfer before bridge handshake");
             }
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
@@ -337,34 +300,52 @@ pub async fn connect(
     connect_signaled(endpoint, session, credential, backend, None).await
 }
 
+/// Latest connector readiness, rather than a queue of stale attachment acks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Connecting,
+    Ready,
+    Disconnected(String),
+}
+
 /// As `connect`, with a signal after the host acknowledges its first
 /// authoritative image. A parent can distinguish a listening child
-/// from a repo session that is actually attached.
+/// from a repo session that is actually attached. This function publishes
+/// Ready; the connection supervisor owns Connecting/Disconnected transitions
+/// when starting, reconnecting or stopping this future.
 pub async fn connect_signaled(
     endpoint: &str,
     session: &str,
     credential: &str,
     backend: Arc<dyn Backend>,
-    attached: Option<tokio::sync::mpsc::Sender<()>>,
+    attached: Option<tokio::sync::watch::Sender<ConnectionStatus>>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !session.is_empty() && session.len() <= 128,
         "invalid session handle"
     );
-    let (socket, _) = tokio_tungstenite::connect_async(endpoint).await?;
+    // Only connection establishment has a deadline, before publication bytes.
+    let (socket, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio_tungstenite::connect_async_with_config(endpoint, Some(websocket_config()), false),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connector WebSocket establishment timed out"))??;
     run_connector(socket, session, credential, backend, attached).await
 }
 
-async fn run_connector(
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+async fn run_connector<S>(
+    mut socket: WebSocketStream<S>,
     session: &str,
     credential: &str,
     backend: Arc<dyn Backend>,
-    attached: Option<tokio::sync::mpsc::Sender<()>>,
-) -> anyhow::Result<()> {
-    let (mut outgoing, mut incoming) = socket.split();
+    attached: Option<tokio::sync::watch::Sender<ConnectionStatus>>,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     send(
-        &mut outgoing,
+        &mut socket,
         &Wire::Hello {
             version: VERSION,
             session: session.to_owned(),
@@ -372,72 +353,104 @@ async fn run_connector(
         },
     )
     .await?;
-    match receive(&mut incoming).await? {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), receive(&mut socket))
+        .await
+        .map_err(|_| anyhow::anyhow!("host did not answer the protocol handshake"))??
+    {
         Some(Incoming::Control(Wire::Ready { version: VERSION })) => {}
+        Some(Incoming::Control(Wire::Ready { version })) => {
+            return Err(
+                ProtocolMismatch(format!("host uses {version}, connector uses {VERSION}")).into(),
+            );
+        }
         Some(Incoming::Control(Wire::Refused { why })) => {
+            if why.starts_with("protocol version") {
+                return Err(ProtocolMismatch(why).into());
+            }
             anyhow::bail!("connection refused: {why}")
         }
         _ => anyhow::bail!("server did not accept the session protocol"),
     }
+    let mut transport = crate::bridge_transport::Connection::new(socket);
     let (snapshot, mut updates) = backend.subscribe_with_snapshot().await;
     let mut last = snapshot.sequence;
-    send_snapshot(&mut outgoing, snapshot).await?;
-    match receive(&mut incoming).await? {
-        Some(Incoming::Control(Wire::Applied { sequence })) if sequence == last => {
+    transport.send(Wire::Snapshot { snapshot }).await?;
+    match transport.recv().await? {
+        Some(Wire::Applied { sequence }) if sequence == last => {
             if let Some(attached) = attached {
-                let _ = attached.try_send(());
+                attached.send_replace(ConnectionStatus::Ready);
             }
         }
         _ => anyhow::bail!("host did not acknowledge the initial snapshot"),
     }
     let mut upload: Option<(u64, String, usize, Vec<u8>)> = None;
-    loop {
+    let sender = transport.outbound.clone();
+    let mut pending = std::collections::VecDeque::new();
+    let mut in_flight = None;
+    let result = async { loop {
         tokio::select! {
-            update = updates.recv() => match update {
+            permit = sender.reserve(), if !pending.is_empty() => {
+                permit.map_err(|_| anyhow::anyhow!("bridge disconnected"))?.send(pending.pop_front().unwrap());
+            }
+            update = updates.recv(), if pending.is_empty() && in_flight.is_none() => match update {
                 Ok(update) if update.sequence <= last => {}
-                Ok(update) if update.sequence == last + 1 => {
+                Ok(update) if Some(update.sequence) == last.checked_add(1) => {
                     last = update.sequence;
-                    send_update(&mut outgoing, update).await?;
+                    in_flight = Some(last);
+                    pending.push_back(Wire::Update { update });
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                     let (snapshot, replacement) = backend.subscribe_with_snapshot().await;
                     last = snapshot.sequence;
                     updates = replacement;
-                    send_snapshot(&mut outgoing, snapshot).await?;
+                    in_flight = Some(last);
+                    pending.push_back(Wire::Snapshot { snapshot });
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
-            message = receive(&mut incoming) => match message? {
-                Some(Incoming::Control(Wire::Request { id, action })) => {
+            // One unsent result/publication owns the pending slot.
+            message = transport.recv(), if pending.is_empty() => match message? {
+                Some(Wire::Request { id, action }) => {
                     let result = backend.dispatch(action).await;
-                    send(&mut outgoing, &Wire::Result { id, result }).await?;
+                    pending.push_back(Wire::Result { id, result });
                 }
-                Some(Incoming::Control(Wire::UploadBegin { id, media_type, size })) => {
+                Some(Wire::UploadBegin { id, media_type, size }) => {
+                    anyhow::ensure!(upload.is_none(), "upload already in progress");
                     anyhow::ensure!(size > 0 && size <= MAX_UPLOAD_BYTES, "invalid upload size");
                     anyhow::ensure!(media_type.len() <= 256, "invalid upload media type");
                     upload = Some((id, media_type, size, Vec::with_capacity(size)));
                 }
-                Some(Incoming::Binary(chunk)) => {
+                Some(Wire::UploadChunk { bytes: chunk }) => {
                     let Some((_, _, size, bytes)) = upload.as_mut() else {
                         anyhow::bail!("upload chunk without a begin message");
                     };
                     anyhow::ensure!(bytes.len() + chunk.len() <= *size, "upload exceeded declared size");
                     bytes.extend_from_slice(&chunk);
                 }
-                Some(Incoming::Control(Wire::UploadEnd { id })) => {
+                Some(Wire::UploadEnd { id }) => {
                     let Some((begin_id, media_type, size, bytes)) = upload.take() else {
                         anyhow::bail!("upload ended without a begin message");
                     };
                     anyhow::ensure!(id == begin_id && bytes.len() == size, "incomplete upload");
                     let result = backend.upload(media_type, bytes).await;
-                    send(&mut outgoing, &Wire::Result { id, result }).await?;
+                    pending.push_back(Wire::Result { id, result });
                 }
-                Some(Incoming::Control(Wire::Applied { .. })) => {}
+                Some(Wire::Applied { sequence }) => {
+                    if in_flight == Some(sequence) { in_flight = None; }
+                }
+                Some(Wire::Resync) => {
+                    let (snapshot, replacement) = backend.subscribe_with_snapshot().await;
+                    last = snapshot.sequence; updates = replacement;
+                    in_flight = Some(last);
+                    pending.push_back(Wire::Snapshot { snapshot });
+                }
                 None => return Ok(()),
                 _ => anyhow::bail!("unexpected host message"),
             },
         }
-    }
+    } }.await;
+    transport.shutdown().await;
+    result
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -448,6 +461,7 @@ pub enum CallError {
 
 struct State {
     active: bool,
+    ready: bool,
     snapshot: Option<Snapshot>,
     generation: u64,
     revision: u64,
@@ -473,6 +487,7 @@ impl Session {
             handle: handle.into(),
             state: Mutex::new(State {
                 active: false,
+                ready: false,
                 snapshot: None,
                 generation: 0,
                 revision: 0,
@@ -501,6 +516,7 @@ impl Session {
             SessionView {
                 revision: state.revision,
                 generation: state.generation,
+                connected: state.ready,
                 snapshot: state.snapshot.clone(),
             },
             receiver,
@@ -508,11 +524,7 @@ impl Session {
     }
 
     pub async fn connected(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .snapshot
-            .is_some()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).ready
     }
 
     pub async fn failure(&self) -> Option<BridgeFailure> {
@@ -526,7 +538,7 @@ impl Session {
     pub async fn call(&self, action: Action) -> Result<ActionResult, CallError> {
         let (id, outbound, answer) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.snapshot.is_none() {
+            if !state.active || !state.ready {
                 return Err(CallError::Disconnected);
             }
             let outbound = state.outbound.clone().ok_or(CallError::Disconnected)?;
@@ -566,7 +578,7 @@ impl Session {
         let _upload = self.upload_gate.lock().await;
         let (id, outbound, answer) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.snapshot.is_none() {
+            if !state.active || !state.ready {
                 return Err(CallError::Disconnected);
             }
             let outbound = state.outbound.clone().ok_or(CallError::Disconnected)?;
@@ -614,18 +626,16 @@ impl Session {
     /// supplies the credential check independently of browser auth.
     pub async fn accept<S, F, Fut>(
         self: Arc<Self>,
-        socket: WebSocketStream<S>,
+        mut socket: WebSocketStream<S>,
         admit: F,
     ) -> anyhow::Result<()>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         F: Fn(String, String) -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
-        let (mut outgoing, mut incoming) = socket.split();
-        let hello =
-            tokio::time::timeout(std::time::Duration::from_secs(10), receive(&mut incoming))
-                .await??;
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(10), receive(&mut socket))
+            .await??;
         let (session, credential) = match hello {
             Some(Incoming::Control(Wire::Hello {
                 version: VERSION,
@@ -634,9 +644,9 @@ impl Session {
             })) => (session, credential),
             _ => {
                 send(
-                    &mut outgoing,
+                    &mut socket,
                     &Wire::Refused {
-                        why: "protocol version or handshake mismatch".into(),
+                        why: format!("protocol version or handshake mismatch; host requires {VERSION}; upgrade the connector and host together"),
                     },
                 )
                 .await?;
@@ -645,7 +655,7 @@ impl Session {
         };
         if session != self.handle || !admit(session.clone(), credential).await {
             send(
-                &mut outgoing,
+                &mut socket,
                 &Wire::Refused {
                     why: "session admission refused".into(),
                 },
@@ -660,15 +670,15 @@ impl Session {
                 None
             } else {
                 state.active = true;
+                state.ready = false;
                 state.generation += 1;
-                state.snapshot = None;
                 state.outbound = Some(tx);
                 Some(state.generation)
             }
         };
         let Some(generation) = generation else {
             send(
-                &mut outgoing,
+                &mut socket,
                 &Wire::Refused {
                     why: "session already connected".into(),
                 },
@@ -681,45 +691,61 @@ impl Session {
             generation,
         };
         let result = async {
-            send(&mut outgoing, &Wire::Ready { version: VERSION }).await?;
-            loop {
+            send(&mut socket, &Wire::Ready { version: VERSION }).await?;
+            let mut transport = crate::bridge_transport::Connection::new(socket);
+            let sender = transport.outbound.clone();
+            let mut pending = std::collections::VecDeque::new();
+            let run = async { loop {
                 tokio::select! {
-                    outbound = rx.recv() => match outbound {
-                        Some(Outgoing::Control(wire)) => send(&mut outgoing, &wire).await?,
-                        Some(Outgoing::Binary(bytes)) => outgoing.send(Message::Binary(bytes.into())).await?,
+                    permit = sender.reserve(), if !pending.is_empty() => {
+                        permit.map_err(|_| anyhow::anyhow!("bridge disconnected"))?.send(pending.pop_front().unwrap());
+                    }
+                    outbound = rx.recv(), if pending.is_empty() => match outbound {
+                        Some(Outgoing::Control(wire)) => pending.push_back(wire),
+                        Some(Outgoing::Binary(bytes)) => pending.push_back(Wire::UploadChunk { bytes }),
                         None => return Ok(()),
                     },
-                    inbound = receive(&mut incoming) => match inbound? {
-                        Some(Incoming::Control(Wire::Snapshot { snapshot })) => {
+                    // One queued request plus one publication acknowledgement.
+                    inbound = transport.recv(), if pending.len() < 2 => match inbound? {
+                        Some(Wire::Snapshot { snapshot }) => {
                             let sequence = snapshot.sequence;
                             {
                                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                                if state.ready {
+                                    anyhow::ensure!(state.snapshot.as_ref().is_none_or(|previous| snapshot.sequence >= previous.sequence), "snapshot moved backwards within a connection");
+                                }
                                 state.failure = None;
+                                state.ready = true;
                                 state.revision += 1;
                                 state.snapshot = Some(snapshot.clone());
                                 let _ = self.events.send(SessionEvent::Snapshot { revision: state.revision, generation, snapshot });
                             }
-                            send(&mut outgoing, &Wire::Applied { sequence }).await?;
+                            pending.push_back(Wire::Applied { sequence });
                         }
-                        Some(Incoming::Control(Wire::Update { update })) => {
+                        Some(Wire::Update { update }) => {
                             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                            anyhow::ensure!(state.ready, "session update before current snapshot");
                             let Some(previous) = state.snapshot.as_ref() else {
                                 anyhow::bail!("session update before snapshot");
                             };
                             if previous.sequence.checked_add(1) != Some(update.sequence) {
-                                anyhow::bail!("session update sequence gap");
+                                drop(state);
+                                pending.push_back(Wire::Resync);
+                                continue;
                             }
                             let merged = crate::replay::merge(&previous.state, &update.state)?;
                             state.revision += 1;
                             state.snapshot = Some(Snapshot { sequence: update.sequence, state: merged });
+                            let sequence = update.sequence;
                             let _ = self.events.send(SessionEvent::Update { revision: state.revision, generation, update });
+                            pending.push_back(Wire::Applied { sequence });
                         }
-                        Some(Incoming::Control(Wire::Result { id, result })) => {
+                        Some(Wire::Result { id, result }) => {
                             if let Some(pending) = self.state.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(&id) {
                                 let _ = pending.send(result);
                             }
                         }
-                        Some(Incoming::Control(Wire::Failure { code, why })) => {
+                        Some(Wire::Failure { code, why }) => {
                             self.state.lock().unwrap_or_else(|e| e.into_inner()).failure = Some(BridgeFailure { code, why: why.clone() });
                             anyhow::bail!("connector failed: {why}");
                         }
@@ -727,7 +753,9 @@ impl Session {
                         _ => anyhow::bail!("unexpected connector message"),
                     },
                 }
-            }
+            } }.await;
+            transport.shutdown().await;
+            run
         }.await;
         result
     }
@@ -745,7 +773,7 @@ impl Drop for ConnectionGuard {
         let mut state = self.session.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.generation == self.generation {
             state.active = false;
-            state.snapshot = None;
+            state.ready = false;
             state.outbound = None;
             state.pending.clear();
             state.revision += 1;
@@ -770,5 +798,313 @@ impl Drop for PendingGuard<'_> {
             .unwrap_or_else(|e| e.into_inner())
             .pending
             .remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    async fn admitted(
+        session: Arc<Session>,
+    ) -> (
+        WebSocketStream<DuplexStream>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (a, b) = tokio::io::duplex(BULK_CHUNK_BYTES * 2);
+        let socket = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
+        let host = tokio::spawn(session.accept(socket, |_, _| async { true }));
+        let mut peer = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
+        send(
+            &mut peer,
+            &Wire::Hello {
+                version: VERSION,
+                session: "test".into(),
+                credential: "local-fixture".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive(&mut peer).await.unwrap(),
+            Some(Incoming::Control(Wire::Ready { version: VERSION }))
+        ));
+        (peer, host)
+    }
+    async fn frame(
+        peer: &mut WebSocketStream<DuplexStream>,
+        tag: u8,
+        id: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) {
+        let mut packet = vec![tag];
+        packet.extend_from_slice(&id.to_le_bytes());
+        packet.extend_from_slice(&offset.to_le_bytes());
+        packet.extend_from_slice(bytes);
+        peer.send(Message::Binary(packet.into())).await.unwrap();
+    }
+    #[tokio::test]
+    async fn an_unfinished_image_cannot_replace_the_committed_image() {
+        for corrupt in [false, true] {
+            let session = Arc::new(Session::new("test"));
+            let (mut peer, host) = admitted(session.clone()).await;
+            let previous = Snapshot {
+                sequence: 0,
+                state: serde_json::json!({"text":"committed"}),
+            };
+            let mut bytes = Vec::new();
+            crate::bridge_codec::encode(
+                &mut bytes,
+                &Wire::Snapshot {
+                    snapshot: previous.clone(),
+                },
+            )
+            .unwrap();
+            frame(&mut peer, 0, 1, 0, &[]).await;
+            frame(&mut peer, 1, 1, 0, &bytes).await;
+            frame(&mut peer, 2, 1, bytes.len() as u64, &[]).await;
+            // Drain the complete Applied transfer; host publication precedes it.
+            for _ in 0..3 {
+                peer.next().await.unwrap().unwrap();
+            }
+            assert!(session.connected().await);
+            let mut candidate = Vec::new();
+            crate::bridge_codec::encode(
+                &mut candidate,
+                &Wire::Update {
+                    update: Update {
+                        sequence: 1,
+                        state: serde_json::json!({"text":"x".repeat(3 * BULK_CHUNK_BYTES)}),
+                    },
+                },
+            )
+            .unwrap();
+            frame(&mut peer, 0, 2, 0, &[]).await;
+            for (index, block) in candidate.chunks(BULK_CHUNK_BYTES).enumerate() {
+                frame(&mut peer, 1, 2, (index * BULK_CHUNK_BYTES) as u64, block).await;
+            }
+            if corrupt {
+                frame(&mut peer, 2, 2, candidate.len() as u64 + 1, &[]).await;
+            } else {
+                // Seeing the Pong proves the reader staged all preceding Data,
+                // including a spilled file, without publishing those bytes.
+                peer.send(Message::Ping(vec![1].into())).await.unwrap();
+                assert!(matches!(
+                    peer.next().await.unwrap().unwrap(),
+                    Message::Pong(_)
+                ));
+                assert_eq!(
+                    session.subscribe_with_snapshot().await.0.snapshot,
+                    Some(previous.clone())
+                );
+                drop(peer);
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), host)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), corrupt, "{result:?}");
+            assert!(!session.connected().await);
+            assert_eq!(
+                session.subscribe_with_snapshot().await.0.snapshot,
+                Some(previous)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn a_host_gap_requests_resync_and_old_snapshots_cannot_move_it_backwards() {
+        let session = Arc::new(Session::new("test"));
+        let (peer, host) = admitted(session.clone()).await;
+        let mut peer = crate::bridge_transport::Connection::new(peer);
+        peer.send(Wire::Snapshot {
+            snapshot: Snapshot {
+                sequence: 0,
+                state: serde_json::json!({"status":"first"}),
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            peer.recv().await.unwrap(),
+            Some(Wire::Applied { sequence: 0 })
+        );
+        peer.send(Wire::Update {
+            update: Update {
+                sequence: 2,
+                state: serde_json::json!({"status":"gap"}),
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(peer.recv().await.unwrap(), Some(Wire::Resync));
+        assert_eq!(
+            session
+                .subscribe_with_snapshot()
+                .await
+                .0
+                .snapshot
+                .unwrap()
+                .sequence,
+            0
+        );
+        peer.send(Wire::Snapshot {
+            snapshot: Snapshot {
+                sequence: 3,
+                state: serde_json::json!({"status":"current"}),
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            peer.recv().await.unwrap(),
+            Some(Wire::Applied { sequence: 3 })
+        );
+        peer.send(Wire::Snapshot {
+            snapshot: Snapshot {
+                sequence: 1,
+                state: serde_json::json!({"status":"old"}),
+            },
+        })
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), host)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            session
+                .subscribe_with_snapshot()
+                .await
+                .0
+                .snapshot
+                .unwrap()
+                .sequence,
+            3
+        );
+        peer.shutdown().await;
+    }
+    #[tokio::test]
+    async fn old_connectors_get_an_upgrade_refusal_before_authentication() {
+        let session = Arc::new(Session::new("test"));
+        let (a, b) = tokio::io::duplex(4096);
+        let socket = WebSocketStream::from_raw_socket(a, Role::Server, None).await;
+        let host = tokio::spawn(session.accept(socket, |_, _| async {
+            panic!("unsupported protocol must not reach admission")
+        }));
+        let mut peer = WebSocketStream::from_raw_socket(b, Role::Client, None).await;
+        send(
+            &mut peer,
+            &Wire::Hello {
+                version: 1,
+                session: "test".into(),
+                credential: "unused".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let Some(Incoming::Control(Wire::Refused { why })) = receive(&mut peer).await.unwrap()
+        else {
+            panic!("missing refusal")
+        };
+        assert!(why.contains("upgrade"));
+        assert!(host.await.unwrap().is_err());
+    }
+    #[tokio::test]
+    async fn a_slow_publication_uses_credit_and_coalesces_broadcast_lag() {
+        struct Source {
+            state: Mutex<Snapshot>,
+            updates: broadcast::Sender<Update>,
+        }
+        #[async_trait]
+        impl Backend for Source {
+            async fn subscribe_with_snapshot(&self) -> (Snapshot, broadcast::Receiver<Update>) {
+                let receiver = self.updates.subscribe();
+                (self.state.lock().unwrap().clone(), receiver)
+            }
+            async fn dispatch(&self, _: Action) -> ActionResult {
+                unreachable!()
+            }
+        }
+        impl Source {
+            fn publish(&self, sequence: u64, text: &str) {
+                let mut state = self.state.lock().unwrap();
+                *state = Snapshot {
+                    sequence,
+                    state: serde_json::json!({"text":text,"sequence":sequence}),
+                };
+                let _ = self.updates.send(Update {
+                    sequence,
+                    state: state.state.clone(),
+                });
+            }
+        }
+        let (updates, _) = broadcast::channel(2);
+        let source = Arc::new(Source {
+            state: Mutex::new(Snapshot {
+                sequence: 0,
+                state: serde_json::Value::Null,
+            }),
+            updates,
+        });
+        let (a, b) = tokio::io::duplex(BULK_CHUNK_BYTES);
+        let socket = WebSocketStream::from_raw_socket(a, Role::Client, None).await;
+        let mut host = WebSocketStream::from_raw_socket(b, Role::Server, None).await;
+        let backend = source.clone();
+        let connector =
+            tokio::spawn(
+                async move { run_connector(socket, "test", "fixture", backend, None).await },
+            );
+        assert!(matches!(
+            receive(&mut host).await.unwrap(),
+            Some(Incoming::Control(Wire::Hello {
+                version: VERSION,
+                ..
+            }))
+        ));
+        send(&mut host, &Wire::Ready { version: VERSION })
+            .await
+            .unwrap();
+        let mut host = crate::bridge_transport::Connection::new(host);
+        assert!(matches!(
+            host.recv().await.unwrap(),
+            Some(Wire::Snapshot {
+                snapshot: Snapshot { sequence: 0, .. }
+            })
+        ));
+        host.send(Wire::Applied { sequence: 0 }).await.unwrap();
+        let large = "x".repeat(2 * 1024 * 1024);
+        source.publish(1, &large);
+        assert!(matches!(
+            host.recv().await.unwrap(),
+            Some(Wire::Update {
+                update: Update { sequence: 1, .. }
+            })
+        ));
+        // Withhold publication credit while filling a two-slot broadcast.
+        // No encoder/transfer queue grows with these twenty updates.
+        for sequence in 2..=20 {
+            source.publish(sequence, &large);
+        }
+        host.send(Wire::Applied { sequence: 1 }).await.unwrap();
+        let fresh = tokio::time::timeout(std::time::Duration::from_secs(5), host.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(Wire::Snapshot { snapshot }) = fresh else {
+            panic!("lag must replace the backlog with one snapshot")
+        };
+        assert_eq!(snapshot.sequence, 20);
+        assert_eq!(snapshot.state["text"], large);
+        host.send(Wire::Applied { sequence: 20 }).await.unwrap();
+        host.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), connector)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

@@ -5,6 +5,8 @@
 
 pub mod assets;
 pub mod bridge;
+mod bridge_codec;
+mod bridge_transport;
 mod replay;
 pub mod request;
 pub mod service;

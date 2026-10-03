@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use clank_web::bridge::{Action, ActionResult, Backend, MAX_CONTROL_BYTES, Snapshot, Update};
+use clank_web::bridge::{Action, ActionResult, Backend, Snapshot, Update};
 use clank_web::request::{BrowserReply, BrowserRequest, Content};
 use tokio::sync::{broadcast, watch};
 
@@ -265,13 +265,10 @@ impl Backend for RepoSession {
                 };
             }
         };
-        let mut reply = self.execute(request).await;
-        let mut value = reply.clone().into_value();
-        if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() >= MAX_CONTROL_BYTES / 2) {
-            reply = plain(413, "repo response is too large for the control channel");
-            value = reply.into_value();
+        let reply = self.execute(request).await;
+        ActionResult::Completed {
+            value: reply.into_value(),
         }
-        ActionResult::Completed { value }
     }
 
     async fn upload(&self, media_type: String, bytes: Vec<u8>) -> ActionResult {

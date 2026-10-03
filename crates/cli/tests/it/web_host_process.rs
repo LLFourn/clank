@@ -137,8 +137,8 @@ impl Repo {
     }
 }
 
-fn frame(event: &str, value: serde_json::Value) -> String {
-    format!("event: {event}\ndata: {value}\n\n")
+fn frame(event: &str, value: serde_json::Value) -> clank_web::service::BrowserFrame {
+    clank_web::service::BrowserFrame::new(event, value)
 }
 
 #[async_trait]
@@ -224,7 +224,8 @@ async fn a_crashed_child_closes_the_connector_without_stopping_the_repo_backend(
     let credential = ready["credential"].as_str().unwrap().to_owned();
     let repo = Arc::new(Repo::new(root.path().to_path_buf()));
     let connector_repo = repo.clone();
-    let (attached, mut attachment) = tokio::sync::mpsc::channel(1);
+    let (attached, mut attachment) =
+        tokio::sync::watch::channel(clank_web::bridge::ConnectionStatus::Connecting);
     let connector = tokio::spawn(async move {
         clank_web::bridge::connect_signaled(
             &endpoint,
@@ -235,7 +236,7 @@ async fn a_crashed_child_closes_the_connector_without_stopping_the_repo_backend(
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), attachment.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(5), attachment.changed())
         .await
         .unwrap()
         .expect("repo attached before the crash");
@@ -487,11 +488,14 @@ async fn feature_parity() {
     let (mut browser, _) = tokio_tungstenite::connect_async(browser).await.unwrap();
     let mut initial = Vec::new();
     for _ in 0..4 {
-        let message = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_page_frame(&mut browser),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         initial.push(message.to_text().unwrap().to_owned());
     }
     assert!(initial.iter().any(|frame| frame.contains("ready")));
@@ -501,35 +505,44 @@ async fn feature_parity() {
         "pane",
         serde_json::json!({"pane_id":"terminal_1","screen":"live terminal"}),
     );
-    let live = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        next_page_frame(&mut browser),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     assert!(live.to_text().unwrap().contains("live terminal"));
 
     // A reread replaces a transcript window, then a new harness session
     // replaces it again. Both changes cross the connector as live frames.
     repo.rebind("s1", 2, "rolled-turn").await;
-    let rolled = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .to_text()
-        .unwrap()
-        .to_owned();
+    let rolled = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        next_page_frame(&mut browser),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+    .to_text()
+    .unwrap()
+    .to_owned();
     assert!(rolled.contains("rolled-turn") && rolled.contains("\"generation\":2"));
     assert!(!rolled.contains("old-turn"));
     repo.rebind("s2", 0, "new-session-turn").await;
-    let rebound = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .to_text()
-        .unwrap()
-        .to_owned();
+    let rebound = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        next_page_frame(&mut browser),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap()
+    .to_text()
+    .unwrap()
+    .to_owned();
     assert!(rebound.contains("new-session-turn") && rebound.contains("\"session\":\"s2\""));
     assert!(!rebound.contains("rolled-turn"));
 
@@ -794,11 +807,14 @@ async fn feature_parity() {
         .unwrap();
     let mut replay = Vec::new();
     for _ in 0..4 {
-        let message = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_page_frame(&mut browser),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         replay.push(message.to_text().unwrap().to_owned());
     }
     assert!(replay.iter().any(|frame| frame.contains("old terminal")));
@@ -938,11 +954,14 @@ async fn feature_parity() {
         .await
         .unwrap();
     for _ in 0..4 {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_page_frame(&mut browser),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
 
     let state: serde_json::Value = client
@@ -964,9 +983,12 @@ async fn feature_parity() {
             .unwrap();
         assert!(revoked.status().is_success());
     }
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(3), browser.next())
-        .await
-        .unwrap();
+    let closed = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        next_page_frame(&mut browser),
+    )
+    .await
+    .unwrap();
     assert!(!matches!(
         closed,
         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))
@@ -989,4 +1011,20 @@ async fn feature_parity() {
         .unwrap()
         .unwrap();
     let _ = reconnected.await;
+}
+
+async fn next_page_frame(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
+{
+    while let Some(message) = socket.next().await {
+        if matches!(&message, Ok(tokio_tungstenite::tungstenite::Message::Text(text)) if text.starts_with("event: connection\n"))
+        {
+            continue;
+        }
+        return Some(message);
+    }
+    None
 }

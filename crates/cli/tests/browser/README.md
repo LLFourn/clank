@@ -11,9 +11,14 @@ cd crates/cli/tests/browser
 npm install playwright
 npx playwright install chromium     # or set CLANK_CHROMIUM to a build you have
 node check.js
+node bridge.js
 ```
 
-`check.js` covers the header, the picker and the draft; `look.js`
+`check.js` covers the header, the picker and the draft; `bridge.js` covers multi-megabyte frames, full retained transcript display,
+connection notices and recovery on the same socket. Its synthetic browser
+check complements `large_harness_turns_reach_a_browser_and_survive_connector_outages`,
+which drives the real harness parser, Feed, RepoSession, bridge and browser socket.
+`look.js`
 covers the rendered transcript — markdown, tool grouping, the measure
 and the two grounds.
 
