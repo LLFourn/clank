@@ -82,6 +82,7 @@ pub(crate) const DISPLAY_CAP: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Transport {
+    Timer,
     Poll,
     Relay,
     /// A line a command source's producer printed
@@ -103,6 +104,7 @@ pub(crate) enum Transport {
 impl Transport {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Transport::Timer => "timer",
             Transport::Poll => "poll",
             Transport::Relay => "relay",
             Transport::Command => "command",
@@ -821,6 +823,55 @@ impl EventLog {
     pub(crate) fn read_rows(&self) -> std::io::Result<Option<ReadRows>> {
         let _lock = SidecarLock::acquire(&self.lock_path, false).ok();
         self.read_rows_unlocked()
+    }
+
+    /// All retained producer IDs, without the replay cursor's horizon. Native
+    /// timers checkpoint this evidence before permitting compaction. Unknown
+    /// semantics or corruption cannot authorize a fresh occurrence.
+    pub(crate) fn retained_timer_ids(&self) -> std::io::Result<Vec<String>> {
+        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        let text = match std::fs::read_to_string(&self.log_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let lines = Self::parse(&text)
+            .map_err(|_| std::io::Error::other("corrupt timer WAL; repair required"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        for line in lines {
+            match line {
+                Line::Known(record) => match *record {
+                    Record::Inbox {
+                        transport: Transport::Timer,
+                        feed_id: Some(id),
+                        item:
+                            WaitItem::TimerEvent {
+                                id: ref item_id, ..
+                            },
+                        ..
+                    } if &id == item_id => {
+                        ids.insert(id);
+                    }
+                    Record::Obs {
+                        feed_id: Some(id), ..
+                    } => {
+                        ids.insert(id);
+                    }
+                    Record::Ack { reply: None, .. } => {}
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "unexpected timer WAL semantics; repair required",
+                        ));
+                    }
+                },
+                Line::Foreign { .. } => {
+                    return Err(std::io::Error::other(
+                        "foreign timer WAL record; repair required",
+                    ));
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
     }
 
     fn read_rows_unlocked(&self) -> std::io::Result<Option<ReadRows>> {

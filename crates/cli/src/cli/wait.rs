@@ -289,6 +289,32 @@ async fn items_with_policy(
     };
     binding.ensure_current(&repo, &author)?;
 
+    let events_dir = crate::agent_store::agents_root(&repo)
+        .join(author.as_str())
+        .join("events");
+    // Mint once before native acceptance; preserve it through shared fallback.
+    let invocation =
+        (!args.peek).then(|| clank_core::pr_review::PrReviewState::new_instance().to_string());
+    let (source_tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut timers = if args.peek {
+        None
+    } else {
+        let mut timers = crate::cli::timer_source::TimerSet::new(
+            &event_sources,
+            &events_dir,
+            invocation.as_deref(),
+            source_tx.clone().into(),
+        )?;
+        timers.due();
+        Some(timers)
+    };
+    let invocation_keys = timers
+        .as_ref()
+        .map(|timers| timers.invocation_keys().clone())
+        .unwrap_or_default();
+    let mut timer_backlog =
+        crate::cli::timer_source::Backlog::new(events_dir.clone(), invocation_keys);
+
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
     } else {
@@ -313,13 +339,16 @@ async fn items_with_policy(
     };
     {
         let items = present_with_blocks(check_blocks(&repo, &author), || {
-            items_for(
+            let mut owed = items_for(
                 &repo,
                 &author,
                 &inputs,
                 &initial_status,
                 &initial_state.fold,
-            )
+            );
+            owed.events
+                .extend(timer_backlog.owed(&mut Default::default()));
+            owed
         });
         if !items.is_empty() {
             binding.ensure_current(&repo, &author)?;
@@ -338,12 +367,9 @@ async fn items_with_policy(
     // every parked wait used to attach its own watcher and refold on
     // every change, measured at 98 of them for 71 agents.
     //
-    // Only when this wait has NO extra sources. The monitor delivers
-    // the projection; it does not yet run `wait_events` or draft
-    // watches, so a wait with github, command or derived draft sources
-    // must keep watching for itself or it would simply never hear from
-    // them. Moving those to the monitor is the next step, and until
-    // then this guard is what makes sharing safe rather than lossy.
+    // The monitor hosts configured sources. Invocation sources and derived
+    // draft watches remain local, so share only when that host covers this
+    // wait's complete source scope.
     //
     // Derived BEFORE the decision, and the same value is what the park
     // below spawns: a source the decision cannot see is a source
@@ -370,7 +396,13 @@ async fn items_with_policy(
     // skipped in poll mode — the heartbeat tick below covers git then).
     // Same producer `clank status` uses, so the panel and this loop wake
     // on the same changes.
-    let _watcher = crate::repo_watch::RepoStateWatcher::attach(&repo, poll_mode, tx)?;
+    let timer_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _watcher = crate::repo_watch::RepoStateWatcher::attach_with_timer_invalidation(
+        &repo,
+        poll_mode,
+        tx,
+        Some(timer_dirty.clone()),
+    )?;
 
     // Refold cadence. Native mode uses a 1.5s heartbeat as the
     // finalize-race safety net (the watcher carries the load).
@@ -389,26 +421,18 @@ async fn items_with_policy(
     // initial pass above returns without them) and are cancelled AND
     // joined on every return path below.
     let mut beat = Beat::bridge(rx);
-    let events_dir = crate::agent_store::agents_root(&repo)
-        .join(author.as_str())
-        .join("events");
-    // ONE invocation, this park: what scopes a `--event` source's
-    // durable state away from the author's configured ones and away
-    // from any other invocation of the same name.
-    let invocation = clank_core::pr_review::PrReviewState::new_instance().to_string();
     // The source-start boundary. Recorded here rather than inside
     // `EventSources::spawn`, because the claim under test is about this
     // PATH reaching it, not about that function's own behaviour.
     starts.record();
-    let (tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
     let spawned = EventSources::spawn(
         &sources.events,
         Some(&events_dir),
         &repo,
         &author,
         &sources.drafts,
-        Some(&invocation),
-        tx.into(),
+        invocation.as_deref(),
+        source_tx.into(),
     );
     // Once the source channel closes (every source task finished, or
     // there were none), its `recv()` is permanently ready with `None`
@@ -421,8 +445,14 @@ async fn items_with_policy(
             // External items drained this beat (merged into whatever
             // the repo projection yields — one emitted result).
             let mut external: Vec<WaitItem> = Vec::new();
-            tokio::select! {
-                _ = tokio::time::sleep(tick) => {}
+            let timer_deadline = timers.as_ref().and_then(|timers| timers.next_deadline());
+            let existing_wake = tokio::select! {
+                _ = crate::cli::timer_source::deadline(timer_deadline) => {
+                    if let Some(timers) = &mut timers { timers.due(); }
+                    timer_backlog.invalidate();
+                    false
+                }
+                _ = tokio::time::sleep(tick) => { true }
                 w = beat.rx.recv() => {
                     if w.is_none() {
                         anyhow::bail!("filesystem watcher disconnected");
@@ -431,6 +461,7 @@ async fn items_with_policy(
                     // one logical change, one refold.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     while beat.rx.try_recv().is_ok() {}
+                    true
                 }
                 item = source_rx.recv(), if sources_open => {
                     match item {
@@ -440,7 +471,14 @@ async fn items_with_policy(
                         Some((item, _)) => external.push(item),
                         None => sources_open = false,
                     }
+                    true
                 }
+            };
+            if existing_wake && let Some(timers) = &mut timers {
+                timers.retry();
+            }
+            if poll_mode || timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                timer_backlog.invalidate();
             }
             // The same beat that notices repo changes also notices a
             // new incarnation. No second hook-side poller is needed.
@@ -488,6 +526,16 @@ async fn items_with_policy(
             // block decision TOGETHER. Park only when it admits nothing
             // (codex 907acd5; codex 344280f for the together).
             drain_external(&mut source_rx, &mut sources_open, &mut external);
+            // Native emissions are signals to reread accepted custody, so the
+            // same row cannot enter through both the sink and discovery.
+            let had_timers = external
+                .iter()
+                .any(|item| matches!(item, WaitItem::TimerEvent { .. }));
+            external.retain(|item| !matches!(item, WaitItem::TimerEvent { .. }));
+            if had_timers {
+                timer_backlog.invalidate();
+            }
+            external.extend(timer_backlog.owed(&mut Default::default()));
             // Nothing is lost by draining into the decision. It
             // returns empty only when `events` is empty, and these
             // items ARE events — which matters because a source
@@ -1038,8 +1086,23 @@ pub(crate) fn resolve_wait_event_sources(
     // (codex ef1861a) or printing from inside a task that then
     // returns, leaving the wait armed without the source the
     // operator configured (codex 072e459).
-    for (source, _) in &sources {
+    let mut timer_names = std::collections::HashSet::new();
+    let mut timer_keys = std::collections::HashSet::new();
+    for (source, origin) in &sources {
         match source {
+            clank_core::agent_config::WaitEventSource::Timer(timer) => {
+                crate::cli::timer_source::parse(timer)?;
+                let scope = match origin {
+                    SourceOrigin::Config => None,
+                    SourceOrigin::Cli => Some("validation"),
+                };
+                anyhow::ensure!(
+                    timer_names.insert((scope, timer.name.clone()))
+                        && timer_keys.insert(timer.source_key(scope)),
+                    "duplicate timer name or storage key `{}` in one scope",
+                    timer.name
+                );
+            }
             clank_core::agent_config::WaitEventSource::Github(g) => {
                 if let Some(why) = g.refusal() {
                     anyhow::bail!("{why}");
@@ -1137,6 +1200,7 @@ fn source_name(source: &clank_core::agent_config::WaitEventSource) -> String {
     match source {
         clank_core::agent_config::WaitEventSource::Command(c) => c.name.clone(),
         clank_core::agent_config::WaitEventSource::Github(g) => g.repo.clone(),
+        clank_core::agent_config::WaitEventSource::Timer(t) => t.name.clone(),
     }
 }
 
@@ -1219,6 +1283,8 @@ impl EventSources {
                 (_, scope) => scope.unwrap_or_default(),
             };
             match source {
+                // Native deadlines belong to the owner's select loop.
+                WaitEventSource::Timer(_) => {}
                 WaitEventSource::Command(c) => {
                     tasks.push(tokio::spawn(run_command_source(
                         c.clone(),
@@ -2082,6 +2148,15 @@ pub(crate) enum WaitJsonItem<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         instructions: Option<&'a str>,
     },
+    #[serde(rename = "timer_event")]
+    TimerEvent {
+        name: &'a str,
+        id: &'a str,
+        due_at: u64,
+        content: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<&'a str>,
+    },
     #[serde(rename = "command_event")]
     CommandEvent {
         name: &'a str,
@@ -2244,6 +2319,19 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             revision: *revision,
             selector: selector.as_deref(),
         },
+        WaitItem::TimerEvent {
+            name,
+            id,
+            due_at,
+            content,
+            selector,
+        } => WaitJsonItem::TimerEvent {
+            name,
+            id,
+            due_at: *due_at,
+            content,
+            selector: selector.as_deref(),
+        },
         WaitItem::CommandEvent {
             name,
             id,
@@ -2390,9 +2478,11 @@ fn render_human(item: &WaitItem) -> String {
         // variants had separate arms building the same line from
         // differently-named fields; a third backend needed a third
         // (a-command-is-an-event-source-like-any-other).
-        e @ (WaitItem::GithubEvent { .. } | WaitItem::CommandEvent { .. }) => {
+        e @ (WaitItem::GithubEvent { .. }
+        | WaitItem::CommandEvent { .. }
+        | WaitItem::TimerEvent { .. }) => {
             let Some(v) = e.event_view() else {
-                unreachable!("both event variants project")
+                unreachable!("every event source projects")
             };
             // A source reporting ITSELF broken reads differently from
             // something it observed: the agent is not being told about
@@ -2401,6 +2491,8 @@ fn render_human(item: &WaitItem) -> String {
                 "source!".to_string()
             } else if v.github.is_some() {
                 "github  ".to_string()
+            } else if matches!(e, WaitItem::TimerEvent { .. }) {
+                "timer   ".to_string()
             } else {
                 "command ".to_string()
             };
@@ -2419,7 +2511,11 @@ fn render_human(item: &WaitItem) -> String {
                 }
             }
             if let Some(c) = v.content {
-                parts.push(c.to_string());
+                parts.push(if matches!(e, WaitItem::TimerEvent { .. }) {
+                    one_line(c, 300)
+                } else {
+                    c.to_string()
+                });
             }
             if let Some(g) = &v.github {
                 if let Some(a) = g.actor {

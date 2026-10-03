@@ -95,6 +95,7 @@ pub(crate) fn resolve_content_ref<'a>(
 pub(crate) enum Backend {
     Github,
     Command,
+    Timer,
     /// A message one agent sent another. Its own backend, not
     /// `Command`: nobody ran it, and a row labelled "command" would
     /// name a producer that does not exist.
@@ -270,16 +271,15 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                         // source's line: both lack github's carve-out,
                         // and calling a message a command would label
                         // the row with something nobody ran.
-                        let is_message = r.transport == crate::cli::github::log::Transport::Message;
-                        let ns = match (&v.github, is_message) {
-                            (Some(_), _) => format!("gh:{}", v.source),
-                            (None, true) => format!("msg:{stem}"),
-                            (None, false) => format!("cmd:{stem}"),
-                        };
-                        let backend = match (&v.github, is_message) {
-                            (Some(_), _) => Backend::Github,
-                            (None, true) => Backend::Message,
-                            (None, false) => Backend::Command,
+                        let (ns, backend) = match (&v.github, r.transport) {
+                            (Some(_), _) => (format!("gh:{}", v.source), Backend::Github),
+                            (None, crate::cli::github::log::Transport::Message) => {
+                                (format!("msg:{stem}"), Backend::Message)
+                            }
+                            (None, crate::cli::github::log::Transport::Timer) => {
+                                (format!("timer:{stem}"), Backend::Timer)
+                            }
+                            (None, _) => (format!("cmd:{stem}"), Backend::Command),
                         };
                         // The PRODUCER's time when it gave one: a
                         // command source stores it on the item, and

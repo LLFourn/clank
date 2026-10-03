@@ -2188,6 +2188,7 @@ pub(crate) struct WaitItem {
     /// (a-command-is-an-event-source-like-any-other). `event` and
     /// `title` above are shared with the github item.
     content: Option<String>,
+    due_at: Option<u64>,
     failure: Option<bool>,
     requires_reply: Option<bool>,
     /// What `clank events ack` takes for this one.
@@ -2342,7 +2343,9 @@ pub(crate) fn discharge_of(
         // say "change or remove the command source" — true when an
         // exiting producer WAS the event, and advice to break the
         // watch now that one isn't.
-        K::CommandEvent => Until("fires until the event is acked — `clank events ack`"),
+        K::CommandEvent | K::TimerEvent => {
+            Until("fires until the event is acked — `clank events ack`")
+        }
         K::ForCommit | K::ForFinished | K::ForBlocked => ObserverOnly,
     }
 }
@@ -2538,6 +2541,25 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 {
                     out.push_str(&format!("    ↳ {}\n", crate::cli::wait::one_line(i, 300)));
                 }
+            }
+            K::TimerEvent => {
+                let name = crate::cli::wait::one_line(item.name.as_deref().unwrap_or("?"), 80);
+                let due = item
+                    .due_at
+                    .map(|at| at.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let content = item
+                    .content
+                    .as_deref()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!(": {}", crate::cli::wait::one_line(c, 300)))
+                    .unwrap_or_default();
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
+                out.push_str(&format!("  - timer: {name} due at {due}{content}{ack}\n"));
             }
             K::CommandEvent => {
                 let name = item.name.as_deref().unwrap_or("?");
@@ -4919,6 +4941,29 @@ mod tests {
         assert!(reason.contains("reply required"), "{reason}");
         assert!(reason.contains("command-questions-abcd@7"), "{reason}");
         assert!(!reason.contains("— ack `clank events ack"), "{reason}");
+    }
+
+    #[test]
+    fn timer_hint_uses_the_actual_wait_wire_and_retains_ack_recipe() {
+        let item = clank_core::wait::WaitItem::TimerEvent {
+            name: "deploy".into(),
+            id: "timer/1".into(),
+            due_at: 1,
+            content: "check\nnow\u{1b}".into(),
+            selector: Some("timer-config-deploy-abcd@3".into()),
+        };
+        let wire = serde_json::json!({"items":[crate::cli::wait::render_json(&item)]});
+        assert_eq!(wire["items"][0]["kind"], "timer_event");
+        assert_eq!(
+            wire["items"][0]["content"], "check\nnow\u{1b}",
+            "wire/WAL preserve original content"
+        );
+        let items = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        let hint = render_wait_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Master);
+        assert!(hint.contains("timer: deploy due at 1: check now"), "{hint}");
+        assert!(hint.contains("clank events ack timer-config-deploy-abcd@3"));
+        assert!(!hint.contains('\u{1b}'));
+        assert!(hint.contains("fires until the event is acked"));
     }
 
     #[test]

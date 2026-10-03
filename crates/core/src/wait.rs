@@ -219,13 +219,17 @@ pub enum WaitItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<ContentRef>,
     },
-    /// …and one event from a command source
-    /// (a-command-is-an-event-source-like-any-other): a line its
-    /// producer printed, deduplicated by the id the producer gave it.
-    ///
-    /// Milestone 1 keeps this its own variant; milestone 2 collapses
-    /// it and `GithubEvent` onto one shape with github's extras in a
-    /// carve-out.
+    /// An accepted one-shot occurrence. The deadline is provenance;
+    /// the qualified selector addresses its authoritative WAL row.
+    TimerEvent {
+        name: String,
+        id: String,
+        due_at: u64,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+    },
+    /// A producer's line, deduplicated by its ID within the source.
     CommandEvent {
         /// The configured source name — what the row is labelled with.
         name: String,
@@ -428,6 +432,7 @@ wake_kinds! {
     Message => "message",
     GithubEvent => "github_event",
     CommandEvent => "command_event",
+    TimerEvent => "timer_event",
     DraftChanged => "draft_changed",
     ForCommit => "for_commit",
     ForFinished => "for_finished",
@@ -524,6 +529,7 @@ impl WaitItem {
             WaitItem::Message { .. } => WaitKind::Message,
             WaitItem::GithubEvent { .. } => WaitKind::GithubEvent,
             WaitItem::CommandEvent { .. } => WaitKind::CommandEvent,
+            WaitItem::TimerEvent { .. } => WaitKind::TimerEvent,
             WaitItem::DraftChanged { .. } => WaitKind::DraftChanged,
             WaitItem::ForCommit { .. } => WaitKind::ForCommit,
             WaitItem::ForFinished { .. } => WaitKind::ForFinished,
@@ -541,6 +547,24 @@ impl WaitItem {
     /// a backend means adding an arm HERE and nowhere else.
     pub fn event_view(&self) -> Option<EventView<'_>> {
         match self {
+            WaitItem::TimerEvent {
+                name,
+                due_at,
+                content,
+                selector,
+                ..
+            } => Some(EventView {
+                source: name,
+                kind: "timer",
+                content: Some(content.as_str()).filter(|c| !c.is_empty()),
+                body: Some(content.as_str()).filter(|c| !c.is_empty()),
+                at: Some(*due_at),
+                instructions: None,
+                selector: selector.as_deref(),
+                failure: false,
+                requires_reply: false,
+                github: None,
+            }),
             WaitItem::GithubEvent {
                 repo,
                 event,

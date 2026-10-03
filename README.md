@@ -416,6 +416,57 @@ user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
 
 ## Extra wake sources
 
+### One-shot scheduled events
+
+An agent can declare a native timer in `.clank/agents/<label>/config.json`:
+
+```json
+{
+  "wait_events": [
+    {"kind":"timer", "name":"check-deploy",
+     "due_at":"2026-10-04T09:00:00+11:00",
+     "content":"Check the deployment and report the result."}
+  ]
+}
+```
+
+Timers are one-shot occurrences, with a nonempty name and an absolute RFC3339
+deadline containing an explicit UTC offset. Deadlines must be at or after the Unix
+epoch, with whole-second precision; `.000` is accepted, nonzero fractions and leap
+seconds are refused. Duplicate timer names in one scope are refused. Equivalent
+offset spellings identify the same instant. There is no cron or recurrence engine.
+
+An armed wait wakes at the deadline with a `timer_event` and a qualified selector.
+Handle the task, then run `clank events ack <selector>`. Reading or receiving it does
+not acknowledge it. Unhandled accepted events survive removing their definition and
+restart; acknowledging an occurrence prevents it firing again with the same name and
+deadline. Editing the deadline creates another occurrence; changing only its content
+does not replace already-accepted work. Removing a future definition cancels it when
+the monitor observes the edit. Invalid edits retain the last accepted host and emit
+a diagnostic; a valid empty `wait_events` array removes its future schedules.
+
+Configured timers belong to their named agent across roster role changes. A timer
+does not automatically follow whoever becomes master. An invocation-only
+`clank wait --event '<timer JSON>'` has a separate identity for each wait call and
+applies only to that invocation. `clank wait --peek` reports accepted work without
+arming or ingesting a future or overdue definition.
+
+The existing monitor owns one native deadline set per author; the local fallback
+owns one per wait. Each waits until its nearest deadline, with no timer subprocess,
+task per timer, clock polling, or additional permanent service. The monitor's existing
+repository watcher and heartbeat remain. Local/invocation config edits apply on the
+next arm. With no monitor or armed wait, a timer cannot launch an agent at its due
+time: it catches up when Clank next arms. Clock movement backwards is rechecked before
+acceptance; a forward jump is observed at the currently armed monotonic deadline or
+next configuration rearm, without periodic clock checks.
+
+Install a timer-capable binary **before** adding timer definitions, on every client
+and monitor host. From this checkout use `cargo install --path crates/cli --locked`,
+then ensure `command -v clank` resolves to that installation. Existing configurations
+need no migration. Timer-capable clients use monitor protocol 8 and the existing
+exclusive handoff when encountering an older monitor; an old binary cannot parse a
+new timer configuration. This feature does not install or start an agent provider.
+
 - `clank wait --peek` — non-blocking, side-effect-free "is there work
   right now?" probe.
 - `clank wait --for commit|finished|stopped` — OBSERVE a repo (often a

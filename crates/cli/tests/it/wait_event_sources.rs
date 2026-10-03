@@ -63,6 +63,171 @@ fn cmd_event(name: &str, argv: &[&str]) -> String {
     serde_json::json!({ "kind": "command", "name": name, "command": argv }).to_string()
 }
 
+fn timer_event(name: &str, due: u64) -> String {
+    let instant = time::OffsetDateTime::from_unix_timestamp(due as i64).unwrap();
+    serde_json::json!({"kind":"timer", "name":name,
+        "due_at":instant.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "content":"check the deployment"})
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timer_peek_is_read_only_and_normal_catchup_precedes_ready_work() {
+    use clank_core::wait::WaitItem;
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo();
+    let timer = timer_event("deploy", 1);
+    let config_path = ".clank/agents/master/config.json";
+    write(repo, config_path, &format!("{{\"wait_events\":[{timer}]}}"));
+    write(repo, ".clank/queue/500-ready.md", "# ready\n");
+    let mut args = wait_args(repo, Vec::new());
+    args.author = Some("master".into());
+    args.peek = true;
+    let starts = clank::cli::wait::SourceStarts::default();
+    let got = clank::cli::wait::items_observing(args, &starts)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        got.iter()
+            .any(|item| matches!(item, WaitItem::PromoteFromQueue { .. }))
+    );
+    assert!(
+        !got.iter()
+            .any(|item| matches!(item, WaitItem::TimerEvent { .. }))
+    );
+    let clank_core::agent_config::WaitEventSource::Timer(source) =
+        serde_json::from_str(&timer).unwrap()
+    else {
+        unreachable!()
+    };
+    let events = repo.join(".clank/agents/master/events");
+    assert!(
+        !events
+            .join(format!("{}.jsonl", source.source_key(None)))
+            .exists(),
+        "peek cannot append a timer WAL"
+    );
+    assert!(
+        !events
+            .join(format!("{}.seen", source.source_key(None)))
+            .exists(),
+        "peek cannot checkpoint a timer ID"
+    );
+
+    let mut args = wait_args(repo, Vec::new());
+    args.author = Some("master".into());
+    let got = clank::cli::wait::items_observing(args, &starts)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        got.iter()
+            .any(|item| matches!(item, WaitItem::PromoteFromQueue { .. }))
+    );
+    let timers: Vec<_> = got
+        .iter()
+        .filter(|item| matches!(item, WaitItem::TimerEvent { .. }))
+        .collect();
+    assert_eq!(
+        timers.len(),
+        1,
+        "sink plus scan must not duplicate the accepted row"
+    );
+    let selector = timers[0].event_view().unwrap().selector.unwrap().to_owned();
+    assert_eq!(
+        starts.count(),
+        0,
+        "catchup starts no ordinary source drivers"
+    );
+    write(repo, config_path, "{}");
+    let mut args = wait_args(repo, Vec::new());
+    args.author = Some("master".into());
+    args.peek = true;
+    let got = clank::cli::wait::items(args).await.unwrap().unwrap();
+    assert!(
+        got.iter().any(|item| item
+            .event_view()
+            .is_some_and(|view| view.selector == Some(selector.as_str()))),
+        "source removal must leave accepted work owed"
+    );
+    let ack = |reply| clank::cli::EventsArgs {
+        command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            reply,
+            repo: Some(repo.to_path_buf()),
+            author: Some("master".into()),
+            ids: vec![selector.clone()],
+        }),
+    };
+    assert!(
+        clank::cli::events::run(ack(Some("answer".into())))
+            .await
+            .is_err(),
+        "timer has no reply backend"
+    );
+    clank::cli::events::run(ack(None)).await.unwrap();
+    write(repo, config_path, &format!("{{\"wait_events\":[{timer}]}}"));
+    let mut args = wait_args(repo, Vec::new());
+    args.author = Some("master".into());
+    let got = clank::cli::wait::items(args).await.unwrap().unwrap();
+    assert!(
+        !got.iter()
+            .any(|item| matches!(item, WaitItem::TimerEvent { .. })),
+        "acked configured occurrence cannot refire"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timer_deadline_wakes_real_parked_wait_without_a_producer() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let due = time::OffsetDateTime::now_utc().unix_timestamp() as u64 + 2;
+    let args = wait_args(env.repo(), vec![timer_event("future", due)]);
+    let got = tokio::time::timeout(
+        common::race_deadline(env.repo()),
+        clank::cli::wait::items(args),
+    )
+    .await
+    .expect("deadline wakes parked wait")
+    .unwrap()
+    .unwrap();
+    assert!(time::OffsetDateTime::now_utc().unix_timestamp() as u64 >= due);
+    assert!(
+        matches!(got.as_slice(), [clank_core::wait::WaitItem::TimerEvent { due_at, selector: Some(_), .. }] if *due_at == due)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timer_invocations_have_distinct_custody_and_old_calls_do_not_wake_peek() {
+    let _serial = common::serial();
+    let env = idle_env();
+    let timer = timer_event("same", 1);
+    let first = clank::cli::wait::items(wait_args(env.repo(), vec![timer.clone()]))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = clank::cli::wait::items(wait_args(env.repo(), vec![timer]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(
+        first[0].event_view().unwrap().selector,
+        second[0].event_view().unwrap().selector
+    );
+    let mut args = wait_args(env.repo(), Vec::new());
+    args.peek = true;
+    assert!(
+        clank::cli::wait::items(args)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// A printed EVENT wakes a parked wait.
 ///
 /// It used to be the command's completion

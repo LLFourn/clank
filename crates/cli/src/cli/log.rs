@@ -411,6 +411,7 @@ pub(crate) fn badge_of(
     glyph.unwrap_or(match backend {
         crate::cli::github::timeline::Backend::Github => "gh",
         crate::cli::github::timeline::Backend::Command => "cmd",
+        crate::cli::github::timeline::Backend::Timer => "timer",
         crate::cli::github::timeline::Backend::Message => "msg",
     })
 }
@@ -419,18 +420,22 @@ pub(crate) fn badge_of(
 /// mirrors the `clank events` CLI's shape so the two surfaces read
 /// the same.
 fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
+    // Bodies and source names can contain lossless operator/producer text.
+    // Every field entering a terminal row uses the existing single-line
+    // projection; stored content and the full detail page stay unchanged.
+    let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
     // WHO first: scanning the timeline, the actor is the fastest way to
     // tell your own activity from someone else's, so it leads rather
     // than trailing after a title that can be long enough to truncate.
     let mut out = String::new();
     if let Some(a) = &g.actor {
-        out.push_str(&format!("{a}  "));
+        out.push_str(&format!("{}  ", clean(a)));
     }
-    out.push_str(&g.kind);
+    out.push_str(&clean(&g.kind));
     if let Some(d) = &g.detail {
-        out.push_str(&format!("/{d}"));
+        out.push_str(&format!("/{}", clean(d)));
     }
-    out.push_str(&format!("  {}", g.source));
+    out.push_str(&format!("  {}", clean(&g.source)));
     if let Some(n) = g.number {
         out.push_str(&format!("#{n}"));
     }
@@ -438,7 +443,7 @@ fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
         out.push_str("  (this SOURCE is broken, not the world)");
     }
     if let Some(t) = &g.content {
-        out.push_str(&format!("  “{t}”"));
+        out.push_str(&format!("  “{}”", clean(t)));
     }
     out
 }
@@ -1379,6 +1384,16 @@ enum LogJsonRow<'a> {
         unhandled: bool,
         baseline: bool,
     },
+    #[serde(rename = "timer_event")]
+    Timer {
+        ts: i64,
+        due_at: u64,
+        source: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<&'a str>,
+        seen_by: &'a [String],
+        unhandled: bool,
+    },
     /// A message one agent sent another. Its own row rather than a
     /// command's: `source` here is the SENDER, which is a different
     /// fact from the name of a producer that ran.
@@ -1450,6 +1465,14 @@ fn json_items<'a>(
                         seen_by: &g.seen_by,
                         unhandled: g.unhandled,
                         baseline: g.baseline,
+                    },
+                    crate::cli::github::timeline::Backend::Timer => LogJsonRow::Timer {
+                        ts,
+                        due_at: g.at,
+                        source: &g.source,
+                        content: g.content.as_deref(),
+                        seen_by: &g.seen_by,
+                        unhandled: g.unhandled,
                     },
                     crate::cli::github::timeline::Backend::Message => LogJsonRow::Message {
                         ts,
@@ -1550,6 +1573,85 @@ fn json_rows<'a>(
 #[cfg(test)]
 mod json_output_tests {
     use super::*;
+
+    #[test]
+    fn a_timer_wal_projects_as_a_timer_in_log_and_web_state_and_ack_refreshes_it() {
+        use crate::cli::github::{
+            log::{EventLog, Transport},
+            timeline,
+        };
+        let repo = tempfile::tempdir().unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("rev/events");
+        let source = clank_core::agent_config::TimerSource {
+            name: "check-deploy".into(),
+            due_at: "1970-01-01T00:01:40Z".into(),
+            content: Some(
+                "Check \u{1b}[31mdeployment\u{1b}[0m\t\nReport result\r\nFull body".into(),
+            ),
+        };
+        let mut log = EventLog::open(&dir, &source.source_key(None)).unwrap();
+        let seq = log
+            .append_inbox(
+                Transport::Timer,
+                Some("timer/100"),
+                None,
+                Some(100),
+                &clank_core::wait::WaitItem::TimerEvent {
+                    name: source.name.clone(),
+                    id: "timer/100".into(),
+                    due_at: 100,
+                    content: source.content.clone().unwrap(),
+                    selector: None,
+                },
+            )
+            .unwrap();
+        for acked in [false, true] {
+            if acked {
+                log.append_ack(seq).unwrap();
+            }
+            let snapshot = timeline::timeline_snapshot(repo.path());
+            assert!(snapshot.notices.is_empty());
+            assert_eq!(snapshot.events.len(), 1);
+            let event = &snapshot.events[0];
+            assert_eq!(event.backend, timeline::Backend::Timer);
+            assert_eq!(
+                event.at, 100,
+                "display time is the due instant, not ingest time"
+            );
+            assert_eq!(event.unhandled, !acked);
+            assert_eq!(event.content.as_deref(), source.content.as_deref());
+            assert_eq!(event_badge(event), "timer");
+            let web = serde_json::to_value(event).unwrap();
+            assert_eq!(web["backend"], "timer");
+            assert_eq!(web["members"][0]["transport"], "timer");
+            let items = interleave(&[], &snapshot.events);
+            let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+            let lines = oneline_plain_lines(&rows);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].starts_with("timer "));
+            assert!(lines[0].contains("“Check deployment”"));
+            assert!(!lines[0].chars().any(char::is_control), "{lines:?}");
+            assert!(!lines[0].contains("Report result"));
+            assert!(!lines[0].contains("[31m"));
+            // The human log and the TUI row use this same description.
+            assert!(!gh_describe(event).chars().any(char::is_control));
+            let mut hostile_fields = event.clone();
+            hostile_fields.source = "deploy\nsecond source".into();
+            hostile_fields.actor = Some("\u{1b}]0;title\u{7}agent\r\nother".into());
+            hostile_fields.detail = Some("\u{1b}[31mready\t".into());
+            hostile_fields.kind = "timer\nother".into();
+            let described = gh_describe(&hostile_fields);
+            assert!(!described.chars().any(char::is_control), "{described:?}");
+            assert_eq!(described, "agent  timer/ready  deploy  “Check deployment”");
+            let reviews = Default::default();
+            let json = serde_json::to_value(json_items(&items, &reviews)).unwrap();
+            assert_eq!(json[0]["kind"], "timer_event");
+            assert_eq!(json[0]["due_at"], 100);
+            assert_eq!(json[0]["unhandled"], !acked);
+            assert_eq!(json[0]["content"], source.content.as_deref().unwrap());
+            assert!(json[0].get("failure").is_none());
+        }
+    }
 
     fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
@@ -1682,6 +1784,7 @@ mod json_output_tests {
                 OnelineRow::Github { backend, .. } => match backend {
                     crate::cli::github::timeline::Backend::Github => "gh",
                     crate::cli::github::timeline::Backend::Command => "cmd",
+                    crate::cli::github::timeline::Backend::Timer => "timer",
                     crate::cli::github::timeline::Backend::Message => "msg",
                 },
                 OnelineRow::Commit { .. } => "commit",

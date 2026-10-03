@@ -113,6 +113,7 @@ fn oldest_obligation(
             | WaitItem::Message { .. }
             | WaitItem::GithubEvent { .. }
             | WaitItem::CommandEvent { .. }
+            | WaitItem::TimerEvent { .. }
             | WaitItem::DraftChanged { .. }
             | WaitItem::ForCommit { .. }
             | WaitItem::ForFinished { .. }

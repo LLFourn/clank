@@ -63,6 +63,43 @@ pub struct AgentConfig {
 pub enum WaitEventSource {
     Github(GithubSource),
     Command(CommandSource),
+    Timer(TimerSource),
+}
+
+/// An absolute, one-shot deadline. The CLI validates the RFC3339 instant;
+/// core configuration remains free of clocks and I/O.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerSource {
+    pub name: String,
+    pub due_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+impl TimerSource {
+    /// Keep origin outside the lossy name slug and hash the whole name.
+    pub fn source_key(&self, invocation: Option<&str>) -> String {
+        let slug: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.name.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        match invocation {
+            None => format!("timer-config-{slug}-{hash:016x}"),
+            Some(scope) => format!("timer-invocation-{slug}-{hash:016x}-{scope}"),
+        }
+    }
 }
 
 /// Watch one GitHub repo's event feed. An agent lists as many of

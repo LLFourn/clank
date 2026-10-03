@@ -172,6 +172,16 @@ pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 impl RepoStateWatcher {
     pub fn attach(repo: &Path, poll_mode: bool, tx: Sender<()>) -> anyhow::Result<Self> {
+        Self::attach_with_timer_invalidation(repo, poll_mode, tx, None)
+    }
+
+    /// Reuse this watcher for disposable timer-inventory invalidation.
+    pub(crate) fn attach_with_timer_invalidation(
+        repo: &Path,
+        poll_mode: bool,
+        tx: Sender<()>,
+        timer_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> anyhow::Result<Self> {
         // `<repo>/.clank` may not exist yet on a brand-new repo; notify
         // refuses to watch a missing path, so create it first (clank
         // owns the dir anyway).
@@ -203,6 +213,22 @@ impl RepoStateWatcher {
             move |res: notify::Result<notify::Event>| {
                 match res {
                     Ok(event) => {
+                        if let Some(dirty) = &timer_dirty
+                            && (event.paths.is_empty()
+                                || event.paths.iter().any(|path| {
+                                    path.starts_with(cr.join("agents"))
+                                        && (path.extension().is_none()
+                                            || (path.extension().is_some_and(|ext| ext == "jsonl")
+                                                && path
+                                                    .file_stem()
+                                                    .and_then(|name| name.to_str())
+                                                    .is_some_and(|name| {
+                                                        name.starts_with("timer-")
+                                                    })))
+                                }))
+                        {
+                            dirty.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         // Path-less events (rescan notices) wake conservatively.
                         if event.paths.is_empty()
                             || event.paths.iter().any(|p| is_core_wake(p, &gd, &cd, &cr))
@@ -211,6 +237,9 @@ impl RepoStateWatcher {
                         }
                     }
                     Err(_) => {
+                        if let Some(dirty) = &timer_dirty {
+                            dirty.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         let _ = tx.send(());
                     }
                 }

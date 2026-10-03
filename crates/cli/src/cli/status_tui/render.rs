@@ -3021,6 +3021,7 @@ pub(super) fn render_event_detail(
         (_, true) => "source BROKEN",
         (crate::cli::github::timeline::Backend::Github, _) => "github",
         (crate::cli::github::timeline::Backend::Command, _) => "command",
+        (crate::cli::github::timeline::Backend::Timer, _) => "timer",
         (crate::cli::github::timeline::Backend::Message, _) => "message",
     };
     out.push(region_rule(
@@ -3142,7 +3143,7 @@ pub(super) fn render_event_detail(
         if ev.backend == Backend::Github || blank {
             let label = match ev.backend {
                 Backend::Github => "title",
-                Backend::Command | Backend::Message => "content",
+                Backend::Command | Backend::Message | Backend::Timer => "content",
             };
             fact(&mut body, label, clean(t));
         } else {
@@ -7735,6 +7736,59 @@ mod tests {
             "the fetched body must precede the facts ({facts_at}) and the \
              copy rows ({members_at}), got body at {body_at}:\n{joined}"
         );
+    }
+
+    #[test]
+    fn a_timer_detail_from_the_wal_has_its_origin_content_and_handled_state() {
+        use crate::cli::github::{
+            log::{EventLog, Transport},
+            timeline,
+        };
+        let repo = tempfile::tempdir().unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("rev/events");
+        let mut log = EventLog::open(&dir, "timer-config-deploy").unwrap();
+        let seq = log
+            .append_inbox(
+                Transport::Timer,
+                Some("timer/100"),
+                None,
+                Some(100),
+                &clank_core::wait::WaitItem::TimerEvent {
+                    name: "deploy".into(),
+                    id: "timer/100".into(),
+                    due_at: 100,
+                    content: "Check deployment\nReport result\u{1b}[31m".into(),
+                    selector: None,
+                },
+            )
+            .unwrap();
+        for acked in [false, true] {
+            if acked {
+                log.append_ack(seq).unwrap();
+            }
+            let ev = timeline::timeline_snapshot(repo.path()).events.remove(0);
+            let ep = super::super::input::EventPage {
+                target: ev.members[0].key.clone(),
+                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                event: ev,
+                prompts: Vec::new(),
+                scroll: 0,
+                content: None,
+            };
+            let (lines, _) = render_event_detail(&ep, &[], 0, 30, 100);
+            let text = lines.join("\n");
+            assert!(text.contains("TIMER · DEPLOY"), "{text}");
+            assert!(text.contains("Check deployment"), "{text}");
+            assert!(text.contains("Report result"), "{text}");
+            assert!(
+                text.contains(if acked { "✓ handled" } else { "? unanswered" }),
+                "{text}"
+            );
+            assert!(
+                !text.contains("\u{1b}[31m"),
+                "payload controls must not become terminal escape sequences"
+            );
+        }
     }
 
     /// AN EVENT WITH A BODY SHOWS THE BODY, not its summary.

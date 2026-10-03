@@ -339,6 +339,7 @@ fn display_id(rows: &[Sourced], s: &Sourced) -> Selector {
 /// (a-command-is-an-event-source-like-any-other). What github alone
 /// has rides `github`, which is the carve-out.
 fn describe(item: &WaitItem) -> String {
+    let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
     if let WaitItem::DraftChanged {
         pr,
         comment,
@@ -349,7 +350,7 @@ fn describe(item: &WaitItem) -> String {
     } = item
     {
         let about = match (comment, path.as_deref()) {
-            (Some(id), Some(path)) => format!("  {path}  comment {id}"),
+            (Some(id), Some(path)) => format!("  {}  comment {id}", clean(path)),
             _ => String::new(),
         };
         return format!("draft/{}  PR #{pr}{about}  (r{revision})", change.wire());
@@ -357,13 +358,13 @@ fn describe(item: &WaitItem) -> String {
     let Some(v) = item.event_view() else {
         return format!("{item:?}");
     };
-    let mut out = v.kind.to_string();
+    let mut out = clean(v.kind);
     if let Some(g) = &v.github
         && let Some(d) = g.detail
     {
-        out.push_str(&format!("/{d}"));
+        out.push_str(&format!("/{}", clean(d)));
     }
-    out.push_str(&format!("  {}", v.source));
+    out.push_str(&format!("  {}", clean(v.source)));
     if let Some(g) = &v.github
         && let Some(n) = g.number
     {
@@ -378,12 +379,12 @@ fn describe(item: &WaitItem) -> String {
         out.push_str("  (reply required)");
     }
     if let Some(c) = v.content {
-        out.push_str(&format!("  “{c}”"));
+        out.push_str(&format!("  “{}”", clean(c)));
     }
     if let Some(g) = &v.github
         && let Some(a) = g.actor
     {
-        out.push_str(&format!("  by {a}"));
+        out.push_str(&format!("  by {}", clean(a)));
     }
     out
 }
@@ -625,6 +626,17 @@ pub(crate) fn sanitize_multiline(s: &str) -> String {
         .collect()
 }
 
+/// The full body is useful when it exceeds the displayed single-line
+/// content summary, even if both fields contain the same stored text.
+fn shown_body(item: &WaitItem) -> Option<String> {
+    let view = item.event_view()?;
+    let full = sanitize_multiline(view.body?);
+    let summary = view
+        .content
+        .map(|text| crate::cli::status_tui::text::one_line(text, usize::MAX));
+    (summary.as_deref() != Some(full.as_str())).then_some(full)
+}
+
 fn show(
     rows: Vec<Sourced>,
     prompts: &std::collections::HashMap<String, String>,
@@ -673,14 +685,7 @@ fn show(
     // The whole text, where the event line is only a summary of it.
     // `describe` is a LIST line and stays one; this is the surface for
     // reading what was actually sent, and a message has no other one.
-    if let Some(full) = s
-        .row
-        .item
-        .event_view()
-        .and_then(|v| v.body)
-        .filter(|b| Some(*b) != s.row.item.event_view().and_then(|v| v.content))
-    {
-        let clean = sanitize_multiline(full);
+    if let Some(clean) = shown_body(&s.row.item) {
         println!("body:      {}", clean.replace('\n', "\n           "));
     }
     if let Some(p) = prompts.get(&s.source) {
@@ -697,6 +702,43 @@ fn show(
 mod tests {
     use super::*;
     use crate::cli::github::log::Transport;
+
+    #[test]
+    fn timer_list_summary_is_safe_and_show_keeps_the_full_body() {
+        let dir = tempdir();
+        let content = "Check \u{1b}[31mdeployment\u{1b}[0m\t\nReport result\r\nFull body";
+        let timer = WaitItem::TimerEvent {
+            name: "deploy\nextra name".into(),
+            id: "timer/100".into(),
+            due_at: 100,
+            content: content.into(),
+            selector: None,
+        };
+        let mut log = crate::cli::github::log::EventLog::open(&dir, "timer-config-deploy").unwrap();
+        log.append_inbox(Transport::Timer, Some("timer/100"), None, Some(100), &timer)
+            .unwrap();
+        let rows = read_all(&dir).unwrap();
+        let row = resolve(&rows, "timer-config-deploy@1").unwrap();
+        let line = describe(&row.row.item);
+        assert_eq!(line, "timer  deploy  “Check deployment”");
+        assert!(!line.chars().any(char::is_control));
+        let body = shown_body(&row.row.item).expect("multiline content must be shown as a body");
+        assert!(body.contains("\nReport result \nFull body"), "{body:?}");
+        assert!(!body.chars().any(|c| c.is_control() && c != '\n'));
+        let json = serde_json::to_value(json_row(&rows, row, &Default::default())).unwrap();
+        assert_eq!(json["item"]["content"], content);
+        let plain = WaitItem::TimerEvent {
+            name: "deploy".into(),
+            id: "timer/100".into(),
+            due_at: 100,
+            content: "one line".into(),
+            selector: None,
+        };
+        assert!(
+            shown_body(&plain).is_none(),
+            "an identical plain summary needs no repeated body"
+        );
+    }
 
     fn item(n: u64) -> WaitItem {
         WaitItem::GithubEvent {

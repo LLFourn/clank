@@ -24,8 +24,9 @@ use clank_core::wait::WaitItem;
 /// `cargo install`, so a fresh client meeting an old monitor is the
 /// expected case and must degrade rather than fail.
 // Version 7 also makes single-tag diagnostics scalar.
+// Version 8 hosts native timers and presents their additive event variant.
 // Old monitors must not keep serving the previous lifecycle after an upgrade.
-pub(crate) const PROTO: u32 = 7;
+pub(crate) const PROTO: u32 = 8;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -2367,7 +2368,17 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // refolding the repo on every change.
     use futures_util::StreamExt;
     let (fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
-    let _watcher = crate::repo_watch::RepoStateWatcher::attach(&repo, false, fs_tx)?;
+    let timer_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _watcher = crate::repo_watch::RepoStateWatcher::attach_with_timer_invalidation(
+        &repo,
+        false,
+        fs_tx,
+        Some(timer_dirty.clone()),
+    )?;
+    let mut timer_backlogs: std::collections::BTreeMap<
+        AgentLabel,
+        crate::cli::timer_source::Backlog,
+    > = Default::default();
     let mut beats = beats(fs_rx, FOLD_TICK);
 
     // Stamped by the fold loop below and by nothing else. A stamp from
@@ -2405,7 +2416,20 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         .extend(reconcile_hosting(&repo, &mut hosted, &source_items));
 
     loop {
+        let timer_deadline = hosted
+            .values()
+            .filter_map(|host| {
+                host.timers
+                    .as_ref()
+                    .and_then(|timers| timers.next_deadline())
+            })
+            .min();
         tokio::select! {
+            _ = crate::cli::timer_source::deadline(timer_deadline) => {
+                for host in hosted.values_mut() {
+                    if let Some(timers) = &mut host.timers { timers.due(); }
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let repo = repo.clone();
@@ -2506,6 +2530,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     client,
                     folded_state.as_ref(),
                     &mut pending,
+                    &hosted,
                 ));
             }
             // A source produced something. WHAT that author is owed is
@@ -2513,13 +2538,15 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             // when no log holds it, which is the one case the channel
             // is the only record of.
             Some((author, emission)) = from_sources.recv() => {
+                if matches!(emission.0, WaitItem::TimerEvent { .. })
+                    && let Some(backlog) = timer_backlogs.get_mut(&author) { backlog.invalidate(); }
                 pending.extend(
                     transient_of(emission)
                         .into_iter()
                         .map(|item| (author.clone(), item)),
                 );
                 if let Some(state) = &folded_state {
-                    leaving.extend(serve_to(&repo, &mut clients, state, Some(&author), &mut pending));
+                    leaving.extend(serve_to_cached(&repo, &mut clients, state, Some(&author), &mut pending, &mut timer_backlogs, &hosted));
                 }
             }
             // A cancelled producer finished winding down. Nothing to
@@ -2537,6 +2564,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             beat = beats.recv() => {
                 if beat.is_none() {
                     anyhow::bail!("the repo watcher stopped");
+                }
+                if timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    for backlog in timer_backlogs.values_mut() { backlog.invalidate(); }
                 }
                 // Fold BEFORE claiming one. The counter means a fold
                 // completed, so moving it first and then failing the
@@ -2556,7 +2586,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         // the durable rows and anything held from
                         // before there was a state to present it
                         // against.
-                        leaving.extend(serve_to(&repo, &mut clients, &state, None, &mut pending));
+                        leaving.extend(serve_to_cached(&repo, &mut clients, &state, None, &mut pending, &mut timer_backlogs, &hosted));
                         folded_state = Some(state);
                     }
                     // The counter stays where it is, so the
@@ -2614,6 +2644,7 @@ struct Hosted {
         crate::cli::event_source::SourceOrigin,
     )>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    timers: Option<crate::cli::timer_source::TimerSet>,
 }
 
 impl Hosted {
@@ -2625,11 +2656,18 @@ impl Hosted {
     /// that was still pending (codex on d2b012d), so the handles come
     /// back and the caller observes them end.
     #[must_use = "a cancelled task has not necessarily stopped; observe these"]
-    fn stop(self) -> Vec<tokio::task::JoinHandle<()>> {
+    fn stop(mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.stop_producing()
+    }
+
+    /// Preserve the accepted spec for the owner's final presentation while
+    /// cancelling all production, including passive future deadlines.
+    fn stop_producing(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.timers.take();
         for task in &self.tasks {
             task.abort();
         }
-        self.tasks
+        std::mem::take(&mut self.tasks)
     }
 }
 
@@ -2643,11 +2681,13 @@ impl Hosted {
 fn hostable(
     repo: &std::path::Path,
     author: &AgentLabel,
-) -> Vec<(
-    clank_core::agent_config::WaitEventSource,
-    crate::cli::event_source::SourceOrigin,
-)> {
-    crate::cli::wait::resolve_wait_event_sources(repo, author, &[]).unwrap_or_default()
+) -> anyhow::Result<
+    Vec<(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::event_source::SourceOrigin,
+    )>,
+> {
+    crate::cli::wait::resolve_wait_event_sources(repo, author, &[])
 }
 
 /// Every agent this repo's roster names.
@@ -2680,20 +2720,60 @@ fn reconcile_hosting(
     let mut departing = Vec::new();
     let authors = roster_authors(repo);
     for author in &authors {
-        let spec = hostable(repo, author);
-        match hosted.get(author) {
-            Some(running) if running.spec == spec => continue,
+        // An invalid edit is a rejected replacement, not an empty config.
+        // Keep the last accepted drivers and definitions until a valid edit.
+        let spec = match hostable(repo, author) {
+            Ok(spec) => spec,
+            Err(error) => {
+                eprintln!("monitor: rejected source config for `{author}`: {error}");
+                if let Some(running) = hosted.get_mut(author)
+                    && let Some(timers) = &mut running.timers
+                {
+                    timers.retry();
+                }
+                continue;
+            }
+        };
+        match hosted.get_mut(author) {
+            Some(running) if running.spec == spec => {
+                // One retry per existing reconciliation wake. New/replaced
+                // sets already attempted catchup; do not try them twice.
+                if let Some(timers) = &mut running.timers {
+                    timers.retry();
+                }
+                continue;
+            }
             _ => {}
         }
-        if let Some(previous) = hosted.remove(author) {
-            departing.extend(previous.stop());
-        }
         if spec.is_empty() {
+            if let Some(previous) = hosted.remove(author) {
+                departing.extend(previous.stop());
+            }
             continue;
         }
         let events_dir = crate::agent_store::agents_root(repo)
             .join(author.as_str())
             .join("events");
+        let sink = crate::cli::event_source::EmissionSink::for_author(into.clone(), author.clone());
+        let mut timers =
+            match crate::cli::timer_source::TimerSet::new(&spec, &events_dir, None, sink.clone()) {
+                Ok(timers) => timers,
+                Err(error) => {
+                    eprintln!("monitor: timer config for `{author}`: {error}");
+                    if let Some(running) = hosted.get_mut(author)
+                        && let Some(timers) = &mut running.timers
+                    {
+                        timers.retry();
+                    }
+                    continue;
+                }
+            };
+        // Prepare every fallible native component before disturbing the
+        // running host. This constructor neither ingests nor spawns anything.
+        if let Some(previous) = hosted.remove(author) {
+            departing.extend(previous.stop());
+        }
+        timers.due();
         let tasks = crate::cli::wait::EventSources::spawn(
             &spec,
             Some(&events_dir),
@@ -2706,10 +2786,17 @@ fn reconcile_hosting(
             // author's config source. A `--event` source handed to a
             // pooled host would be refused rather than pooled.
             None,
-            crate::cli::event_source::EmissionSink::for_author(into.clone(), author.clone()),
+            sink,
         )
         .into_tasks();
-        hosted.insert(author.clone(), Hosted { spec, tasks });
+        hosted.insert(
+            author.clone(),
+            Hosted {
+                spec,
+                tasks,
+                timers: Some(timers),
+            },
+        );
     }
     // An author off the roster keeps nothing running: a revoked agent's
     // producer is a producer nobody can ever be served from.
@@ -2740,6 +2827,10 @@ fn reconcile_hosting(
 fn owed_from_sources(
     repo: &std::path::Path,
     author: &AgentLabel,
+    sources: &[(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::event_source::SourceOrigin,
+    )],
     shown: &mut std::collections::HashSet<(String, u64, String)>,
 ) -> Vec<WaitItem> {
     use clank_core::agent_config::WaitEventSource;
@@ -2748,9 +2839,10 @@ fn owed_from_sources(
         .join(author.as_str())
         .join("events");
     let mut owed = Vec::new();
-    for (source, _) in hostable(repo, author) {
+    for (source, _) in sources {
         let (key, prompt) = match &source {
             WaitEventSource::Command(c) => (c.source_key(), None),
+            WaitEventSource::Timer(_) => continue,
             WaitEventSource::Github(g) => (
                 crate::cli::github::supervisor::source_key(g),
                 g.prompt.clone(),
@@ -2811,6 +2903,7 @@ fn admit_into(
     client: Client,
     state: Option<&crate::repo_state::RepoState>,
     pending: &mut Vec<(AgentLabel, WaitItem)>,
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut arriving = vec![client];
     if let Some(state) = state {
@@ -2819,7 +2912,15 @@ fn admit_into(
         // a newcomer that returns on admission work without it would
         // leave it waiting for a tick that may never find an eligible
         // client (codex on 1552f66).
-        let leaving = serve_to(repo, &mut arriving, state, None, pending);
+        let leaving = serve_to_cached(
+            repo,
+            &mut arriving,
+            state,
+            None,
+            pending,
+            &mut Default::default(),
+            hosted,
+        );
         clients.append(&mut arriving);
         return leaving;
     }
@@ -3262,7 +3363,7 @@ async fn stand_down(
     repo: &std::path::Path,
     mut clients: Vec<Client>,
     mut leaving: Vec<tokio::task::JoinHandle<Wrote>>,
-    hosted: std::collections::BTreeMap<AgentLabel, Hosted>,
+    mut hosted: std::collections::BTreeMap<AgentLabel, Hosted>,
     mut owned: OwnedTasks,
     arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<Greeted>,
     from_sources: &mut tokio::sync::mpsc::UnboundedReceiver<(
@@ -3301,8 +3402,8 @@ async fn stand_down(
     // the producers cannot discard a private forwarding buffer. Durable
     // rows replay from the WAL, but transients need this final drain.
     let mut producers: Vec<tokio::task::JoinHandle<()>> = owned.take_all();
-    for (_, running) in hosted {
-        producers.extend(running.stop());
+    for running in hosted.values_mut() {
+        producers.extend(running.stop_producing());
     }
     from_sources.close();
     while let Ok((author, emission)) = from_sources.try_recv() {
@@ -3321,7 +3422,15 @@ async fn stand_down(
     // was reported lost anyway. Nothing to present before the first
     // fold: what a client is owed is read against folded state.
     if let Some(state) = folded {
-        leaving.extend(serve_to(repo, &mut clients, state, None, pending));
+        leaving.extend(serve_to_cached(
+            repo,
+            &mut clients,
+            state,
+            None,
+            pending,
+            &mut Default::default(),
+            &hosted,
+        ));
     }
 
     let decision = retire(clients, leaving, producers, left(by), settle, pending.len()).await;
@@ -3485,12 +3594,33 @@ fn serve(repo: &std::path::Path, clients: &mut Vec<Client>, state: &crate::repo_
 /// perfectly well.
 #[must_use = "a departing client's last frame is still in its writer; drop these only \
               where the runtime is certain to outlive them"]
+#[cfg(test)]
 fn serve_to(
     repo: &std::path::Path,
     clients: &mut Vec<Client>,
     state: &crate::repo_state::RepoState,
     only: Option<&AgentLabel>,
     pending: &mut Vec<(AgentLabel, WaitItem)>,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    serve_to_cached(
+        repo,
+        clients,
+        state,
+        only,
+        pending,
+        &mut Default::default(),
+        &Default::default(),
+    )
+}
+
+fn serve_to_cached(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: &crate::repo_state::RepoState,
+    only: Option<&AgentLabel>,
+    pending: &mut Vec<(AgentLabel, WaitItem)>,
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     if clients.is_empty() {
         return Vec::new();
@@ -3538,7 +3668,31 @@ fn serve_to(
                 // reach the agent without the block context the local
                 // path gives it, and without the durable eligibility
                 // that says it is still owed at all (codex on ca2ea69).
-                let mut external = owed_from_sources(repo, author, &mut client.shown);
+                // Presentation uses the same accepted spec as production. A
+                // rejected edit cannot hide the retained drivers' WAL rows or
+                // apply unaccepted GitHub prompt changes to their delivery.
+                let current;
+                let sources = match hosted.get(author) {
+                    Some(host) => &host.spec,
+                    None => {
+                        current = hostable(repo, author).unwrap_or_default();
+                        &current
+                    }
+                };
+                let mut external = owed_from_sources(repo, author, sources, &mut client.shown);
+                external.extend(
+                    timer_backlogs
+                        .entry(author.clone())
+                        .or_insert_with(|| {
+                            crate::cli::timer_source::Backlog::new(
+                                crate::agent_store::agents_root(repo)
+                                    .join(author.as_str())
+                                    .join("events"),
+                                Default::default(),
+                            )
+                        })
+                        .owed(&mut client.shown),
+                );
                 // An emission no log holds exists nowhere else, so it
                 // is merged into THIS presentation rather than sent
                 // after it. A client returns on its first non-empty
@@ -3930,6 +4084,7 @@ mod tests {
 
         // As the transition does: stop them, then hand the handles on.
         let producers = Hosted {
+            timers: None,
             spec: Vec::new(),
             tasks: vec![producer],
         }
@@ -4113,6 +4268,7 @@ mod tests {
         let hosted = std::collections::BTreeMap::from([(
             claude.clone(),
             Hosted {
+                timers: None,
                 spec: Vec::new(),
                 tasks: vec![producer],
             },
@@ -4337,6 +4493,7 @@ mod tests {
 
         // As the transition does: stop them, then hand the handles on.
         let producers = Hosted {
+            timers: None,
             spec: Vec::new(),
             tasks: vec![producer],
         }
@@ -4757,6 +4914,7 @@ mod tests {
         // Exactly what `reconcile_hosting` returns when an author's
         // sources change or its roster entry goes.
         let departing = Hosted {
+            timers: None,
             spec: Vec::new(),
             tasks: vec![producer],
         }
@@ -7348,6 +7506,324 @@ mod tests {
         d
     }
 
+    fn with_timer(repo: &std::path::Path, name: &str, due: u64) {
+        let author = AgentLabel::parse("codex").unwrap();
+        crate::agent_store::update_agent_config(repo, &author, |config| {
+            config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
+                clank_core::agent_config::TimerSource {
+                    name: name.into(),
+                    due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)
+                        .unwrap()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap(),
+                    content: Some("scheduled work".into()),
+                },
+            )];
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_timer_edits_preserve_drivers_and_their_accepted_delivery_spec() {
+        use crate::cli::event_source::{EmissionSink, SourceOrigin};
+        use crate::cli::github::log::{EventLog, Transport};
+        use clank_core::agent_config::WaitEventSource;
+        let repo = repo_with_roster();
+        let author = AgentLabel::parse("codex").unwrap();
+        with_source(repo.path(), "codex", "accepted-command");
+        let mut spec = hostable(repo.path(), &author).unwrap();
+        let github: WaitEventSource = serde_json::from_value(serde_json::json!({
+            "kind":"github", "repo":"o/r", "events":["pr_opened"], "prompt":"accepted instructions"
+        }))
+        .unwrap();
+        spec.push((github, SourceOrigin::Config));
+        let timer: WaitEventSource = serde_json::from_value(serde_json::json!({
+            "kind":"timer", "name":"future", "due_at":"2040-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        spec.push((timer, SourceOrigin::Config));
+        crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+            config.wait_events = spec.iter().map(|(source, _)| source.clone()).collect();
+        })
+        .unwrap();
+        let events = crate::agent_store::agents_root(repo.path()).join("codex/events");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let timers = crate::cli::timer_source::TimerSet::new(
+            &spec,
+            &events,
+            None,
+            EmissionSink::for_author(tx.clone(), author.clone()),
+        )
+        .unwrap();
+        let deadline = timers.next_deadline();
+        // Lifecycle stand-ins for the two ordinary drivers: no real GitHub
+        // request is appropriate in this regression test. Their guards prove
+        // that even cancellation after an await would be observed.
+        struct Ended(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let held = ended.clone();
+            tasks.push(tokio::spawn(async move {
+                let _guard = Ended(held);
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }));
+            ready.await.unwrap();
+        }
+        let ids: Vec<_> = tasks.iter().map(|task| task.id()).collect();
+        let command_key = match &spec[0].0 {
+            WaitEventSource::Command(source) => source.source_key(),
+            _ => unreachable!(),
+        };
+        let github_key = match &spec[1].0 {
+            WaitEventSource::Github(source) => crate::cli::github::supervisor::source_key(source),
+            _ => unreachable!(),
+        };
+        for (key, transport, item) in [
+            (
+                &command_key,
+                Transport::Command,
+                serde_json::json!({"kind":"command_event", "name":"accepted-command", "id":"one", "event":"work", "content":"still owed"}),
+            ),
+            (
+                &github_key,
+                Transport::Poll,
+                serde_json::json!({"kind":"github_event", "repo":"o/r", "event":"pr_opened", "title":"new PR"}),
+            ),
+        ] {
+            let item: WaitItem = serde_json::from_value(item).unwrap();
+            EventLog::open(&events, key)
+                .unwrap()
+                .append_inbox(transport, Some("one"), None, None, &item)
+                .unwrap();
+        }
+        let mut hosts = std::collections::BTreeMap::from([(
+            author.clone(),
+            Hosted {
+                spec: spec.clone(),
+                tasks,
+                timers: Some(timers),
+            },
+        )]);
+        for bad in [
+            serde_json::json!([{"kind":"timer", "name":"broken", "due_at":"invalid"}]),
+            serde_json::json!([
+                {"kind":"timer", "name":"duplicate", "due_at":"2040-01-01T00:00:00Z"},
+                {"kind":"timer", "name":"duplicate", "due_at":"2040-01-02T00:00:00Z"}
+            ]),
+        ] {
+            let mut attempted = vec![
+                serde_json::json!({"kind":"command", "name":"unaccepted-command", "command":["true"]}),
+                serde_json::json!({"kind":"github", "repo":"different/repo", "events":["pr_opened"], "prompt":"unaccepted instructions"}),
+            ];
+            attempted.extend(bad.as_array().unwrap().iter().cloned());
+            std::fs::write(
+                crate::agent_store::agents_root(repo.path()).join("codex/config.json"),
+                serde_json::to_vec(&serde_json::json!({"wait_events":attempted})).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                hostable(repo.path(), &author).is_err(),
+                "invalid edit is distinct from clearing sources"
+            );
+            assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+            assert_eq!(hosts[&author].spec, spec);
+            assert_eq!(
+                hosts[&author]
+                    .tasks
+                    .iter()
+                    .map(|task| task.id())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(
+                hosts[&author].timers.as_ref().unwrap().next_deadline(),
+                deadline
+            );
+            assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let (out, mut received) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+            let client = Client {
+                writer: None,
+                who: Served::Agent {
+                    author: author.clone(),
+                },
+                out,
+                shown: Default::default(),
+            };
+            let mut clients = Vec::new();
+            let state = crate::repo_state::RepoState::empty(repo.path().to_owned());
+            assert!(
+                admit_into(
+                    repo.path(),
+                    &mut clients,
+                    client,
+                    Some(&state),
+                    &mut Vec::new(),
+                    &hosts
+                )
+                .is_empty()
+            );
+            let note: Note = serde_json::from_str(&received.recv().await.unwrap()).unwrap();
+            let Note::Items { items } = note else {
+                panic!("retained drivers' rows must stay deliverable")
+            };
+            assert_eq!(items.len(), 2);
+            assert!(items.iter().any(|item| matches!(item, WaitItem::CommandEvent { name, .. } if name == "accepted-command")));
+            assert!(items.iter().any(|item| matches!(item, WaitItem::GithubEvent { instructions: Some(prompt), .. } if prompt == "accepted instructions")));
+        }
+        // A genuinely empty, valid replacement still revokes every driver.
+        crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+            config.wait_events.clear()
+        })
+        .unwrap();
+        let departing = reconcile_hosting(repo.path(), &mut hosts, &tx);
+        assert!(hosts.is_empty());
+        assert_eq!(departing.len(), 2);
+        for task in departing {
+            let _ = task.await;
+        }
+        assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn timer_host_is_passive_unchanged_folds_preserve_deadline_and_removal_cancels() {
+        let repo = repo_with_roster();
+        with_timer(
+            repo.path(),
+            "future",
+            crate::cli::timer_source::wall_now() + 60,
+        );
+        let author = AgentLabel::parse("codex").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosts = Default::default();
+        assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+        let deadline = hosts[&author].timers.as_ref().unwrap().next_deadline();
+        assert!(deadline.is_some());
+        assert!(
+            hosts[&author].tasks.is_empty(),
+            "native timer starts no tasks or producers"
+        );
+        for _ in 0..10 {
+            assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+            assert_eq!(
+                hosts[&author].timers.as_ref().unwrap().next_deadline(),
+                deadline
+            );
+        }
+        crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+            config.wait_events.clear()
+        })
+        .unwrap();
+        assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+        assert!(hosts.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(
+            !crate::agent_store::agents_root(repo.path())
+                .join("codex/events")
+                .exists(),
+            "future hosting acquires no idle ingest lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_removed_definition_is_owed_to_two_admissions_and_ack_retires_it() {
+        let repo = repo_with_roster();
+        let author = AgentLabel::parse("codex").unwrap();
+        with_timer(repo.path(), "past", 1);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosts = Default::default();
+        assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+        assert!(matches!(
+            rx.recv().await.unwrap().1,
+            (
+                WaitItem::TimerEvent { .. },
+                crate::cli::event_source::Durability::Logged
+            )
+        ));
+        crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+            config.wait_events.clear()
+        })
+        .unwrap();
+        assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+        assert!(hosts.is_empty());
+        let fresh = |out| Client {
+            writer: None,
+            who: Served::Agent {
+                author: author.clone(),
+            },
+            out,
+            shown: Default::default(),
+        };
+        let (one, mut first) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let (two, mut second) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let mut clients = vec![fresh(one), fresh(two)];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let mut cache = Default::default();
+        assert!(
+            serve_to_cached(
+                repo.path(),
+                &mut clients,
+                &state,
+                None,
+                &mut Vec::new(),
+                &mut cache,
+                &hosts,
+            )
+            .is_empty()
+        );
+        let mut selectors = Vec::new();
+        for receiver in [&mut first, &mut second] {
+            let note: Note = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+            let Note::Items { items } = note else {
+                panic!("accepted timer is owed")
+            };
+            assert_eq!(items.len(), 1);
+            selectors.push(items[0].event_view().unwrap().selector.unwrap().to_owned());
+        }
+        assert_eq!(
+            selectors[0], selectors[1],
+            "one WAL occurrence, independent presentations"
+        );
+        assert!(clients.is_empty());
+        crate::cli::events::run(crate::cli::EventsArgs {
+            command: crate::cli::EventsCmd::Ack(crate::cli::EventsAckArgs {
+                repo: Some(repo.path().to_owned()),
+                author: Some("codex".into()),
+                ids: vec![selectors.remove(0)],
+                reply: None,
+            }),
+        })
+        .await
+        .unwrap();
+        let (out, mut later) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        clients.push(fresh(out));
+        assert!(
+            serve_to_cached(
+                repo.path(),
+                &mut clients,
+                &state,
+                None,
+                &mut Vec::new(),
+                &mut cache,
+                &hosts,
+            )
+            .is_empty()
+        );
+        let note: Note = serde_json::from_str(&later.recv().await.unwrap()).unwrap();
+        assert!(
+            matches!(note, Note::Beat),
+            "cached inventory still validates durable ack state"
+        );
+    }
+
     fn hello_for(repo: &std::path::Path, author: &str) -> String {
         serde_json::to_string(&Hello {
             proto: PROTO,
@@ -8011,7 +8487,7 @@ mod tests {
             let _ = task.await;
         }
         for author in &heard {
-            let sources = hostable(repo.path(), author);
+            let sources = hostable(repo.path(), author).unwrap();
             let clank_core::agent_config::WaitEventSource::Command(command) = &sources[0].0 else {
                 unreachable!()
             };
@@ -8040,7 +8516,7 @@ mod tests {
         with_source(repo.path(), "codex", "deploys");
         let codex = AgentLabel::parse("codex").unwrap();
 
-        let hosted = hostable(repo.path(), &codex);
+        let hosted = hostable(repo.path(), &codex).unwrap();
         assert!(!hosted.is_empty(), "the fixture declares one");
         assert!(
             hosted
@@ -8166,7 +8642,7 @@ mod tests {
         let events = crate::agent_store::agents_root(repo.path())
             .join("codex")
             .join("events");
-        let key = match &hostable(repo.path(), &codex)[0].0 {
+        let key = match &hostable(repo.path(), &codex).unwrap()[0].0 {
             clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
             other => panic!("the fixture declares a command source, got {other:?}"),
         };
@@ -8284,7 +8760,7 @@ mod tests {
         .unwrap();
 
         let events = agent_dir.join("events");
-        let key = match &hostable(repo.path(), &codex)[0].0 {
+        let key = match &hostable(repo.path(), &codex).unwrap()[0].0 {
             clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
             other => panic!("the fixture declares a command source, got {other:?}"),
         };
@@ -8571,6 +9047,7 @@ mod tests {
             },
             Some(&state),
             &mut pending,
+            &Default::default(),
         );
 
         let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
@@ -8672,6 +9149,7 @@ mod tests {
             },
             Some(&state),
             &mut pending,
+            &Default::default(),
         );
         let note: Note = serde_json::from_str(next.recv().await.unwrap().trim_end()).unwrap();
         let Note::Items { items, .. } = note else {
@@ -8706,7 +9184,7 @@ mod tests {
 
         // What the monitor hosts: this author's configured source, with
         // a row in it.
-        let configured = match &hostable(repo.path(), &claude)[0].0 {
+        let configured = match &hostable(repo.path(), &claude).unwrap()[0].0 {
             clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
             other => panic!("a command source, got {other:?}"),
         };
@@ -8791,7 +9269,7 @@ mod tests {
             let events = crate::agent_store::agents_root(repo.path())
                 .join(who)
                 .join("events");
-            let key = match &hostable(repo.path(), &author)[0].0 {
+            let key = match &hostable(repo.path(), &author).unwrap()[0].0 {
                 clank_core::agent_config::WaitEventSource::Command(c) => c.source_key(),
                 other => panic!("a command source, got {other:?}"),
             };
@@ -8905,6 +9383,7 @@ mod tests {
                 },
                 Some(&state),
                 &mut Vec::new(),
+                &Default::default(),
             );
         }
 
