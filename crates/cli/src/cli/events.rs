@@ -125,15 +125,15 @@ pub(crate) fn join_prompts(
 /// One listed row, addressable across sources: `source` is the WAL
 /// file stem, `seq` the per-source sequence.
 #[derive(Debug)]
-struct Sourced {
-    source: String,
-    row: EventRow,
+pub(crate) struct Sourced {
+    pub(crate) source: String,
+    pub(crate) row: EventRow,
 }
 
 /// Every source log's rows, discovery by directory glob. A corrupt
 /// log is reported and skipped — inspection must not block on it (the
 /// ingest side owns quarantine).
-fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
+pub(crate) fn read_all(dir: &Path) -> anyhow::Result<Vec<Sourced>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -991,6 +991,7 @@ mod tests {
         use crate::cli::command_source as cs;
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "questions".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1144,6 +1145,7 @@ mod tests {
 
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1243,6 +1245,7 @@ mod tests {
 
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1300,6 +1303,7 @@ mod tests {
 
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1695,6 +1699,7 @@ mod tests {
         use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
+            interrupt: false,
             repo: repo.into(),
             events: vec![GithubEventKind::IssueOpened],
             poll_interval: None,
@@ -1773,6 +1778,7 @@ mod tests {
         use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
+            interrupt: false,
             repo: repo.into(),
             events: vec![GithubEventKind::IssueOpened],
             poll_interval: None,

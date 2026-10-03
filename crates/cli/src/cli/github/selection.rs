@@ -411,6 +411,7 @@ mod tests {
 
     fn src(events: &[GithubEventKind]) -> GithubSource {
         GithubSource {
+            interrupt: false,
             repo: "o/r".into(),
             events: events.to_vec(),
             watch: Vec::new(),

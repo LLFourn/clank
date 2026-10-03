@@ -72,7 +72,7 @@ pub enum Command {
     /// (`--to`), or `--master` for whoever that repo's roster names
     /// master. The message wakes its agent until it is handled.
     Send(crate::cli::SendArgs),
-    /// Type a message straight into an agent's terminal
+    /// Submit a message to an agent's terminal, then interrupt its current turn
     ///
     /// The escape hatch for when `clank send` cannot be delivered —
     /// a wedged hook, a stale binding, a wake that never fires. It
@@ -272,8 +272,8 @@ pub async fn dispatch_with(
         Command::Wait(args) => crate::cli::grok_handoff::run_wait(args).await,
         Command::Feedback(args) => crate::cli::feedback::run(args).await,
         Command::Events(args) => crate::cli::events::run(args).await,
-        Command::Send(args) => crate::cli::send::run(args),
-        Command::Nudge(args) => crate::cli::nudge::run(args),
+        Command::Send(args) => crate::cli::send::run(args).await,
+        Command::Nudge(args) => crate::cli::nudge::run(args).await,
         Command::Monitor(args) => crate::cli::monitor::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,

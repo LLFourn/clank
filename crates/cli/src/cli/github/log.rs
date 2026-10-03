@@ -42,7 +42,9 @@ use std::path::{Path, PathBuf};
 
 use clank_core::wait::WaitItem;
 
+mod interruption;
 mod timer;
+pub(crate) use interruption::{InterruptAttempt, InterruptOutcome};
 
 #[derive(Debug)]
 pub(crate) enum RecurringTransition {
@@ -156,6 +158,15 @@ enum Line {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Record {
+    /// Claim precedes the side effect; outcome never acknowledges the event.
+    Interrupt {
+        v: u64,
+        seq: u64,
+        ident: String,
+        at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<InterruptOutcome>,
+    },
     /// Compacted recurring acknowledgement evidence and allocator reservation.
     /// Never a selector or a separate completion transaction.
     TimerProgress {
@@ -184,6 +195,8 @@ enum Record {
         /// One atomic append per event, like every primary record.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         baseline: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        interrupt: bool,
         transport: Transport,
         #[serde(skip_serializing_if = "Option::is_none")]
         feed_id: Option<String>,
@@ -235,6 +248,7 @@ impl Record {
             | Record::Ack { v, .. }
             | Record::TimerProgress { v, .. }
             | Record::ReplyIntent { v, .. } => *v,
+            Record::Interrupt { v, .. } => *v,
         }
     }
 }
@@ -326,6 +340,10 @@ pub(crate) struct ReadRows {
 /// diagnosing poll/relay dedup or offline catch-up (codex c009500).
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct EventRow {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) interrupt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interrupt_attempt: Option<InterruptAttempt>,
     pub(crate) seq: u64,
     pub(crate) at: u64,
     /// Github-side event time when known; display time is
@@ -534,9 +552,23 @@ impl SharedWal {
         event_at: Option<u64>,
         item: &WaitItem,
     ) -> crate::cli::event_source::Durability {
+        self.interruptible_inbox(transport, feed_id, action_key, event_at, item, false)
+    }
+
+    pub(crate) fn interruptible_inbox(
+        &self,
+        transport: Transport,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+        interrupt: bool,
+    ) -> crate::cli::event_source::Durability {
         self.with(|log| {
-            log.append_inbox(transport, feed_id, action_key, event_at, item)
-                .map(|_| ())
+            log.append_interruptible_inbox(
+                transport, feed_id, action_key, event_at, item, interrupt,
+            )
+            .map(|_| ())
         })
     }
 
@@ -788,6 +820,9 @@ impl EventLog {
                     }
                 }
                 Record::Ack { .. } => {}
+                Record::Interrupt { seq, .. } => {
+                    max_seq = max_seq.max(seq);
+                }
                 Record::TimerProgress { seq, .. } => {
                     max_seq = max_seq.max(seq);
                 }
@@ -891,7 +926,7 @@ impl EventLog {
                     } => {
                         ids.insert(id);
                     }
-                    Record::Ack { reply: None, .. } => {}
+                    Record::Ack { reply: None, .. } | Record::Interrupt { .. } => {}
                     _ => {
                         return Err(std::io::Error::other(
                             "unexpected timer WAL semantics; repair required",
@@ -942,9 +977,25 @@ impl EventLog {
             .filter(|l| matches!(l, Line::Foreign { .. }))
             .count();
         let mut replies = std::collections::HashMap::new();
+        let mut interrupts = std::collections::HashMap::new();
         for line in &lines_in {
             if let Line::Known(record) = line {
                 match record.as_ref() {
+                    Record::Interrupt {
+                        seq,
+                        ident,
+                        at,
+                        outcome,
+                        ..
+                    } => {
+                        interrupts.insert(
+                            (*seq, ident.clone()),
+                            InterruptAttempt {
+                                at: *at,
+                                outcome: outcome.clone(),
+                            },
+                        );
+                    }
                     Record::ReplyIntent {
                         seq, ident, reply, ..
                     } => {
@@ -978,6 +1029,7 @@ impl EventLog {
                     at,
                     event_at,
                     baseline,
+                    interrupt,
                     transport,
                     feed_id,
                     action_key,
@@ -996,6 +1048,8 @@ impl EventLog {
                     std::collections::hash_map::Entry::Vacant(v) => {
                         v.insert(rows.len());
                         rows.push(EventRow {
+                            interrupt,
+                            interrupt_attempt: None,
                             seq,
                             at,
                             event_at,
@@ -1013,6 +1067,9 @@ impl EventLog {
                     std::collections::hash_map::Entry::Occupied(o) => {
                         let row = &mut rows[*o.get()];
                         row.baseline &= baseline;
+                        // Conflicting physical copies must not manufacture
+                        // permission to interrupt an old, ordinary event.
+                        row.interrupt &= interrupt;
                         if row.feed_id.is_none() {
                             row.feed_id = feed_id;
                         }
@@ -1031,6 +1088,7 @@ impl EventLog {
                 .iter()
                 .any(|(a, i)| ack_covers(*a, i.as_deref(), row.seq, &row.ident));
             row.acked = row.baseline || covered;
+            row.interrupt_attempt = interrupts.remove(&(row.seq, row.ident.clone()));
             if let Some((reply, accepted)) = replies.remove(&(row.seq, row.ident.clone())) {
                 row.reply = Some(reply);
                 row.reply_accepted = accepted;
@@ -1141,7 +1199,21 @@ impl EventLog {
         event_at: Option<u64>,
         item: &WaitItem,
     ) -> std::io::Result<u64> {
-        self.append_inbox_record(transport, feed_id, action_key, event_at, item, false)
+        self.append_inbox_record(transport, feed_id, action_key, event_at, item, false, false)
+    }
+
+    pub(crate) fn append_interruptible_inbox(
+        &mut self,
+        transport: Transport,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+        interrupt: bool,
+    ) -> std::io::Result<u64> {
+        self.append_inbox_record(
+            transport, feed_id, action_key, event_at, item, false, interrupt,
+        )
     }
 
     /// A pre-watch event at baseline: full payload, BORN HANDLED —
@@ -1153,7 +1225,15 @@ impl EventLog {
         event_at: Option<u64>,
         item: &WaitItem,
     ) -> std::io::Result<u64> {
-        self.append_inbox_record(Transport::Poll, feed_id, action_key, event_at, item, true)
+        self.append_inbox_record(
+            Transport::Poll,
+            feed_id,
+            action_key,
+            event_at,
+            item,
+            true,
+            false,
+        )
     }
 
     fn append_inbox_record(
@@ -1164,6 +1244,7 @@ impl EventLog {
         event_at: Option<u64>,
         item: &WaitItem,
         baseline: bool,
+        interrupt: bool,
     ) -> std::io::Result<u64> {
         let Some(seq) = self.next_seq else {
             return Err(std::io::Error::other(
@@ -1176,6 +1257,7 @@ impl EventLog {
             at: now_epoch(),
             event_at,
             baseline,
+            interrupt,
             transport,
             feed_id: feed_id.map(str::to_owned),
             action_key: action_key.map(str::to_owned),
@@ -1479,6 +1561,7 @@ impl EventLog {
         let mut identities: Vec<(Option<String>, Option<String>, u64, bool)> = Vec::new();
         let mut foreign: Vec<(String, Option<u64>)> = Vec::new();
         let mut intents = Vec::new();
+        let mut interrupt_records = Vec::new();
         for l in lines_in {
             let r = match l {
                 Line::Known(r) => *r,
@@ -1535,6 +1618,7 @@ impl EventLog {
                     ));
                 }
                 Record::ReplyIntent { .. } => intents.push(r),
+                Record::Interrupt { .. } => interrupt_records.push(r),
             }
         }
         let covered = |g: &CGroup| {
@@ -1680,6 +1764,19 @@ impl EventLog {
                     .any(|(gi, g)| !handled_set.contains(&gi) && g.seq == seq && &g.ident == ident)
             {
                 out.push_str(&serde_json::to_string(&intent).map_err(std::io::Error::other)?);
+                out.push('\n');
+                kept_lines += 1;
+            }
+        }
+        for record in interrupt_records {
+            if let Record::Interrupt { seq, ref ident, .. } = record
+                && cgroups.iter().enumerate().any(|(gi, group)| {
+                    (!handled_set.contains(&gi) || retained.contains(&gi))
+                        && group.seq == seq
+                        && &group.ident == ident
+                })
+            {
+                out.push_str(&serde_json::to_string(&record).map_err(std::io::Error::other)?);
                 out.push('\n');
                 kept_lines += 1;
             }

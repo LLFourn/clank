@@ -279,6 +279,7 @@ mod tests {
     fn seed(repo: &Path, agent: &str, route: Option<&CommandReplyRoute>, required: bool) -> String {
         let dir = directory(repo, agent);
         let src = CommandSource {
+            interrupt: false,
             name: "questions".into(),
             command: vec!["true".into()],
             reply_command: route.map(|r| r.command.clone()),

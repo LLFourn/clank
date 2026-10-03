@@ -200,6 +200,28 @@ pub fn deliver(
     log_message(repo, to, &mint_id(), from, sent, body, None)
 }
 
+pub fn deliver_with_interrupt(
+    repo: &Path,
+    to: &AgentLabel,
+    from: Option<&Sender>,
+    sent: &str,
+    body: &str,
+    interrupt: bool,
+) -> anyhow::Result<String> {
+    let handle = mint_id();
+    log_message_with_key(
+        repo,
+        to,
+        &handle,
+        &action_key(to, &handle),
+        from,
+        sent,
+        body,
+        None,
+        interrupt,
+    )
+}
+
 /// The shared append, used by a send and by migration. `at` overrides
 /// the event's display time, which migration needs and a send does not.
 fn log_message(
@@ -212,7 +234,7 @@ fn log_message(
     at: Option<u64>,
 ) -> anyhow::Result<String> {
     let key = action_key(to, handle);
-    log_message_with_key(repo, to, handle, &key, from, sent, body, at)
+    log_message_with_key(repo, to, handle, &key, from, sent, body, at, false)
 }
 
 /// The same, under a caller-chosen action key. Migration needs its own
@@ -227,6 +249,7 @@ fn log_message_with_key(
     sent: &str,
     body: &str,
     at: Option<u64>,
+    interrupt: bool,
 ) -> anyhow::Result<String> {
     // Held across BOTH steps: reading the next sequence and writing at
     // it are one allocation, and a lock around only the write does not
@@ -243,7 +266,7 @@ fn log_message_with_key(
         selector: None,
     };
     let at = at.or_else(|| parse_rfc3339_secs(sent));
-    log.append_inbox(Transport::Message, None, Some(key), at, &item)
+    log.append_interruptible_inbox(Transport::Message, None, Some(key), at, &item, interrupt)
         .with_context(|| format!("logging a message for `{}`", to.as_str()))?;
     // Compaction runs HERE, on the write path and under the same
     // writer lock, because a message log has no coordinator to run it
@@ -344,6 +367,7 @@ pub fn migrate(repo: &Path, label: &AgentLabel) -> anyhow::Result<usize> {
                 "",
                 &message.body,
                 at,
+                false,
             )?;
         }
         std::fs::remove_file(&path).with_context(|| format!("removing `{}`", path.display()))?;
@@ -477,6 +501,23 @@ mod tests {
 
     fn grok() -> AgentLabel {
         AgentLabel::parse("grok").unwrap()
+    }
+
+    #[test]
+    fn interrupt_policy_is_recorded_without_handling_the_message() {
+        let repo = tempfile::tempdir().unwrap();
+        deliver_with_interrupt(repo.path(), &grok(), None, SENT, "urgent", true).unwrap();
+        deliver(repo.path(), &grok(), None, SENT, "ordinary").unwrap();
+        let rows = message_log(repo.path(), &grok())
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert!(rows[0].interrupt);
+        assert!(!rows[1].interrupt);
+        assert_eq!(pending(repo.path(), &grok()).len(), 2);
+        assert!(rows.iter().all(|row| row.interrupt_attempt.is_none()));
     }
 
     fn legacy_file(repo: &Path, name: &str, raw: &str) -> PathBuf {

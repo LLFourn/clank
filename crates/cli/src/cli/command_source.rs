@@ -48,6 +48,9 @@ pub(crate) fn backend_state_dir(agent_dir: &std::path::Path, key: &str) -> std::
 /// cannot reach the renderer's layout.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub(crate) struct Line {
+    /// Per-event override; absence inherits the source's default.
+    #[serde(default)]
+    pub(crate) interrupt: Option<bool>,
     /// Producer-owned and unique within the source. Compared for
     /// EQUALITY and nothing else — never ordered, never a resume
     /// point.
@@ -242,6 +245,7 @@ pub(crate) enum Ingested {
     /// never re-derives it — two places deriving one identity is two
     /// places to disagree.
     Emit {
+        interrupt: bool,
         id: String,
         item: Box<clank_core::wait::WaitItem>,
     },
@@ -287,6 +291,7 @@ pub(crate) fn ingest_line(
         Known::No => {}
     }
     Some(Ingested::Emit {
+        interrupt: line.interrupt.unwrap_or(src.interrupt),
         id: line.id.clone(),
         item: Box::new(clank_core::wait::WaitItem::CommandEvent {
             name: src.name.clone(),
@@ -328,7 +333,11 @@ pub(crate) fn apply(
 ) -> bool {
     match what {
         Ingested::Refuse(_) | Ingested::Duplicate => true,
-        Ingested::Emit { id, mut item } => {
+        Ingested::Emit {
+            id,
+            mut item,
+            interrupt,
+        } => {
             // The producer's timestamp goes in the ENVELOPE, where
             // every reader already looks for an event's own time.
             // Leaving it None made a replayed or backfilled event
@@ -339,12 +348,13 @@ pub(crate) fn apply(
                 clank_core::wait::WaitItem::CommandEvent { at, .. } => *at,
                 _ => None,
             };
-            let seq = match log.append_inbox(
+            let seq = match log.append_interruptible_inbox(
                 crate::cli::github::log::Transport::Command,
                 Some(&id),
                 None,
                 event_at,
                 &item,
+                interrupt,
             ) {
                 Ok(seq) => seq,
                 Err(e) => {
@@ -515,6 +525,7 @@ pub(crate) fn report_failure(
     );
     apply(
         Ingested::Emit {
+            interrupt: false,
             item: Box::new(failure_event(src, &id, why)),
             id,
         },
@@ -596,12 +607,40 @@ mod tests {
 
     fn src_named(name: &str) -> clank_core::agent_config::CommandSource {
         clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: name.into(),
             command: vec!["true".into()],
             reply_command: None,
             receipt_command: None,
             glyph: None,
         }
+    }
+
+    #[test]
+    fn producer_override_and_source_default_are_snapshotted_before_replay() {
+        let dir = tmpdir();
+        let (mut log, mut seen) = store(dir.path());
+        let mut source = src_named("voice");
+        source.interrupt = true;
+        for raw in [
+            r#"{"id":"one","content":"wake"}"#,
+            r#"{"id":"two","interrupt":false}"#,
+        ] {
+            let what = ingest_line(&source, &seen, raw).unwrap();
+            assert!(apply(what, KEY, &mut log, &mut seen, |_| true));
+        }
+        let rows = log.read_rows().unwrap().unwrap().rows;
+        assert!(rows[0].interrupt);
+        assert!(!rows[1].interrupt);
+        source.interrupt = false;
+        let explicit = ingest_line(&source, &seen, r#"{"id":"three","interrupt":true}"#).unwrap();
+        assert!(apply(explicit, KEY, &mut log, &mut seen, |_| true));
+        assert!(log.read_rows().unwrap().unwrap().rows[2].interrupt);
+        assert_eq!(
+            ingest_line(&source, &seen, r#"{"id":"one","interrupt":false}"#),
+            Some(Ingested::Duplicate)
+        );
+        assert!(log.read_rows().unwrap().unwrap().rows[0].interrupt);
     }
 
     const KEY: &str = "command-s-00000000";
@@ -1009,7 +1048,8 @@ mod tests {
     fn a_broken_source_reports_once_until_it_is_acked() {
         let dir = tmpdir();
         let (mut log, mut seen) = store(dir.path());
-        let src = src_named("s");
+        let mut src = src_named("s");
+        src.interrupt = true;
         let woke = std::cell::RefCell::new(Vec::new());
         let report = |log: &mut EventLog, seen: &mut Seen| {
             report_failure(&src, KEY, log, seen, "it keeps dying", |i| {
@@ -1058,6 +1098,14 @@ mod tests {
         assert_eq!(
             failures_owed, 1,
             "the report is durable, not a passing notice",
+        );
+
+        let rows = log.read_rows().unwrap().unwrap().rows;
+        assert!(rows[0].interrupt);
+        assert!(
+            rows.iter()
+                .filter(|row| matches!(row.item, WaitItem::CommandEvent { failure: true, .. }))
+                .all(|row| !row.interrupt)
         );
 
         // Acked: a later breakage is news again. Only the FAILURE
@@ -1769,6 +1817,8 @@ mod producer_tests {
     /// One logged row, with only the fields this decision reads.
     fn row(seq: u64, ident: &str, acked: bool) -> crate::cli::github::log::EventRow {
         crate::cli::github::log::EventRow {
+            interrupt: false,
+            interrupt_attempt: None,
             seq,
             at: 0,
             event_at: None,
@@ -1853,6 +1903,8 @@ mod producer_tests {
     #[test]
     fn a_replayed_github_row_is_stamped_with_the_watchs_prompt() {
         let github = |seq: u64| crate::cli::github::log::EventRow {
+            interrupt: false,
+            interrupt_attempt: None,
             seq,
             at: 0,
             event_at: None,

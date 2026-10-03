@@ -75,6 +75,7 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
     let mut progress = false;
     let mut acks: HashMap<u64, Vec<Record>> = HashMap::new();
     let mut ids = HashMap::new();
+    let mut interrupts = Vec::new();
     for line in lines {
         let Line::Known(record) = line else {
             return Err(invalid("foreign recurring WAL record; repair required"));
@@ -83,6 +84,10 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
             return Err(invalid("unsupported recurring WAL version"));
         }
         match record.as_ref() {
+            Record::Interrupt { seq, .. } => {
+                state.high = state.high.max(*seq);
+                interrupts.push(record.as_ref().clone());
+            }
             Record::TimerProgress {
                 seq,
                 generation,
@@ -261,6 +266,27 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
             ));
         }
     }
+    for record in interrupts {
+        let Record::Interrupt { seq, ref ident, .. } = record else {
+            unreachable!()
+        };
+        let group = state
+            .groups
+            .get_mut(&(seq, ident.clone()))
+            .ok_or_else(|| invalid("recurring interrupt has no matching occurrence"))?;
+        if !group.rows.iter().any(|row| {
+            matches!(
+                row,
+                Record::Inbox {
+                    interrupt: true,
+                    ..
+                }
+            )
+        }) {
+            return Err(invalid("recurring interrupt was not requested"));
+        }
+        group.rows.push(record);
+    }
     Ok(state)
 }
 
@@ -327,6 +353,16 @@ impl EventLog {
         content: &str,
         wall: u64,
     ) -> std::io::Result<RecurringTransition> {
+        self.accept_recurring_with_interrupt(r, content, wall, false)
+    }
+
+    pub(crate) fn accept_recurring_with_interrupt(
+        &mut self,
+        r: &Recurrence,
+        content: &str,
+        wall: u64,
+        interrupt: bool,
+    ) -> std::io::Result<RecurringTransition> {
         self.validate_recurring_key(r)?;
         let dir = self
             .log_path
@@ -380,6 +416,7 @@ impl EventLog {
             at: wall,
             event_at: Some(slots.due_at),
             baseline: false,
+            interrupt,
             transport: Transport::Timer,
             feed_id: Some(id),
             action_key: None,
@@ -491,6 +528,38 @@ mod tests {
         .unwrap();
         let log = EventLog::open(dir.path(), &r.source_key()).unwrap();
         (dir, r, log)
+    }
+
+    #[test]
+    fn recurring_interrupt_claim_survives_strict_recovery_and_compaction() {
+        let (dir, r, mut log) = fixture();
+        let (seq, ident, _) = accepted(&mut log, &r, 120);
+        // Seed the new policy on this isolated occurrence; source API policy
+        // propagation is a separate milestone, not implied by this fixture.
+        let text = std::fs::read_to_string(&log.log_path).unwrap();
+        let mut encoded = String::new();
+        for line in text.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["t"] == "inbox" {
+                value["interrupt"] = true.into();
+            }
+            encoded.push_str(&serde_json::to_string(&value).unwrap());
+            encoded.push('\n');
+        }
+        std::fs::write(&log.log_path, encoded).unwrap();
+        assert!(log.claim_interrupt(seq, &ident).unwrap());
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let mut reopened = EventLog::open(dir.path(), &r.source_key()).unwrap();
+        assert!(!reopened.claim_interrupt(seq, &ident).unwrap());
+        let row = reopened
+            .read_timer_backlog(true)
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert!(!row.acked);
+        assert!(row.interrupt_attempt.is_some());
     }
 
     fn accepted(log: &mut EventLog, r: &Recurrence, wall: u64) -> (u64, String, WaitItem) {

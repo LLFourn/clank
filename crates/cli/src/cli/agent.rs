@@ -339,6 +339,10 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let codex_root = codex_launch_root(&composed, &crate::agent_env::Process);
     pre_launch_codex_trust(launch_tool, &repo, codex_root.as_deref());
 
+    if let Err(error) = super::pane_target::record(&repo, &label, launch_tool, &composed.program) {
+        eprintln!("clank: launch provenance unavailable for interruption: {error:#}");
+    }
+
     exec_composed(
         composed,
         (launch_tool == Tool::Grok).then_some(repo.as_path()),

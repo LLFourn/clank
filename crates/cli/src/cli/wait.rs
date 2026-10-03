@@ -3318,6 +3318,7 @@ mod shared_tests {
     async fn two_invocations_of_one_name_keep_their_own_state() {
         use crate::cli::command_source as cs;
         let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -3815,6 +3816,7 @@ mod tests {
 
     fn command_source(name: &str, argv: &[&str]) -> clank_core::agent_config::CommandSource {
         clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: name.into(),
             command: argv.iter().map(|s| s.to_string()).collect(),
             reply_command: None,

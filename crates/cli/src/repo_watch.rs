@@ -182,6 +182,16 @@ impl RepoStateWatcher {
         tx: Sender<()>,
         timer_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<Self> {
+        Self::attach_with_invalidations(repo, poll_mode, tx, timer_dirty, None)
+    }
+
+    pub(crate) fn attach_with_invalidations(
+        repo: &Path,
+        poll_mode: bool,
+        tx: Sender<()>,
+        timer_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        event_dirty: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> anyhow::Result<Self> {
         // `<repo>/.clank` may not exist yet on a brand-new repo; notify
         // refuses to watch a missing path, so create it first (clank
         // owns the dir anyway).
@@ -213,6 +223,15 @@ impl RepoStateWatcher {
             move |res: notify::Result<notify::Event>| {
                 match res {
                     Ok(event) => {
+                        if let Some(dirty) = &event_dirty
+                            && (event.paths.is_empty()
+                                || event
+                                    .paths
+                                    .iter()
+                                    .any(|path| is_event_invalidation(path, &cr)))
+                        {
+                            dirty.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         if let Some(dirty) = &timer_dirty
                             && (event.paths.is_empty()
                                 || event.paths.iter().any(|path| {
@@ -237,6 +256,9 @@ impl RepoStateWatcher {
                         }
                     }
                     Err(_) => {
+                        if let Some(dirty) = &event_dirty {
+                            dirty.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         if let Some(dirty) = &timer_dirty {
                             dirty.store(true, std::sync::atomic::Ordering::Release);
                         }
@@ -269,12 +291,50 @@ impl RepoStateWatcher {
     }
 }
 
+/// Event custody or inventory changed; ordinary git/config/feedback changes do
+/// not initiate interruption. Ancestor-directory changes conservatively rescan.
+fn is_event_invalidation(path: &Path, clank: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(clank.join("agents")) else {
+        return false;
+    };
+    let components: Vec<_> = relative.components().collect();
+    components.len() < 2
+        || (components[1].as_os_str() == "events"
+            && (path.extension().is_none()
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn p(rel: &str) -> PathBuf {
         PathBuf::from("/r").join(rel)
+    }
+
+    #[test]
+    fn event_invalidations_exclude_ordinary_repo_state_and_sidecars() {
+        let root = p(".clank");
+        for path in [
+            ".clank/agents/grok/events/messages.jsonl",
+            ".clank/agents/grok/events/timer-config-a.jsonl",
+            ".clank/agents/grok/events",
+            ".clank/agents/grok",
+        ] {
+            assert!(is_event_invalidation(&p(path), &root), "{path}");
+        }
+        for path in [
+            ".git/HEAD",
+            ".clank/config.json",
+            ".clank/agents/grok/config.json",
+            ".clank/agents/grok/feedback/a.md",
+            ".clank/agents/grok/events/messages.lock",
+            ".clank/agents/grok/events/messages.state.json",
+        ] {
+            assert!(!is_event_invalidation(&p(path), &root), "{path}");
+        }
     }
 
     #[test]

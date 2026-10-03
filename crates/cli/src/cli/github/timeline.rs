@@ -757,6 +757,7 @@ mod tests {
         std::fs::create_dir_all(&events).unwrap();
 
         let glyphed = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -764,6 +765,7 @@ mod tests {
             glyph: Some("*".into()),
         };
         let plain = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "builds".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -864,6 +866,7 @@ mod tests {
         std::fs::create_dir_all(&events).unwrap();
 
         let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,

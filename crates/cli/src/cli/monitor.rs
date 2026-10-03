@@ -26,7 +26,10 @@ use clank_core::wait::WaitItem;
 // Version 7 also makes single-tag diagnostics scalar.
 // Version 8 hosts native timers and presents their additive event variant.
 // Old monitors must not keep serving the previous lifecycle after an upgrade.
-pub(crate) const PROTO: u32 = 9;
+// Version 10 owns eligible-event interruption even without an armed waiter.
+// Version 9 can host the same inbox but cannot promise this control lifecycle;
+// a fresh client must negotiate retirement rather than silently reuse it.
+pub(crate) const PROTO: u32 = 10;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -2373,11 +2376,13 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     use futures_util::StreamExt;
     let (fs_tx, fs_rx) = std::sync::mpsc::channel::<()>();
     let timer_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _watcher = crate::repo_watch::RepoStateWatcher::attach_with_timer_invalidation(
+    let event_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _watcher = crate::repo_watch::RepoStateWatcher::attach_with_invalidations(
         &repo,
         false,
         fs_tx,
         Some(timer_dirty.clone()),
+        Some(event_dirty.clone()),
     )?;
     let mut timer_backlogs: std::collections::BTreeMap<
         AgentLabel,
@@ -2419,6 +2424,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         .departing
         .extend(reconcile_hosting(&repo, &mut hosted, &source_items));
 
+    for author in roster_authors(&repo) {
+        owned.interrupting.notify(&repo, author);
+    }
     loop {
         let timer_deadline = hosted
             .values()
@@ -2542,6 +2550,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             // when no log holds it, which is the one case the channel
             // is the only record of.
             Some((author, emission)) = from_sources.recv() => {
+                if roster_authors(&repo).contains(&author) {
+                    owned.interrupting.notify(&repo, author.clone());
+                }
                 if matches!(emission.0, WaitItem::TimerEvent { .. })
                     && let Some(backlog) = timer_backlogs.get_mut(&author) { backlog.invalidate(); }
                 pending.extend(
@@ -2558,6 +2569,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             // what a retirement would otherwise have to wait for, and
             // collecting here keeps it from growing with the number of
             // config changes a long-lived monitor sees.
+            Some(author) = owned.interrupting.next(), if !owned.interrupting.is_empty() => {
+                owned.interrupting.completed(&repo, author);
+            }
             Some(_) = owned.departing.next(), if !owned.departing.is_empty() => {}
             // A handshake finished. Whatever it decided has already
             // gone to `arrivals`; this only stops us owning the task.
@@ -2569,6 +2583,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 if beat.is_none() {
                     anyhow::bail!("the repo watcher stopped");
                 }
+                let events_changed = event_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
                 let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
                 if timers_changed {
                     for backlog in timer_backlogs.values_mut() { backlog.invalidate(); }
@@ -2581,6 +2596,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 match advance(&repo, fold, &heartbeat).await {
                     Some((next, state)) => {
                         fold = next;
+                        if events_changed {
+                            for author in roster_authors(&repo) { owned.interrupting.notify(&repo, author); }
+                        }
                         // `.clank/` is a wake dir, so an edited
                         // `wait_events` takes effect here rather than
                         // on a restart.
@@ -2601,6 +2619,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     None => {
                         // Keep an observed ack/config invalidation until a fold
                         // can apply it; clearing dirty must not strand Pending.
+                        if events_changed { event_dirty.store(true, std::sync::atomic::Ordering::Release); }
                         if timers_changed { timer_dirty.store(true, std::sync::atomic::Ordering::Release); }
                         eprintln!("monitor: fold failed, held at {fold}");
                     }
@@ -3289,6 +3308,7 @@ const SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// rule and a test can hold it to it.
 #[derive(Default)]
 struct OwnedTasks {
+    interrupting: super::event_interrupt::Scheduler,
     /// Producers a reconcile cancelled, still winding down.
     departing: futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
     /// Handshakes still running. One mid-greeting at the cutoff has a
@@ -3324,6 +3344,7 @@ impl OwnedTasks {
         std::mem::take(&mut self.departing)
             .into_iter()
             .chain(std::mem::take(&mut self.greeting))
+            .chain(std::mem::take(&mut self.interrupting).take_handles())
             .collect()
     }
 }
@@ -4106,20 +4127,26 @@ mod tests {
     /// moved. Both sets are drained, and what comes back is what the
     /// retirement will wait for.
     #[tokio::test]
-    async fn the_owner_hands_over_both_kinds_of_task() {
+    async fn the_owner_hands_over_every_kind_of_task() {
         let mut owned = OwnedTasks::default();
         owned.departing.push(tokio::spawn(async {}));
         owned.departing.push(tokio::spawn(async {}));
         owned.greeting.push(tokio::spawn(async {}));
+        let repo = tempfile::tempdir().unwrap();
+        owned
+            .interrupting
+            .notify(repo.path(), AgentLabel::parse("grok").unwrap());
 
         let all = owned.take_all();
         assert_eq!(
             all.len(),
-            3,
-            "a cancelled producer and a running handshake both count"
+            4,
+            "producers, handshakes and interruption tasks all count"
         );
         assert!(
-            owned.departing.is_empty() && owned.greeting.is_empty(),
+            owned.departing.is_empty()
+                && owned.greeting.is_empty()
+                && owned.interrupting.is_empty(),
             "and the owner keeps nothing back, or the retirement waits for less than it owns"
         );
 
@@ -7497,6 +7524,7 @@ mod tests {
         crate::agent_store::update_agent_config(repo, &author, |config| {
             config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
                 clank_core::agent_config::TimerSource {
+                    interrupt: false,
                     name: name.into(),
                     repeat_every: None,
                     due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)

@@ -286,10 +286,11 @@ impl TimerSet {
             }
             Some(r) => (|| {
                 let mut log = EventLog::open(&self.dir, &entry.key)?;
-                let transition = log.accept_recurring(
+                let transition = log.accept_recurring_with_interrupt(
                     r,
                     entry.source.content.as_deref().unwrap_or_default(),
                     wall,
+                    entry.source.interrupt,
                 )?;
                 let next = match transition {
                     super::github::log::RecurringTransition::Future(due) => Some(due),
@@ -350,6 +351,7 @@ mod tests {
 
     fn source(name: &str, due: u64) -> TimerSource {
         TimerSource {
+            interrupt: false,
             name: name.into(),
             repeat_every: None,
             due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)
@@ -386,6 +388,41 @@ mod tests {
         let mut source = source(name, 100);
         source.repeat_every = Some("10s".into());
         source
+    }
+
+    #[tokio::test]
+    async fn due_occurrences_keep_their_policy_after_source_changes() {
+        for recurring in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut source = if recurring {
+                recurring_source("urgent")
+            } else {
+                source("urgent", 100)
+            };
+            source.interrupt = true;
+            let key = if recurring {
+                recurrence::Recurrence::parse(&source, None)
+                    .unwrap()
+                    .source_key()
+            } else {
+                source.source_key(None)
+            };
+            let (mut timers, mut rx) = set(dir.path(), vec![source.clone()]);
+            timers.due_at(100, Instant::now());
+            assert!(rx.try_recv().is_ok());
+            assert!(rows(dir.path(), &key)[0].interrupt);
+            drop(timers);
+            source.interrupt = false;
+            let (mut timers, _) = set(dir.path(), vec![source]);
+            timers.due_at(200, Instant::now());
+            timers.refresh_at(200, Instant::now());
+            let retained = rows(dir.path(), &key);
+            assert_eq!(retained.len(), 1, "pending occurrence must not duplicate");
+            assert!(
+                retained[0].interrupt,
+                "policy belongs to the accepted occurrence"
+            );
+        }
     }
 
     #[tokio::test]
@@ -976,7 +1013,14 @@ fn accept(
         content: source.content.clone().unwrap_or_default(),
         selector: None,
     };
-    let seq = log.append_inbox(Transport::Timer, Some(&id), None, Some(due), &item)?;
+    let seq = log.append_interruptible_inbox(
+        Transport::Timer,
+        Some(&id),
+        None,
+        Some(due),
+        &item,
+        source.interrupt,
+    )?;
     let checkpoint = seen.record(&id);
     super::command_source::stamp_selector(&mut item, key, seq);
     // A failed index write or closed sink cannot retract accepted WAL custody.

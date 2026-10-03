@@ -71,6 +71,9 @@ pub enum WaitEventSource {
 /// core configuration remains free of clocks and I/O.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerSource {
+    /// Best-effort interruption for each newly due occurrence; not part of identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt: bool,
     pub name: String,
     pub due_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,6 +133,9 @@ impl TimerSource {
 /// these as it likes — nothing is fixed to a single repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubSource {
+    /// Best-effort interruption for newly ingested eligible events.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt: bool,
     /// `owner/name`.
     pub repo: String,
     /// Which event sub-kinds wake the agent — the FLAT shape, whose
@@ -575,6 +581,9 @@ impl GithubEventKind {
 /// expected to stay up, restarted with backoff when it does not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSource {
+    /// Default for producer events; an explicit per-line value overrides it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt: bool,
     /// Labels the wake item, and IDENTIFIES the source: its durable
     /// state — resume token and decision window — is keyed on this
     /// alone. See [`CommandSource::source_key`].
@@ -924,11 +933,48 @@ mod tests {
 
     fn cmd(name: &str) -> CommandSource {
         CommandSource {
+            interrupt: false,
             name: name.into(),
             command: vec!["true".into()],
             reply_command: None,
             receipt_command: None,
             glyph: None,
+        }
+    }
+
+    #[test]
+    fn interruption_defaults_off_and_does_not_rekey_sources() {
+        for raw in [
+            r#"{"kind":"command","name":"voice","command":["backend"]}"#,
+            r#"{"kind":"timer","name":"daily","due_at":"2026-10-04T09:00:00Z","repeat_every":"24h"}"#,
+            r#"{"kind":"github","repo":"a/b","events":["pr_opened"]}"#,
+        ] {
+            let mut source: WaitEventSource = serde_json::from_str(raw).unwrap();
+            assert!(
+                serde_json::to_value(&source)
+                    .unwrap()
+                    .get("interrupt")
+                    .is_none()
+            );
+            match &mut source {
+                WaitEventSource::Command(command) => {
+                    let before = command.source_key();
+                    command.interrupt = true;
+                    assert_eq!(command.source_key(), before);
+                }
+                WaitEventSource::Timer(timer) => {
+                    let before = timer.source_key(None);
+                    timer.interrupt = true;
+                    assert_eq!(timer.source_key(None), before);
+                }
+                WaitEventSource::Github(github) => github.interrupt = true,
+            }
+            let encoded = serde_json::to_value(&source).unwrap();
+            assert_eq!(encoded["interrupt"], true);
+            assert_eq!(
+                serde_json::from_value::<WaitEventSource>(encoded).unwrap(),
+                source
+            );
         }
     }
 
@@ -1137,6 +1183,7 @@ mod tests {
         // github-wake-pr-updates-and-pushes: the additive sub-kinds +
         // the branches filter round-trip…
         let src = WaitEventSource::Github(GithubSource {
+            interrupt: false,
             repo: "o/r".into(),
             events: vec![GithubEventKind::PrUpdated, GithubEventKind::BranchPush],
             watch: Vec::new(),

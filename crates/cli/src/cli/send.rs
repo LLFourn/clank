@@ -7,19 +7,23 @@ use clank_core::ids::AgentLabel;
 use super::{SendArgs, resolve_repo};
 use crate::agent_env::Ambient;
 
-pub fn run(args: SendArgs) -> anyhow::Result<()> {
+pub async fn run(args: SendArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let to = recipient(&repo, args.to.as_deref(), args.master)?;
     let body = body_of(&args.message, args.file.as_deref())?;
     let from = sender_in(&crate::agent_env::Process);
-    let handle = crate::inbox::deliver(
+    let handle = crate::inbox::deliver_with_interrupt(
         &repo,
         &to,
         from.as_ref(),
         &crate::cli::stop_hook::now_rfc3339(),
         &body,
+        args.interrupt,
     )?;
     println!("sent to `{to}` in {}: {handle}", repo.display());
+    if args.interrupt {
+        super::event_interrupt::run(repo, to).await;
+    }
     Ok(())
 }
 
@@ -127,16 +131,18 @@ mod tests {
         assert!(err.to_string().contains("claude, codex"), "{err}");
     }
 
-    #[test]
-    fn a_message_sent_to_another_repo_lands_in_its_event_log() {
+    #[tokio::test]
+    async fn a_message_sent_to_another_repo_lands_in_its_event_log() {
         let there = repo_with_roster(TEAM);
         run(SendArgs {
+            interrupt: false,
             repo: Some(there.path().to_path_buf()),
             to: None,
             master: true,
             message: vec!["hello".into()],
             file: None,
         })
+        .await
         .unwrap();
         let repo = dunce::canonicalize(there.path()).unwrap();
         let to = recipient(&repo, None, true).unwrap();
@@ -155,6 +161,40 @@ mod tests {
         assert_eq!(body, "hello");
         assert_eq!(selector.as_deref(), Some("messages@1"));
         assert!(!crate::inbox::inbox_dir(&repo, &to).exists());
+    }
+
+    #[tokio::test]
+    async fn interrupting_send_keeps_custody_when_no_matching_transport_exists() {
+        let there = repo_with_roster(TEAM);
+        run(SendArgs {
+            interrupt: true,
+            repo: Some(there.path().into()),
+            to: None,
+            master: true,
+            message: vec!["urgent instruction".into()],
+            file: None,
+        })
+        .await
+        .unwrap();
+        let repo = dunce::canonicalize(there.path()).unwrap();
+        let to = recipient(&repo, None, true).unwrap();
+        assert_eq!(crate::inbox::pending(&repo, &to).len(), 1);
+        let dir = crate::agent_store::agents_root(&repo)
+            .join(to.as_str())
+            .join("events");
+        let row = crate::cli::github::log::EventLog::open(&dir, "messages")
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert!(row.interrupt);
+        assert!(!row.acked);
+        assert_eq!(
+            row.interrupt_attempt.unwrap().outcome,
+            Some(crate::cli::github::log::InterruptOutcome::Unavailable)
+        );
     }
 
     #[test]

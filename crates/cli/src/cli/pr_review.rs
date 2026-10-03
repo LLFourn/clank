@@ -419,6 +419,7 @@ pub fn propose_with(
 /// price, and the prompt says so.
 pub fn review_source(slug: &str, pr: u32) -> GithubSource {
     GithubSource {
+        interrupt: false,
         repo: slug.to_string(),
         events: vec![
             GithubEventKind::PrComment,

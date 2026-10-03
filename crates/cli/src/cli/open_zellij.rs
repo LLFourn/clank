@@ -1654,137 +1654,100 @@ pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<Subscri
         .map(SubscribeChild)
 }
 
-/// The two actions that say `text` to a pane and press Enter, as
-/// argv after the session prefix; nothing for empty text. The text
-/// follows `--`, so a message beginning with `-` is a message, not a
-/// flag. Enter is byte 13 through `write`, not a newline through
-/// `write-chars`: a newline is what a multi-line paste is made of,
-/// and a chat prompt treats those differently from Return.
-/// Codex uses its own submit sequence below; a bare CR can insert a
-/// newline even after the paste-burst window has elapsed.
-///
-/// Not a pane MUTATION in the ownership gate's sense: typing into a
-/// pane leaves its place in the layout to the reconciler, which is
-/// what that gate protects.
-pub(crate) fn say_argvs(pane: &str, text: &str) -> Option<[Vec<String>; 2]> {
-    if text.is_empty() {
-        return None;
-    }
-    let chars = ["action", "write-chars", "-p", pane, "--", text]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let enter = ["action", "write", "-p", pane, "13"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    Some([chars, enter])
-}
+// Terminal transport and provider key knowledge live in one module.
+#[cfg(test)]
+use super::pane_input::{codex_submit_argv, say_argvs, stop_argv};
+pub(crate) use super::pane_input::{say_to_pane_for_tool, stop_pane};
 
-/// Kitty keyboard protocol's Enter press: CSI 13;1:1u. Codex's TUI
-/// distinguishes this from the raw CR used by shells and other agents.
-fn codex_submit_argv(pane: &str) -> Vec<String> {
-    [
-        "action", "write", "-p", pane, "27", "91", "49", "51", "59", "49", "58", "49", "117",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-/// Grok cancels a running turn with Ctrl+C; Esc only shows a hint.
-/// Other harnesses use Escape. Select the key from the pane's tool,
-/// never from an inherited environment variable in the web server.
-fn stop_argv(pane: &str, tool: clank_core::vocab::Tool) -> Vec<String> {
-    let byte = if tool == clank_core::vocab::Tool::Grok {
-        "3"
-    } else {
-        "27"
-    };
-    ["action", "write", "-p", pane, byte]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-pub(crate) fn stop_pane(
-    session: &str,
-    pane: &str,
-    tool: clank_core::vocab::Tool,
-) -> anyhow::Result<()> {
-    let argv = stop_argv(pane, tool);
+/// Execute one typed terminal-input action. Provider policy belongs to pane_input;
+/// this remains the sole module that starts Zellij subprocesses.
+pub(crate) fn write_pane_action(session: &str, pane: &str, argv: &[String]) -> anyhow::Result<()> {
     let out = std::process::Command::new("zellij")
         .args(["--session", session])
-        .args(&argv)
+        .args(argv)
         .output()?;
     if !out.status.success() {
         anyhow::bail!(
-            "zellij refused `write` for {pane}: {}",
+            "zellij refused `{}` for {pane}: {}",
+            argv.get(1).map(String::as_str).unwrap_or("?"),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
 }
 
-/// Type `text` into `pane` and submit it the way `tool` expects.
-///
-/// PANE ONLY: nothing here reads a stored session binding, which is
-/// what lets `clank nudge` use it when the binding is the suspect
-/// thing. The web bridge wraps this with the app-server attempt it is
-/// willing to trust; the submit-sequence knowledge lives here once.
-pub(crate) fn say_to_pane_for_tool(
+/// Event-loop-safe input with bounded I/O. A timeout is an uncertain mutation,
+/// not evidence that the server ignored the bytes: callers must not resend it.
+pub(crate) async fn write_pane_action_async(
     session: &str,
     pane: &str,
-    tool: clank_core::vocab::Tool,
-    text: &str,
+    argv: &[String],
 ) -> anyhow::Result<()> {
-    if tool == clank_core::vocab::Tool::Codex {
-        say_to_codex_pane(session, pane, text)
-    } else {
-        say_to_pane(session, pane, text)
-    }
-}
-
-/// Say `text` to `pane` in `session` and press Enter.
-pub(crate) fn say_to_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
-    say_to_pane_with_delay(session, pane, text, false)
-}
-
-/// Codex can treat Enter immediately after injected text as a pasted
-/// newline. Its terminal fallback waits past the paste-burst window,
-/// then sends a kitty-protocol Enter press. A held Stop hook may still
-/// queue the prompt; `codex_chat` handles that when available.
-pub(crate) fn say_to_codex_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
-    say_to_pane_with_delay(session, pane, text, true)
-}
-
-fn say_to_pane_with_delay(
-    session: &str,
-    pane: &str,
-    text: &str,
-    delay: bool,
-) -> anyhow::Result<()> {
-    let Some(argvs) = say_argvs(pane, text) else {
-        return Ok(());
-    };
-    for (i, mut argv) in argvs.into_iter().enumerate() {
-        if i == 1 && delay {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            argv = codex_submit_argv(pane);
-        }
-        let out = std::process::Command::new("zellij")
-            .args(["--session", session])
-            .args(&argv)
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "zellij refused `{}` for {pane}: {}",
-                argv.get(1).map(String::as_str).unwrap_or("?"),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-    }
+    let mut command = tokio::process::Command::new("zellij");
+    command.args(["--session", session]).args(argv);
+    let status = run_pane_write(&mut command, std::time::Duration::from_secs(3)).await?;
+    anyhow::ensure!(
+        status.success(),
+        "zellij refused terminal input for {pane}: {status}"
+    );
     Ok(())
+}
+
+async fn run_pane_write(
+    command: &mut tokio::process::Command,
+    budget: std::time::Duration,
+) -> anyhow::Result<std::process::ExitStatus> {
+    use tokio::io::AsyncReadExt;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("starting terminal input transport")?;
+    let mut group = super::wait::GroupKill::over(child.id());
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut tail = super::wait::RingTail::new(4096);
+    let result = tokio::time::timeout(budget, async {
+        let mut sink = tokio::io::sink();
+        let out = tokio::io::copy(&mut stdout, &mut sink);
+        let err = async {
+            let mut bytes = [0; 8192];
+            loop {
+                let count = stderr.read(&mut bytes).await?;
+                if count == 0 {
+                    break;
+                }
+                tail.push(&bytes[..count]);
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        tokio::try_join!(child.wait(), out, err).map(|(status, _, _)| status)
+    })
+    .await;
+    group.terminate();
+    if !matches!(result, Ok(Ok(_))) {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await;
+    }
+    match result {
+        Ok(Ok(status)) if status.success() => Ok(status),
+        Ok(Ok(status)) => anyhow::bail!(
+            "terminal input transport exited {status}; stderr: {}",
+            tail.into_string()
+        ),
+        Ok(Err(error)) => anyhow::bail!(
+            "terminal input transport failed: {error}; acceptance is unknown; stderr: {}",
+            tail.into_string()
+        ),
+        Err(_) => anyhow::bail!(
+            "terminal input transport timed out after {budget:?}; acceptance is unknown; stderr: {}",
+            tail.into_string()
+        ),
+    }
 }
 
 /// Project a pane listing to this repo's agents as `(label, staged)`
@@ -2066,7 +2029,7 @@ fn inside_stack(foreign: &ZellijPane, first: &ZellijPane, span: &StackSpan) -> b
 /// from the `ZELLIJ_PANE_ID` env var zellij sets per-pane. A clank command
 /// always runs in a terminal pane (never the plugin pane that can share
 /// the same numeric id), so the ref is `terminal_<id>`. `None` when unset.
-fn caller_pane_id() -> Option<String> {
+pub(crate) fn caller_pane_id() -> Option<String> {
     let id = std::env::var("ZELLIJ_PANE_ID").ok()?;
     (!id.is_empty()).then(|| format!("terminal_{id}"))
 }
@@ -2171,6 +2134,47 @@ fn live_session_names(list_output: &str) -> Vec<String> {
 /// panes are not seen, which fails OPEN (no holder found).
 pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> SessionScan {
     scan_sessions(deadline, zellij_list_sessions_checked, start_list_panes)
+}
+
+/// Scoped async discovery for event/nudge control. Every query owns its client
+/// group and pipe drains through a deadline; no detached reader thread or
+/// blocking global session listing can outlive cancellation or retirement.
+pub(crate) async fn panes_in_all_sessions_async(deadline: std::time::Duration) -> SessionScan {
+    use futures_util::StreamExt;
+    let argv = vec!["zellij".into(), "list-sessions".into(), "-n".into()];
+    let Some(listing) = (match run_open_query(&argv, deadline).await {
+        Ok(output) => interpret_listing(output.status.success(), &output.stdout, &output.stderr),
+        Err(_) => None,
+    }) else {
+        return assemble_scan(None);
+    };
+    let mut queries = futures_util::stream::FuturesUnordered::new();
+    for session in live_session_names(&listing) {
+        queries.push(async move {
+            let argv = vec![
+                "zellij".into(),
+                "-s".into(),
+                session.clone(),
+                "action".into(),
+                "list-panes".into(),
+                "--json".into(),
+                "--command".into(),
+                "--tab".into(),
+            ];
+            let panes = match run_open_query(&argv, deadline).await {
+                Ok(output) if output.status.success() => {
+                    serde_json::from_str::<Vec<ZellijPane>>(&output.stdout).ok()
+                }
+                _ => None,
+            };
+            (session, panes)
+        });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(outcome) = queries.next().await {
+        outcomes.push(outcome);
+    }
+    assemble_scan(Some(outcomes))
 }
 
 /// [`panes_in_all_sessions`] with the session listing supplied, so the
@@ -3086,6 +3090,37 @@ mod tests {
         assert_eq!(out.stdout, "tab\n");
         assert_eq!(out.stderr.len(), 4096);
         assert!(out.stderr.ends_with("stderr-line\n"));
+    }
+
+    #[tokio::test]
+    async fn pane_write_discards_stdout_and_retains_failure_tail() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 100000 /dev/zero; printf transport-refused >&2; exit 7",
+        ]);
+        let error = run_pane_write(&mut command, std::time::Duration::from_secs(3))
+            .await
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("transport-refused"));
+        assert!(diagnostic.contains("7"));
+        assert!(
+            diagnostic.len() < 5000,
+            "stdout must not be captured as an error body"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_write_deadline_covers_descendants_retaining_output_pipes() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 30 & exit 0"]);
+        let started = std::time::Instant::now();
+        let error = run_pane_write(&mut command, std::time::Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("acceptance is unknown"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[tokio::test]

@@ -665,6 +665,55 @@ group; uncertain ownership refuses a new launch and names the record to inspect.
 Use updated Clank binaries for all agents, the monitor and the TUI before
 enabling required replies; an older client does not enforce this new policy.
 
+Events may request **best-effort interruption** while retaining normal inbox
+delivery. For a message:
+
+```sh
+clank send --to grok --interrupt -m "Please switch to the new task"
+```
+
+Set `"interrupt": true` on a command, GitHub or timer source to request it for
+newly accepted events. A command producer line can override its source default
+with `"interrupt": true` or `false`. The default is off. The chosen value belongs
+to the persisted event; changing configuration or replaying an ID does not change
+old events. Baseline history and source-failure notices never interrupt. Timers
+request interruption only when an occurrence becomes due, including catch-up.
+
+The monitor initiates requests without requiring an armed waiter. One recipient's
+pending eligible events coalesce into one request; the sender uses the same ledger
+when sending an interrupting message without a monitor. Codex first tries the
+bound thread's native control socket, selected from the target launch profile.
+It requires an already-loaded thread with a matching repository, rechecks the
+binding before control, interrupts the exact active turn and confirms that turn
+ended with one read before submitting the inbox hint. It never resumes a thread
+or polls for completion. Relative profile paths with unknown launch cwd are
+refused. A read-only preflight failure permits verified terminal fallback;
+uncertainty after native control forbids a second transport attempt.
+
+The verified Zellij pane receives a brief inbox instruction, then Ctrl+C for
+Grok or Escape for other providers. `clank nudge` uses the same submission/cancellation sequence with your
+message and remains independent of hook and binding health. Launch provenance
+must corroborate the actual running provider; restart older panes through an
+updated Clank launcher if that evidence is missing. Accepted terminal bytes are
+not proof that a subprocess stopped or an event was read.
+
+Interruption does not copy event contents into a second prompt, acknowledge work,
+supply a required reply or create a wake receipt. Missing/unverified transport
+preserves ordinary delivery. There is at most one automatic attempt for each
+logical event; replay, reconnect and idle monitor beats do not retry it. A crash
+or deadline may leave an unconfirmed attempt, which also does not retry.
+`clank events show <selector> --json` includes `interrupt` and `interrupt_attempt`.
+The interruption path adds no watcher or idle polling. Upgrade all Clank clients
+and the monitor before enabling it. Monitor capability 10 includes this lifecycle;
+a newer client requests cooperative retirement of an older host. Refresh long-lived
+TUI clients as well so they share the replacement rather than keep local watchers. Grok and Claude currently use verified
+terminal control. OpenCode's server API has cancellation, but Clank has no verified
+attachable endpoint for a live TUI; it likewise uses the terminal path. No separate
+provider process/server is started to control a persisted session. Without a
+verified transport, pending work is delivered through the ordinary wait/hook.
+An already-armed local wait emits its normal context directly; it needs no detached
+interruption helper. Wake receipts and required replies keep their normal meaning.
+
 Command sources can opt into **wake receipts**, independently of replies. Add
 `receipt_command` to an agent's configured `wait_events` source:
 

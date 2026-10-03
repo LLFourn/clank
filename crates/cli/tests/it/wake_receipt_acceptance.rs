@@ -84,7 +84,7 @@ impl Fixture {
         let ready_path = repo.join("producer-ready.sock");
         let ready = UnixDatagram::bind(&ready_path).unwrap();
         let output = repo.join("receipt.json");
-        let source = CommandSource {
+        let source = CommandSource { interrupt: false,
             name: "voice/a".into(),
             command: vec!["/usr/bin/python3".into(), "-c".into(),
                 "import json,os,socket,sys,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(json.dumps({'pid':os.getpid(),'parent':os.getppid(),'cwd':os.getcwd(),'state':os.environ['CLANK_SOURCE_STATE_DIR'],'argv':sys.argv[1:3]}).encode(),sys.argv[3]); g=open(sys.argv[4]); data=json.loads(g.readline()); print(json.dumps(data),flush=True); time.sleep(300)".into(),
@@ -296,8 +296,10 @@ impl Drop for Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_fallback_hook_receives_configured_producer_and_keeps_reply_owed() {
+async fn local_fallback_hook_receives_interrupting_producer_without_zellij_and_keeps_reply_owed() {
     let mut fixture = Fixture::new(Tool::Codex, true);
+    fixture.source.interrupt = true;
+    fixture.enable_receipts(); // Persist the updated source policy alongside its receipt callback.
     let _lease = fixture.monitor_lease(); // No published monitor: attachment must fall back.
     let hook = fixture.hook_child(false).await;
     let ready = fixture.producer_ready().await;
@@ -322,6 +324,23 @@ async fn local_fallback_hook_receives_configured_producer_and_keeps_reply_owed()
     );
     fixture.assert_receipt(&ready);
     let selector = fixture.assert_owed().await;
+    let shown = fixture
+        .run(&[
+            "events",
+            "show",
+            &selector,
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(shown.status.success());
+    let row: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(row["interrupt"], true);
+    assert!(
+        row.get("interrupt_attempt").is_none_or(Value::is_null),
+        "an already-armed local hook needs no detached interrupt helper"
+    );
     let ack = fixture
         .run(&[
             "events",
@@ -483,6 +502,7 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
     clank::agent_store::update_agent_config(&fixture.repo, &fixture.author, |cfg| {
         cfg.wait_events = vec![WaitEventSource::Timer(
             clank_core::agent_config::TimerSource {
+                interrupt: false,
                 name: "recurring-monitor".into(),
                 due_at: anchor
                     .format(&time::format_description::well_known::Rfc3339)
@@ -768,4 +788,93 @@ async fn receipt_does_not_retire_work_or_redirect_a_successor_masters_subscripti
     assert_eq!(rows[0]["item"]["id"], ID);
     assert_eq!(rows[0]["acked"], false);
     assert!(rows[0].get("reply").is_none());
+}
+
+#[tokio::test]
+async fn shared_monitor_claims_due_interrupt_without_waiter_and_does_not_probe_on_beats() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(Tool::Codex, false);
+    let source = clank_core::agent_config::TimerSource {
+        interrupt: true,
+        name: "interrupt-without-waiter".into(),
+        due_at: "1970-01-01T00:01:40Z".into(),
+        repeat_every: None,
+        content: Some("durable task".into()),
+    };
+    clank::agent_store::update_agent_config(&fixture.repo, &fixture.author, |cfg| {
+        cfg.wait_events = vec![WaitEventSource::Timer(source.clone())];
+    })
+    .unwrap();
+    let bin = fixture.home.join("probe-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let shim = bin.join("zellij");
+    std::fs::write(&shim, "#!/bin/sh\nprintf 'query\\n' >> \"$CLANK_TEST_QUERY_COUNT\"\nprintf 'No active zellij sessions found.\\n' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let count = fixture.home.join("queries");
+    let mut monitor = fixture
+        .command()
+        .args(["monitor", "start", "--repo", fixture.repo.to_str().unwrap()])
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
+        )
+        .env("CLANK_TEST_QUERY_COUNT", &count)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(monitor.stdout.take().unwrap()).lines();
+    assert!(
+        tokio::time::timeout(LIMIT, stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .contains("listening on")
+    );
+    let mut stderr = BufReader::new(monitor.stderr.take().unwrap()).lines();
+    tokio::time::timeout(LIMIT, async {
+        while let Some(line) = stderr.next_line().await.unwrap() {
+            if line.contains("Some(Unavailable) for 1 event(s)") {
+                return;
+            }
+        }
+        panic!("monitor ended before due interruption was attempted");
+    })
+    .await
+    .expect("due work must initiate interruption without a waiter");
+    let listed = fixture
+        .run(&[
+            "events",
+            "list",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(listed.status.success());
+    let rows: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["item"]["name"] == source.name)
+        .unwrap();
+    assert_eq!(row["interrupt"], true);
+    assert_eq!(row["acked"], false);
+    assert_eq!(row["interrupt_attempt"]["outcome"], "unavailable");
+    assert!(
+        !fixture.output.exists(),
+        "attempts cannot fabricate receipts"
+    );
+    // Cross a normal monitor heartbeat, including the claim's own FS invalidation.
+    // This one-shot test delay measures cost; production has no retry timer.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(
+        std::fs::read_to_string(&count).unwrap(),
+        "query\n",
+        "idle beats and claim invalidations cannot retry transport discovery"
+    );
+    monitor.start_kill().unwrap();
+    monitor.wait().await.unwrap();
 }

@@ -15,11 +15,13 @@ pub mod attending;
 pub mod auto;
 pub mod block;
 pub(crate) mod codex_chat;
+pub(crate) mod codex_interrupt;
 pub mod command;
 pub mod command_source;
 pub mod config;
 pub mod diff;
 pub mod doctor;
+pub(crate) mod event_interrupt;
 pub(crate) mod event_source;
 pub mod events;
 pub mod export;
@@ -42,6 +44,8 @@ pub mod nudge;
 pub mod open;
 pub mod open_zellij;
 mod owned_callback;
+pub mod pane_input;
+pub(crate) mod pane_target;
 pub mod pick;
 pub(crate) mod plan_mutation;
 pub mod plan_resolve;
@@ -751,6 +755,9 @@ pub struct NudgeArgs {
 #[command(group(clap::ArgGroup::new("recipient").required(true).args(["to", "master"])))]
 #[command(group(clap::ArgGroup::new("body").required(true).args(["message", "file"])))]
 pub struct SendArgs {
+    /// Request best-effort interruption; the event remains pending if unavailable.
+    #[arg(long)]
+    pub interrupt: bool,
     /// The recipient's repo. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,

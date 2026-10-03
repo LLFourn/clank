@@ -132,7 +132,7 @@ impl Panes for Zellij {
                 {
                     return Ok(());
                 }
-                return open_zellij::say_to_pane_for_tool(
+                return crate::cli::pane_input::say_to_pane_for_tool(
                     &self.session,
                     pane,
                     clank_core::vocab::Tool::Codex,
@@ -140,7 +140,7 @@ impl Panes for Zellij {
                 );
             }
         }
-        open_zellij::say_to_pane_for_tool(
+        crate::cli::pane_input::say_to_pane_for_tool(
             &self.session,
             pane,
             clank_core::vocab::Tool::Claude,
@@ -153,7 +153,7 @@ impl Panes for Zellij {
         })?;
         let table = open_zellij::agent_pane_table(&panes, &self.repo);
         let tool = pane_tool(&self.repo, &table, pane)?;
-        open_zellij::stop_pane(&self.session, pane, tool)
+        crate::cli::pane_input::stop_pane(&self.session, pane, tool)
     }
 }
 

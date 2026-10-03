@@ -73,6 +73,7 @@ pub(crate) struct ChecksSide<'a, C: CiReader> {
 /// the gate — realtime without a poll-established horizon could
 /// replay history.
 pub(crate) struct Coordinator {
+    interrupt: bool,
     keys: SeenSet,
     baseline_done: bool,
     buffered: std::collections::VecDeque<Classified>,
@@ -95,6 +96,7 @@ impl Coordinator {
         wal: crate::cli::github::log::SharedWal,
     ) -> Self {
         Self {
+            interrupt: false,
             keys: SeenSet::new(SEEN_CAP),
             baseline_done: false,
             buffered: std::collections::VecDeque::new(),
@@ -140,12 +142,13 @@ impl Coordinator {
         // the log cannot work out whether this one is in it, and the
         // existing behaviour on a failed append is to warn once and
         // keep delivering so the agent still learns about the event.
-        let durability = self.wal.inbox(
+        let durability = self.wal.interruptible_inbox(
             transport,
             c.feed_id.as_deref(),
             c.key.as_deref(),
             c.event_at,
             &c.item,
+            self.interrupt,
         );
         self.tx.send((c.item, durability)).is_ok()
     }
@@ -328,6 +331,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     }
     let wal = crate::cli::github::log::SharedWal::new(log);
     let mut coordinator = Coordinator::with_wal(tx.clone(), wal.clone());
+    coordinator.interrupt = src.interrupt;
     // The key horizon covers BOTH halves — it is what stops a relay
     // delivery and a poll of the same action emitting twice — so it
     // is restored from any valid log. Opening the relay's gate is a
@@ -624,6 +628,26 @@ mod tests {
     use crate::cli::github::session::tests::{FixedLogin, ScriptLogin};
     use crate::cli::github::session::{GithubSession, HttpSend, MiniResponse};
     use std::sync::Mutex;
+
+    #[test]
+    fn interruption_applies_to_new_events_but_never_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let wal = crate::cli::github::log::SharedWal::new(Some(open_log(dir.path())));
+        let mut coordinator = Coordinator::with_wal(tx.into(), wal);
+        coordinator.interrupt = true;
+        assert!(coordinator.baseline(vec![classified(1, Some("baseline"))]));
+        assert!(coordinator.offer(classified(2, Some("fresh"))));
+        assert!(rx.try_recv().is_ok());
+        let rows = open_log(dir.path()).read_rows().unwrap().unwrap().rows;
+        assert!(!rows[0].interrupt);
+        assert!(rows[1].interrupt);
+        coordinator.interrupt = false;
+        assert!(coordinator.offer(classified(2, Some("fresh"))));
+        let rows = open_log(dir.path()).read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].interrupt);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn relay_start_failure_and_exit_route_one_reason_through_the_inbox() {

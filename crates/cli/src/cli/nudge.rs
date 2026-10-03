@@ -1,4 +1,4 @@
-//! `clank nudge`: type a message straight into an agent's pane.
+//! `clank nudge`: submit a message, then interrupt the agent's current turn.
 //!
 //! `clank send` is the right mechanism and has a failure mode it
 //! cannot report: it writes a durable inbox row and trusts the agent's
@@ -12,30 +12,18 @@
 //! reads no hook, no inbox, no session binding and no wait — only the
 //! live pane listing — and it writes nothing to disk.
 
-use std::path::Path;
-use std::time::Duration;
-
-use clank_core::ids::AgentLabel;
-
 use super::{NudgeArgs, resolve_repo};
-use crate::cli::open_zellij::{self, SessionPane, SessionScan};
+use crate::cli::open_zellij;
 
-/// Matches `session_holder`'s: healthy servers answer in well under
-/// 0.2 s, and a stale one must not hold up a person trying to reach an
-/// agent that is right there.
-const SCAN_DEADLINE: Duration = Duration::from_secs(1);
-
-pub fn run(args: NudgeArgs) -> anyhow::Result<()> {
+pub async fn run(args: NudgeArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let to = crate::cli::send::recipient(&repo, args.to.as_deref(), args.master)?;
     let body = crate::cli::send::body_of(&args.message, args.file.as_deref())?;
 
     open_zellij::require_zellij()?;
-    let scan = open_zellij::panes_in_all_sessions(SCAN_DEADLINE);
-    let found = locate(&scan, &repo, &to)?;
-
-    let tool = crate::agent_store::resolve_tool(&repo, &to)?;
-    open_zellij::say_to_pane_for_tool(&found.session, &found.pane, tool, &body)?;
+    let (found, tool) = super::pane_target::discover(repo.clone(), to.clone()).await?;
+    crate::cli::pane_input::submit_and_interrupt_async(&found.session, &found.pane, tool, &body)
+        .await?;
     println!(
         "nudged `{to}` in {} (session {}, pane {})",
         repo.display(),
@@ -45,84 +33,13 @@ pub fn run(args: NudgeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The one pane a nudge may type into.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Found {
-    pub(crate) session: String,
-    pub(crate) pane: String,
-}
-
-/// Pick the target from one scan, or explain why there isn't one.
-///
-/// Fails CLOSED on every doubt. A launch may treat a session that did
-/// not answer as one fewer pane; here the same silence could be hiding
-/// the target or a second copy of it, and typing a message to a human
-/// into an arbitrary agent is the outcome this command exists to avoid.
-pub(crate) fn locate(scan: &SessionScan, repo: &Path, label: &AgentLabel) -> anyhow::Result<Found> {
-    let command = open_zellij::agent_start_command(label.as_str(), &repo.to_string_lossy());
-    let launched: Vec<&SessionPane> = scan
-        .panes
-        .iter()
-        .filter(|sp| sp.pane.launched_by(&command))
-        .collect();
-    let live: Vec<&&SessionPane> = launched.iter().filter(|sp| !sp.pane.has_exited()).collect();
-
-    if scan.listing_failed {
-        anyhow::bail!(
-            "could not ask zellij what sessions exist, so nothing is known about \
-             `{label}`'s pane — not even whether there is one. Check that `zellij` runs, \
-             then retry; nothing was typed."
-        );
-    }
-
-    let missed = || scan.unanswered.join(", ");
-    match live.as_slice() {
-        [one] if scan.unanswered.is_empty() => Ok(Found {
-            session: one.session.clone(),
-            pane: one.pane.pane_id(),
-        }),
-        [one] => anyhow::bail!(
-            "`{label}` has a pane in session `{}`, but session(s) {} did not answer — one of \
-             them may hold another `{label}` for this repo, and a nudge to the wrong one is \
-             not recoverable. Close or fix the unresponsive session, then retry.",
-            one.session,
-            missed()
-        ),
-        [] if !launched.is_empty() => anyhow::bail!(
-            "`{label}`'s pane in session `{}` has EXITED — its agent is not running, and \
-             zellij would accept the keystrokes anyway. Restart it (Ctrl-a r in the \
-             console) and retry.",
-            launched[0].session
-        ),
-        [] if !scan.unanswered.is_empty() => anyhow::bail!(
-            "no live pane for `{label}` in {}, and session(s) {} did not answer within \
-             {SCAN_DEADLINE:?} — this is not the same as `{label}` having no pane, so \
-             nothing was typed.",
-            repo.display(),
-            missed()
-        ),
-        [] => anyhow::bail!(
-            "no pane for `{label}` in {} in any live zellij session — `clank open zellij` \
-             starts the team.",
-            repo.display()
-        ),
-        many => anyhow::bail!(
-            "`{label}` in {} has live panes in {} sessions ({}) — close the duplicate, then \
-             retry. Typing into an arbitrary one is exactly the misdelivery this command \
-             exists to avoid.",
-            repo.display(),
-            many.len(),
-            many.iter()
-                .map(|sp| sp.session.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::open_zellij::{SessionPane, SessionScan};
+    use crate::cli::pane_target::{Found, locate};
+    use clank_core::ids::AgentLabel;
+    use std::path::Path;
 
     fn repo() -> &'static Path {
         Path::new("/w/proj")

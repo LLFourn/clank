@@ -1035,6 +1035,7 @@ pub(super) mod tests {
         include_own: bool,
     ) -> GithubSource {
         GithubSource {
+            interrupt: false,
             repo: "o/r".into(),
             events: events.to_vec(),
             watch: Vec::new(),
@@ -1447,6 +1448,7 @@ pub(super) mod tests {
         let raw: Vec<serde_json::Value> =
             serde_json::from_str(include_str!("events_fixture.json")).unwrap();
         let s = GithubSource {
+            interrupt: false,
             repo: "o/r".into(),
             events: vec![
                 PrOpened,

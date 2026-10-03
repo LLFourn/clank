@@ -167,6 +167,7 @@ mod tests {
 
     fn source() -> TimerSource {
         TimerSource {
+            interrupt: false,
             name: "check/deploy 🦀".into(),
             due_at: "1970-01-01T00:01:40Z".into(),
             repeat_every: Some("10s".into()),
