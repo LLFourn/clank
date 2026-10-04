@@ -17,7 +17,7 @@ use crate::git_io::{self, GitIoError};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::RepoState;
 use crate::state_cache;
-use clank_core::repo_state::LogEvent;
+use clank_core::repo_state::{LogEvent, RepoWarning};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebuildError {
@@ -156,6 +156,16 @@ fn fold_events(
     base_depth: u64,
     tip_depth: u64,
 ) -> FoldOutput {
+    fold_events_recording(state, events, base_depth, tip_depth, None)
+}
+
+fn fold_events_recording(
+    state: &mut RepoState,
+    events: Vec<crate::disk_snapshot::CommitEvent>,
+    base_depth: u64,
+    tip_depth: u64,
+    mut diagnostics: Option<&mut Vec<RepoWarning>>,
+) -> FoldOutput {
     let mut log_events = Vec::new();
     let mut checkpoints = Vec::new();
     let mut depth = base_depth;
@@ -164,6 +174,20 @@ fn fold_events(
         FOLD_COMMIT_COUNT.with(|count| count.set(count.get() + 1));
         let sha = event.commit.clone();
         log_events.extend(apply_commit(state, &event));
+        if let Some(records) = diagnostics.as_deref_mut() {
+            // New diagnostics are appended by this fold step. Capture them
+            // before later successful introductions/deletions retire provenance.
+            // Do not scan old warnings or keep a diagnostic archive in the cache.
+            let first = state.fold.warnings.len()
+                - state
+                    .fold
+                    .warnings
+                    .iter()
+                    .rev()
+                    .take_while(|warning| warning.sha == sha)
+                    .count();
+            records.extend_from_slice(&state.fold.warnings[first..]);
+        }
         depth += 1;
         state.head = Some(sha);
         if clank_core::checkpoint::should_checkpoint(tip_depth.saturating_sub(depth)) {
@@ -260,6 +284,19 @@ pub(crate) fn rebuild_from_adoption_with_git(
     rebuild_from_floor_with_git(repo_root, git, from, to, floor.as_ref(), true)
 }
 
+/// The explicit diagnostic query uses the same range fold and checkpoint
+/// resume policy. Include pre-adoption commits: a rejected first introduction
+/// produces evidence even though it has not adopted Clank successfully yet.
+pub(crate) fn rebuild_from_recording_with_git(
+    repo_root: &Path,
+    git: &git_io::Repo,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+    diagnostics: &mut Vec<RepoWarning>,
+) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
+    rebuild_from_floor_recording_with_git(repo_root, git, from, to, None, false, Some(diagnostics))
+}
+
 fn rebuild_from_floor(
     repo_root: &Path,
     from: Option<&CommitSha>,
@@ -279,6 +316,26 @@ fn rebuild_from_floor_with_git(
     to: &CommitSha,
     floor: Option<&CommitSha>,
     require_adopted_checkpoint: bool,
+) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
+    rebuild_from_floor_recording_with_git(
+        repo_root,
+        git,
+        from,
+        to,
+        floor,
+        require_adopted_checkpoint,
+        None,
+    )
+}
+
+fn rebuild_from_floor_recording_with_git(
+    repo_root: &Path,
+    git: &git_io::Repo,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+    floor: Option<&CommitSha>,
+    require_adopted_checkpoint: bool,
+    diagnostics: Option<&mut Vec<RepoWarning>>,
 ) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
     let base = from
         .and_then(|f| find_base_checkpoint_matching(repo_root, git, f, require_adopted_checkpoint));
@@ -314,7 +371,8 @@ fn rebuild_from_floor_with_git(
 
     // Phase 2 (collecting): keep the log events, drop the checkpoints —
     // the render never writes or prunes the cache.
-    let FoldOutput { log_events, .. } = fold_events(&mut state, phase2, mid_depth, tip_depth);
+    let FoldOutput { log_events, .. } =
+        fold_events_recording(&mut state, phase2, mid_depth, tip_depth, diagnostics);
     state.head = Some(to.clone());
 
     Ok((state, log_events))

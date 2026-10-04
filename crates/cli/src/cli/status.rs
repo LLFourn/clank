@@ -677,7 +677,13 @@ impl StatusSnapshot {
             pr_reviews: work_status.pr_reviews,
             ad_hoc: work_status.ad_hoc,
             head_correction: work_status.head_correction,
-            warnings: state.fold.warnings.clone(),
+            warnings: state
+                .fold
+                .warnings
+                .iter()
+                .filter(|warning| warning.is_amendable_at(state.head.as_ref()))
+                .cloned()
+                .collect(),
         })
     }
 

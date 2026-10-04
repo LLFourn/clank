@@ -152,7 +152,171 @@ fn legacy_cache_rebuild_and_warm_resume_share_one_accepted_plan() {
         after.get("ad_hoc").is_none(),
         "ignored tags do not create reviewer work: {after}"
     );
-    assert_eq!(after["warnings"].as_array().unwrap().len(), 1);
+    assert!(
+        after.get("warnings").is_none(),
+        "old diagnostics are not current warnings"
+    );
+    assert_eq!(
+        rt.block_on(clank::rebuild::rebuild_repo(repo))
+            .unwrap()
+            .fold
+            .warnings
+            .len(),
+        1,
+        "status filtering must preserve ignored-run provenance"
+    );
+}
+
+fn cli(env: &TestEnv, args: &[&str]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_clank"))
+        .env_clear()
+        .env("HOME", env.home())
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(env.repo())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn diagnostics_survive_later_success_and_respect_history_filters() {
+    let env = TestEnv::init();
+    let repo = env.repo();
+    write(
+        repo,
+        ".clank/.gitignore",
+        "/cache/\n/agents/\n/config.json\n",
+    );
+    write(repo, ".clank/plans/accepted.md", "# accepted\n");
+    commit(repo, "[accepted] intro");
+    let accepted = clank::git_io::rev_parse_head(repo).unwrap().unwrap();
+    write(repo, ".clank/plans/overlapping.md", "# overlapping\n");
+    commit(repo, "[overlapping] intro");
+    let rejected = clank::git_io::rev_parse_head(repo).unwrap().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let snapshot = || {
+        rt.block_on(clank::cli::status::snapshot(repo, Some(env.home())))
+            .unwrap()
+    };
+    assert!(snapshot().to_human().contains("ignored introduction"));
+    write(repo, "src.rs", "// accepted work\n");
+    commit(repo, "[accepted] implementation");
+    assert!(!snapshot().to_human().contains("ignored introduction"));
+    assert!(snapshot().to_json().get("warnings").is_none());
+    assert!(!cli(&env, &["status"]).contains("ignored introduction"));
+    assert!(!cli(&env, &["log", "--oneline"]).contains("ignored introduction"));
+    write(repo, ".clank/finished/accepted.md", "# accepted\n");
+    std::fs::remove_file(repo.join(".clank/plans/accepted.md")).unwrap();
+    commit(repo, "[accepted] finish");
+    std::fs::remove_file(repo.join(".clank/plans/overlapping.md")).unwrap();
+    commit(repo, "[overlapping] discard rejected introduction");
+    write(
+        repo,
+        ".clank/plans/overlapping.md",
+        "# successful new run\n",
+    );
+    commit(repo, "[overlapping] introduce successfully");
+    let state = rt.block_on(clank::rebuild::rebuild_repo(repo)).unwrap();
+    assert!(
+        state.fold.warnings.is_empty(),
+        "successful run retires fold provenance"
+    );
+
+    let all = cli(&env, &["log", "--diagnostics", "--json", "-n", "0"]);
+    let records: serde_json::Value = serde_json::from_str(&all).unwrap();
+    assert_eq!(records.as_array().unwrap().len(), 1);
+    assert_eq!(records[0]["sha"], rejected.as_str());
+    assert_eq!(records[0]["plan"], "overlapping");
+    assert_eq!(records[0]["warning"]["kind"], "rejected_plan_intro");
+    let human = cli(&env, &["log", "--diagnostics", "-n", "0"]);
+    assert!(human.contains(rejected.as_str()) && human.contains("`accepted` was already active"));
+    let only_rejected = format!("{accepted}..{rejected}");
+    assert_eq!(
+        cli(&env, &["log", "--diagnostics", "--json", &only_rejected]),
+        all
+    );
+    for args in [
+        vec!["log", "--diagnostics", "--json", "-n", "1"],
+        vec![
+            "log",
+            "--diagnostics",
+            "--json",
+            "-n",
+            "0",
+            "--plan",
+            "accepted",
+        ],
+    ] {
+        assert_eq!(cli(&env, &args).trim(), "[]");
+    }
+    let after_rejected = format!("{rejected}..HEAD");
+    assert_eq!(
+        cli(&env, &["log", "--diagnostics", "--json", &after_rejected]).trim(),
+        "[]"
+    );
+    assert_eq!(
+        cli(
+            &env,
+            &[
+                "log",
+                "--diagnostics",
+                "--json",
+                "-n",
+                "0",
+                "--plan",
+                "overlapping"
+            ]
+        ),
+        all
+    );
+    assert!(snapshot().to_json().get("warnings").is_none());
+}
+
+#[test]
+fn amending_a_multiple_introduction_head_removes_current_and_history_diagnostics() {
+    let env = TestEnv::init();
+    let repo = env.repo();
+    write(
+        repo,
+        ".clank/.gitignore",
+        "/cache/\n/agents/\n/config.json\n",
+    );
+    write(repo, "base.rs", "// before adoption\n");
+    commit(repo, "initial code");
+    write(repo, ".clank/plans/alpha.md", "# alpha\n");
+    write(repo, ".clank/plans/beta.md", "# beta\n");
+    commit(repo, "introduce two plans");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let snapshot = || {
+        rt.block_on(clank::cli::status::snapshot(repo, Some(env.home())))
+            .unwrap()
+            .to_json()
+    };
+    assert_eq!(snapshot()["warnings"].as_array().unwrap().len(), 2);
+    let records: serde_json::Value =
+        serde_json::from_str(&cli(&env, &["log", "--diagnostics", "--json", "-n", "0"])).unwrap();
+    assert_eq!(
+        records.as_array().unwrap().len(),
+        2,
+        "pre-adoption diagnostics are retained"
+    );
+    git(repo, &["rm", "--quiet", ".clank/plans/beta.md"]);
+    git(repo, &["commit", "--quiet", "--amend", "--no-edit"]);
+    let corrected = snapshot();
+    assert!(corrected.get("warnings").is_none());
+    assert_eq!(corrected["active_plan"]["plan"], "alpha");
+    assert_eq!(
+        cli(&env, &["log", "--diagnostics", "--json", "-n", "0"]).trim(),
+        "[]"
+    );
 }
 
 #[test]

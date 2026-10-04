@@ -332,7 +332,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `fork` | Linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds) |
 | `pr-review` | Multi-agent review loop against a GitHub PR |
 | `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
-| `log` | Chronological commit + review timeline (`--oneline`, `-j`) |
+| `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
 | `html` | Render the event log + status to a static site; `html open` |
 | `diff` | Launch the configured editor on a plan / range diff |
 | `stash` | Set a plan's commits aside (bare pushes, like `git stash`) / `pop` restores / `list` |
@@ -343,6 +343,20 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `export` | Dump the repo's roster config as JSON |
 | `rewire` | Remap feedback after rebase/amend (installed as a git hook) |
 | `stop-hook` | The per-tool Stop-hook adapter (installed by `setup`) |
+
+Status shows a commit warning only when it belongs to HEAD and amending that
+commit can repair it, such as introducing another plan while one is active or
+introducing several plans in one commit. Historical ignored introductions remain
+part of replay's provenance, but do not clutter CLI or TUI status. Warning labels
+and wrapped text use the terminal's warning color independently of the state bar.
+
+Use `clank log --diagnostics` to inspect reconstruction evidence, including the
+responsible commit and reason, even after later successful work retires that
+evidence from current workflow state. This explicit view replaces the timeline;
+`--json` emits typed records, and the usual range, `-n` and `--plan` filters apply.
+Use `-n 0` for the whole first-parent history. No history rewrite or cache migration
+is needed, and ordinary log output remains unchanged. Live operational failures
+and HEAD tag corrections keep their existing status surfaces.
 
 ## Layout
 

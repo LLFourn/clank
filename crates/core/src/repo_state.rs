@@ -185,6 +185,15 @@ pub struct RepoWarning {
     pub warning: Warning,
 }
 
+impl RepoWarning {
+    /// Only a rejected introduction at the current tip is repairable by
+    /// amending that commit. Dangling references describe later projection
+    /// state, not a defect attributable to an amendable introduction.
+    pub fn is_amendable_at(&self, head: Option<&CommitSha>) -> bool {
+        head == Some(&self.sha) && matches!(self.warning, Warning::RejectedPlanIntro { .. })
+    }
+}
+
 /// Typed warning vocabulary. Closed set of facts the fold notices
 /// but doesn't act on. The fold writes a `RepoWarning` for each;
 /// projection filters by `(sha, plan)` to display.
@@ -1593,6 +1602,15 @@ mod tests {
         assert!(matches!(&s.warnings[0].warning,
             Warning::RejectedPlanIntro { plan: p, reason: IntroRejection::PlanAlreadyActive { active } }
                 if p == &plan("bar") && active == &plan("foo")));
+        assert!(s.warnings[0].is_amendable_at(Some(&event.sha)));
+        assert!(!s.warnings[0].is_amendable_at(Some(&sha("3333"))));
+        assert!(!s.warnings[0].is_amendable_at(None));
+        let dangling = RepoWarning {
+            sha: event.sha.clone(),
+            plan: Some(plan("bar")),
+            warning: Warning::DanglingPlanRef { plan: plan("bar") },
+        };
+        assert!(!dangling.is_amendable_at(Some(&event.sha)));
         s.warnings.clear();
         assert_eq!(
             s, before,

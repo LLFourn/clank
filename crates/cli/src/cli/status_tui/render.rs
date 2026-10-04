@@ -508,7 +508,10 @@ pub(super) fn scrollable_header(
             .into_iter()
             .enumerate()
         {
-            body.push(vec![label(if i == 0 { "warn" } else { "" }), accent(line)]);
+            body.push(vec![
+                colored("0;33", format!("{:>5}  ", if i == 0 { "warn" } else { "" })),
+                colored("0;33", line),
+            ]);
         }
     }
 
@@ -5696,11 +5699,11 @@ mod tests {
         );
     }
     #[test]
-    fn an_ignored_introduction_is_visible_while_only_the_accepted_plan_has_work() {
+    fn an_amendable_head_introduction_is_visible_in_cli_json_and_tui() {
         use clank_core::repo_state::{IntroRejection, RepoWarning, Warning};
         let mut s = snap(None, vec![]);
         s.warnings.push(RepoWarning {
-            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            sha: crate::lifecycle::CommitSha::parse(s.head_sha.as_deref().unwrap()).unwrap(),
             plan: Some(crate::lifecycle::PlanKey::parse("ignored").unwrap()),
             warning: Warning::RejectedPlanIntro {
                 plan: crate::lifecycle::PlanKey::parse("ignored").unwrap(),
@@ -5720,6 +5723,77 @@ mod tests {
         assert_eq!(
             s.to_json()["warnings"][0]["warning"]["kind"],
             "rejected_plan_intro"
+        );
+    }
+
+    #[test]
+    fn wrapped_warning_label_and_text_keep_their_style_across_state_changes() {
+        use clank_core::repo_state::{IntroRejection, RepoWarning, Warning};
+        let mut idle = snap(None, vec![]);
+        idle.warnings.push(RepoWarning {
+            sha: crate::lifecycle::CommitSha::parse(idle.head_sha.as_deref().unwrap()).unwrap(),
+            plan: Some(crate::lifecycle::PlanKey::parse("ignored").unwrap()),
+            warning: Warning::RejectedPlanIntro {
+                plan: crate::lifecycle::PlanKey::parse("ignored").unwrap(),
+                reason: IntroRejection::PlanAlreadyActive {
+                    active: crate::lifecycle::PlanKey::parse("accepted").unwrap(),
+                },
+            },
+        });
+        let mut baseline = None;
+        let mut hues = std::collections::BTreeSet::new();
+        for phase in 0..5 {
+            match phase {
+                1 => {
+                    idle.active_plan = Some(plan_state("accepted", WaitingOn::MasterToContinue));
+                    idle.active_plan.as_mut().unwrap().gate =
+                        clank_core::vocab::CommitGateState::Continued;
+                }
+                2 => {
+                    idle.dirty = Some(crate::git_io::DirtyStats {
+                        insertions: 10,
+                        deletions: 2,
+                        untracked: 1,
+                        binary: 0,
+                    })
+                }
+                3 => {
+                    idle.dirty = None;
+                    idle.active_plan.as_mut().unwrap().waiting_on = WaitingOn::MasterToFinalize;
+                    idle.active_plan.as_mut().unwrap().gate =
+                        clank_core::vocab::CommitGateState::Finished;
+                }
+                4 => idle.blocks.push(crate::cli::block::BlockEntry {
+                    agent: "claude".into(),
+                    name: "decision".into(),
+                    question: "choose".into(),
+                    answer: None,
+                }),
+                _ => {}
+            }
+            hues.insert(state_color(&idle).sgr());
+            let lines: Vec<_> = render(&idle, 40, 32)
+                .into_iter()
+                .filter(|line| line.contains("\x1b[0;33m"))
+                .collect();
+            assert!(lines.len() > 1, "exercise wrapping: {lines:?}");
+            assert!(lines[0].contains("\x1b[0;33m warn  \x1b[0m"), "{lines:?}");
+            for line in &lines {
+                assert_eq!(
+                    line.matches("\x1b[0;33m").count(),
+                    2,
+                    "label and text: {line:?}"
+                );
+            }
+            if let Some(previous) = &baseline {
+                assert_eq!(&lines, previous, "warning style must not depend on state");
+            } else {
+                baseline = Some(lines);
+            }
+        }
+        assert!(
+            hues.len() >= 3,
+            "state indicators still have different hues"
         );
     }
 

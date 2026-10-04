@@ -305,6 +305,10 @@ pub struct LogArgs {
     /// (log-timeline-github-events).
     #[arg(long)]
     pub no_github: bool,
+    /// Show history reconstruction diagnostics instead of the timeline.
+    /// Respects the commit range, -n and --plan; --json emits typed records.
+    #[arg(long)]
+    pub diagnostics: bool,
 }
 
 #[derive(Args, Debug)]

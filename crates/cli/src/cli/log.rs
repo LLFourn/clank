@@ -61,6 +61,38 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     if from.is_some() {
         page.reverse();
     }
+    if args.diagnostics {
+        let mut diagnostics = Vec::new();
+        if let Some(oldest) = page.last() {
+            let from = git.parent_of(&oldest.sha)?;
+            crate::rebuild::rebuild_from_recording_with_git(
+                &repo,
+                &git,
+                from.as_ref(),
+                &to,
+                &mut diagnostics,
+            )?;
+        }
+        let records: Vec<_> = diagnostics
+            .iter()
+            .rev()
+            .filter(|record| {
+                plan_filter
+                    .as_ref()
+                    .is_none_or(|plan| record.plan.as_ref() == Some(plan))
+            })
+            .collect();
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        } else if records.is_empty() {
+            println!("no history diagnostics");
+        } else {
+            for record in records {
+                println!("{}  {}", record.sha, record.warning);
+            }
+        }
+        return Ok(());
+    }
     let adopted_at = state.fold.adopted_at.as_ref();
     let tip_post_adoption = match adopted_at {
         None => false,
