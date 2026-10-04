@@ -11,6 +11,7 @@ use serde_json::Value;
 struct Replay {
     panes: Option<BrowserFrame>,
     status: Option<BrowserFrame>,
+    questions: Option<BrowserFrame>,
     turns: BTreeMap<String, BrowserFrame>,
     screens: BTreeMap<String, BrowserFrame>,
 }
@@ -48,6 +49,13 @@ impl Replay {
                         .retain(|label, _| labels.contains(label.as_str()));
                 }
                 self.status = Some(frame.clone());
+            }
+            "questions" => {
+                anyhow::ensure!(
+                    data["agents"].is_object(),
+                    "question windows must be an object"
+                );
+                self.questions = Some(frame.clone());
             }
             "pane" => {
                 let id = string(data, "pane_id")?;
@@ -101,6 +109,9 @@ impl Replay {
             frames.push(status);
         }
         frames.extend(self.turns.into_values());
+        if let Some(questions) = self.questions {
+            frames.push(questions);
+        }
         frames.extend(self.screens.into_values());
         frames
     }
@@ -140,6 +151,32 @@ mod tests {
     use super::merge;
     fn sse(event: &str, data: &serde_json::Value) -> super::BrowserFrame {
         super::BrowserFrame::new(event, data.clone())
+    }
+
+    #[test]
+    fn questions_replace_the_native_window_and_empty_images_clear_it() {
+        let old = serde_json::json!({"replay":[sse("questions", &serde_json::json!({"agents":{
+            "codex":{"session":"one","owner":"old","pending":[{"id":7}]}}}))],"live":[]});
+        let replacement = sse(
+            "questions",
+            &serde_json::json!({"agents":{
+            "codex":{"session":"two","owner":"new","pending":[{"id":7}]}}}),
+        );
+        let updated = merge(&old, &serde_json::json!({"live":[replacement.clone()]})).unwrap();
+        assert_eq!(
+            updated["replay"][0],
+            serde_json::to_value(replacement).unwrap()
+        );
+        let cleared = sse("questions", &serde_json::json!({"agents":{}}));
+        let updated = merge(&updated, &serde_json::json!({"live":[cleared.clone()]})).unwrap();
+        assert_eq!(updated["replay"][0], serde_json::to_value(cleared).unwrap());
+        assert!(
+            merge(
+                &updated,
+                &serde_json::json!({"live":[sse("questions", &serde_json::json!({"agents":[]}))]})
+            )
+            .is_err()
+        );
     }
 
     #[test]

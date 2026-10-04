@@ -45,26 +45,23 @@ fn web_timeline_boundary() {
         "Timeline contains content or action markup: {:?}",
         forbidden_timeline_markup(ledger)
     );
-    for link in [
-        "id=\"manage-team\"",
-        "id=\"device-settings\"",
-        "id=\"queue-new\"",
-    ] {
+    for link in ["id=\"roster\"", "id=\"queue-new\""] {
         assert!(ledger.contains(link), "missing Timeline navigation {link}");
     }
 
-    // The delegated listener handles generated plan links only. The
-    // three named links open page components; none dispatches a mutation.
+    // Generated plan links open pages. Roster links select an agent;
+    // neither navigation surface dispatches a mutation.
     let delegated = section(
         PAGE,
         "ledgerEl.addEventListener('click', (e) => {",
         "// ---- status ----",
     );
-    let management = section(
+    let roster = section(
         PAGE,
-        "$('manage-team').addEventListener('click', (e) => {",
-        "ledgerEl.addEventListener('click', (e) => {",
+        "$('roster').addEventListener('click', (e) => {",
+        "function settingsWhy(",
     );
+    assert!(roster.contains("show(target())"));
     let create = section(
         PAGE,
         "$('queue-new').addEventListener('click', (e) => {",
@@ -72,7 +69,6 @@ fn web_timeline_boundary() {
     );
     for (name, handler) in [
         ("generated page links", delegated),
-        ("management links", management),
         ("new plan link", create),
     ] {
         assert!(
@@ -89,6 +85,12 @@ fn web_timeline_boundary() {
         ] {
             assert!(!handler.contains(mutation), "{name} dispatches {mutation}");
         }
+    }
+    for mutation in ["fetch(", "askAgent(", "dispatch(", "requestSubmit("] {
+        assert!(
+            !roster.contains(mutation),
+            "roster navigation dispatches {mutation}"
+        );
     }
     for listener in [
         "$('queue').addEventListener",

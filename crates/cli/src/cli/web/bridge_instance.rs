@@ -82,6 +82,9 @@ pub(crate) struct BridgeInstance {
     tails: Arc<Mutex<Tails>>,
     builder: Option<SiteBuilder>,
     feed: Feed,
+    questions: Arc<super::native_questions::Owners>,
+    claude_questions: Arc<super::claude_questions::Registry>,
+    claude_broker: Option<super::claude_questions::Broker>,
     connection_problem: watch::Receiver<clank_web::bridge::ConnectionStatus>,
     repo: PathBuf,
     home: Option<PathBuf>,
@@ -275,15 +278,32 @@ impl BridgeInstance {
         let subscription = Arc::new(Mutex::new(super::subscribe(&*panes, &table, &feed)));
         let (cancel, cancelled) = watch::channel(false);
         let blocking = Arc::new(Blocking::default());
-        let backend = Arc::new(super::repo_session::RepoSession::new(
+        let questions = Arc::new(super::native_questions::Owners::new(
             repo.clone(),
             home.clone(),
-            panes.clone(),
             feed.clone(),
-            reopen,
-            blocking.clone(),
-            cancelled.clone(),
         ));
+        let claude_questions = super::claude_questions::Registry::new(repo.clone(), feed.clone());
+        let claude_broker = match claude_questions.start() {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                tracing::warn!(%error,"native Claude question broker unavailable");
+                None
+            }
+        };
+        let backend = Arc::new(
+            super::repo_session::RepoSession::new(
+                repo.clone(),
+                home.clone(),
+                panes.clone(),
+                feed.clone(),
+                reopen,
+                blocking.clone(),
+                cancelled.clone(),
+            )
+            .with_questions(questions.clone())
+            .with_claude_questions(claude_questions.clone()),
+        );
         let mut tasks = JoinSet::new();
         let (attached_tx, mut attached_rx) =
             watch::channel(clank_web::bridge::ConnectionStatus::Connecting);
@@ -321,6 +341,9 @@ impl BridgeInstance {
             tails: Arc::new(Mutex::new(Tails::default())),
             builder: Some(builder),
             feed,
+            questions,
+            claude_questions,
+            claude_broker,
             connection_problem,
             repo,
             home,
@@ -357,6 +380,8 @@ impl BridgeInstance {
     }
 
     pub(crate) fn observe(&self, snap: &crate::cli::status::StatusSnapshot) {
+        self.questions.observe(snap);
+        self.claude_questions.reconcile();
         let chat = {
             let mut tails = self.tails.lock().unwrap_or_else(|error| error.into_inner());
             tails.reap();
@@ -479,6 +504,12 @@ impl BridgeInstance {
 
     pub(crate) async fn stop(mut self) {
         let _ = self.cancel.send(true);
+        self.claude_questions.stop();
+        if let Some(broker) = self.claude_broker.take() {
+            broker.stop().await;
+        }
+        self.questions.stop();
+        self.questions.join().await;
         if let Some(host) = self.host.take() {
             host.stop().await;
         }
@@ -528,6 +559,9 @@ impl BridgeInstance {
 
 impl Drop for BridgeInstance {
     fn drop(&mut self) {
+        self.claude_questions.stop();
+        self.claude_broker.take();
+        self.questions.stop();
         let _ = self.cancel.send(true);
         if let Some(host) = self.host.as_mut() {
             let _ = host.child.start_kill();

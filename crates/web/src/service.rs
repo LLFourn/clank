@@ -160,6 +160,8 @@ impl WebService {
                     | "stash"
                     | "agents"
                     | "blocks/answer"
+                    | "questions/reconnect"
+                    | "questions/answer"
                     | "agents/reopen"
                     | "upload"
             ) | (Method::GET, "agents/candidates")
@@ -208,7 +210,15 @@ impl WebService {
             (Method::POST, "upload") => self.upload(req, lease).await,
             (
                 Method::POST,
-                "say" | "stop" | "queue" | "stash" | "agents" | "blocks/answer" | "agents/reopen",
+                "say"
+                | "stop"
+                | "queue"
+                | "stash"
+                | "agents"
+                | "blocks/answer"
+                | "questions/reconnect"
+                | "questions/answer"
+                | "agents/reopen",
             )
             | (Method::GET, "agents/candidates") => self.action(req, lease, &path).await,
             (Method::GET, path) if path.starts_with("html/") => self.action(req, lease, path).await,
@@ -308,8 +318,20 @@ impl WebService {
                 "say" | "blocks/answer" => 64 * 1024,
                 _ => 4 * 1024,
             };
-            let body = http_body_util::Limited::new(req.into_body(), limit);
-            let Ok(body) = body.collect().await.map(|body| body.to_bytes()) else {
+            let body = if path == "questions/answer" {
+                req.into_body()
+                    .collect()
+                    .await
+                    .ok()
+                    .map(|body| body.to_bytes())
+            } else {
+                http_body_util::Limited::new(req.into_body(), limit)
+                    .collect()
+                    .await
+                    .ok()
+                    .map(|body| body.to_bytes())
+            };
+            let Some(body) = body else {
                 return json_why(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
             };
             match parse_action(path, &body) {
@@ -424,6 +446,12 @@ struct BlockInput {
 
 fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
     Ok(match path {
+        "questions/reconnect" => BrowserRequest::QuestionReconnect {
+            ask: serde_json::from_slice(bytes)?,
+        },
+        "questions/answer" => BrowserRequest::QuestionAnswer {
+            ask: serde_json::from_slice(bytes)?,
+        },
         "say" => {
             let input: SayInput = serde_json::from_slice(bytes)?;
             BrowserRequest::Say {
@@ -648,6 +676,24 @@ fn bytes(status: StatusCode, body: impl Into<Bytes>, content_type: &'static str)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_answer_route_preserves_opaque_identity_and_rejects_untyped_input() {
+        let body = serde_json::json!({"agent":"codex","session":"session","owner":"epoch:2",
+            "id":"18446744073709551615","turn":"turn","item":"item","attempt":"attempt",
+            "answers":{"private":["x".repeat(100_000)]}});
+        let action =
+            super::parse_action("questions/answer", &serde_json::to_vec(&body).unwrap()).unwrap();
+        let crate::request::BrowserRequest::QuestionAnswer { ask } = action else {
+            panic!("question action")
+        };
+        assert_eq!(ask.id, "18446744073709551615");
+        assert_eq!(ask.answers["private"][0].len(), 100_000);
+        let mut wrong = body;
+        wrong["id"] = serde_json::json!(7);
+        assert!(
+            super::parse_action("questions/answer", &serde_json::to_vec(&wrong).unwrap()).is_err()
+        );
+    }
     use std::convert::Infallible;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1100,6 +1146,30 @@ mod tests {
             }]
         );
 
+        let question=serde_json::json!({"agent":"codex","session":"s1","owner":"owner:1","id":"18446744073709551615",
+            "turn":"turn","item":"item","attempt":"attempt-one","answers":{"private":["x".repeat(100_000)]}}).to_string();
+        let mut native_answer = TcpStream::connect(addr).await.unwrap();
+        native_answer.write_all(format!("POST /app/team/questions/answer HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nCookie: session=allowed\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{question}",question.len()).as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            native_answer.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 204")
+        );
+        let calls_now = calls.lock().await;
+        let BrowserRequest::QuestionAnswer { ask: native_ask } = calls_now.last().unwrap() else {
+            panic!("native answer routed")
+        };
+        assert_eq!(native_ask.id, "18446744073709551615");
+        assert_eq!(native_ask.answers["private"][0].len(), 100_000);
+        drop(calls_now);
         let bytes = vec![0xa5; 128 * 1024 + 3];
         let mut upload = TcpStream::connect(addr).await.unwrap();
         upload.write_all(format!(
@@ -1133,7 +1203,7 @@ mod tests {
             String::from_utf8(response).unwrap()
         });
         tokio::time::timeout(Duration::from_secs(3), async {
-            while calls.lock().await.len() != 2 {
+            while calls.lock().await.len() != 3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1177,7 +1247,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
         assert_eq!(
             calls.lock().await.len(),
-            2,
+            3,
             "a disconnected request cannot reach the repo"
         );
         server.abort();

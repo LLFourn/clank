@@ -230,6 +230,9 @@ pub enum Command {
     /// continuation output. Installed by `clank setup`; not typically
     /// invoked directly.
     StopHook(crate::cli::StopHookArgs),
+    /// Native Claude question hook adapter (installed by setup).
+    #[command(hide = true)]
+    QuestionHook,
 }
 
 /// Run the parsed command. The bin's `main` owns process concerns —
@@ -277,6 +280,7 @@ pub async fn dispatch_with(
         Command::Monitor(args) => crate::cli::monitor::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
+        Command::QuestionHook => crate::cli::web::claude_questions::run().await,
         Command::StopHook(args) => crate::cli::stop_hook::run(args).await,
         Command::Setup(args) => crate::cli::setup::run(args).await,
         Command::Doctor(args) => crate::cli::doctor::run(args).await,

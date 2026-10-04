@@ -13,9 +13,11 @@
 //! The default host owns browser admission and server controls.
 
 mod bridge_instance;
+pub(crate) mod claude_questions;
 pub(crate) mod dns;
 pub(crate) mod door;
 mod feed;
+mod native_questions;
 mod repo_session;
 mod transcript;
 pub(crate) mod tunnel;

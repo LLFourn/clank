@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use clank_core::vocab::Tool;
 
+pub(super) mod questions;
+
 /// Who a turn belongs to. `Harness` is the tool talking to its own
 /// model — a stop-hook nudge, an environment note — which must not
 /// read as the person.
@@ -49,6 +51,10 @@ pub(crate) enum Body {
     /// the output arriving later is an upsert of the same id. Images
     /// in the output ride with it.
     Tool {
+        /// Read-only recorded question content. A transcript never grants
+        /// permission to answer a live provider request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<questions::Question>,
         name: String,
         input: String,
         /// What the call SAYS it is doing: one line, derived from the
@@ -447,6 +453,7 @@ mod claude {
                             at,
                             who: Who::Agent,
                             body: Body::Tool {
+                                question: questions::parse(Tool::Claude, &name, &input),
                                 name,
                                 input,
                                 title,
@@ -639,6 +646,7 @@ mod codex {
                     at,
                     who: Who::Agent,
                     body: Body::Tool {
+                        question: questions::parse(Tool::Codex, &name, &input),
                         name,
                         input,
                         title,
@@ -725,6 +733,7 @@ mod grok {
                             at: None,
                             who: Who::Agent,
                             body: Body::Tool {
+                                question: None,
                                 name,
                                 input,
                                 title,
@@ -1112,6 +1121,38 @@ mod tests {
             "{title}"
         );
         assert_eq!(detail.len(), 400, "the detail is not cut");
+    }
+
+    #[test]
+    fn claude_question_calls_are_typed_and_keep_the_original_tool_input() {
+        let input = serde_json::json!({"questions":[{"header":"Direction", "question":"Which way?",
+            "multiSelect":true, "options":[{"label":"North","description":"First"},
+                {"label":"South","description":"Second"}]}]});
+        let line = serde_json::json!({"type":"assistant", "uuid":"assistant-turn", "message":{
+            "role":"assistant", "content":[{"type":"tool_use","id":"question-call",
+                "name":"AskUserQuestion", "input":input}]}})
+        .to_string();
+        let parsed = parse(Tool::Claude, &line);
+        let t = turn(&parsed[0]);
+        let Body::Tool {
+            question: Some(question),
+            input: raw,
+            output,
+            ..
+        } = &t.body
+        else {
+            panic!("typed question")
+        };
+        assert_eq!(t.id, "question-call");
+        assert_eq!(raw, &input.to_string());
+        assert_eq!(question.fields[0].question, "Which way?");
+        assert!(question.fields[0].multi_select);
+        assert!(output.is_none());
+        // Optional metadata does not invalidate older retained tool bodies.
+        let old = serde_json::json!({"kind":"tool","name":"Bash","input":"ls",
+            "output":null});
+        let old: Body = serde_json::from_value(old).unwrap();
+        assert!(matches!(old, Body::Tool { question: None, .. }));
     }
 
     /// Both agents' fixtures, through the parser rather than the

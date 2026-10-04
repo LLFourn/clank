@@ -757,6 +757,10 @@ pub(super) fn inspect_provider(
                     async_mode: claude_async,
                 }),
                 Box::new(SessionStartHook),
+                Box::new(ClaudeQuestionHook("PreToolUse")),
+                Box::new(ClaudeQuestionHook("PermissionRequest")),
+                Box::new(ClaudeQuestionHook("PostToolUse")),
+                Box::new(ClaudeQuestionHook("PostToolUseFailure")),
             ],
         ),
         Tool::Codex => (
@@ -1265,6 +1269,9 @@ struct HookWrapper<'a> {
 
 /// Tool-specific knowledge for the hook merger.
 trait HookKind {
+    fn owns(&self, entry: &serde_json::Value) -> bool {
+        hook_is_clank(entry)
+    }
     /// What goes into the `command` field of the JSON entry.
     fn command(&self) -> &'static str;
     /// Tool name for the diagnostic summary.
@@ -1333,7 +1340,34 @@ fn install_claude_hooks(
     summary: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     merge_hook_into_settings(path, ClaudeHook { async_mode }, dry_run, summary)?;
-    merge_hook_into_settings(path, SessionStartHook, dry_run, summary)
+    merge_hook_into_settings(path, SessionStartHook, dry_run, summary)?;
+    for event in [
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PostToolUseFailure",
+    ] {
+        merge_hook_into_settings(path, ClaudeQuestionHook(event), dry_run, summary)?;
+    }
+    Ok(())
+}
+struct ClaudeQuestionHook(&'static str);
+impl HookKind for ClaudeQuestionHook {
+    fn owns(&self, entry: &serde_json::Value) -> bool {
+        entry.get("command").and_then(|v|v.as_str()).and_then(|s|shell_words::split(s).ok()).is_some_and(|words|matches!(words.as_slice(),[program,command,..] if Path::new(program).file_name()==Some(std::ffi::OsStr::new("clank")) && command=="question-hook"))
+    }
+    fn command(&self) -> &'static str {
+        "clank question-hook"
+    }
+    fn tool_name(&self) -> &'static str {
+        "claude"
+    }
+    fn event(&self) -> &'static str {
+        self.0
+    }
+    fn matcher(&self) -> Option<&'static str> {
+        Some("AskUserQuestion")
+    }
 }
 
 /// SessionStart companion: binds the launched session to its label,
@@ -1502,7 +1536,7 @@ fn merge_hook_value(
             return true;
         };
         let before = inner.len();
-        inner.retain(|h| !hook_is_clank(h));
+        inner.retain(|h| !kind.owns(h));
         let taken = before - inner.len();
         removed += taken;
         taken == 0 || !inner.is_empty()
@@ -1590,7 +1624,7 @@ pub(super) fn install_grok_hooks(
 
 /// Whether one inner hook entry is clank's; see [`clank_hook_args`].
 pub(crate) fn hook_is_clank(entry: &serde_json::Value) -> bool {
-    clank_hook_args(entry).is_some()
+    clank_hook_args(entry).is_some() || ClaudeQuestionHook("PreToolUse").owns(entry)
 }
 
 /// The words an inner hook entry's `command` passes to
@@ -1606,8 +1640,8 @@ pub(crate) fn hook_is_clank(entry: &serde_json::Value) -> bool {
 /// lose fields it doesn't know: claude's `settings.json` turned up
 /// with every clank `id` marker gone, stranding the entries so setup
 /// piled up duplicates (a-hook-is-known-by-what-it-runs). Every entry
-/// clank has written runs `clank stop-hook`; renaming that subcommand
-/// means matching both names here.
+/// Stop entries run `clank stop-hook`; the question adapter has its own
+/// ownership predicate. This function returns Stop adapter argv only.
 pub(crate) fn clank_hook_args(entry: &serde_json::Value) -> Option<Vec<String>> {
     let command = entry.get("command")?.as_str()?;
     let words = shell_words::split(command).ok()?;
@@ -3369,6 +3403,32 @@ mod tests {
     }
 
     #[test]
+    fn question_hooks_are_owned_idempotent_and_leave_other_provider_hooks_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let user = serde_json::json!({"type":"command","command":"my-question-ui"});
+        std::fs::write(&path,serde_json::json!({"hooks":{"PreToolUse":[{"matcher":"AskUserQuestion","custom":7,"hooks":[user.clone(),{"type":"command","command":"clank question-hook"}]}]}}).to_string()).unwrap();
+        install_claude_hooks(&path, false, false, &mut vec![]).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        install_claude_hooks(&path, false, false, &mut vec![]).unwrap();
+        assert_eq!(first, std::fs::read_to_string(&path).unwrap());
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        for event in [
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "PostToolUseFailure",
+        ] {
+            assert_eq!(clank_hook_entries(&value, event).len(), 1);
+        }
+        assert_eq!(value["hooks"]["PreToolUse"][0]["custom"], 7);
+        assert_eq!(
+            value["hooks"]["PreToolUse"][0]["hooks"],
+            serde_json::json!([user])
+        );
+    }
+
+    #[test]
     fn a_hook_is_clanks_by_the_command_it_runs() {
         let owned = |command: &str| hook_is_clank(&serde_json::json!({"command": command}));
         assert!(owned("clank stop-hook --tool claude"));
@@ -3440,8 +3500,15 @@ mod tests {
             );
             assert_eq!(v["hooks"][event].as_array().unwrap().len(), 2, "{v}");
         }
-        assert_eq!(summary.len(), 2, "{summary:?}");
-        assert!(summary.iter().all(|l| l.contains("merge")), "{summary:?}");
+        assert_eq!(summary.len(), 6, "{summary:?}");
+        assert!(
+            summary[..2].iter().all(|l| l.contains("merge")),
+            "{summary:?}"
+        );
+        assert!(
+            summary[2..].iter().all(|l| l.contains("add")),
+            "{summary:?}"
+        );
     }
 
     /// Ownership is the inner entry's, not its wrapper's: a user's

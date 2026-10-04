@@ -12,6 +12,8 @@ mod agent_setup_acceptance;
 mod agent_swap_integration;
 mod block_blast_radius;
 mod clank_dir_boundary;
+mod claude_question_protocol;
+mod codex_question_protocol;
 mod diff_tree_changes_scenarios;
 mod doctor_unbound_reviewer_integration;
 mod feedback_read_integration;

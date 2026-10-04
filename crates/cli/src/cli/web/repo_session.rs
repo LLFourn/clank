@@ -19,6 +19,8 @@ pub(crate) struct RepoSession {
     reopen: Option<Reopener>,
     blocking: Arc<Blocking>,
     cancelled: watch::Receiver<bool>,
+    questions: Option<Arc<super::native_questions::Owners>>,
+    claude_questions: Option<Arc<super::claude_questions::Registry>>,
 }
 
 impl RepoSession {
@@ -39,14 +41,46 @@ impl RepoSession {
             reopen,
             blocking,
             cancelled,
+            questions: None,
+            claude_questions: None,
         }
     }
+    pub(crate) fn with_questions(
+        mut self,
+        questions: Arc<super::native_questions::Owners>,
+    ) -> Self {
+        self.questions = Some(questions);
+        self
+    }
 
+    pub(crate) fn with_claude_questions(
+        mut self,
+        registry: Arc<super::claude_questions::Registry>,
+    ) -> Self {
+        self.claude_questions = Some(registry);
+        self
+    }
     async fn execute(&self, request: BrowserRequest) -> BrowserReply {
         if *self.cancelled.borrow() {
             return plain(503, "the repo connector is stopping");
         }
         match request {
+            BrowserRequest::QuestionReconnect { ask } => match &self.questions {
+                Some(questions) => questions.reconnect(ask),
+                None => plain(409, "native question recovery is unavailable"),
+            },
+            BrowserRequest::QuestionAnswer { ask }
+                if self
+                    .claude_questions
+                    .as_ref()
+                    .is_some_and(|c| c.owns(&ask.agent)) =>
+            {
+                self.claude_questions.as_ref().unwrap().answer(ask).await
+            }
+            BrowserRequest::QuestionAnswer { ask } => match &self.questions {
+                Some(questions) => questions.answer(ask).await,
+                None => plain(409, "native question answers are unavailable"),
+            },
             BrowserRequest::Say {
                 pane,
                 label,

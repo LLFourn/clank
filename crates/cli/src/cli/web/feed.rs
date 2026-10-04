@@ -112,6 +112,7 @@ pub(crate) struct Retained {
     pub(crate) closed: BTreeSet<String>,
     /// Each agent's transcript window, by label.
     pub(crate) turns: BTreeMap<String, AgentTurns>,
+    pub(crate) questions: BTreeMap<String, super::native_questions::Window>,
 }
 
 impl Retained {
@@ -132,6 +133,10 @@ impl Retained {
         for (agent, window) in &self.turns {
             out.push(turns_frame(agent, window));
         }
+        out.push(browser_frame(
+            "questions",
+            &serde_json::json!({"agents":self.questions}),
+        ));
         for (id, viewport) in &self.viewports {
             out.push(pane_frame(id, viewport));
         }
@@ -220,6 +225,71 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
+    pub(crate) fn question_window(&self, agent: &str) -> Option<super::native_questions::Window> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .questions
+            .get(agent)
+            .cloned()
+    }
+    /// Claims/removals and native deltas share the retained-image lock. A late
+    /// native owner cannot recreate a removed or rebound agent's window.
+    pub(crate) fn question_claim(
+        &self,
+        agent: &str,
+        window: Option<super::native_questions::Window>,
+    ) {
+        self.publish(|state| {
+            match window {
+                Some(window) => {
+                    state.questions.insert(agent.into(), window);
+                }
+                None => {
+                    state.questions.remove(agent);
+                }
+            }
+            vec![browser_frame(
+                "questions",
+                &serde_json::json!({"agents":state.questions}),
+            )]
+        });
+    }
+    /// Invalidation belongs to an exact generation, including provider swaps.
+    /// Check and removal share the retained-state lock.
+    pub(crate) fn question_release(&self, agent: &str, owner: &str) {
+        self.publish(|state| {
+            if !state.questions.get(agent).is_some_and(|w| w.owner == owner) {
+                return vec![];
+            }
+            state.questions.remove(agent);
+            vec![browser_frame(
+                "questions",
+                &serde_json::json!({"agents":state.questions}),
+            )]
+        });
+    }
+    pub(crate) fn question_update(
+        &self,
+        agent: &str,
+        owner: &str,
+        apply: impl FnOnce(&mut super::native_questions::Window),
+    ) {
+        self.publish(|state| {
+            let Some(window) = state.questions.get_mut(agent).filter(|w| w.owner == owner) else {
+                return vec![];
+            };
+            let before = window.clone();
+            apply(window);
+            if *window == before {
+                return vec![];
+            }
+            vec![browser_frame(
+                "questions",
+                &serde_json::json!({"agents":state.questions}),
+            )]
+        });
+    }
     /// The latest pane table the page and its actions both use. The
     /// reconciler checks again before any reopen changes the layout.
     pub(crate) fn has_live_pane(&self, label: &str) -> bool {
@@ -667,13 +737,14 @@ mod tests {
         feed.status(serde_json::json!({"lamp": "🔨 CLAUDE working"}));
 
         let (frames, _rx) = test_connect(&feed);
-        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.len(), 4);
         assert!(frames[0].starts_with("event: panes\n"), "the table first");
         assert!(frames[1].starts_with("event: status\n"));
+        assert!(frames[2].starts_with("event: questions\n"));
         assert!(
-            frames[2].starts_with("event: pane\n") && frames[2].contains("terminal_5"),
+            frames[3].starts_with("event: pane\n") && frames[3].contains("terminal_5"),
             "then the viewport it would otherwise wait for: {}",
-            &frames[2][..40]
+            &frames[3][..40]
         );
     }
 
@@ -958,6 +1029,7 @@ mod tests {
             at: Some(1_000),
             who: super::super::transcript::Who::Agent,
             body: Body::Tool {
+                question: None,
                 name: "Bash".into(),
                 input: "ls".into(),
                 title: "ls".into(),
@@ -1113,6 +1185,67 @@ mod tests {
         // An output for a call older than the window is nothing.
         feed.tool_output("claude", 1, "s1", 1, "toolu_ancient", "x".into(), vec![]);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn recorded_questions_keep_content_and_identity_when_a_result_arrives() {
+        use super::super::transcript::{Parsed, parse};
+        use clank_core::vocab::Tool;
+
+        let input = serde_json::json!({"questions":[{"id":"choice", "header":"Choice",
+            "question":"Choose a path?", "options":[{"label":"A","description":"First"}]}]});
+        let line = serde_json::json!({"type":"response_item","ordinal":3,"payload":{
+            "type":"function_call", "call_id":"question-call", "name":"request_user_input",
+            "arguments": input.to_string()}})
+        .to_string();
+        let Parsed::Turn(question) = parse(Tool::Codex, &line).remove(0) else {
+            panic!("question turn")
+        };
+        let feed = Feed::new();
+        feed.claim_turns("codex", 1, Some("session"));
+        feed.turns_reset("codex", 1, "session", 1, vec![question.clone()]);
+        let (frames, mut rx) = test_connect(&feed);
+        let mut page = PageModel::default();
+        for f in frames {
+            page.apply(&f);
+        }
+        // A result from an obsolete transcript owner cannot resolve this card.
+        feed.tool_output(
+            "codex",
+            2,
+            "session",
+            1,
+            "question-call",
+            "stale".into(),
+            vec![],
+        );
+        assert!(rx.try_recv().is_err());
+        feed.tool_output(
+            "codex",
+            1,
+            "session",
+            1,
+            "question-call",
+            "cancelled".into(),
+            vec![],
+        );
+        page.apply(&rx.try_recv().unwrap());
+        let window = &page.agents["codex"];
+        assert_eq!(window.turns.len(), 1);
+        assert_eq!(window.turns[0].id, "question-call");
+        let Body::Tool {
+            question: Some(content),
+            output: Some(output),
+            input: raw,
+            ..
+        } = &window.turns[0].body
+        else {
+            panic!("question and result retained")
+        };
+        assert_eq!(content.fields[0].id.as_deref(), Some("choice"));
+        assert_eq!(content.fields[0].question, "Choose a path?");
+        assert_eq!(raw, &input.to_string());
+        assert_eq!(output, "cancelled");
     }
 
     /// A turn for a stale session or generation is dropped — by the

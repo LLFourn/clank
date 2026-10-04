@@ -38,12 +38,43 @@ pub enum BrowserRequest {
         question: String,
         answer: String,
     },
+    QuestionReconnect {
+        ask: QuestionReconnect,
+    },
+    QuestionAnswer {
+        ask: QuestionAnswer,
+    },
     Reopen {
         label: String,
     },
     Site {
         path: String,
     },
+}
+
+/// Recovery targets the existing owner, never a transcript or a new session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionReconnect {
+    pub agent: String,
+    pub session: String,
+    pub owner: String,
+}
+
+/// Exact native authority plus a client attempt identity. Transcript IDs and
+/// a successfully delivered HTTP request are not native answer receipts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionAnswer {
+    pub agent: String,
+    pub session: String,
+    pub owner: String,
+    /// JSON-encoded native ID, opaque to browsers to preserve u64 precision.
+    pub id: String,
+    pub turn: String,
+    pub item: String,
+    pub attempt: String,
+    pub answers: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl BrowserRequest {

@@ -12,6 +12,8 @@ npm install playwright
 npx playwright install chromium     # or set CLANK_CHROMIUM to a build you have
 node check.js
 node bridge.js
+node colors.js
+node questions.js
 ```
 
 `check.js` covers the header, the picker and the draft; `bridge.js` covers multi-megabyte frames, full retained transcript display,
@@ -21,6 +23,18 @@ which drives the real harness parser, Feed, RepoSession, bridge and browser sock
 `look.js`
 covers the rendered transcript — markdown, tool grouping, the measure
 and the two grounds.
+
+`colors.js` checks actual computed colours across repository state changes at
+320/390/768/1280px: links, controls, focused composer, question cards and
+historical verdicts stay stable while activity/gate dots change. It also checks
+text/button contrast, readable gate labels and draft retention. Set
+`CLANK_COLOR_PREVIEW=/tmp/clank-colors` to save screenshots per width.
+
+`questions.js` checks native-only question cards, choice/free-text/private forms,
+opaque native IDs, replay/focus/draft preservation, rejection and unknown sends,
+cancellation before HTTP replies, duplicate submission suppression, session
+changes and private draft storage. Native socket delivery/arbitration has separate
+Rust fixtures; this browser test does not claim a live authenticated round trip.
 
 Every check is written so that reverting the fix it guards makes it
 fail; they were built by reproducing three defects found in review

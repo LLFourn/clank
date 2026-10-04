@@ -23,18 +23,14 @@
     --edge: #e3ded4;
     --ink: #262420;
     --muted: #6a655c;
-    --hue: #5f5fff;
-    /* The verdict colours. Independent of `--hue`, which the script
-       reassigns per session state -- a mark that tracked it could not
-       be right about its own verdict. */
+    /* Navigation and controls keep a fixed palette. Only activity/status
+       indicators consume the repository's changing state colour. */
+    --accent: #5f5fff;
+    --accent-ink: color-mix(in srgb, var(--accent) 58%, #17150f);
+    --state-hue: #5f5fff;
     --ok: #2f8f4e;
     --done: #2a7f9e;
     --changes: #c2401f;
-    /* The state hues were picked to glow on a dark ground. Anything
-       that must carry TEXT — a filled button — takes them mixed
-       toward the ink instead, or a yellow `reviewing` lamp puts pale
-       letters on pale yellow. */
-    --hue-deep: color-mix(in srgb, var(--hue) 58%, #17150f);
     --mono: ui-monospace, Menlo, "SF Mono", Consolas, monospace;
     --text: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --plate: "Martian Mono", var(--mono);
@@ -70,7 +66,7 @@
     overflow: hidden;
   }
   button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; text-align: left; }
-  button:focus-visible { outline: 2px solid var(--hue); outline-offset: -2px; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
   /* The header: the shown agent, said once, and what it owes. */
   .bar {
@@ -90,10 +86,10 @@
   .bar .who .caret { color: var(--muted); font-size: 13px; }
   /* Pinned, with the turn somewhere else: the one thing the header
      cannot say when it is showing a name of your choosing. */
-  .bar .who .away { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--hue); animation: breathe 2.4s ease-in-out infinite; }
+  .bar .who .away { display: none; width: 7px; height: 7px; border-radius: 50%; background: var(--state-hue); animation: breathe 2.4s ease-in-out infinite; }
   .bar .who.elsewhere .away { display: inline-block; }
   .bar .who .tag { color: var(--muted); font-size: 11px; }
-  .state { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 14px; margin-top: 1px; }
+  .state { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin-top: 1px; }
   .state .doing { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: 12px; }
   .doing { display: flex; align-items: baseline; gap: 9px; }
   .doing .said { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -101,16 +97,17 @@
   .doing .clock { flex: 0 0 auto; font-family: var(--plate); font-weight: 700; color: var(--ink); }
   .state .doing .dot, .picker .doing .dot {
     display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-    background: var(--hue); margin-right: 7px; vertical-align: 1px;
+    background: var(--state-hue); margin-right: 7px; vertical-align: 1px;
     animation: breathe 2.4s ease-in-out infinite;
   }
-  .state .modes { flex: 0 0 auto; display: flex; gap: 11px; font-size: 12px; }
+  .state .modes { grid-column: 1 / -1; min-width: 0; display: flex; gap: 18px; overflow-x: auto; font-size: 13px; padding-top: 6px; }
+  .state .modes button { flex: 0 0 auto; min-height: 32px; }
   .state .modes button { color: var(--muted); padding: 2px 0; border-bottom: 2px solid transparent; }
   .state .modes button.on { color: var(--ink); border-bottom-color: var(--ink); }
   .state .modes button:disabled, .state .modes button[aria-disabled="true"] { opacity: 0.4; }
   .state .modes button[aria-disabled="true"] { cursor: help; }
   .chat-reason { position: absolute; top: 100%; right: 8px; z-index: 5; width: min(330px, calc(100vw - 16px)); padding: 12px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 8px; box-shadow: 0 18px 44px rgba(0, 0, 0, .5); font-size: 13px; }
-  .chat-reason button { display: block; margin: 9px 0 0 auto; color: var(--hue-deep); text-decoration: underline; }
+  .chat-reason button { display: block; margin: 9px 0 0 auto; color: var(--accent-ink); text-decoration: underline; }
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
   @media (prefers-reduced-motion: reduce) { .dot, .away { animation: none; } }
 
@@ -123,20 +120,20 @@
   }
   .picker .opt { display: block; width: 100%; padding: 9px 14px 10px; border-bottom: 1px solid var(--edge); border-left: 3px solid transparent; }
   .picker .opt:last-child { border-bottom: 0; }
-  .picker .opt[aria-selected="true"] { border-left-color: var(--hue); }
+  .picker .opt[aria-selected="true"] { border-left-color: var(--accent); }
   .picker .opt .nm { font-family: var(--plate); font-weight: 700; font-size: 15px; }
   .picker .opt .role { color: var(--muted); font-size: 11px; margin-left: 8px; }
   .picker .opt .doing { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
   /* An interruption, not chrome: here while it is true, gone after. */
-  .strip { grid-area: strip; padding: 9px 14px; background: color-mix(in srgb, var(--hue) 13%, var(--bezel)); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); font-size: 12px; white-space: pre-wrap; max-height: 42vh; overflow-y: auto; }
+  .strip { grid-area: strip; padding: 9px 14px; background: color-mix(in srgb, var(--accent) 13%, var(--bezel)); border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); font-size: 12px; white-space: pre-wrap; max-height: 42vh; overflow-y: auto; }
   .strip .how { display: block; color: var(--muted); margin-top: 3px; }
   .strip .block { margin-bottom: 10px; }
   .strip .block:last-child { margin-bottom: 0; }
   .strip .block-context { color: var(--muted); font-weight: 700; }
   .strip .block-question { margin: 3px 0 6px; }
   .strip textarea { display: block; width: 100%; box-sizing: border-box; min-height: 60px; resize: vertical; font: inherit; color: var(--ink); background: var(--base); border: 1px solid var(--edge); border-radius: 4px; padding: 6px; }
-  .strip .block button { margin-top: 6px; padding: 5px 9px; background: var(--hue-deep); color: white; border-radius: 4px; font-weight: 700; }
+  .strip .block button { margin-top: 6px; padding: 5px 9px; background: var(--accent-ink); color: white; border-radius: 4px; font-weight: 700; }
   .strip .block button:disabled { opacity: .5; }
   .strip .block-error { color: var(--ink); margin-left: 8px; }
 
@@ -146,18 +143,18 @@
   .plan-view { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); background: var(--base); }
   .plan-view [hidden] { display: none !important; }
   .plan-view .head { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
-  .plan-view .head button { flex: 0 0 auto; color: var(--hue-deep); font-weight: 700; }
+  .plan-view .head button { flex: 0 0 auto; color: var(--accent-ink); font-weight: 700; }
   .plan-view .head span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); }
   .plan-view .queue-page-tools { grid-row: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
   .plan-view .stash-page-tools { grid-row: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
   .plan-view .stash-page-tools .stash-state { margin-right: auto; color: var(--muted); font-size: 12px; }
-  .plan-view .queue-page-tools button, .plan-view .queue-editor button { color: var(--hue-deep); font-weight: 700; }
-  .plan-view .stash-page-tools button { color: var(--hue-deep); font-weight: 700; }
+  .plan-view .queue-page-tools button, .plan-view .queue-editor button { color: var(--accent-ink); font-weight: 700; }
+  .plan-view .stash-page-tools button { color: var(--accent-ink); font-weight: 700; }
   .plan-view .queue-page-tools label { display: flex; align-items: center; gap: 5px; margin-left: auto; font-size: 12px; }
   .plan-view .queue-page-tools input { width: 4em; }
   .plan-view .qwhy { grid-row: 3; padding: 8px 14px; color: var(--bad, #d05a4a); border-bottom: 1px solid var(--edge); }
   .plan-view .stash-why { grid-row: 3; padding: 8px 14px; color: var(--bad, #d05a4a); border-bottom: 1px solid var(--edge); }
-  .plan-view iframe, .plan-view .queue-editor, .plan-view .queue-result, .plan-view .stash-result, .plan-view .management-page { grid-row: 4; min-height: 0; }
+  .plan-view iframe, .plan-view .queue-editor, .plan-view .queue-result, .plan-view .stash-result { grid-row: 4; min-height: 0; }
   .plan-view iframe { display: block; width: 100%; height: 100%; border: 0; background: var(--base); }
   .plan-view .queue-editor { overflow: auto; padding: 12px 14px; }
   .plan-view .queue-editor form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-height: 100%; gap: 12px; }
@@ -170,10 +167,9 @@
   .plan-view .queue-editor .preview { min-height: 0; overflow: auto; border: 1px solid var(--edge); padding: 10px; }
   .plan-view .queue-editor .preview strong { display: block; margin-bottom: 10px; color: var(--muted); }
   .plan-view .queue-result, .plan-view .stash-result { padding: 24px; overflow: auto; }
-  .plan-view .management-page { overflow: auto; padding: 18px 24px 40px; }
-  .plan-view .management-page h2 { font-family: var(--plate); font-size: 22px; margin: 0 0 16px; }
-  .plan-view .management-page p { max-width: 58ch; line-height: 1.45; }
-  .plan-view .management-page .forget { color: var(--hue-deep); font-weight: 700; }
+  .management-page { overflow: auto; padding: 18px 24px 40px; }
+  .management-page h2 { font-family: var(--plate); font-size: 22px; margin: 0 0 16px; }
+  .management-page p { max-width: 58ch; line-height: 1.45; }
   @media (max-width: 700px) {
     .plan-view .queue-editor .editor-main { grid-template-columns: 1fr; grid-template-rows: minmax(260px, 1fr) minmax(240px, 1fr); }
     .plan-view .queue-editor .preview { min-height: 220px; }
@@ -196,10 +192,33 @@
   .turn.outgoing .text { white-space: pre-wrap; }
   .turn.outgoing .delivery { display: block; margin-top: 6px; color: var(--muted); font: 12px var(--mono); overflow-wrap: anywhere; }
   .turn.outgoing.failed .delivery { color: var(--bad, #d05a4a); }
-  .turn.outgoing .retry, .turn.outgoing .dismiss { margin: 6px 12px 0 0; color: var(--hue-deep); font: 12px var(--mono); text-decoration: underline; }
+  .turn.outgoing .retry, .turn.outgoing .dismiss { margin: 6px 12px 0 0; color: var(--accent-ink); font: 12px var(--mono); text-decoration: underline; }
   .turn .text { overflow-wrap: anywhere; }
   .turn.harness .text { color: var(--muted); font-size: 13px; }
   .turn.thinking .text { color: var(--muted); }
+  .question-card { margin: 12px 0; padding: 16px; border: 1px solid var(--edge); border-radius: 10px; background: var(--bezel); }
+  .question-card .question-caption, .question-card .question-note { color: var(--muted); font-size: 12px; }
+  .question-card .question-caption { font-weight: 650; }
+  .question-card h3 { margin: 8px 0; font-size: 16px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
+  .question-card .question-header { margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .question-card ul { margin: 8px 0 12px; padding-left: 20px; }
+  .question-card li { padding: 3px 0; overflow-wrap: anywhere; }
+  .question-card .choice-description { color: var(--muted); font-size: 13px; }
+  .question-card .question-terminal { margin: 8px 0; padding: 6px 10px; border: 1px solid var(--edge); border-radius: 5px; }
+  .question-card .question-terminal:disabled { opacity: .5; cursor: default; }
+  .question-card .question-result { margin-top: 8px; font-size: 12px; }
+  .question-card .question-result pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px var(--mono); }
+  .question-answer fieldset { border: 0; padding: 0; margin: 0 0 14px; min-width: 0; }
+  .question-answer legend { font-size: 12px; color: var(--muted); max-width: 100%; overflow-wrap: anywhere; }
+  .question-answer label { display: flex; align-items: start; gap: 8px; padding: 5px 0; }
+  .question-answer label > span { min-width: 0; overflow-wrap: anywhere; }
+  .question-answer input[type=radio], .question-answer input[type=checkbox] { flex: 0 0 auto; margin-top: 4px; accent-color: var(--accent-ink); }
+  .question-answer textarea, .question-answer input[type=text], .question-answer input[type=password] { display: block; width: 100%; min-width: 0; box-sizing: border-box; padding: 9px; background: var(--base); color: var(--ink); border: 1px solid var(--edge); border-radius: 5px; font: inherit; }
+  .question-answer textarea { min-height: 70px; resize: vertical; }
+  .question-submit { padding: 7px 12px; background: var(--accent-ink); color: white; border-radius: 6px; margin-bottom: 8px; }
+  .question-submit:disabled { opacity: .55; cursor: default; }
+  .question-notice { font-size: 12px; overflow-wrap: anywhere; margin-top: 7px; }
+  .question-discard { margin-left: 10px; color: var(--accent-ink); text-decoration: underline; font-size: 12px; }
 
   /* Rendered prose. `render_markdown` is the only thing allowed to
      produce this markup; it escapes raw HTML and refuses a
@@ -215,7 +234,7 @@
   .prose ul, .prose ol { padding-left: 1.4em; }
   .prose li { margin: 0.25em 0; }
   .prose blockquote { margin-left: 0; padding: 0.1em 0 0.1em 1em; border-left: 3px solid var(--edge); color: var(--muted); }
-  .prose a { color: var(--hue-deep); text-underline-offset: 2px; }
+  .prose a { color: var(--accent-ink); text-underline-offset: 2px; }
   .prose code { font-family: var(--mono); font-size: 0.86em; background: var(--bezel); border: 1px solid var(--edge); border-radius: 4px; padding: 0.1em 0.32em; }
   .prose pre { margin: 0 0 0.9em; padding: 10px 12px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 8px; overflow-x: auto; }
   .prose pre code { font-size: 0.85em; background: none; border: 0; padding: 0; }
@@ -270,10 +289,10 @@
      cap is reached. */
   .say #text { display: block; width: 100%; background: none; color: var(--ink); border: 0; padding: 2px 6px 6px 0; font: 16px var(--text); resize: none; overflow-y: auto; line-height: 1.45; }
   .say #text:focus { outline: none; }
-  .bubble:focus-within { border-color: color-mix(in srgb, var(--hue) 45%, var(--edge)); }
+  .bubble:focus-within { border-color: color-mix(in srgb, var(--accent) 45%, var(--edge)); }
   .tools { display: flex; align-items: center; gap: 8px; }
   .tools .sent { margin-left: auto; }
-  .say button.send { background: var(--hue-deep); color: #fff; border-radius: 999px; padding: 7px 18px; font-weight: 700; }
+  .say button.send { background: var(--accent-ink); color: #fff; border-radius: 999px; padding: 7px 18px; font-weight: 700; }
   /* Beside Send, never instead of it: whether an agent is working is
      evidence, not a fact, and no amount of doubt should leave a person
      unable to speak. */
@@ -286,29 +305,41 @@
   .ledger { display: none; grid-area: agent; min-height: 0; background: var(--bezel); overflow: auto; font-size: 13px; }
   .ledger .lhead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 10px 14px 8px; }
   .ledger .lhead .session { font-family: var(--plate); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .management-links { display: flex; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--edge); }
-  .ledger .management-links a { color: var(--hue-deep); font-size: 12px; }
+  .roster { padding: 10px 10px; border-bottom: 1px solid var(--edge); }
+  .roster a { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px; color: var(--ink); text-decoration: none; border-radius: 6px; }
+  .roster a:hover, .roster a[aria-current="true"] { background: var(--base); }
+  .roster .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+  .roster .detail { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+  .provider-mark { width: 30px; height: 30px; border: 1px solid var(--edge); border-radius: 9px; display: inline-grid; place-items: center; font: 700 13px var(--plate); background: var(--base); color: var(--ink); }
+  .agent > .management-page { min-height: 0; width: 100%; max-width: var(--column); margin-inline: auto; }
+  .profile { flex: 0 0 32px; width: 32px; height: 32px; margin-left: auto; display: grid; place-items: center; border: 1px solid var(--edge); border-radius: 50%; }
+  .profile svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+  .access-panel { position: absolute; top: 44px; right: 14px; z-index: 6; width: min(300px, calc(100vw - 28px)); padding: 16px; border: 1px solid var(--edge); border-radius: 10px; background: var(--base); box-shadow: 0 10px 30px #0002; }
+  .access-panel h2 { margin: 0; font-size: 15px; }
+  .access-panel p { color: var(--muted); }
+  .access-panel button { text-decoration: underline; padding: 6px 0; }
   .ledger .facts { padding: 6px 14px 10px; border-bottom: 1px solid var(--edge); }
   .ledger .facts .plan { font-family: var(--plate); font-weight: 700; }
-  .ledger .facts .gate { color: var(--hue); }
+  .ledger .facts .gate { color: var(--ink); }
+  .ledger .facts .gate::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--state-hue); margin-right: 6px; vertical-align: 1px; }
   .ledger .facts .line { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .ledger .queue { padding: 2px 14px 8px; border-bottom: 1px solid var(--edge); }
   .ledger .queue:empty { display: none; }
   .ledger .queue .head { color: var(--muted); font-size: 12px; padding: 4px 0; }
   .ledger .queue .q { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
   .ledger .queue .q .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .queue .q a.nm, .ledger .queue .q a.open { color: var(--hue-deep); }
+  .ledger .queue .q a.nm { color: var(--accent-ink); }
   .ledger .queue .q .pri { flex: 0 0 auto; color: var(--muted); font-family: var(--mono); font-size: 12px; }
   .ledger .queue-tools { padding: 5px 14px; border-bottom: 1px solid var(--edge); }
-  .ledger .queue-tools a { color: var(--hue); font-size: 12px; }
+  .ledger .queue-tools a { color: var(--accent-ink); font-size: 12px; }
   .ledger .stash-list { padding: 8px 14px; border-bottom: 1px solid var(--edge); }
   .ledger .stash-list:empty { display: none; }
   .ledger .stash-list .head { color: var(--muted); font-size: 12px; padding-bottom: 4px; }
   .ledger .stash-list .item { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; }
   .ledger .stash-list .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ledger .stash-list a.name { color: var(--hue-deep); }
+  .ledger .stash-list a.name { color: var(--accent-ink); }
   .ledger .stash-list .note { color: var(--muted); font-size: 12px; }
-  .ledger .stash-list a { color: var(--hue); font-size: 12px; }
+  .ledger .stash-list a { color: var(--accent-ink); font-size: 12px; }
   .management-page .team .member { border-top: 1px solid var(--edge); padding: 12px 0; }
   .management-page .team .member summary { cursor: pointer; font-family: var(--plate); font-weight: 700; }
   .management-page .team .member summary span { color: var(--muted); font: 12px var(--mono); margin-left: 8px; }
@@ -317,7 +348,7 @@
   .management-page .team .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0; }
   .management-page .team input, .management-page .team select { min-width: 0; padding: 7px; border: 1px solid var(--edge); border-radius: 4px; background: var(--base); color: var(--ink); font: 13px var(--mono); }
   .management-page .team input { flex: 1 1 140px; }
-  .management-page .team button { padding: 5px; color: var(--hue-deep); text-decoration: underline; font: 13px var(--mono); }
+  .management-page .team button { padding: 5px; color: var(--accent-ink); text-decoration: underline; font: 13px var(--mono); }
   .management-page .team button.armed { color: var(--bad, #d05a4a); font-weight: 700; }
   .management-page .team .why { color: var(--bad, #d05a4a); font: 13px var(--mono); overflow-wrap: anywhere; }
   .management-page .team .why.ok { color: var(--muted); }
@@ -344,20 +375,8 @@
   .row a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); }
   .row a:hover, .row a:focus-visible { border-bottom-color: var(--ink); outline: none; }
   .row .sha, .row .author { color: var(--muted); }
-  /* A review mark takes the colour of its VERDICT, not the session's.
-     `--hue` is set per session state from the script below, so a
-     refusal was drawn in whatever the session happened to be -- the
-     same green as an approval, or yellow. Every other surface already
-     colours these by verdict: the TUI through `verdict_color`, the
-     generated site through `.mark-request-changes`.
-
-     The unclassed rule is a BELT, and unreachable today: every review
-     row `ledger_row` builds carries a verdict class, and only review
-     rows get `.row.review`. It covers a payload whose `verdict_class`
-     is absent -- the field is skipped when None -- rather than any
-     path taken now. Nothing exercises it, so it is a rule that cannot
-     be wrong because it never runs (ruthless 244972c). */
-  .row.review .glyph { color: var(--hue); }
+  /* Review marks use their verdict, with a neutral fallback. */
+  .row.review .glyph { color: var(--muted); }
   .row.review .glyph.v-continue { color: var(--ok); }
   .row.review .glyph.v-finished { color: var(--done); }
   .row.review .glyph.v-changes { color: var(--changes); }
@@ -386,14 +405,22 @@
       <button class="who" id="who" aria-haspopup="listbox" aria-expanded="false" aria-controls="picker">
       <span class="name" id="whoname"></span><span class="caret">▾</span><span class="away"></span><span class="tag" id="autotag">auto</span>
       </button>
+      <button class="profile" id="profile" type="button" aria-label="Remote access for this browser" aria-expanded="false" aria-controls="access-panel"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 22v-3a8 8 0 0 1 16 0v3"/></svg></button>
     </div>
+    <section class="access-panel" id="access-panel" aria-labelledby="access-title" hidden>
+      <h2 id="access-title">Remote access</h2>
+      <p id="access-description">This browser has access to this remote. Disconnect to forget its saved access.</p>
+      <button id="forget" type="button">Disconnect this browser</button>
+    </section>
     <div class="state">
       <span class="doing" id="doing"></span>
-      <span class="modes">
-        <button id="mode-transcript" data-mode="transcript" aria-controls="chat-reason" aria-expanded="false" aria-pressed="false">Chat</button>
-        <button id="mode-terminal" data-mode="terminal" aria-pressed="false">terminal</button>
-        <button id="mode-timeline" data-mode="timeline" aria-controls="ledger" aria-pressed="false">Timeline</button>
-      </span>
+      <div class="modes" role="tablist" aria-label="Workspace">
+        <button id="mode-transcript" data-mode="transcript" role="tab" aria-controls="views" aria-selected="false" tabindex="-1" aria-expanded="false">Chat</button>
+        <button id="mode-terminal" data-mode="terminal" role="tab" aria-controls="views" aria-selected="false" tabindex="-1">Terminal</button>
+        <button id="mode-team" data-mode="team" role="tab" aria-controls="team-page" aria-selected="false" tabindex="0">Team</button>
+        <button id="mode-settings" data-mode="settings" role="tab" aria-controls="settings-page" aria-selected="false" tabindex="-1">Settings</button>
+        <button id="mode-timeline" data-mode="timeline" role="tab" aria-controls="ledger" aria-selected="false" tabindex="-1">Timeline</button>
+      </div>
     </div>
     <div class="chat-reason" id="chat-reason" role="dialog" aria-label="Why Chat is unavailable" hidden><span id="chat-reason-text"></span><button id="chat-reason-close" type="button">Close</button></div>
     <div class="picker" id="picker" role="listbox" aria-label="Choose an agent" hidden></div>
@@ -433,29 +460,28 @@
       </section>
       <div class="queue-result" id="queue-result" hidden><h2 id="queue-result-title"></h2><p>Use Back to return to the plan list.</p></div>
       <div class="stash-result" id="stash-result" hidden><h2>Plan restored</h2><p>Use Back to return to the plan list.</p></div>
-      <section class="management-page" id="team-page" hidden>
-        <h2>Manage team</h2>
-        <div class="team" id="team">
-          <div id="team-rows"></div>
-          <form id="team-add"><div class="controls">
-            <input id="team-add-name" aria-label="Agent name" placeholder="agent name" list="team-library" required>
-            <datalist id="team-library"></datalist>
-            <select id="team-add-tool" aria-label="Agent tool">
-              <option value="">from library</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="grok">Grok</option><option value="opencode">OpenCode</option>
-            </select>
-            <select id="team-add-review" aria-label="Review tier">
-              <option value="commit">commit</option><option value="plan">plan</option><option value="final">final</option><option value="gate">gate</option><option value="standby">standby (no reviews)</option>
-            </select>
-            <button type="submit">Add agent</button>
-          </div></form>
-          <div class="why" id="team-why" role="status" aria-live="polite" hidden></div>
-        </div>
-      </section>
-      <section class="management-page" id="device-page" hidden>
-        <h2>Device settings</h2>
-        <p>Sign out this browser and forget its saved access to this session.</p>
-        <button class="forget" id="forget" type="button">Forget this device</button>
-      </section>
+    </section>
+    <section class="management-page" id="team-page" role="tabpanel" aria-labelledby="mode-team" tabindex="0" hidden>
+      <h2>Team</h2>
+      <div class="team" id="team">
+        <div id="team-rows"></div>
+        <form id="team-add"><div class="controls">
+          <input id="team-add-name" aria-label="Agent name" placeholder="agent name" list="team-library" required>
+          <datalist id="team-library"></datalist>
+          <select id="team-add-tool" aria-label="Agent tool">
+            <option value="">from library</option><option value="claude">Claude</option><option value="codex">Codex</option><option value="grok">Grok</option><option value="opencode">OpenCode</option>
+          </select>
+          <select id="team-add-review" aria-label="Review tier">
+            <option value="commit">commit</option><option value="plan">plan</option><option value="final">final</option><option value="gate">gate</option><option value="standby">standby (no reviews)</option>
+          </select>
+          <button type="submit">Add agent</button>
+        </div></form>
+        <div class="why" id="team-why" role="status" aria-live="polite" hidden></div>
+      </div>
+    </section>
+    <section class="management-page" id="settings-page" role="tabpanel" aria-labelledby="mode-settings" tabindex="0" hidden>
+      <h2 id="settings-title">Agent settings</h2>
+      <div class="team"><div id="settings-rows"></div><div class="why" id="settings-why" role="status" aria-live="polite" hidden></div></div>
     </section>
   </div>
   <form class="say" id="say">
@@ -474,10 +500,7 @@
   <aside class="ledger" id="ledger">
     <div class="lhead"><span class="session" id="session"></span></div>
     <div class="facts" id="facts"></div>
-    <nav class="management-links" aria-label="Management pages">
-      <a id="manage-team" href="#manage-team">Manage team</a>
-      <a id="device-settings" href="#device-settings">Device settings</a>
-    </nav>
+    <nav class="roster" id="roster" aria-label="Team members"></nav>
     <div class="queue" id="queue"></div>
     <div class="queue-tools"><a href="#new-queued-plan" id="queue-new">New queued plan</a></div>
     <div class="stash-list" id="stash-list"></div>
@@ -530,7 +553,7 @@
     switch (fx.do) {
       case 'store': keep.set(fx.token); return;
       case 'discard': keep.clear(); return;
-      case 'navigate': location.replace(fx.to); return;
+      case 'navigate': location.replace(fx.to === '/login' ? web.login : fx.to === '/' ? web.base : fx.to); return;
       case 'guard':
         try {
           if (fx.set) sessionStorage.setItem('clank.tried', '1');
@@ -581,9 +604,9 @@
   const whoEl = $('who'), whoName = $('whoname'), autoTag = $('autotag'), doingEl = $('doing');
   const projectEl = $('project');
   const pickerEl = $('picker'), stripEl = $('strip');
-  const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal'), timeline: $('mode-timeline') };
+  const modeBtns = { transcript: $('mode-transcript'), terminal: $('mode-terminal'), team: $('mode-team'), settings: $('mode-settings'), timeline: $('mode-timeline') };
   const narrowTimeline = window.matchMedia('(max-width: 959px)');
-  let timelineOpen = false;
+  let timelineOpen = false, workspace = null;
   const chatReasonEl = $('chat-reason'), chatReasonText = $('chat-reason-text');
   const form = $('say'), input = $('text'), send = $('send'), sentEl = $('sent'), stopBtn = $('stop');
   /*__CLANK_COMPOSER__*/
@@ -640,9 +663,21 @@
   // next load would ask for the token again and be remembered against
   // the user's wishes.
   const forgetEl = $('forget');
+  function openAccess(open) {
+    $('access-panel').hidden = !open;
+    $('profile').setAttribute('aria-expanded', String(open));
+    if (open) (forgetEl.hidden ? $('profile') : forgetEl).focus();
+  }
+  $('profile').addEventListener('click', () => openAccess($('access-panel').hidden));
+  document.addEventListener('click', (e) => {
+    if (!$('access-panel').contains(e.target) && !$('profile').contains(e.target)) openAccess(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('access-panel').hidden) { openAccess(false); $('profile').focus(); }
+  });
   if (web.hosted && !web.signout) {
     forgetEl.hidden = true;
-    $('device-settings').hidden = true;
+    $('access-description').textContent = 'This browser is connected through the host. Sign-out is managed by the host.';
   }
   async function forgetAtDoor() {
     forgetEl.disabled = true;
@@ -680,7 +715,10 @@
   const paneOf = new Map();                 // label → pane id
   let paneHeard = false;
   const agents = new Map();                 // label → { session, generation, turns[] }  (mirrors PageModel)
+  let nativeWindows = new Map();
+  const questionEntries = new Map();         // drafts in this page only, never browser storage
   const views = new Map();                  // label → { transcript: el, terminal: el, term }
+  const drafts = new Map();               // unsent text belongs to its selected agent
   let shown = null;                         // the agent on screen
   let live = null;                          // null: never opened; then true/false
   // A browser can refuse storage outright — a private window, blocked
@@ -913,10 +951,14 @@
     const opt = e.target.closest('.opt'); if (!opt) return;
     if (!$('plan-view').hidden) closeSitePage(false);
     const k = opt.dataset.key;
+    if ((pending > 0 || sending > 0) && (k === 'auto' || k.slice(4) !== shown)) {
+      sentEl.textContent = pending > 0 ? 'Finish attaching before switching agents' : 'Finish sending before switching agents';
+      return;
+    }
     selection = k === 'auto' ? { auto: true } : { label: k.slice(4) };
     keepSelection();
     openPicker(false);
-    show(target());                        // an explicit pick moves, draft or not
+    show(target());                        // each agent keeps its own unsent draft
     whoEl.focus();
   });
   document.addEventListener('click', (e) => {
@@ -976,7 +1018,7 @@
   // ---- the agent ----
   function ensureViews(label) {
     if (views.has(label)) return;
-    const transcript = document.createElement('div'); transcript.className = 'view transcript'; transcript.innerHTML = '<div class="turns"></div>';
+    const transcript = document.createElement('div'); transcript.className = 'view transcript'; transcript.innerHTML = '<div class="native-recovery empty-note" hidden><span></span> <button class="native-reconnect" type="button">Reconnect questions</button></div><div class="turns"></div>';
     const terminal = document.createElement('div'); terminal.className = 'view terminal'; terminal.innerHTML = '<div class="term"></div><div class="gone"></div>';
     viewsEl.append(transcript, terminal);
     const term = new Terminal({ cols: 80, rows: 24, disableStdin: true, cursorBlink: false, scrollback: 0, fontFamily: 'ui-monospace, Menlo, "SF Mono", Consolas, monospace', fontSize: 13, allowProposedApi: true, theme: { background: '#1a1917', foreground: '#e8e4dc' } });
@@ -985,6 +1027,9 @@
   }
 
   function hasTranscript(label) { return !!roster().find((a) => a.label === label)?.transcript; }
+  function hasChat(label) { return hasTranscript(label)
+    || (nativeWindows.has(label) && nativeWindows.get(label).session===boundSession(label))
+    || [...questionEntries.values()].some(e => e.agent===label && e.session===boundSession(label)); }
   function chatReason(label) {
     if (!label) return heard ? 'No agent is selected.' : 'Waiting for this session to report its agents.';
     const a = roster().find((row) => row.label === label);
@@ -1007,8 +1052,8 @@
     if (!chatReasonEl.hidden && !chatReasonEl.contains(e.target) && e.target !== modeBtns.transcript) closeChatReason();
   });
   function modeFor(label) {
-    const wanted = modes[label] || (hasTranscript(label) ? 'transcript' : 'terminal');
-    return wanted === 'transcript' && !hasTranscript(label) ? 'terminal' : wanted;
+    const wanted = modes[label] || (hasChat(label) ? 'transcript' : 'terminal');
+    return wanted === 'transcript' && !hasChat(label) ? 'terminal' : wanted;
   }
 
   // Stop was pressed, and nothing has happened since. Suppression is
@@ -1045,22 +1090,39 @@
     stopBtn.hidden = !p || p.closed || stopping(shown);
   }
   function show(label) {
-    if (shown !== label || hasTranscript(label)) closeChatReason();
+    if (shown !== label) {
+      if (shown) drafts.set(shown, input.value);
+      input.value = drafts.get(label) || '';
+      sentEl.textContent = '';
+      resize();
+    }
+    if (shown !== label || hasChat(label)) closeChatReason();
     shown = label;
     if (!chatReasonEl.hidden) chatReasonText.textContent = chatReason(label);
     const agentMode = label ? modeFor(label) : null;
-    const mode = timelineOpen && narrowTimeline.matches ? 'timeline' : agentMode;
+    const mode = timelineOpen && narrowTimeline.matches ? 'timeline' : workspace || agentMode;
     document.body.classList.toggle('timeline-active', mode === 'timeline');
     for (const [m, btn] of Object.entries(modeBtns)) {
       btn.classList.toggle('on', m === mode);
-      btn.setAttribute('aria-pressed', String(m === mode));
-      btn.disabled = m === 'terminal' && !label;
-      if (m === 'transcript') btn.setAttribute('aria-disabled', String(!label || !hasTranscript(label)));
+      btn.setAttribute('aria-selected', String(m === mode));
+      btn.tabIndex = m === mode || (!mode && m === 'team') ? 0 : -1;
+      btn.disabled = (m === 'terminal' || m === 'settings') && !label;
+      if (m === 'transcript') btn.setAttribute('aria-disabled', String(!label || !hasChat(label)));
     }
     for (const [l, v] of views) {
-      v.transcript.classList.toggle('on', l === label && agentMode === 'transcript');
-      v.terminal.classList.toggle('on', l === label && agentMode === 'terminal');
+      v.transcript.classList.toggle('on', l === label && !workspace && agentMode === 'transcript');
+      v.terminal.classList.toggle('on', l === label && !workspace && agentMode === 'terminal');
     }
+    const planOpen = !$('plan-view').hidden;
+    viewsEl.setAttribute('role', 'tabpanel');
+    viewsEl.setAttribute('aria-labelledby', agentMode === 'terminal' ? 'mode-terminal' : 'mode-transcript');
+    viewsEl.tabIndex = 0;
+    viewsEl.hidden = !!workspace || planOpen;
+    $('team-page').hidden = workspace !== 'team' || planOpen;
+    $('settings-page').hidden = workspace !== 'settings' || planOpen;
+    form.hidden = !!workspace || planOpen;
+    paintSettings();
+    paintRoster();
     syncSend();
     input.placeholder = label ? `Say something to ${label}` : 'Say something';
     const p = panes.get(label && paneOf.get(label));
@@ -1069,17 +1131,32 @@
   }
   for (const [m, btn] of Object.entries(modeBtns)) btn.addEventListener('click', () => {
     if (!$('plan-view').hidden) closeSitePage(false);
+    if (m === 'team' || m === 'settings') {
+      if (m === 'settings' && shown) { selection = { label: shown }; keepSelection(); }
+      workspace = m; timelineOpen = false; closeChatReason(); show(shown);
+      if (m === 'team') loadLibrary();
+      return;
+    }
     if (m === 'timeline') {
       timelineOpen = true;
       closeChatReason();
       show(shown);
       return;
     }
-    if (m === 'transcript' && !hasTranscript(shown)) { openChatReason(); return; }
+    if (m === 'transcript' && !hasChat(shown)) { openChatReason(); return; }
     if (!shown) return;
     closeChatReason();
     timelineOpen = false;
+    workspace = null;
     modes[shown] = m; remember('clank.modes', modes); show(shown);
+  });
+  document.querySelector('[role="tablist"]').addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    const tabs = Object.values(modeBtns).filter((b) => !b.disabled && b.getClientRects().length);
+    const at = tabs.indexOf(document.activeElement);
+    const next = e.key === 'Home' ? tabs[0] : e.key === 'End' ? tabs.at(-1)
+      : tabs[(at + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+    if (next) { e.preventDefault(); next.focus(); next.click(); }
   });
   window.addEventListener('resize', () => {
     if (timelineOpen && !narrowTimeline.matches) { timelineOpen = false; show(shown); }
@@ -1095,6 +1172,10 @@
     if (b.kind === 'text') return `${age}<div class="text prose"></div>`;
     if (b.kind === 'thinking') return `${age}<details><summary>thinking</summary><pre class="text"></pre></details>`;
     if (b.kind === 'image') return `${age}<span class="shots"></span>`;
+    if (b.kind === 'tool' && b.question) {
+      const wrapper = b.live_entry ? 'form' : 'div';
+      return `${age}<section class="question-card"><div class="question-caption"></div><${wrapper} class="${b.live_entry ? 'question-answer' : 'question-record'}"><div class="question-fields"></div><button class="question-submit" type="submit" hidden>Submit answer</button></${wrapper}><div class="question-note" role="status" aria-live="polite"></div><div class="question-notice" role="alert"></div><button class="question-terminal" type="button">View in Terminal</button><button class="question-reconnect" type="button" hidden>Reconnect questions</button><button class="question-discard" type="button" hidden>Discard answer draft</button><details class="question-result" hidden><summary>Recorded result</summary><pre></pre></details></section>`;
+    }
     return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre><div class="shots"></div></details>`;
   }
   // An image the transcript carried: the picture on a data URL, the
@@ -1110,6 +1191,22 @@
     viewerEl.classList.add('open');
   }
   function hideFull() { viewerEl.classList.remove('open'); viewerEl.innerHTML = ''; }
+  async function requestQuestionRecovery(button, ask, notify) {
+    if(button.disabled)return;
+    button.disabled=true;
+    try {
+      const reply=await fetch(route('/questions/reconnect'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(ask)});
+      const outcome=await reply.json();
+      notify(outcome.message || 'Check Terminal for connection status.');
+    } catch (_) {notify('Connection recovery is unconfirmed. No answer was submitted; check Terminal.');}
+    paintTranscript(ask.agent);
+  }
+  function reconnectQuestions(button) {
+    const entry=questionEntries.get(button.closest('.question-card').dataset.key);
+    if(!entry)return;
+    requestQuestionRecovery(button,{agent:entry.agent,session:entry.session,owner:entry.owner},
+      message=>{if(questionEntries.get(entry.key)===entry)entry.notice=message;});
+  }
   viewsEl.addEventListener('click', (e) => { const img = e.target.closest('img.shot'); if (img) showFull(img.getAttribute('src')); });
   viewerEl.addEventListener('click', hideFull);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && viewerEl.classList.contains('open')) hideFull(); });
@@ -1135,6 +1232,7 @@
     }
     if (b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
     if (b.kind === 'image') { fillShots(el.querySelector('.shots'), [b]); return; }
+    if (b.kind === 'tool' && b.question) { fillQuestion(el, b); return; }
     el.querySelector('summary .name').textContent = b.name;
     // What the call SAYS it is doing, and the call itself to read. A
     // turn from before those were derived has neither, and falls back
@@ -1147,14 +1245,254 @@
     out.hidden = b.output == null;
     fillShots(el.querySelector('.shots'), b.images || []);
   }
+  function questionKey(agent, window, request) {
+    return JSON.stringify([agent, window.session, window.owner, request.id, request.turn, request.item]);
+  }
+  function onQuestions(data) {
+    nativeWindows = new Map(Object.entries(data.agents || {}));
+    for(const view of views.values())view.recoveryNotice=null;
+    reconcileQuestions();
+    if (shown) show(shown);
+    for (const label of views.keys()) paintTranscript(label);
+  }
+  function reconcileQuestions() {
+    for (const [label, window] of nativeWindows) {
+      if (window.session !== boundSession(label) || !roster().some(a => a.label === label)) continue;
+      for (const request of window.pending || []) {
+        const key = questionKey(label, window, request);
+        let entry = questionEntries.get(key);
+        if (!entry) {
+          entry = {key, agent:label, session:window.session, owner:window.owner, request,
+            at:now(), state:'pending', notice:'', draft:new Map()};
+          questionEntries.set(key, entry);
+        }
+        entry.request = request;
+        if (['answered','local','failed','unknown','unavailable'].includes(request.delivery)) entry.state=request.delivery;
+        else if (request.delivery === 'submitted' && ['pending','sending','submitted','unavailable','resolved'].includes(entry.state)) entry.state = 'submitted';
+        else if (request.delivery === 'sending' && ['pending','unavailable','resolved'].includes(entry.state)) entry.state = 'unknown';
+        else if (request.delivery === 'pending' && ['unavailable','resolved'].includes(entry.state) && window.available) entry.state='pending';
+      }
+    }
+    for (const [key, entry] of questionEntries) {
+      if (entry.session !== boundSession(entry.agent) || !roster().some(a => a.label === entry.agent)) {
+        entry.state = 'stale'; questionEntries.delete(key); continue;
+      }
+      // A known native completion remains true when a later prompt or owner
+      // stops retaining that request. Session clearing above still drops drafts.
+      if (['answered','local','failed','cancelled'].includes(entry.state)) continue;
+      const window = nativeWindows.get(entry.agent);
+      if (!window || window.owner !== entry.owner || window.session !== entry.session) {
+        entry.state = 'stale'; continue;
+      }
+      if (!window.available) { if(['sending','submitted'].includes(entry.state)) entry.state='unknown'; else if(entry.state !== 'unknown') entry.state = 'unavailable'; continue; }
+      const pending = window.pending?.some(r => questionKey(entry.agent, window, r) === entry.key);
+      if (!pending) {
+        entry.state = window.ended?.turn === entry.request.turn && window.ended.status === 'interrupted'
+          ? 'cancelled' : window.ended?.turn === entry.request.turn && window.ended.status === 'failed'
+          ? 'failed' : 'resolved';
+      }
+    }
+  }
+  function pruneQuestionEntries() {
+    // Undrafted closed metadata follows retained history/the last native turn.
+    for (const [key, entry] of questionEntries) {
+      const drafted=[...entry.draft.values()].some(d => d.selected.size || d.other);
+      const recorded=agents.get(entry.agent)?.turns.some(t => t.id===entry.request.item);
+      const lastTurn=nativeWindows.get(entry.agent)?.ended?.turn===entry.request.turn || nativeWindows.get(entry.agent)?.pending?.some(r=>questionKey(entry.agent,nativeWindows.get(entry.agent),r)===entry.key);
+      if (!drafted && !recorded && !lastTurn && !['pending','sending','submitted','unknown'].includes(entry.state)) questionEntries.delete(key);
+    }
+  }
+  function questionState(entry) {
+    return ({pending:live ? 'Answer this pending native question.' : 'Disconnected. Your draft is kept; reconnect before answering.',
+      answered:'Claude confirmed these answers.', local:'Answered in Claude.',
+      sending:'Sending answer…', submitted:'Answer sent; awaiting the harness. Acceptance is unconfirmed.',
+      unknown:'Delivery is unconfirmed. Your draft is kept. Check Terminal before taking further action.',
+      resolved:'Resolved in the harness. This does not confirm which answer won; check Terminal.',
+      cancelled:'The harness cancelled this turn. Answer acceptance is unconfirmed.',
+      failed:'The native question failed. Your draft is kept; check Terminal.',
+      stale:'The session or native owner changed. This draft cannot answer the new request.',
+      unavailable:'The native question is unavailable. Your draft is kept; use Terminal.'})[entry.state];
+  }
+  function questionTurns(label, recorded) {
+    pruneQuestionEntries();
+    const list = recorded.slice();
+    for (const entry of questionEntries.values()) {
+      if (entry.agent !== label || entry.session !== boundSession(label)) continue;
+      const index = list.findIndex(t => t.id === entry.request.item && t.body.kind === 'tool' && t.body.question);
+      const original = index < 0 ? null : list[index];
+      const turn = {id:`native-question:${entry.key}`, who:'agent', at:original?.at || entry.at,
+        body:{kind:'tool', name:'request_user_input', input:'', output:original?.body.output ?? null,
+          images:[], question:entry.request.question, live_entry:entry}};
+      if (index < 0) list.push(turn); else list.splice(index, 1, turn);
+    }
+    return list;
+  }
+  function fillAnswerFields(container, entry) {
+    entry.request.question.fields.forEach((field, index) => {
+      let draft = entry.draft.get(field.id);
+      if (!draft) { draft = {selected:new Set(), other:'', otherChosen:false}; entry.draft.set(field.id, draft); }
+      const group = document.createElement('fieldset');
+      const legend = document.createElement('legend');
+      legend.textContent = [field.header, field.multi_select ? 'Choose multiple' : '', field.is_secret ? 'Private answer' : ''].filter(Boolean).join(' · ');
+      const prompt = document.createElement('h3'); prompt.textContent = field.question;
+      group.append(legend,prompt);
+      const name = `${entry.key}:${index}`;
+      const choices = [];
+      field.options.forEach((option, n) => {
+        const label = document.createElement('label'), input = document.createElement('input');
+        input.type = field.multi_select ? 'checkbox' : 'radio'; input.name = name;
+        input.checked = draft.selected.has(n); choices.push(input);
+        input.addEventListener('change', () => {
+          if (!field.multi_select) { draft.selected.clear(); draft.otherChosen = false; }
+          if (input.checked) draft.selected.add(n); else draft.selected.delete(n);
+        });
+        const words = document.createElement('span'), title = document.createElement('strong');
+        title.textContent = option.label; words.append(title);
+        if (option.description) {const detail=document.createElement('div');detail.className='choice-description';detail.textContent=option.description;words.append(detail);}
+        label.append(input,words); group.append(label);
+      });
+      if (!field.options.length || field.is_other) {
+        let otherChoice = null;
+        if (field.options.length) {
+          const label = document.createElement('label'); otherChoice = document.createElement('input');
+          otherChoice.type = field.multi_select ? 'checkbox' : 'radio'; otherChoice.name = name;
+          otherChoice.checked = draft.otherChosen; label.append(otherChoice,document.createTextNode('Other'));
+          otherChoice.addEventListener('change',()=>{draft.otherChosen=otherChoice.checked;if(!field.multi_select)draft.selected.clear();});
+          group.append(label);
+        }
+        const input = document.createElement(field.is_secret ? 'input' : 'textarea');
+        if (field.is_secret) input.type = 'password';
+        input.autocomplete = 'off'; input.setAttribute('aria-label',field.question + (field.options.length ? ' — Other answer' : ''));
+        input.value = draft.other;
+        input.addEventListener('input',()=>{
+          draft.other=input.value;
+          if (otherChoice) {otherChoice.checked=true;draft.otherChosen=true;if(!field.multi_select){draft.selected.clear();for(const choice of choices)choice.checked=false;}}
+        });
+        group.append(input);
+      }
+      container.append(group);
+    });
+  }
+  viewsEl.addEventListener('submit',async event => {
+    const form = event.target.closest('.question-answer'); if(!form) return;
+    event.preventDefault();
+    const entry = questionEntries.get(form.closest('.question-card').dataset.key);
+    if (!entry || entry.state !== 'pending' || !live) return;
+    const answers = Object.fromEntries(entry.request.question.fields.map(field => {
+      const draft=entry.draft.get(field.id);
+      const values=field.options.filter((_,n)=>draft.selected.has(n)).map(option=>option.label);
+      if (!field.options.length || draft.otherChosen) values.push(draft.other);
+      return [field.id,values];
+    }));
+    if (Object.values(answers).some(values => !values.length || values.some(value=>!value.trim()))) {
+      entry.notice='Answer every question before submitting.';paintTranscript(entry.agent);return;
+    }
+    const attempt=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+    const ask={agent:entry.agent,session:entry.session,owner:entry.owner,id:entry.request.id,
+      turn:entry.request.turn,item:entry.request.item,attempt,answers};
+    entry.state='sending';entry.notice='';paintTranscript(entry.agent);
+    try {
+      const reply=await fetch(route('/questions/answer'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(ask)});
+      const outcome=await reply.json();
+      // A native resolution/rebind may precede this HTTP reply. Never reopen
+      // that card or report the reply against a newly selected agent.
+      if (['sending','pending','unavailable'].includes(entry.state)) {
+        const connected=nativeWindows.get(entry.agent)?.available;
+        entry.state=outcome.state==='submitted' ? (connected ? 'submitted' : 'unknown')
+          : outcome.state==='invalid' || outcome.state==='busy' ? (connected ? 'pending' : 'unavailable')
+          : outcome.state==='stale' ? 'stale' : outcome.state==='unavailable' ? 'unavailable' : 'unknown';
+        entry.notice=typeof outcome.message==='string' ? outcome.message : 'Delivery is unconfirmed. Check Terminal.';
+      }
+    } catch (_) {
+      if (entry.state==='sending' || entry.state==='unavailable') entry.state='unknown';
+      entry.notice='The connection ended without a reply. Delivery is unconfirmed; check Terminal.';
+    }
+    paintTranscript(entry.agent);
+  });
+  function fillQuestion(el, body) {
+    const card = el.querySelector('.question-card'), question = body.question;
+    const entry = body.live_entry;
+    card.dataset.key = entry?.key || '';
+    const provider = question.provider === 'claude' ? 'Claude' : 'Codex';
+    card.querySelector('.question-caption').textContent = `${provider}${entry && !entry.request.blocking ? " background" : ""} question`;
+    const fields = card.querySelector('.question-fields');
+    const sig = JSON.stringify([question.fields, entry?.key || '']);
+    if (fields.dataset.signature !== sig) {
+      fields.dataset.signature = sig;
+      // All provider strings are text nodes, including option labels.
+      fields.replaceChildren();
+      if (entry) fillAnswerFields(fields, entry);
+      else {
+        for (const field of question.fields) {
+          const header = document.createElement('div'); header.className = 'question-header';
+          header.textContent = [field.header, field.multi_select ? 'Choose multiple' : '', field.is_secret ? 'Private answer' : ''].filter(Boolean).join(' · ');
+          const prompt = document.createElement('h3'); prompt.textContent = field.question;
+          fields.append(header, prompt);
+          if (field.options.length) {
+            const list = document.createElement('ul');
+            for (const option of field.options) {
+              const row = document.createElement('li'), label = document.createElement('strong');
+              label.textContent = option.label; row.append(label);
+              if (option.description) {
+                const description = document.createElement('div'); description.className = 'choice-description';
+                description.textContent = option.description; row.append(description);
+              }
+              list.append(row);
+            }
+            fields.append(list);
+          }
+        }
+      }
+    }
+    const recorded = body.output != null;
+    card.querySelector('.question-note').textContent = entry ? questionState(entry) : recorded
+      ? 'Result recorded · check Terminal for current status.'
+      : 'Answer in the agent’s local terminal. No pending native answer authority is available here.';
+    const editable = entry && entry.state === 'pending' && live;
+    for (const fieldset of fields.querySelectorAll('fieldset')) fieldset.disabled = !editable;
+    const submit = card.querySelector('.question-submit');
+    submit.hidden = !entry; submit.disabled = !editable;
+    submit.textContent = entry?.state === 'sending' ? 'Sending…' : 'Submit answer';
+    card.querySelector('.question-notice').textContent = entry?.notice || '';
+    const recovery=card.querySelector('.question-reconnect');
+    const nativeWindow=entry && nativeWindows.get(entry.agent);
+    recovery.hidden=!entry || !nativeWindow || nativeWindow.owner!==entry.owner || nativeWindow.available;
+    recovery.disabled=!live || nativeWindow?.reason?.startsWith('Connecting') || nativeWindow?.reason?.startsWith('Reconnecting');
+    card.querySelector('.question-discard').hidden = !entry || ['pending','sending','submitted','unknown'].includes(entry.state);
+    const target = entry?.agent || shown;
+    const pane = panes.get(target && paneOf.get(target));
+    const button = card.querySelector('.question-terminal');
+    button.disabled = !pane || pane.closed;
+    button.textContent = button.disabled ? 'Terminal unavailable' : 'View in Terminal';
+    const result = card.querySelector('.question-result');
+    const privateAnswer = question.fields.some((field) => field.is_secret);
+    result.hidden = !recorded || privateAnswer;
+    result.querySelector('pre').textContent = !recorded || privateAnswer ? '' : body.output;
+  }
+  viewsEl.addEventListener('click', (e) => {
+    if (e.target.closest('.question-terminal')) modeBtns.terminal.click();
+    const nativeRecovery=e.target.closest('.native-reconnect');
+    if(nativeRecovery && shown) {
+      const agent=shown, window=nativeWindows.get(agent);
+      if(window)requestQuestionRecovery(nativeRecovery,{agent,session:window.session,owner:window.owner},message=>{
+        const v=views.get(agent);
+        if(v && nativeWindows.get(agent)?.owner===window.owner)v.recoveryNotice={owner:window.owner,message};
+      });
+    }
+    const recovery=e.target.closest('.question-reconnect');
+    if(recovery)reconnectQuestions(recovery);
+    const discard = e.target.closest('.question-discard');
+    if (discard) {const key = discard.closest('.question-card').dataset.key;const entry=questionEntries.get(key);if(entry){questionEntries.delete(key);paintTranscript(entry.agent);}}
+  });
+  const isCommand = (t) => t.body.kind === 'tool' && !t.body.question;
   // A run of tool calls with no prose between them is one row: what
   // was said stays readable, what was DONE is one tap away.
   function slotsOf(turns) {
     const slots = [];
     for (const t of turns) {
       const last = slots[slots.length - 1];
-      if (t.body.kind === 'tool' && last && last.tools) last.turns.push(t);
-      else slots.push({ tools: t.body.kind === 'tool', turns: [t] });
+      if (isCommand(t) && last && last.tools) last.turns.push(t);
+      else slots.push({ tools: isCommand(t), turns: [t] });
     }
     return slots;
   }
@@ -1164,15 +1502,22 @@
   // moves between the top level and a group as its run grows, and
   // rebuilding it would close whatever the reader had opened.
   function placeTurn(box, parent, t, cursor) {
+    const renderer = t.body.kind === 'tool' && t.body.question ? 'question' : t.body.kind;
     let el = box.querySelector(`[data-id="${CSS.escape(t.id)}"]`);
     if (!el) {
       el = document.createElement('div');
       el.dataset.id = t.id;
       el.className = `turn ${t.who} ${t.body.kind}`;
+      el.dataset.renderer = renderer;
       el.innerHTML = turnHtml(t);
       parent.insertBefore(el, cursor);
     } else if (el !== cursor) {
       parent.insertBefore(el, cursor);
+    }
+    if (el.dataset.renderer !== renderer) {
+      el.dataset.renderer = renderer;
+      el.className = `turn ${t.who} ${t.body.kind}`;
+      el.innerHTML = turnHtml(t);
     }
     fillTurn(el, t);
     return el.nextElementSibling;
@@ -1226,9 +1571,15 @@
 
   function paintTranscript(label) {
     const v = views.get(label); if (!v) return;
+    const recovery=v.transcript.querySelector('.native-recovery'), nativeWindow=nativeWindows.get(label);
+    recovery.hidden=!nativeWindow || nativeWindow.session!==boundSession(label) || nativeWindow.available;
+    if(!recovery.hidden) {
+      recovery.querySelector('span').textContent=(v.recoveryNotice?.owner===nativeWindow.owner ? v.recoveryNotice.message : null) || nativeWindow.reason || 'Native questions are unavailable. Use Terminal or reconnect.';
+      recovery.querySelector('button').disabled=!live || nativeWindow.reason?.startsWith('Connecting') || nativeWindow.reason?.startsWith('Reconnecting');
+    }
     const box = v.transcript.querySelector('.turns');
     const w = agents.get(label);
-    const shown = (w ? w.turns : []).filter((t) => t.who !== 'harness');
+    const shown = questionTurns(label, (w ? w.turns : []).filter((t) => t.who !== 'harness'));
     const outgoing = outbox.filter((e) => e.agent === label && e.session === boundSession(label));
     if (!shown.length && !outgoing.length) { box.innerHTML = `<div class="turn empty-note"><span class="text">Nothing said yet.</span></div>`; return; }
     if (box.querySelector('.empty-note')) box.innerHTML = '';
@@ -1461,9 +1812,8 @@
     box.innerHTML = queue.length
       ? `<div class="head">queued</div>`
         + queue.map((q) => `<div class="q" data-handle="${esc(q.handle)}">`
-          + (q.page ? `<a class="nm" href="${esc(siteHref(q.page))}">${esc(q.name)}</a>` : `<span class="nm">${esc(q.name)}</span>`)
+          + (q.page ? `<a class="nm" title="${esc(q.name)}" href="${esc(siteHref(q.page))}">${esc(q.name)}</a>` : `<span class="nm">${esc(q.name)}</span>`)
           + `<span class="pri" aria-label="priority ${esc(String(q.priority))}">${esc(String(q.priority).padStart(3, '0'))}</span>`
-          + (q.page ? `<a class="open" href="${esc(siteHref(q.page))}">Open plan</a>` : '')
           + `</div>`).join('')
       : '';
     if (focused) box.querySelector(`.q[data-handle="${CSS.escape(focused)}"] a.nm`)?.focus();
@@ -1572,9 +1922,8 @@
     $('stash-list').innerHTML = entries.length
       ? `<div class="head">stashed</div>` + entries.map((s) =>
           `<div class="item" data-stem="${esc(s.stem)}">`
-          + (s.page ? `<a class="name" href="${esc(siteHref(s.page))}">${esc(s.stem)}</a>` : `<span class="name">${esc(s.stem)}</span>`)
+          + (s.page ? `<a class="name" title="${esc(s.stem)}" href="${esc(siteHref(s.page))}">${esc(s.stem)}</a>` : `<span class="name">${esc(s.stem)}</span>`)
           + `<span class="note">${s.commits} commit${s.commits === 1 ? '' : 's'}${s.ready ? ' · ready' : s.waiting_for ? ' · waiting' : ''}</span>`
-          + (s.page ? `<a href="${esc(siteHref(s.page))}">Open plan</a>` : '')
           + `</div>`).join('')
       : '';
   }
@@ -1685,18 +2034,11 @@
       .map((el) => [el.closest('.member').dataset.label, el.value]));
     rows.innerHTML = agents.map((a) => {
       const name = esc(a.label), master = a.role === 'master';
-      const auto = a.auto === 'on' ? 'on' : 'off', nextAuto = auto === 'on' ? 'off' : 'on';
       const tier = master ? '' : `<label>review tier <select data-do="review" aria-label="Review tier for ${name}">`
         + reviewKinds.map((kind) => `<option value="${kind}"${a.role === kind ? ' selected' : ''}>${kind === 'standby' ? 'standby (no reviews)' : kind}</option>`).join('')
         + '</select></label>';
       return `<details class="member" data-label="${name}"><summary>${name}<span>${esc(a.role)} · ${esc(a.tool || '')}</span></summary>`
-        + `<pre>${esc(a.invocation || a.tool || '')}</pre>`
-        + `<div class="binding">${a.session ? `session ${esc(a.session)}` : 'unbound — the agent binds its own session'} · ${paneState(a.label)}</div>`
-        + `<div class="auto-state">Auto ${auto} · ${a.auto_explicit == null ? 'inherited' : 'set for this agent'}</div>`
         + `<div class="controls">${tier}${master ? '' : '<button type="button" data-do="promote">Promote to master</button>'}`
-        + `<button type="button" data-do="auto_mode" data-mode="${nextAuto}">Turn auto ${nextAuto}</button>`
-        + `${a.session ? `<button type="button" data-do="clear_session" data-session="${esc(a.session)}">Clear session</button>` : ''}`
-        + `${paneState(a.label) === 'pane missing' ? '<button type="button" data-do="reopen">Reopen pane</button>' : ''}`
         + `<input class="swap" list="team-library" aria-label="Replace ${name} with agent" placeholder="replacement agent">`
         + `<button type="button" data-do="swap">Swap</button>`
         + `${master ? '' : '<button type="button" data-do="remove">Remove</button>'}</div></details>`;
@@ -1708,15 +2050,67 @@
     }
     paintLibrary();
     armedAgent = null;
-    if (armedClear) {
-      const button = rows.querySelector(`.member[data-label="${CSS.escape(armedClear.label)}"] button[data-do="clear_session"]`);
-      if (button && button.dataset.session === armedClear.session) {
-        button.classList.add('armed'); button.textContent = 'Clear session?';
-      } else armedClear = null;
-    }
   }
-  async function askAgent(ask) {
-    teamWhy('');
+  let settingsDrawn = null, rosterDrawn = null;
+  function providerMark(tool) {
+    const names = { claude: 'Claude', codex: 'Codex', grok: 'Grok', opencode: 'OpenCode' };
+    const name = names[tool] || tool || 'Agent';
+    const mark = { claude: 'Cl', codex: 'Co', grok: 'G', opencode: 'OC' }[tool] || name.slice(0, 1);
+    return `<span class="provider-mark" aria-hidden="true">${esc(mark)}</span>`;
+  }
+  function paintRoster() {
+    const agents = roster();
+    const sig = JSON.stringify([shown, agents.map((a) => [a.label, a.role, a.tool, clause(a), paneState(a.label)])]);
+    if (sig === rosterDrawn) return;
+    rosterDrawn = sig;
+    const focused = document.activeElement?.closest('#roster a')?.dataset.label;
+    $('roster').innerHTML = agents.map((a) => `<a href="#agent-${encodeURIComponent(a.label)}" data-label="${esc(a.label)}" aria-current="${a.label === shown}">`
+      + providerMark(a.tool) + `<span><span class="name">${esc(a.label)}</span><span class="detail">${esc(a.role)} · ${esc(a.tool || 'agent')} · ${paneState(a.label)}</span><span class="detail">${clause(a)}</span></span></a>`).join('');
+    if (focused) $('roster').querySelector(`a[data-label="${CSS.escape(focused)}"]`)?.focus();
+  }
+  $('roster').addEventListener('click', (e) => {
+    const link = e.target.closest('a[data-label]');
+    if (!link || !roster().some((a) => a.label === link.dataset.label)) return;
+    e.preventDefault();
+    if ((pending > 0 || sending > 0) && link.dataset.label !== shown) {
+      sentEl.textContent = pending > 0 ? 'Finish attaching before switching agents' : 'Finish sending before switching agents';
+      return;
+    }
+    if (!$('plan-view').hidden) closeSitePage(false);
+    selection = { label: link.dataset.label }; keepSelection();
+    workspace = null; timelineOpen = false; show(target());
+    whoEl.focus();
+  });
+  function settingsWhy(label, message) {
+    if (label !== shown) return;
+    const box = $('settings-why');
+    box.textContent = message || ''; box.hidden = !message;
+    box.classList.toggle('ok', !!message && message.startsWith('Saved.'));
+  }
+  function paintSettings() {
+    const a = roster().find((a) => a.label === shown);
+    const sig = JSON.stringify([shown, a?.tool, a?.invocation, a?.session, a?.auto, a?.auto_explicit, paneState(shown)]);
+    if (sig === settingsDrawn) return;
+    const previousLabel = $('settings-rows').querySelector('.member')?.dataset.label;
+    settingsDrawn = sig;
+    $('settings-title').textContent = a ? `${a.label} settings` : 'Agent settings';
+    if (previousLabel !== shown) $('settings-why').hidden = true;
+    if (!a) { $('settings-rows').textContent = 'Choose an agent to see its settings.'; armedClear = null; return; }
+    const auto = a.auto === 'on' ? 'on' : 'off', nextAuto = auto === 'on' ? 'off' : 'on';
+    $('settings-rows').innerHTML = `<div class="member" data-label="${esc(a.label)}">`
+      + `<pre>${esc(a.invocation || a.tool || '')}</pre>`
+      + `<div class="binding">${a.session ? `session ${esc(a.session)}` : 'unbound — the agent binds its own session'} · ${paneState(a.label)}</div>`
+      + `<div class="auto-state">Auto ${auto} · ${a.auto_explicit == null ? 'inherited' : 'set for this agent'}</div>`
+      + `<div class="controls"><button type="button" data-do="auto_mode" data-mode="${nextAuto}">Turn auto ${nextAuto}</button>`
+      + `${a.session ? `<button type="button" data-do="clear_session" data-session="${esc(a.session)}">Clear session</button>` : ''}`
+      + `${paneState(a.label) === 'pane missing' ? '<button type="button" data-do="reopen">Reopen pane</button>' : ''}</div></div>`;
+    if (armedClear?.label === a.label && armedClear.session === a.session) {
+      const button = $('settings-rows').querySelector('[data-do="clear_session"]');
+      button.classList.add('armed'); button.textContent = 'Clear session?';
+    } else armedClear = null;
+  }
+  async function askAgent(ask, why = teamWhy) {
+    why('');
     try {
       const r = await fetch(route('/agents'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ask),
@@ -1727,10 +2121,10 @@
         try { why = JSON.parse(body).why || body; } catch (err) {}
         throw new Error(why || 'the team refused that change');
       }
-      teamWhy(ask.do === 'clear_session' ? 'Saved. Session cleared; status will update shortly.' : 'Saved. The team will update shortly.');
+      why(ask.do === 'clear_session' ? 'Saved. Session cleared; status will update shortly.' : 'Saved. The team will update shortly.');
       return true;
     } catch (err) {
-      teamWhy(err.message || String(err));
+      why(err.message || String(err));
       return false;
     }
   }
@@ -1749,31 +2143,32 @@
     const ok = await askAgent({ do: 'review', label, review: select.value });
     if (!ok) select.value = roster().find((a) => a.label === label)?.role || 'commit';
   });
-  $('team-rows').addEventListener('click', (e) => {
+  function agentAction(e) {
     const button = e.target.closest('button[data-do]');
     if (!button) return;
     const row = button.closest('.member'), label = row.dataset.label, action = button.dataset.do;
+    const why = e.currentTarget.id === 'settings-rows' ? (message) => settingsWhy(label, message) : teamWhy;
     if (action === 'clear_session') {
       const session = button.dataset.session;
       if (!armedClear || armedClear.label !== label || armedClear.session !== session) {
-        const old = $('team-rows').querySelector('button[data-do="clear_session"].armed');
+        const old = $('settings-rows').querySelector('button[data-do="clear_session"].armed');
         if (old) { old.classList.remove('armed'); old.textContent = 'Clear session'; }
         armedClear = { label, session };
         button.classList.add('armed'); button.textContent = 'Clear session?';
-        teamWhy(`Clear ${label}'s binding to ${session}?`);
+        why(`Clear ${label}'s binding to ${session}?`);
       } else {
         armedClear = null;
         button.classList.remove('armed'); button.textContent = 'Clear session';
-        askAgent({ do: 'clear_session', label, session });
+        askAgent({ do: 'clear_session', label, session }, why);
       }
       return;
     }
     if (armedClear) {
-      const old = $('team-rows').querySelector('button[data-do="clear_session"].armed');
+      const old = $('settings-rows').querySelector('button[data-do="clear_session"].armed');
       if (old) { old.classList.remove('armed'); old.textContent = 'Clear session'; }
       armedClear = null;
     }
-    if (action === 'reopen') { askReopen(label); return; }
+    if (action === 'reopen') { askReopen(label, why); return; }
     if (action !== 'remove' && armedAgent) {
       const armed = $('team-rows').querySelector(`.member[data-label="${CSS.escape(armedAgent)}"] button[data-do="remove"]`);
       if (armed) { armed.classList.remove('armed'); armed.textContent = 'Remove'; }
@@ -1782,10 +2177,10 @@
     if (action === 'auto_mode') {
       const mode = button.dataset.mode;
       button.disabled = true;
-      askAgent({ do: 'auto_mode', label, mode }).then((ok) => {
+      askAgent({ do: 'auto_mode', label, mode }, why).then((ok) => {
         if (ok) {
           const agent = roster().find((a) => a.label === label);
-          if (agent) { agent.auto = mode; agent.auto_explicit = mode; paintTeam(roster()); }
+          if (agent) { agent.auto = mode; agent.auto_explicit = mode; paintSettings(); }
         } else button.disabled = false;
       });
       return;
@@ -1804,19 +2199,21 @@
     }
     if (action === 'swap') {
       const into = row.querySelector('input.swap').value.trim();
-      if (!into) { teamWhy('Choose a replacement agent first.'); return; }
-      askAgent({ do: 'swap', label, into });
-    } else askAgent({ do: action, label });
-  });
-  async function askReopen(label) {
-    teamWhy('');
+      if (!into) { why('Choose a replacement agent first.'); return; }
+      askAgent({ do: 'swap', label, into }, why);
+    } else askAgent({ do: action, label }, why);
+  }
+  $('team-rows').addEventListener('click', agentAction);
+  $('settings-rows').addEventListener('click', agentAction);
+  async function askReopen(label, why = teamWhy) {
+    why('');
     try {
       const r = await fetch(route('/agents/reopen'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ label }),
       });
       const answer = await r.json();
-      teamWhy(r.ok ? `Saved. ${answer.message}` : answer.why || 'the pane could not be reopened');
-    } catch (err) { teamWhy('could not reach the pane reconciler'); }
+      why(r.ok ? `Saved. ${answer.message}` : answer.why || 'the pane could not be reopened');
+    } catch (err) { why('could not reach the pane reconciler'); }
   }
 
   // ---- the ledger ----
@@ -1846,19 +2243,13 @@
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');
   }
-  let planReturnTimeline = false, planTimelineScroll = 0, planReturnHref = '', managementPage = null;
-  function paintManagementPage() {
-    $('team-page').hidden = managementPage !== 'team';
-    $('device-page').hidden = managementPage !== 'device';
-    if (managementPage) $('plan-frame').hidden = true;
-  }
+  let planReturnTimeline = false, planTimelineScroll = 0, planReturnHref = '';
   function openSitePage(url, title, selected = null, returnHref = '') {
     planReturnTimeline = timelineOpen && narrowTimeline.matches;
     planTimelineScroll = ledgerEl.scrollTop;
     planReturnHref = returnHref || url?.href || '';
     queuePage = selected?.kind === 'queue' || selected?.kind === 'new' ? selected : null;
     stashPage = selected?.kind === 'stash' ? selected : null;
-    managementPage = selected?.kind === 'team' || selected?.kind === 'device' ? selected.kind : null;
     armedQueueAction = null;
     queueWhy('');
     stashWhy('');
@@ -1871,9 +2262,9 @@
     else $('plan-frame').removeAttribute('src');
     paintQueuePage();
     paintStashPage();
-    paintManagementPage();
     $('views').hidden = true;
     $('plan-view').hidden = false;
+    show(shown);
     $('plan-back').focus();
     if (stashPage) loadStashSource(stashPage);
   }
@@ -1885,13 +2276,11 @@
     $('views').hidden = false;
     queuePage = null;
     stashPage = null;
-    managementPage = null;
     armedQueueAction = null;
     $('queue-promote').textContent = 'Promote';
     $('queue-unqueue').textContent = 'Unqueue';
     paintQueuePage();
     paintStashPage();
-    paintManagementPage();
     const returningToTimeline = planReturnTimeline && narrowTimeline.matches;
     timelineOpen = returningToTimeline;
     planReturnTimeline = false;
@@ -1904,15 +2293,6 @@
     planReturnHref = '';
   }
   $('plan-back').addEventListener('click', () => closeSitePage());
-  $('manage-team').addEventListener('click', (e) => {
-    e.preventDefault();
-    openSitePage(null, 'Manage team', { kind: 'team' }, e.currentTarget.href);
-    loadLibrary();
-  });
-  $('device-settings').addEventListener('click', (e) => {
-    e.preventDefault();
-    openSitePage(null, 'Device settings', { kind: 'device' }, e.currentTarget.href);
-  });
   ledgerEl.addEventListener('click', (e) => {
     const link = e.target.closest('a[href]');
     if (!link || !ledgerEl.contains(link)) return;
@@ -1945,7 +2325,9 @@
       for (const label of prunedLabels) paintTranscript(label);
     }
     heard = true;
-    document.documentElement.style.setProperty('--hue', facts.hue || '#5f5fff');
+    reconcileQuestions();
+    for (const label of views.keys()) paintTranscript(label);
+    document.documentElement.style.setProperty('--state-hue', facts.hue || '#5f5fff');
     for (const a of roster()) ensureViews(a.label);
     paintEmpty();
     if (shown) retarget(); else show(target());
@@ -1960,7 +2342,7 @@
   // a stream, while an upgrade's frames come through at once. The
   // frames themselves are unchanged — `event: NAME\ndata: JSON` —
   // so the server side of the feed did not have to move.
-  const handlers = { connection: (d) => { live = d.connected === true; paintHeader(); paintEmpty(); }, status: onStatus, panes: onPanes, pane: onPane, turns: applyTurns, turn: applyTurn };
+  const handlers = { connection: (d) => { live = d.connected === true; paintHeader(); paintEmpty(); for (const label of views.keys()) paintTranscript(label); }, status: onStatus, panes: onPanes, pane: onPane, turns: applyTurns, turn: applyTurn, questions: onQuestions };
   let socket = null, retry = 0, closedForGood = false;
 
   function deliver(text) {
