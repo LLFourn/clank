@@ -294,6 +294,8 @@ pub(crate) fn ingest_line(
         interrupt: line.interrupt.unwrap_or(src.interrupt),
         id: line.id.clone(),
         item: Box::new(clank_core::wait::WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: src.name.clone(),
             id: line.id,
             // Defaults to the source's name: with nothing filtering on
@@ -371,6 +373,14 @@ pub(crate) fn apply(
             if let Err(e) = seen.record(&id) {
                 eprintln!("wait: could not index event id `{id}`: {e}");
             }
+            item.set_presentation(log.presentation_key(
+                seq,
+                crate::cli::github::log::Transport::Command,
+                Some(&id),
+                None,
+                event_at,
+                &item,
+            ));
             stamp_selector(&mut item, source_key, seq);
             send(*item)
         }
@@ -486,6 +496,11 @@ pub(crate) fn owed_from_log(
             continue;
         }
         let mut item = row.item;
+        item.set_presentation(clank_core::wait::EventPresentation {
+            source: source_key.to_owned(),
+            seq: row.seq,
+            ident: row.ident,
+        });
         stamp_presentation(&mut item, source_key, row.seq, prompt);
         owed.push(item);
     }
@@ -556,6 +571,8 @@ fn failure_event(
     why: &str,
 ) -> clank_core::wait::WaitItem {
     clank_core::wait::WaitItem::CommandEvent {
+        presentation: None,
+        source_cwd: None,
         name: src.name.clone(),
         id: id.to_string(),
         event: FAILURE_KIND.to_string(),
@@ -581,10 +598,12 @@ pub(crate) fn ingest_line_with_route(
         && let clank_core::wait::WaitItem::CommandEvent {
             requires_reply,
             reply_route,
+            source_cwd,
             ..
         } = item.as_mut()
     {
         *reply_route = route.cloned();
+        *source_cwd = std::env::current_dir().ok();
         if *requires_reply && reply_route.is_none() {
             eprintln!(
                 "wait: source `{}` emitted an event requiring a reply without a reply_command; it stays owed",
@@ -1817,12 +1836,15 @@ mod producer_tests {
     /// One logged row, with only the fields this decision reads.
     fn row(seq: u64, ident: &str, acked: bool) -> crate::cli::github::log::EventRow {
         crate::cli::github::log::EventRow {
+            message_replies: Vec::new(),
+            message_history_pruned: false,
             interrupt: false,
             interrupt_attempt: None,
             seq,
             at: 0,
             event_at: None,
             transport: crate::cli::github::log::Transport::Command,
+            woken_at: None,
             acked,
             reply: None,
             reply_accepted: false,
@@ -1831,6 +1853,8 @@ mod producer_tests {
             feed_id: None,
             action_key: None,
             item: clank_core::wait::WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
                 name: "deploys".into(),
                 id: ident.into(),
                 event: "deploys".into(),
@@ -1903,6 +1927,9 @@ mod producer_tests {
     #[test]
     fn a_replayed_github_row_is_stamped_with_the_watchs_prompt() {
         let github = |seq: u64| crate::cli::github::log::EventRow {
+            woken_at: None,
+            message_replies: Vec::new(),
+            message_history_pruned: false,
             interrupt: false,
             interrupt_attempt: None,
             seq,
@@ -1917,6 +1944,7 @@ mod producer_tests {
             feed_id: None,
             action_key: None,
             item: clank_core::wait::WaitItem::GithubEvent {
+                presentation: None,
                 repo: "o/n".into(),
                 event: "pr_opened".into(),
                 detail: None,

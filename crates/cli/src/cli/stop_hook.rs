@@ -789,7 +789,14 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
         tool: binding_tool,
         session: input.session_id,
     };
-    emit_session_delivery(&payload, binding, prepared, &mut std::io::stdout()).await;
+    emit_session_delivery(
+        &payload,
+        binding,
+        prepared,
+        selected_presentations(&items),
+        &mut std::io::stdout(),
+    )
+    .await;
     Ok(())
 }
 
@@ -797,6 +804,7 @@ async fn emit_session_delivery(
     payload: &serde_json::Value,
     binding: ReceiptBinding,
     prepared: super::wake_receipt::Prepared,
+    selected: Vec<clank_core::wait::EventPresentation>,
     stdout: &mut impl std::io::Write,
 ) {
     if !binding.current() {
@@ -807,7 +815,10 @@ async fn emit_session_delivery(
         stdout.write_all(b"\n")?;
         stdout.flush()
     })();
-    if emitted.is_ok() && binding.tool == Tool::Claude {
+    if emitted.is_ok() && binding.tool == Tool::Claude && binding.current() {
+        super::presentation::record(&binding.repo, &binding.author, &selected, || {
+            binding.current()
+        });
         super::wake_receipt::dispatch(
             &binding.repo,
             &binding.author,
@@ -2275,6 +2286,7 @@ impl<'de, T: FromTag> serde::Deserialize<'de> for Tag<T> {
 pub(crate) struct WaitItem {
     #[serde(skip)]
     source_cwd: Option<std::sync::Arc<PathBuf>>,
+    presentation: Option<clank_core::wait::EventPresentation>,
     pub(crate) kind: Option<Tag<clank_core::wait::WaitKind>>,
     pub(crate) plan: Option<String>,
     pub(crate) sha: Option<String>,
@@ -2588,7 +2600,13 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 let ack = item
                     .selector
                     .as_deref()
-                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .map(|s| {
+                        if item.requires_reply.unwrap_or(false) {
+                            format!(" — reply required; ack `clank events ack {s} --reply <text>`")
+                        } else {
+                            format!(" — ack `clank events ack {s}`")
+                        }
+                    })
                     .unwrap_or_default();
                 out.push_str(&format!("  - message: {handle} {from}: {subject}{ack}\n"));
             }
@@ -2776,6 +2794,7 @@ fn short_sha(s: &str) -> &str {
 struct ReceiptCapture {
     binding: Option<ReceiptBinding>,
     prepared: super::wake_receipt::Prepared,
+    selected: Vec<clank_core::wait::EventPresentation>,
 }
 impl ReceiptCapture {
     fn selected(
@@ -2793,6 +2812,7 @@ impl ReceiptCapture {
                 session: session.into(),
             }),
             prepared: super::wake_receipt::prepare(repo, author, receipt_candidates(items)),
+            selected: selected_presentations(items),
         }
     }
 }
@@ -2806,6 +2826,24 @@ impl ReceiptBinding {
     fn current(&self) -> bool {
         crate::agent_store::binding_matches(&self.repo, &self.author, self.tool, &self.session)
     }
+}
+fn selected_presentations(items: &[WaitItem]) -> Vec<clank_core::wait::EventPresentation> {
+    items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.wake_kind(),
+                Some(
+                    clank_core::wait::WaitKind::Message
+                        | clank_core::wait::WaitKind::GithubEvent
+                        | clank_core::wait::WaitKind::CommandEvent
+                        | clank_core::wait::WaitKind::TimerEvent
+                        | clank_core::wait::WaitKind::DraftChanged
+                )
+            )
+        })
+        .filter_map(|item| item.presentation.clone())
+        .collect()
 }
 fn receipt_candidates(
     items: &[WaitItem],
@@ -2916,6 +2954,12 @@ async fn emit_delivery(
             if presented {
                 if let Some(binding) = capture.binding {
                     if binding.current() {
+                        super::presentation::record(
+                            &binding.repo,
+                            &binding.author,
+                            &capture.selected,
+                            || binding.current(),
+                        );
                         super::wake_receipt::dispatch(
                             &binding.repo,
                             &binding.author,
@@ -2947,6 +2991,7 @@ mod tests {
         marker: PathBuf,
         fail_after: Option<usize>,
         fail_flush: bool,
+        on_flush: Option<Box<dyn FnMut()>>,
     }
     impl ReceiptWriter {
         fn new(marker: PathBuf) -> Self {
@@ -2955,6 +3000,7 @@ mod tests {
                 marker,
                 fail_after: None,
                 fail_flush: false,
+                on_flush: None,
             }
         }
     }
@@ -2971,6 +3017,9 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             if self.fail_flush {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            if let Some(action) = &mut self.on_flush {
+                action();
             }
             std::fs::write(&self.marker, &self.bytes)
         }
@@ -3039,6 +3088,7 @@ mod tests {
                 fixture.output.exists(),
                 "callback must observe completed flush for {tool:?}"
             );
+            assert!(fixture.rows()[0].woken_at.is_some());
             assert!(!fixture.rows()[0].acked);
             assert!(fixture.rows()[0].reply.is_none());
             match tool {
@@ -3094,8 +3144,54 @@ mod tests {
         .unwrap();
         assert!(diagnostic.len() <= super::super::wake_receipt::DIAGNOSTIC_BYTES);
         assert!(String::from_utf8(diagnostic).unwrap().contains("exited"));
+        assert!(
+            fixture.rows()[0].woken_at.is_some(),
+            "callback failure cannot erase wake evidence"
+        );
         assert!(!fixture.rows()[0].acked);
         assert!(fixture.rows()[0].reply.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_binding_replaced_during_flush_cannot_earn_presentation_or_callback() {
+        let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+        let (outcome, capture) = receipt_outcome(&fixture, Tool::Codex);
+        let mut writer = ReceiptWriter::new(fixture.marker());
+        let (repo, author) = (fixture.repo.clone(), fixture.author.clone());
+        writer.on_flush = Some(Box::new(move || {
+            crate::agent_store::bind_session_to_agent(
+                &repo,
+                &author,
+                Tool::Codex,
+                &clank_core::SessionId::parse("replacement-at-flush").unwrap(),
+            )
+            .unwrap();
+        }));
+        emit_delivery(outcome, Tool::Codex, capture, &mut writer, &mut Vec::new()).await;
+        assert!(!writer.bytes.is_empty());
+        assert!(fixture.rows()[0].woken_at.is_none());
+        assert!(!fixture.rows()[0].acked && !fixture.output.exists());
+    }
+
+    #[tokio::test]
+    async fn presentation_is_independent_of_receipt_configuration_and_inspection() {
+        let mut fixture = super::super::wake_receipt::fixtures::Fixture::new();
+        fixture.update_source(|source| source.receipt_command = None);
+        let (outcome, capture) = receipt_outcome(&fixture, Tool::Codex);
+        assert!(
+            fixture.rows()[0].woken_at.is_none(),
+            "selection and parsing alone are not wake evidence"
+        );
+        emit_delivery(
+            outcome,
+            Tool::Codex,
+            capture,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(fixture.rows()[0].woken_at.is_some());
+        assert!(!fixture.rows()[0].acked && !fixture.output.exists());
     }
 
     #[tokio::test]
@@ -3127,6 +3223,7 @@ mod tests {
                 );
                 assert!(!fixture.output.exists());
                 assert!(!fixture.marker().exists());
+                assert!(fixture.rows()[0].woken_at.is_none());
                 assert!(!fixture.rows()[0].acked);
             }
         }
@@ -3154,6 +3251,7 @@ mod tests {
             )
             .await;
             assert!(!fixture.output.exists());
+            assert!(fixture.rows()[0].woken_at.is_none());
         }
         let fixture = super::super::wake_receipt::fixtures::Fixture::new();
         let (outcome, capture) = receipt_outcome(&fixture, Tool::Codex);
@@ -3169,6 +3267,7 @@ mod tests {
         emit_delivery(outcome, Tool::Codex, capture, &mut stdout, &mut stderr).await;
         assert!(stdout.is_empty() && stderr.is_empty());
         assert!(!fixture.output.exists());
+        assert!(fixture.rows()[0].woken_at.is_none());
     }
 
     #[tokio::test]
@@ -3179,8 +3278,16 @@ mod tests {
             let mut writer = ReceiptWriter::new(fixture.marker());
             writer.fail_flush = failure;
             let payload = session_start_payload("voice work");
-            emit_session_delivery(&payload, binding, fixture.prepared(), &mut writer).await;
+            emit_session_delivery(
+                &payload,
+                binding,
+                fixture.prepared(),
+                vec![fixture.item.presentation().unwrap().clone()],
+                &mut writer,
+            )
+            .await;
             assert_eq!(fixture.output.exists(), !failure);
+            assert_eq!(fixture.rows()[0].woken_at.is_some(), !failure);
             let value: serde_json::Value = serde_json::from_slice(&writer.bytes).unwrap();
             assert_eq!(value, payload);
             assert!(!fixture.rows()[0].acked);
@@ -5400,21 +5507,23 @@ mod tests {
     fn a_broken_source_does_not_read_as_something_it_observed() {
         let wire = |failure| {
             serde_json::json!({
-                "items": [serde_json::to_value(crate::cli::wait::render_json(
-                    &clank_core::wait::WaitItem::CommandEvent {
-                        name: "deploys".into(),
-                        id: "x".into(),
-                        event: "e".into(),
-                        content: "`sh -c ...` has stopped 3 times in a row".into(),
-                        at: None,
-                        failure,
-                        requires_reply: false,
-                        reply_route: None,
-                        selector: Some("command-deploys-0000abcd@2".into()),
-                    },
-                ))
-                .unwrap()]
-            })
+                           "items": [serde_json::to_value(crate::cli::wait::render_json(
+                               &clank_core::wait::WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
+                                   name: "deploys".into(),
+                                   id: "x".into(),
+                                   event: "e".into(),
+                                   content: "`sh -c ...` has stopped 3 times in a row".into(),
+                                   at: None,
+                                   failure,
+                                   requires_reply: false,
+                                   reply_route: None,
+                                   selector: Some("command-deploys-0000abcd@2".into()),
+                               },
+                           ))
+                           .unwrap()]
+                       })
         };
         let label = AgentLabel::parse("codex").unwrap();
         let render = |failure| {
@@ -5455,6 +5564,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_required_message_hint_carries_the_same_policy_as_its_wait_wire() {
+        let item: clank_core::wait::WaitItem = serde_json::from_value(serde_json::json!({
+            "kind":"message", "handle":"request", "subject":"Please answer", "body":"Full request",
+            "requires_reply":true, "reply_route":{"repo":"/origin","agent":"coordinator"}, "selector":"messages@7"
+        })).unwrap();
+        let wire = serde_json::json!({"items":[crate::cli::wait::render_json(&item)]});
+        let parsed = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        let rendered =
+            render_wait_items(&parsed, &AgentLabel::parse("codex").unwrap(), Role::Master);
+        assert!(
+            rendered.contains("reply required; ack `clank events ack messages@7 --reply <text>`"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("— ack `clank events ack messages@7`"));
+    }
+
+    #[test]
     fn recurring_timer_hint_preserves_snapshot_and_plain_ack_recipe() {
         use crate::cli::{
             github::log::{EventLog, RecurringTransition},
@@ -5491,6 +5617,7 @@ mod tests {
     #[test]
     fn timer_hint_uses_the_actual_wait_wire_and_retains_ack_recipe() {
         let item = clank_core::wait::WaitItem::TimerEvent {
+            presentation: None,
             name: "deploy".into(),
             recurrence: None,
             id: "timer/1".into(),
@@ -5519,39 +5646,41 @@ mod tests {
         // useless `? @ ?` fallback. Built from wait's ACTUAL --json
         // field names (the same wire the hook consumes).
         let raw = serde_json::json!({
-            "items": [
-                {
-                    "kind": "github_event",
-                    "repo": "o/r",
-                    "event": "pr_comment",
-                    "detail": "review",
-                    "number": 12,
-                    "title": "Add the widget",
-                    "actor": "hubot",
-                    "url": "https://github.com/o/r/pull/12"
-                },
-                // The REAL wire, serialized from a real item: the
-                // last fixture here was hand-written and still
-                // carried `exit_code`/`output_tail` long after the
-                // wake stopped having them
-                // (a-command-is-an-event-source-like-any-other).
-                serde_json::to_value(crate::cli::wait::render_json(
-                    &clank_core::wait::WaitItem::CommandEvent {
-                        name: "signal".into(),
-                        id: "sha-abc".into(),
-                        event: "deployed".into(),
-                        content: "prod is live".into(),
-                        at: None,
-                        failure: false,
-                        requires_reply: false,
-                        reply_route: None,
-                        selector: Some("command-signal-0000abcd@7".into()),
-                    },
-                ))
-                .unwrap(),
-                { "kind": "some_future_kind", "plan": "p", "sha": "abcdef123456789" }
-            ]
-        });
+                   "items": [
+                       {
+                           "kind": "github_event",
+                           "repo": "o/r",
+                           "event": "pr_comment",
+                           "detail": "review",
+                           "number": 12,
+                           "title": "Add the widget",
+                           "actor": "hubot",
+                           "url": "https://github.com/o/r/pull/12"
+                       },
+                       // The REAL wire, serialized from a real item: the
+                       // last fixture here was hand-written and still
+                       // carried `exit_code`/`output_tail` long after the
+                       // wake stopped having them
+                       // (a-command-is-an-event-source-like-any-other).
+                       serde_json::to_value(crate::cli::wait::render_json(
+                           &clank_core::wait::WaitItem::CommandEvent {
+        presentation: None,
+        source_cwd: None,
+                               name: "signal".into(),
+                               id: "sha-abc".into(),
+                               event: "deployed".into(),
+                               content: "prod is live".into(),
+                               at: None,
+                               failure: false,
+                               requires_reply: false,
+                               reply_route: None,
+                               selector: Some("command-signal-0000abcd@7".into()),
+                           },
+                       ))
+                       .unwrap(),
+                       { "kind": "some_future_kind", "plan": "p", "sha": "abcdef123456789" }
+                   ]
+               });
         let items = parse_wait_json(raw.to_string().as_bytes()).unwrap();
         let label = AgentLabel::parse("codex").unwrap();
         let out = render_wait_items(&items, &label, Role::Reviewer);
@@ -5662,6 +5791,9 @@ mod tests {
         let item = |from: Option<&str>, repo: Option<&str>| {
             serde_json::to_value(crate::cli::wait::render_json(
                 &clank_core::wait::WaitItem::Message {
+                    presentation: None,
+                    requires_reply: false,
+                    reply_route: None,
                     handle: "500-00000001-rebase-please".to_string(),
                     from: from.map(String::from),
                     repo: repo.map(String::from),

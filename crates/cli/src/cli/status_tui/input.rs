@@ -1506,11 +1506,12 @@ impl WaitPage {
 /// [`Mode::EventDetail`].
 #[derive(Debug, Clone)]
 pub(super) struct EventPage {
-    /// The targeted copy — the FULL key.
-    pub(super) target: crate::cli::github::timeline::MemberKey,
-    /// The component's sorted member keys as of the last successful
+    /// A full inbox copy key or an outgoing operation identity. Only inbox
+    /// members are acknowledgement targets; outgoing identities only navigate.
+    pub(super) target: crate::cli::github::timeline::EventKey,
+    /// The component's inbox and outgoing keys as of the last successful
     /// refresh; retargeting follows the first surviving key.
-    pub(super) retained: Vec<crate::cli::github::timeline::MemberKey>,
+    pub(super) retained: Vec<crate::cli::github::timeline::EventKey>,
     /// The component's current merged view.
     pub(super) event: crate::cli::github::timeline::MergedEvent,
     /// Standing watch prompts, deduplicated: `None` attribution when

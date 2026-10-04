@@ -338,6 +338,10 @@ async fn local_fallback_hook_receives_interrupting_producer_without_zellij_and_k
     let row: Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(row["interrupt"], true);
     assert!(
+        row["woken_at"].is_u64(),
+        "real Codex output records delivery evidence"
+    );
+    assert!(
         row.get("interrupt_attempt").is_none_or(Value::is_null),
         "an already-armed local hook needs no detached interrupt helper"
     );
@@ -422,6 +426,11 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
         ])
         .await;
     assert!(show.status.success());
+    let inspected: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert!(
+        inspected.get("woken_at").is_none(),
+        "plain wait, peek and inspection are not presentation"
+    );
     assert!(
         !fixture.output.exists(),
         "peek/list/show cannot emit receipts"
@@ -454,6 +463,22 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
             .contains("do the task")
     );
     assert!(output.stderr.is_empty());
+    let shown = fixture
+        .run(&[
+            "events",
+            "show",
+            &selector,
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(shown.status.success());
+    let delivered: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(
+        delivered["woken_at"].is_u64(),
+        "Claude SessionStart context records wake evidence"
+    );
     fixture.assert_receipt(&ready);
     fixture.assert_owed().await;
 }
@@ -693,7 +718,24 @@ async fn shared_monitor_delivery_preserves_monitor_cwd_and_does_not_own_receipts
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(payload["reason"].as_str().unwrap().contains("do the task"));
     fixture.assert_receipt(&ready);
-    fixture.assert_owed().await;
+    let selector = fixture.assert_owed().await;
+    let shown = fixture
+        .run(&[
+            "events",
+            "show",
+            &selector,
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(shown.status.success());
+    let delivered: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(
+        delivered["woken_at"].is_u64(),
+        "monitor custody alone is insufficient; successful hook output stamps its exact copy"
+    );
+
     // A newer protocol greeting exercises normal owned-source retirement.
     let descriptor: Value = serde_json::from_slice(
         &std::fs::read(runtime_dir().join(format!("{}.json", repo_tag(&fixture.repo)))).unwrap(),
@@ -877,4 +919,83 @@ async fn shared_monitor_claims_due_interrupt_without_waiter_and_does_not_probe_o
     );
     monitor.start_kill().unwrap();
     monitor.wait().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_read_earns_receipt_without_ack_and_inspection_hides_content() {
+    let mut fixture = Fixture::new(Tool::Codex, true);
+    // Receipt-only backends also need the authoritative source-host cwd.
+    fixture.source.reply_command = None;
+    fixture.enable_receipts();
+    let _lease = fixture.monitor_lease();
+    let wait = fixture
+        .command()
+        .args([
+            "wait",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--author",
+            fixture.author.as_str(),
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ready = fixture.producer_ready().await;
+    fixture.emit_event();
+    let output = tokio::time::timeout(LIMIT, wait.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.output.exists());
+    let selector = fixture.assert_owed().await;
+    for verb in ["list", "show"] {
+        let mut args = vec!["events", verb];
+        if verb == "show" {
+            args.push(&selector);
+        }
+        args.extend(["--repo", fixture.repo.to_str().unwrap(), "--json"]);
+        let inspected = fixture.run(&args).await;
+        assert!(inspected.status.success());
+        assert!(!String::from_utf8_lossy(&inspected.stdout).contains("do the task"));
+        assert!(!fixture.output.exists());
+    }
+    let read = fixture
+        .run(&[
+            "events",
+            "read",
+            &selector,
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let full: Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(full["item"]["content"], "do the task");
+    fixture.assert_receipt(&ready);
+    fixture.assert_owed().await;
+    let metadata = fixture
+        .run(&[
+            "events",
+            "show",
+            &selector,
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--json",
+        ])
+        .await;
+    let state: Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    assert!(state["woken_at"].is_u64());
+    assert_eq!(state["acked"], false);
 }

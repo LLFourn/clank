@@ -156,6 +156,7 @@ pub(crate) fn classify_event(
         let head = payload.get("head").and_then(|h| h.as_str());
         return Some(Classified {
             item: WaitItem::GithubEvent {
+                presentation: None,
                 repo: repo.to_string(),
                 event: kind_str(GithubEventKind::BranchPush).to_string(),
                 detail: None,
@@ -229,6 +230,7 @@ pub(crate) fn classify_event(
     let key = action_key(kind, detail, payload, obj);
     Some(Classified {
         item: WaitItem::GithubEvent {
+            presentation: None,
             repo: repo.to_string(),
             event: kind_str(kind).to_string(),
             detail: detail.map(str::to_string),
@@ -566,6 +568,7 @@ pub(crate) fn classify_webhook(
         let after = payload.get("after").and_then(|h| h.as_str());
         return Some(Classified {
             item: WaitItem::GithubEvent {
+                presentation: None,
                 repo: repo.to_string(),
                 event: kind_str(GithubEventKind::BranchPush).to_string(),
                 detail: None,
@@ -631,6 +634,7 @@ pub(crate) fn classify_webhook(
     let key = action_key(kind, detail, payload, obj);
     Some(Classified {
         item: WaitItem::GithubEvent {
+            presentation: None,
             repo: repo.to_string(),
             event: kind_str(kind).to_string(),
             detail: detail.map(str::to_string),
@@ -3034,6 +3038,7 @@ pub(super) mod tests {
 
     pub(in crate::cli::github) fn gh_item(event: &str, number: Option<u64>) -> WaitItem {
         WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: event.into(),
             detail: None,
@@ -3185,6 +3190,7 @@ pub(super) mod tests {
     pub(in crate::cli::github) fn classified(n: u64, key: Option<&str>) -> Classified {
         Classified {
             item: WaitItem::GithubEvent {
+                presentation: None,
                 repo: "o/r".into(),
                 event: "issue_opened".into(),
                 detail: None,

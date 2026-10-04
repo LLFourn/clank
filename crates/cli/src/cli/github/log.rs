@@ -43,8 +43,11 @@ use std::path::{Path, PathBuf};
 use clank_core::wait::WaitItem;
 
 mod interruption;
+mod message;
+mod presentation;
 mod timer;
 pub(crate) use interruption::{InterruptAttempt, InterruptOutcome};
+pub(crate) use message::{MessageOperation, MessageOperationState, MessageReceipt};
 
 #[derive(Debug)]
 pub(crate) enum RecurringTransition {
@@ -125,10 +128,11 @@ impl Transport {
     }
 }
 
-/// The version this binary writes and fully understands. Bumps ONLY
-/// for semantic changes to an existing `t` — additive optional fields
-/// never bump it (event-log-format-compat).
+/// Default envelope version. Record-specific semantic changes are admitted
+/// explicitly by `Record::understood`; additive fields do not bump this.
 const CURRENT_V: u64 = 1;
+/// Older Message readers must not discard the reply obligation and plain-ack.
+const REPLY_REQUIRED_MESSAGE_V: u64 = 2;
 
 /// One immutable answer attempt. Routing is captured here too, so retries made
 /// through another stored copy still answer using the original transaction.
@@ -158,6 +162,27 @@ enum Line {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Record {
+    /// Some accepted reply bodies aged out while their parent remains retained.
+    MessageHistoryPruned { v: u64, seq: u64, ident: String },
+    /// First successful model delivery of an exact retained inbox copy.
+    Presentation {
+        v: u64,
+        seq: u64,
+        ident: String,
+        at: u64,
+    },
+    MessageOperation {
+        v: u64,
+        seq: u64,
+        operation: MessageOperation,
+        receipt: Option<MessageReceipt>,
+    },
+    MessageReceipt {
+        v: u64,
+        seq: u64,
+        receipt: MessageReceipt,
+        released: bool,
+    },
     /// Claim precedes the side effect; outcome never acknowledges the event.
     Interrupt {
         v: u64,
@@ -241,14 +266,46 @@ enum Record {
 }
 
 impl Record {
+    fn understood(&self) -> bool {
+        if self.version() <= CURRENT_V {
+            // Required-message semantics are never encoded as additive v1
+            // fields: an older reader would silently discard the obligation.
+            return !matches!(
+                self,
+                Record::Inbox {
+                    item: WaitItem::Message {
+                        requires_reply: true,
+                        ..
+                    },
+                    ..
+                }
+            );
+        }
+        matches!(
+            self,
+            Record::Inbox {
+                v: REPLY_REQUIRED_MESSAGE_V,
+                transport: Transport::Message,
+                item: WaitItem::Message {
+                    requires_reply: true,
+                    reply_route: Some(_),
+                    ..
+                },
+                ..
+            }
+        )
+    }
     fn version(&self) -> u64 {
         match self {
+            Record::MessageOperation { v, .. }
+            | Record::MessageReceipt { v, .. }
+            | Record::MessageHistoryPruned { v, .. } => *v,
             Record::Inbox { v, .. }
             | Record::Obs { v, .. }
             | Record::Ack { v, .. }
             | Record::TimerProgress { v, .. }
             | Record::ReplyIntent { v, .. } => *v,
-            Record::Interrupt { v, .. } => *v,
+            Record::Interrupt { v, .. } | Record::Presentation { v, .. } => *v,
         }
     }
 }
@@ -291,7 +348,9 @@ fn ack_covers(ack_seq: u64, ack_ident: Option<&str>, row_seq: u64, row_ident: &s
 /// An optional answer becomes owed once submitted, even if its original event
 /// allowed plain ack. Presentation must give the same policy as the writer.
 fn mark_pending_reply(item: &mut WaitItem) {
-    if let WaitItem::CommandEvent { requires_reply, .. } = item {
+    if let WaitItem::CommandEvent { requires_reply, .. }
+    | WaitItem::Message { requires_reply, .. } = item
+    {
         *requires_reply = true;
     }
 }
@@ -327,9 +386,11 @@ pub(crate) struct InboxEntry {
 }
 
 /// [`EventLog::read_rows`]'s result: the inbox rows plus how many
-/// foreign records the read skipped.
+/// foreign records the read skipped, plus accepted outgoing custody independent
+/// of whether the original inbox body remains in the display horizon.
 #[derive(Debug)]
 pub(crate) struct ReadRows {
+    pub(crate) outgoing_replies: Vec<MessageOperationState>,
     pub(crate) rows: Vec<EventRow>,
     pub(crate) foreign: usize,
 }
@@ -340,6 +401,10 @@ pub(crate) struct ReadRows {
 /// diagnosing poll/relay dedup or offline catch-up (codex c009500).
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct EventRow {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) message_replies: Vec<MessageOperationState>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) message_history_pruned: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) interrupt: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,6 +417,8 @@ pub(crate) struct EventRow {
     pub(crate) event_at: Option<u64>,
     pub(crate) transport: Transport,
     pub(crate) acked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) woken_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reply: Option<EventReply>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -542,8 +609,34 @@ impl SharedWal {
         }
     }
 
+    /// Append and attach the exact accepted copy; a failed append carries no key.
+    pub(crate) fn selected_inbox(
+        &self,
+        transport: Transport,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &mut WaitItem,
+        interrupt: bool,
+    ) -> crate::cli::event_source::Durability {
+        let mut selected = None;
+        let durability = self.with(|log| {
+            let seq = log.append_interruptible_inbox(
+                transport, feed_id, action_key, event_at, item, interrupt,
+            )?;
+            selected =
+                Some(log.presentation_key(seq, transport, feed_id, action_key, event_at, item));
+            Ok(())
+        });
+        if let Some(key) = selected {
+            item.set_presentation(key);
+        }
+        durability
+    }
+
     /// The atomic durable decision for a presentable event — call
     /// BEFORE emitting.
+    #[cfg(test)]
     pub(crate) fn inbox(
         &self,
         transport: Transport,
@@ -555,6 +648,7 @@ impl SharedWal {
         self.interruptible_inbox(transport, feed_id, action_key, event_at, item, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn interruptible_inbox(
         &self,
         transport: Transport,
@@ -650,7 +744,7 @@ enum DurableSync {
     Directory,
 }
 
-fn now_epoch() -> u64 {
+pub(crate) fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -703,7 +797,7 @@ impl EventLog {
             // evolution must never destroy a log.
             let known = serde_json::from_value::<Record>(value.clone())
                 .ok()
-                .filter(|r| r.version() <= CURRENT_V);
+                .filter(Record::understood);
             match known {
                 Some(r) => out.push(Line::Known(Box::new(r))),
                 None => out.push(Line::Foreign {
@@ -721,7 +815,7 @@ impl EventLog {
     fn fold(lines_in: Vec<Line>) -> FoldOut {
         // All ack selectors up front — coverage is answered ONLY by
         // the shared matcher (wal-single-ingest-writer).
-        let mut acks: Vec<(u64, Option<String>)> = Vec::new();
+        let mut acks = message::operation_acks(&lines_in);
         for l in &lines_in {
             if let Line::Known(r) = l
                 && let Record::Ack { seq, ident, .. } = r.as_ref()
@@ -820,7 +914,9 @@ impl EventLog {
                     }
                 }
                 Record::Ack { .. } => {}
-                Record::Interrupt { seq, .. } => {
+                Record::Interrupt { seq, .. }
+                | Record::Presentation { seq, .. }
+                | Record::MessageHistoryPruned { seq, .. } => {
                     max_seq = max_seq.max(seq);
                 }
                 Record::TimerProgress { seq, .. } => {
@@ -829,6 +925,20 @@ impl EventLog {
                 Record::ReplyIntent { seq, ident, .. } => {
                     max_seq = max_seq.max(seq);
                     pending_replies.push((seq, ident));
+                }
+                Record::MessageOperation {
+                    seq,
+                    operation,
+                    receipt,
+                    ..
+                } => {
+                    max_seq = max_seq.max(seq);
+                    if operation.acknowledge && receipt.is_none() {
+                        pending_replies.push((operation.original_seq, operation.original_ident));
+                    }
+                }
+                Record::MessageReceipt { seq, .. } => {
+                    max_seq = max_seq.max(seq);
                 }
             }
         }
@@ -926,7 +1036,9 @@ impl EventLog {
                     } => {
                         ids.insert(id);
                     }
-                    Record::Ack { reply: None, .. } | Record::Interrupt { .. } => {}
+                    Record::Ack { reply: None, .. }
+                    | Record::Interrupt { .. }
+                    | Record::Presentation { .. } => {}
                     _ => {
                         return Err(std::io::Error::other(
                             "unexpected timer WAL semantics; repair required",
@@ -949,6 +1061,7 @@ impl EventLog {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(Some(ReadRows {
+                        outgoing_replies: Vec::new(),
                         rows: Vec::new(),
                         foreign: 0,
                     }));
@@ -962,7 +1075,24 @@ impl EventLog {
         if self.is_recurring_key() && !lines_in.is_empty() {
             self.validate_recurring_inspection(&lines_in)?;
         }
-        let acks: Vec<(u64, Option<String>)> = lines_in
+        let mut message_replies: std::collections::BTreeMap<
+            (u64, String),
+            Vec<MessageOperationState>,
+        > = std::collections::BTreeMap::new();
+        let mut outgoing_replies = Vec::new();
+        for state in message::operations(&lines_in)? {
+            if state.receipt.is_some() {
+                outgoing_replies.push(state.clone());
+            }
+            message_replies
+                .entry((
+                    state.operation.original_seq,
+                    state.operation.original_ident.clone(),
+                ))
+                .or_default()
+                .push(state);
+        }
+        let mut acks: Vec<(u64, Option<String>)> = lines_in
             .iter()
             .filter_map(|l| match l {
                 Line::Known(r) => match r.as_ref() {
@@ -972,15 +1102,35 @@ impl EventLog {
                 _ => None,
             })
             .collect();
+        acks.extend(
+            message_replies
+                .values()
+                .flatten()
+                .filter(|s| s.operation.acknowledge && s.receipt.is_some())
+                .map(|s| {
+                    (
+                        s.operation.original_seq,
+                        Some(s.operation.original_ident.clone()),
+                    )
+                }),
+        );
         let foreign = lines_in
             .iter()
             .filter(|l| matches!(l, Line::Foreign { .. }))
             .count();
         let mut replies = std::collections::HashMap::new();
         let mut interrupts = std::collections::HashMap::new();
+        let mut presentations = std::collections::HashMap::new();
+        let mut pruned = std::collections::BTreeSet::new();
         for line in &lines_in {
             if let Line::Known(record) = line {
                 match record.as_ref() {
+                    Record::MessageHistoryPruned { seq, ident, .. } => {
+                        pruned.insert((*seq, ident.clone()));
+                    }
+                    Record::Presentation { seq, ident, at, .. } => {
+                        presentations.entry((*seq, ident.clone())).or_insert(*at);
+                    }
                     Record::Interrupt {
                         seq,
                         ident,
@@ -1048,12 +1198,15 @@ impl EventLog {
                     std::collections::hash_map::Entry::Vacant(v) => {
                         v.insert(rows.len());
                         rows.push(EventRow {
+                            message_replies: Vec::new(),
+                            message_history_pruned: false,
                             interrupt,
                             interrupt_attempt: None,
                             seq,
                             at,
                             event_at,
                             transport,
+                            woken_at: None,
                             acked: false, // resolved below
                             reply: None,
                             reply_accepted: false,
@@ -1088,6 +1241,19 @@ impl EventLog {
                 .iter()
                 .any(|(a, i)| ack_covers(*a, i.as_deref(), row.seq, &row.ident));
             row.acked = row.baseline || covered;
+            row.woken_at = presentations.remove(&(row.seq, row.ident.clone()));
+            row.message_history_pruned = pruned.contains(&(row.seq, row.ident.clone()));
+            row.message_replies = message_replies
+                .remove(&(row.seq, row.ident.clone()))
+                .unwrap_or_default();
+            if !row.acked
+                && row
+                    .message_replies
+                    .iter()
+                    .any(|s| s.receipt.is_none() && s.operation.acknowledge)
+            {
+                mark_pending_reply(&mut row.item);
+            }
             row.interrupt_attempt = interrupts.remove(&(row.seq, row.ident.clone()));
             if let Some((reply, accepted)) = replies.remove(&(row.seq, row.ident.clone())) {
                 row.reply = Some(reply);
@@ -1098,7 +1264,11 @@ impl EventLog {
             }
         }
         rows.sort_by_key(|r| r.seq);
-        Ok(Some(ReadRows { rows, foreign }))
+        Ok(Some(ReadRows {
+            rows,
+            foreign,
+            outgoing_replies,
+        }))
     }
 
     /// Read both artifacts. Never fails: every failure mode maps to
@@ -1191,6 +1361,30 @@ impl EventLog {
 
     /// The single atomic durable decision for a presentable event —
     /// call BEFORE emitting the item.
+    pub(crate) fn source_key(&self) -> &str {
+        self.log_path.file_stem().unwrap().to_str().unwrap()
+    }
+    pub(crate) fn presentation_key(
+        &self,
+        seq: u64,
+        transport: Transport,
+        feed_id: Option<&str>,
+        action_key: Option<&str>,
+        event_at: Option<u64>,
+        item: &WaitItem,
+    ) -> clank_core::wait::EventPresentation {
+        clank_core::wait::EventPresentation {
+            source: self
+                .log_path
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            seq,
+            ident: logical_ident(feed_id, action_key, event_at, transport, item),
+        }
+    }
+
     pub(crate) fn append_inbox(
         &mut self,
         transport: Transport,
@@ -1246,13 +1440,40 @@ impl EventLog {
         baseline: bool,
         interrupt: bool,
     ) -> std::io::Result<u64> {
+        if item.presentation().is_some() {
+            return Err(std::io::Error::other(
+                "presentation metadata is not an inbox payload",
+            ));
+        }
+        if let WaitItem::Message {
+            requires_reply: true,
+            reply_route,
+            ..
+        } = item
+        {
+            if reply_route.is_none() || transport != Transport::Message || baseline {
+                return Err(std::io::Error::other(
+                    "reply-required message needs a concrete route and a live message inbox",
+                ));
+            }
+        }
         let Some(seq) = self.next_seq else {
             return Err(std::io::Error::other(
                 "event-log seq namespace exhausted (a record reserves u64::MAX)",
             ));
         };
         self.append(&Record::Inbox {
-            v: CURRENT_V,
+            v: if matches!(
+                item,
+                WaitItem::Message {
+                    requires_reply: true,
+                    ..
+                }
+            ) {
+                REPLY_REQUIRED_MESSAGE_V
+            } else {
+                CURRENT_V
+            },
             seq,
             at: now_epoch(),
             event_at,
@@ -1447,13 +1668,20 @@ impl EventLog {
     /// Explicit reply transactions are synced before their external effect.
     /// Repair a crash-torn final line before appending a retry or acceptance.
     fn append_durable_unlocked(&mut self, record: &Record) -> std::io::Result<()> {
-        let mut file = self.repaired_log_file()?;
-        let mut encoded = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-        encoded.push(b'\n');
-        file.write_all(&encoded)?;
+        self.append_durable_batch_unlocked(std::slice::from_ref(record))
+    }
+
+    fn append_durable_batch_unlocked(&mut self, records: &[Record]) -> std::io::Result<()> {
+        let file = self.repaired_log_file()?;
+        let mut writer = std::io::BufWriter::new(&file);
+        for record in records {
+            serde_json::to_writer(&mut writer, record).map_err(std::io::Error::other)?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
         self.sync_durable_file(&file)?;
         self.sync_durable_directory()?;
-        self.lines += 1;
+        self.lines += records.len();
         Ok(())
     }
 
@@ -1529,11 +1757,12 @@ impl EventLog {
             // Corruption is load's problem; don't compound it here.
             return Ok(0);
         };
+        let message_lines = lines_in.clone();
         // Coverage is answered ONLY by the shared matcher over the
         // canonical identity — never seq-keyed (codex 77b5d97: a
         // discriminated ack against two colliding rows must handle
         // exactly its row, through rewrite and reload).
-        let acks: Vec<(u64, Option<String>, Record)> = lines_in
+        let mut acks: Vec<(u64, Option<String>, Record)> = lines_in
             .iter()
             .filter_map(|l| match l {
                 Line::Known(r) => match r.as_ref() {
@@ -1543,6 +1772,19 @@ impl EventLog {
                 _ => None,
             })
             .collect();
+        for (seq, ident) in message::operation_acks(&message_lines) {
+            acks.push((
+                seq,
+                ident.clone(),
+                Record::Ack {
+                    v: CURRENT_V,
+                    seq,
+                    at: now_epoch(),
+                    ident,
+                    reply: None,
+                },
+            ));
+        }
         // Pass 1: GROUP physical rows by the (seq, ident) event key —
         // the same grouped state fold builds (codex 20cdd09). Every
         // physical row of a kept group is rewritten VERBATIM (the
@@ -1562,6 +1804,7 @@ impl EventLog {
         let mut foreign: Vec<(String, Option<u64>)> = Vec::new();
         let mut intents = Vec::new();
         let mut interrupt_records = Vec::new();
+        let mut presentation_records = std::collections::BTreeMap::new();
         for l in lines_in {
             let r = match l {
                 Line::Known(r) => *r,
@@ -1619,6 +1862,14 @@ impl EventLog {
                 }
                 Record::ReplyIntent { .. } => intents.push(r),
                 Record::Interrupt { .. } => interrupt_records.push(r),
+                Record::Presentation { seq, ref ident, .. } => {
+                    presentation_records
+                        .entry((seq, ident.clone()))
+                        .or_insert(r);
+                }
+                Record::MessageOperation { .. }
+                | Record::MessageReceipt { .. }
+                | Record::MessageHistoryPruned { .. } => {}
             }
         }
         let covered = |g: &CGroup| {
@@ -1633,8 +1884,16 @@ impl EventLog {
         // the union of their copies' identity observations.
         let fold_older = handled.len().saturating_sub(DISPLAY_CAP);
         let mut retained: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let pending_message_targets: std::collections::BTreeSet<_> =
+            message::operations(&message_lines)?
+                .into_iter()
+                .filter(|s| s.receipt.is_none())
+                .map(|s| (s.operation.original_seq, s.operation.original_ident))
+                .collect();
         for (rank, &gi) in handled.iter().enumerate() {
-            if rank < fold_older {
+            if rank < fold_older
+                && !pending_message_targets.contains(&(cgroups[gi].seq, cgroups[gi].ident.clone()))
+            {
                 for r in &cgroups[gi].rows {
                     if let Record::Inbox {
                         at,
@@ -1756,6 +2015,24 @@ impl EventLog {
             out.push('\n');
             kept_lines += 1;
         }
+        let targets: std::collections::BTreeSet<_> = cgroups
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !handled_set.contains(i) || retained.contains(i))
+            .map(|(_, g)| (g.seq, g.ident.clone()))
+            .collect();
+        for (key, record) in presentation_records {
+            if targets.contains(&key) {
+                out.push_str(&serde_json::to_string(&record).map_err(std::io::Error::other)?);
+                out.push('\n');
+                kept_lines += 1;
+            }
+        }
+        for record in message::compact_records(&message_lines, &targets)? {
+            out.push_str(&serde_json::to_string(&record).map_err(std::io::Error::other)?);
+            out.push('\n');
+            kept_lines += 1;
+        }
         for intent in intents {
             if let Record::ReplyIntent { seq, ref ident, .. } = intent
                 && cgroups
@@ -1806,10 +2083,86 @@ impl EventLog {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn reply_required_messages_use_a_specific_v2_record_and_survive_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::open(dir.path(), "messages").unwrap();
+        let old: WaitItem = serde_json::from_value(
+            serde_json::json!({"kind":"message", "handle":"old", "subject":"hello", "body":"hello"}),
+        )
+        .unwrap();
+        assert!(!old.event_view().unwrap().requires_reply);
+        log.append_inbox(Transport::Message, None, Some("old"), None, &old)
+            .unwrap();
+        let mut required = old.clone();
+        if let WaitItem::Message {
+            handle,
+            requires_reply,
+            reply_route,
+            ..
+        } = &mut required
+        {
+            *handle = "new".into();
+            *requires_reply = true;
+            *reply_route = Some(clank_core::wait::MessageReplyRoute {
+                repo: dir.path().into(),
+                agent: clank_core::ids::AgentLabel::parse("alpha").unwrap(),
+            });
+        }
+        log.append_inbox(Transport::Message, None, Some("new"), None, &required)
+            .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("messages.jsonl")).unwrap();
+        let raw: Vec<serde_json::Value> = text
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(raw[0]["v"], 1);
+        assert!(raw[0]["item"].get("requires_reply").is_none());
+        assert_eq!(raw[1]["v"], 2);
+        // This is the prior reader's version gate: even after ignoring new
+        // payload fields, it cannot expose the v2 obligation as plain work.
+        let record: Record = serde_json::from_value(raw[1].clone()).unwrap();
+        assert!(record.version() > CURRENT_V);
+        assert!(record.understood());
+        let mut future = raw[1].clone();
+        future["v"] = serde_json::json!(3);
+        let mut unrelated = raw[0].clone();
+        unrelated["v"] = serde_json::json!(2);
+        for foreign in [future, unrelated] {
+            assert!(matches!(
+                &EventLog::parse(&format!("{foreign}\n")).unwrap()[0],
+                Line::Foreign { .. }
+            ));
+        }
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let mut restarted = EventLog::open(dir.path(), "messages").unwrap();
+        let rows = restarted.read_rows().unwrap().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].item, required);
+        restarted
+            .append_checked_ack(rows[0].seq, &rows[0].ident)
+            .unwrap();
+        assert!(
+            restarted
+                .append_checked_ack(rows[1].seq, &rows[1].ident)
+                .is_err()
+        );
+        if let WaitItem::Message { reply_route, .. } = &mut required {
+            *reply_route = None;
+        }
+        assert!(
+            restarted
+                .append_inbox(Transport::Message, None, None, None, &required)
+                .is_err()
+        );
+    }
+
     use super::*;
 
     fn item(n: u64) -> WaitItem {
         WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "pr_comment".into(),
             detail: Some("review_comment".into()),

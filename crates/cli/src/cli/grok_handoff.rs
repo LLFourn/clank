@@ -966,7 +966,7 @@ async fn wait(key: String, generation: String, mut args: WaitArgs) -> Result<()>
     match result {
         Ok(Some(items)) => {
             worker.authorize_delivery(&Process)?;
-            super::wait::emit(&items, json);
+            emit_selected(&worker, &Process, &items, json, &mut std::io::stdout())?;
             Ok(())
         }
         Ok(None) => bail!("automatic Grok handoff produced no work"),
@@ -987,6 +987,25 @@ async fn wait(key: String, generation: String, mut args: WaitArgs) -> Result<()>
             Err(error)
         }
     }
+}
+
+fn emit_selected(
+    worker: &Worker,
+    env: &dyn Ambient,
+    items: &[clank_core::wait::WaitItem],
+    json: bool,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    worker.authorize_delivery(env)?;
+    super::wait::emit_checked(items, json, None, writer)?;
+    let selected: Vec<_> = items
+        .iter()
+        .filter_map(|item| item.presentation().cloned())
+        .collect();
+    super::presentation::record(&worker.owner.repo, &worker.owner.label, &selected, || {
+        worker.authorize_delivery(env).is_ok()
+    });
+    Ok(())
 }
 
 /// One read-only diagnosis of the owned slot. It neither creates runtime

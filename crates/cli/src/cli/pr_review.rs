@@ -614,6 +614,11 @@ fn present_draft_rows(
             continue;
         }
         let mut item = row.item;
+        item.set_presentation(clank_core::wait::EventPresentation {
+            source: key.into(),
+            seq: row.seq,
+            ident: row.ident,
+        });
         if let clank_core::wait::WaitItem::DraftChanged { selector, .. } = &mut item {
             *selector = Some(crate::cli::events::Selector::qualified(key, row.seq).to_string());
         }
@@ -682,6 +687,7 @@ async fn ingest_draft<R: crate::cli::github::draft::DraftReader, F: Fn() -> bool
                     continue;
                 }
                 let item = clank_core::wait::WaitItem::DraftChanged {
+                    presentation: None,
                     pr,
                     instance,
                     comment: change.comment,

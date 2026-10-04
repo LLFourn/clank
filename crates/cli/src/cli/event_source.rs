@@ -62,6 +62,8 @@ mod tests {
     fn emission(id: &str, durability: Durability) -> Emission {
         (
             WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
                 name: "source".into(),
                 id: id.into(),
                 event: "source".into(),

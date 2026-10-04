@@ -3891,6 +3891,8 @@ mod tests {
         let repo = repo_with_roster();
         let claude = AgentLabel::parse("claude").unwrap();
         let held = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "a".into(),
             event: "deploys".into(),
@@ -4260,6 +4262,8 @@ mod tests {
         let producer = tokio::spawn(async move {
             sink.send((
                 WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
                     name: "deploys".into(),
                     id: "a".into(),
                     event: "deploys".into(),
@@ -4428,6 +4432,8 @@ mod tests {
         let mut pending = vec![(
             claude,
             WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
                 name: "deploys".into(),
                 id: "a".into(),
                 event: "deploys".into(),
@@ -8743,6 +8749,8 @@ mod tests {
                 None,
                 None,
                 &WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
                     name: "deploys".into(),
                     id: "a".into(),
                     event: "deploys".into(),
@@ -8858,6 +8866,8 @@ mod tests {
                 None,
                 None,
                 &WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
                     name: "deploys".into(),
                     id: "a".into(),
                     event: "deploys".into(),
@@ -8920,6 +8930,7 @@ mod tests {
         with_source(repo.path(), "codex", "deploys");
         let codex = AgentLabel::parse("codex").unwrap();
         let unlogged = WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/n".into(),
             event: "pr_opened".into(),
             detail: None,
@@ -8994,6 +9005,8 @@ mod tests {
 
         let claude = AgentLabel::parse("claude").unwrap();
         let held = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "a".into(),
             event: "deploys".into(),
@@ -9043,6 +9056,8 @@ mod tests {
         let repo = repo_with_roster();
         let codex = AgentLabel::parse("codex").unwrap();
         let held = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "a".into(),
             event: "deploys".into(),
@@ -9105,6 +9120,8 @@ mod tests {
 
         let claude = AgentLabel::parse("claude").unwrap();
         let held = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "a".into(),
             event: "deploys".into(),
@@ -9198,6 +9215,8 @@ mod tests {
 
         // Now a transient. There is no eligible client, so it waits.
         let later = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "b".into(),
             event: "deploys".into(),
@@ -9275,6 +9294,8 @@ mod tests {
             other => panic!("a command source, got {other:?}"),
         };
         let row = |content: &str| WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "builds".into(),
             id: content.into(),
             event: "builds".into(),
@@ -9367,6 +9388,8 @@ mod tests {
                     None,
                     None,
                     &WaitItem::CommandEvent {
+                        presentation: None,
+                        source_cwd: None,
                         name: "s".into(),
                         id: content.into(),
                         event: "s".into(),

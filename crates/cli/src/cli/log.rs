@@ -351,6 +351,7 @@ pub(crate) fn interleave_with_plain<'a>(
 /// pre-watch (baseline) history — it's context, not team activity —
 /// while live rows get the cyan badge; no-color output keeps the
 /// textual markers (codex c917ba7).
+#[cfg(test)]
 fn gh_colored_row(g: &crate::cli::github::timeline::MergedEvent, mark: &str) -> String {
     let line = gh_describe(g);
     let badge = event_badge(g);
@@ -412,7 +413,7 @@ pub(crate) fn badge_of(
         crate::cli::github::timeline::Backend::Github => "gh",
         crate::cli::github::timeline::Backend::Command => "cmd",
         crate::cli::github::timeline::Backend::Timer => "timer",
-        crate::cli::github::timeline::Backend::Message => "msg",
+        crate::cli::github::timeline::Backend::Message => "✉",
     })
 }
 
@@ -450,6 +451,13 @@ fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
     }
     if let Some(t) = &g.content {
         out.push_str(&format!("  “{}”", clean(t)));
+    }
+    for reply in &g.outgoing {
+        out.push_str(&format!(
+            "  sent → {} ({})",
+            clean(reply.destination.agent.as_str()),
+            clean(&reply.destination.repo.display().to_string())
+        ));
     }
     out
 }
@@ -604,18 +612,15 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
                     println!();
                 }
                 started = true;
-                let mark = if g.unhandled {
-                    "  [UNHANDLED]"
-                } else if g.baseline {
-                    "  (pre-watch)"
-                } else {
-                    ""
-                };
+                let mark = if g.baseline { "  (pre-watch)" } else { "" };
+                let badge = format!("{} {}", g.delivery().glyph(), event_badge(g));
+                let line = gh_describe(g);
                 if c {
-                    println!("{}", gh_colored_row(g, mark));
+                    println!("{}", colored_event_row(&badge, &line, g.baseline, mark));
                 } else {
-                    println!("{} {}{mark}", event_badge(g), gh_describe(g));
+                    println!("{badge} {line}{mark}");
                 }
+
                 if !g.seen_by.is_empty() {
                     println!("Seen-by: {}", g.seen_by.join(", "));
                 }
@@ -865,6 +870,7 @@ pub(crate) enum OnelineRow {
         /// (`StatusSnapshot.github_events` in the TUI) — Enter's
         /// page target. Row and list are always set together.
         event_idx: usize,
+        delivery: crate::cli::github::timeline::DeliveryState,
         line: String,
         unhandled: bool,
         baseline: bool,
@@ -931,6 +937,7 @@ pub(crate) fn oneline_items_rows(
                 refs: commit.refs.clone(),
             }),
             TimelineItem::Github(idx, g) => out.push(OnelineRow::Github {
+                delivery: g.delivery(),
                 event_idx: *idx,
                 line: gh_describe(g),
                 unhandled: g.unhandled,
@@ -1135,22 +1142,19 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 ..
             } => plan_footer_text(plan.as_deref(), *duration_secs),
             OnelineRow::Github {
-                event_idx: _,
                 line,
-                unhandled,
+                delivery,
                 baseline,
                 backend,
                 glyph,
                 ..
             } => {
-                let mark = if *unhandled {
-                    " ⚠"
-                } else if *baseline {
-                    " (pre-watch)"
-                } else {
-                    ""
-                };
-                format!("{} {line}{mark}", badge_of(glyph.as_deref(), *backend))
+                let mark = if *baseline { " (pre-watch)" } else { "" };
+                format!(
+                    "{} {} {line}{mark}",
+                    delivery.glyph(),
+                    badge_of(glyph.as_deref(), *backend)
+                )
             }
             OnelineRow::Notice(n) => format!("({n})"),
             OnelineRow::PlainCommit {
@@ -1219,22 +1223,18 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
             }
             OnelineRow::Github {
                 line,
-                unhandled,
+                delivery,
+                unhandled: _,
                 baseline,
                 glyph,
                 backend,
                 ..
             } => {
                 let badge = badge_of(glyph.as_deref(), backend);
-                let mark = if unhandled {
-                    " ⚠"
-                } else if baseline {
-                    " (pre-watch)"
-                } else {
-                    ""
-                };
+                let mark = if baseline { " (pre-watch)" } else { "" };
+                let badge = format!("{} {badge}", delivery.glyph());
                 if c {
-                    println!("{}", colored_event_row(badge, &line, baseline, mark));
+                    println!("{}", colored_event_row(&badge, &line, baseline, mark));
                 } else {
                     println!("{badge} {line}{mark}");
                 }
@@ -1351,6 +1351,8 @@ enum LogJsonRow<'a> {
     },
     #[serde(rename = "github_event")]
     Github {
+        members: &'a [crate::cli::github::timeline::MemberRef],
+        delivery: crate::cli::github::timeline::DeliveryState,
         ts: i64,
         repo: &'a str,
         event: &'a str,
@@ -1376,6 +1378,8 @@ enum LogJsonRow<'a> {
     /// no way to detect (codex 80e1fb9).
     #[serde(rename = "command_event")]
     Command {
+        members: &'a [crate::cli::github::timeline::MemberRef],
+        delivery: crate::cli::github::timeline::DeliveryState,
         ts: i64,
         source: &'a str,
         /// The sub-kind, named `event` like github's because the DTO
@@ -1392,6 +1396,8 @@ enum LogJsonRow<'a> {
     },
     #[serde(rename = "timer_event")]
     Timer {
+        members: &'a [crate::cli::github::timeline::MemberRef],
+        delivery: crate::cli::github::timeline::DeliveryState,
         ts: i64,
         due_at: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1406,9 +1412,16 @@ enum LogJsonRow<'a> {
     /// command's: `source` here is the SENDER, which is a different
     /// fact from the name of a producer that ran.
     Message {
+        delivery: crate::cli::github::timeline::DeliveryState,
         ts: i64,
         /// Who sent it.
         from: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<&'a str>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        outgoing: &'a Vec<crate::cli::github::timeline::OutgoingReply>,
+        members: &'a [crate::cli::github::timeline::MemberRef],
+        outgoing_only: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         subject: Option<&'a str>,
         seen_by: &'a [String],
@@ -1452,6 +1465,8 @@ fn json_items<'a>(
                 let ts = i64::try_from(g.at).unwrap_or(i64::MAX);
                 out.push(match g.backend {
                     crate::cli::github::timeline::Backend::Github => LogJsonRow::Github {
+                        delivery: g.delivery(),
+                        members: &g.members,
                         ts,
                         repo: &g.source,
                         event: &g.kind,
@@ -1465,6 +1480,8 @@ fn json_items<'a>(
                         baseline: g.baseline,
                     },
                     crate::cli::github::timeline::Backend::Command => LogJsonRow::Command {
+                        delivery: g.delivery(),
+                        members: &g.members,
                         ts,
                         source: &g.source,
                         event: &g.kind,
@@ -1475,6 +1492,8 @@ fn json_items<'a>(
                         baseline: g.baseline,
                     },
                     crate::cli::github::timeline::Backend::Timer => LogJsonRow::Timer {
+                        delivery: g.delivery(),
+                        members: &g.members,
                         ts,
                         recurrence: g.recurrence.as_ref(),
                         due_at: g.at,
@@ -1484,7 +1503,12 @@ fn json_items<'a>(
                         unhandled: g.unhandled,
                     },
                     crate::cli::github::timeline::Backend::Message => LogJsonRow::Message {
+                        delivery: g.delivery(),
                         ts,
+                        body: g.body.as_deref(),
+                        outgoing: &g.outgoing,
+                        members: &g.members,
+                        outgoing_only: g.outgoing_only(),
                         from: &g.source,
                         subject: g.content.as_deref(),
                         seen_by: &g.seen_by,
@@ -1584,6 +1608,63 @@ mod json_output_tests {
     use super::*;
 
     #[test]
+    fn actual_wal_delivery_has_shared_cli_json_and_web_states() {
+        use crate::cli::github::{
+            log::Transport,
+            timeline::{self, DeliveryState},
+        };
+        let (repo, _, mut log, _, _) = timeline::tests::reply_fixture(false, true);
+        let row = log.read_rows().unwrap().unwrap().rows.remove(0);
+        let key = clank_core::wait::EventPresentation {
+            source: "messages".into(),
+            seq: row.seq,
+            ident: row.ident.clone(),
+        };
+        for state in [
+            DeliveryState::Unwoken,
+            DeliveryState::Woken,
+            DeliveryState::Acknowledged,
+        ] {
+            if state == DeliveryState::Woken {
+                log.append_presentations(&[key.clone()], 123, || true)
+                    .unwrap();
+            }
+            if state == DeliveryState::Acknowledged {
+                log.append_checked_ack(key.seq, &key.ident).unwrap();
+            }
+            let snapshot = timeline::timeline_snapshot(repo.path());
+            let event = snapshot
+                .events
+                .iter()
+                .find(|e| !e.members.is_empty())
+                .unwrap();
+            assert_eq!(event.delivery(), state);
+            assert_eq!(event.members[0].transport, Transport::Message);
+            let web = serde_json::to_value(event).unwrap();
+            assert_eq!(web["delivery"], serde_json::to_value(state).unwrap());
+            let items = interleave(&[], &snapshot.events);
+            let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+            let lines = oneline_plain_lines(&rows);
+            let line = lines
+                .iter()
+                .find(|s| s.contains("Original question"))
+                .unwrap();
+            assert!(line.starts_with(&format!("{} ✉ ", state.glyph())), "{line}");
+            let reviews = Default::default();
+            let json = serde_json::to_value(json_items(&items, &reviews)).unwrap();
+            let entry = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["subject"] == "Original question")
+                .unwrap();
+            assert_eq!(entry["delivery"], web["delivery"]);
+            assert_eq!(entry["members"], web["members"]);
+            assert_eq!(entry["unhandled"], state != DeliveryState::Acknowledged);
+        }
+    }
+
+    #[test]
     fn recurring_timer_provenance_reaches_log_json_and_web_event_state() {
         use crate::cli::{
             github::{log::EventLog, timeline},
@@ -1650,6 +1731,7 @@ mod json_output_tests {
                 None,
                 Some(100),
                 &clank_core::wait::WaitItem::TimerEvent {
+                    presentation: None,
                     name: source.name.clone(),
                     recurrence: None,
                     id: "timer/100".into(),
@@ -1682,7 +1764,7 @@ mod json_output_tests {
             let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
             let lines = oneline_plain_lines(&rows);
             assert_eq!(lines.len(), 1);
-            assert!(lines[0].starts_with("timer "));
+            assert!(lines[0].starts_with(if acked { "✓✓ timer " } else { "? timer " }));
             assert!(lines[0].contains("“Check deployment”"));
             assert!(!lines[0].chars().any(char::is_control), "{lines:?}");
             assert!(!lines[0].contains("Report result"));
@@ -1707,8 +1789,71 @@ mod json_output_tests {
         }
     }
 
+    #[test]
+    fn outgoing_message_body_route_and_link_survive_log_json_and_oneline_projection() {
+        use crate::cli::github::timeline;
+        let (repo, _external, _source, _target, op) = timeline::tests::reply_fixture(false, true);
+        let snapshot = timeline::timeline_snapshot(repo.path());
+        let reply = snapshot
+            .events
+            .iter()
+            .find(|e| !e.outgoing.is_empty())
+            .unwrap();
+        let items = vec![TimelineItem::Github(0, reply)];
+        let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+        assert!(matches!(
+            &rows[0],
+            OnelineRow::Github {
+                delivery: crate::cli::github::timeline::DeliveryState::Sent,
+                unhandled: false,
+                ..
+            }
+        ));
+        let described = gh_describe(reply);
+        assert!(described.contains("sent → coordinator"));
+        assert!(described.contains(&op.route.repo.display().to_string()));
+        assert_eq!(event_badge(reply), "✉");
+        let reviews = Default::default();
+        let json = serde_json::to_value(json_items(&items, &reviews)).unwrap();
+        assert_eq!(json[0]["kind"], "Message");
+        assert_eq!(json[0]["body"], op.text);
+        assert_eq!(json[0]["outgoing_only"], true);
+        assert_eq!(
+            json[0]["outgoing"][0]["destination"]["agent"],
+            "coordinator"
+        );
+        assert_eq!(json[0]["outgoing"][0]["operation_id"], op.id);
+        assert_eq!(
+            json[0]["outgoing"][0]["original_handle"],
+            op.original_handle
+        );
+        assert_eq!(json[0]["members"], serde_json::json!([]));
+        assert_eq!(json[0]["seen_by"], serde_json::json!([]));
+        assert_eq!(json[0]["unhandled"], false);
+    }
+
+    fn test_member(unhandled: bool) -> crate::cli::github::timeline::MemberRef {
+        use crate::cli::github::{
+            log::Transport,
+            timeline::{MemberKey, MemberRef},
+        };
+        MemberRef {
+            key: MemberKey {
+                agent: "claude".into(),
+                source: "fixture".into(),
+                seq: 1,
+                ident: "fixture".into(),
+            },
+            acked: !unhandled,
+            woken_at: None,
+            transport: Transport::Poll,
+            content: None,
+        }
+    }
+
     fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at,
             backend: crate::cli::github::timeline::Backend::Github,
@@ -1723,7 +1868,7 @@ mod json_output_tests {
             actor: Some("alice".into()),
             url: None,
             seen_by: vec!["claude".into()],
-            members: Vec::new(),
+            members: vec![test_member(unhandled)],
             unhandled,
             baseline: false,
         }
@@ -1796,6 +1941,7 @@ mod json_output_tests {
         // marker without ANSI in plain output.
         let base = gh(100, "old news", false);
         let base = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             baseline: true,
             ..base
         };
@@ -1840,7 +1986,7 @@ mod json_output_tests {
                     crate::cli::github::timeline::Backend::Github => "gh",
                     crate::cli::github::timeline::Backend::Command => "cmd",
                     crate::cli::github::timeline::Backend::Timer => "timer",
-                    crate::cli::github::timeline::Backend::Message => "msg",
+                    crate::cli::github::timeline::Backend::Message => "✉",
                 },
                 OnelineRow::Commit { .. } => "commit",
                 _ => "other",
@@ -1953,7 +2099,7 @@ mod json_output_tests {
         // Plain lines render the badge + open-work mark.
         let lines = oneline_plain_lines(&rows);
         assert!(
-            lines[0].starts_with("gh ") && lines[0].ends_with(" ⚠"),
+            lines[0].starts_with("? gh ") && !lines[0].contains("⚠"),
             "{lines:?}"
         );
     }
@@ -1966,6 +2112,7 @@ mod json_output_tests {
     #[test]
     fn no_github_hides_github_events_and_keeps_command_ones() {
         let ev = |backend, source: &str| crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 150,
             backend,
@@ -1980,7 +2127,7 @@ mod json_output_tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
-            members: Vec::new(),
+            members: vec![test_member(true)],
             unhandled: true,
             baseline: false,
         };
@@ -2014,6 +2161,7 @@ mod json_output_tests {
     #[test]
     fn a_command_events_row_and_json_are_not_dressed_up_as_github() {
         let cmd = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 150,
             backend: crate::cli::github::timeline::Backend::Command,
@@ -2028,7 +2176,7 @@ mod json_output_tests {
             actor: None,
             url: None,
             seen_by: vec!["claude".into()],
-            members: Vec::new(),
+            members: vec![test_member(true)],
             unhandled: true,
             baseline: false,
         };
@@ -2049,11 +2197,11 @@ mod json_output_tests {
         assert_eq!(badge, crate::cli::github::timeline::Backend::Command);
         let lines = oneline_plain_lines(&rows);
         assert!(
-            lines.iter().any(|l| l.starts_with("cmd ")),
+            lines.iter().any(|l| l.starts_with("? cmd ")),
             "the gutter says what produced it: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.starts_with("gh ")),
+            !lines.iter().any(|l| l.starts_with("? gh ")),
             "and never claims github: {lines:?}"
         );
         // A broken SOURCE reads as one, even here.
@@ -2346,6 +2494,7 @@ mod tests {
             subject: "[split] wrap up".into(),
         };
         let event = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 2,
             backend: crate::cli::github::timeline::Backend::Github,

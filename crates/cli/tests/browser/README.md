@@ -14,6 +14,7 @@ node check.js
 node bridge.js
 node colors.js
 node questions.js
+node messages.js
 ```
 
 `check.js` covers the header, the picker and the draft; `bridge.js` covers multi-megabyte frames, full retained transcript display,
@@ -35,6 +36,11 @@ opaque native IDs, replay/focus/draft preservation, rejection and unknown sends,
 cancellation before HTTP replies, duplicate submission suppression, session
 changes and private draft storage. Native socket delivery/arbitration has separate
 Rust fixtures; this browser test does not claim a live authenticated round trip.
+
+`messages.js` checks the real page's event timeline against synthetic custody
+rows: the mail badge, an external reply's sent marker and destination, escaped
+text, and absence of an invented recipient acknowledgement. Rust custody tests
+cover actual accepted-operation projection and same-repo inbox merging.
 
 Every check is written so that reverting the fix it guards makes it
 fail; they were built by reproducing three defects found in review

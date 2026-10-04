@@ -330,6 +330,7 @@ pub(crate) fn item(repo: &str, pr: &PrHead, rollup: &CiRollup) -> Option<WaitIte
         _ => "CI passed".to_string(),
     };
     Some(WaitItem::GithubEvent {
+        presentation: None,
         repo: repo.to_string(),
         event: crate::cli::github::feed::kind_str(kind).to_string(),
         detail: None,

@@ -885,6 +885,34 @@ mod real_wait {
                 .any(|item| matches!(item, WaitItem::Message { handle: id, .. } if id == &handle)),
             "delivery is not acknowledgment"
         );
+        let mut log = super::super::super::github::log::EventLog::open(
+            &crate::agent_store::agents_root(&fixture.owner.repo).join("grok/events"),
+            "messages",
+        )
+        .unwrap();
+        assert!(
+            log.read_rows().unwrap().unwrap().rows[0].woken_at.is_none(),
+            "registration and work selection are not delivery"
+        );
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        assert!(emit_selected(&worker, &fixture.env, &items, true, &mut Broken).is_err());
+        assert!(log.read_rows().unwrap().unwrap().rows[0].woken_at.is_none());
+        let mut wire = Vec::new();
+        emit_selected(&worker, &fixture.env, &items, true, &mut wire).unwrap();
+        let row = log.read_rows().unwrap().unwrap().rows.remove(0);
+        assert!(row.woken_at.is_some() && !row.acked);
+        assert!(serde_json::from_slice::<serde_json::Value>(&wire).unwrap()["items"].is_array());
+        fixture.runtime.cancel(&fixture.owner).unwrap();
+        assert!(emit_selected(&worker, &fixture.env, &items, true, &mut Vec::new()).is_err());
+        assert!(!log.load().unhandled.is_empty());
     }
 }
 

@@ -110,7 +110,7 @@ pub async fn submit_and_interrupt_async(
 /// stays in its durable inbox: this only asks the target to read pending work.
 /// Role is deliberately resolved by Clank when the target reads, never captured
 /// in terminal text before interruption. No receipt or acknowledgement is forged.
-pub(crate) const EVENT_WAKE: &str = "Clank has pending events for this session. Run `clank events list`, read the pending events with `clank events show`, and handle them before acknowledging. Follow any required-reply contract. Your current role and work are determined by Clank.";
+pub(crate) const EVENT_WAKE: &str = "Clank has pending events for this session. Run `clank events list`, read the pending events with `clank events read`, and handle them before acknowledging. Follow any required-reply contract. Your current role and work are determined by Clank.";
 
 pub(crate) async fn wake_for_events_async(
     session: &str,

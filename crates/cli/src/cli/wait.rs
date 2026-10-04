@@ -1596,6 +1596,11 @@ async fn run_command_source_with(
                             continue;
                         }
                         let mut item = row.item;
+                        item.set_presentation(clank_core::wait::EventPresentation {
+                            source: key.clone(),
+                            seq: row.seq,
+                            ident: row.ident,
+                        });
                         cs::stamp_selector(&mut item, &key, row.seq);
                         if tx
                             .send((item, crate::cli::event_source::Durability::Logged))
@@ -1728,6 +1733,11 @@ async fn run_leased_command_source(
             continue;
         }
         let mut item = entry.item;
+        item.set_presentation(clank_core::wait::EventPresentation {
+            source: key.clone(),
+            seq: entry.seq,
+            ident: entry.ident,
+        });
         cs::stamp_selector(&mut item, &key, entry.seq);
         if tx
             .send((item, crate::cli::event_source::Durability::Logged))
@@ -2106,20 +2116,29 @@ pub(crate) fn emit(items: &[WaitItem], json: bool) {
     emit_with_context(items, json, None);
 }
 fn emit_with_context(items: &[WaitItem], json: bool, source_cwd: Option<&Path>) {
+    if let Err(error) = emit_checked(items, json, source_cwd, &mut std::io::stdout()) {
+        eprintln!("wait: could not write work: {error}");
+    }
+}
+pub(crate) fn emit_checked(
+    items: &[WaitItem],
+    json: bool,
+    source_cwd: Option<&Path>,
+    writer: &mut impl std::io::Write,
+) -> std::io::Result<()> {
     if json {
         let envelope = WaitEnvelope {
             items: items.iter().map(render_json).collect(),
             source_cwd,
         };
-        println!(
-            "{}",
-            serde_json::to_string(&envelope).expect("serialize wait envelope")
-        );
+        serde_json::to_writer(&mut *writer, &envelope).map_err(std::io::Error::other)?;
+        writeln!(writer)?;
     } else {
         for item in items {
-            println!("{}", render_human(item));
+            writeln!(writer, "{}", render_human(item))?;
         }
     }
+    writer.flush()
 }
 
 /// 12 hex chars (48 bits), not git's display default of 7: agents
@@ -2177,7 +2196,13 @@ pub(crate) enum WaitJsonItem<'a> {
     PromoteFromQueue { name: &'a str, priority: u16 },
     #[serde(rename = "message")]
     Message {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<&'a clank_core::wait::EventPresentation>,
         handle: &'a str,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        requires_reply: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_route: Option<&'a clank_core::wait::MessageReplyRoute>,
         /// The whole message. The wake shows its first line; an agent
         /// that wants the rest has it here rather than in a file.
         body: &'a str,
@@ -2191,6 +2216,8 @@ pub(crate) enum WaitJsonItem<'a> {
     },
     #[serde(rename = "github_event")]
     GithubEvent {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<&'a clank_core::wait::EventPresentation>,
         repo: &'a str,
         event: &'a str,
         detail: Option<&'a str>,
@@ -2203,6 +2230,8 @@ pub(crate) enum WaitJsonItem<'a> {
     },
     #[serde(rename = "timer_event")]
     TimerEvent {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<&'a clank_core::wait::EventPresentation>,
         name: &'a str,
         id: &'a str,
         due_at: u64,
@@ -2214,6 +2243,8 @@ pub(crate) enum WaitJsonItem<'a> {
     },
     #[serde(rename = "command_event")]
     CommandEvent {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<&'a clank_core::wait::EventPresentation>,
         name: &'a str,
         id: &'a str,
         event: &'a str,
@@ -2231,6 +2262,8 @@ pub(crate) enum WaitJsonItem<'a> {
     },
     #[serde(rename = "draft_changed")]
     DraftChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<&'a clank_core::wait::EventPresentation>,
         pr: u32,
         /// Opaque: which run of that PR's review. It exists so an ack
         /// cannot cross runs, and means nothing to a reader.
@@ -2323,14 +2356,20 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             priority: *priority,
         },
         WaitItem::Message {
+            presentation: _,
             handle,
             from,
             repo,
             subject,
             body,
             selector,
+            requires_reply,
+            reply_route,
         } => WaitJsonItem::Message {
+            presentation: item.presentation(),
             handle,
+            requires_reply: *requires_reply,
+            reply_route: reply_route.as_ref(),
             from: from.as_deref(),
             repo: repo.as_deref(),
             subject,
@@ -2338,6 +2377,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             selector: selector.as_deref(),
         },
         WaitItem::GithubEvent {
+            presentation: _,
             repo,
             event,
             detail,
@@ -2348,6 +2388,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             instructions,
             content: _,
         } => WaitJsonItem::GithubEvent {
+            presentation: item.presentation(),
             repo,
             event,
             detail: detail.as_deref(),
@@ -2358,6 +2399,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             instructions: instructions.as_deref(),
         },
         WaitItem::DraftChanged {
+            presentation: _,
             pr,
             instance,
             comment,
@@ -2366,6 +2408,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             revision,
             selector,
         } => WaitJsonItem::DraftChanged {
+            presentation: item.presentation(),
             pr: *pr,
             instance: *instance,
             comment: *comment,
@@ -2375,6 +2418,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             selector: selector.as_deref(),
         },
         WaitItem::TimerEvent {
+            presentation: _,
             name,
             id,
             due_at,
@@ -2382,6 +2426,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             recurrence,
             selector,
         } => WaitJsonItem::TimerEvent {
+            presentation: item.presentation(),
             name,
             id,
             due_at: *due_at,
@@ -2400,6 +2445,7 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             selector,
             ..
         } => WaitJsonItem::CommandEvent {
+            presentation: item.presentation(),
             name,
             id,
             event,
@@ -2607,7 +2653,7 @@ fn render_human(item: &WaitItem) -> String {
             // The operator's per-watch prompt rides as ONE indented
             // follow-on line: control chars collapse (same treatment
             // as PR titles — operator text must not restructure the
-            // item list), full text lives in `clank events show`.
+            // item list), full text lives in `clank events read`.
             if let Some(i) = v.instructions.filter(|i| !i.trim().is_empty()) {
                 line.push_str("\n         \u{21b3} ");
                 line.push_str(&one_line(i, 300));
@@ -3776,6 +3822,7 @@ mod tests {
     fn a_draft_wake_is_not_owed_to_a_reviewer() {
         let dir = tempfile::tempdir().unwrap();
         let draft = || WaitItem::DraftChanged {
+            presentation: None,
             pr: 42,
             instance: 1,
             comment: None,
@@ -4378,6 +4425,7 @@ mod tests {
     #[test]
     fn a_github_event_and_a_command_event_render_as_one_row() {
         let gh = WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "pr_comment".into(),
             detail: Some("review".into()),
@@ -4389,6 +4437,8 @@ mod tests {
             content: None,
         };
         let cmd = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "sha-abc".into(),
             event: "deployed".into(),
@@ -4438,6 +4488,8 @@ mod tests {
         // A source reporting ITSELF broken is marked as such, and
         // does not read as news about the world.
         let broken = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "deploys".into(),
             id: "clank.source-failure:x".into(),
             event: "clank.source-failure".into(),
@@ -4849,6 +4901,8 @@ mod tests {
 
         let mut log = crate::cli::github::log::EventLog::open(dir.path(), &key).unwrap();
         let stored = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "owed".into(),
             id: "left-over".into(),
             event: "k".into(),
@@ -5043,6 +5097,9 @@ mod tests {
         };
         let event = || {
             vec![WaitItem::Message {
+                presentation: None,
+                requires_reply: false,
+                reply_route: None,
                 handle: "h".into(),
                 from: None,
                 repo: None,
@@ -5139,6 +5196,8 @@ mod tests {
 
     fn cmd_row() -> WaitItem {
         WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "cmd".into(),
             id: "1".into(),
             event: "k".into(),
@@ -5275,6 +5334,8 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         tx.send((
             WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
                 name: "a".into(),
                 id: "1".into(),
                 event: "k".into(),
@@ -5470,6 +5531,7 @@ mod tests {
         // external-wake-hints-carry-payload: the one-liner carries the
         // detail and the URL (the actionable pointer)…
         let full = WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "pr_comment".into(),
             detail: Some("review".into()),
@@ -5487,6 +5549,7 @@ mod tests {
         );
         // …and absent optionals leave no dangling separators.
         let sparse = WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "issue_opened".into(),
             detail: None,
@@ -5503,6 +5566,7 @@ mod tests {
         // can't restructure the item list (github-watch-prompts).
         // Promptless hints above stay byte-stable.
         let prompted = WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "issue_opened".into(),
             detail: None,
@@ -5519,6 +5583,7 @@ mod tests {
         );
         // Blank instructions render nothing extra.
         let blank = WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "issue_opened".into(),
             detail: None,

@@ -588,7 +588,7 @@ repository watcher uses `notify::PollWatcher`, and its cadence is unchanged.
   read from each watched PR's checks, so an arm sees the CURRENT
   result: a build that went red and was replaced by a green one while
   nothing was armed is not recoverable.
-  `clank events list` / `show` inspect it; the `clank-github` skill
+  `clank events list` / `show` inspect metadata; `events read` delivers content; the `clank-github` skill
   teaches agents the react-then-ack loop.
 
 Command producers write one JSON object per stdout line, with an `id` unique
@@ -621,7 +621,8 @@ Plain acknowledgement, including bulk or TUI acknowledgement, refuses an
 event requiring a reply. The TUI shows the CLI recipe; it has no reply editor.
 `--reply` takes one event selector and a nonempty answer; the supplied text is
 preserved verbatim. Ordinary command events can also receive an explicit reply
-if they have a handler. Other backends currently refuse `--reply`.
+if they have a handler. Messages also support replies as described below;
+GitHub, timer and other backends refuse `--reply`.
 
 Clank invokes `reply_command` directly with its configured argv, without shell
 interpolation or added arguments. Stdin carries one JSON object, then EOF:
@@ -647,9 +648,58 @@ backend are serialized by one nonblocking lease, keeping its callback count
 bounded. A concurrent submission is refused. After failure or interruption,
 retry explicitly
 with the original answer; different text is refused while that intent exists.
-`clank events show <selector> --json` includes the saved reply and acceptance.
+`clank events read <selector> --json` includes the saved reply and acceptance.
 
-Callback attempts are **at least once**: a crash after backend acceptance but
+Message replies use concrete agent destinations:
+
+```sh
+clank send --repo /destination --to worker --reply-to coordinator --reply-repo /origin -m 'Please investigate'
+clank events ack messages@7 --reply 'Investigation complete.'
+clank events reply messages@7 -m 'A further finding.'
+clank events reply messages@7 --operation <printed-id> -m 'A further finding.'
+```
+
+`--reply-to` requires an answer before acknowledgement. Without `--reply-repo`,
+the reply agent belongs to the invoking repository, independently of send's
+destination `--repo`. The concrete agent and canonical repository are captured;
+master changes do not retarget the answer. An unbound person can specify this
+endpoint. Ordinary agent messages can receive a reply using their saved sender
+metadata, without becoming reply-required; a human message needs an explicit
+reply endpoint.
+
+`events ack --reply` stores one immutable acknowledgement reply. The destination
+must accept it durably before the original is handled. Retry with identical text;
+different text cannot replace that acknowledgement. `events reply` instead sends
+a deliberate reply without completing or reopening the original, including after
+acknowledgement. Each invocation without `--operation` sends a new message, even
+with identical text. To retry an interrupted deliberate reply, reuse its printed
+operation ID and exact text. An unknown or pruned operation ID refuses delivery.
+`events read` and its JSON expose retained reply bodies, endpoints, operation IDs
+and pending/accepted state, so an interrupted command's ID is recoverable.
+
+Message delivery is deduplicated across the destination/source commit gap. A
+small destination receipt pin survives inbox acknowledgement and body compaction
+until source acceptance is saved; cleanup failures leave acceptance intact and
+can be retried explicitly. Reply commands use a single nonblocking author lease,
+short local writer locks and no idle retry worker or polling. New replies do not
+inherit the original message's reply obligation. Command callbacks retain the
+separate single-answer contract below; `events reply` does not invoke them.
+
+Reply-required messages use a version-2 inbox record that older readers cannot
+treat as plain-ackable work. Install supporting binaries on every custodian before
+using this feature; mixed old/new message-operation writers are unsupported.
+
+Accepted replies appear in the timeline with a `✉` mail badge, their sender,
+destination and subject. A reply within the same repository merges with its
+recipient's inbox copy; only recipient copies count as pending work or ack
+targets. External replies show `sent →` locally, even if that repository is
+unavailable, without fetching it or claiming the recipient woke or acknowledged.
+In the TUI, open the reply to read its full body, endpoint, operation ID and
+original-message link. `clank log --json` preserves those fields as structured
+data. Pending reply intents remain visible in event detail and are not shown as
+sent timeline entries.
+
+Command-backend callback attempts are **at least once**: a crash after backend acceptance but
 before its local record can repeat delivery. The backend must persist and
 deduplicate `idempotency_key`, return zero for a previously accepted identical
 submission, and refuse conflicting content for that key. The author, key and
@@ -714,6 +764,34 @@ verified transport, pending work is delivered through the ordinary wait/hook.
 An already-armed local wait emits its normal context directly; it needs no detached
 interruption helper. Wake receipts and required replies keep their normal meaning.
 
+Event timelines use `?` for an event that has not been woken, `✓` for a wake
+that has not been acknowledged, and `✓✓` for acknowledgement. Messages carry
+an additional `✉` envelope badge. A wake proves successful output and flush to
+an agent's delivery adapter or explicit `events read`, not understanding or
+completion. Merely opening the timeline, inspecting events, or running a plain `wait`/`wait --peek`
+does not mark them woken. Legacy acknowledged events get double ticks; pending
+legacy events remain `?` until a real wake or explicit read.
+
+Clank records the first wake for each exact inbox copy in its existing WAL.
+Generic Codex, Claude and OpenCode continuations, Claude SessionStart context,
+the registered native Grok background wait, and explicit event reads record
+successful delivery after flush and binding validation. Failed output or stale
+sessions leave the state unchanged. A crash or storage error after output can conservatively leave `?`;
+the event stays owed, and a later real wake can record it. Callback configuration,
+callback failure and callback budgets do not control this local evidence.
+
+Merged entries show `✓✓` only when all local recipient copies are acknowledged.
+If any pending recipient has no wake evidence, the entry remains `?`; otherwise
+it shows `✓`. Detail and structured JSON retain each recipient's own `woken_at`
+and acknowledgement. Pre-watch history stays distinct. Accepted outbound-only
+replies show `→` for Sent: local custody never claims that an external recipient
+woke or acknowledged. Display does not scan the destination repository.
+
+Wake evidence adds no polling, process, idle timer or retry queue. Each actual
+wake batches its new stamps under one short lock/read/file-and-directory sync per
+source. Repeated wakes append no new stamps. Compaction retains evidence only
+while its exact inbox copy is retained, including recurring timer occurrences.
+
 Command sources can opt into **wake receipts**, independently of replies. Add
 `receipt_command` to an agent's configured `wait_events` source:
 
@@ -726,8 +804,8 @@ Command sources can opt into **wake receipts**, independently of replies. Add
 }
 ```
 
-A receipt means Clank successfully wrote and flushed a hook wake containing the
-event. It does not prove that the provider accepted the continuation or that the
+A receipt means Clank successfully wrote and flushed a hook wake or an explicit
+`events read` containing the event. It does not prove that the provider accepted the continuation or that the
 model read or completed the instruction. It never acknowledges an event, submits
 an answer, or completes backend work. Receipt handlers should record delivery/read
 metadata only; for Anx, this must not invoke `anx ack` or `anx say --done`. Unfinished
@@ -748,7 +826,9 @@ and keep their children in Clank's owned process group rather than daemonizing.
 Clank creates and supplies the source's resolved `CLANK_SOURCE_STATE_DIR`, without
 reading its private contents. The working directory is the current presentation
 host's: the monitor's cwd for shared waits, and the local wait's cwd for fallback
-or peek catch-up. It is not an immutable historical producer directory.
+or peek catch-up. An explicit `events read` uses the source-host cwd captured on
+the accepted command row (or its saved reply route for older rows). Old rows with
+neither context skip the callback with a diagnostic rather than guessing a cwd.
 
 The receipt route is captured from the presenting author's current configuration.
 Editing a handler changes later presentations; an in-flight batch keeps its captured
@@ -758,9 +838,22 @@ subscription arguments and immutable saved reply routes do not change. Omitted
 handlers add no receipt callback, WAL reread, runtime coordination or child process.
 Invocation-only `--event` receipt handlers are refused; configure the source instead.
 
+Use `clank events read <selector>` (or `--json`) inside the bound agent session to
+read an event's full content. `events list` and `events show`, including JSON, expose
+only allowlisted routing, identity, lifecycle and reply-operation metadata. They
+omit message subjects/bodies, command/timer content, watch instructions and reply
+text. Reading verifies the current tool/session/agent binding before output and
+after its successful flush; `--author` cannot impersonate a different recipient.
+The read records the exact copy's first delivery evidence, then dispatches the same
+configured command receipt callback as hooks. It never acknowledges or answers.
+A failed write/flush or a replaced binding earns no receipt. Ordinary timeline and
+raw filesystem views are not instrumented: this is an explicit delivery boundary,
+not proof of model cognition or enforcement against direct filesystem access.
+
 Supported presentations are generic Codex, Claude and OpenCode Stop-hook wakes,
-and Claude SessionStart's actual additional-context output. Native Grok handoffs and
-arbitrary backend/file reads are outside this version. `events list`, `show`, `ack`,
+Claude SessionStart's actual additional-context output, and explicit `events read`.
+Native Grok handoffs record local delivery evidence but do not dispatch backend
+receipt callbacks; arbitrary backend/file reads are outside this version. `events list`, `show`, `ack`,
 plain `wait`, and `wait --peek` do not notify. Peek includes pending configured source
 rows without starting producers; a SessionStart adapter that emits that result owns
 the receipt. Failed/partial output, failed flush, stale bindings, diagnostics, control

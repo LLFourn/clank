@@ -8,7 +8,7 @@
 //! noticed — silently, because "-" is a valid message to an inbox.
 //!
 //! ONE pass, before dispatch, rather than a call in each command's
-//! `run`. Seven commands take a free-text `-m` and they disagree about
+//! `run`. Nine commands take a free-text `-m` and they disagree about
 //! emptiness — `block create` writes the text with no check at all,
 //! while `feedback write` accepts an empty body as a verdict-only
 //! note. Substitution is therefore all that happens here; what a
@@ -16,7 +16,8 @@
 
 use crate::cli::command::Command;
 use crate::cli::{
-    BlockArgs, BlockCmd, FeedbackArgs, FeedbackCmd, PrReviewArgs, PrReviewCmd, QueueArgs, QueueCmd,
+    BlockArgs, BlockCmd, EventsArgs, EventsCmd, FeedbackArgs, FeedbackCmd, PrReviewArgs,
+    PrReviewCmd, QueueArgs, QueueCmd,
 };
 
 /// The `-m` of the command being run, in the three shapes clap parses
@@ -29,11 +30,14 @@ enum Field<'a> {
 
 /// Where the free-text `-m` lives for each command that has one.
 ///
-/// Adding an eighth is meant to land here; `every_free_text_m_is_wired`
+/// Adding another command is meant to land here; `every_free_text_m_is_wired`
 /// fails if one is declared and not routed.
 fn field_of(cmd: &mut Command) -> Option<Field<'_>> {
     Some(match cmd {
         Command::Send(a) => Field::Many(&mut a.message),
+        Command::Events(EventsArgs {
+            command: EventsCmd::Reply(a),
+        }) => Field::Many(&mut a.message),
         Command::Nudge(a) => Field::Many(&mut a.message),
         Command::Finish(a) => Field::Many(&mut a.message),
         Command::Unblock(a) => Field::One(&mut a.message),
@@ -138,6 +142,7 @@ mod tests {
         let body = "BODY";
         for args in [
             vec!["send", "--master", "-m", "-"],
+            vec!["events", "reply", "messages@7", "-m", "-"],
             vec!["nudge", "--master", "-m", "-"],
             vec!["finish", "-m", "-"],
             vec!["queue", "add", "some-plan", "-m", "-"],
@@ -165,14 +170,14 @@ mod tests {
         }
     }
 
-    /// The tripwire for an eighth. `field_of` has a wildcard arm, so a
+    /// The tripwire for another command. `field_of` has a wildcard arm, so a
     /// new `-m` would silently keep sending a literal "-" — which is
     /// the exact bug this plan fixes.
     #[test]
     fn every_free_text_m_is_wired() {
         let declared = include_str!("mod.rs").matches("short = 'm'").count();
         assert_eq!(
-            declared, 8,
+            declared, 9,
             "a `-m` was added or removed in mod.rs; route it in `field_of` and list it in \
              `every_command_with_a_free_text_m_reads_stdin_for_a_dash`, then update this count"
         );

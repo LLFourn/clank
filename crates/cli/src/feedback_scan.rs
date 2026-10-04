@@ -40,6 +40,12 @@ pub fn scan_feedback(
     };
 
     for agent_entry in agent_dirs.flatten() {
+        // Reply dispatch leaves lock/owner sidecars next to agent directories.
+        // They are not agents; attempting sidecar/feedback yields ENOTDIR and
+        // previously discarded every review in the log's best-effort scan.
+        if !agent_entry.file_type()?.is_dir() {
+            continue;
+        }
         let feedback_dir = agent_entry.path().join("feedback");
         let files = match std::fs::read_dir(&feedback_dir) {
             Ok(it) => it,
@@ -154,6 +160,21 @@ mod tests {
             "CONTINUE\n",
         );
         let view = scan_feedback(repo, &[s1.clone()]).unwrap();
+        assert_eq!(view.per_commit[0].entries.len(), 1);
+    }
+
+    #[test]
+    fn reply_sidecars_do_not_hide_real_reviews() {
+        let dir = TempDir::new().unwrap();
+        let sha = full_sha("abcdef0");
+        write(
+            dir.path(),
+            ".clank/agents/alice/feedback/abcdef0.md",
+            "CONTINUE\n",
+        );
+        write(dir.path(), ".clank/agents/reply-backend.ingest.lock", "");
+        write(dir.path(), ".clank/agents/reply-backend.owner.json", "{}");
+        let view = scan_feedback(dir.path(), &[sha]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 

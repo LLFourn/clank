@@ -75,6 +75,9 @@ mod tests {
 
     fn item() -> WaitItem {
         WaitItem::Message {
+            presentation: None,
+            requires_reply: false,
+            reply_route: None,
             handle: "id".into(),
             from: None,
             repo: None,

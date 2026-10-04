@@ -2268,7 +2268,7 @@ mod tests {
             for role in [Role::Master, Role::Reviewer] {
                 let skill = compose_skill(role, tool);
                 for step in [
-                    "clank events show",
+                    "clank events read",
                     "clank events ack",
                     "clank send",
                     "--master",

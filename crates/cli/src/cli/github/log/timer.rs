@@ -76,6 +76,7 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
     let mut acks: HashMap<u64, Vec<Record>> = HashMap::new();
     let mut ids = HashMap::new();
     let mut interrupts = Vec::new();
+    let mut presentations = BTreeMap::new();
     for line in lines {
         let Line::Known(record) = line else {
             return Err(invalid("foreign recurring WAL record; repair required"));
@@ -84,6 +85,12 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
             return Err(invalid("unsupported recurring WAL version"));
         }
         match record.as_ref() {
+            Record::Presentation { seq, ident, .. } => {
+                state.high = state.high.max(*seq);
+                presentations
+                    .entry((*seq, ident.clone()))
+                    .or_insert(record.as_ref().clone());
+            }
             Record::Interrupt { seq, .. } => {
                 state.high = state.high.max(*seq);
                 interrupts.push(record.as_ref().clone());
@@ -266,6 +273,14 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
             ));
         }
     }
+    for (key, record) in presentations {
+        state
+            .groups
+            .get_mut(&key)
+            .ok_or_else(|| invalid("recurring presentation has no matching occurrence"))?
+            .rows
+            .push(record);
+    }
     for record in interrupts {
         let Record::Interrupt { seq, ref ident, .. } = record else {
             unreachable!()
@@ -397,6 +412,7 @@ impl EventLog {
             .ok_or_else(|| invalid("recurring sequence exhausted"))?;
         let id = r.producer_id(slots.last).map_err(std::io::Error::other)?;
         let item = WaitItem::TimerEvent {
+            presentation: None,
             name: r.generation.name.clone(),
             id: id.clone(),
             due_at: slots.due_at,
@@ -528,6 +544,43 @@ mod tests {
         .unwrap();
         let log = EventLog::open(dir.path(), &r.source_key()).unwrap();
         (dir, r, log)
+    }
+
+    #[test]
+    fn recurring_wake_survives_strict_restart_ack_and_compaction() {
+        let (dir, r, mut log) = fixture();
+        let (seq, ident, _) = accepted(&mut log, &r, 120);
+        let key = clank_core::wait::EventPresentation {
+            source: r.source_key(),
+            seq,
+            ident: ident.clone(),
+        };
+        assert_eq!(
+            log.append_presentations(&[key.clone()], 125, || true)
+                .unwrap(),
+            1
+        );
+        force_compact(&mut log);
+        let mut log = EventLog::open(dir.path(), &r.source_key()).unwrap();
+        let row = log
+            .read_timer_backlog(true)
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert_eq!(row.woken_at, Some(125));
+        assert!(!row.acked);
+        ack(&mut log, seq, &ident, 130);
+        force_compact(&mut log);
+        let row = log
+            .read_timer_backlog(true)
+            .unwrap()
+            .unwrap()
+            .rows
+            .remove(0);
+        assert!(row.acked);
+        assert_eq!(row.woken_at, Some(125));
+        assert_eq!(log.append_presentations(&[key], 150, || true).unwrap(), 0);
     }
 
     #[test]

@@ -14,15 +14,17 @@ use crate::cli::github::log::{EventLog, EventRow};
 use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
 
+mod message_reply;
+mod read;
 mod reply;
 use reply::ack_with_reply;
 
 pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
     match args.command {
         super::EventsCmd::List(a) => {
-            let (dir, prompts) = events_context(a.repo.as_deref(), a.author.as_deref())?;
+            let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
-            list(rows, &prompts, a.all, a.json)
+            list(rows, a.all, a.json)
         }
         super::EventsCmd::Ack(a) => {
             let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
@@ -36,9 +38,18 @@ pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
             }
         }
         super::EventsCmd::Show(a) => {
-            let (dir, prompts) = events_context(a.repo.as_deref(), a.author.as_deref())?;
+            let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
-            show(rows, &prompts, &a.id, a.json)
+            show_metadata(rows, &a.id, a.json)
+        }
+        super::EventsCmd::Read(a) => read::run(a).await,
+        super::EventsCmd::Reply(a) => {
+            let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
+            let rows = read_all(&dir)?;
+            let selected = resolve(&rows, &a.id)?;
+            let repo = super::resolve_repo(a.repo.as_deref())?;
+            let text = super::send::body_of(&a.message, a.file.as_deref())?;
+            message_reply::submit(&repo, &dir, selected, &text, a.operation.as_deref(), false)
         }
     }
 }
@@ -428,7 +439,7 @@ pub(crate) fn recurrence_summary(r: &clank_core::agent_config::TimerRecurrence) 
     )
 }
 
-/// The one JSON envelope for both `list -j` and `show -j`: the
+/// The content-bearing JSON envelope for `read -j`: the
 /// addressable id + source alongside the full row (durable identities
 /// included) — the documented inspection contract (codex c009500).
 #[derive(serde::Serialize)]
@@ -456,15 +467,138 @@ fn json_row<'a>(
     }
 }
 
-fn list(
-    rows: Vec<Sourced>,
-    prompts: &std::collections::HashMap<String, String>,
-    all: bool,
-    json: bool,
-) -> anyhow::Result<()> {
+/// An allowlisted projection: content, subject, instructions, reply text and
+/// callback argv never enter the discovery surfaces (including JSON).
+fn metadata_row(rows: &[Sourced], s: &Sourced) -> serde_json::Value {
+    use serde_json::json;
+    let item = match &s.row.item {
+        WaitItem::Message {
+            handle,
+            from,
+            repo,
+            requires_reply,
+            reply_route,
+            ..
+        } => json!({"kind":"message", "handle":handle, "from":from, "repo":repo,
+                "requires_reply":requires_reply, "reply_route":reply_route}),
+        WaitItem::CommandEvent {
+            name,
+            id,
+            event,
+            failure,
+            requires_reply,
+            ..
+        } => json!({"kind":"command_event", "name":name, "id":id, "event":event,
+                "failure":failure, "requires_reply":requires_reply}),
+        WaitItem::TimerEvent {
+            name,
+            id,
+            due_at,
+            recurrence,
+            ..
+        } => json!({"kind":"timer_event", "name":name, "id":id, "due_at":due_at,
+                "recurrence":recurrence}),
+        WaitItem::GithubEvent {
+            repo,
+            event,
+            detail,
+            number,
+            actor,
+            url,
+            ..
+        } => json!({"kind":"github_event", "repo":repo, "event":event, "detail":detail,
+                "number":number, "actor":actor, "url":url}),
+        WaitItem::DraftChanged {
+            pr,
+            comment,
+            path,
+            change,
+            revision,
+            ..
+        } => json!({"kind":"draft_changed", "pr":pr, "comment":comment, "path":path,
+                "change":change, "revision":revision}),
+        other => json!({"kind":other.kind().as_str()}),
+    };
+    let mut value = json!({"id":display_id(rows,s).to_string(), "source":s.source,
+        "seq":s.row.seq, "at":s.row.at, "transport":s.row.transport,
+        "acked":s.row.acked, "ident":s.row.ident, "item":item});
+    let fields = value.as_object_mut().unwrap();
+    if let Some(at) = s.row.woken_at {
+        fields.insert("woken_at".into(), json!(at));
+    }
+    if let Some(at) = s.row.event_at {
+        fields.insert("event_at".into(), json!(at));
+    }
+    if let Some(id) = &s.row.feed_id {
+        fields.insert("feed_id".into(), json!(id));
+    }
+    if let Some(key) = &s.row.action_key {
+        fields.insert("action_key".into(), json!(key));
+    }
+    if s.row.baseline {
+        fields.insert("baseline".into(), json!(true));
+    }
+    if s.row.interrupt {
+        fields.insert("interrupt".into(), json!(true));
+    }
+    if let Some(attempt) = &s.row.interrupt_attempt {
+        fields.insert("interrupt_attempt".into(), json!(attempt));
+    }
+    if s.row.reply.is_some() {
+        fields.insert("reply_accepted".into(), json!(s.row.reply_accepted));
+    }
+    if s.row.message_history_pruned {
+        fields.insert("message_history_pruned".into(), json!(true));
+    }
+    if !s.row.message_replies.is_empty() {
+        fields.insert(
+            "message_replies".into(),
+            json!(
+                s.row
+                    .message_replies
+                    .iter()
+                    .map(|r| json!({"id":r.operation.id, "route":r.operation.route,
+                "acknowledge":r.operation.acknowledge,"accepted":r.receipt.is_some()}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    value
+}
+fn metadata_description(item: &WaitItem) -> String {
+    let clean = |s: &str| crate::cli::status_tui::text::one_line(s, usize::MAX);
+    let Some(v) = item.event_view() else {
+        return item.kind().as_str().into();
+    };
+    format!(
+        "{}  {}{}",
+        clean(v.kind),
+        clean(v.source),
+        if v.requires_reply {
+            "  (reply required)"
+        } else {
+            ""
+        }
+    )
+}
+fn show_metadata(rows: Vec<Sourced>, id: &str, json: bool) -> anyhow::Result<()> {
+    let s = resolve(&rows, id)?;
+    // Detailed metadata uses the same allowlist as discovery; there is no
+    // full-content diagnostic escape hatch disguised as a non-receipted read.
+    println!("{}", serde_json::to_string_pretty(&metadata_row(&rows, s))?);
+    if !json {
+        println!(
+            "read content with: clank events read {}",
+            display_id(&rows, s)
+        );
+    }
+    Ok(())
+}
+
+fn list(rows: Vec<Sourced>, all: bool, json: bool) -> anyhow::Result<()> {
     let shown: Vec<&Sourced> = rows.iter().filter(|s| all || !s.row.acked).collect();
     if json {
-        let out: Vec<JsonRow> = shown.iter().map(|s| json_row(&rows, s, prompts)).collect();
+        let out: Vec<_> = shown.iter().map(|s| metadata_row(&rows, s)).collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -483,15 +617,11 @@ fn list(
             display_id(&rows, s),
             age(s.row.at),
             status,
-            describe(&s.row.item)
+            metadata_description(&s.row.item)
         );
-        // The watch's standing instructions ride under every event
-        // it produced (github-watch-prompts).
-        if let Some(p) = prompts.get(&s.source) {
-            println!("{:>10}  ↳ {}", "", crate::cli::wait::one_line(p, 300));
-        }
     }
-    println!("\nack with: clank events ack <id> …   (unacked events keep waking the wait)");
+    println!("\nread with: clank events read <id>   (records delivery without acknowledgement)");
+    println!("ack with: clank events ack <id> …   (unacked events keep waking the wait)");
     if shown.iter().any(|s| needs_reply(&s.row.item)) {
         println!("events marked reply required cannot be handled with a plain ack");
     }
@@ -672,63 +802,113 @@ fn shown_body(item: &WaitItem) -> Option<String> {
     (summary.as_deref() != Some(full.as_str())).then_some(full)
 }
 
-fn show(
-    rows: Vec<Sourced>,
+fn render_full(
+    rows: &[Sourced],
     prompts: &std::collections::HashMap<String, String>,
     id: &str,
     json: bool,
+    writer: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
-    let s = resolve(&rows, id)?;
+    let s = resolve(rows, id)?;
     if json {
-        println!(
+        writeln!(
+            writer,
             "{}",
-            serde_json::to_string_pretty(&json_row(&rows, s, prompts))?
-        );
+            serde_json::to_string_pretty(&json_row(rows, s, prompts))?
+        )?;
         return Ok(());
     }
-    println!("id:        {}", display_id(&rows, s));
-    println!("source:    {}", s.source);
-    println!("logged:    {} ago", age(s.row.at));
-    println!("transport: {:?}", s.row.transport);
-    println!(
+    writeln!(writer, "id:        {}", display_id(&rows, s))?;
+    writeln!(writer, "source:    {}", s.source)?;
+    writeln!(writer, "logged:    {} ago", age(s.row.at))?;
+    writeln!(writer, "transport: {:?}", s.row.transport)?;
+    writeln!(
+        writer,
         "status:    {}",
         if s.row.acked { "handled" } else { "UNHANDLED" }
-    );
+    )?;
     // The durable identities: which feed event this was (poll) and
     // which action key deduped it (either transport) — the state that
     // explains dedup/catch-up behavior (codex c009500).
     if let Some(fid) = &s.row.feed_id {
-        println!("feed id:   {fid}");
+        writeln!(writer, "feed id:   {fid}")?;
     }
     if let Some(key) = &s.row.action_key {
-        println!("action:    {key}");
+        writeln!(writer, "action:    {key}")?;
     }
-    println!("event:     {}", describe(&s.row.item));
+    writeln!(writer, "event:     {}", describe(&s.row.item))?;
     if needs_reply(&s.row.item) {
-        println!("reply:     required; plain acknowledgement is refused");
+        writeln!(
+            writer,
+            "reply:     required; plain acknowledgement is refused"
+        )?;
     }
     if let Some(reply) = &s.row.reply {
-        println!(
+        writeln!(
+            writer,
             "answer:    {}",
             sanitize_multiline(&reply.text).replace('\n', "\n           ")
-        );
-        println!("accepted:  {}", s.row.reply_accepted);
+        )?;
+        writeln!(writer, "accepted:  {}", s.row.reply_accepted)?;
+    }
+    if s.row.message_history_pruned {
+        writeln!(
+            writer,
+            "Reply history: older accepted replies were pruned; retained replies follow"
+        )?;
+    }
+    for state in &s.row.message_replies {
+        let op = &state.operation;
+        writeln!(
+            writer,
+            "operation: {} ({}, {})",
+            op.id,
+            if op.acknowledge {
+                "ack reply"
+            } else {
+                "deliberate reply"
+            },
+            if state.receipt.is_some() {
+                "accepted"
+            } else {
+                "pending"
+            }
+        )?;
+        writeln!(
+            writer,
+            "reply to:  {} ({})",
+            op.route.agent,
+            sanitize_multiline(&op.route.repo.display().to_string())
+        )?;
+        writeln!(
+            writer,
+            "reply:     {}",
+            sanitize_multiline(&op.text).replace('\n', "\n           ")
+        )?;
     }
     if let Some(url) = s.row.item.event_view().and_then(|v| v.github?.url) {
-        println!("url:       {url}");
+        writeln!(writer, "url:       {url}")?;
     }
     // The whole text, where the event line is only a summary of it.
     // `describe` is a LIST line and stays one; this is the surface for
     // reading what was actually sent, and a message has no other one.
     if let Some(clean) = shown_body(&s.row.item) {
-        println!("body:      {}", clean.replace('\n', "\n           "));
+        writeln!(
+            writer,
+            "body:      {}",
+            clean.replace('\n', "\n           ")
+        )?;
     }
     if let Some(p) = prompts.get(&s.source) {
         // Full text (multi-line preserved), but non-newline control
         // characters must not reach the terminal raw; continuation
         // lines align under the value column.
         let clean = sanitize_multiline(p);
-        println!("prompt:    {}", clean.replace('\n', "\n           "));
+        writeln!(
+            writer,
+            "prompt:    {}",
+            clean.replace('\n', "\n           ")
+        )?;
     }
     Ok(())
 }
@@ -744,6 +924,7 @@ mod tests {
         let mut healthy =
             crate::cli::github::log::EventLog::open(&dir, "timer-config-healthy").unwrap();
         let item = WaitItem::TimerEvent {
+            presentation: None,
             name: "healthy".into(),
             id: "timer/1".into(),
             due_at: 1,
@@ -770,6 +951,7 @@ mod tests {
         let dir = tempdir();
         let content = "Check \u{1b}[31mdeployment\u{1b}[0m\t\nReport result\r\nFull body";
         let timer = WaitItem::TimerEvent {
+            presentation: None,
             name: "deploy\nextra name".into(),
             recurrence: None,
             id: "timer/100".into(),
@@ -791,6 +973,7 @@ mod tests {
         let json = serde_json::to_value(json_row(&rows, row, &Default::default())).unwrap();
         assert_eq!(json["item"]["content"], content);
         let plain = WaitItem::TimerEvent {
+            presentation: None,
             name: "deploy".into(),
             recurrence: None,
             id: "timer/100".into(),
@@ -806,6 +989,7 @@ mod tests {
 
     fn item(n: u64) -> WaitItem {
         WaitItem::GithubEvent {
+            presentation: None,
             repo: "o/r".into(),
             event: "pr_comment".into(),
             detail: Some("review".into()),
@@ -900,6 +1084,7 @@ mod tests {
         let mut log = EventLog::open(&dir, key).unwrap();
         log.load();
         let draft = WaitItem::DraftChanged {
+            presentation: None,
             pr: 7,
             instance: 11,
             comment: Some(42),
@@ -1056,6 +1241,8 @@ mod tests {
             })
             .collect();
         let command = |id: &str, requires_reply| WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
             name: "questions".into(),
             id: id.into(),
             event: "question".into(),

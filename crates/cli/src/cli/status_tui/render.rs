@@ -945,7 +945,7 @@ pub(super) const MIN_EVENT_STATE_COLS: u16 = 20;
 /// Whether this event still wants someone, in a fixed
 /// [`MARK_FIELD`]-wide column at the start of the row's own spans.
 ///
-/// BOTH states are marked. Rendering "handled" as the absence of a
+/// All three lifecycle states are marked. Rendering "handled" as the absence of a
 /// mark made it identical to a row that simply says nothing about it,
 /// which is the whole defect: a timeline you have worked through was a
 /// wall of unmarked rows.
@@ -959,23 +959,19 @@ pub(super) const MIN_EVENT_STATE_COLS: u16 = 20;
 /// (`log::verdict_mark`), so it carries the right sense here. `✓`
 /// overlaps with an approved review, which is why this one is DIM and
 /// in a different column on a different row kind: the coloured `✓` of
-/// a verdict and the receding `✓` of a handled event never appear in
+/// a verdict and the receding `✓✓` of an acknowledged event never appear in
 /// the same place.
-fn event_mark(baseline: bool, unhandled: bool) -> Span {
-    let field = |glyph: &str| {
-        format!(
-            "{glyph}{}",
-            " ".repeat(MARK_FIELD.saturating_sub(display_width(glyph)))
-        )
-    };
-    match (baseline, unhandled) {
-        (true, _) => dim(field("")),
-        // Magenta ON PURPOSE: not the warning colour, because work you
-        // have not looked at yet is not a fault, and not the badge's
-        // cyan or a verdict's green/red, which already mean other
-        // things in this list.
-        (false, true) => colored("35", field("?")),
-        (false, false) => dim(field("✓")),
+fn event_mark(delivery: crate::cli::github::timeline::DeliveryState) -> Span {
+    use crate::cli::github::timeline::DeliveryState;
+    let glyph = delivery.glyph();
+    let field = format!(
+        "{glyph}{}",
+        " ".repeat((MARK_FIELD + 1).saturating_sub(display_width(glyph)))
+    );
+    match delivery {
+        DeliveryState::Unwoken => colored("35", field),
+        DeliveryState::Woken => colored("36", field),
+        _ => dim(field),
     }
 }
 
@@ -1006,6 +1002,7 @@ pub(super) fn log_row_spans(
         // agent's copy is unhandled (log-timeline-github-events).
         OnelineRow::Github {
             event_idx: _,
+            delivery,
             line,
             unhandled,
             baseline,
@@ -1016,7 +1013,7 @@ pub(super) fn log_row_spans(
             // Pre-watch history renders fully DIM — it's context, not
             // team activity (github-watch-resilience).
             let badge = crate::cli::log::badge_of(glyph.as_deref(), *backend);
-            let mut spans = vec![event_mark(*baseline, *unhandled)];
+            let mut spans = vec![event_mark(*delivery)];
             if *baseline {
                 spans.push(dim(format!("{badge} {line} (pre-watch)")));
             } else {
@@ -3007,13 +3004,7 @@ pub(super) fn render_event_detail(
     // The SAME glyphs the timeline row uses. A page that called this
     // state something else made the reader translate between two
     // surfaces describing one fact.
-    let state_hint = if ev.baseline {
-        "pre-watch history"
-    } else if ev.unhandled {
-        "? unanswered"
-    } else {
-        "✓ handled"
-    };
+    let state_hint = ev.delivery().label();
     // The row SAYS which backend produced it. Reading it off the
     // carve-out instead labelled a sparse github event — no url, no
     // number, no actor — as a command (codex 80e1fb9).
@@ -3108,6 +3099,44 @@ pub(super) fn render_event_detail(
         .unwrap_or_default();
     fact(&mut body, "event", format!("{}{detail}", clean(&ev.kind)));
     fact(&mut body, "age", crate::cli::events::age(ev.at));
+    let wrapped_fact = |body: &mut Vec<String>, key: &str, value: String| {
+        body.push(emit(&[dim(format!("  {key}"))], "", cols));
+        for line in super::text::wrap(&value, cols.saturating_sub(4).max(1)) {
+            body.push(emit(&[plain(format!("  {line}"))], "", cols));
+        }
+    };
+    for reply in &ev.outgoing {
+        wrapped_fact(
+            &mut body,
+            "from",
+            format!(
+                "{} ({})",
+                clean(&reply.from),
+                clean(&reply.from_repo.display().to_string())
+            ),
+        );
+        wrapped_fact(
+            &mut body,
+            "to",
+            format!(
+                "{} ({})",
+                clean(reply.destination.agent.as_str()),
+                clean(&reply.destination.repo.display().to_string())
+            ),
+        );
+        wrapped_fact(&mut body, "operation", clean(&reply.operation_id));
+        wrapped_fact(
+            &mut body,
+            "reply to",
+            format!(
+                "{}/{}@{} · {}",
+                clean(&reply.original.agent),
+                clean(&reply.original.source),
+                reply.original.seq,
+                clean(&reply.original_handle)
+            ),
+        );
+    }
     if let Some(r) = &ev.recurrence {
         body.push(emit(&[dim("  schedule".to_string())], "", cols));
         for line in super::text::wrap(
@@ -3178,13 +3207,11 @@ pub(super) fn render_event_detail(
         fact(&mut body, "url", clean(u));
     }
     body.push(String::new());
-    body.push(emit(&[dim("  copies".to_string())], "", cols));
+    if !ev.members.is_empty() {
+        body.push(emit(&[dim("  copies".to_string())], "", cols));
+    }
     for m in &ev.members {
-        let state = if m.acked {
-            "✓ handled"
-        } else {
-            "? unanswered"
-        };
+        let state = m.delivery().label();
         body.push(emit(
             &[plain(format!(
                 "    {}  {}@{}  {}  {}",
@@ -4026,6 +4053,37 @@ mod tests {
     /// survive drawing, because a row that loses it downstream is
     /// back to asking nothing -- and the selected row is drawn
     /// inverted, a different path from the dim one.
+    #[test]
+    fn all_delivery_states_keep_status_and_mail_badge_at_narrow_widths() {
+        use crate::cli::github::timeline::{Backend, DeliveryState};
+        use crate::cli::log::OnelineRow;
+        for delivery in [
+            DeliveryState::Unwoken,
+            DeliveryState::Woken,
+            DeliveryState::Acknowledged,
+        ] {
+            let row = OnelineRow::Github {
+                event_idx: 0,
+                delivery,
+                line: "message coordinator  Question".into(),
+                unhandled: delivery != DeliveryState::Acknowledged,
+                baseline: false,
+                at: 100,
+                backend: Backend::Message,
+                glyph: None,
+            };
+            for cols in [8, 12, 24, 80] {
+                let spans = log_row_spans(&row, 0, &Default::default(), cols);
+                let text = visible(&emit(&spans, "", cols));
+                assert!(
+                    text.contains(delivery.glyph()) && text.contains('✉'),
+                    "{delivery:?} {cols}: {text}"
+                );
+                assert!(display_width(&text) <= cols);
+            }
+        }
+    }
+
     #[test]
     fn the_remote_icon_carries_its_selector_into_every_row_state() {
         use crate::cli::status_tui::remote::Shown::*;
@@ -4888,6 +4946,7 @@ mod tests {
             );
         }
         let voice = [MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 190,
             backend: Backend::Command,
@@ -7689,6 +7748,7 @@ mod tests {
         use clank_core::wait::ContentRef;
 
         let ev = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 0,
             backend: crate::cli::github::timeline::Backend::Github,
@@ -7706,6 +7766,7 @@ mod tests {
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
                 key: crate::cli::github::timeline::MemberKey {
                     agent: "alpha".into(),
                     source: "github-o-r-aaaa".into(),
@@ -7718,8 +7779,8 @@ mod tests {
             }],
         };
         let mut ep = super::super::input::EventPage {
-            target: ev.members[0].key.clone(),
-            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
             event: ev,
             prompts: Vec::new(),
             scroll: 0,
@@ -7770,11 +7831,11 @@ mod tests {
             .unwrap();
         let event = timeline::timeline_snapshot(repo.path()).events.remove(0);
         let ep = super::super::input::EventPage {
-            target: event.members[0].key.clone(),
+            target: event.members[0].key.clone().into(),
             retained: event
                 .members
                 .iter()
-                .map(|member| member.key.clone())
+                .map(|member| member.key.clone().into())
                 .collect(),
             event,
             prompts: Vec::new(),
@@ -7807,6 +7868,7 @@ mod tests {
                 None,
                 Some(100),
                 &clank_core::wait::WaitItem::TimerEvent {
+                    presentation: None,
                     name: "deploy".into(),
                     recurrence: None,
                     id: "timer/100".into(),
@@ -7822,8 +7884,8 @@ mod tests {
             }
             let ev = timeline::timeline_snapshot(repo.path()).events.remove(0);
             let ep = super::super::input::EventPage {
-                target: ev.members[0].key.clone(),
-                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                target: ev.members[0].key.clone().into(),
+                retained: ev.page_keys(),
                 event: ev,
                 prompts: Vec::new(),
                 scroll: 0,
@@ -7835,7 +7897,11 @@ mod tests {
             assert!(text.contains("Check deployment"), "{text}");
             assert!(text.contains("Report result"), "{text}");
             assert!(
-                text.contains(if acked { "✓ handled" } else { "? unanswered" }),
+                text.contains(if acked {
+                    "✓✓ acknowledged"
+                } else {
+                    "? not woken"
+                }),
                 "{text}"
             );
             assert!(
@@ -7854,6 +7920,7 @@ mod tests {
     fn a_body_bearing_event_shows_all_of_it() {
         let text = "# Rebase please\n\nonto master, then run the suite.\n\nThanks.";
         let mut ev = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 0,
             backend: crate::cli::github::timeline::Backend::Message,
@@ -7871,6 +7938,7 @@ mod tests {
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
                 key: crate::cli::github::timeline::MemberKey {
                     agent: "grok".into(),
                     source: "messages".into(),
@@ -7884,8 +7952,8 @@ mod tests {
         };
         let page = |ev: &crate::cli::github::timeline::MergedEvent| {
             let ep = super::super::input::EventPage {
-                target: ev.members[0].key.clone(),
-                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                target: ev.members[0].key.clone().into(),
+                retained: ev.page_keys(),
                 event: ev.clone(),
                 prompts: Vec::new(),
                 scroll: 0,
@@ -7935,6 +8003,7 @@ mod tests {
     fn a_command_events_content_keeps_its_lines() {
         let page = |content: &str, cols: usize| {
             let ev = crate::cli::github::timeline::MergedEvent {
+                outgoing: Vec::new(),
                 recurrence: None,
                 at: 0,
                 backend: crate::cli::github::timeline::Backend::Command,
@@ -7952,6 +8021,7 @@ mod tests {
                 unhandled: true,
                 baseline: false,
                 members: vec![crate::cli::github::timeline::MemberRef {
+                    woken_at: None,
                     key: crate::cli::github::timeline::MemberKey {
                         agent: "claude".into(),
                         source: "command-deploys-0000abcd".into(),
@@ -7964,8 +8034,8 @@ mod tests {
                 }],
             };
             let ep = super::super::input::EventPage {
-                target: ev.members[0].key.clone(),
-                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                target: ev.members[0].key.clone().into(),
+                retained: ev.page_keys(),
                 event: ev,
                 prompts: Vec::new(),
                 scroll: 0,
@@ -8084,6 +8154,7 @@ mod tests {
     #[test]
     fn the_event_page_renders_a_command_event_without_githubs_extras() {
         let ev = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 0,
             backend: crate::cli::github::timeline::Backend::Command,
@@ -8101,6 +8172,7 @@ mod tests {
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
                 key: crate::cli::github::timeline::MemberKey {
                     agent: "claude".into(),
                     source: "command-deploys-0000abcd".into(),
@@ -8113,8 +8185,8 @@ mod tests {
             }],
         };
         let ep = super::super::input::EventPage {
-            target: ev.members[0].key.clone(),
-            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
             event: ev,
             prompts: Vec::new(),
             scroll: 0,
@@ -8171,11 +8243,13 @@ mod tests {
                 seq: 3,
                 ident: "f:1".into(),
             },
+            woken_at: None,
             acked,
             transport,
             content: None,
         };
         let ev = MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 1,
             backend: crate::cli::github::timeline::Backend::Github,
@@ -8198,8 +8272,8 @@ mod tests {
             ],
         };
         let ep = super::super::input::EventPage {
-            target: ev.members[0].key.clone(),
-            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
             event: ev,
             prompts: vec![
                 (Some("alpha".into()), "triage and reply".into()),
@@ -8221,11 +8295,11 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("alpha  github-o-r-aaaa@3  poll  ? unanswered"),
+            text.contains("alpha  github-o-r-aaaa@3  poll  ? not woken"),
             "{text}"
         );
         assert!(
-            text.contains("beta  github-o-r-aaaa@3  relay  ✓ handled"),
+            text.contains("beta  github-o-r-aaaa@3  relay  ✓✓ acknowledged"),
             "{text}"
         );
         assert!(text.contains("[alpha] triage and reply"), "{text}");
@@ -8553,6 +8627,13 @@ mod tests {
         use crate::cli::log::OnelineRow;
         let now = crate::age::now();
         let ev = |line: &str, unhandled: bool, baseline: bool, backend| OnelineRow::Github {
+            delivery: if baseline {
+                crate::cli::github::timeline::DeliveryState::History
+            } else if unhandled {
+                crate::cli::github::timeline::DeliveryState::Unwoken
+            } else {
+                crate::cli::github::timeline::DeliveryState::Acknowledged
+            },
             event_idx: 0,
             line: line.into(),
             unhandled,
@@ -8577,8 +8658,11 @@ mod tests {
         let cmd = visible(line_with(&out, "a thing happened"));
 
         // Both states are MARKED. Neither is the absence of the other.
-        assert!(wants.contains("? gh"), "unanswered must say so: {wants:?}");
-        assert!(handled.contains("✓ gh"), "handled must say so: {handled:?}");
+        assert!(wants.contains("?  gh"), "unanswered must say so: {wants:?}");
+        assert!(
+            handled.contains("✓✓ gh"),
+            "handled must say so: {handled:?}"
+        );
         assert!(
             prewatch.contains("  gh") && !prewatch.contains('?') && !prewatch.contains('✓'),
             "pre-watch was never anyone's to answer, so it carries no mark: {prewatch:?}",
@@ -8589,7 +8673,7 @@ mod tests {
         );
 
         // The same marks mean the same thing on a command source.
-        assert!(cmd.contains("? cmd"), "a cmd event marks alike: {cmd:?}");
+        assert!(cmd.contains("?  cmd"), "a cmd event marks alike: {cmd:?}");
 
         // The marks land in ONE column across rows whose describe
         // lines differ in length.
@@ -8657,6 +8741,60 @@ mod tests {
     /// chain — copies to `unhandled`, `any(!acked)` — is merge()'s,
     /// and timeline.rs pins it there.
     #[test]
+    fn outgoing_reply_has_sent_marker_and_reachable_wrapped_details() {
+        use crate::cli::github::timeline;
+        use crate::cli::status_tui::input::{EventAction, EventPage};
+        let (repo, _external, _source, _target, op) = timeline::tests::reply_fixture(false, true);
+        let snapshot = timeline::timeline_snapshot(repo.path());
+        let event = snapshot
+            .events
+            .iter()
+            .find(|e| !e.outgoing.is_empty())
+            .unwrap();
+        let items = vec![crate::cli::log::TimelineItem::Github(0, event)];
+        let rows =
+            crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
+        for width in [1, usize::from(super::MIN_EVENT_STATE_COLS), 80] {
+            let spans = log_row_spans(&rows[0], 0, &Default::default(), width);
+            assert!(spans[0].1.contains('→'));
+            assert!(!spans[0].1.contains('✓'));
+        }
+        let page = EventPage {
+            target: event.page_keys().remove(0),
+            retained: event.page_keys(),
+            event: event.clone(),
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+        for width in [24, 80] {
+            let (lines, _) = render_event_detail(&page, &[EventAction::Back], 0, 300, width);
+            let text: String = lines
+                .iter()
+                .map(|line| visible(line))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.contains("coordinator"), "{text}");
+            assert!(text.contains(&op.id), "{text}");
+            assert!(text.contains("parent-handle"), "{text}");
+            assert!(text.contains("Answer β."), "{text}");
+            assert!(
+                text.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains("Keep this whitespace."),
+                "{text}"
+            );
+            assert!(!text.contains("handled") && !text.contains("unanswered"));
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&visible(line)) <= width)
+            );
+        }
+    }
+
+    #[test]
     fn the_row_follows_the_copies_that_are_still_owed() {
         use crate::cli::github::timeline::{Backend, MemberKey, MemberRef, MergedEvent};
         let member = |agent: &str, acked: bool| MemberRef {
@@ -8666,11 +8804,13 @@ mod tests {
                 seq: 1,
                 ident: "i".into(),
             },
+            woken_at: None,
             acked,
             transport: crate::cli::github::log::Transport::Poll,
             content: None,
         };
         let event = |members: Vec<MemberRef>| MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             backend: Backend::Github,
             glyph: None,
@@ -8708,13 +8848,13 @@ mod tests {
 
         // The LAST copy acks: the row flips, with no other change.
         let all = event(vec![member("alpha", true), member("beta", true)]);
-        assert_eq!(mark_of(&all), "✓", "the last ack settles the row");
+        assert_eq!(mark_of(&all), "✓✓", "the last ack settles the row");
 
         // And the page says the same words about the same two events.
-        for (ev, want) in [(&mixed, "? unanswered"), (&all, "✓ handled")] {
+        for (ev, want) in [(&mixed, "? not woken"), (&all, "✓✓ acknowledged")] {
             let page = super::super::input::EventPage {
-                target: ev.members[0].key.clone(),
-                retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+                target: ev.members[0].key.clone().into(),
+                retained: ev.page_keys(),
                 event: (*ev).clone(),
                 prompts: Vec::new(),
                 scroll: 0,

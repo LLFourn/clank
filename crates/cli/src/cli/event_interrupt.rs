@@ -248,6 +248,9 @@ mod tests {
             Some(id),
             None,
             &WaitItem::Message {
+                presentation: None,
+                requires_reply: false,
+                reply_route: None,
                 handle: id.into(),
                 from: None,
                 repo: None,

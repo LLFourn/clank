@@ -127,7 +127,7 @@ impl Coordinator {
     /// event's single atomic WAL record (inbox when emitting, obs when
     /// the other path already emitted the action), THEN emits. Returns
     /// false when the wait side is gone (the caller should stop).
-    fn gate(&mut self, c: Classified, transport: crate::cli::github::log::Transport) -> bool {
+    fn gate(&mut self, mut c: Classified, transport: crate::cli::github::log::Transport) -> bool {
         // Keyless wakes skip the dedup entirely: never dedup.
         if let Some(k) = &c.key {
             if self.keys.as_btree().contains(k) {
@@ -142,12 +142,12 @@ impl Coordinator {
         // the log cannot work out whether this one is in it, and the
         // existing behaviour on a failed append is to warn once and
         // keep delivering so the agent still learns about the event.
-        let durability = self.wal.interruptible_inbox(
+        let durability = self.wal.selected_inbox(
             transport,
             c.feed_id.as_deref(),
             c.key.as_deref(),
             c.event_at,
-            &c.item,
+            &mut c.item,
             self.interrupt,
         );
         self.tx.send((c.item, durability)).is_ok()
@@ -316,11 +316,14 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
                 continue;
             }
             // Read back OUT of the log, so the log has it.
+            let mut item = entry.item.clone();
+            item.set_presentation(clank_core::wait::EventPresentation {
+                source: l.source_key().to_owned(),
+                seq: entry.seq,
+                ident: entry.ident.clone(),
+            });
             if tx
-                .send((
-                    entry.item.clone(),
-                    crate::cli::event_source::Durability::Logged,
-                ))
+                .send((item, crate::cli::event_source::Durability::Logged))
                 .is_err()
             {
                 return; // wait gone
@@ -2045,6 +2048,7 @@ mod tests {
         {
             let mut log = open_log(&dir);
             let item = WaitItem::GithubEvent {
+                presentation: None,
                 repo: "o/r".into(),
                 event: "issue_opened".into(),
                 detail: None,
@@ -3036,7 +3040,16 @@ mod tests {
         // WAL-first: the emitted event is durably unhandled.
         let loaded = open_log(&dir).load();
         assert_eq!(loaded.unhandled.len(), 1);
-        assert_eq!(loaded.unhandled[0].item, woke.0, "byte-faithful record");
+        let mut expected = loaded.unhandled[0].item.clone();
+        assert!(
+            expected.presentation().is_none(),
+            "selection is not WAL payload"
+        );
+        expected.set_presentation(woke.0.presentation().unwrap().clone());
+        assert_eq!(
+            expected, woke.0,
+            "payload preserved with exact selected copy"
+        );
         run2.abort();
         let _ = run2.await;
     }
@@ -3088,7 +3101,9 @@ mod tests {
             .await
             .expect("backlog wakes the arm")
             .expect("open");
-        assert_eq!(woke.0, classified(9, Some("issue#9")).item);
+        let mut expected = classified(9, Some("issue#9")).item;
+        expected.set_presentation(woke.0.presentation().unwrap().clone());
+        assert_eq!(woke.0, expected);
         run.abort();
         let _ = run.await;
 

@@ -117,6 +117,23 @@ pub struct CommandReplyRoute {
     pub state_dir: Option<std::path::PathBuf>,
 }
 
+/// Concrete message reply destination, captured before delivery. Role changes
+/// cannot retarget an obligation to another master.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReplyRoute {
+    pub repo: std::path::PathBuf,
+    pub agent: AgentLabel,
+}
+
+/// Exact WAL copy selected by a delivery owner. This is transient transport
+/// metadata, never producer input or evidence that a wake has occurred.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EventPresentation {
+    pub source: String,
+    pub seq: u64,
+    pub ident: String,
+}
+
 /// Flat tagged list `wait` returns from one refold round.
 /// Empty list at the call site means "no outcome, keep blocking."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +180,8 @@ pub enum WaitItem {
     /// agent's own message log, never by `work_for`. Returned on every
     /// arm until it is acked, like every other event.
     Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<EventPresentation>,
         /// The message's identity within its recipient — a minted id
         /// for a new send, the old inbox file's stem for a migrated
         /// one. Unique per recipient, which is what keeps two agents'
@@ -181,6 +200,10 @@ pub enum WaitItem {
         /// anywhere, so this record is the only copy: a body that is
         /// not here was not sent.
         body: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        requires_reply: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_route: Option<MessageReplyRoute>,
         /// What to pass `clank events ack` to finish this one.
         ///
         /// Stamped at PRESENTATION time from the row's own sequence,
@@ -193,6 +216,8 @@ pub enum WaitItem {
     /// CLI's external source tasks, never by `work_for`. A GitHub
     /// event on a watched repo…
     GithubEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<EventPresentation>,
         /// `owner/name` of the watched repo.
         repo: String,
         /// The configured sub-kind that fired (`pr_opened`, …).
@@ -223,6 +248,8 @@ pub enum WaitItem {
     /// The deadline is provenance;
     /// the qualified selector addresses its authoritative WAL row.
     TimerEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<EventPresentation>,
         name: String,
         id: String,
         due_at: u64,
@@ -234,6 +261,12 @@ pub enum WaitItem {
     },
     /// A producer's line, deduplicated by its ID within the source.
     CommandEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<EventPresentation>,
+        /// Execution context captured by the source host, never by its producer.
+        /// Explicit CLI reads use it for receipt callbacks after restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_cwd: Option<std::path::PathBuf>,
         /// The configured source name — what the row is labelled with.
         name: String,
         /// The producer's own id, the dedup identity. Compared for
@@ -288,6 +321,8 @@ pub enum WaitItem {
     /// agents' own changes with, and every stand-in for it erases the
     /// operator's edits too (codex ce892ea).
     DraftChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<EventPresentation>,
         pr: u32,
         /// Which RUN of that PR's review this belongs to. Revisions
         /// restart at 1 for each run, so `(pr, revision)` is ambiguous
@@ -350,6 +385,29 @@ pub enum WaitItem {
         round: u64,
         next: PrMasterNext,
     },
+}
+
+impl WaitItem {
+    pub fn presentation(&self) -> Option<&EventPresentation> {
+        match self {
+            Self::Message { presentation, .. }
+            | Self::GithubEvent { presentation, .. }
+            | Self::TimerEvent { presentation, .. }
+            | Self::CommandEvent { presentation, .. }
+            | Self::DraftChanged { presentation, .. } => presentation.as_ref(),
+            _ => None,
+        }
+    }
+    pub fn set_presentation(&mut self, key: EventPresentation) {
+        match self {
+            Self::Message { presentation, .. }
+            | Self::GithubEvent { presentation, .. }
+            | Self::TimerEvent { presentation, .. }
+            | Self::CommandEvent { presentation, .. }
+            | Self::DraftChanged { presentation, .. } => *presentation = Some(key),
+            _ => {}
+        }
+    }
 }
 
 /// The `kind` tag on a [`WaitItem`], as a closed set
@@ -572,6 +630,7 @@ impl WaitItem {
                 github: None,
             }),
             WaitItem::GithubEvent {
+                presentation: _,
                 repo,
                 event,
                 detail,
@@ -651,6 +710,7 @@ impl WaitItem {
                 subject,
                 body,
                 selector,
+                requires_reply,
                 ..
             } => Some(EventView {
                 source: from.as_deref().unwrap_or("a person"),
@@ -661,7 +721,7 @@ impl WaitItem {
                 instructions: None,
                 selector: selector.as_deref(),
                 failure: false,
-                requires_reply: false,
+                requires_reply: *requires_reply,
                 recurrence: None,
                 github: None,
             }),

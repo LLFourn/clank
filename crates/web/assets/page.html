@@ -2239,6 +2239,7 @@
       const main = r.kind === 'header' ? link(r, esc(r.text))
         : r.kind === 'commit' ? `<span class="glyph">${esc(r.glyph || '')}</span>${link(r, `<span class="sha">${esc(r.sha || '')}</span>`)} ${r.stands_for ? `<span class="plan">${esc(r.stands_for)}</span>` : esc(r.text)}`
         : r.kind === 'review' ? `<span class="glyph ${esc(r.verdict_class || '')}">${esc(r.glyph || '')}</span>${link(r, `<span class="author">${esc(r.author || '')}</span>`)}${r.text ? ': ' + esc(r.text) : ''}`
+        : r.kind === 'github' ? `<span class="glyph">${esc(r.glyph || '')}</span>${esc(r.text)}`
         : esc(r.text);
       return `<div class="row ${r.kind}"><span class="main">${main}</span><span class="age">${esc(r.age || '')}</span></div>`;
     }).join('');

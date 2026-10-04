@@ -33,6 +33,9 @@ pub(super) async fn ack_with_reply(
         );
     }
     let selected = resolve(&rows, &ids[0])?;
+    if matches!(selected.row.item, WaitItem::Message { .. }) {
+        return super::message_reply::submit(repo, dir, selected, text, None, true);
+    }
     let WaitItem::CommandEvent {
         id, reply_route, ..
     } = &selected.row.item
@@ -518,6 +521,7 @@ mod tests {
             None,
             None,
             &WaitItem::GithubEvent {
+                presentation: None,
                 repo: "o/r".into(),
                 event: "pr_comment".into(),
                 detail: None,

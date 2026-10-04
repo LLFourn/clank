@@ -858,8 +858,11 @@ fn retarget_event_page(
     // DIFFERENT object: re-fetching on every refresh would re-issue
     // continuously while a failure persists (Contract 4) and would
     // discard a body already on screen.
-    let now =
-        crate::cli::github::timeline::resolve_content_ref(&ep.event.members, &ep.target).cloned();
+    let now = ep
+        .target
+        .member()
+        .and_then(|key| crate::cli::github::timeline::resolve_content_ref(&ep.event.members, key))
+        .cloned();
     let mut fetch = None;
     if content_needs_refetch(ep.content.as_ref().map(|c| &c.target), now.as_ref()) {
         ep.content = now.map(|target| {
@@ -922,12 +925,9 @@ fn refetch_event_page(
         return false;
     };
     for key in &p.retained {
-        if let Some(ev) = events
-            .iter()
-            .find(|e| e.members.iter().any(|m| &m.key == key))
-        {
+        if let Some(ev) = events.iter().find(|e| e.has_page_key(key)) {
             p.target = key.clone();
-            p.retained = ev.members.iter().map(|m| m.key.clone()).collect();
+            p.retained = ev.page_keys();
             p.event = ev.clone();
             return true;
         }
@@ -2439,9 +2439,19 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             age,
             page: None,
         },
-        OnelineRow::Github { line, .. } => LedgerRow {
+        OnelineRow::Github {
+            line,
+            backend,
+            glyph,
+            delivery,
+            ..
+        } => LedgerRow {
             kind: "github".into(),
-            glyph: None,
+            glyph: Some(format!(
+                "{} {}",
+                delivery.glyph(),
+                crate::cli::log::badge_of(glyph.as_deref(), *backend)
+            )),
             sha: None,
             text: line.clone(),
             author: None,
@@ -4562,13 +4572,16 @@ pub(crate) async fn run_tui(
                                 })) = seq.get(log.cursor)
                                 {
                                     if let Some(ev) = snapshot.github_events.get(*event_idx)
-                                        && let Some(first) = ev.members.first()
+                                        && let Some(first) = ev.page_keys().into_iter().next()
                                     {
-                                        let want =
-                                            crate::cli::github::timeline::resolve_content_ref(
-                                                &ev.members,
-                                                &first.key,
-                                            )
+                                        let want = first
+                                            .member()
+                                            .and_then(|key| {
+                                                crate::cli::github::timeline::resolve_content_ref(
+                                                    &ev.members,
+                                                    key,
+                                                )
+                                            })
                                             .cloned();
                                         let slot = want.map(|target| {
                                             content_generation += 1;
@@ -4584,12 +4597,8 @@ pub(crate) async fn run_tui(
                                             )
                                         });
                                         event_page = Some(EventPage {
-                                            target: first.key.clone(),
-                                            retained: ev
-                                                .members
-                                                .iter()
-                                                .map(|m| m.key.clone())
-                                                .collect(),
+                                            target: first,
+                                            retained: ev.page_keys(),
                                             event: ev.clone(),
                                             prompts: event_prompts(&repo, ev),
                                             scroll: 0,
@@ -5143,6 +5152,49 @@ pub(crate) mod tests {
     /// painted. The painted one is wrapped to the region and clipped
     /// to its height, which is how a reason arrives useless.
     #[test]
+    fn remote_ledger_preserves_three_delivery_markers_from_actual_wal() {
+        use crate::cli::github::timeline::{self, DeliveryState};
+        let (repo, _, mut log, _, _) = timeline::tests::reply_fixture(false, true);
+        let row = log.read_rows().unwrap().unwrap().rows.remove(0);
+        let key = clank_core::wait::EventPresentation {
+            source: "messages".into(),
+            seq: row.seq,
+            ident: row.ident.clone(),
+        };
+        for state in [
+            DeliveryState::Unwoken,
+            DeliveryState::Woken,
+            DeliveryState::Acknowledged,
+        ] {
+            if state == DeliveryState::Woken {
+                log.append_presentations(&[key.clone()], 123, || true)
+                    .unwrap();
+            }
+            if state == DeliveryState::Acknowledged {
+                log.append_checked_ack(key.seq, &key.ident).unwrap();
+            }
+            let snapshot = timeline::timeline_snapshot(repo.path());
+            let items = crate::cli::log::interleave(&[], &snapshot.events);
+            let rows = crate::cli::log::oneline_items_rows(
+                &items,
+                &Default::default(),
+                &Default::default(),
+            );
+            let web = ledger_rows(&rows);
+            let row = web
+                .iter()
+                .find(|r| r.text.contains("Original question"))
+                .unwrap();
+            assert_eq!(
+                row.glyph.as_deref(),
+                Some(format!("{} ✉", state.glyph()).as_str())
+            );
+            let sent = web.iter().find(|r| r.text.contains("sent →")).unwrap();
+            assert_eq!(sent.glyph.as_deref(), Some("→ ✉"));
+        }
+    }
+
+    #[test]
     fn copying_takes_the_whole_reason_not_the_window() {
         let long = format!(
             "not reachable through the tunnel: {}",
@@ -5290,6 +5342,7 @@ pub(crate) mod tests {
                 seq,
                 ident: ident.into(),
             },
+            woken_at: None,
             acked,
             transport: crate::cli::github::log::Transport::Poll,
             content: None,
@@ -5300,6 +5353,7 @@ pub(crate) mod tests {
         members: Vec<crate::cli::github::timeline::MemberRef>,
     ) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
             recurrence: None,
             at: 1,
             backend: crate::cli::github::timeline::Backend::Github,
@@ -5324,8 +5378,8 @@ pub(crate) mod tests {
     fn mk_page() -> EventPage {
         let ev = mk_event(vec![mk_member("alpha", 1, "f:1", false)]);
         EventPage {
-            target: ev.members[0].key.clone(),
-            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
             event: ev,
             prompts: Vec::new(),
             scroll: 0,
@@ -5418,8 +5472,8 @@ pub(crate) mod tests {
         let mut ev = mk_event(vec![mk_member("alpha", 1, "f:1", false), handled]);
         ev.url = Some("https://github.com/o/r/pull/12".into());
         let ep = EventPage {
-            target: ev.members[0].key.clone(),
-            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
             event: ev,
             prompts: Vec::new(),
             scroll: 0,
@@ -5465,8 +5519,8 @@ pub(crate) mod tests {
         ev.number = Some(602);
         ev.url = Some("https://github.com/o/r/pull/602#discussion_r7".into());
         let ep = EventPage {
-            target: ev.members[0].key.clone(),
-            retained: ev.members.iter().map(|m| m.key.clone()).collect(),
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
             event: ev,
             prompts: Vec::new(),
             scroll: 0,
@@ -5793,6 +5847,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn outgoing_reply_page_survives_refresh_without_ack_or_remote_content_requests() {
+        use crate::cli::github::timeline;
+        let (repo, _external, _source, _target, op) = timeline::tests::reply_fixture(false, true);
+        let snapshot = timeline::timeline_snapshot(repo.path());
+        let event = snapshot
+            .events
+            .iter()
+            .find(|e| !e.outgoing.is_empty())
+            .unwrap();
+        let mut page = Some(EventPage {
+            target: event.page_keys().remove(0),
+            retained: event.page_keys(),
+            event: event.clone(),
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        });
+        assert_eq!(actions_for(page.as_ref().unwrap()), vec![EventAction::Back]);
+        let mut generation = 0;
+        let result =
+            retarget_event_page(&mut page, &snapshot.events, repo.path(), 0, &mut generation)
+                .unwrap();
+        assert!(result.fetch.is_none());
+        assert_eq!(generation, 0);
+        assert_eq!(
+            page.as_ref().unwrap().event.body.as_deref(),
+            Some(op.text.as_str())
+        );
+        let items = vec![crate::cli::log::TimelineItem::Github(0, event)];
+        let rows =
+            crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
+        let ledger = ledger_rows(&rows);
+        assert_eq!(ledger[0].glyph.as_deref(), Some("→ ✉"));
+        assert!(ledger[0].text.contains("sent → coordinator"));
+        assert_eq!(
+            ledger[0].page, None,
+            "outbound is not a git plan/commit page"
+        );
+        assert!(!refetch_event_page(&mut page, &[]));
+        assert!(
+            page.is_none(),
+            "only disappearance of retained identities closes the page"
+        );
+    }
+
+    #[test]
     fn event_page_retargets_through_the_retained_set() {
         // The retarget contract (tui-github-event-page): first
         // surviving retained key wins — including across a component
@@ -5801,8 +5901,8 @@ pub(crate) mod tests {
         let a = mk_member("alpha", 1, "f:1", false);
         let b = mk_member("beta", 1, "f:1", false);
         let mut page = Some(EventPage {
-            target: a.key.clone(),
-            retained: vec![a.key.clone(), b.key.clone()],
+            target: a.key.clone().into(),
+            retained: vec![a.key.clone().into(), b.key.clone().into()],
             event: mk_event(vec![a.clone(), b.clone()]),
             prompts: Vec::new(),
             scroll: 0,
@@ -5813,14 +5913,22 @@ pub(crate) mod tests {
         let fresh = vec![mk_event(vec![b.clone()])];
         assert!(refetch_event_page(&mut page, &fresh));
         let p = page.as_ref().unwrap();
-        assert_eq!(p.target, b.key, "retargeted to the first surviving key");
-        assert_eq!(p.retained, vec![b.key.clone()], "retained set refreshed");
+        assert_eq!(
+            p.target,
+            b.key.clone().into(),
+            "retargeted to the first surviving key"
+        );
+        assert_eq!(
+            p.retained,
+            vec![b.key.clone().into()],
+            "retained set refreshed"
+        );
 
         // SPLIT: alpha and beta now live in SEPARATE components; a
         // page retaining both follows the FIRST retained key's side.
         let mut split_page = Some(EventPage {
-            target: a.key.clone(),
-            retained: vec![a.key.clone(), b.key.clone()],
+            target: a.key.clone().into(),
+            retained: vec![a.key.clone().into(), b.key.clone().into()],
             event: mk_event(vec![a.clone(), b.clone()]),
             prompts: Vec::new(),
             scroll: 0,
@@ -5829,8 +5937,12 @@ pub(crate) mod tests {
         let split = vec![mk_event(vec![b.clone()]), mk_event(vec![a.clone()])];
         assert!(refetch_event_page(&mut split_page, &split));
         let p = split_page.as_ref().unwrap();
-        assert_eq!(p.target, a.key, "first-key wins picks alpha's side");
-        assert_eq!(p.retained, vec![a.key.clone()]);
+        assert_eq!(
+            p.target,
+            a.key.clone().into(),
+            "first-key wins picks alpha's side"
+        );
+        assert_eq!(p.retained, vec![a.key.clone().into()]);
 
         // Everything gone → closed.
         assert!(!refetch_event_page(&mut page, &[]));

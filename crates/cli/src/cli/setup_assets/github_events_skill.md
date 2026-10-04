@@ -37,12 +37,13 @@ idempotently and acking promptly is the discipline.
 ## Inspecting the inbox
 
 ```sh
-clank events list            # unhandled events
+clank events list            # unhandled metadata
 clank events list --all -j   # everything, machine-readable
-clank events show <id>       # one full record (url, transport, age)
+clank events show <id>       # one metadata record (url, transport, age)
+clank events read <id>       # full content; records delivery to your bound session
 ```
 
-`list`/`show` display the watch's `prompt` (its standing
+`read` displays the watch's `prompt` (its standing
 instructions) with each event — including events logged before the
 prompt was written: it is joined from the CURRENT config at render
 time, never stored in the log.

@@ -529,6 +529,8 @@ pub(super) mod fixtures {
             .unwrap();
             let id = "utt/a/雪\n\"$()".to_string();
             let mut item = WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
                 name: source.name.clone(),
                 id: id.clone(),
                 event: "voice".into(),
@@ -559,6 +561,14 @@ pub(super) mod fixtures {
                     &item,
                 )
                 .unwrap();
+            item.set_presentation(log.presentation_key(
+                seq,
+                super::super::github::log::Transport::Command,
+                None,
+                None,
+                None,
+                &item,
+            ));
             let selector = format!("{key}@{seq}");
             if let WaitItem::CommandEvent { selector: slot, .. } = &mut item {
                 *slot = Some(selector.clone());
@@ -698,7 +708,13 @@ mod tests {
         assert!(fixture.prepared().diagnostics.0.is_empty());
         assert_eq!(fixture.rows()[0].item, {
             let mut item = fixture.item.clone();
-            if let clank_core::wait::WaitItem::CommandEvent { selector, .. } = &mut item {
+            if let clank_core::wait::WaitItem::CommandEvent {
+                selector,
+                presentation,
+                ..
+            } = &mut item
+            {
+                *presentation = None;
                 *selector = None;
             }
             item

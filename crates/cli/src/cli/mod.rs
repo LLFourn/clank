@@ -50,6 +50,7 @@ pub mod pick;
 pub(crate) mod plan_mutation;
 pub mod plan_resolve;
 pub mod pr_review;
+mod presentation;
 pub mod purge;
 pub mod queue;
 pub mod rereview;
@@ -755,6 +756,12 @@ pub struct NudgeArgs {
 #[command(group(clap::ArgGroup::new("recipient").required(true).args(["to", "master"])))]
 #[command(group(clap::ArgGroup::new("body").required(true).args(["message", "file"])))]
 pub struct SendArgs {
+    /// Require a reply to this concrete agent in the invoking repo.
+    #[arg(long, value_name = "LABEL")]
+    pub reply_to: Option<String>,
+    /// Reply destination repo; defaults to the invoking repo, independently of --repo.
+    #[arg(long, value_name = "PATH", requires = "reply_to")]
+    pub reply_repo: Option<PathBuf>,
     /// Request best-effort interruption; the event remains pending if unavailable.
     #[arg(long)]
     pub interrupt: bool,
@@ -784,12 +791,16 @@ pub struct EventsArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum EventsCmd {
-    /// List logged github events (unhandled by default).
+    /// List event metadata without reading content (unhandled by default).
     List(EventsListArgs),
     /// Mark events handled so they stop waking you.
     Ack(EventsAckArgs),
-    /// Show one event's full record.
+    /// Send a deliberate message reply without acknowledging the original.
+    Reply(EventsReplyArgs),
+    /// Inspect one event's metadata without reading content.
     Show(EventsShowArgs),
+    /// Read an event's content and record delivery to your bound agent.
+    Read(EventsShowArgs),
 }
 
 #[derive(Args, Debug)]
@@ -822,6 +833,25 @@ pub struct EventsAckArgs {
     /// `<source>@<seq>` when several sources share a seq.
     #[arg(required = true, value_name = "ID")]
     pub ids: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("body").required(true).args(["message", "file"])))]
+pub struct EventsReplyArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+    /// Retry this retained operation; omit to send a new deliberate reply.
+    #[arg(long, value_name = "OP")]
+    pub operation: Option<String>,
+    #[arg(value_name = "ID")]
+    pub id: String,
+    #[arg(short = 'm', long = "message", value_name = "TEXT")]
+    pub message: Vec<String>,
+    /// Read reply text from PATH; - reads stdin.
+    #[arg(short = 'F', long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

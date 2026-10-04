@@ -28,7 +28,6 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 
 ## Messages (both roles)
 
-A `message` is an event like any other, and its wake names the
-selector: `clank events show <sel>`, act, then `clank events ack <sel>`
-(it re-wakes until you do). Reply naming the sender and repo it gave:
-`clank send [--repo P] (--to <label> | --master) -m "…"`.
+Use `clank events read <sel>` to read a message and record delivery; act, then
+`clank events ack <sel>` (it re-wakes until acked). `list`/`show` are metadata-only.
+Reply to its sender/repo with `clank send [--repo P] (--to <label> | --master) -m "…"`.

@@ -151,13 +151,30 @@ fn message_log(repo: &Path, label: &AgentLabel) -> std::io::Result<EventLog> {
     )
 }
 
+/// Allocation and append remain one local transaction for every message writer.
+/// The closure must return before accessing another repository.
+pub(crate) fn message_transaction<T>(
+    repo: &Path,
+    label: &AgentLabel,
+    f: impl FnOnce(&mut EventLog) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    anyhow::ensure!(
+        repo.is_dir(),
+        "message repository is unavailable: {}",
+        repo.display()
+    );
+    let _writer = message_writer_lock(repo, label)?;
+    let mut log = message_log(repo, label)?;
+    f(&mut log)
+}
+
 /// A name no other message will take.
 ///
 /// Minted rather than counted: `EventLog` is a handle on one (agent,
 /// source) pair and numbers only within it, so it cannot tell a send to
 /// one agent from a send to another. Random bytes need no allocator and
 /// no cross-agent state on the write path.
-fn mint_id() -> String {
+pub(crate) fn mint_id() -> String {
     let mut bytes = [0u8; 12];
     getrandom::fill(&mut bytes).expect("the OS can produce random bytes");
     bytes.iter().fold(String::new(), |mut s, b| {
@@ -208,6 +225,18 @@ pub fn deliver_with_interrupt(
     body: &str,
     interrupt: bool,
 ) -> anyhow::Result<String> {
+    deliver_with_options(repo, to, from, sent, body, interrupt, None)
+}
+
+pub fn deliver_with_options(
+    repo: &Path,
+    to: &AgentLabel,
+    from: Option<&Sender>,
+    sent: &str,
+    body: &str,
+    interrupt: bool,
+    reply_route: Option<&clank_core::wait::MessageReplyRoute>,
+) -> anyhow::Result<String> {
     let handle = mint_id();
     log_message_with_key(
         repo,
@@ -219,6 +248,7 @@ pub fn deliver_with_interrupt(
         body,
         None,
         interrupt,
+        reply_route,
     )
 }
 
@@ -234,7 +264,7 @@ fn log_message(
     at: Option<u64>,
 ) -> anyhow::Result<String> {
     let key = action_key(to, handle);
-    log_message_with_key(repo, to, handle, &key, from, sent, body, at, false)
+    log_message_with_key(repo, to, handle, &key, from, sent, body, at, false, None)
 }
 
 /// The same, under a caller-chosen action key. Migration needs its own
@@ -250,6 +280,7 @@ fn log_message_with_key(
     body: &str,
     at: Option<u64>,
     interrupt: bool,
+    reply_route: Option<&clank_core::wait::MessageReplyRoute>,
 ) -> anyhow::Result<String> {
     // Held across BOTH steps: reading the next sequence and writing at
     // it are one allocation, and a lock around only the write does not
@@ -258,11 +289,14 @@ fn log_message_with_key(
     let mut log = message_log(repo, to)?;
     log.load();
     let item = WaitItem::Message {
+        presentation: None,
         handle: handle.to_string(),
         from: from.map(|s| s.label.clone()),
         repo: from.map(|s| s.repo.display().to_string()),
         subject: first_line(body).to_string(),
         body: body.to_string(),
+        requires_reply: reply_route.is_some(),
+        reply_route: reply_route.cloned(),
         selector: None,
     };
     let at = at.or_else(|| parse_rfc3339_secs(sent));
@@ -368,6 +402,7 @@ pub fn migrate(repo: &Path, label: &AgentLabel) -> anyhow::Result<usize> {
                 &message.body,
                 at,
                 false,
+                None,
             )?;
         }
         std::fs::remove_file(&path).with_context(|| format!("removing `{}`", path.display()))?;
@@ -483,6 +518,11 @@ pub fn pending(repo: &Path, label: &AgentLabel) -> Vec<WaitItem> {
         .filter(|r| !r.acked)
         .filter_map(|row| {
             let mut item = row.item;
+            item.set_presentation(clank_core::wait::EventPresentation {
+                source: MESSAGES_SOURCE.into(),
+                seq: row.seq,
+                ident: row.ident,
+            });
             let WaitItem::Message { selector, .. } = &mut item else {
                 return None;
             };
@@ -550,6 +590,8 @@ mod tests {
         let woken = pending(repo.path(), &to);
         assert_eq!(woken.len(), 1, "one message, one wake: {woken:?}");
         let WaitItem::Message {
+            requires_reply: false,
+            reply_route: None,
             handle: got,
             subject,
             from: sender,
@@ -845,6 +887,9 @@ mod tests {
                     Some(&format!("old#{i}")),
                     None,
                     &WaitItem::Message {
+                        presentation: None,
+                        requires_reply: false,
+                        reply_route: None,
                         handle: format!("o{i}"),
                         from: None,
                         repo: None,
@@ -952,6 +997,9 @@ mod tests {
                     Some(&format!("noise#{i}")),
                     None,
                     &WaitItem::Message {
+                        presentation: None,
+                        requires_reply: false,
+                        reply_route: None,
                         handle: format!("n{i}"),
                         from: None,
                         repo: None,
@@ -1019,6 +1067,9 @@ mod tests {
                     Some(&format!("message#{}/{i}", to.as_str())),
                     None,
                     &WaitItem::Message {
+                        presentation: None,
+                        requires_reply: false,
+                        reply_route: None,
                         handle: format!("h{i}"),
                         from: None,
                         repo: None,
@@ -1117,6 +1168,9 @@ mod tests {
         noise.load();
         for i in 0..crate::cli::github::log::COMPACT_AT {
             let item = WaitItem::Message {
+                presentation: None,
+                requires_reply: false,
+                reply_route: None,
                 handle: format!("n{i}"),
                 from: None,
                 repo: None,

@@ -297,6 +297,18 @@ impl TimerSet {
                     super::github::log::RecurringTransition::Pending => None,
                     super::github::log::RecurringTransition::Accepted { seq, mut item } => {
                         // Selectors are projection metadata, never persisted payload.
+                        let (id, due) = match &item {
+                            WaitItem::TimerEvent { id, due_at, .. } => (id.clone(), *due_at),
+                            _ => unreachable!(),
+                        };
+                        item.set_presentation(log.presentation_key(
+                            seq,
+                            Transport::Timer,
+                            Some(&id),
+                            None,
+                            Some(due),
+                            &item,
+                        ));
                         super::command_source::stamp_selector(&mut item, &entry.key, seq);
                         let _ = self.sink.send((item, Durability::Logged));
                         None
@@ -597,6 +609,7 @@ mod tests {
             let id = r.producer_id(slot).unwrap();
             let due = r.due_at(slot).unwrap();
             let item = WaitItem::TimerEvent {
+                presentation: None,
                 name: source.name.clone(),
                 id: id.clone(),
                 due_at: due,
@@ -833,6 +846,7 @@ mod tests {
         for due in 1..=2100 {
             let id = format!("timer/{due}");
             let item = WaitItem::TimerEvent {
+                presentation: None,
                 name: src.name.clone(),
                 recurrence: None,
                 id: id.clone(),
@@ -1006,6 +1020,7 @@ fn accept(
         Known::No => {}
     }
     let mut item = WaitItem::TimerEvent {
+        presentation: None,
         name: source.name.clone(),
         recurrence: None,
         id: id.clone(),
@@ -1022,6 +1037,14 @@ fn accept(
         source.interrupt,
     )?;
     let checkpoint = seen.record(&id);
+    item.set_presentation(log.presentation_key(
+        seq,
+        Transport::Timer,
+        Some(&id),
+        None,
+        Some(due),
+        &item,
+    ));
     super::command_source::stamp_selector(&mut item, key, seq);
     // A failed index write or closed sink cannot retract accepted WAL custody.
     let _ = sink.send((item, Durability::Logged));

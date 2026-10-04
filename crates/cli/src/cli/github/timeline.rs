@@ -43,6 +43,8 @@ pub(crate) struct MemberRef {
     #[serde(flatten)]
     pub(crate) key: MemberKey,
     pub(crate) acked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) woken_at: Option<u64>,
     pub(crate) transport: crate::cli::github::log::Transport,
     /// This copy's content reference (tui-github-event-content).
     /// Absent on rows logged before it existed, which is why the
@@ -50,6 +52,48 @@ pub(crate) struct MemberRef {
     /// zero's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<clank_core::wait::ContentRef>,
+}
+
+/// Shared lifecycle projection. Sent is source custody, not remote wake evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeliveryState {
+    Unwoken,
+    Woken,
+    Acknowledged,
+    Sent,
+    History,
+}
+impl DeliveryState {
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Self::Unwoken => "?",
+            Self::Woken => "✓",
+            Self::Acknowledged => "✓✓",
+            Self::Sent => "→",
+            Self::History => "",
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unwoken => "? not woken",
+            Self::Woken => "✓ woken · awaiting acknowledgement",
+            Self::Acknowledged => "✓✓ acknowledged",
+            Self::Sent => "→ sent · recipient wake/ack unknown",
+            Self::History => "pre-watch history",
+        }
+    }
+}
+impl MemberRef {
+    pub(crate) fn delivery(&self) -> DeliveryState {
+        if self.acked {
+            DeliveryState::Acknowledged
+        } else if self.woken_at.is_some() {
+            DeliveryState::Woken
+        } else {
+            DeliveryState::Unwoken
+        }
+    }
 }
 
 /// Which object the PAGE should read a body from for a merged
@@ -102,9 +146,49 @@ pub(crate) enum Backend {
     Message,
 }
 
+/// Sending custody is independent of recipient delivery/acknowledgement.
+/// Body and timestamp belong to the containing timeline entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OutgoingReply {
+    pub(crate) operation_id: String,
+    pub(crate) delivery_id: String,
+    pub(crate) from: String,
+    pub(crate) from_repo: std::path::PathBuf,
+    pub(crate) destination: clank_core::wait::MessageReplyRoute,
+    pub(crate) original: MemberKey,
+    pub(crate) original_handle: String,
+    pub(crate) acknowledge: bool,
+}
+
+/// Page navigation identity, never an acknowledgement address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EventKey {
+    Inbox(MemberKey),
+    Outgoing {
+        author: String,
+        operation_id: String,
+    },
+}
+impl From<MemberKey> for EventKey {
+    fn from(key: MemberKey) -> Self {
+        Self::Inbox(key)
+    }
+}
+impl EventKey {
+    pub(crate) fn member(&self) -> Option<&MemberKey> {
+        match self {
+            Self::Inbox(key) => Some(key),
+            Self::Outgoing { .. } => None,
+        }
+    }
+}
+
 /// One merged timeline entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(remote = "Self")]
 pub(crate) struct MergedEvent {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) outgoing: Vec<OutgoingReply>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) recurrence: Option<clank_core::agent_config::TimerRecurrence>,
     /// What KIND of backend produced it — the carve-out's presence is
@@ -149,7 +233,8 @@ pub(crate) struct MergedEvent {
     pub(crate) actor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) url: Option<String>,
-    /// Agent labels holding a copy, sorted, deduped.
+    /// Local recipient labels holding an inbox copy, sorted, deduped. An
+    /// outgoing sender's custody does not count as having received the reply.
     pub(crate) seen_by: Vec<String>,
     /// Every copy's full address + state, sorted by
     /// (agent, source, seq, ident) — the page's target space and the
@@ -165,6 +250,72 @@ pub(crate) struct MergedEvent {
     /// normal, and a live unhandled copy keeps it open.
     pub(crate) baseline: bool,
 }
+impl serde::Serialize for MergedEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Projection<'a> {
+            delivery: DeliveryState,
+            #[serde(flatten, with = "MergedEvent")]
+            event: &'a MergedEvent,
+        }
+        Projection {
+            delivery: self.delivery(),
+            event: self,
+        }
+        .serialize(serializer)
+    }
+}
+impl MergedEvent {
+    pub(crate) fn delivery(&self) -> DeliveryState {
+        if self.baseline {
+            return DeliveryState::History;
+        }
+        if self.outgoing_only() {
+            return DeliveryState::Sent;
+        }
+        if self
+            .members
+            .iter()
+            .any(|m| m.delivery() == DeliveryState::Unwoken)
+        {
+            return DeliveryState::Unwoken;
+        }
+        if self
+            .members
+            .iter()
+            .any(|m| m.delivery() == DeliveryState::Woken)
+        {
+            return DeliveryState::Woken;
+        }
+        DeliveryState::Acknowledged
+    }
+
+    pub(crate) fn outgoing_only(&self) -> bool {
+        self.members.is_empty() && !self.outgoing.is_empty()
+    }
+    pub(crate) fn has_page_key(&self, key: &EventKey) -> bool {
+        match key {
+            EventKey::Inbox(key) => self.members.iter().any(|m| &m.key == key),
+            EventKey::Outgoing {
+                author,
+                operation_id,
+            } => self
+                .outgoing
+                .iter()
+                .any(|o| &o.from == author && &o.operation_id == operation_id),
+        }
+    }
+    pub(crate) fn page_keys(&self) -> Vec<EventKey> {
+        self.members
+            .iter()
+            .map(|m| m.key.clone().into())
+            .chain(self.outgoing.iter().map(|o| EventKey::Outgoing {
+                author: o.from.clone(),
+                operation_id: o.operation_id.clone(),
+            }))
+            .collect()
+    }
+}
 
 /// The typed result of one timeline read: entries plus deduplicated
 /// read notices (corrupt logs, read failures, skipped-foreign counts).
@@ -179,10 +330,11 @@ pub(crate) struct TimelineSnapshot {
 }
 
 /// One agent's copy of one event, pre-merge. `(agent, source, seq)`
-/// is the copy's stable PROVENANCE — the total tiebreak that keeps
+/// plus its discriminator is the copy's stable PROVENANCE — the total tiebreak that keeps
 /// member preference and entry order deterministic when timestamps
 /// tie (codex 92e9deb: HashMap/read_dir order must never show).
 struct Copy {
+    outgoing: Option<OutgoingReply>,
     agent: String,
     source: String,
     seq: u64,
@@ -194,12 +346,19 @@ struct Copy {
     aliases: Vec<(String, String)>,
     item: WaitItem,
     acked: bool,
+    woken_at: Option<u64>,
     baseline: bool,
 }
 
 impl Copy {
-    fn provenance(&self) -> (u64, &str, &str, u64) {
-        (self.display_at, &self.agent, &self.source, self.seq)
+    fn provenance(&self) -> (u64, &str, &str, u64, &str) {
+        (
+            self.display_at,
+            &self.agent,
+            &self.source,
+            self.seq,
+            &self.ident,
+        )
     }
 }
 
@@ -211,6 +370,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
     // so a legacy message is in the timeline the first time somebody
     // LOOKS rather than the next time its recipient waits.
     crate::inbox::migrate_all(repo);
+    let local_repo = dunce::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let mut copies: Vec<Copy> = Vec::new();
     let mut notices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let agents_root = crate::agent_store::agents_root(repo);
@@ -297,7 +457,15 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                         if let Some(k) = &r.action_key {
                             aliases.push((event_repo.clone(), format!("k:{k}")));
                         }
+                        if let WaitItem::Message { handle, .. } = &r.item
+                            && r.action_key
+                                .as_deref()
+                                .is_some_and(|k| k == format!("message-reply/{handle}"))
+                        {
+                            aliases.push(delivery_alias(&local_repo, &label, handle));
+                        }
                         Some(Copy {
+                            outgoing: None,
                             agent: label.clone(),
                             source: stem.to_string(),
                             seq: r.seq,
@@ -308,10 +476,59 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             glyph: glyphs.get(stem).cloned(),
                             aliases,
                             item: r.item,
+                            woken_at: r.woken_at,
                             acked: r.acked,
                             baseline: r.baseline,
                         })
                     }));
+                    // Acceptance records also survive after the parent body is
+                    // pruned. Read them from the same parsed WAL, with no remote
+                    // scan and without turning them into sender inbox work.
+                    for state in read.outgoing_replies {
+                        let op = state.operation;
+                        if op.repo != local_repo
+                            || op.author.as_str() != label
+                            || stem != crate::inbox::MESSAGES_SOURCE
+                        {
+                            notices.insert(format!(
+                                "{label}/{name}: outgoing reply provenance disagrees — skipped"
+                            ));
+                            continue;
+                        }
+                        let id = op.delivery_id();
+                        let item = op.item();
+                        let alias = delivery_alias(&op.route.repo, op.route.agent.as_str(), &id);
+                        copies.push(Copy {
+                            outgoing: Some(OutgoingReply {
+                                operation_id: op.id,
+                                delivery_id: id.clone(),
+                                from: label.clone(),
+                                from_repo: op.repo,
+                                destination: op.route,
+                                original: MemberKey {
+                                    agent: label.clone(),
+                                    source: stem.into(),
+                                    seq: op.original_seq,
+                                    ident: op.original_ident,
+                                },
+                                original_handle: op.original_handle,
+                                acknowledge: op.acknowledge,
+                            }),
+                            agent: label.clone(),
+                            source: stem.into(),
+                            seq: state.seq,
+                            ident: id,
+                            transport: crate::cli::github::log::Transport::Message,
+                            display_at: op.at,
+                            backend: Backend::Message,
+                            glyph: None,
+                            aliases: vec![alias],
+                            item,
+                            woken_at: None,
+                            acked: false,
+                            baseline: false,
+                        });
+                    }
                 }
                 Ok(None) => {
                     notices.insert(format!("{label}/{name}: corrupt — skipped"));
@@ -326,6 +543,16 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
         events: merge(copies),
         notices: notices.into_iter().collect(),
     }
+}
+
+fn delivery_alias(repo: &Path, recipient: &str, id: &str) -> (String, String) {
+    (
+        format!(
+            "msg-delivery:{}",
+            serde_json::to_string(&(repo, recipient)).unwrap()
+        ),
+        id.into(),
+    )
 }
 
 /// This agent's configured command-source glyphs, keyed by the WAL
@@ -408,7 +635,7 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
         groups.entry(root).or_default().push(i);
     }
     // Provenance-first determinism (codex 92e9deb): members order by
-    // (display_at, agent, source, seq) — a TOTAL key — so field-wise
+    // (display_at, agent, source, seq, ident) — a TOTAL key — so field-wise
     // first-some never depends on read_dir order; entries then sort by
     // (at, minimum member provenance), total again, so tied timestamps
     // can't shuffle across invocations or TUI refreshes.
@@ -435,11 +662,16 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                     )
                 })
                 .unwrap_or_default();
+            let inbound: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&i| copies[i].outgoing.is_none())
+                .collect();
             let mut seen_by: Vec<String> =
-                members.iter().map(|&i| copies[i].agent.clone()).collect();
+                inbound.iter().map(|&i| copies[i].agent.clone()).collect();
             seen_by.sort();
             seen_by.dedup();
-            let mut member_refs: Vec<MemberRef> = members
+            let mut member_refs: Vec<MemberRef> = inbound
                 .iter()
                 .map(|&i| MemberRef {
                     key: MemberKey {
@@ -448,6 +680,7 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                         seq: copies[i].seq,
                         ident: copies[i].ident.clone(),
                     },
+                    woken_at: copies[i].woken_at,
                     acked: copies[i].acked,
                     transport: copies[i].transport,
                     content: copies[i]
@@ -458,6 +691,10 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 .collect();
             member_refs.sort_by(|a, b| a.key.cmp(&b.key));
             let merged = MergedEvent {
+                outgoing: members
+                    .iter()
+                    .filter_map(|&i| copies[i].outgoing.clone())
+                    .collect(),
                 recurrence: members.iter().find_map(|&i| {
                     copies[i]
                         .item
@@ -496,8 +733,8 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                 }),
                 seen_by,
                 members: member_refs,
-                unhandled: members.iter().any(|&i| !copies[i].acked),
-                baseline: members.iter().all(|&i| copies[i].baseline),
+                unhandled: inbound.iter().any(|&i| !copies[i].acked),
+                baseline: !inbound.is_empty() && inbound.iter().all(|&i| copies[i].baseline),
             };
             (members, merged)
         })
@@ -509,12 +746,13 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     use clank_core::wait::ContentRef;
 
     fn member_with(agent: &str, content: Option<ContentRef>) -> MemberRef {
         MemberRef {
+            woken_at: None,
             key: MemberKey {
                 agent: agent.into(),
                 source: "github-o-r-aaaa".into(),
@@ -593,6 +831,46 @@ mod tests {
     /// rows pending, both projecting, and only one reaching the TUI
     /// (codex 4e47a2a).
     #[test]
+    fn merged_delivery_never_hides_an_unwoken_pending_recipient() {
+        let mut log = member_with("alpha", None);
+        let mut other = member_with("beta", None);
+        let (repo, _, _, _, _) = reply_fixture(false, true);
+        let mut ev = timeline_snapshot(repo.path())
+            .events
+            .into_iter()
+            .find(|e| !e.members.is_empty())
+            .unwrap();
+        for (a, b, expected) in [
+            ((false, None), (false, None), DeliveryState::Unwoken),
+            ((false, Some(100)), (false, None), DeliveryState::Unwoken),
+            ((true, None), (false, None), DeliveryState::Unwoken),
+            ((false, Some(100)), (false, Some(200)), DeliveryState::Woken),
+            ((true, None), (false, Some(200)), DeliveryState::Woken),
+            ((true, None), (true, None), DeliveryState::Acknowledged),
+        ] {
+            (log.acked, log.woken_at) = a;
+            (other.acked, other.woken_at) = b;
+            ev.members = vec![log.clone(), other.clone()];
+            ev.unhandled = ev.members.iter().any(|m| !m.acked);
+            assert_eq!(ev.delivery(), expected);
+            let encoded = serde_json::to_value(&ev).unwrap();
+            assert_eq!(encoded["delivery"], serde_json::to_value(expected).unwrap());
+            assert_eq!(encoded["members"][1]["acked"], b.0);
+        }
+        ev.baseline = true;
+        assert_eq!(ev.delivery(), DeliveryState::History);
+        ev.baseline = false;
+        ev.members.clear();
+        ev.outgoing = timeline_snapshot(repo.path())
+            .events
+            .into_iter()
+            .find(|e| e.outgoing_only())
+            .unwrap()
+            .outgoing;
+        assert_eq!(ev.delivery(), DeliveryState::Sent);
+    }
+
+    #[test]
     fn a_command_event_reaches_the_timeline_beside_a_github_one() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -618,6 +896,8 @@ mod tests {
             None,
             Some(200),
             &WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
                 name: "deploys".into(),
                 id: "sha-abc".into(),
                 event: "deployed".into(),
@@ -704,6 +984,8 @@ mod tests {
                 None,
                 Some(200),
                 &WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
                     name: "o/r".into(),
                     id: "123".into(),
                     event: "deployed".into(),
@@ -794,6 +1076,8 @@ mod tests {
                     None,
                     Some(100),
                     &WaitItem::CommandEvent {
+                        presentation: None,
+                        source_cwd: None,
                         name: src.name.clone(),
                         id: id.into(),
                         event: "ran".into(),
@@ -840,11 +1124,11 @@ mod tests {
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         let lines = crate::cli::log::oneline_plain_lines(&rows);
         assert!(
-            lines.iter().any(|l| l.starts_with("* ")),
+            lines.iter().any(|l| l.starts_with("? * ")),
             "the configured glyph is the gutter badge: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with("cmd ")),
+            lines.iter().any(|l| l.starts_with("? cmd ")),
             "and an unconfigured source keeps the default: {lines:?}"
         );
     }
@@ -881,6 +1165,8 @@ mod tests {
                 None,
                 Some(100),
                 &WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
                     name: "deploys".into(),
                     id: "a".into(),
                     event: "ran".into(),
@@ -960,6 +1246,7 @@ mod tests {
                 None,
                 Some(100),
                 &WaitItem::GithubEvent {
+                    presentation: None,
                     repo: "o/r".into(),
                     event: "branch_push".into(),
                     detail: None,
@@ -1002,6 +1289,8 @@ mod tests {
                 // supervisor populated it.
                 None,
                 &WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
                     name: "deploys".into(),
                     id: "sha-abc".into(),
                     event: "deployed".into(),
@@ -1025,6 +1314,7 @@ mod tests {
 
     fn item(repo: &str, n: u64, title: Option<&str>) -> WaitItem {
         WaitItem::GithubEvent {
+            presentation: None,
             repo: repo.into(),
             event: "pr_comment".into(),
             detail: Some("review".into()),
@@ -1354,6 +1644,202 @@ mod tests {
         let events = timeline_snapshot(&repo).events;
         let dimmed = events.iter().find(|e| e.number == Some(6)).unwrap();
         assert!(dimmed.baseline && !dimmed.unhandled);
+    }
+
+    pub(crate) fn reply_fixture(
+        local: bool,
+        accepted: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        EventLog,
+        EventLog,
+        crate::cli::github::log::MessageOperation,
+    ) {
+        use crate::cli::github::log::{MessageOperation, Transport};
+        use clank_core::{ids::AgentLabel, wait::MessageReplyRoute};
+        let repo = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(repo.path()).unwrap();
+        let target = if local {
+            root.clone()
+        } else {
+            dunce::canonicalize(external.path()).unwrap()
+        };
+        let mut source = EventLog::open(
+            &crate::agent_store::agents_root(&root).join("worker/events"),
+            "messages",
+        )
+        .unwrap();
+        let mut destination = EventLog::open(
+            &crate::agent_store::agents_root(&target).join("coordinator/events"),
+            "messages",
+        )
+        .unwrap();
+        source
+            .append_inbox(
+                Transport::Message,
+                None,
+                Some("original"),
+                Some(10),
+                &WaitItem::Message {
+                    presentation: None,
+                    handle: "parent-handle".into(),
+                    from: Some("coordinator".into()),
+                    repo: Some(target.display().to_string()),
+                    subject: "Original question".into(),
+                    body: "Original question".into(),
+                    requires_reply: false,
+                    reply_route: None,
+                    selector: None,
+                },
+            )
+            .unwrap();
+        let parent = source.read_rows().unwrap().unwrap().rows.remove(0);
+        let op = MessageOperation {
+            id: "first-reply".into(),
+            repo: root,
+            author: AgentLabel::parse("worker").unwrap(),
+            original_seq: parent.seq,
+            original_ident: parent.ident,
+            original_handle: "parent-handle".into(),
+            route: MessageReplyRoute {
+                repo: target,
+                agent: AgentLabel::parse("coordinator").unwrap(),
+            },
+            text: "  Answer β.\nKeep this whitespace.  ".into(),
+            at: 42,
+            acknowledge: false,
+        };
+        let state = source.begin_message_operation(&op).unwrap();
+        if accepted {
+            let receipt = destination.accept_message_delivery(&op).unwrap();
+            source.accept_message_operation(&state, &receipt).unwrap();
+            destination.release_message_receipt(&receipt).unwrap();
+        }
+        (repo, external, source, destination, op)
+    }
+
+    #[test]
+    fn external_reply_projects_from_local_custody_without_recipient_access() {
+        let (repo, external, mut source, _destination, op) = reply_fixture(false, true);
+        std::fs::remove_dir_all(external.path()).unwrap();
+        let snapshot = timeline_snapshot(repo.path());
+        assert!(snapshot.notices.is_empty(), "{:?}", snapshot.notices);
+        assert_eq!(snapshot.events.len(), 2);
+        let reply = snapshot
+            .events
+            .iter()
+            .find(|e| !e.outgoing.is_empty())
+            .unwrap();
+        assert!(reply.outgoing_only());
+        assert!(!reply.unhandled && !reply.baseline);
+        assert!(reply.members.is_empty() && reply.seen_by.is_empty());
+        assert_eq!(reply.body.as_deref(), Some(op.text.as_str()));
+        assert_eq!(reply.at, op.at);
+        assert_eq!(reply.outgoing[0].destination, op.route);
+        assert_eq!(reply.outgoing[0].original_handle, "parent-handle");
+        assert_eq!(reply.outgoing[0].original.ident, op.original_ident);
+        assert_eq!(
+            reply.page_keys(),
+            vec![EventKey::Outgoing {
+                author: "worker".into(),
+                operation_id: op.id
+            }]
+        );
+        assert_eq!(
+            source.load().unhandled.len(),
+            1,
+            "outgoing records are not work"
+        );
+        assert!(
+            !external.path().exists(),
+            "rendering does not recreate the remote repo"
+        );
+    }
+
+    #[test]
+    fn same_repo_reply_merges_custody_with_only_real_recipient_state() {
+        let (repo, _external, _source, mut target, op) = reply_fixture(true, true);
+        let snapshot = timeline_snapshot(repo.path());
+        assert_eq!(snapshot.events.len(), 2, "original plus one merged reply");
+        let reply = snapshot
+            .events
+            .iter()
+            .find(|e| !e.outgoing.is_empty())
+            .unwrap();
+        assert!(!reply.outgoing_only());
+        assert!(reply.unhandled);
+        assert_eq!(reply.seen_by, vec!["coordinator"]);
+        assert_eq!(reply.members.len(), 1);
+        assert_eq!(reply.members[0].key.agent, "coordinator");
+        assert_eq!(reply.outgoing[0].delivery_id, op.delivery_id());
+        assert_eq!(reply.page_keys().len(), 2);
+        let key = &reply.members[0].key;
+        target.append_checked_ack(key.seq, &key.ident).unwrap();
+        let refreshed = timeline_snapshot(repo.path());
+        let reply = refreshed
+            .events
+            .iter()
+            .find(|e| !e.outgoing.is_empty())
+            .unwrap();
+        assert!(!reply.unhandled && !reply.outgoing_only());
+        assert!(reply.members[0].acked);
+    }
+
+    #[test]
+    fn pending_intents_are_not_sent_and_equal_deliberate_bodies_do_not_merge() {
+        let (repo, _external, mut source, mut target, mut op) = reply_fixture(true, false);
+        let snapshot = timeline_snapshot(repo.path());
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(snapshot.events[0].outgoing.is_empty());
+        for id in ["first-reply", "second-reply"] {
+            op.id = id.into();
+            let state = source.begin_message_operation(&op).unwrap();
+            let receipt = target.accept_message_delivery(&op).unwrap();
+            source.accept_message_operation(&state, &receipt).unwrap();
+            target.release_message_receipt(&receipt).unwrap();
+        }
+        let snapshot = timeline_snapshot(repo.path());
+        let replies: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| !e.outgoing.is_empty())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].body, replies[1].body);
+        assert_ne!(
+            replies[0].outgoing[0].delivery_id,
+            replies[1].outgoing[0].delivery_id
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|e| e.members.len() == 1 && e.outgoing.len() == 1)
+        );
+    }
+
+    #[test]
+    fn accepted_reply_outlives_parent_display_and_pin_cleanup() {
+        let (repo, _external, _source, _target, op) = reply_fixture(false, true);
+        // Model the compacted form: source acceptance is retained independently
+        // of an original body, not discovered only through row.message_replies.
+        let path =
+            crate::agent_store::agents_root(repo.path()).join("worker/events/messages.jsonl");
+        let accepted: Vec<_> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["t"] == "message_operation" && !value["receipt"].is_null()
+            })
+            .map(str::to_owned)
+            .collect();
+        std::fs::write(&path, accepted.join("\n") + "\n").unwrap();
+        let snapshot = timeline_snapshot(repo.path());
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].body.as_deref(), Some(op.text.as_str()));
+        assert!(snapshot.events[0].outgoing_only());
     }
 
     #[test]
