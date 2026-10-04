@@ -212,7 +212,8 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     // can be stale (a codex session under a since-changed claude roster
     // entry must still get codex launch side effects; codex ff3ca44).
     let mut grok_checked = false;
-    let (composed, launch_tool) = match bound_session {
+    let mut consume_fork = false;
+    let (mut composed, launch_tool) = match bound_session {
         // A seeded fork spec (clank fork) takes precedence over the
         // plain bootstrap on first launch: fork the source session
         // with the orientation prompt; the forked id then binds via
@@ -250,7 +251,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                     if !args.print {
                         super::setup::ensure_launch_setup(&repo, spec.tool, desc.launch.as_ref())
                             .await?;
-                        crate::cli::fork::take_fork_spec(&repo, &label)?;
+                        consume_fork = true;
                     }
                     let tool = spec.tool;
                     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -339,13 +340,55 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let codex_root = codex_launch_root(&composed, &crate::agent_env::Process);
     pre_launch_codex_trust(launch_tool, &repo, codex_root.as_deref());
 
+    if launch_tool == Tool::Claude {
+        // The selected repo is both the actual cwd and the trust scope. Resolve
+        // the composed environment (the bound/fork tool can override the roster).
+        let launch = LaunchConfig {
+            command: Some(composed.program.clone()),
+            args: composed.args.clone(),
+            env: composed.env_overrides.clone(),
+        };
+        let (home, _, roots) = super::setup::provider_launch_paths(
+            &repo,
+            launch_tool,
+            Some(&launch),
+            &crate::agent_env::Process,
+        )?;
+        // Claude's current storage backend requires absolute configuration paths.
+        // Pin relative profile paths to the same cwd setup used before execution.
+        composed
+            .env_overrides
+            .insert("HOME".into(), home.to_string_lossy().into());
+        let custom = launch
+            .env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR"))
+            .is_some_and(|value| !value.is_empty());
+        let config_home = if custom {
+            let root = &roots[0];
+            composed
+                .env_overrides
+                .insert("CLAUDE_CONFIG_DIR".into(), root.to_string_lossy().into());
+            root.as_path()
+        } else {
+            home.as_path()
+        };
+        super::claude_trust::prepare(config_home, &repo).await?;
+    }
+
+    // Failed setup or trust preparation must leave the one-shot fork retryable.
+    if consume_fork {
+        crate::cli::fork::take_fork_spec(&repo, &label)?;
+    }
+
     if let Err(error) = super::pane_target::record(&repo, &label, launch_tool, &composed.program) {
         eprintln!("clank: launch provenance unavailable for interruption: {error:#}");
     }
 
     exec_composed(
         composed,
-        (launch_tool == Tool::Grok).then_some(repo.as_path()),
+        matches!(launch_tool, Tool::Grok | Tool::Claude).then_some(repo.as_path()),
     )
 }
 
@@ -420,8 +463,8 @@ fn codex_launch_root(c: &ComposedLaunch, env: &dyn crate::agent_env::Ambient) ->
 
 /// The pre-exec trust step: codex launches record the MAIN repo root
 /// (codex's prompt applies trust to the repository root, so it covers
-/// every worktree under it) as trusted; claude has no such prompt and
-/// writes nothing.
+/// every worktree under it) as trusted. Claude has its own JSON trust step;
+/// other providers do not write Codex configuration.
 fn pre_launch_codex_trust(tool: Tool, repo: &Path, codex_root: Option<&Path>) {
     if tool != Tool::Codex {
         return;
@@ -3414,8 +3457,8 @@ mod tests {
         // codex ff3ca44: the trust step keys on the tool the composed
         // launch ACTUALLY runs (fork spec / bound session), never the
         // roster description — a codex fork spec under a stale claude
-        // roster entry must still record trust, and a claude launch
-        // must write nothing.
+        // roster entry must still record Codex trust, and a Claude launch
+        // must leave Codex configuration alone.
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         assert!(
@@ -3440,7 +3483,7 @@ mod tests {
         let body = std::fs::read_to_string(&cfg).unwrap();
         assert!(body.contains("trust_level = \"trusted\""), "{body}");
 
-        // A claude launch writes nothing.
+        // The Codex helper writes nothing for a Claude launch.
         let home2 = tempfile::tempdir().unwrap();
         pre_launch_codex_trust(
             Tool::Claude,

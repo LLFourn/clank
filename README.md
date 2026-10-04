@@ -107,6 +107,16 @@ a custom profile. Locally edited integration files are preserved and reported;
 launch does not force an overwrite. Preview commands remain read-only. Repair runs
 at launch, with no idle polling or setup daemon.
 
+Claude launches also record workspace trust in the selected profile's user
+configuration before execution: `projects["<main checkout>"].hasTrustDialogAccepted`
+in `~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json` for a custom profile.
+This follows [Claude's documented workspace trust model](https://code.claude.com/docs/en/permissions#project-allow-rules-and-workspace-trust);
+linked worktrees share the main checkout's trust. Fresh starts, resumes and forks
+use the selected repository as their actual working directory. Configuration is
+merged under Claude's native write lock, preserving other settings and tool
+permissions. A failed trust write stops launch with a retryable error; previews
+do not record trust or consume fork intent.
+
 `clank doctor` follows the configured launch profiles and reports their actual
 asset paths. It probes the selected Claude executable for hook mode and the
 selected Grok executable for native capabilities. Diagnosis does not install

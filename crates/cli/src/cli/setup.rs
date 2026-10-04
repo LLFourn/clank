@@ -367,16 +367,19 @@ pub(super) fn resolve_provider_root(
         Tool::Grok => "GROK_HOME",
         Tool::OpenCode => "OPENCODE_CONFIG_DIR",
     };
-    let path = env(override_key).map(PathBuf::from).unwrap_or_else(|| {
-        if tool == Tool::OpenCode {
-            env("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"))
-                .join("opencode")
-        } else {
-            home.join(TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1)
-        }
-    });
+    let path = env(override_key)
+        .filter(|value| tool != Tool::Claude || !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if tool == Tool::OpenCode {
+                env("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home.join(".config"))
+                    .join("opencode")
+            } else {
+                home.join(TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1)
+            }
+        });
     if path.is_absolute() {
         path
     } else {
@@ -397,7 +400,7 @@ pub(super) fn provider_launch_paths(
             .map(std::ffi::OsString::from)
             .or_else(|| ambient.var_os(name))
     };
-    let cwd = if tool == Tool::Grok {
+    let cwd = if matches!(tool, Tool::Grok | Tool::Claude) {
         repo.to_owned()
     } else {
         ambient
@@ -1771,6 +1774,30 @@ mod tests {
                 == "XDG_CONFIG_HOME")
                 .then(|| "/fixture/xdg".into())),
             Path::new("/fixture/xdg/opencode")
+        );
+    }
+
+    #[test]
+    fn claude_setup_relative_paths_use_the_selected_repo_and_empty_override_defaults() {
+        let repo = Path::new("/selected/repo");
+        let ambient = crate::agent_env::Stated::saying(&[
+            ("HOME", "relative-home"),
+            ("CLAUDE_CONFIG_DIR", "relative-profile"),
+        ])
+        .at(Path::new("/caller/home"), Path::new("/caller/cwd"));
+        let (home, cwd, roots) = provider_launch_paths(repo, Tool::Claude, None, &ambient).unwrap();
+        assert_eq!(home, repo.join("relative-home"));
+        assert_eq!(cwd, repo);
+        assert_eq!(roots, [repo.join("relative-profile")]);
+        let launch = clank_core::agent_config::LaunchConfig {
+            env: std::collections::BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            provider_launch_paths(repo, Tool::Claude, Some(&launch), &ambient)
+                .unwrap()
+                .2,
+            [repo.join("relative-home/.claude")]
         );
     }
 
