@@ -1,9 +1,8 @@
 # clank
 
 Multi-agent peer review around plans. One agent (the **master**) writes
-a plan; reviewers weigh in; the master implements it commit by commit;
-reviewers sign off on each commit; the plan finalizes into a sealed
-record.
+a plan; reviewers weigh in; the master implements the complete plan in one
+commit by default; reviewers sign off; the plan finalizes into a sealed record.
 
 Everything lives in `.clank/` and `git`. No daemon, no server, no
 database — the review history IS the commit history.
@@ -19,7 +18,7 @@ database — the review history IS the commit history.
           │                                           │
  implement│  git commit -m "[my-feature] …" ─────────▶│  woken with the commit
           │                                           │
-          │◀──────────── CONTINUE / REQUEST_CHANGES ──┤  (repeat per commit)
+          │◀──────────── CONTINUE / REQUEST_CHANGES ──┤  review corrections
           │                                           │
           │◀──────────────────────────── FINISHED ────┤  gate reviewer
   finish  │  clank finish my-feature                  │
@@ -43,6 +42,12 @@ not chase them.
   - **plan** — reviews at the plan stage (the intro / plan revisions).
   - **final** — reviews when the work is believed complete.
   - **gate** — folds into BOTH the plan- and final-stage reviews.
+- Implement a plan in one complete commit unless it specifies internal named
+  milestones with a strong justification for their review boundaries. Do not add
+  milestones merely to excuse incremental implementation. Reviewers must request
+  changes for unjustified milestone plans or partial implementation without such
+  milestones. Promotion, finalization and requested review corrections remain
+  separate steps; every commit is still followed by stopping for review.
 - Verdicts are `CONTINUE` (good, keep going — with a note on what's
   left), `REQUEST_CHANGES` (fix before proceeding), and `FINISHED`
   (the plan is done). When the gate says FINISHED, the master runs
@@ -180,8 +185,10 @@ verdict becomes the header — don't restate it in the message.
 
 **6. The master — implement, then finalize.**
 
-Each commit is tagged `[my-feature]` and wakes the reviewers again.
-When the gate reviewer says FINISHED:
+Implement everything the plan specifies in one commit tagged `[my-feature]`,
+then stop for review. Use separate implementation commits only for strongly
+justified internal named milestones already specified in the plan. Address any
+requested review correction and stop again. When the gate reviewer says FINISHED:
 
 ```sh
 clank finish my-feature -m "<what changed>" -m "<why>"

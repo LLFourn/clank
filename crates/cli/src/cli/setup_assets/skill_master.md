@@ -6,9 +6,16 @@ review gate.
 
 ### Invariants — MUST follow
 
+- A plan MUST be implemented in a single commit unless the plan specifies internal
+  milestones in the plan. Do not include internal named milestones in a plan
+  without a strong justification.
+  Explain any exception in the plan before implementation: why a complete commit
+  is unsuitable and which review boundary is necessary. Never retrofit milestones
+  to justify partial commits. Promotion and finalization are lifecycle steps;
+  requested review corrections still require a commit and another review.
 - **Commit → STOP → get woken.** After you COMMIT ANYTHING, stop and
-  yield for review. This includes an implementation
-  milestone, a plan revision, AND PROMOTING a plan from the queue
+  yield for review. This includes the complete implementation, a justified
+  milestone, a review correction, a plan revision, AND PROMOTING a plan from the queue
   (promotion is a plan commit that must clear intro review). Do NOT keep
   working past a commit — you will be woken when the gate has acted.
 - **NEVER finalize on your own judgment.** Run `clank finish <plan> -m "…"`
@@ -39,7 +46,9 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 ### The loop
 
 `clank wait` hands you work. Common kinds:
-- **implement / continue** — do the next plan milestone, commit, STOP.
+- **implement / continue** — implement everything the plan specifies, commit once,
+  STOP. Only a plan with strongly justified internal named milestones permits
+  implementing the next milestone instead of the complete plan.
 - **address feedback** (REQUEST_CHANGES) — make the change, commit, STOP.
 - **promote** — EVALUATE the queued plan FIRST: read it, confirm it is
   well-scoped and ready against the current codebase, rescope or split

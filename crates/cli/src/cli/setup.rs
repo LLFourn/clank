@@ -52,7 +52,7 @@ const OBSOLETE_SKILL: &str = "clank";
 /// Lead with the role guard ("Use ONLY when … Do NOT use …") and name
 /// the other skill, so an agent never loads the wrong role's skill (and
 /// runs commands it must never touch).
-const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement plan milestones, promote/finish plans, manage the roster). Do NOT use as a reviewer or on standby — use clank-reviewer instead.";
+const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement complete plans, promote/finish plans, manage the roster). Do NOT use as a reviewer or on standby — use clank-reviewer instead.";
 const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER and STANDBY roles. Use ONLY when you are a reviewer or on standby in a clank repo. Do NOT use as the master — use clank-master instead.";
 
 /// Claude's Stop hook owns its wait and returns the wake as a
