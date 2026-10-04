@@ -154,21 +154,6 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
                 if tool != Tool::Grok {
                     continue;
                 }
-                let state = super::grok_handoff::diagnose(
-                    repo,
-                    &label,
-                    cfg.as_ref().and_then(|c| c.session.as_ref()).map(|s| &s.id),
-                );
-                out.push(match state {
-                    Ok(message) => {
-                        CheckResult::warn("repo", format!("Grok {label} handoff snapshot"), message)
-                    }
-                    Err(e) => CheckResult::fail(
-                        "repo",
-                        format!("Grok {label} handoff snapshot"),
-                        format!("{e:#}"),
-                    ),
-                });
                 match super::grok_launch::Provider::resolve(desc.launch.as_ref(), repo) {
                     Ok(provider) => {
                         let profile_home = provider.env.get("HOME").map(PathBuf::from)

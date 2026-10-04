@@ -12,17 +12,15 @@ use std::path::{Path, PathBuf};
 use super::grok_launch::Provider;
 
 pub(super) const COMMAND: &str = "clank stop-hook --tool grok";
-pub(super) const TERMINALS: &str = "^(run_terminal_command|bash|Bash)$";
-pub(super) const EVENTS: [(&str, bool); 9] = [
-    ("SessionStart", false),
-    ("Stop", false),
-    ("SessionEnd", false),
-    ("StopCancelled", false),
-    ("StopFailure", false),
-    ("PreToolUse", true),
-    ("PostToolUse", true),
-    ("PostToolUseFailure", true),
-    ("PermissionDenied", true),
+pub(super) const EVENTS: [&str; 3] = ["SessionStart", "Stop", "SessionEnd"];
+// Installation removes only Clank-owned entries for the retired adapter.
+pub(super) const RETIRED_EVENTS: [&str; 6] = [
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PermissionDenied",
+    "StopCancelled",
+    "StopFailure",
 ];
 
 pub(super) fn profile(repo: &Path, label: &AgentLabel) -> Result<Provider> {
@@ -69,7 +67,6 @@ pub(super) fn asset_location(
 #[derive(Debug)]
 pub(super) struct Capabilities {
     pub version: Option<String>,
-    pub pre_tool_use: bool,
     pub stop: bool,
     pub candidate: bool,
     pub failure: Option<&'static str>,
@@ -89,23 +86,28 @@ impl Capabilities {
         let gate = |name: &str| {
             events.is_some_and(|events| events.iter().any(|v| v.as_str() == Some(name)))
         };
-        let pre_tool_use = gate("pre_tool_use");
         let stop = gate("stop");
         let baseline = version
             .as_deref()
             .and_then(version_tuple)
             .is_some_and(|v| v.0 == 1 && v >= (1, 0, 46));
-        let candidate = baseline && pre_tool_use && stop;
-        Self { version, pre_tool_use, stop, candidate,
-            failure: (!candidate).then_some("requires Grok 1.x at least 1.0.46 and advertised native PreToolUse/Stop decision gates") }
+        let candidate = baseline && stop;
+        Self {
+            version,
+            stop,
+            candidate,
+            failure: (!candidate).then_some(
+                "requires Grok 1.x at least 1.0.46 and an advertised native Stop decision gate",
+            ),
+        }
     }
     pub(super) fn description(&self) -> String {
         // Whitelisted data only: initialize also contains account/model/config
         // metadata, and an error may contain secret profile arguments. Neither
         // the full response nor provider stderr belongs in setup/doctor output.
-        format!("version={}, advertised PreToolUse={}, Stop={}; {}",
+        format!("version={}, advertised Stop={}; {}",
             self.version.as_deref().filter(|v| version_tuple(v).is_some()).unwrap_or("unknown"),
-            self.pre_tool_use, self.stop,
+            self.stop,
             self.failure.unwrap_or("candidate for the native adapter; loaded hook payloads and background-to-model continuation are not verified by initialize"))
     }
 }
@@ -125,7 +127,6 @@ pub(super) async fn probe(provider: &Provider, repo: &Path) -> Capabilities {
         Ok(init) => Capabilities::decode(&init),
         Err(_) => Capabilities {
             version: None,
-            pre_tool_use: false,
             stop: false,
             candidate: false,
             failure: Some(
@@ -157,7 +158,7 @@ pub(super) fn read_hooks(path: &Path) -> Result<Value> {
 pub(super) fn validate_hooks(provider: &Provider) -> Result<()> {
     let path = hook_path(provider);
     let value = read_hooks(&path)?;
-    for (event, terminal) in EVENTS {
+    for event in EVENTS {
         let mut owned = Vec::new();
         for group in value
             .get("hooks")
@@ -189,9 +190,25 @@ pub(super) fn validate_hooks(provider: &Provider) -> Result<()> {
             "native Grok {event} command/timeout drifted"
         );
         let matcher = group.get("matcher").and_then(Value::as_str);
+        ensure!(matcher.is_none(), "native Grok {event} matcher drifted");
+    }
+    for event in RETIRED_EVENTS {
+        let owned = value
+            .pointer(&format!("/hooks/{event}"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .any(super::setup::hook_is_clank);
         ensure!(
-            matcher == terminal.then_some(TERMINALS),
-            "native Grok {event} matcher drifted"
+            !owned,
+            "retired native Grok {event} Clank hook remains installed"
         );
     }
     Ok(())

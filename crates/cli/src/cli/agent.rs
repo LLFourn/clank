@@ -859,9 +859,9 @@ pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
 /// A first/resumed turn reaches the native Stop guard before arming. Subsequent
 /// completion turns re-arm the canonical command through the installed skill.
 pub(super) const DEFAULT_AUTO_PROMPT_GROK: &str = "Session resumed. End your turn so the \
-    native Clank Stop guard can check your handoff. If it requests arming, run \
+    native Clank Stop guard can check running background tasks. If it requests arming, run \
     `clank wait` with run_terminal_command and block_until_ms: 0. Keep exactly one \
-    automatic task; do not start a plain clank wait alongside it.";
+    background wait; cancel an existing task before replacing it.";
 
 /// Resolve the initial prompt for an agent-start invocation.
 ///

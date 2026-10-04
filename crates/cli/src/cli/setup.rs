@@ -123,26 +123,24 @@ const WORK_LOOP_CODEX: WorkLoop = WorkLoop {
   there is work. You WILL be woken; do not spin.",
 };
 
-/// Native Stop guards one provider-owned background completion channel.
+/// Native Stop asks for one ordinary provider-owned background wait.
 const WORK_LOOP_GROK: WorkLoop = WorkLoop {
     arrival: "\
-- **Use the native guarded handoff.** On first start/resume, end your
-  turn so the native Stop hook can check the existing handoff. If it
+- **Use one background wait.** On first start/resume, end your
+  turn so the native Stop hook can check running tasks. If it
   requests arming, run `clank wait` with `run_terminal_command`
-  and `block_until_ms: 0`. Clank's PreToolUse hook tags that call and
-  PostToolUse confirms its background task before any work is delivered.
+  and `block_until_ms: 0`, with no positive timeout.
   Keep exactly one such task. Its completion wakes you: act on the
-  printed items immediately, then re-arm the same bare command and end
-  your turn. Do not copy its generated key/generation or tagged command.
-  A hook error is a failed handoff, not proof that work was handled.
+  printed items immediately, then re-arm `clank wait` and end your turn.
+  The monitor validates your bound session and rejects duplicate waits.
+  A failed wait is not proof that work was handled.
   Run `clank doctor` to diagnose setup; actual completion notifications
   must be enabled in Grok. Each item names its kind, plan and short sha.",
     prohibition: "\
 - **NEVER poll.** Do not use a foreground wait, a positive task timeout,
-  or repeated status/task checks. Do not start ordinary `clank wait`
-  alongside the automatic handoff. To keep an existing manual waiter,
-  explicitly use `clank auto off`; to migrate, terminate that specific
-  native task before arming the guarded one. No handoff acknowledges work.",
+  or repeated status/task checks. Keep one background `clank wait`;
+  cancel an existing task before replacing it. Use `clank auto off` for
+  manual operation. Waiting never acknowledges work.",
 };
 
 /// opencode is plugin-driven (opencode-agent-tool M1/M2): the clank
@@ -771,9 +769,7 @@ pub(super) fn inspect_provider(
             "hooks/clank.json",
             super::grok_setup::EVENTS
                 .into_iter()
-                .map(|(event, terminal)| {
-                    Box::new(GrokHook { event, terminal }) as Box<dyn HookKind>
-                })
+                .map(|event| Box::new(GrokHook { event }) as Box<dyn HookKind>)
                 .collect(),
         ),
         Tool::OpenCode => return Ok(ready),
@@ -786,6 +782,9 @@ pub(super) fn inspect_provider(
         Err(error) => return Err(error.into()),
     };
     let before = value.clone();
+    if tool == Tool::Grok {
+        retire_grok_hooks(&mut value)?;
+    }
     for kind in kinds {
         merge_hook_value(&mut value, &path, kind.as_ref())?;
     }
@@ -1559,7 +1558,6 @@ fn merge_hook_value(
 
 struct GrokHook {
     event: &'static str,
-    terminal: bool,
 }
 impl HookKind for GrokHook {
     fn command(&self) -> &'static str {
@@ -1573,9 +1571,6 @@ impl HookKind for GrokHook {
     }
     fn timeout(&self) -> u64 {
         5
-    }
-    fn matcher(&self) -> Option<&'static str> {
-        self.terminal.then_some(super::grok_setup::TERMINALS)
     }
 }
 
@@ -1597,8 +1592,9 @@ pub(super) fn install_grok_hooks(
         Err(e) => return Err(e),
     };
     let before = value.clone();
-    for (event, terminal) in super::grok_setup::EVENTS {
-        merge_hook_value(&mut value, path, &GrokHook { event, terminal })?;
+    retire_grok_hooks(&mut value)?;
+    for event in super::grok_setup::EVENTS {
+        merge_hook_value(&mut value, path, &GrokHook { event })?;
     }
     if value == before {
         summary.push(format!("  ok    {} (native Grok adapter)", path.display()));
@@ -1619,6 +1615,37 @@ pub(super) fn install_grok_hooks(
         "  write {} (complete native Grok adapter)",
         path.display()
     ));
+    Ok(())
+}
+
+/// One upgrade transformation, used by readiness and installation alike.
+fn retire_grok_hooks(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    if let Some(hooks) = value
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for event in super::grok_setup::RETIRED_EVENTS {
+            if let Some(groups) = hooks.get_mut(event) {
+                let groups = groups
+                    .as_array_mut()
+                    .context("retired Grok hook groups must be arrays")?;
+                groups.retain_mut(|group| {
+                    let Some(entries) = group
+                        .get_mut("hooks")
+                        .and_then(serde_json::Value::as_array_mut)
+                    else {
+                        return true;
+                    };
+                    let before = entries.len();
+                    entries.retain(|entry| !hook_is_clank(entry));
+                    before == entries.len() || !entries.is_empty()
+                });
+                if groups.is_empty() {
+                    hooks.remove(event);
+                }
+            }
+        }
+    }
     Ok(())
 }
 

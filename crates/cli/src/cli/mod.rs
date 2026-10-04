@@ -29,7 +29,7 @@ pub mod feedback;
 pub mod finish;
 pub mod fork;
 pub mod github;
-pub(crate) mod grok_handoff;
+pub(crate) mod grok_hook;
 pub(crate) mod grok_launch;
 pub(crate) mod grok_setup;
 pub mod html;
@@ -524,11 +524,6 @@ pub struct StatusArgs {
 pub struct WaitCommandArgs {
     #[command(flatten)]
     pub wait: WaitArgs,
-    /// Native hook correlation; never supplied by the model.
-    #[arg(long, hide = true, requires = "handoff_generation", conflicts_with_all = ["peek", "for", "die_with_owner"])]
-    pub handoff_key: Option<String>,
-    #[arg(long, hide = true, requires = "handoff_key")]
-    pub handoff_generation: Option<String>,
 }
 
 #[derive(Args, Debug)]

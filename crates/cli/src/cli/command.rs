@@ -272,7 +272,7 @@ pub async fn dispatch_with(
         Command::Rereview(args) => crate::cli::rereview::run(args).await,
         Command::Rewire(args) => crate::cli::rewire::run(args).await,
         Command::Status(args) => crate::cli::status::run(args).await,
-        Command::Wait(args) => crate::cli::grok_handoff::run_wait(args).await,
+        Command::Wait(args) => crate::cli::wait::run(args.wait).await,
         Command::Feedback(args) => crate::cli::feedback::run(args).await,
         Command::Events(args) => crate::cli::events::run(args).await,
         Command::Send(args) => crate::cli::send::run(args).await,
@@ -518,30 +518,12 @@ mod tests {
             Command::Wait(_)
         ));
         assert!(Cli::try_parse_from(["clank", "grok-wait"]).is_err());
-        assert!(Cli::try_parse_from(["clank", "wait", "--handoff-key", "key"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "clank",
-                "wait",
-                "--handoff-key",
-                "key",
-                "--handoff-generation",
-                "generation",
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "clank",
-                "wait",
-                "--handoff-key",
-                "key",
-                "--handoff-generation",
-                "generation",
-                "--peek",
-            ])
-            .is_err()
-        );
+        assert!(matches!(
+            Cli::try_parse_from(["clank", "wait", "--repo", "."])
+                .unwrap()
+                .command,
+            Command::Wait(_)
+        ));
     }
 
     #[test]

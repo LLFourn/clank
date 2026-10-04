@@ -59,9 +59,7 @@ pub(crate) fn binding_matches(repo: &Path, label: &AgentLabel, tool: Tool, sessi
 /// dirs if needed.
 pub fn save_agent_config(repo: &Path, label: &AgentLabel, cfg: &AgentConfig) -> anyhow::Result<()> {
     let path = agent_config_path(repo, label);
-    let previous = load_agent_config(repo, label).ok().flatten();
     save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))?;
-    crate::cli::grok_handoff::config_changed(repo, label, previous.as_ref(), cfg);
     Ok(())
 }
 

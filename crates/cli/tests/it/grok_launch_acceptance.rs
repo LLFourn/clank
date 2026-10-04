@@ -1,5 +1,5 @@
 //! The exec boundary needs a subprocess: in-process composers cannot prove
-//! the native hooks and generated waiter command work in the launched env.
+//! the native hooks and ordinary wait command work in the launched env.
 //! Use the existing CLI binary, one integration harness, empty temporary homes,
 //! and a deterministic provider transport. No terminals, models or credentials.
 
@@ -177,9 +177,7 @@ impl Fixture {
                 self.root.to_str().unwrap(),
             ])
             .await;
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("advertised PreToolUse=true, Stop=true")
-        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("advertised Stop=true"));
         for role in ["clank-master", "clank-reviewer"] {
             let body =
                 std::fs::read_to_string(self.grok.join("skills").join(role).join("SKILL.md"))
@@ -386,14 +384,6 @@ impl Drop for Fixture {
         for extension in ["json", "lock", "repair"] {
             let _ = std::fs::remove_file(runtime.join(format!("{tag}.{extension}")));
         }
-        let mut hash = blake3::Hasher::new();
-        hash.update(self.root.as_os_str().as_encoded_bytes());
-        hash.update(&[0]);
-        hash.update(b"grok");
-        let key = hash.finalize().to_hex()[..24].to_owned();
-        for extension in ["json", "sock", "lock", "lease"] {
-            let _ = std::fs::remove_file(runtime.join(format!("g_{key}.{extension}")));
-        }
     }
 }
 
@@ -425,32 +415,22 @@ async fn cycles_after_setup(f: &Fixture, expected: Option<&str>, expected_probes
             .is_none()
     );
     actor.send(json!({"action":"begin","cycles":10})).await;
-    let mut commands = std::collections::BTreeSet::new();
     let mut monitor = None;
-    let mut slot = None;
     for cycle in 0..10 {
-        let offered = actor.next("offered").await;
-        assert_eq!(offered["cycle"], cycle);
-        assert!(
-            commands.insert(offered["command"].as_str().unwrap().to_owned()),
-            "each cycle must own a new generation"
-        );
-        let words = shell_words::split(offered["command"].as_str().unwrap()).unwrap();
-        assert_eq!(words.len(), 7);
-        assert_eq!(words[2], "wait");
-        assert_eq!(words[3], "--handoff-key");
-        assert_eq!(words[5], "--handoff-generation");
-        if let Some(previous) = &slot {
-            assert_eq!(&words[4], previous, "cycles must reuse one runtime slot");
+        let started = actor.next("started").await;
+        assert_eq!(started["cycle"], cycle);
+        let words = shell_words::split(started["command"].as_str().unwrap()).unwrap();
+        assert_eq!(&words[..2], &["clank", "wait"]);
+        if cycle % 2 == 0 {
+            assert_eq!(&words[2..], &["--repo", f.root.to_str().unwrap()]);
         } else {
-            slot = Some(words[4].clone());
+            assert_eq!(words.len(), 2);
         }
         // A pending event remains unhandled, even while a process was armed.
         if cycle == 0 {
             assert!(f.pending(&pending).is_some());
         }
-        actor.send(json!({"action":"register"})).await;
-        let registered = actor.next("registered").await;
+        let registered = actor.next("waiting").await;
         assert_ne!(registered["stop"]["decision"], "block");
         if cycle > 0 {
             assert_eq!(
@@ -463,7 +443,19 @@ async fn cycles_after_setup(f: &Fixture, expected: Option<&str>, expected_probes
             if let Some(previous) = &monitor {
                 assert_eq!(&current, previous, "re-arming must reuse one monitor");
             } else {
-                monitor = Some(current);
+                monitor = Some(current.clone());
+            }
+            if cycle == 4 {
+                // This descriptor is checked against the fixture's canonical
+                // repository. Kill only its monitor while the wait is parked:
+                // the same process must reconnect and catch the persisted event.
+                let pid = current["pid"]
+                    .as_i64()
+                    .and_then(|p| i32::try_from(p).ok())
+                    .and_then(clank::signal::Pid::new)
+                    .unwrap();
+                clank::signal::signal_process(pid, libc::SIGTERM);
+                monitor = None;
             }
             pending = f.deliver(cycle);
         }
@@ -475,6 +467,16 @@ async fn cycles_after_setup(f: &Fixture, expected: Option<&str>, expected_probes
         let selector = f
             .pending(&pending)
             .expect("delivery must not acknowledge work");
+        let listed = f
+            .run(&["events", "list", "--author", "grok", "--json"])
+            .await;
+        let metadata: Vec<Value> = serde_json::from_slice(&listed.stdout).unwrap();
+        let delivered = metadata
+            .iter()
+            .find(|row| row["item"]["handle"] == pending)
+            .expect("the delivered event must remain listed");
+        assert!(delivered["woken_at"].is_number(), "{delivered}");
+        assert_eq!(delivered["acked"], false);
         actor
             .send(json!({"action":"react","selector":selector}))
             .await;
@@ -485,11 +487,13 @@ async fn cycles_after_setup(f: &Fixture, expected: Option<&str>, expected_probes
     actor.next("ended").await;
     actor.end().await;
     let rows = f.rows();
-    assert_eq!(
+    assert!(
         rows.iter()
-            .filter(|r| r["kind"] == "hook" && r["event"] == "PostToolUse")
-            .count(),
-        10
+            .filter(|r| r["kind"] == "hook")
+            .all(|r| matches!(
+                r["event"].as_str(),
+                Some("SessionStart" | "Stop" | "SessionEnd")
+            ))
     );
     for start in rows.iter().filter(|r| {
         r["kind"] == "start"
@@ -547,7 +551,7 @@ async fn fresh_launch_delivers_pending_work_and_ten_background_completion_turns(
 }
 
 #[tokio::test]
-async fn missing_setup_is_repaired_before_native_grok_launch_and_handoff() {
+async fn missing_setup_is_repaired_before_native_grok_launch_and_wait() {
     let f = Fixture::new();
     assert!(!f.grok.join("hooks/clank.json").exists());
     cycles_after_setup(&f, None, 1).await;

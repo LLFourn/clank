@@ -67,11 +67,8 @@ fn capability_advertisement_is_neither_a_version_guess_nor_a_wake_proof() {
     for version in ["1.0.45", "2.0.0", "garbage", "1.0.46-secret"] {
         assert!(!Capabilities::decode(&advertised(version, &["pre_tool_use", "stop"])).candidate);
     }
-    for events in [
-        &["stop"][..],
-        &["pre_tool_use"][..],
-        &["PreToolUse", "Stop"][..],
-    ] {
+    assert!(Capabilities::decode(&advertised("1.0.46", &["stop"])).candidate);
+    for events in [&[][..], &["pre_tool_use"][..], &["PreToolUse", "Stop"][..]] {
         assert!(!Capabilities::decode(&advertised("1.0.46", events)).candidate);
     }
     assert!(!Capabilities::decode(&json!({"_meta":{"agentVersion":"1.0.46"}})).candidate);
@@ -109,6 +106,36 @@ fn complete_install_is_idempotent_and_keeps_unrelated_hooks() {
 }
 
 #[test]
+fn upgrade_removes_all_retired_owned_hooks_and_readiness_detects_them() {
+    let f = Fixture::new();
+    f.install(false).unwrap();
+    let path = hook_path(&f.provider);
+    let mut value = read_hooks(&path).unwrap();
+    let user = json!({"type":"command", "command":"user-notification"});
+    for event in RETIRED_EVENTS {
+        value["hooks"][event] = json!([{"matcher":"keep-me", "custom":42, "hooks":[
+            {"type":"command", "command":COMMAND}, user
+        ]}]);
+    }
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(validate_hooks(&f.provider).is_err());
+    assert!(
+        !super::super::setup::inspect_provider(&f.cwd, Tool::Grok, &f.provider.root, false)
+            .unwrap()
+    );
+    f.install(false).unwrap();
+    validate_hooks(&f.provider).unwrap();
+    let value = read_hooks(&path).unwrap();
+    for event in RETIRED_EVENTS {
+        assert_eq!(value["hooks"][event][0]["hooks"], json!([user]));
+        assert_eq!(value["hooks"][event][0]["custom"], 42);
+    }
+    let before = std::fs::read(&path).unwrap();
+    f.install(false).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
 fn dry_run_creates_nothing_and_malformed_event_cannot_publish_partial_adapter() {
     let f = Fixture::new();
     let path = hook_path(&f.provider);
@@ -122,12 +149,12 @@ fn dry_run_creates_nothing_and_malformed_event_cannot_publish_partial_adapter() 
 }
 
 #[test]
-fn validator_catches_missing_post_guard_and_incorrect_terminal_matcher() {
+fn validator_catches_missing_lifecycle_and_retired_owned_hooks() {
     let f = Fixture::new();
     f.install(false).unwrap();
     let path = hook_path(&f.provider);
     let original = read_hooks(&path).unwrap();
-    for event in ["PostToolUse", "PreToolUse", "SessionStart", "StopCancelled"] {
+    for event in EVENTS {
         let mut broken = original.clone();
         broken["hooks"].as_object_mut().unwrap().remove(event);
         std::fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
@@ -139,13 +166,13 @@ fn validator_catches_missing_post_guard_and_incorrect_terminal_matcher() {
         );
     }
     let mut broken = original;
-    broken["hooks"]["PostToolUse"][0]["matcher"] = Value::String(".*".into());
+    broken["hooks"]["PostToolUse"] = json!([{"hooks":[{"type":"command","command":COMMAND}]}]);
     std::fs::write(path, serde_json::to_vec(&broken).unwrap()).unwrap();
     assert!(
         validate_hooks(&f.provider)
             .unwrap_err()
             .to_string()
-            .contains("matcher")
+            .contains("retired")
     );
 }
 

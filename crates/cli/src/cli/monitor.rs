@@ -29,7 +29,12 @@ use clank_core::wait::WaitItem;
 // Version 10 owns eligible-event interruption even without an armed waiter.
 // Version 9 can host the same inbox but cannot promise this control lifecycle;
 // a fresh client must negotiate retirement rather than silently reuse it.
-pub(crate) const PROTO: u32 = 10;
+// 11 admits one automatic Grok wait per bound session and reports refusals.
+pub(crate) const PROTO: u32 = 11;
+
+#[cfg(test)]
+#[path = "monitor_grok_tests.rs"]
+mod grok_tests;
 
 /// What a monitor can do, not just what its frames look like.
 ///
@@ -146,6 +151,9 @@ pub(crate) enum Welcome {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub(crate) enum Note {
+    /// A lifecycle or admission refusal. It must never fall back to a local
+    /// watcher, which would bypass the monitor's ownership decision.
+    Refused { why: String },
     /// What this client's author is owed. Empty is never sent; a client
     /// blocks until it has something, as a park does today.
     Items {
@@ -824,6 +832,10 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
+    pub(crate) fn cancellation_socket(&self) -> std::io::Result<std::os::unix::net::UnixStream> {
+        self.io.get_ref().try_clone()
+    }
+
     fn over_reader(io: std::io::BufReader<std::os::unix::net::UnixStream>) -> Self {
         Self {
             io,
@@ -1443,6 +1455,18 @@ pub(crate) fn look_at_in(
 #[derive(Debug)]
 pub(crate) struct RepairPermit {
     _file: std::fs::File,
+}
+
+impl Drop for RepairPermit {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // A concurrent fork can briefly inherit this open-file description
+        // before CLOEXEC closes it. Release explicitly when repair ends,
+        // rather than leave admission waiting for that unrelated child.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 /// Where this uid's RUNTIME state lives: the descriptor, the monitor
@@ -2262,6 +2286,7 @@ enum Served {
 #[derive(Debug)]
 struct Client {
     who: Served,
+    holder: Option<Holder>,
     out: tokio::sync::mpsc::Sender<String>,
     /// The task that owns this client's socket.
     ///
@@ -2898,6 +2923,33 @@ fn admit_into(
     pending: &mut Vec<(AgentLabel, WaitItem)>,
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    let mut leaving = Vec::new();
+    // EOF closes each writer's receiver. Remove those connections before
+    // admitting a replacement; no task token or cleanup by session-wide key.
+    let mut live = Vec::new();
+    for old in clients.drain(..) {
+        if old.out.is_closed() {
+            if let Some(writer) = old.writer {
+                leaving.push(writer);
+            }
+        } else {
+            live.push(old);
+        }
+    }
+    *clients = live;
+    let duplicate = automatic_grok_client(repo, &client)
+        && clients
+            .iter()
+            .any(|old| old.holder == client.holder && old.who == client.who);
+    let refusal = client_refusal(repo, &client).or_else(|| duplicate.then(||
+        "this Grok session already has a connected automatic wait; keep that task or cancel it before starting another".to_owned()));
+    if let Some(why) = refusal {
+        send_note(&client, &Note::Refused { why });
+        if let Some(writer) = client.writer {
+            leaving.push(writer);
+        }
+        return leaving;
+    }
     let mut arriving = vec![client];
     if let Some(state) = state {
         // The REAL buffer: a transient retained while its author had
@@ -2905,7 +2957,7 @@ fn admit_into(
         // a newcomer that returns on admission work without it would
         // leave it waiting for a tick that may never find an eligible
         // client (codex on 1552f66).
-        let leaving = serve_to_cached(
+        leaving.extend(serve_to_cached(
             repo,
             &mut arriving,
             state,
@@ -2913,12 +2965,50 @@ fn admit_into(
             pending,
             &mut Default::default(),
             hosted,
-        );
+        ));
         clients.append(&mut arriving);
         return leaving;
     }
     clients.append(&mut arriving);
-    Vec::new()
+    leaving
+}
+
+fn automatic_grok_client(repo: &std::path::Path, client: &Client) -> bool {
+    let Served::Agent { author } = &client.who else {
+        return false;
+    };
+    if !client
+        .holder
+        .as_ref()
+        .is_some_and(|h| h.tool == clank_core::Tool::Grok)
+    {
+        return false;
+    }
+    let Ok(cfg) = crate::agent_store::load_agent_config(repo, author) else {
+        return false;
+    };
+    // A custom launch HOME can have a different global auto default from the
+    // monitor's own HOME. Derive it from the roster, not a new protocol field.
+    let home = super::grok_setup::profile(repo, author)
+        .ok()
+        .and_then(|provider| provider.env.get("HOME").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
+    crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
+        == clank_core::AutoMode::On
+}
+
+fn client_refusal(repo: &std::path::Path, client: &Client) -> Option<String> {
+    let Served::Agent { author } = &client.who else {
+        return None;
+    };
+    let holder = client.holder.as_ref()?;
+    if !crate::agent_store::binding_matches(repo, author, holder.tool, &holder.session) {
+        return Some(format!(
+            "this {} session no longer owns `{author}`",
+            holder.tool.as_str()
+        ));
+    }
+    None
 }
 
 /// Beats, produced independently of client traffic.
@@ -3125,7 +3215,15 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
     let admitted = match greeting {
         Greeting::Decline(d) => Err(d),
         Greeting::Obsolete(_) => unreachable!("returned above"),
-        Greeting::Client(hello) => served_for(repo, hello.who),
+        Greeting::Client(hello) => served_for(repo, hello.who.clone()).map(|who| {
+            (
+                who,
+                match hello.who {
+                    Who::Agent { holder, .. } => holder,
+                    Who::Observer => None,
+                },
+            )
+        }),
     };
 
     let welcome = match &admitted {
@@ -3136,7 +3234,7 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         .write_all(format!("{}\n", serde_json::to_string(&welcome)?).as_bytes())
         .await?;
 
-    let who = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
+    let (who, holder) = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
     if let Served::Agent { author, .. } = &who {
         tracing::debug!(%author, "monitor agent wait admitted");
     }
@@ -3144,6 +3242,7 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
     let writer = tokio::spawn(write_to(io.into_inner(), queued, who.name()));
     Ok(Greeted::Client(Client {
         who,
+        holder,
         out,
         writer: Some(writer),
         shown: Default::default(),
@@ -3201,9 +3300,14 @@ async fn write_to_within(
     author: String,
     budget: Duration,
 ) -> Wrote {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    while let Some(line) = queued.recv().await {
+    loop {
+        let mut unexpected = [0u8; 1];
+        let line = tokio::select! {
+            line = queued.recv() => match line { Some(line) => line, None => return Wrote::Drained },
+            _ = socket.read(&mut unexpected) => return Wrote::Failed,
+        };
         match tokio::time::timeout(budget, socket.write_all(line.as_bytes())).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -3216,7 +3320,6 @@ async fn write_to_within(
             }
         }
     }
-    Wrote::Drained
 }
 
 /// What a retirement established before it released the repo.
@@ -3632,6 +3735,13 @@ fn serve_to_cached(
     // held for them.
     let mut delivered: Vec<AgentLabel> = Vec::new();
     for mut client in clients.drain(..) {
+        if let Some(why) = client_refusal(repo, &client) {
+            send_note(&client, &Note::Refused { why });
+            if let Some(writer) = client.writer {
+                leaving.push(writer);
+            }
+            continue;
+        }
         if let Some(only) = only
             && !matches!(&client.who, Served::Agent { author, .. } if author == only)
         {
@@ -3914,6 +4024,7 @@ mod tests {
             },
             out,
             writer: Some(writer),
+            holder: None,
             shown: Default::default(),
         }];
 
@@ -3978,6 +4089,7 @@ mod tests {
                 who: Served::Observer,
                 out,
                 writer: Some(writer),
+                holder: None,
                 shown: Default::default(),
             }
         };
@@ -4032,6 +4144,7 @@ mod tests {
                 who: Served::Observer,
                 out,
                 writer: Some(writer),
+                holder: None,
                 shown: Default::default(),
             }
         };
@@ -4195,6 +4308,7 @@ mod tests {
                 who: Served::Observer,
                 out,
                 writer: Some(writer),
+                holder: None,
                 shown: Default::default(),
             }))
             .unwrap();
@@ -4297,6 +4411,7 @@ mod tests {
             who: Served::Agent { author: claude },
             out,
             writer: Some(writer),
+            holder: None,
             shown: Default::default(),
         }];
 
@@ -4425,6 +4540,7 @@ mod tests {
                 },
                 out,
                 writer: Some(writer),
+                holder: None,
                 shown: Default::default(),
             }))
             .unwrap();
@@ -7748,6 +7864,7 @@ mod tests {
                     author: author.clone(),
                 },
                 out,
+                holder: None,
                 shown: Default::default(),
             };
             let mut clients = Vec::new();
@@ -7852,6 +7969,7 @@ mod tests {
                 author: author.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         };
         let (one, mut first) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
@@ -8150,6 +8268,7 @@ mod tests {
                 writer: None,
                 who: Served::Agent { author: label },
                 out,
+                holder: None,
                 shown: Default::default(),
             });
             peers.push(theirs);
@@ -8771,6 +8890,7 @@ mod tests {
                 author: codex.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -8801,6 +8921,7 @@ mod tests {
                 author: codex.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         };
         clients.push(fresh(out));
@@ -8888,6 +9009,7 @@ mod tests {
                 author: codex.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -8949,6 +9071,7 @@ mod tests {
                 author: codex.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -9026,6 +9149,7 @@ mod tests {
                 author: claude.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -9078,6 +9202,7 @@ mod tests {
                 author: AgentLabel::parse("claude").unwrap(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -9092,6 +9217,7 @@ mod tests {
         // a transient is one author's event, like any other.
         let note: Note = serde_json::from_str(other.recv().await.unwrap().trim_end()).unwrap();
         match note {
+            Note::Refused { why } => panic!("unexpected refusal: {why}"),
             Note::Beat { .. } => {}
             Note::Items { items, .. } => assert!(
                 !items.contains(&held),
@@ -9146,6 +9272,7 @@ mod tests {
                     author: claude.clone(),
                 },
                 out,
+                holder: None,
                 shown: Default::default(),
             },
             Some(&state),
@@ -9198,6 +9325,7 @@ mod tests {
                 author: claude.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let mut pending = Vec::new();
@@ -9250,6 +9378,7 @@ mod tests {
                     author: claude.clone(),
                 },
                 out,
+                holder: None,
                 shown: Default::default(),
             },
             Some(&state),
@@ -9331,6 +9460,7 @@ mod tests {
                 author: claude.clone(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -9416,6 +9546,7 @@ mod tests {
                 author: AgentLabel::parse(who).unwrap(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         };
         let mut clients = vec![agent("codex", a), agent("claude", b)];
@@ -9468,6 +9599,7 @@ mod tests {
                 author: AgentLabel::parse("claude").unwrap(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         }];
 
@@ -9488,6 +9620,7 @@ mod tests {
                         author: AgentLabel::parse("codex").unwrap(),
                     },
                     out,
+                    holder: None,
                     shown: Default::default(),
                 },
                 Some(&state),
@@ -9526,6 +9659,7 @@ mod tests {
                 author: AgentLabel::parse(author).unwrap(),
             },
             out,
+            holder: None,
             shown: Default::default(),
         };
         let mut clients = vec![
@@ -9535,6 +9669,7 @@ mod tests {
                 writer: None,
                 who: Served::Observer,
                 out: watching,
+                holder: None,
                 shown: Default::default(),
             },
         ];
@@ -9583,6 +9718,7 @@ mod tests {
             writer: None,
             who: Served::Observer,
             out,
+            holder: None,
             shown: Default::default(),
         }];
         // A repo with work to do: a queued plan is something an AGENT

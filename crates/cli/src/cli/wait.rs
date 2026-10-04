@@ -32,7 +32,7 @@ use clank_core::wait::WaitItem;
 /// exact tool/session still holds the label. A terminal wait with no
 /// session remains a direct, unclaimed observer.
 #[derive(Debug, Clone)]
-struct WaitBinding(
+pub(super) struct WaitBinding(
     Option<(clank_core::Tool, clank_core::SessionId)>,
     WaitPolicy,
 );
@@ -127,6 +127,9 @@ impl WaitBinding {
 }
 
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
+    if let Some((repo, author, binding)) = automatic_grok(&args, &crate::agent_env::Process)? {
+        return run_automatic_grok(args, &repo, &author, &binding).await;
+    }
     let json = args.json;
     let peek = args.peek;
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -164,6 +167,140 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         emit_with_context(&items, json, source_cwd.as_deref());
     }
     Ok(())
+}
+
+/// Native session identity is enough. The launch cwd fixes the repository;
+/// `--repo` can restate it but cannot move this automatic waiter elsewhere.
+pub(super) fn automatic_grok(
+    args: &WaitArgs,
+    env: &dyn crate::agent_env::Ambient,
+) -> anyhow::Result<Option<(PathBuf, AgentLabel, WaitBinding)>> {
+    if args.peek || args.r#for.is_some() || args.die_with_owner {
+        return Ok(None);
+    }
+    let Some(raw) = env
+        .var(crate::agent_env::ENV_GROK_SESSION)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    let session = clank_core::SessionId::parse(&raw)?;
+    let cwd = env
+        .cwd()
+        .ok_or_else(|| anyhow::anyhow!("Grok wait has no working directory"))?;
+    let bound_repo = resolve_repo(Some(&cwd))?;
+    let author = crate::agent_env::resolve_identity_for_hook_in(
+        &bound_repo,
+        clank_core::Tool::Grok,
+        &session,
+        env,
+    )?;
+    let cfg = crate::agent_store::load_agent_config(&bound_repo, &author)?;
+    if crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), env.home().as_deref())
+        == clank_core::AutoMode::Off
+    {
+        return Ok(None);
+    }
+    let repo = match args.repo.as_deref() {
+        Some(path) => resolve_repo(Some(path))?,
+        None => bound_repo.clone(),
+    };
+    anyhow::ensure!(
+        repo == bound_repo,
+        "automatic Grok wait cannot leave its session's repository"
+    );
+    anyhow::ensure!(
+        args.author
+            .as_deref()
+            .is_none_or(|label| label == author.as_str()),
+        "automatic Grok wait cannot override its session's agent"
+    );
+    let binding = WaitBinding(
+        Some((clank_core::Tool::Grok, session)),
+        WaitPolicy::AutomaticGrok { home: env.home() },
+    );
+    binding.ensure_current(&repo, &author)?;
+    Ok(Some((repo, author, binding)))
+}
+
+async fn run_automatic_grok(
+    args: WaitArgs,
+    repo: &Path,
+    author: &AgentLabel,
+    binding: &WaitBinding,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.events.is_empty(),
+        "automatic Grok wait uses monitor-hosted sources; configure wait_events or use auto off for invocation-only --event sources"
+    );
+    // Keep the existing PR draft producer only while this master is parked.
+    // Its remote review cadence is unrelated to wait ownership or registration.
+    let inputs = derive_wait_inputs(repo, author)?;
+    let drafts = WakeSources::derive(repo, inputs.role, vec![]).drafts;
+    let (draft_tx, mut draft_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut producers = None;
+    let result = async {
+        loop {
+            binding.ensure_current(repo, author)?;
+            let attached = crate::cli::monitor::attach_or_spawn_with(
+                repo,
+                crate::cli::monitor::Who::Agent {
+                    author: author.to_string(),
+                    holder: binding.holder(),
+                    has_cli_sources: false,
+                },
+                crate::cli::monitor::spawn_monitor,
+            )
+            .await;
+            let crate::cli::monitor::Attached::Shared(conn) = attached else {
+                anyhow::bail!(
+                    "automatic Grok wait could not subscribe to its repository monitor: {attached:?}"
+                );
+            };
+            tracing::debug!(%author, "monitor subscription registered");
+            let wake = tokio::select! {
+                wake = shared_wait_within_on_idle(conn, repo, author, binding,
+                    crate::cli::monitor::BEAT_GRACE, || {
+                        if producers.is_none() && !drafts.is_empty() {
+                            producers = Some(EventSources::spawn(&[], None, repo, author,
+                                &drafts, None, draft_tx.clone().into()));
+                        }
+                    }) => wake?,
+                Some((item, _)) = draft_rx.recv() => {
+                    binding.ensure_current(repo, author)?;
+                    let inputs = derive_wait_inputs(repo, author)?;
+                    let state = crate::rebuild::rebuild_repo(repo).await?;
+                    let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
+                    let head = crate::git_io::head_commit_at(repo, &state);
+                    let status = state.fold.derive_status(&reviews, &inputs.work_policy, head.as_ref());
+                    let items = owed_for(repo, author, &inputs, &status, &state.fold, &mut vec![item]);
+                    if items.is_empty() { continue; }
+                    Shared::Woke(items, std::env::current_dir().ok())
+                }
+            };
+            match wake {
+                Shared::Woke(items, cwd) => {
+                    binding.ensure_current(repo, author)?;
+                    emit_checked(&items, args.json, cwd.as_deref(), &mut std::io::stdout())?;
+                    let selected = items
+                        .iter()
+                        .filter_map(|item| item.presentation().cloned())
+                        .collect::<Vec<_>>();
+                    super::presentation::record(repo, author, &selected, || {
+                        binding.ensure_current(repo, author).is_ok()
+                    });
+                    return Ok(());
+                }
+                // Reattach only after a real disconnect or the existing monitor
+                // liveness deadline. No polling, helper or Grok registration timer.
+                Shared::Alone(why) => tracing::debug!(%why, "reconnecting Grok wait"),
+            }
+        }
+    }.await;
+    if let Some(producers) = producers {
+        producers.shutdown().await;
+    }
+    result
 }
 
 fn superseded_error(error: anyhow::Error, json: bool) -> anyhow::Result<()> {
@@ -216,34 +353,19 @@ pub async fn items_observing(
     args: WaitArgs,
     starts: &SourceStarts,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, starts, None, &mut None).await
-}
-
-pub(super) async fn automatic_grok_items(
-    args: WaitArgs,
-    session: clank_core::SessionId,
-) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    use crate::agent_env::Ambient;
-    items_with_policy(
-        args,
-        &SourceStarts::default(),
-        Some((session, crate::agent_env::Process.home())),
-        &mut None,
-    )
-    .await
+    items_with_policy(args, starts, &mut None).await
 }
 
 async fn items_with_context(
     args: WaitArgs,
     source_cwd: &mut Option<PathBuf>,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, &SourceStarts::default(), None, source_cwd).await
+    items_with_policy(args, &SourceStarts::default(), source_cwd).await
 }
 
 async fn items_with_policy(
     args: WaitArgs,
     starts: &SourceStarts,
-    automatic: Option<(clank_core::SessionId, Option<std::path::PathBuf>)>,
     source_cwd: &mut Option<PathBuf>,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
     *source_cwd = std::env::current_dir().ok();
@@ -289,15 +411,7 @@ async fn items_with_policy(
     // is fail-soft there (wait-reloads-config-per-refold).
     let mut inputs = derive_wait_inputs(&repo, &author)?;
 
-    // The native adapter already validated Grok's actual session. Inherited
-    // Claude/Codex variables cannot override that identity or prevent arming.
-    let binding = match automatic {
-        Some((session, home)) => WaitBinding(
-            Some((clank_core::Tool::Grok, session)),
-            WaitPolicy::AutomaticGrok { home },
-        ),
-        None => WaitBinding::capture(&args)?,
-    };
+    let binding = WaitBinding::capture(&args)?;
     binding.ensure_current(&repo, &author)?;
 
     let events_dir = crate::agent_store::agents_root(&repo)
@@ -994,7 +1108,18 @@ async fn shared_wait_within(
     binding: &WaitBinding,
     grace: Duration,
 ) -> anyhow::Result<Shared> {
-    let mut notes = bridge_notes(conn, grace);
+    shared_wait_within_on_idle(conn, repo, author, binding, grace, || {}).await
+}
+
+async fn shared_wait_within_on_idle(
+    conn: crate::cli::monitor::Conn,
+    repo: &Path,
+    author: &AgentLabel,
+    binding: &WaitBinding,
+    grace: Duration,
+    mut idle: impl FnMut(),
+) -> anyhow::Result<Shared> {
+    let mut notes = bridge_notes(conn, grace)?;
     // The sharing ends exactly one way: the reader is gone. A failed
     // read is the REASON, not a second ending — giving it an arm of
     // its own would make two code paths for one rule, and each would
@@ -1014,10 +1139,15 @@ async fn shared_wait_within(
                 // A fold that owes this author nothing, and the beat
                 // that says the monitor is alive, are both just "keep
                 // waiting".
-                if let crate::cli::monitor::Note::Items { items, source_cwd } = note {
-                    if !items.is_empty() {
+                match note {
+                    crate::cli::monitor::Note::Items { items, source_cwd } if !items.is_empty() => {
                         return Ok(Shared::Woke(items, source_cwd));
                     }
+                    crate::cli::monitor::Note::Refused { why } => {
+                        anyhow::bail!("monitor refused wait: {why}")
+                    }
+                    crate::cli::monitor::Note::Beat => idle(),
+                    _ => {}
                 }
             }
             Some(Err(e)) => why = e,
@@ -1040,13 +1170,10 @@ async fn shared_wait_within(
 /// bound a future that never yields, so a monitor's silence becomes a
 /// hang instead of a fallback.
 ///
-/// The thread ends when its send fails — the receiver is gone because
-/// the wait returned — after at most one more `grace` parked in the
-/// read. That outlives nothing: delivering items ends the process.
-fn bridge_notes(
-    mut conn: crate::cli::monitor::Conn,
-    grace: Duration,
-) -> tokio::sync::mpsc::UnboundedReceiver<Result<crate::cli::monitor::Note, String>> {
+/// Dropping the receiver shuts down the socket and immediately releases the
+/// reader thread, including when a different source wins the wait's select.
+fn bridge_notes(mut conn: crate::cli::monitor::Conn, grace: Duration) -> std::io::Result<Notes> {
+    let socket = conn.cancellation_socket()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
         loop {
@@ -1057,7 +1184,26 @@ fn bridge_notes(
             }
         }
     });
-    rx
+    Ok(Notes { rx, socket })
+}
+
+struct Notes {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<crate::cli::monitor::Note, String>>,
+    socket: std::os::unix::net::UnixStream,
+}
+
+impl Notes {
+    async fn recv(&mut self) -> Option<Result<crate::cli::monitor::Note, String>> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for Notes {
+    fn drop(&mut self) {
+        // Cancelled selects close the connection and wake its blocked reader
+        // immediately, so a replacement never waits for the monitor heartbeat.
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// What `author` is owed at one fold, block decision included.
@@ -2806,6 +2952,54 @@ mod shared_tests {
             matches!(got.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
             "{got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_producers_start_only_after_an_admitted_idle_note() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("grok").unwrap();
+        let binding = WaitBinding(None, WaitPolicy::Manual);
+        for (notes, expected, refused) in [
+            (
+                vec![Note::Items {
+                    items: vec![promote()],
+                    source_cwd: None,
+                }],
+                0,
+                false,
+            ),
+            (
+                vec![Note::Refused {
+                    why: "duplicate".into(),
+                }],
+                0,
+                true,
+            ),
+            (
+                vec![
+                    Note::Beat,
+                    Note::Items {
+                        items: vec![promote()],
+                        source_cwd: None,
+                    },
+                ],
+                1,
+                false,
+            ),
+        ] {
+            let mut starts = 0;
+            let result = shared_wait_within_on_idle(
+                monitor_saying(notes),
+                repo.path(),
+                &author,
+                &binding,
+                Duration::from_secs(1),
+                || starts += 1,
+            )
+            .await;
+            assert_eq!(result.is_err(), refused);
+            assert_eq!(starts, expected);
+        }
     }
 
     #[tokio::test]

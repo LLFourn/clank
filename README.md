@@ -83,13 +83,15 @@ command for claude, the clank opencode plugin
 and merges its Stop and SessionStart hooks into claude's
 `settings.json` and codex's `hooks.json`, replacing any entry that
 runs `clank stop-hook`. Grok gets a native adapter at
-`$GROK_HOME/hooks/clank.json` (default `~/.grok/hooks/clank.json`): a fast Stop
-guard and terminal-only Pre/Post hooks protect one background handoff.
+`$GROK_HOME/hooks/clank.json` (default `~/.grok/hooks/clank.json`): SessionStart
+binds the session, Stop requests one ordinary background wait, and SessionEnd
+releases that session's binding. Setup removes the retired Clank-owned tool hooks
+while preserving unrelated user hooks.
 For a custom Grok launch profile, use
 `clank setup --grok-agent <label> --repo <repo>` to install its hooks and
 skills in that profile's home. Setup probes the selected executable once;
 automatic launches require the complete adapter and Grok 1.x at least 1.0.46
-advertising native PreToolUse/Stop gates. `clank auto off` retains manual operation.
+advertising the native Stop decision gate. `clank auto off` retains manual operation.
 These configuration/capability checks do not prove enabled completion
 notifications or a model wake; doctor reports that distinction explicitly.
 
@@ -400,15 +402,16 @@ auto-mode drives it:
   kitty-protocol Enter press. That fallback can leave a submitted
   message queued behind the held Stop hook; use the remote Stop button
   to release it.
-- **grok** — native PreToolUse tags one `clank wait` requested with
-  `run_terminal_command` and `block_until_ms: 0`; PostToolUse confirms its
-  background task before the existing Clank wait can deliver. Background
-  completion carries new work turns; Stop only checks or requests bounded
-  repair. Existing ordinary waits require an explicit migration choice.
-  There is no new idle helper or polling cadence. Corrected fork preparation,
-  setup, capability gates and deterministic lifecycle fixtures are implemented;
-  authenticated native payload and model wake/reaction acceptance remain
-  unverified. See [the integration contract](GROK-INTEGRATION.md).
+- **grok** — native SessionStart binds the session; Stop checks the native
+  background-task snapshot and requests one ordinary `clank wait` using
+  `run_terminal_command` and `block_until_ms: 0` when needed. The wait connects
+  directly to the shared monitor with the existing agent and session identity.
+  The monitor rejects duplicate automatic waits; no tool arguments are rewritten.
+  Grok's background completion carries the next work turn. An idle wait adds no
+  helper, watcher or polling cadence. Setup migrates existing Clank-owned hooks
+  while preserving user hooks. Deterministic launch fixtures verify the wiring;
+  authenticated model completion acceptance remains a separate live check. See
+  [the integration contract](GROK-INTEGRATION.md).
 - **opencode** — the clank plugin long-polls in-hook on
   `session.idle` and injects the items as a new prompt; the agent
   never arms anything. Global and custom configuration directories load
@@ -774,7 +777,7 @@ legacy events remain `?` until a real wake or explicit read.
 
 Clank records the first wake for each exact inbox copy in its existing WAL.
 Generic Codex, Claude and OpenCode continuations, Claude SessionStart context,
-the registered native Grok background wait, and explicit event reads record
+the native Grok background wait, and explicit event reads record
 successful delivery after flush and binding validation. Failed output or stale
 sessions leave the state unchanged. A crash or storage error after output can conservatively leave `?`;
 the event stays owed, and a later real wake can record it. Callback configuration,

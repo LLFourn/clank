@@ -1,9 +1,9 @@
 """Deterministic provider transport, never a model or network client.
 
 ACP advertises the inspected native schema and copies empty fixture history.
-Interactive mode executes installed hook commands and their rewritten waiter,
+Interactive mode executes installed lifecycle hooks and ordinary background waits,
 then models the provider's background-completion-to-turn callback explicitly.
-The Rust driver controls registration, delivery and acknowledgement with pipes.
+The Rust driver controls delivery and acknowledgement with pipes.
 """
 import json
 import os
@@ -91,13 +91,9 @@ def receive(expected):
 
 
 def hook(event, turn="0", **values):
-    native = {"SessionStart": "session_start", "Stop": "stop", "PreToolUse": "pre_tool_use",
-              "PostToolUse": "post_tool_use", "SessionEnd": "session_end"}[event]
+    native = {"SessionStart": "session_start", "Stop": "stop", "SessionEnd": "session_end"}[event]
     payload = dict(hookEventName=native, sessionId=sid, cwd=cwd, promptId=turn,
                    reason="end_turn", **values)
-    # Official native tool-call dispatch has no promptId; only Stop carries it.
-    if event in ("PreToolUse", "PostToolUse"):
-        payload.pop("promptId")
     env = dict(os.environ, GROK_HOOK_EVENT=native)
     entry = [entry for group in hooks[event] for entry in group["hooks"]
              if entry["command"] == "clank stop-hook --tool grok"]
@@ -118,34 +114,16 @@ try:
     total = receive("begin")["cycles"]
     for cycle in range(total):
         turn = str(cycle)
-        tool = dict(toolName="run_terminal_command", toolUseId="call-" + turn,
-                    toolInput={"command": "clank wait", "block_until_ms": 0})
-        offered = hook("PreToolUse", turn, **tool)
-        rewritten = offered["hookSpecificOutput"]["updatedInput"]
-        tool["toolInput"] = rewritten
-        duplicate = hook("PreToolUse", turn, toolName=tool["toolName"],
-                         toolUseId="duplicate-" + turn,
-                         toolInput={"command": "clank wait", "block_until_ms": 0})
-        assert duplicate.get("decision") == "deny", duplicate
-        command = shlex.split(rewritten["command"])
-        assert command.pop(0) == "exec"
+        command = ["clank", "wait"]
+        if cycle % 2 == 0:
+            command.extend(["--repo", cwd])
         worker = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                   env=dict(os.environ, RUST_LOG="clank::cli::wait=debug"))
         workers.append(worker)
-        # One bounded negative-output sample proves pending work cannot complete
-        # inline before registration. It is not a provider/task polling loop.
-        if cycle == 0:
-            if select.select([worker.stdout], [], [], 0.2)[0]:
-                out, error = worker.communicate(timeout=5)
-                raise AssertionError("worker ended/output before registration: " + out + error)
-        emit("offered", cycle=cycle, command=rewritten["command"], pid=worker.pid)
-        receive("register")
-        result = {"type": "BackgroundTaskStarted", "task_id": "task-" + turn,
-                  "task_type": "bash", "status": "running", "command": rewritten["command"]}
-        hook("PostToolUse", turn, toolResult=result, **tool)
-        stopped = hook("Stop", turn, backgroundTasks=[{
-            "id": result["task_id"], "type": "shell", "status": "running",
-            "command": rewritten["command"]}])
+        emit("started", cycle=cycle, command=shlex.join(command), pid=worker.pid)
+        stopped = hook("Stop", turn, stopHookActive=True, backgroundTasks=[{
+            "id": "task-" + turn, "type": "shell", "status": "running",
+            "command": shlex.join(command)}])
         assert stopped.get("decision") != "block", stopped
         ready = ""
         if cycle > 0:
@@ -154,7 +132,7 @@ try:
             assert select.select([worker.stderr, worker.stdout], [], [], 20)[0], "subscription timeout"
             ready = worker.stderr.readline()
             assert "monitor subscription registered" in ready, ready
-        emit("registered", cycle=cycle, stop=stopped, worker_running=worker.poll() is None)
+        emit("waiting", cycle=cycle, stop=stopped, worker_running=worker.poll() is None)
         out, error = worker.communicate(timeout=20)
         error = ready + error
         assert worker.returncode == 0, error

@@ -1,4 +1,11 @@
 # replyable-messages-and-delivery-state-in-the-timeline
+
+> Historical implementation notes: the Grok registration adapter described below
+> is retired by `grok-wait-uses-session-identity-without-a-registration-handshake`.
+> Current Grok waits subscribe directly to the monitor with native session identity;
+> there is no tool rewriting or PostToolUse registration requirement. See
+> `GROK-INTEGRATION.md` for the current contract.
+
 # Replyable messages and delivery state in the timeline
 
 ## Why

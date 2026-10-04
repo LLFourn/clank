@@ -4,8 +4,8 @@
 //! TWO adapters live here, for two different hook events with two
 //! different contracts. Each is a short algorithm, and the code below
 //! is those algorithms in order.
-//! Grok's native lifecycle dispatches to [`super::grok_handoff`] before either
-//! algorithm: its Stop checks a provider-owned background handoff and never
+//! Grok's native lifecycle dispatches to [`super::grok_hook`] before either
+//! algorithm: its Stop checks the native background task snapshot and never
 //! runs the hook-owned poll below.
 //!
 //! # A Stop turn
@@ -109,7 +109,7 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     if Tool::from(args.tool) == Tool::Grok {
-        return super::grok_handoff::hook(args);
+        return super::grok_hook::hook(args);
     }
     if args.session_start {
         return run_session_start(args).await;
