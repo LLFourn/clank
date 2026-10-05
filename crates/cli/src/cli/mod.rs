@@ -128,6 +128,11 @@ pub enum ConfigKey {
     /// bool, default: false. `--no-squash` skips it for one finish.
     #[command(name = "finish.autosquash", alias = "finish_autosquash")]
     FinishAutosquash(ConfigKeyArgs),
+    /// How long an agent may have pending work that nothing is waiting
+    /// for, with no failure in its record, before a person is told.
+    /// duration (30s, 40m, 1h) or `off`, default: 40m.
+    #[command(name = "recovery.stall_after", alias = "recovery_stall_after")]
+    RecoveryStallAfter(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]

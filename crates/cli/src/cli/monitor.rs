@@ -2727,6 +2727,9 @@ fn recovery_facts(
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let stall_after = crate::cli::config::load_with_home(repo, home.as_deref())
+        .recovery
+        .stall_after;
     let mut facts = Vec::new();
     for author in roster_authors(repo) {
         let Ok(cfg) = crate::agent_store::load_agent_config(repo, &author) else {
@@ -2750,6 +2753,7 @@ fn recovery_facts(
                 &reviews,
                 head.as_ref(),
             );
+        let attending = obligated && recovery_gate_holds(repo, &author);
         facts.push(crate::cli::recovery::Facts {
             agent_dir: crate::agent_store::agents_root(repo).join(author.as_str()),
             author,
@@ -2757,6 +2761,8 @@ fn recovery_facts(
             auto,
             delivering,
             obligated,
+            stall_after,
+            attending,
         });
     }
     facts
@@ -2803,6 +2809,12 @@ fn owes_anything(
         .is_empty()
 }
 
+/// A question or block is pending, or the agent provably attends to work.
+fn recovery_gate_holds(repo: &std::path::Path, author: &AgentLabel) -> bool {
+    let dir = crate::agent_store::agents_root(repo).join(author.as_str());
+    crate::cli::wait::blocked(repo, author) || crate::cli::stop_hook::attendance_is_live(&dir)
+}
+
 /// A transport's answer, and the attempt it answers.
 type RecoveryAnswer = (
     AgentLabel,
@@ -2843,8 +2855,7 @@ fn recovery_gate(
     {
         return Gate::AutoOff;
     }
-    let dir = crate::agent_store::agents_root(repo).join(author.as_str());
-    if crate::cli::wait::blocked(repo, author) || crate::cli::stop_hook::attendance_is_live(&dir) {
+    if recovery_gate_holds(repo, author) {
         Gate::Hold
     } else {
         Gate::Go
@@ -4504,6 +4515,29 @@ mod recovery_tests {
             "an agent with no bound session is not considered"
         );
         assert!(alone[0].obligated && !alone[0].delivering, "{alone:?}");
+        assert_eq!(
+            alone[0].stall_after,
+            Some(40 * 60),
+            "the configured interval"
+        );
+        assert!(!alone[0].attending);
+        let marker = crate::agent_store::agents_root(repo.path()).join("codex/attending");
+        let me = std::process::id() as i32;
+        std::fs::write(
+            &marker,
+            serde_json::json!({
+                "task": "build",
+                "pid": me,
+                "token": crate::proc_identity::token_for(me),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            facts(&[])[0].attending,
+            "proven attendance ends stall eligibility"
+        );
+        std::fs::remove_file(&marker).unwrap();
 
         let (helper, _rx) = client(
             Served::Helper {

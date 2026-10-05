@@ -17,6 +17,8 @@ pub struct Config {
     pub diff: DiffConfig,
     /// `clank finish` settings.
     pub finish: FinishConfig,
+    /// The monitor's recovery of agents nothing is waking.
+    pub recovery: RecoveryConfig,
 }
 
 impl Default for Config {
@@ -26,7 +28,41 @@ impl Default for Config {
             hooks: BTreeMap::new(),
             diff: DiffConfig::default(),
             finish: FinishConfig::default(),
+            recovery: RecoveryConfig::default(),
         }
+    }
+}
+
+/// Recovery config, from `.clank/config.json#/recovery`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryConfig {
+    /// Seconds an eligible agent may hold pending work, with no failure in
+    /// its record, before a person is told. `None` is `off`.
+    pub stall_after: Option<u64>,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            stall_after: Some(40 * 60),
+        }
+    }
+}
+
+/// `off`, or a duration in clank's grammar; `0` is `off` too.
+fn parse_stall_after(raw: &str) -> anyhow::Result<Option<u64>> {
+    if raw.trim() == "off" {
+        return Ok(None);
+    }
+    Ok(super::wait::parse_duration_str(raw)?.map(|d| d.as_secs()))
+}
+
+/// The shortest way to write `secs` back in the grammar it was read in.
+pub(crate) fn show_duration(secs: u64) -> String {
+    match secs {
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
     }
 }
 
@@ -88,6 +124,14 @@ struct ConfigFile {
     diff: Option<DiffFile>,
     #[serde(default)]
     finish: Option<FinishFile>,
+    #[serde(default)]
+    recovery: Option<RecoveryFile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RecoveryFile {
+    #[serde(default)]
+    stall_after: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -434,6 +478,17 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         cfg.finish.autosquash = v;
         present.insert("finish.autosquash".to_string());
     }
+    if let Some(raw) = parsed.recovery.and_then(|r| r.stall_after) {
+        match parse_stall_after(&raw) {
+            Ok(v) => {
+                cfg.recovery.stall_after = v;
+                present.insert("recovery.stall_after".to_string());
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "clank config: bad recovery.stall_after; ignoring it");
+            }
+        }
+    }
     present
 }
 
@@ -496,6 +551,13 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         type_desc: "bool",
         default: "false",
         help: "Collapse a plan into one commit at `clank finish` by REWRITING the current branch in place (rewrites published history if the branch was already pushed); `--no-squash` skips it for one finish",
+    },
+    KeyDef {
+        section: "recovery",
+        name: "stall_after",
+        type_desc: "duration|off",
+        default: "40m",
+        help: "Tell a person when an agent has had pending work this long that nothing is waiting for, with no failure in its record; `off` disables only this",
     },
 ];
 
@@ -596,6 +658,10 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
             .unwrap_or(false)
             .to_string(),
         "finish.autosquash" => cfg.finish.autosquash.to_string(),
+        "recovery.stall_after" => cfg
+            .recovery
+            .stall_after
+            .map_or_else(|| "off".to_string(), show_duration),
         _ => "unknown key".to_string(),
     }
 }
@@ -619,6 +685,7 @@ fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
         "diff.wait" => Some(&["diff", "wait"]),
         "diff.editor.command" => Some(&["diff", "editor", "command"]),
         "finish.autosquash" => Some(&["finish", "autosquash"]),
+        "recovery.stall_after" => Some(&["recovery", "stall_after"]),
         _ => None,
     }
 }
@@ -638,11 +705,18 @@ struct ConfigJson<'a> {
     hooks: HooksJson<'a>,
     diff: DiffJson<'a>,
     finish: FinishJson,
+    recovery: RecoveryJson,
 }
 
 #[derive(serde::Serialize)]
 struct FinishJson {
     autosquash: bool,
+}
+
+#[derive(serde::Serialize)]
+struct RecoveryJson {
+    /// Seconds, or `null` for `off`.
+    stall_after: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -686,6 +760,9 @@ impl<'a> From<&'a Config> for ConfigJson<'a> {
             finish: FinishJson {
                 autosquash: cfg.finish.autosquash,
             },
+            recovery: RecoveryJson {
+                stall_after: cfg.recovery.stall_after,
+            },
         }
     }
 }
@@ -699,6 +776,7 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::DiffEditorCommand(_) => "diff.editor.command",
         ConfigKey::DiffWait(_) => "diff.wait",
         ConfigKey::FinishAutosquash(_) => "finish.autosquash",
+        ConfigKey::RecoveryStallAfter(_) => "recovery.stall_after",
     }
 }
 
@@ -710,7 +788,8 @@ fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         | ConfigKey::HooksBlocked(a)
         | ConfigKey::DiffEditorCommand(a)
         | ConfigKey::DiffWait(a)
-        | ConfigKey::FinishAutosquash(a) => a,
+        | ConfigKey::FinishAutosquash(a)
+        | ConfigKey::RecoveryStallAfter(a) => a,
     }
 }
 
@@ -781,6 +860,9 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("set requires a value"))?;
             if def.type_desc == "bool" && value != "true" && value != "false" {
                 anyhow::bail!("{key} is a bool; value must be true or false");
+            }
+            if def.type_desc == "duration|off" {
+                parse_stall_after(value).map_err(|e| anyhow::anyhow!("{key}: {e}, or off"))?;
             }
             let path = key_to_json_path(key).expect("key_name always returns a catalog key");
             // `--global` writes the user-scope config; otherwise the repo's.
@@ -1504,6 +1586,9 @@ mod tests {
                 },
                 "finish": {
                     "autosquash": cfg.finish.autosquash,
+                },
+                "recovery": {
+                    "stall_after": 2400,
                 }
             })
         );
@@ -1595,6 +1680,43 @@ mod tests {
         let kv = kvs.iter().find(|kv| kv.key == "finish.autosquash").unwrap();
         assert_eq!(kv.value, "true");
         assert_eq!(kv.source, ValueSource::Repo);
+    }
+
+    /// `recovery.stall_after`: 40 minutes unless set, a duration or `off`
+    /// when it is, and a value it cannot read leaves the default standing.
+    #[test]
+    fn recovery_stall_after_reads_a_duration_or_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(load_isolated(tmp.path()).recovery.stall_after, Some(2400));
+        for (raw, want, shown) in [
+            ("90m", Some(5400), "90m"),
+            ("1h", Some(3600), "1h"),
+            ("45s", Some(45), "45s"),
+            ("off", None, "off"),
+            ("0", None, "off"),
+            ("soon", Some(2400), "40m"),
+        ] {
+            write(
+                &tmp.path().join(".clank/config.json"),
+                &format!(r#"{{"recovery":{{"stall_after":"{raw}"}}}}"#),
+            );
+            let cfg = load_isolated(tmp.path());
+            assert_eq!(cfg.recovery.stall_after, want, "{raw}");
+            assert_eq!(get_value(&cfg, "recovery.stall_after"), shown, "{raw}");
+        }
+        set_repo_key(
+            tmp.path(),
+            &["recovery", "stall_after"],
+            "off",
+            "duration|off",
+        )
+        .unwrap();
+        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kv = kvs
+            .iter()
+            .find(|kv| kv.key == "recovery.stall_after")
+            .unwrap();
+        assert_eq!((kv.value.as_str(), kv.source), ("off", ValueSource::Repo));
     }
 
     #[test]

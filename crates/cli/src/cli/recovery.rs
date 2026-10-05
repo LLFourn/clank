@@ -948,6 +948,11 @@ pub(crate) struct Facts {
     pub(crate) delivering: bool,
     /// A newly arriving waiter would be handed work.
     pub(crate) obligated: bool,
+    /// `recovery.stall_after`, in seconds; `None` is `off`.
+    pub(crate) stall_after: Option<u64>,
+    /// A question or block is pending, or attendance is proven: the agent
+    /// is not stalled, whatever its record says.
+    pub(crate) attending: bool,
 }
 
 /// What the monitor must do for an agent.
@@ -1020,6 +1025,17 @@ struct Watched {
     /// Answers that arrived during a hold, or whose decision could not be
     /// stored, applied in order by the next decision that is.
     answers: Vec<(AttemptRef, Answer)>,
+    /// The stall as last observed and decided, which a storage hold does
+    /// not hold back.
+    stall: Option<Stall>,
+    /// The stall as last stored: what its notice and status are told from.
+    stall_saved: Option<Stall>,
+    /// The stall interval while the agent is eligible for one, `None` while
+    /// it is not: what a stall decision is rebuilt from, whenever it is made.
+    stall_policy: Option<u64>,
+    /// The stall could not be stored: it is decided again at this time, by
+    /// the deadline path, and by nothing before it.
+    stall_held: Option<u64>,
 }
 
 struct Reading {
@@ -1060,14 +1076,20 @@ impl Driver {
     pub(crate) fn next_due(&self) -> Option<u64> {
         self.agents
             .values()
-            .filter_map(|w| {
+            .flat_map(|w| {
                 let held = w.held_until.unwrap_or(0);
-                if w.owed {
-                    return Some(held);
-                }
-                let at = w.episode.as_ref().filter(|e| e.live())?.next_at?;
-                Some(at.max(held))
+                let episode = if w.owed {
+                    Some(held)
+                } else {
+                    w.episode
+                        .as_ref()
+                        .filter(|e| e.live())
+                        .and_then(|e| e.next_at)
+                        .map(|at| at.max(held))
+                };
+                [episode, w.stall_due()]
             })
+            .flatten()
             .min()
     }
 
@@ -1102,6 +1124,10 @@ impl Driver {
                     held_until: None,
                     owed: false,
                     answers: Vec::new(),
+                    stall: load_stall(&f.agent_dir),
+                    stall_saved: load_stall(&f.agent_dir),
+                    stall_policy: None,
+                    stall_held: None,
                 });
             w.auto = f.auto;
             if w.session != session {
@@ -1119,6 +1145,8 @@ impl Driver {
             }
             if f.delivering {
                 acts.extend(decision(&f.author, w, now, Some(Gate::Deliverer), None));
+                w.stall_policy = None;
+                acts.extend(set_stall(&f.author, w, None, now));
                 disarm(w);
                 continue;
             }
@@ -1130,6 +1158,8 @@ impl Driver {
                     Some(Gate::ObligationCleared),
                     None,
                 ));
+                w.stall_policy = None;
+                acts.extend(set_stall(&f.author, w, None, now));
                 disarm(w);
                 continue;
             }
@@ -1141,9 +1171,13 @@ impl Driver {
             }
             // Otherwise the watch reports what changes: nothing is looked
             // at again on a fold.
-            if (rebound || w.watch.is_none()) && ensure(w) {
+            let armed = (rebound || w.watch.is_none()) && ensure(w);
+            if armed {
                 acts.extend(decision(&f.author, w, now, None, None));
             }
+            w.stall_policy = f.stall_after.filter(|_| f.auto && !f.attending);
+            let stall = stall_wanted(w, now, armed);
+            acts.extend(set_stall(&f.author, w, stall, now));
         }
         self.lost.clear();
         acts.extend(self.sync_watches());
@@ -1208,6 +1242,16 @@ impl Driver {
                     if armed || refresh(w) {
                         acts.extend(decision(author, w, now, None, None));
                     }
+                    if let Some(s) = w.stall.clone()
+                        && (armed || s.state == StallState::Quiet || s.told())
+                        && record_mark(w) != s.mark
+                        && !w.told_latched()
+                    {
+                        // The record moved after a stop, or is another
+                        // record: counted from here.
+                        let again = Stall::waiting(&s.session, now, s.after, record_mark(w));
+                        acts.extend(set_stall(author, w, Some(again), now));
+                    }
                 }
             }
         }
@@ -1232,11 +1276,18 @@ impl Driver {
                 .is_some_and(|at| at <= now)
                 || w.owed;
             let due = due && w.held_until.is_none_or(|at| at <= now);
-            if !due {
+            let stalled = w.stall_due().is_some_and(|at| at <= now);
+            if !due && !stalled {
                 continue;
             }
             let fresh = refresh(w);
             let mut g = gate(author, &w.session);
+            if stalled {
+                acts.extend(stall_expired(author, w, now, g));
+            }
+            if !due {
+                continue;
+            }
             if g == Gate::AutoOff {
                 w.auto = false;
                 g = Gate::Go;
@@ -1437,6 +1488,297 @@ fn decision(
     acts
 }
 
+/// The fallback for an eligible agent whose record shows no failure: told
+/// once, after `after` seconds in which its record has not moved. Notice
+/// only; it never starts or stops a turn.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Stall {
+    pub(crate) session: String,
+    /// When the record was last seen to move, or eligibility began.
+    pub(crate) since: u64,
+    pub(crate) after: u64,
+    /// The record as it was at `since`; `None` when there was none to read.
+    pub(crate) mark: Option<Mark>,
+    pub(crate) state: StallState,
+}
+
+/// Which record, and how far it had got: any difference is progress, an
+/// append or a slow tool's output as much as a replaced file of the same
+/// size.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Mark {
+    pub(crate) path: PathBuf,
+    pub(crate) ino: u64,
+    pub(crate) len: u64,
+    pub(crate) modified_ns: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum StallState {
+    Waiting,
+    /// The latest turn was stopped, or failed and is failed-turn recovery's.
+    /// Nothing until the record moves.
+    Quiet,
+    /// Latched until the agent stops being eligible.
+    Told {
+        notice: String,
+    },
+}
+
+impl Stall {
+    fn waiting(session: &str, now: u64, after: u64, mark: Option<Mark>) -> Self {
+        Stall {
+            session: session.to_string(),
+            since: now,
+            after,
+            mark,
+            state: StallState::Waiting,
+        }
+    }
+
+    fn told(&self) -> bool {
+        matches!(self.state, StallState::Told { .. })
+    }
+
+    fn same_interval(&self, other: &Stall) -> bool {
+        self.session == other.session && self.since == other.since
+    }
+}
+
+impl Watched {
+    /// The latch: a told stall that is stored for this same interval. One
+    /// not yet stored is only a candidate, which the record or eligibility
+    /// may still overtake.
+    fn told_latched(&self) -> bool {
+        match (&self.stall, &self.stall_saved) {
+            (Some(s), Some(saved)) => s.told() && saved.told() && s.same_interval(saved),
+            _ => false,
+        }
+    }
+
+    /// When the stall must be looked at: its deadline, or the end of a
+    /// storage hold that left a decision owed.
+    fn stall_due(&self) -> Option<u64> {
+        if let Some(held) = self.stall_held {
+            return Some(held);
+        }
+        self.stall
+            .as_ref()
+            .filter(|s| s.state == StallState::Waiting)
+            .map(|s| s.since + s.after)
+    }
+}
+
+/// The agent's record as it is now, the measure of its progress whatever
+/// the record says: a slow tool's output counts.
+fn record_mark(w: &Watched) -> Option<Mark> {
+    use std::os::unix::fs::MetadataExt;
+    let path = match (&w.read, &w.source) {
+        (Some(r), _) => &r.path,
+        (None, Some((_, Some(Source::At(path))))) => path,
+        _ => return None,
+    };
+    let m = std::fs::metadata(path).ok()?;
+    Some(Mark {
+        path: path.clone(),
+        ino: m.ino(),
+        len: m.len(),
+        modified_ns: m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos()),
+    })
+}
+
+/// The stall the agent should have now, from its current eligibility: kept
+/// across folds and restarts, begun afresh when it was not eligible before
+/// or its record is another one.
+fn stall_wanted(w: &Watched, now: u64, armed: bool) -> Option<Stall> {
+    let after = w.stall_policy?;
+    let mark = record_mark(w);
+    Some(match w.stall.clone() {
+        Some(s) if s.session == w.session && (!armed || w.told_latched() || mark == s.mark) => {
+            Stall { after, ..s }
+        }
+        _ => Stall::waiting(&w.session, now, after, mark),
+    })
+}
+
+/// A stall's deadline, or the end of a hold that left its decision owed:
+/// rebuilt from the agent's current eligibility, and at a deadline, a person
+/// is told unless the record moved, the latest turn was stopped or failed,
+/// or the agent is not eligible just now.
+fn stall_expired(
+    author: &clank_core::ids::AgentLabel,
+    w: &mut Watched,
+    now: u64,
+    gate: Gate,
+) -> Vec<Act> {
+    let latched = w.told_latched();
+    let next = match stall_wanted(w, now, false) {
+        Some(s) if s.state == StallState::Waiting && s.since + s.after <= now => {
+            stall_at_deadline(author, w, s, now, gate)
+        }
+        // A told stall a hold kept from being stored is decided again, at
+        // its deadline, from the record and the agent as they are now.
+        Some(s) if s.told() && !latched => stall_at_deadline(
+            author,
+            w,
+            Stall {
+                state: StallState::Waiting,
+                ..s
+            },
+            now,
+            gate,
+        ),
+        other => other,
+    };
+    set_stall(author, w, next, now)
+}
+
+fn stall_at_deadline(
+    author: &clank_core::ids::AgentLabel,
+    w: &Watched,
+    s: Stall,
+    now: u64,
+    gate: Gate,
+) -> Option<Stall> {
+    let mark = record_mark(w);
+    match gate {
+        Gate::Deliverer | Gate::SessionChanged | Gate::ObligationCleared | Gate::AutoOff => None,
+        // Not eligible just now: counted again from here.
+        Gate::Hold => Some(Stall::waiting(&s.session, now, s.after, mark)),
+        Gate::Go | Gate::Unobserved => stall_verdict(author, w, s, now, mark),
+    }
+}
+
+/// Whether the eligible agent's interval `s` has stalled, from its record
+/// and policy as they are now: re-armed if the record moved, still waiting
+/// if its current interval has not passed, quiet if the latest turn was
+/// stopped or failed, and told only otherwise. The one rule every told
+/// stall is made by, wherever it is decided or stored.
+fn stall_verdict(
+    author: &clank_core::ids::AgentLabel,
+    w: &Watched,
+    s: Stall,
+    now: u64,
+    mark: Option<Mark>,
+) -> Option<Stall> {
+    let after = w.stall_policy?;
+    if mark != s.mark {
+        return Some(Stall::waiting(&s.session, now, after, mark));
+    }
+    if s.since + after > now {
+        return Some(Stall {
+            after,
+            state: StallState::Waiting,
+            ..s
+        });
+    }
+    let latest = w.snap.latest().map(|t| &t.outcome);
+    let failing =
+        matches!(latest, Some(Outcome::Failed(_))) || w.episode.as_ref().is_some_and(|e| e.live());
+    let state = if failing || matches!(latest, Some(Outcome::Interrupted)) {
+        StallState::Quiet
+    } else {
+        StallState::Told {
+            notice: format!(
+                "{author} has had pending work for {} and is not waiting for it",
+                crate::cli::config::show_duration(after)
+            ),
+        }
+    };
+    Some(Stall { after, state, ..s })
+}
+
+/// Make `next` the agent's stall, and store it unless storage is held.
+/// What is observed during a hold is kept, not dropped: the hold delays
+/// only the write, and the write at its end is of the latest state.
+fn set_stall(
+    author: &clank_core::ids::AgentLabel,
+    w: &mut Watched,
+    next: Option<Stall>,
+    now: u64,
+) -> Vec<Act> {
+    w.stall = next;
+    save_stall(author, w, now)
+}
+
+/// Store the stall if it differs from what is stored, telling a person if
+/// the stored stall has just become told: the notice follows the stored
+/// transition, never a state that was overtaken before it could be saved.
+fn save_stall(author: &clank_core::ids::AgentLabel, w: &mut Watched, now: u64) -> Vec<Act> {
+    if w.stall_held.is_some_and(|at| at > now) {
+        return Vec::new();
+    }
+    if let Some(s) = w.stall.clone()
+        && s.told()
+        && !w.told_latched()
+    {
+        // A notice not yet stored is still a candidate: whichever path
+        // stores it, it is first judged by the record as it is now. An
+        // unchanged mark means an unchanged record, so the turns already
+        // read still stand.
+        w.stall = stall_verdict(author, w, s, now, record_mark(w));
+    }
+    if w.stall == w.stall_saved {
+        // Nothing owed: whatever hold there was is over.
+        w.stall_held = None;
+        return Vec::new();
+    }
+    if let Err(e) = store_stall(&w.agent_dir, w.stall.as_ref()) {
+        eprintln!("monitor: could not record `{author}`'s stall, so nothing was done: {e}");
+        w.stall_held = Some(now + RETRY_LOOK);
+        return Vec::new();
+    }
+    w.stall_held = None;
+    let previous = std::mem::replace(&mut w.stall_saved, w.stall.clone());
+    let told_before = |s: &Stall| {
+        previous
+            .as_ref()
+            .is_some_and(|p| p.told() && p.same_interval(s))
+    };
+    match &w.stall {
+        Some(
+            s @ Stall {
+                state: StallState::Told { notice },
+                ..
+            },
+        ) if !told_before(s) => vec![Act::Notice {
+            author: author.clone(),
+            key: format!("{}:stall:{}", s.session, s.since),
+            text: notice.clone(),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) fn stall_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("stall.json")
+}
+
+pub(crate) fn load_stall(agent_dir: &Path) -> Option<Stall> {
+    let raw = std::fs::read_to_string(stall_path(agent_dir)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn store_stall(agent_dir: &Path, stall: Option<&Stall>) -> std::io::Result<()> {
+    let path = stall_path(agent_dir);
+    match stall {
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+        Some(stall) => {
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(stall)?)?;
+            std::fs::rename(&tmp, &path)
+        }
+    }
+}
+
 pub(crate) fn episode_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("recovery.json")
 }
@@ -1453,6 +1795,10 @@ pub(crate) fn waiting_for_you(agent_dir: &Path) -> Option<String> {
     load(agent_dir)
         .filter(|ep| ep.state == State::Escalated)
         .and_then(|ep| ep.notice)
+        .or_else(|| match load_stall(agent_dir)?.state {
+            StallState::Told { notice } => Some(notice),
+            _ => None,
+        })
 }
 
 pub(crate) fn load(agent_dir: &Path) -> Option<Episode> {
@@ -2305,6 +2651,8 @@ pub(crate) mod tests {
             auto: true,
             delivering,
             obligated,
+            stall_after: None,
+            attending: false,
         }
     }
 
@@ -2724,6 +3072,8 @@ pub(crate) mod tests {
             auto: true,
             delivering: false,
             obligated: true,
+            stall_after: None,
+            attending: false,
         };
         let watch = WatchKey {
             dir: root.clone(),
@@ -3319,6 +3669,8 @@ pub(crate) mod tests {
             auto: true,
             delivering: false,
             obligated: true,
+            stall_after: None,
+            attending: false,
         };
         let acts = d.reconcile(vec![f], 0);
         forward(&watch, &acts);
@@ -3491,5 +3843,587 @@ pub(crate) mod tests {
         );
         let ep = load(dir.path()).unwrap();
         assert_eq!((ep.opened_by.as_str(), ep.state), ("p1", State::Escalated));
+    }
+
+    const AFTER: u64 = 40 * 60;
+
+    fn stalling(dir: &Path, record: &Path) -> Facts {
+        Facts {
+            stall_after: Some(AFTER),
+            ..codex_facts(dir, record, "session-one", true, false)
+        }
+    }
+
+    /// A rollout whose latest turn finished, and an agent still owing work.
+    fn quiet_agent() -> (tempfile::TempDir, PathBuf, Driver) {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        let mut d = driver();
+        assert!(
+            d.reconcile(vec![stalling(dir.path(), &rollout)], 0)
+                .iter()
+                .all(|a| matches!(a, Act::Watch(_)))
+        );
+        (dir, rollout, d)
+    }
+
+    const NOW_GO: fn(&clank_core::ids::AgentLabel, &str) -> Gate = |_, _| Gate::Go;
+
+    /// Pending work, nothing waiting for it, and a record that has not
+    /// moved: one notice at the configured interval, kept for status, and
+    /// nothing more until eligibility resets.
+    #[test]
+    fn a_stalled_agent_is_told_once() {
+        let (dir, _, mut d) = quiet_agent();
+        assert_eq!(d.next_due(), Some(AFTER), "one deadline, nothing else");
+        assert!(d.due(AFTER - 1, NOW_GO).is_empty());
+        let acts = d.due(AFTER, NOW_GO);
+        assert_eq!(
+            notices_with_keys(&acts),
+            [(
+                "session-one:stall:0",
+                "agent has had pending work for 40m and is not waiting for it"
+            )]
+        );
+        assert_eq!(
+            waiting_for_you(dir.path()).as_deref(),
+            Some("agent has had pending work for 40m and is not waiting for it")
+        );
+        assert_eq!(d.next_due(), None);
+        assert!(d.due(AFTER * 3, NOW_GO).is_empty());
+    }
+
+    /// A slow tool writes to the record without any turn ending: the
+    /// deadline is re-armed from the last movement, not told.
+    #[test]
+    fn a_record_that_moved_before_the_deadline_is_not_stalled() {
+        let (_dir, rollout, mut d) = quiet_agent();
+        append(
+            &rollout,
+            &[r#"{"type":"response_item","payload":{"type":"function_call_output"}}"#],
+        );
+        assert!(notices(&d.due(AFTER, NOW_GO)).is_empty());
+        assert_eq!(
+            d.next_due(),
+            Some(AFTER * 2),
+            "counted from the movement it found"
+        );
+        assert_eq!(notices(&d.due(AFTER * 2, NOW_GO)).len(), 1);
+    }
+
+    /// A person stopped the latest turn: nothing is told, and nothing
+    /// waits, until the record moves again.
+    #[test]
+    fn a_stopped_turn_is_not_a_stall_until_the_record_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        let aborted = r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T","reason":"interrupted"}}"#;
+        append(&rollout, &[&line(STARTED, "t1"), &line(aborted, "t1")]);
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        assert!(d.due(AFTER, NOW_GO).is_empty());
+        assert_eq!(d.next_due(), None, "nothing waits on a stopped turn");
+        append(&rollout, &[&line(STARTED, "t2")]);
+        touched(&mut d, &rollout, AFTER + 5);
+        assert_eq!(d.next_due(), Some(AFTER + 5 + AFTER));
+    }
+
+    /// A failure the record shows is failed-turn recovery's: it is told
+    /// once, by that, and never again as a stall.
+    #[test]
+    fn a_recorded_failure_is_left_to_failed_turn_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
+        let mut d = driver();
+        let acts = d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        assert!(matches!(notices(&acts).as_slice(), [t] if t.contains("server_overloaded")));
+        assert!(notices(&d.due(AFTER, NOW_GO)).is_empty());
+        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
+    }
+
+    /// A deliverer, the end of the obligation or of auto mode means no
+    /// deadline at all; attendance or a block at the deadline counts it
+    /// again from there. Each just before the deadline cancels it.
+    #[test]
+    fn eligibility_ending_before_the_deadline_cancels_it() {
+        for end in ["deliverer", "obligation", "auto"] {
+            let (dir, rollout, mut d) = quiet_agent();
+            let mut f = stalling(dir.path(), &rollout);
+            match end {
+                "deliverer" => f.delivering = true,
+                "obligation" => f.obligated = false,
+                _ => f.auto = false,
+            }
+            d.reconcile(vec![f], AFTER - 1);
+            assert_eq!(load_stall(dir.path()), None, "{end}");
+            assert!(d.due(AFTER, NOW_GO).is_empty(), "{end}");
+            assert_eq!(d.next_due(), None, "{end}");
+        }
+        let (_dir, _, mut d) = quiet_agent();
+        assert!(d.due(AFTER, |_, _| Gate::Hold).is_empty());
+        assert_eq!(d.next_due(), Some(AFTER * 2), "attending: counted again");
+        for gone in [Gate::Deliverer, Gate::SessionChanged, Gate::AutoOff] {
+            let (dir, _, mut d) = quiet_agent();
+            assert!(d.due(AFTER, |_, _| gone).is_empty(), "{gone:?}");
+            assert_eq!(load_stall(dir.path()), None, "{gone:?}");
+        }
+    }
+
+    /// `off` disables only this: no deadline, while a recorded failure is
+    /// still told.
+    #[test]
+    fn off_disables_the_stall_and_nothing_else() {
+        let (dir, rollout, mut d) = quiet_agent();
+        let f = || Facts {
+            stall_after: None,
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(vec![f()], 1);
+        assert_eq!((d.next_due(), load_stall(dir.path())), (None, None));
+        append(&rollout, &[&line(STARTED, "t2"), &line(FAILED, "t2")]);
+        assert_eq!(notices(&touched(&mut d, &rollout, 2)).len(), 1);
+    }
+
+    /// A monitor restarted before the deadline keeps it, one restarted
+    /// after it fires it once, and one restarted after the notice does not
+    /// tell again.
+    #[test]
+    fn a_restart_keeps_the_deadline_and_never_tells_twice() {
+        let (dir, rollout, d) = quiet_agent();
+        drop(d);
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 100);
+        assert_eq!(
+            d.next_due(),
+            Some(AFTER),
+            "the deadline it had, not a new one"
+        );
+        drop(d);
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], AFTER + 100);
+        assert_eq!(notices(&d.due(AFTER + 100, NOW_GO)).len(), 1);
+        drop(d);
+        let mut d = driver();
+        let acts = d.reconcile(vec![stalling(dir.path(), &rollout)], AFTER + 200);
+        assert!(notices(&acts).is_empty());
+        assert!(d.due(AFTER * 5, NOW_GO).is_empty());
+    }
+
+    /// A record clank cannot find, or cannot make sense of, is no reason
+    /// to stay quiet: that is what this fallback is for.
+    #[test]
+    fn a_missing_or_unreadable_record_is_still_told() {
+        for record in ["missing", "garbage"] {
+            let dir = tempfile::tempdir().unwrap();
+            let rollout = dir.path().join("rollout.jsonl");
+            if record == "garbage" {
+                append(&rollout, &["not json", "{\"type\":\"something else\"}"]);
+            }
+            let mut d = driver();
+            d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+            assert_eq!(notices(&d.due(AFTER, NOW_GO)).len(), 1, "{record}");
+        }
+    }
+
+    /// A notice that could not be stored is held, not retried in a loop,
+    /// and told once storage works.
+    #[test]
+    fn a_stall_that_could_not_be_stored_is_told_after_the_hold() {
+        let (dir, _, mut d) = quiet_agent();
+        let blocked = stall_path(dir.path()).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(d.due(AFTER, NOW_GO).is_empty());
+        assert_eq!(d.next_due(), Some(AFTER + RETRY_LOOK));
+        assert!(d.due(AFTER + 1, NOW_GO).is_empty());
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(notices(&d.due(AFTER + RETRY_LOOK, NOW_GO)).len(), 1);
+    }
+
+    /// A failure whose recovery already ended (here, its retry was
+    /// refused) is still the failed-turn plan's: the stall stays quiet.
+    #[test]
+    fn a_failure_whose_recovery_ended_is_still_not_a_stall() {
+        enable(Tool::Codex, Some(Transport::Helper));
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        let attempt = dispatches(&d.due(60, NOW_GO))[0].0.clone();
+        d.answer(&label(), &attempt, Answer::Refused, 61);
+        assert_eq!(load(dir.path()).unwrap().state, State::Closed);
+        assert!(notices(&d.due(AFTER, NOW_GO)).is_empty());
+        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
+    }
+
+    /// During a storage hold a fold writes nothing either: the stall a
+    /// deliverer ends is let go when the hold does.
+    #[test]
+    fn a_stall_hold_covers_folds_too() {
+        let (dir, rollout, mut d) = quiet_agent();
+        let blocked = stall_path(dir.path()).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        d.due(AFTER, NOW_GO);
+        let held = d.next_due();
+        let delivering = || Facts {
+            delivering: true,
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(vec![delivering()], AFTER + 1);
+        assert_eq!(d.next_due(), held, "nothing was written");
+        assert!(load_stall(dir.path()).is_some());
+        std::fs::remove_dir(&blocked).unwrap();
+        d.reconcile(vec![delivering()], AFTER + RETRY_LOOK);
+        assert_eq!(load_stall(dir.path()), None);
+    }
+
+    /// A stall that could not be stored, whether its first arming, a
+    /// clear, or a policy that changed during the hold, is decided again
+    /// from the agent as it is when the hold ends, and a disk that keeps
+    /// failing moves the hold on rather than leaving it due.
+    #[test]
+    fn a_stall_decision_owed_across_a_hold_is_rebuilt_from_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        let blocked = stall_path(dir.path()).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        assert_eq!(d.next_due(), Some(RETRY_LOOK), "first arming owed");
+        d.due(RETRY_LOOK, NOW_GO);
+        assert_eq!(
+            d.next_due(),
+            Some(RETRY_LOOK * 2),
+            "still failing: moved on"
+        );
+        std::fs::remove_dir(&blocked).unwrap();
+        d.due(RETRY_LOOK * 2, NOW_GO);
+        let armed = load_stall(dir.path()).unwrap();
+        assert_eq!(
+            (armed.state, armed.since),
+            (StallState::Waiting, 0),
+            "counted from when it became eligible, not from the save"
+        );
+        assert_eq!(d.next_due(), Some(AFTER));
+
+        // A clear that fails, then `off` during the hold.
+        std::fs::remove_file(stall_path(dir.path())).unwrap();
+        std::fs::create_dir(stall_path(dir.path())).unwrap();
+        let off = || Facts {
+            stall_after: None,
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(
+            vec![Facts {
+                delivering: true,
+                ..stalling(dir.path(), &rollout)
+            }],
+            1000,
+        );
+        assert_eq!(d.next_due(), Some(1000 + RETRY_LOOK));
+        d.reconcile(vec![off()], 1001);
+        std::fs::remove_dir(stall_path(dir.path())).unwrap();
+        assert!(d.due(1000 + RETRY_LOOK, NOW_GO).is_empty());
+        assert_eq!(
+            (d.next_due(), load_stall(dir.path())),
+            (None, None),
+            "off, as it is now"
+        );
+    }
+
+    fn stop(turn: &str) -> String {
+        line(
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T","reason":"interrupted"}}"#,
+            turn,
+        )
+    }
+
+    /// A record replaced by another of the same size, or a session whose
+    /// record moved to another path, is progress: a quiet stall counts
+    /// again from there.
+    #[test]
+    fn a_replaced_record_of_the_same_size_is_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &stop("t1")]);
+        let size = std::fs::metadata(&rollout).unwrap().len() as usize;
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        d.due(AFTER, NOW_GO);
+        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
+
+        let running = format!("{}\n", line(STARTED, "t2"));
+        let pad = size - running.len() - 1;
+        let filler = format!(r#"{{"pad":"{}"}}"#, "x".repeat(pad - 10));
+        let replacement = format!("{running}{filler}\n");
+        assert_eq!(replacement.len(), size);
+        let tmp = dir.path().join("rollout.new");
+        std::fs::write(&tmp, replacement).unwrap();
+        std::fs::rename(&tmp, &rollout).unwrap();
+        touched(&mut d, &rollout, AFTER + 10);
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!((s.state, s.since), (StallState::Waiting, AFTER + 10));
+
+        let moved = dir.path().join("moved.jsonl");
+        append(&moved, &[&line(STARTED, "t3"), &stop("t3")]);
+        d.due(AFTER * 2 + 10, NOW_GO);
+        d.reconcile(vec![stalling(dir.path(), &moved)], AFTER * 3);
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!(
+            (s.state, s.since),
+            (StallState::Waiting, AFTER * 3),
+            "another record"
+        );
+    }
+
+    /// A question, block or proven attendance ends eligibility like
+    /// anything else: no deadline while it lasts, a told notice let go, and
+    /// a fresh interval, and a fresh notice, once it is over.
+    #[test]
+    fn attending_ends_the_stall_and_resuming_starts_it_afresh() {
+        let (dir, rollout, mut d) = quiet_agent();
+        let attending = |on: bool| Facts {
+            attending: on,
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(vec![attending(true)], AFTER - 10);
+        assert_eq!((d.next_due(), load_stall(dir.path())), (None, None));
+        d.reconcile(vec![attending(false)], AFTER - 5);
+        assert_eq!(d.next_due(), Some(AFTER - 5 + AFTER), "a fresh interval");
+        let told = d.due(AFTER * 2 - 5, NOW_GO);
+        assert_eq!(notices(&told).len(), 1);
+
+        d.reconcile(vec![attending(true)], AFTER * 3);
+        assert_eq!(waiting_for_you(dir.path()), None, "the notice is let go");
+        d.reconcile(vec![attending(false)], AFTER * 4);
+        let again = d.due(AFTER * 5, NOW_GO);
+        assert_eq!(
+            notices_with_keys(&again).first().map(|(k, _)| *k),
+            Some(format!("session-one:stall:{}", AFTER * 4).as_str())
+        );
+    }
+
+    /// An owed decision that turns out to change nothing still ends the
+    /// hold: an arming that failed, then `off`, leaves nothing due.
+    #[test]
+    fn an_owed_stall_that_needs_nothing_leaves_nothing_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        let blocked = stall_path(dir.path()).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        let off = Facts {
+            stall_after: None,
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(vec![off], 1);
+        d.due(RETRY_LOOK, NOW_GO);
+        assert_eq!(d.next_due(), None);
+    }
+
+    fn stopped_agent() -> (tempfile::TempDir, PathBuf, Driver) {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &stop("t1")]);
+        let mut d = driver();
+        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
+        d.due(AFTER, NOW_GO);
+        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
+        (dir, rollout, d)
+    }
+
+    /// A quiet stall's record moves while storage is held: the re-arm is
+    /// kept, and saved, counted from the movement, when the hold ends.
+    #[test]
+    fn a_rearm_observed_during_a_hold_is_saved_after_it() {
+        let (dir, rollout, mut d) = stopped_agent();
+        let blocked = stall_path(dir.path()).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        append(&rollout, &[&line(STARTED, "t2")]);
+        touched(&mut d, &rollout, AFTER + 1);
+        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
+        std::fs::remove_dir(&blocked).unwrap();
+        assert!(d.due(AFTER + 1 + RETRY_LOOK, NOW_GO).is_empty());
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!((s.state, s.since), (StallState::Waiting, AFTER + 1));
+        assert_eq!(d.next_due(), Some(AFTER + 1 + AFTER));
+        assert_eq!(notices(&d.due(AFTER + 1 + AFTER, NOW_GO)).len(), 1);
+    }
+
+    /// A newer decision during the hold supersedes the pending re-arm: a
+    /// deliverer arriving leaves nothing stored and nothing due.
+    #[test]
+    fn a_newer_decision_supersedes_one_pending_in_a_hold() {
+        let (dir, rollout, mut d) = stopped_agent();
+        let blocked = stall_path(dir.path()).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        append(&rollout, &[&line(STARTED, "t2")]);
+        touched(&mut d, &rollout, AFTER + 1);
+        let delivering = Facts {
+            delivering: true,
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(vec![delivering], AFTER + 2);
+        std::fs::remove_dir(&blocked).unwrap();
+        assert!(d.due(AFTER + 1 + RETRY_LOOK, NOW_GO).is_empty());
+        assert_eq!((load_stall(dir.path()), d.next_due()), (None, None));
+    }
+
+    /// Told, then not eligible and eligible again, all while storage is
+    /// held: the latch is let go and a fresh interval counted from when it
+    /// became eligible, with no notice until that interval passes.
+    #[test]
+    fn an_eligibility_reset_during_a_hold_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, rollout, mut d) = quiet_agent();
+        assert_eq!(notices(&d.due(AFTER, NOW_GO)).len(), 1);
+        let attending = |on: bool| Facts {
+            attending: on,
+            ..stalling(dir.path(), &rollout)
+        };
+        let perms = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        perms(0o555);
+        d.reconcile(vec![attending(true)], 2500);
+        d.reconcile(vec![attending(false)], 2501);
+        perms(0o755);
+        assert!(
+            load_stall(dir.path()).unwrap().told(),
+            "nothing written yet"
+        );
+        assert!(d.due(2500 + RETRY_LOOK, NOW_GO).is_empty());
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!((s.state, s.since), (StallState::Waiting, 2501));
+        assert_eq!(waiting_for_you(dir.path()), None);
+        let again = d.due(2501 + AFTER, NOW_GO);
+        assert_eq!(
+            notices_with_keys(&again).first().map(|(k, _)| *k),
+            Some("session-one:stall:2501")
+        );
+    }
+
+    fn block(dir: &Path) -> PathBuf {
+        let blocked = stall_path(dir).with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        blocked
+    }
+
+    /// A notice that could not be stored is only a candidate: progress
+    /// seen before it could be stored overtakes it, and nobody is told.
+    #[test]
+    fn an_unstored_notice_overtaken_by_progress_is_never_told() {
+        let (dir, rollout, mut d) = quiet_agent();
+        let blocked = block(dir.path());
+        assert!(d.due(AFTER, NOW_GO).is_empty());
+        append(&rollout, &[&line(STARTED, "t2")]);
+        assert!(notices(&touched(&mut d, &rollout, AFTER + 1)).is_empty());
+        std::fs::remove_dir(&blocked).unwrap();
+        let acts = d.due(AFTER + RETRY_LOOK, NOW_GO);
+        assert_eq!(notices_with_keys(&acts), [], "{acts:?}");
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!((s.state, s.since), (StallState::Waiting, AFTER + 1));
+    }
+
+    /// An unstored notice is decided again at the hold's end by the
+    /// deadline's own gate: a deliverer, a new binding or auto mode off
+    /// cancels it before any fold.
+    #[test]
+    fn an_unstored_notice_is_cancelled_by_the_gate_at_the_holds_end() {
+        for gone in [Gate::Deliverer, Gate::SessionChanged, Gate::AutoOff] {
+            let (dir, _, mut d) = quiet_agent();
+            let blocked = block(dir.path());
+            assert!(d.due(AFTER, NOW_GO).is_empty());
+            std::fs::remove_dir(&blocked).unwrap();
+            assert!(
+                d.due(AFTER + RETRY_LOOK, |_, _| gone).is_empty(),
+                "{gone:?}"
+            );
+            assert_eq!(load_stall(dir.path()), None, "{gone:?}");
+        }
+    }
+
+    /// A later interval's notice is told though the stored one before it
+    /// was told too: the latch is per interval.
+    #[test]
+    fn each_interval_is_told_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, rollout, mut d) = quiet_agent();
+        assert_eq!(notices(&d.due(AFTER, NOW_GO)).len(), 1);
+        let attending = |on: bool| Facts {
+            attending: on,
+            ..stalling(dir.path(), &rollout)
+        };
+        let perms = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        perms(0o555);
+        d.reconcile(vec![attending(true)], 2500);
+        d.reconcile(vec![attending(false)], 2501);
+        assert!(d.due(2501 + AFTER, NOW_GO).is_empty(), "held");
+        perms(0o755);
+        let acts = d.due(2501 + AFTER + RETRY_LOOK, NOW_GO);
+        assert_eq!(
+            notices_with_keys(&acts)
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            ["session-one:stall:2501"]
+        );
+        let s = load_stall(dir.path()).unwrap();
+        assert!(s.told() && s.since == 2501);
+    }
+
+    /// A fold that reaches an unstored notice before its deadline path,
+    /// with progress in the record whose event never came, stores the
+    /// progress, not the notice.
+    #[test]
+    fn a_fold_judges_an_unstored_notice_by_the_record() {
+        let (dir, rollout, mut d) = quiet_agent();
+        let blocked = block(dir.path());
+        assert!(d.due(AFTER, NOW_GO).is_empty());
+        append(&rollout, &[&line(STARTED, "t2")]);
+        std::fs::remove_dir(&blocked).unwrap();
+        let acts = d.reconcile(vec![stalling(dir.path(), &rollout)], AFTER + RETRY_LOOK);
+        assert_eq!(notices_with_keys(&acts), [], "{acts:?}");
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!(
+            (s.state, s.since),
+            (StallState::Waiting, AFTER + RETRY_LOOK)
+        );
+        assert_eq!(d.next_due(), Some(AFTER + RETRY_LOOK + AFTER));
+    }
+
+    /// An interval lengthened while its notice was held is not told before
+    /// its new deadline, and is told, once, at it.
+    #[test]
+    fn a_lengthened_interval_is_not_told_early() {
+        let (dir, rollout, mut d) = quiet_agent();
+        let blocked = block(dir.path());
+        assert!(d.due(AFTER, NOW_GO).is_empty());
+        let longer = AFTER + 1200;
+        let f = || Facts {
+            stall_after: Some(longer),
+            ..stalling(dir.path(), &rollout)
+        };
+        d.reconcile(vec![f()], AFTER + 1);
+        std::fs::remove_dir(&blocked).unwrap();
+        assert!(notices(&d.due(AFTER + RETRY_LOOK, NOW_GO)).is_empty());
+        let s = load_stall(dir.path()).unwrap();
+        assert_eq!(
+            (s.state, s.since, s.after),
+            (StallState::Waiting, 0, longer)
+        );
+        assert_eq!(d.next_due(), Some(longer));
+        let acts = d.due(longer, NOW_GO);
+        assert!(
+            matches!(notices(&acts).as_slice(), [t] if t.contains("for 1h")),
+            "{acts:?}"
+        );
     }
 }
