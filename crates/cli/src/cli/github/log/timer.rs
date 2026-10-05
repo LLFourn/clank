@@ -368,7 +368,7 @@ impl EventLog {
         content: &str,
         wall: u64,
     ) -> std::io::Result<RecurringTransition> {
-        self.accept_recurring_with_interrupt(r, content, wall, false)
+        self.accept_recurring_with_interrupt(r, content, wall, Interrupt::default())
     }
 
     pub(crate) fn accept_recurring_with_interrupt(
@@ -376,7 +376,7 @@ impl EventLog {
         r: &Recurrence,
         content: &str,
         wall: u64,
-        interrupt: bool,
+        interrupt: Interrupt,
     ) -> std::io::Result<RecurringTransition> {
         self.validate_recurring_key(r)?;
         let dir = self
@@ -432,7 +432,8 @@ impl EventLog {
             at: wall,
             event_at: Some(slots.due_at),
             baseline: false,
-            interrupt,
+            interrupt: interrupt.on,
+            interrupt_hint: interrupt.hint,
             transport: Transport::Timer,
             feed_id: Some(id),
             action_key: None,

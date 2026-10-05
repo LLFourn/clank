@@ -242,6 +242,7 @@ mod tests {
         let dir = crate::agent_store::agents_root(repo.path()).join("reader/events");
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "signal".into(),
             command: vec!["true".into()],
             reply_command: None,

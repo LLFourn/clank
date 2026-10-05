@@ -420,6 +420,7 @@ pub fn propose_with(
 pub fn review_source(slug: &str, pr: u32) -> GithubSource {
     GithubSource {
         interrupt: false,
+        interrupt_message: None,
         repo: slug.to_string(),
         events: vec![
             GithubEventKind::PrComment,

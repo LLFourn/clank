@@ -283,6 +283,7 @@ mod tests {
         let dir = directory(repo, agent);
         let src = CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "questions".into(),
             command: vec!["true".into()],
             reply_command: route.map(|r| r.command.clone()),

@@ -12,7 +12,7 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 /// False permits terminal fallback only before any native mutation. After an
 /// interrupt/start may have been sent, errors forbid another transport attempt.
-pub(crate) async fn try_wake(repo: &Path, label: &AgentLabel) -> anyhow::Result<bool> {
+pub(crate) async fn try_wake(repo: &Path, label: &AgentLabel, hint: &str) -> anyhow::Result<bool> {
     let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
         return Ok(false);
     };
@@ -23,7 +23,7 @@ pub(crate) async fn try_wake(repo: &Path, label: &AgentLabel) -> anyhow::Result<
         return Ok(false);
     };
     let mut rpc = Rpc { socket, next_id: 1 };
-    wake(&mut rpc, repo, &thread, || {
+    wake(&mut rpc, repo, &thread, hint, || {
         super::event_interrupt::blocking(|| {
             crate::agent_store::resolve_role(repo, label).is_ok()
                 && crate::agent_store::binding_matches(repo, label, Tool::Codex, &thread)
@@ -274,6 +274,7 @@ async fn wake<S: AsyncRead + AsyncWrite + Unpin>(
     rpc: &mut Rpc<S>,
     repo: &Path,
     thread: &str,
+    hint: &str,
     still_bound: impl Fn() -> bool,
 ) -> anyhow::Result<bool> {
     // Everything in this preflight is read-only. Unsupported versions, absent
@@ -307,7 +308,7 @@ async fn wake<S: AsyncRead + AsyncWrite + Unpin>(
     }
     rpc.call(
         "turn/start",
-        json!({"threadId":thread,"input":[{"type":"text","text":super::pane_input::EVENT_WAKE}]}),
+        json!({"threadId":thread,"input":[{"type":"text","text":hint}]}),
     )
     .await?;
     Ok(true)
@@ -316,6 +317,8 @@ async fn wake<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HINT: &str = "Interrupted for new voice message: command-voice-7f9bc9f9@15";
     use tokio_tungstenite::tungstenite::protocol::Role;
 
     async fn pair() -> (
@@ -378,7 +381,7 @@ mod tests {
     async fn busy_waits_for_correlated_reply_confirms_once_then_starts_hint() {
         let repo = tempfile::tempdir().unwrap();
         let (mut client, mut server) = pair().await;
-        let control = wake(&mut client, repo.path(), "thread", || true);
+        let control = wake(&mut client, repo.path(), "thread", HINT, || true);
         let script = async {
             preflight(&mut server, repo.path(), "inProgress").await;
             // Notifications are not correlated acknowledgement and are ignored.
@@ -399,10 +402,7 @@ mod tests {
             )
             .await;
             let req = request(&mut server, "turn/start", json!({"turn":{"id":"new"}})).await;
-            assert_eq!(
-                req["params"]["input"],
-                json!([{"type":"text","text":super::super::pane_input::EVENT_WAKE}])
-            );
+            assert_eq!(req["params"]["input"], json!([{"type":"text","text":HINT}]));
         };
         let (result, ()) = tokio::join!(control, script);
         assert!(result.unwrap());
@@ -555,10 +555,13 @@ mod tests {
     async fn idle_starts_without_interrupt() {
         let repo = tempfile::tempdir().unwrap();
         let (mut client, mut server) = pair().await;
-        let (result, ()) = tokio::join!(wake(&mut client, repo.path(), "thread", || true), async {
-            preflight(&mut server, repo.path(), "completed").await;
-            request(&mut server, "turn/start", json!({})).await;
-        });
+        let (result, ()) = tokio::join!(
+            wake(&mut client, repo.path(), "thread", HINT, || true),
+            async {
+                preflight(&mut server, repo.path(), "completed").await;
+                request(&mut server, "turn/start", json!({})).await;
+            }
+        );
         assert!(result.unwrap());
     }
     #[tokio::test]
@@ -570,8 +573,9 @@ mod tests {
         ] {
             let repo = tempfile::tempdir().unwrap();
             let (mut client, mut server) = pair().await;
-            let (result, ()) =
-                tokio::join!(wake(&mut client, repo.path(), "thread", || true), async {
+            let (result, ()) = tokio::join!(
+                wake(&mut client, repo.path(), "thread", HINT, || true),
+                async {
                     preflight(&mut server, repo.path(), "inProgress").await;
                     request(&mut server, "turn/interrupt", json!({})).await;
                     request(
@@ -580,7 +584,8 @@ mod tests {
                         json!({"data":[{"id":id,"status":status}]}),
                     )
                     .await;
-                });
+                }
+            );
             assert!(result.unwrap_err().to_string().contains("unconfirmed"));
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), server.next())
@@ -596,8 +601,9 @@ mod tests {
             let repo = tempfile::tempdir().unwrap();
             let foreign = tempfile::tempdir().unwrap();
             let (mut client, mut server) = pair().await;
-            let (result, ()) =
-                tokio::join!(wake(&mut client, repo.path(), "thread", || true), async {
+            let (result, ()) = tokio::join!(
+                wake(&mut client, repo.path(), "thread", HINT, || true),
+                async {
                     request(&mut server, "initialize", json!({})).await;
                     request(&mut server, "initialized", Value::Null).await;
                     request(
@@ -614,7 +620,8 @@ mod tests {
                         )
                         .await;
                     }
-                });
+                }
+            );
             assert!(!result.unwrap());
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), server.next())
@@ -634,8 +641,9 @@ mod tests {
                 checks.set(n + 1);
                 after && n == 0
             };
-            let (result, ()) =
-                tokio::join!(wake(&mut client, repo.path(), "thread", bound), async {
+            let (result, ()) = tokio::join!(
+                wake(&mut client, repo.path(), "thread", HINT, bound),
+                async {
                     preflight(&mut server, repo.path(), "inProgress").await;
                     if after {
                         request(&mut server, "turn/interrupt", json!({})).await;
@@ -646,7 +654,8 @@ mod tests {
                         )
                         .await;
                     }
-                });
+                }
+            );
             if after {
                 assert!(result.unwrap_err().to_string().contains("binding changed"));
             } else {
@@ -659,8 +668,9 @@ mod tests {
         for busy in [false, true] {
             let repo = tempfile::tempdir().unwrap();
             let (mut client, mut server) = pair().await;
-            let (result, ()) =
-                tokio::join!(wake(&mut client, repo.path(), "thread", || true), async {
+            let (result, ()) = tokio::join!(
+                wake(&mut client, repo.path(), "thread", HINT, || true),
+                async {
                     preflight(
                         &mut server,
                         repo.path(),
@@ -683,7 +693,8 @@ mod tests {
                         ))
                         .await
                         .unwrap();
-                });
+                }
+            );
             assert!(result.unwrap_err().to_string().contains("rejected"));
         }
     }
@@ -695,7 +706,7 @@ mod tests {
         let control = async {
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(100),
-                wake(&mut client, repo.path(), "thread", || true),
+                wake(&mut client, repo.path(), "thread", HINT, || true),
             )
             .await;
             assert!(result.is_err());
@@ -798,7 +809,7 @@ mod tests {
         // A refused target never connects, and the script would wait for
         // it forever.
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(try_wake(repo.path(), &label), script)
+            tokio::join!(try_wake(repo.path(), &label, HINT), script)
         })
         .await
         .unwrap_or_else(|_| panic!("the wake never reached the socket (linked: {linked})"));

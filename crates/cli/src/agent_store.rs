@@ -1086,6 +1086,7 @@ mod tests {
             wait_events: vec![clank_core::agent_config::WaitEventSource::Github(
                 clank_core::agent_config::GithubSource {
                     interrupt: false,
+                    interrupt_message: None,
                     repo: "o/r".into(),
                     events: vec![clank_core::agent_config::GithubEventKind::PrOpened],
                     poll_interval: None,

@@ -74,6 +74,10 @@ pub struct TimerSource {
     /// Best-effort interruption for each newly due occurrence; not part of identity.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupt: bool,
+    /// What the agent is told after an interruption, before Clank's selectors
+    /// for the events it covers. Expected when `interrupt` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_message: Option<String>,
     pub name: String,
     pub due_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +140,10 @@ pub struct GithubSource {
     /// Best-effort interruption for newly ingested eligible events.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupt: bool,
+    /// What the agent is told after an interruption, before Clank's selectors
+    /// for the events it covers. Expected when `interrupt` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_message: Option<String>,
     /// `owner/name`.
     pub repo: String,
     /// Which event sub-kinds wake the agent — the FLAT shape, whose
@@ -584,6 +592,10 @@ pub struct CommandSource {
     /// Default for producer events; an explicit per-line value overrides it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupt: bool,
+    /// What the agent is told after an interruption, before Clank's selectors
+    /// for the events it covers. Expected when `interrupt` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_message: Option<String>,
     /// Labels the wake item, and IDENTIFIES the source: its durable
     /// state — resume token and decision window — is keyed on this
     /// alone. See [`CommandSource::source_key`].

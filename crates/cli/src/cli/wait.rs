@@ -3565,6 +3565,7 @@ mod shared_tests {
         use crate::cli::command_source as cs;
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -4082,6 +4083,7 @@ mod tests {
     fn command_source(name: &str, argv: &[&str]) -> clank_core::agent_config::CommandSource {
         clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: name.into(),
             command: argv.iter().map(|s| s.to_string()).collect(),
             reply_command: None,
@@ -4169,6 +4171,92 @@ mod tests {
             Some("other delivered")
         );
         drop(sources);
+    }
+
+    /// An interruption description that cannot be typed into a pane is
+    /// presentation, not custody: its source still starts and delivers next
+    /// to another, its required reply still holds, and the hint handed to
+    /// the transport tells its event as `New events` with its selector.
+    #[tokio::test]
+    async fn an_unusable_interrupt_message_never_stops_its_source() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let mut voice = command_source(
+            "voice",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' '{\"id\":\"v1\",\"content\":\"hello\"}'; sleep 300",
+            ],
+        );
+        voice.interrupt = true;
+        voice.interrupt_message = Some("Interrupted for new voice message".into());
+        let mut bad = command_source(
+            "bad",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' '{\"id\":\"b1\",\"content\":\"answer me\",\"requires_reply\":true}'; sleep 300",
+            ],
+        );
+        bad.interrupt = true;
+        bad.interrupt_message = Some("two\nlines".into());
+        let keys = [voice.source_key(), bad.source_key()];
+        let cfg = clank_core::agent_config::AgentConfig {
+            wait_events: vec![
+                clank_core::agent_config::WaitEventSource::Command(voice),
+                clank_core::agent_config::WaitEventSource::Command(bad),
+            ],
+            ..Default::default()
+        };
+        crate::agent_store::save_agent_config(repo.path(), &author, &cfg).unwrap();
+        let declared = resolve_wait_event_sources(repo.path(), &author, &[]).unwrap();
+        assert_eq!(declared.len(), 2, "both sources are admitted");
+        let events = crate::agent_store::agents_root(repo.path())
+            .join(author.as_str())
+            .join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let (mut rx, sources) =
+            spawn_local(&declared, Some(&events), repo.path(), &author, &[], None);
+        let mut names = std::collections::BTreeSet::new();
+        for _ in 0..2 {
+            let (item, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("both producers deliver")
+                .unwrap();
+            let WaitItem::CommandEvent { name, failure, .. } = item else {
+                panic!("expected command event");
+            };
+            assert!(!failure);
+            names.insert(name);
+        }
+        assert_eq!(names, ["bad".to_string(), "voice".to_string()].into());
+        drop(sources);
+
+        let rows = crate::cli::events::read_all(&events).unwrap();
+        let bad_row = rows.iter().find(|r| r.source == keys[1]).unwrap();
+        assert!(bad_row.row.interrupt && !bad_row.row.acked);
+        assert!(matches!(
+            bad_row.row.item,
+            WaitItem::CommandEvent {
+                requires_reply: true,
+                ..
+            }
+        ));
+        let handed = std::sync::Mutex::new(None);
+        crate::cli::event_interrupt::dispatch(events, Duration::from_secs(1), |text| {
+            *handed.lock().unwrap() = Some(text);
+            async { crate::cli::github::log::InterruptOutcome::Submitted }
+        })
+        .await
+        .unwrap();
+        let text = handed.into_inner().unwrap().unwrap();
+        assert!(
+            text.contains(&format!("Interrupted for new voice message: {}@", keys[0]))
+                && text.contains(&format!("New events: {}@", keys[1]))
+                && !text.contains("two"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

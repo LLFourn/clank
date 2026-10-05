@@ -506,7 +506,7 @@ pub(super) mod fixtures {
             std::fs::create_dir(&cwd).unwrap();
             let output = repo.join("receipt.json");
             let author = AgentLabel::parse("codex").unwrap();
-            let source = CommandSource { interrupt: false,
+            let source = CommandSource { interrupt_message: None, interrupt: false,
                 name: "voice/a".into(), command: vec!["producer".into(), "events".into(), "--flag".into()],
                 reply_command: Some(vec!["answer-backend".into()]), glyph: None,
                 receipt_command: Some(vec!["/usr/bin/python3".into(), "-c".into(),
@@ -644,6 +644,7 @@ mod tests {
     fn source(name: &str) -> CommandSource {
         CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: name.into(),
             command: vec!["producer".into(), "events".into(), "--flag".into()],
             reply_command: None,

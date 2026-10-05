@@ -161,6 +161,7 @@ mod tests {
             event_at: None,
             baseline: false,
             interrupt: false,
+            interrupt_hint: None,
             transport: Transport::Message,
             feed_id: Some("collision".into()),
             action_key: None,

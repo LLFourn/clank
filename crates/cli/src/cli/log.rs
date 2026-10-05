@@ -1781,6 +1781,7 @@ mod json_output_tests {
         let dir = crate::agent_store::agents_root(repo.path()).join("rev/events");
         let source = clank_core::agent_config::TimerSource {
             interrupt: false,
+            interrupt_message: None,
             name: "check-deploy".into(),
             repeat_every: None,
             due_at: "1970-01-01T00:01:40Z".into(),

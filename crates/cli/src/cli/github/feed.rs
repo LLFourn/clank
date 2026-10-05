@@ -1040,6 +1040,7 @@ pub(super) mod tests {
     ) -> GithubSource {
         GithubSource {
             interrupt: false,
+            interrupt_message: None,
             repo: "o/r".into(),
             events: events.to_vec(),
             watch: Vec::new(),
@@ -1453,6 +1454,7 @@ pub(super) mod tests {
             serde_json::from_str(include_str!("events_fixture.json")).unwrap();
         let s = GithubSource {
             interrupt: false,
+            interrupt_message: None,
             repo: "o/r".into(),
             events: vec![
                 PrOpened,

@@ -3137,6 +3137,12 @@ fn reconcile_hosting_changed(
             }
             _ => {}
         }
+        // Once per change of this author's sources, not on every fold.
+        for (source, _) in &spec {
+            if let Some(problem) = crate::cli::event_interrupt::hint_problem(source) {
+                eprintln!("monitor: `{author}`: {problem}");
+            }
+        }
         if spec.is_empty() {
             if let Some(previous) = hosted.remove(author) {
                 departing.extend(previous.stop());
@@ -4459,6 +4465,7 @@ mod recovery_tests {
         let codex = AgentLabel::parse("codex").unwrap();
         let timer = clank_core::agent_config::TimerSource {
             interrupt: false,
+            interrupt_message: None,
             name: "check".into(),
             repeat_every: None,
             due_at: "1970-01-01T00:01:40Z".into(),
@@ -8371,6 +8378,7 @@ mod tests {
             config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
                 clank_core::agent_config::TimerSource {
                     interrupt: false,
+                    interrupt_message: None,
                     name: name.into(),
                     repeat_every: None,
                     due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)

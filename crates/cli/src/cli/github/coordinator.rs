@@ -73,7 +73,7 @@ pub(crate) struct ChecksSide<'a, C: CiReader> {
 /// the gate — realtime without a poll-established horizon could
 /// replay history.
 pub(crate) struct Coordinator {
-    interrupt: bool,
+    interrupt: crate::cli::github::log::Interrupt,
     keys: SeenSet,
     baseline_done: bool,
     buffered: std::collections::VecDeque<Classified>,
@@ -96,7 +96,7 @@ impl Coordinator {
         wal: crate::cli::github::log::SharedWal,
     ) -> Self {
         Self {
-            interrupt: false,
+            interrupt: Default::default(),
             keys: SeenSet::new(SEEN_CAP),
             baseline_done: false,
             buffered: std::collections::VecDeque::new(),
@@ -148,7 +148,7 @@ impl Coordinator {
             c.key.as_deref(),
             c.event_at,
             &mut c.item,
-            self.interrupt,
+            self.interrupt.clone(),
         );
         self.tx.send((c.item, durability)).is_ok()
     }
@@ -334,7 +334,8 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     }
     let wal = crate::cli::github::log::SharedWal::new(log);
     let mut coordinator = Coordinator::with_wal(tx.clone(), wal.clone());
-    coordinator.interrupt = src.interrupt;
+    coordinator.interrupt =
+        crate::cli::github::log::Interrupt::new(src.interrupt, src.interrupt_message.as_deref());
     // The key horizon covers BOTH halves — it is what stops a relay
     // delivery and a poll of the same action emitting twice — so it
     // is restored from any valid log. Opening the relay's gate is a
@@ -638,14 +639,20 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let wal = crate::cli::github::log::SharedWal::new(Some(open_log(dir.path())));
         let mut coordinator = Coordinator::with_wal(tx.into(), wal);
-        coordinator.interrupt = true;
+        coordinator.interrupt =
+            crate::cli::github::log::Interrupt::new(true, Some("New PR activity"));
         assert!(coordinator.baseline(vec![classified(1, Some("baseline"))]));
         assert!(coordinator.offer(classified(2, Some("fresh"))));
         assert!(rx.try_recv().is_ok());
         let rows = open_log(dir.path()).read_rows().unwrap().unwrap().rows;
         assert!(!rows[0].interrupt);
         assert!(rows[1].interrupt);
-        coordinator.interrupt = false;
+        assert_eq!(
+            rows[0].interrupt_hint, None,
+            "the baseline never interrupts"
+        );
+        assert_eq!(rows[1].interrupt_hint.as_deref(), Some("New PR activity"));
+        coordinator.interrupt = false.into();
         assert!(coordinator.offer(classified(2, Some("fresh"))));
         let rows = open_log(dir.path()).read_rows().unwrap().unwrap().rows;
         assert_eq!(rows.len(), 2);

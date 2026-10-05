@@ -11,6 +11,31 @@ pub(crate) enum InterruptOutcome {
     Unknown,
 }
 
+/// An event's request to interrupt its agent, and the description its
+/// source gave for the hint. Recorded with the event, so a later config
+/// change never alters an accepted event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Interrupt {
+    pub(crate) on: bool,
+    pub(crate) hint: Option<String>,
+}
+
+impl Interrupt {
+    /// The description is kept only for an event that interrupts.
+    pub(crate) fn new(on: bool, hint: Option<&str>) -> Self {
+        Self {
+            on,
+            hint: hint.filter(|_| on).map(str::to_owned),
+        }
+    }
+}
+
+impl From<bool> for Interrupt {
+    fn from(on: bool) -> Self {
+        Self::new(on, None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct InterruptAttempt {
     pub(crate) at: u64,
@@ -97,7 +122,7 @@ mod tests {
                 Some("k"),
                 None,
                 &item(),
-                interrupt,
+                interrupt.into(),
             )
             .unwrap();
         let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();

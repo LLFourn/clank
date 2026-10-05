@@ -10,6 +10,117 @@ struct Claim {
     source: String,
     seq: u64,
     ident: String,
+    hint: Option<String>,
+    /// A sent message, whose wake keeps its fixed wording.
+    message: bool,
+}
+
+impl Claim {
+    /// What `clank events read` and `clank events ack` take for this event.
+    fn selector(&self) -> String {
+        format!("{}@{}", self.source, self.seq)
+    }
+}
+
+/// The longest description typed into a pane.
+pub(crate) const HINT_MAX: usize = 200;
+const UNDESCRIBED: &str = "New events";
+/// Descriptions, and selectors per description, before `+N more`.
+const SHOWN: usize = 3;
+
+/// A source's description, if it is fit to type into an agent's pane: one
+/// line, no control characters, not empty, and short. This is the one place
+/// a description is judged; one that fails it is never typed, and its events
+/// are told as `New events` instead, still with their selectors.
+pub(crate) fn hint_text(raw: &str) -> Option<&str> {
+    let text = raw.trim();
+    (!text.is_empty() && text.chars().count() <= HINT_MAX && !text.chars().any(char::is_control))
+        .then_some(text)
+}
+
+/// What is wrong with how `source` describes its interruptions, if anything:
+/// reported where config is checked or changes, never a reason to refuse
+/// the source or its events.
+pub(crate) fn hint_problem(source: &clank_core::agent_config::WaitEventSource) -> Option<String> {
+    use clank_core::agent_config::WaitEventSource;
+    let (name, interrupt, message) = match source {
+        WaitEventSource::Command(s) => (&s.name, s.interrupt, s.interrupt_message.as_deref()),
+        WaitEventSource::Github(s) => (&s.repo, s.interrupt, s.interrupt_message.as_deref()),
+        WaitEventSource::Timer(s) => (&s.name, s.interrupt, s.interrupt_message.as_deref()),
+    };
+    let why = match (interrupt, message) {
+        (false, Some(_)) => {
+            "has `interrupt_message` without `interrupt: true`, so it is never used"
+        }
+        (true, None) => "interrupts without an `interrupt_message`; add one describing its events",
+        (true, Some(m)) if hint_text(m).is_none() => {
+            "has an `interrupt_message` that cannot be typed into a pane (it must be one line, \
+             without control characters, non-empty and at most 200 characters)"
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "source `{name}` {why}; its events are told as `{UNDESCRIBED}` with their selectors"
+    ))
+}
+
+/// The wake a sent message has always had: messages carry no description,
+/// and `clank send --interrupt` keeps this wording.
+pub(crate) const MESSAGE_WAKE: &str = "Clank has pending events for this session. Run `clank events list`, read the pending events with `clank events read`, and handle them before acknowledging. Follow any required-reply contract. Your current role and work are determined by Clank.";
+
+/// One claimed event, as the hint tells it.
+pub(crate) enum Claimed<'a> {
+    Message,
+    Event {
+        description: Option<&'a str>,
+        selector: String,
+    },
+}
+
+/// The one line typed after an interruption: each source's description with
+/// the selectors of its events, in the order they were claimed, so no
+/// source's words cover another's events and the agent can read each one at
+/// once; then, for any sent message, its fixed wake. One interruption either
+/// way.
+pub(crate) fn hint<'a>(events: impl IntoIterator<Item = Claimed<'a>>) -> String {
+    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+    let mut messages = false;
+    for event in events {
+        let Claimed::Event {
+            description,
+            selector,
+        } = event
+        else {
+            messages = true;
+            continue;
+        };
+        let description = description.and_then(hint_text).unwrap_or(UNDESCRIBED);
+        match groups.iter_mut().find(|(d, _)| *d == description) {
+            Some((_, selectors)) => selectors.push(selector),
+            None => groups.push((description, vec![selector])),
+        }
+    }
+    let more = |n: usize| format!("+{n} more");
+    let mut parts: Vec<String> = groups
+        .iter()
+        .take(SHOWN)
+        .map(|(description, selectors)| {
+            let mut shown: Vec<String> = selectors.iter().take(SHOWN).cloned().collect();
+            if selectors.len() > SHOWN {
+                shown.push(more(selectors.len() - SHOWN));
+            }
+            format!("{description}: {}", shown.join(", "))
+        })
+        .collect();
+    let hidden: usize = groups.iter().skip(SHOWN).map(|(_, s)| s.len()).sum();
+    if hidden > 0 {
+        parts.push(more(hidden));
+    }
+    match (parts.is_empty(), messages) {
+        (_, false) => parts.join("; "),
+        (true, true) => MESSAGE_WAKE.to_string(),
+        (false, true) => format!("{}. {MESSAGE_WAKE}", parts.join("; ")),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -32,7 +143,7 @@ pub(crate) struct Report {
 pub(crate) async fn dispatch<F>(
     dir: PathBuf,
     within: Duration,
-    perform: impl FnOnce() -> F,
+    perform: impl FnOnce(String) -> F,
 ) -> anyhow::Result<Report>
 where
     F: Future<Output = InterruptOutcome>,
@@ -46,7 +157,15 @@ where
         });
     }
     let claimed = claims.len();
-    let outcome = match tokio::time::timeout(within, perform()).await {
+    // From the batch this attempt claimed, and nothing read before it.
+    let text = hint(claims.iter().map(|c| match c.message {
+        true => Claimed::Message,
+        false => Claimed::Event {
+            description: c.hint.as_deref(),
+            selector: c.selector(),
+        },
+    }));
+    let outcome = match tokio::time::timeout(within, perform(text)).await {
         Ok(outcome) => outcome,
         Err(_) => InterruptOutcome::Indeterminate,
     };
@@ -81,11 +200,12 @@ pub(crate) async fn run(repo: PathBuf, label: clank_core::ids::AgentLabel) {
     let dir = crate::agent_store::agents_root(&repo)
         .join(label.as_str())
         .join("events");
-    let result = dispatch(dir, Duration::from_secs(12), || async {
-        if crate::agent_store::resolve_role(&repo, &label).is_err() {
+    let (repo, label) = (&repo, &label);
+    let result = dispatch(dir, Duration::from_secs(12), |text| async move {
+        if crate::agent_store::resolve_role(repo, label).is_err() {
             return InterruptOutcome::Unavailable;
         }
-        match super::codex_interrupt::try_wake(&repo, &label).await {
+        match super::codex_interrupt::try_wake(repo, label, &text).await {
             Ok(true) => return InterruptOutcome::Submitted,
             Ok(false) => {}, // No native mutation: verified terminal fallback is safe.
             Err(error) => {
@@ -100,7 +220,9 @@ pub(crate) async fn run(repo: PathBuf, label: clank_core::ids::AgentLabel) {
                 return InterruptOutcome::Unavailable;
             }
         };
-        match super::pane_input::wake_for_events_async(&target.session, &target.pane, tool).await {
+        match super::pane_input::wake_for_events_async(&target.session, &target.pane, tool, &text)
+            .await
+        {
             Ok(()) => InterruptOutcome::Submitted,
             Err(error) => {
                 eprintln!("interrupt `{label}`: acceptance unconfirmed ({error:#}); normal delivery remains pending");
@@ -209,6 +331,8 @@ fn claim_pending(dir: PathBuf) -> anyhow::Result<(Vec<Claim>, Vec<String>)> {
                 source: candidate.source,
                 seq: row.seq,
                 ident: row.ident,
+                hint: row.interrupt_hint,
+                message: matches!(row.item, clank_core::wait::WaitItem::Message { .. }),
             }),
             Ok(false) => {}
             Err(error) => errors.push(format!("{}@{}: {error}", candidate.source, row.seq)),
@@ -258,7 +382,7 @@ mod tests {
                 body: "work".into(),
                 selector: None,
             },
-            interrupt,
+            interrupt.into(),
         )
         .unwrap()
     }
@@ -278,7 +402,7 @@ mod tests {
         add(dir.path(), "command-a", "two", true);
         add(dir.path(), "messages", "ordinary", false);
         let calls = AtomicUsize::new(0);
-        let report = dispatch(dir.path().into(), Duration::from_secs(1), || async {
+        let report = dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             // Another writer can acquire the same lock inside transport I/O.
             // This would deadlock if the dispatch retained an exclusive claim lock.
@@ -301,7 +425,7 @@ mod tests {
             Some(InterruptOutcome::Submitted)
         );
         assert!(rows(dir.path(), "messages")[1].interrupt_attempt.is_none());
-        let again = dispatch(dir.path().into(), Duration::from_secs(1), || async {
+        let again = dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
             panic!("no eligible event means no target discovery or transport");
         })
         .await
@@ -314,7 +438,7 @@ mod tests {
         for outcome in [InterruptOutcome::Unavailable, InterruptOutcome::Failed] {
             let dir = tempfile::tempdir().unwrap();
             add(dir.path(), "messages", "one", true);
-            let report = dispatch(dir.path().into(), Duration::from_secs(1), || async {
+            let report = dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
                 outcome.clone()
             })
             .await
@@ -324,7 +448,7 @@ mod tests {
             assert!(!row.acked);
             assert_eq!(row.interrupt_attempt.unwrap().outcome, Some(outcome));
             assert_eq!(
-                dispatch(dir.path().into(), Duration::from_secs(1), || async {
+                dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
                     panic!("transport failures do not retry on replay");
                 })
                 .await
@@ -344,7 +468,7 @@ mod tests {
         for _ in 0..4 {
             let dir = dir.path().to_owned();
             let calls = calls.clone();
-            tasks.spawn(dispatch(dir, Duration::from_secs(1), move || async move {
+            tasks.spawn(dispatch(dir, Duration::from_secs(1), move |_| async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 InterruptOutcome::Submitted
             }));
@@ -368,7 +492,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         add(dir.path(), "messages", "one", true);
         let dropped = Arc::new(AtomicUsize::new(0));
-        let report = dispatch(dir.path().into(), Duration::from_millis(20), || async {
+        let report = dispatch(dir.path().into(), Duration::from_millis(20), |_| async {
             let _owned = Dropped(dropped.clone());
             std::future::pending().await
         })
@@ -387,7 +511,7 @@ mod tests {
         let running = tokio::spawn(dispatch(
             dir.path().into(),
             Duration::from_secs(1),
-            || async move {
+            |_| async move {
                 entered.send(()).unwrap();
                 std::future::pending().await
             },
@@ -398,7 +522,7 @@ mod tests {
         let row = rows(dir.path(), "messages").remove(0);
         assert!(!row.acked);
         assert_eq!(row.interrupt_attempt.unwrap().outcome, None);
-        let again = dispatch(dir.path().into(), Duration::from_secs(1), || async {
+        let again = dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
             panic!("cancelled caller does not grant another transport attempt");
         })
         .await
@@ -412,7 +536,7 @@ mod tests {
         add(dir.path(), "messages", "one", true);
         let corrupt = dir.path().join("command-broken.jsonl");
         std::fs::write(&corrupt, "bad interior line\n").unwrap();
-        let report = dispatch(dir.path().into(), Duration::from_secs(1), || async {
+        let report = dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
             InterruptOutcome::Unavailable
         })
         .await
@@ -512,7 +636,7 @@ mod tests {
             .append_ack(seq)
             .unwrap();
         assert_eq!(
-            dispatch(dir.path().into(), Duration::from_secs(1), || async {
+            dispatch(dir.path().into(), Duration::from_secs(1), |_| async {
                 panic!("handled event must not interrupt");
             })
             .await
@@ -520,5 +644,193 @@ mod tests {
             .claimed,
             0
         );
+    }
+
+    fn add_described(dir: &std::path::Path, source: &str, id: &str, hint: Option<&str>) -> u64 {
+        let mut log = EventLog::open(dir, source).unwrap();
+        log.load();
+        log.append_interruptible_inbox(
+            Transport::Command,
+            Some(id),
+            None,
+            None,
+            &WaitItem::CommandEvent {
+                presentation: None,
+                source_cwd: None,
+                name: source.into(),
+                id: id.into(),
+                event: source.into(),
+                content: "work".into(),
+                at: None,
+                failure: false,
+                requires_reply: false,
+                reply_route: None,
+                selector: None,
+            },
+            super::super::github::log::Interrupt::new(true, hint),
+        )
+        .unwrap()
+    }
+
+    const VOICE: &str = "Interrupted for new voice message";
+
+    #[test]
+    fn a_description_is_one_short_clean_line_or_nothing() {
+        assert_eq!(hint_text(&format!("  {VOICE} ")), Some(VOICE));
+        for unusable in [
+            "",
+            "   ",
+            "two\nlines",
+            "carriage\rreturn",
+            "escape \u{1b}[2J",
+            "tab\there",
+        ] {
+            assert_eq!(hint_text(unusable), None, "{unusable:?}");
+        }
+        assert!(hint_text(&"x".repeat(HINT_MAX)).is_some());
+        assert_eq!(hint_text(&"x".repeat(HINT_MAX + 1)), None);
+    }
+
+    fn ev<'a>(description: Option<&'a str>, selector: &str) -> Claimed<'a> {
+        Claimed::Event {
+            description,
+            selector: selector.to_string(),
+        }
+    }
+
+    /// A sent message keeps the wake it always had, alone or beside sources'
+    /// descriptions, and a batch is still one hint.
+    #[test]
+    fn a_sent_message_keeps_its_fixed_wake() {
+        assert_eq!(hint([Claimed::Message, Claimed::Message]), MESSAGE_WAKE);
+        assert_eq!(
+            hint([Claimed::Message, ev(Some(VOICE), "v@1")]),
+            format!("{VOICE}: v@1. {MESSAGE_WAKE}")
+        );
+    }
+
+    #[test]
+    fn the_hint_names_each_events_selector_under_its_own_description() {
+        assert_eq!(
+            hint([ev(Some(VOICE), "command-voice-7f9bc9f9@15")]),
+            "Interrupted for new voice message: command-voice-7f9bc9f9@15"
+        );
+        assert_eq!(
+            hint([
+                ev(Some(VOICE), "v@1"),
+                ev(Some("New PR review"), "github-x@3"),
+                ev(Some(VOICE), "v@2"),
+                ev(None, "command-q@8"),
+                ev(Some("bad\nline"), "c@4"),
+            ]),
+            "Interrupted for new voice message: v@1, v@2; New PR review: github-x@3; \
+             New events: command-q@8, c@4"
+        );
+        let many = (1..=5).map(|n| ev(Some(VOICE), &format!("v@{n}")));
+        assert_eq!(hint(many), format!("{VOICE}: v@1, v@2, v@3, +2 more"));
+        let groups = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(|d| ev(Some(d), &format!("{d}@1")));
+        assert_eq!(hint(groups), "a: a@1; b: b@1; c: c@1; +2 more");
+    }
+
+    /// The hint is made from exactly the events this attempt claimed: their
+    /// descriptions and selectors, which `clank events read` resolves. An
+    /// unusable description, as stored, still never reaches the transport.
+    #[tokio::test]
+    async fn the_transport_is_handed_the_hint_for_the_claimed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice = "command-voice-7f9bc9f9";
+        let first = add_described(dir.path(), voice, "a", Some(VOICE));
+        let acked = add_described(dir.path(), voice, "b", Some(VOICE));
+        let row = rows(dir.path(), voice).remove(1);
+        EventLog::open(dir.path(), voice)
+            .unwrap()
+            .append_ack_ident(acked, &row.ident)
+            .unwrap();
+        let bad = add_described(dir.path(), "command-bad", "c", Some("one\ntwo"));
+        let handed = std::sync::Mutex::new(None);
+        dispatch(dir.path().into(), Duration::from_secs(1), |text| {
+            *handed.lock().unwrap() = Some(text);
+            async { InterruptOutcome::Submitted }
+        })
+        .await
+        .unwrap();
+        let text = handed.into_inner().unwrap().unwrap();
+        let mut parts = vec![
+            format!("{VOICE}: {voice}@{first}"),
+            format!("New events: command-bad@{bad}"),
+        ];
+        if !text.starts_with(VOICE) {
+            parts.reverse();
+        }
+        assert_eq!(text, parts.join("; "));
+        let selector: super::super::events::Selector = format!("{voice}@{first}").parse().unwrap();
+        assert_eq!(
+            (selector.source.as_deref(), selector.seq),
+            (Some(voice), first)
+        );
+    }
+
+    /// The description is recorded with the event, kept only when it
+    /// interrupts, and shown by `clank events show --json`.
+    #[test]
+    fn the_description_is_recorded_with_the_event() {
+        let dir = tempfile::tempdir().unwrap();
+        add_described(dir.path(), "command-voice", "a", Some(VOICE));
+        let row = rows(dir.path(), "command-voice").remove(0);
+        assert_eq!(row.interrupt_hint.as_deref(), Some(VOICE));
+        assert_eq!(serde_json::to_value(&row).unwrap()["interrupt_hint"], VOICE);
+        assert_eq!(
+            super::super::github::log::Interrupt::new(false, Some(VOICE)).hint,
+            None
+        );
+    }
+
+    #[test]
+    fn a_sources_description_problem_is_named_never_refused() {
+        use clank_core::agent_config::{TimerSource, WaitEventSource};
+        let timer = |interrupt, message: Option<&str>| {
+            WaitEventSource::Timer(TimerSource {
+                interrupt,
+                interrupt_message: message.map(str::to_string),
+                name: "standup".into(),
+                due_at: "2026-10-06T09:00:00Z".into(),
+                repeat_every: None,
+                content: None,
+            })
+        };
+        assert_eq!(hint_problem(&timer(true, Some(VOICE))), None);
+        assert_eq!(hint_problem(&timer(false, None)), None);
+        for (source, says) in [
+            (timer(true, None), "without an `interrupt_message`"),
+            (timer(true, Some("a\nb")), "cannot be typed into a pane"),
+            (timer(false, Some(VOICE)), "without `interrupt: true`"),
+        ] {
+            let problem = hint_problem(&source).unwrap();
+            assert!(
+                problem.contains("`standup`") && problem.contains(says),
+                "{problem}"
+            );
+        }
+    }
+
+    /// An interrupting sent message alone keeps its fixed wake through the
+    /// real dispatch, and stays pending: the wake reads nothing and owes
+    /// nothing.
+    #[tokio::test]
+    async fn an_interrupting_message_alone_keeps_its_fixed_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        add(dir.path(), "messages", "one", true);
+        let handed = std::sync::Mutex::new(None);
+        dispatch(dir.path().into(), Duration::from_secs(1), |text| {
+            *handed.lock().unwrap() = Some(text);
+            async { InterruptOutcome::Submitted }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handed.into_inner().unwrap().as_deref(), Some(MESSAGE_WAKE));
+        let row = rows(dir.path(), "messages").remove(0);
+        assert!(!row.acked && row.woken_at.is_none());
     }
 }

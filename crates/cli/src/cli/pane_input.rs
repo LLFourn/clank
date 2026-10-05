@@ -176,17 +176,16 @@ where
 }
 
 /// A fresh prompt is the handoff across native cancellation hooks. User content
-/// stays in its durable inbox: this only asks the target to read pending work.
+/// stays in its durable inbox: `hint` only names the pending events to read.
 /// Role is deliberately resolved by Clank when the target reads, never captured
 /// in terminal text before interruption. No receipt or acknowledgement is forged.
-pub(crate) const EVENT_WAKE: &str = "Clank has pending events for this session. Run `clank events list`, read the pending events with `clank events read`, and handle them before acknowledging. Follow any required-reply contract. Your current role and work are determined by Clank.";
-
 pub(crate) async fn wake_for_events_async(
     session: &str,
     pane: &str,
     tool: clank_core::Tool,
+    hint: &str,
 ) -> anyhow::Result<()> {
-    interrupt_and_submit_async(session, pane, tool, EVENT_WAKE).await
+    interrupt_and_submit_async(session, pane, tool, hint).await
 }
 
 /// The order, separated from the terminal so it can be asserted.

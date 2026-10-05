@@ -46,7 +46,7 @@ mod interruption;
 mod message;
 mod presentation;
 mod timer;
-pub(crate) use interruption::{InterruptAttempt, InterruptOutcome};
+pub(crate) use interruption::{Interrupt, InterruptAttempt, InterruptOutcome};
 pub(crate) use message::{MessageOperation, MessageOperationState, MessageReceipt};
 
 #[derive(Debug)]
@@ -222,6 +222,10 @@ enum Record {
         baseline: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         interrupt: bool,
+        /// The source's description for its interruption hint, as it was
+        /// when the event was accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interrupt_hint: Option<String>,
         transport: Transport,
         #[serde(skip_serializing_if = "Option::is_none")]
         feed_id: Option<String>,
@@ -407,6 +411,8 @@ pub(crate) struct EventRow {
     pub(crate) message_history_pruned: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) interrupt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interrupt_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) interrupt_attempt: Option<InterruptAttempt>,
     pub(crate) seq: u64,
@@ -617,12 +623,17 @@ impl SharedWal {
         action_key: Option<&str>,
         event_at: Option<u64>,
         item: &mut WaitItem,
-        interrupt: bool,
+        interrupt: Interrupt,
     ) -> crate::cli::event_source::Durability {
         let mut selected = None;
         let durability = self.with(|log| {
             let seq = log.append_interruptible_inbox(
-                transport, feed_id, action_key, event_at, item, interrupt,
+                transport,
+                feed_id,
+                action_key,
+                event_at,
+                item,
+                interrupt.clone(),
             )?;
             selected =
                 Some(log.presentation_key(seq, transport, feed_id, action_key, event_at, item));
@@ -645,7 +656,14 @@ impl SharedWal {
         event_at: Option<u64>,
         item: &WaitItem,
     ) -> crate::cli::event_source::Durability {
-        self.interruptible_inbox(transport, feed_id, action_key, event_at, item, false)
+        self.interruptible_inbox(
+            transport,
+            feed_id,
+            action_key,
+            event_at,
+            item,
+            Interrupt::default(),
+        )
     }
 
     #[cfg(test)]
@@ -656,11 +674,16 @@ impl SharedWal {
         action_key: Option<&str>,
         event_at: Option<u64>,
         item: &WaitItem,
-        interrupt: bool,
+        interrupt: Interrupt,
     ) -> crate::cli::event_source::Durability {
         self.with(|log| {
             log.append_interruptible_inbox(
-                transport, feed_id, action_key, event_at, item, interrupt,
+                transport,
+                feed_id,
+                action_key,
+                event_at,
+                item,
+                interrupt.clone(),
             )
             .map(|_| ())
         })
@@ -1180,6 +1203,7 @@ impl EventLog {
                     event_at,
                     baseline,
                     interrupt,
+                    interrupt_hint,
                     transport,
                     feed_id,
                     action_key,
@@ -1201,6 +1225,7 @@ impl EventLog {
                             message_replies: Vec::new(),
                             message_history_pruned: false,
                             interrupt,
+                            interrupt_hint,
                             interrupt_attempt: None,
                             seq,
                             at,
@@ -1223,6 +1248,10 @@ impl EventLog {
                         // Conflicting physical copies must not manufacture
                         // permission to interrupt an old, ordinary event.
                         row.interrupt &= interrupt;
+                        // Copies that disagree on the words keep none.
+                        if row.interrupt_hint != interrupt_hint {
+                            row.interrupt_hint = None;
+                        }
                         if row.feed_id.is_none() {
                             row.feed_id = feed_id;
                         }
@@ -1393,7 +1422,15 @@ impl EventLog {
         event_at: Option<u64>,
         item: &WaitItem,
     ) -> std::io::Result<u64> {
-        self.append_inbox_record(transport, feed_id, action_key, event_at, item, false, false)
+        self.append_inbox_record(
+            transport,
+            feed_id,
+            action_key,
+            event_at,
+            item,
+            false,
+            Interrupt::default(),
+        )
     }
 
     pub(crate) fn append_interruptible_inbox(
@@ -1403,7 +1440,7 @@ impl EventLog {
         action_key: Option<&str>,
         event_at: Option<u64>,
         item: &WaitItem,
-        interrupt: bool,
+        interrupt: Interrupt,
     ) -> std::io::Result<u64> {
         self.append_inbox_record(
             transport, feed_id, action_key, event_at, item, false, interrupt,
@@ -1426,7 +1463,7 @@ impl EventLog {
             event_at,
             item,
             true,
-            false,
+            Interrupt::default(),
         )
     }
 
@@ -1438,7 +1475,7 @@ impl EventLog {
         event_at: Option<u64>,
         item: &WaitItem,
         baseline: bool,
-        interrupt: bool,
+        interrupt: Interrupt,
     ) -> std::io::Result<u64> {
         if item.presentation().is_some() {
             return Err(std::io::Error::other(
@@ -1478,7 +1515,8 @@ impl EventLog {
             at: now_epoch(),
             event_at,
             baseline,
-            interrupt,
+            interrupt: interrupt.on,
+            interrupt_hint: interrupt.hint,
             transport,
             feed_id: feed_id.map(str::to_owned),
             action_key: action_key.map(str::to_owned),

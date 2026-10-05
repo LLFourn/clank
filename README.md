@@ -769,6 +769,29 @@ to the persisted event; changing configuration or replaying an ID does not chang
 old events. Baseline history and source-failure notices never interrupt. Timers
 request interruption only when an occurrence becomes due, including catch-up.
 
+An interrupting source should describe its events with `"interrupt_message"`, and
+a command producer line can override it. After the interruption, Clank submits
+that text followed by the selector of each event, the selector that
+`clank events read` and `clank events ack` take:
+
+```json
+{"kind": "command", "name": "voice", "command": ["voice-feed"],
+ "interrupt": true, "interrupt_message": "Interrupted for new voice message"}
+```
+
+That produces `Interrupted for new voice message: command-voice-7f9bc9f9@15`.
+
+- **Several events in one interruption:** each description is listed with its own
+  selectors, groups joined by `; ` and capped with `+N more`.
+- **Events with no usable description** are listed as `New events`. A description
+  is usable if it is one line, contains no control characters, is not empty, and
+  is at most 200 characters.
+- **An unusable description** is never typed into a pane, and never stops its
+  source or its events. `clank doctor` and the monitor report it, as they do a
+  missing one.
+- **The description is recorded with each event,** like `interrupt` itself.
+  `clank events show --json` shows it as `interrupt_hint`.
+
 The monitor initiates requests without requiring an armed waiter. One recipient's
 pending eligible events coalesce into one request; the sender uses the same ledger
 when sending an interrupting message without a monitor. Codex first tries the

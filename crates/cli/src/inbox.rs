@@ -300,8 +300,15 @@ fn log_message_with_key(
         selector: None,
     };
     let at = at.or_else(|| parse_rfc3339_secs(sent));
-    log.append_interruptible_inbox(Transport::Message, None, Some(key), at, &item, interrupt)
-        .with_context(|| format!("logging a message for `{}`", to.as_str()))?;
+    log.append_interruptible_inbox(
+        Transport::Message,
+        None,
+        Some(key),
+        at,
+        &item,
+        interrupt.into(),
+    )
+    .with_context(|| format!("logging a message for `{}`", to.as_str()))?;
     // Compaction runs HERE, on the write path and under the same
     // writer lock, because a message log has no coordinator to run it
     // for it. Every other producer compacts through the loop that owns

@@ -51,6 +51,9 @@ pub(crate) struct Line {
     /// Per-event override; absence inherits the source's default.
     #[serde(default)]
     pub(crate) interrupt: Option<bool>,
+    /// Per-event override of the source's interruption description.
+    #[serde(default)]
+    pub(crate) interrupt_message: Option<String>,
     /// Producer-owned and unique within the source. Compared for
     /// EQUALITY and nothing else — never ordered, never a resume
     /// point.
@@ -184,7 +187,7 @@ pub(crate) enum Ingested {
     /// never re-derives it — two places deriving one identity is two
     /// places to disagree.
     Emit {
-        interrupt: bool,
+        interrupt: crate::cli::github::log::Interrupt,
         id: String,
         item: Box<clank_core::wait::WaitItem>,
     },
@@ -230,7 +233,12 @@ pub(crate) fn ingest_line(
         Known::No => {}
     }
     Some(Ingested::Emit {
-        interrupt: line.interrupt.unwrap_or(src.interrupt),
+        interrupt: crate::cli::github::log::Interrupt::new(
+            line.interrupt.unwrap_or(src.interrupt),
+            line.interrupt_message
+                .as_deref()
+                .or(src.interrupt_message.as_deref()),
+        ),
         id: line.id.clone(),
         item: Box::new(clank_core::wait::WaitItem::CommandEvent {
             presentation: None,
@@ -481,7 +489,7 @@ pub(crate) fn report_failure(
     );
     apply(
         Ingested::Emit {
-            interrupt: false,
+            interrupt: Default::default(),
             item: Box::new(failure_event(src, &id, why)),
             id,
         },
@@ -568,6 +576,7 @@ mod tests {
     fn src_named(name: &str) -> clank_core::agent_config::CommandSource {
         clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: name.into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -601,6 +610,39 @@ mod tests {
             Some(Ingested::Duplicate)
         );
         assert!(log.read_rows().unwrap().unwrap().rows[0].interrupt);
+    }
+
+    /// A line's description overrides its source's, and an unusable one is
+    /// still an event: it is stored as given, and only ever refused where a
+    /// hint is typed.
+    #[test]
+    fn a_lines_description_overrides_its_sources_and_never_refuses_the_event() {
+        let dir = tmpdir();
+        let (mut log, mut seen) = store(dir.path());
+        let mut source = src_named("voice");
+        source.interrupt = true;
+        source.interrupt_message = Some("Interrupted for new voice message".into());
+        for raw in [
+            r#"{"id":"one"}"#,
+            r#"{"id":"two","interrupt_message":"Urgent voice message"}"#,
+            r#"{"id":"three","interrupt_message":"two\nlines"}"#,
+            r#"{"id":"four","interrupt":false,"interrupt_message":"ignored"}"#,
+        ] {
+            let what = ingest_line(&source, &seen, raw).unwrap();
+            assert!(apply(what, KEY, &mut log, &mut seen, |_| true));
+        }
+        let rows = log.read_rows().unwrap().unwrap().rows;
+        let hints: Vec<_> = rows.iter().map(|r| r.interrupt_hint.as_deref()).collect();
+        assert_eq!(
+            hints,
+            [
+                Some("Interrupted for new voice message"),
+                Some("Urgent voice message"),
+                Some("two\nlines"),
+                None,
+            ]
+        );
+        assert!(rows[2].interrupt, "an unusable description keeps its event");
     }
 
     const KEY: &str = "command-s-00000000";
@@ -1942,6 +1984,7 @@ mod producer_tests {
             message_replies: Vec::new(),
             message_history_pruned: false,
             interrupt: false,
+            interrupt_hint: None,
             interrupt_attempt: None,
             seq,
             at: 0,
@@ -2034,6 +2077,7 @@ mod producer_tests {
             message_replies: Vec::new(),
             message_history_pruned: false,
             interrupt: false,
+            interrupt_hint: None,
             interrupt_attempt: None,
             seq,
             at: 0,

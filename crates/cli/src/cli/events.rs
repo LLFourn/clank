@@ -1172,6 +1172,7 @@ mod tests {
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "questions".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1328,6 +1329,7 @@ mod tests {
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1428,6 +1430,7 @@ mod tests {
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1486,6 +1489,7 @@ mod tests {
         let dir = tempdir();
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1882,6 +1886,7 @@ mod tests {
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
             interrupt: false,
+            interrupt_message: None,
             repo: repo.into(),
             events: vec![GithubEventKind::IssueOpened],
             poll_interval: None,
@@ -1961,6 +1966,7 @@ mod tests {
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
             interrupt: false,
+            interrupt_message: None,
             repo: repo.into(),
             events: vec![GithubEventKind::IssueOpened],
             poll_interval: None,

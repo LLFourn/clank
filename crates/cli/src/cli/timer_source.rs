@@ -290,7 +290,10 @@ impl TimerSet {
                     r,
                     entry.source.content.as_deref().unwrap_or_default(),
                     wall,
-                    entry.source.interrupt,
+                    super::github::log::Interrupt::new(
+                        entry.source.interrupt,
+                        entry.source.interrupt_message.as_deref(),
+                    ),
                 )?;
                 let next = match transition {
                     super::github::log::RecurringTransition::Future(due) => Some(due),
@@ -364,6 +367,7 @@ mod tests {
     fn source(name: &str, due: u64) -> TimerSource {
         TimerSource {
             interrupt: false,
+            interrupt_message: None,
             name: name.into(),
             repeat_every: None,
             due_at: time::OffsetDateTime::from_unix_timestamp(due as i64)
@@ -412,6 +416,7 @@ mod tests {
                 source("urgent", 100)
             };
             source.interrupt = true;
+            source.interrupt_message = Some("Standup".into());
             let key = if recurring {
                 recurrence::Recurrence::parse(&source, None)
                     .unwrap()
@@ -423,8 +428,13 @@ mod tests {
             timers.due_at(100, Instant::now());
             assert!(rx.try_recv().is_ok());
             assert!(rows(dir.path(), &key)[0].interrupt);
+            assert_eq!(
+                rows(dir.path(), &key)[0].interrupt_hint.as_deref(),
+                Some("Standup")
+            );
             drop(timers);
             source.interrupt = false;
+            source.interrupt_message = None;
             let (mut timers, _) = set(dir.path(), vec![source]);
             timers.due_at(200, Instant::now());
             timers.refresh_at(200, Instant::now());
@@ -434,6 +444,7 @@ mod tests {
                 retained[0].interrupt,
                 "policy belongs to the accepted occurrence"
             );
+            assert_eq!(retained[0].interrupt_hint.as_deref(), Some("Standup"));
         }
     }
 
@@ -1034,7 +1045,7 @@ fn accept(
         None,
         Some(due),
         &item,
-        source.interrupt,
+        super::github::log::Interrupt::new(source.interrupt, source.interrupt_message.as_deref()),
     )?;
     let checkpoint = seen.record(&id);
     item.set_presentation(log.presentation_key(

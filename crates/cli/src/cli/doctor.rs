@@ -585,6 +585,24 @@ pub fn repo_checks(
         }
     }
 
+    for (label, _, _) in &members {
+        let sources = load_agent_config(repo, label)
+            .ok()
+            .flatten()
+            .map(|c| c.wait_events)
+            .unwrap_or_default();
+        for problem in sources
+            .iter()
+            .filter_map(crate::cli::event_interrupt::hint_problem)
+        {
+            out.push(CheckResult::warn(
+                SECTION,
+                format!("agent: {label} interruptions"),
+                problem,
+            ));
+        }
+    }
+
     out
 }
 
@@ -1714,6 +1732,53 @@ mod tests {
             .find(|r| r.name == "agent: kimi")
             .expect("agent check ran");
         assert_eq!(agent.status, CheckStatus::Warn);
+    }
+
+    /// An interrupting source without a usable description is a warning,
+    /// naming the source and the field, never a failure: the source still
+    /// runs.
+    #[test]
+    fn repo_checks_warn_about_an_undescribed_interrupting_source() {
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
+        use clank_core::vocab::Tool;
+        let dir = init_git_repo();
+        let label = clank_core::ids::AgentLabel::parse("assistent").unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            dir.path(),
+            &label,
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+            RosterRole::Master,
+        )
+        .unwrap();
+        let source = clank_core::agent_config::CommandSource {
+            interrupt: true,
+            interrupt_message: None,
+            name: "voice".into(),
+            command: vec!["true".into()],
+            reply_command: None,
+            receipt_command: None,
+            glyph: None,
+        };
+        let cfg = clank_core::agent_config::AgentConfig {
+            wait_events: vec![clank_core::agent_config::WaitEventSource::Command(source)],
+            ..Default::default()
+        };
+        crate::agent_store::save_agent_config(dir.path(), &label, &cfg).unwrap();
+        let results = repo_checks(dir.path(), None, None);
+        let check = results
+            .iter()
+            .find(|r| r.name == "agent: assistent interruptions")
+            .expect("interruption check ran");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.message.contains("`voice`") && check.message.contains("interrupt_message"),
+            "{}",
+            check.message
+        );
     }
 
     #[test]

@@ -1098,6 +1098,7 @@ pub(crate) mod tests {
 
         let glyphed = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1106,6 +1107,7 @@ pub(crate) mod tests {
         };
         let plain = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "builds".into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1206,6 +1208,7 @@ pub(crate) mod tests {
 
         let src = clank_core::agent_config::CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: "deploys".into(),
             command: vec!["true".into()],
             reply_command: None,

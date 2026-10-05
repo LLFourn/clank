@@ -84,7 +84,7 @@ impl Fixture {
         let ready_path = repo.join("producer-ready.sock");
         let ready = UnixDatagram::bind(&ready_path).unwrap();
         let output = repo.join("receipt.json");
-        let source = CommandSource { interrupt: false,
+        let source = CommandSource { interrupt_message: None, interrupt: false,
             name: "voice/a".into(),
             command: vec!["/usr/bin/python3".into(), "-c".into(),
                 "import json,os,socket,sys,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(json.dumps({'pid':os.getpid(),'parent':os.getppid(),'cwd':os.getcwd(),'state':os.environ['CLANK_SOURCE_STATE_DIR'],'argv':sys.argv[1:3]}).encode(),sys.argv[3]); g=open(sys.argv[4]); data=json.loads(g.readline()); print(json.dumps(data),flush=True); time.sleep(300)".into(),
@@ -300,6 +300,8 @@ async fn wide_icon_hook_receives_interrupting_producer_without_zellij_and_keeps_
     let mut fixture = Fixture::new(Tool::Codex, true);
     fixture.source.interrupt = true;
     fixture.source.glyph = Some("💬".into()); // Cosmetic width must not kill the native wait.
+    // Nor may an interruption description that cannot be typed into a pane.
+    fixture.source.interrupt_message = Some("two\nlines".into());
     fixture.enable_receipts(); // Persist the updated source policy alongside its receipt callback.
     let _lease = fixture.monitor_lease(); // No published monitor: attachment must fall back.
     let hook = fixture.hook_child(false).await;
@@ -529,6 +531,7 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
         cfg.wait_events = vec![WaitEventSource::Timer(
             clank_core::agent_config::TimerSource {
                 interrupt: false,
+                interrupt_message: None,
                 name: "recurring-monitor".into(),
                 due_at: anchor
                     .format(&time::format_description::well_known::Rfc3339)
@@ -839,6 +842,7 @@ async fn shared_monitor_claims_due_interrupt_without_waiter_and_does_not_probe_o
     let fixture = Fixture::new(Tool::Codex, false);
     let source = clank_core::agent_config::TimerSource {
         interrupt: true,
+        interrupt_message: None,
         name: "interrupt-without-waiter".into(),
         due_at: "1970-01-01T00:01:40Z".into(),
         repeat_every: None,
