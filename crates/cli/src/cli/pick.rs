@@ -96,9 +96,9 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
     // Interleaved-foreign check, per plan: inside the plan's own span,
     // every commit must belong to SOME picked plan — cherry-pick replays
     // diffs, so a foreign commit inside the span is likely load-bearing
-    // context we'd silently skip. Name the offenders (same rule + spirit
-    // as the squash guard). Picking two mutually-interleaved plans
-    // TOGETHER is fine: each covers the other's "foreign" commits.
+    // context we'd silently skip. Name the offenders. Picking two
+    // mutually-interleaved plans TOGETHER is fine: each covers the
+    // other's "foreign" commits.
     for (key, natives) in &natives_by_plan {
         let positions: Vec<usize> = natives.iter().filter_map(&pos_of).collect();
         let (Some(&lo), Some(&hi)) = (positions.iter().min(), positions.iter().max()) else {

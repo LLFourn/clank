@@ -42,10 +42,11 @@ pub struct RewriteOpts<'a> {
     /// branch already exists.
     pub into_branch: Option<&'a str>,
     pub dry: bool,
-    /// `Some(msg)` collapses the squash range into one commit on top of
-    /// `intro_parent`, with the supplied message. Refuses if any commit in
-    /// the COLLAPSED range is marked `foreign` (a squash can't selectively
-    /// preserve interleaved foreign work). The resulting tree is the squash
+    /// `Some(msg)` collapses the squash range into one commit with the
+    /// supplied message. Commits in the COLLAPSED range marked `foreign`
+    /// are moved ahead of it first, each keeping its own message and
+    /// author; the rewrite refuses only if one of them does not apply
+    /// cleanly there. The resulting tree is the squash
     /// tip's tree minus `head_strip_paths` — Drop commits don't carry
     /// per-commit `strip_paths`, so unioning the manifest's strip_paths
     /// would leak content the per-commit replay would have removed by
@@ -142,31 +143,25 @@ async fn run_inner(
         (false, _) => None,
     };
 
-    // Squash adds one more blocker: foreign commits INSIDE the collapsed
-    // range (a squash can't selectively preserve interleaved foreign work —
-    // replay uses full trees, so replaying an interleaved commit after the
-    // squash would reset the plan's later changes). Commits AFTER the
-    // squash tip are restack steps and never trip this. Name the offenders
-    // so the operator knows what to re-tag or move.
+    // Foreign commits INSIDE the collapsed range — untagged adhoc work or
+    // another plan's — move AHEAD of the squash rather than into it, so
+    // their messages and authors survive. Replay uses full trees, so one
+    // left after the squash would reset the plan's later changes. Worked
+    // out here, for dry runs and preflights too: whether they can move
+    // is a blocker like any other.
     let mut blockers = blockers;
-    if let Some(boundary) = boundary {
-        // boundary < steps.len() by construction (a position() hit, or
-        // len-1 of a non-empty list), so the inclusive slice is in range.
-        let offenders: Vec<String> = plan.steps[..=boundary]
-            .iter()
-            .filter(|s| s.foreign)
-            .map(|s| format!("{} {}", short(&s.sha), s.subject))
-            .collect();
-        if !offenders.is_empty() {
-            blockers.push(format!(
-                "--squash refuses {} foreign commit(s) interleaved within the \
-                 plan's own range:\n    {}\n  Re-tag or move them, or use \
-                 `clank purge` without `--squash` first, then retry.",
-                offenders.len(),
-                offenders.join("\n    "),
-            ));
+    let ahead = match boundary {
+        Some(boundary) if opts.linear => {
+            match move_ahead(opts.repo, &plan.steps[..=boundary], intro_parent.as_deref())? {
+                Ok(ahead) => ahead,
+                Err(blocker) => {
+                    blockers.push(blocker);
+                    Vec::new()
+                }
+            }
         }
-    }
+        _ => Vec::new(),
+    };
 
     // Whether a dirty tree matters here cannot be known until the tip
     // exists: a rewrite that lands the SAME tree needs no worktree
@@ -180,7 +175,7 @@ async fn run_inner(
     // a clean tree still writes nothing at all.
     let asked = opts.into_branch.is_none() && working_tree_dirty(opts.repo)?;
     let built = if blockers.is_empty() && (!opts.dry || asked) {
-        Some(build_new_tip(&opts, &plan, boundary, intro_parent.as_deref()).await?)
+        Some(build_new_tip(&opts, &plan, boundary, intro_parent.as_deref(), &ahead).await?)
     } else {
         None
     };
@@ -199,7 +194,10 @@ async fn run_inner(
 
     if opts.dry {
         if let Some(msg) = opts.squash {
-            print_squash_dry_run(&opts, &plan, boundary, &blockers, msg);
+            print!(
+                "{}",
+                squash_dry_run_text(&opts, &plan, boundary, &ahead, &blockers, msg)
+            );
         } else {
             print_rebase_todo(&opts, &plan, &blockers);
         }
@@ -258,6 +256,16 @@ async fn run_inner(
             current
         }
     };
+    if !ahead.is_empty() {
+        println!(
+            "moved {} commit(s) that are not this plan's ahead of the squash, each \
+             with its own message and author:",
+            ahead.len()
+        );
+        for moved in &ahead {
+            println!("  {} {}", short(&moved.sha), moved.subject);
+        }
+    }
 
     Ok((
         blockers,
@@ -451,6 +459,75 @@ fn build_plan(commits: &[RewriteCommit], intro_parent: Option<&str>) -> Executio
     }
 }
 
+/// A foreign commit re-applied ahead of the squash: the tree it lands
+/// there, already stripped as its disposition says.
+#[derive(Debug)]
+struct Ahead {
+    sha: String,
+    subject: String,
+    tree: String,
+}
+
+/// Re-apply the collapsed range's foreign commits, in order, onto
+/// `intro_parent` — their changes, not their trees. `Err` is the
+/// blocker naming the first that will not apply, and why.
+///
+/// Only trees are written here, never commits or refs, so a refusal
+/// leaves nothing anyone can see.
+fn move_ahead(
+    repo: &Path,
+    collapsed: &[PlanStep],
+    intro_parent: Option<&str>,
+) -> anyhow::Result<Result<Vec<Ahead>, String>> {
+    let mut foreign = collapsed.iter().filter(|s| s.foreign).peekable();
+    if foreign.peek().is_none() {
+        return Ok(Ok(Vec::new()));
+    }
+    // A plan that starts at the root has the empty tree before it, and
+    // what moves ahead of it becomes the new root.
+    let mut onto = match intro_parent {
+        Some(parent) => git_plumbing::commit_tree_oid(repo, parent)?,
+        None => git_plumbing::empty_tree(repo)?,
+    };
+    let mut ahead = Vec::new();
+    for step in foreign {
+        // A disposition says what a commit's change contributes once
+        // the plan's artifacts are stripped, never whether the commit
+        // survives: a foreign commit is somebody else's, so it moves
+        // even when that leaves it empty.
+        let tree = match step.disposition {
+            RewriteDisposition::Drop => onto.clone(),
+            disposition => {
+                let tree = match git_plumbing::replay_change(repo, &step.sha, &onto)? {
+                    git_plumbing::Replayed::Tree(tree) => tree,
+                    git_plumbing::Replayed::Conflicts(paths) => {
+                        return Ok(Err(format!(
+                            "--squash cannot move {} {} ahead of the plan's commits: \
+                             re-applying it there conflicts on {}. It probably depends on a \
+                             plan commit before it. Nothing was rewritten.",
+                            short(&step.sha),
+                            step.subject,
+                            paths.join(", "),
+                        )));
+                    }
+                };
+                if disposition == RewriteDisposition::Rewrite {
+                    git_plumbing::strip_tree_id(repo, &tree, &step.strip_paths)?
+                } else {
+                    tree
+                }
+            }
+        };
+        onto = tree.clone();
+        ahead.push(Ahead {
+            sha: step.sha.clone(),
+            subject: step.subject.clone(),
+            tree,
+        });
+    }
+    Ok(Ok(ahead))
+}
+
 /// Pre-flight diagnostics. Live run bails on the first; `--dry`
 /// reports the full list as a footer after the listing.
 /// Whether landing `new_tip` on the current branch would change the
@@ -471,26 +548,37 @@ async fn build_new_tip(
     plan: &ExecutionPlan,
     boundary: Option<usize>,
     intro_parent: Option<&str>,
+    ahead: &[Ahead],
 ) -> anyhow::Result<(String, Vec<(CommitSha, CommitSha)>)> {
     let mut pairs: Vec<(CommitSha, CommitSha)> = Vec::new();
     let new_tip = if let Some(message) = opts.squash {
         // None only for an empty range, which the empty-range blocker
         // already bailed on above.
         let boundary = boundary.expect("empty squash range is caught by blockers");
+        let mut base = intro_parent.map(str::to_string);
+        for moved in ahead {
+            let new =
+                git_plumbing::replay_commit(opts.repo, &moved.sha, &moved.tree, base.as_deref())?;
+            pairs.push((parse_rewritten(&moved.sha)?, parse_rewritten(&new)?));
+            base = Some(new);
+        }
         let squash_source = opts.squash_tip.unwrap_or(opts.head_sha);
         let squashed = apply_squash(
             opts.repo,
             squash_source,
             opts.head_strip_paths,
-            intro_parent,
+            base.as_deref(),
             message,
         )
         .await?;
         let squashed_sha = parse_rewritten(&squashed)?;
-        // Every collapsed old maps to the one squash commit (the feedback
-        // migrator keeps the LATEST old per new — the finalize commit's).
+        // Every collapsed plan commit maps to the one squash commit (the
+        // feedback migrator keeps the LATEST old per new — the finalize
+        // commit's); a moved one maps to its own new commit, above.
         for step in &plan.steps[..=boundary] {
-            pairs.push((parse_rewritten(&step.sha)?, squashed_sha.clone()));
+            if !step.foreign {
+                pairs.push((parse_rewritten(&step.sha)?, squashed_sha.clone()));
+            }
         }
         // RESTACK the steps after the squash tip individually, per their
         // manifest disposition — purge stripping applies to their trees too.
@@ -522,11 +610,44 @@ async fn build_new_tip(
                 parent = new;
             }
         }
+        let expected = squash_lands(opts, plan, boundary)?;
+        let landed = git_plumbing::commit_tree_oid(opts.repo, &parent)?;
+        anyhow::ensure!(
+            landed == expected,
+            "refusing: the squash would land tree {landed}, not {expected} — moving \
+             commits may never change content"
+        );
         parent
     } else {
         apply_plan(opts.repo, plan, intro_parent, &mut pairs).await?
     };
     Ok((new_tip, pairs))
+}
+
+/// The tree a squash must land, worked out from the ORIGINAL commits
+/// alone, so it cannot depend on how anything was reordered: the last
+/// restacked commit's tree as its disposition leaves it, or the
+/// collapsed tree when nothing is restacked.
+fn squash_lands(
+    opts: &RewriteOpts<'_>,
+    plan: &ExecutionPlan,
+    boundary: usize,
+) -> anyhow::Result<String> {
+    let last = plan.steps[boundary + 1..]
+        .iter()
+        .rev()
+        .find(|s| s.disposition != RewriteDisposition::Drop);
+    match last {
+        Some(step) if step.disposition == RewriteDisposition::Rewrite => {
+            git_plumbing::strip_tree(opts.repo, &step.sha, &step.strip_paths)
+        }
+        Some(step) => git_plumbing::commit_tree_oid(opts.repo, &step.sha),
+        None => git_plumbing::strip_tree(
+            opts.repo,
+            opts.squash_tip.unwrap_or(opts.head_sha).as_str(),
+            opts.head_strip_paths,
+        ),
+    }
 }
 
 fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
@@ -671,31 +792,39 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
 /// rebase's directives, so we present the target as a one-commit
 /// summary that's explicitly not pipeable to git. Operator runs
 /// the live command if they want to execute it.
-fn print_squash_dry_run(
+fn squash_dry_run_text(
     opts: &RewriteOpts<'_>,
     plan: &ExecutionPlan,
     boundary: Option<usize>,
+    ahead: &[Ahead],
     blockers: &[String],
     msg: &str,
-) {
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     let collapse_end = boundary.unwrap_or(plan.steps.len().saturating_sub(1));
     let restacked = plan.steps.len().saturating_sub(collapse_end + 1);
-    println!("# clank rewrite --squash preview");
+    let _ = writeln!(out, "# clank rewrite --squash preview");
     if let Some(intro) = opts.intro_sha {
         let tip = opts.squash_tip.unwrap_or(opts.head_sha);
-        println!(
+        let _ = writeln!(
+            out,
             "# range: {}..{} ({} commit(s) would collapse into one)",
             short(intro.as_str()),
             short(tip.as_str()),
             collapse_end + 1,
         );
         if restacked > 0 {
-            println!("# restacked on top: {restacked} later commit(s), preserved individually");
+            let _ = writeln!(
+                out,
+                "# restacked on top: {restacked} later commit(s), preserved individually"
+            );
         }
     } else {
-        println!("# range: (empty — no .clank/ history)");
+        let _ = writeln!(out, "# range: (empty — no .clank/ history)");
     }
-    println!(
+    let _ = writeln!(
+        out,
         "# starting parent: {}",
         plan.intro_parent.as_deref().unwrap_or("(root)"),
     );
@@ -703,33 +832,55 @@ fn print_squash_dry_run(
         Some(b) => format!("a NEW branch `{b}` (current branch untouched)"),
         None => "the CURRENT branch (in place)".into(),
     };
-    println!("# target: {target}");
-    println!("#");
-    println!("# would create ONE commit on top of starting parent:");
-    println!("#   message: {msg}");
+    let _ = writeln!(out, "# target: {target}");
+    let _ = writeln!(out, "#");
+    if !ahead.is_empty() {
+        let _ = writeln!(
+            out,
+            "# would first move {} commit(s) that are not this plan's (adhoc, or",
+            ahead.len()
+        );
+        let _ = writeln!(
+            out,
+            "# another plan's) onto the starting parent, in order, each keeping its"
+        );
+        let _ = writeln!(out, "# own message and author:");
+        for moved in ahead {
+            let _ = writeln!(out, "#   pick  {} {}", short(&moved.sha), moved.subject);
+        }
+        let _ = writeln!(out, "#");
+        let _ = writeln!(out, "# then create ONE commit on top of them:");
+    } else {
+        let _ = writeln!(out, "# would create ONE commit on top of starting parent:");
+    }
+    let _ = writeln!(out, "#   message: {msg}");
     let tree_src = if opts.squash_tip.is_some() {
         "the finalize commit's tree"
     } else {
         "HEAD's tree"
     };
     if opts.head_strip_paths.is_empty() {
-        println!("#   tree: {tree_src}, unchanged");
+        let _ = writeln!(out, "#   tree: {tree_src}, unchanged");
     } else {
-        println!("#   tree: {tree_src} MINUS:");
+        let _ = writeln!(out, "#   tree: {tree_src} MINUS:");
         for p in opts.head_strip_paths {
-            println!("#     - {p}");
+            let _ = writeln!(out, "#     - {p}");
         }
     }
-    println!("#");
+    let _ = writeln!(out, "#");
     if !blockers.is_empty() {
-        println!("# BLOCKERS (live run would refuse):");
+        let _ = writeln!(out, "# BLOCKERS (live run would refuse):");
         for b in blockers {
-            println!("#   - {b}");
+            let _ = writeln!(out, "#   - {b}");
         }
-        println!("#");
+        let _ = writeln!(out, "#");
     }
-    println!("# Squash mode is NOT pipeable to git rebase. Run the live command");
-    println!("# without --dry to materialize the squashed commit.");
+    let _ = writeln!(
+        out,
+        "# Squash mode is NOT pipeable to git rebase. Run the live command"
+    );
+    let _ = writeln!(out, "# without --dry to materialize the squashed commit.");
+    out
 }
 
 /// Walk `plan.steps` in order, producing a new tip SHA. When every
@@ -788,13 +939,13 @@ async fn apply_plan(
 /// `source_sha` is the squash tip (a buried plan's finalize commit, or HEAD
 /// for an active plan): its tree — minus the strip set — is the collapsed
 /// tree (the plan's cumulative end state), and its author/date seed the
-/// commit. Foreign-commit refusal lives in `run()`'s blocker check; this
-/// function assumes the range is clean.
+/// commit. `parent` is the starting parent, or the last foreign commit
+/// moved ahead of the squash.
 async fn apply_squash(
     repo: &Path,
     source_sha: &CommitSha,
     strip_paths: &[String],
-    intro_parent: Option<&str>,
+    parent: Option<&str>,
     message: &str,
 ) -> anyhow::Result<String> {
     // The strip set comes from the preview, computed at the squash tip's
@@ -813,7 +964,7 @@ async fn apply_squash(
     // `squash_commit` carries the idempotence above: the tip's author is
     // preserved and the committer date is pinned to it, so re-squashing
     // reproduces the same sha (finish-squash-idempotent-on-finished).
-    git_plumbing::squash_commit(repo, src, &new_tree, intro_parent, message.as_bytes())
+    git_plumbing::squash_commit(repo, src, &new_tree, parent, message.as_bytes())
 }
 
 pub(crate) fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
@@ -1636,41 +1787,370 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rewrite_squash_refuses_foreign_commit_in_range() {
-        let dir = init_repo();
-        write(dir.path(), "README.md", "seed\n");
-        let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
-        let intro = commit(dir.path(), "plan: foo");
-        let preview = mk_preview(
-            &intro,
-            &intro,
-            vec![(
-                intro.clone(),
-                "plan: foo".into(),
-                RewriteDisposition::Drop,
-                true, // foreign
-                vec![],
-            )],
+    fn git_out(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit_by(repo: &Path, msg: &str, author: &str) -> String {
+        run(repo, &["add", "-A"]);
+        run(
+            repo,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--author",
+                author,
+                "-m",
+                msg,
+            ],
         );
-        let err = super::run(RewriteOpts {
-            repo: dir.path(),
+        git_out(repo, &["rev-parse", "HEAD"])
+    }
+
+    fn step(
+        sha: &str,
+        subject: &str,
+        foreign: bool,
+    ) -> (String, String, RewriteDisposition, bool, Vec<String>) {
+        (
+            sha.to_string(),
+            subject.to_string(),
+            RewriteDisposition::KeepVerbatim,
+            foreign,
+            vec![],
+        )
+    }
+
+    async fn squash_in_place(
+        repo: &Path,
+        preview: &RewritePreviewResponse,
+        strip: &[String],
+    ) -> anyhow::Result<RewriteOutcome> {
+        super::run(RewriteOpts {
+            repo,
             intro_sha: preview.intro_sha.as_ref(),
             head_sha: &preview.head_sha,
             linear: preview.linear,
             commits: &preview.commits,
-            into_branch: Some("squashed"),
+            into_branch: None,
             dry: false,
+            squash: Some("[foo] all of foo"),
+            squash_tip: preview.squash_tip.as_ref(),
+            head_strip_paths: strip,
+        })
+        .await
+    }
 
-            squash: Some("collapse"),
+    /// seed, the plan's intro, then plan and foreign work interleaved.
+    /// Returns (seed, intro, [shas of the rest in order]).
+    fn interleaved(
+        repo: &Path,
+        rest: &[(&str, &str, &str, &str)],
+    ) -> (String, String, Vec<String>) {
+        write(repo, "README.md", "seed\n");
+        let seed = commit(repo, "seed");
+        write(repo, ".clank/plans/foo.md", "# foo\n");
+        let intro = commit(repo, "[foo] intro");
+        let shas = rest
+            .iter()
+            .map(|(path, body, msg, author)| {
+                write(repo, path, body);
+                commit_by(repo, msg, author)
+            })
+            .collect();
+        (seed, intro, shas)
+    }
+
+    #[tokio::test]
+    async fn a_foreign_commit_moves_ahead_of_the_squash_with_its_own_identity() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let (seed, intro, shas) = interleaved(
+            repo,
+            &[
+                ("src/a.rs", "a\n", "[foo] a", "Plan <plan@x>"),
+                (
+                    "other.rs",
+                    "other\n",
+                    "fix the other thing",
+                    "Adhoc Person <adhoc@x>",
+                ),
+                ("src/b.rs", "b\n", "[foo] b", "Plan <plan@x>"),
+            ],
+        );
+        let head_tree = git_out(repo, &["rev-parse", "HEAD^{tree}"]);
+        let preview = mk_preview(
+            &intro,
+            &shas[2],
+            vec![
+                step(&intro, "[foo] intro", false),
+                step(&shas[0], "[foo] a", false),
+                step(&shas[1], "fix the other thing", true),
+                step(&shas[2], "[foo] b", false),
+            ],
+        );
+        let outcome = squash_in_place(repo, &preview, &[]).await.unwrap();
+
+        let chain = rev_list(repo, "main");
+        assert_eq!(
+            chain.len(),
+            3,
+            "seed, the moved commit, the squash: {chain:?}"
+        );
+        assert_eq!(chain[0], seed);
+        let moved = &chain[1];
+        assert_eq!(show_subject(repo, moved), "fix the other thing");
+        assert_eq!(
+            git_out(repo, &["show", "-s", "--format=%an <%ae>", moved]),
+            "Adhoc Person <adhoc@x>"
+        );
+        assert!(tree_has(repo, moved, "other.rs"));
+        assert!(
+            !tree_has(repo, moved, "src/a.rs"),
+            "it carries only its own change"
+        );
+        assert_eq!(show_subject(repo, &chain[2]), "[foo] all of foo");
+        assert_eq!(
+            git_out(repo, &["rev-parse", "HEAD^{tree}"]),
+            head_tree,
+            "moving commits may never change content"
+        );
+
+        let pairs: Vec<(String, String)> = outcome
+            .pairs
+            .iter()
+            .map(|(old, new)| (old.as_str().to_string(), new.as_str().to_string()))
+            .collect();
+        assert!(
+            pairs.contains(&(shas[1].clone(), moved.clone())),
+            "{pairs:?}"
+        );
+        assert!(
+            !pairs.contains(&(shas[1].clone(), chain[2].clone())),
+            "a moved commit's feedback follows it, not the squash: {pairs:?}"
+        );
+        for plan_commit in [&intro, &shas[0], &shas[2]] {
+            assert!(
+                pairs.contains(&(plan_commit.clone(), chain[2].clone())),
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn several_foreign_commits_keep_their_order_and_an_empty_one_survives() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let (seed, intro, shas) = interleaved(
+            repo,
+            &[
+                ("one.rs", "1\n", "first adhoc", "A <a@x>"),
+                ("src/a.rs", "a\n", "[foo] a", "Plan <plan@x>"),
+                ("two.rs", "2\n", "second adhoc", "B <b@x>"),
+            ],
+        );
+        let empty = commit_by(repo, "an empty note", "C <c@x>");
+        let preview = mk_preview(
+            &intro,
+            &empty,
+            vec![
+                step(&intro, "[foo] intro", false),
+                step(&shas[0], "first adhoc", true),
+                step(&shas[1], "[foo] a", false),
+                step(&shas[2], "second adhoc", true),
+                step(&empty, "an empty note", true),
+            ],
+        );
+        squash_in_place(repo, &preview, &[]).await.unwrap();
+
+        let subjects: Vec<String> = rev_list(repo, "main")
+            .iter()
+            .map(|sha| show_subject(repo, sha))
+            .collect();
+        assert_eq!(
+            subjects,
+            [
+                "seed",
+                "first adhoc",
+                "second adhoc",
+                "an empty note",
+                "[foo] all of foo"
+            ]
+        );
+        assert_eq!(rev_list(repo, "main")[0], seed);
+    }
+
+    /// A foreign commit that depends on a plan commit before it cannot
+    /// move ahead of that commit. Nothing at all changes: not the
+    /// branch, not the index, not the edits sitting in the worktree.
+    #[tokio::test]
+    async fn a_foreign_commit_that_will_not_apply_rewrites_nothing() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let (_, intro, shas) = interleaved(
+            repo,
+            &[
+                ("src/a.rs", "a\n", "[foo] a", "Plan <plan@x>"),
+                ("src/a.rs", "a, fixed\n", "fix a", "Adhoc <adhoc@x>"),
+            ],
+        );
+        write(repo, "README.md", "edited, not committed\n");
+        run(repo, &["add", "README.md"]);
+        write(repo, "scratch.txt", "untracked\n");
+        let status_before = git_out(repo, &["status", "--porcelain"]);
+        let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+
+        let preview = mk_preview(
+            &intro,
+            &shas[1],
+            vec![
+                step(&intro, "[foo] intro", false),
+                step(&shas[0], "[foo] a", false),
+                step(&shas[1], "fix a", true),
+            ],
+        );
+        let blockers = super::preflight(RewriteOpts {
+            repo,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: true,
+            commits: &preview.commits,
+            into_branch: None,
+            dry: false,
+            squash: Some("[foo] all of foo"),
             squash_tip: None,
             head_strip_paths: &[],
         })
         .await
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("foreign"), "got: {msg}");
+        .unwrap();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains(&shas[1][..7]), "{}", blockers[0]);
+        assert!(blockers[0].contains("src/a.rs"), "{}", blockers[0]);
+
+        let err = squash_in_place(repo, &preview, &[]).await.unwrap_err();
+        assert!(format!("{err}").contains("fix a"), "{err}");
+        assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(git_out(repo, &["status", "--porcelain"]), status_before);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "edited, not committed\n"
+        );
+    }
+
+    /// The finished-plan shape: the squash stops at the finalize commit,
+    /// a foreign commit before it moves ahead, and one after it is
+    /// restacked on top as before.
+    #[tokio::test]
+    async fn a_foreign_commit_after_the_squash_tip_is_restacked_not_moved() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let (_, intro, shas) = interleaved(
+            repo,
+            &[
+                ("before.rs", "b\n", "adhoc before", "A <a@x>"),
+                ("src/a.rs", "a\n", "[foo] finish", "Plan <plan@x>"),
+                ("after.rs", "c\n", "adhoc after", "B <b@x>"),
+            ],
+        );
+        let head_tree = git_out(repo, &["rev-parse", "HEAD^{tree}"]);
+        let mut preview = mk_preview(
+            &intro,
+            &shas[2],
+            vec![
+                step(&intro, "[foo] intro", false),
+                step(&shas[0], "adhoc before", true),
+                step(&shas[1], "[foo] finish", false),
+                step(&shas[2], "adhoc after", true),
+            ],
+        );
+        preview.squash_tip = Some(CommitSha::parse(&shas[1]).unwrap());
+        squash_in_place(repo, &preview, &[]).await.unwrap();
+        let subjects: Vec<String> = rev_list(repo, "main")
+            .iter()
+            .map(|sha| show_subject(repo, sha))
+            .collect();
+        assert_eq!(
+            subjects,
+            ["seed", "adhoc before", "[foo] all of foo", "adhoc after"]
+        );
+        assert_eq!(git_out(repo, &["rev-parse", "HEAD^{tree}"]), head_tree);
+    }
+
+    /// With `--purge` only the plan's own artifacts go. A moved commit
+    /// that carries ANOTHER plan's file keeps it.
+    #[tokio::test]
+    async fn a_purging_squash_moves_another_plans_commit_with_its_files() {
+        let dir = init_repo();
+        let repo = dir.path();
+        let (_, intro, shas) = interleaved(
+            repo,
+            &[
+                (
+                    ".clank/plans/bar.md",
+                    "# bar\n",
+                    "[bar] intro",
+                    "Bar <bar@x>",
+                ),
+                ("src/a.rs", "a\n", "[foo] a", "Plan <plan@x>"),
+            ],
+        );
+        let preview = mk_preview(
+            &intro,
+            &shas[1],
+            vec![
+                step(&intro, "[foo] intro", false),
+                step(&shas[0], "[bar] intro", true),
+                step(&shas[1], "[foo] a", false),
+            ],
+        );
+        let strip = vec![".clank/plans/foo.md".to_string()];
+        squash_in_place(repo, &preview, &strip).await.unwrap();
+        let chain = rev_list(repo, "main");
+        assert_eq!(show_subject(repo, &chain[1]), "[bar] intro");
+        assert!(tree_has(repo, &chain[1], ".clank/plans/bar.md"));
+        assert!(tree_has(repo, "HEAD", ".clank/plans/bar.md"));
+        assert!(tree_has(repo, "HEAD", "src/a.rs"));
+        assert!(!tree_has(repo, "HEAD", ".clank/plans/foo.md"));
+    }
+
+    #[test]
+    fn the_dry_run_names_what_moves_before_the_squash() {
+        let text = squash_dry_run_text(
+            &RewriteOpts {
+                repo: Path::new("/nowhere"),
+                intro_sha: None,
+                head_sha: &CommitSha::parse("1111111111111111111111111111111111111111").unwrap(),
+                linear: true,
+                commits: &[],
+                into_branch: None,
+                dry: true,
+                squash: Some("[foo] all"),
+                squash_tip: None,
+                head_strip_paths: &[],
+            },
+            &ExecutionPlan {
+                intro_parent: None,
+                steps: Vec::new(),
+            },
+            None,
+            &[Ahead {
+                sha: "2222222222222222222222222222222222222222".into(),
+                subject: "fix the other thing".into(),
+                tree: String::new(),
+            }],
+            &[],
+            "[foo] all",
+        );
+        let moved = text.find("pick  2222222 fix the other thing").expect(&text);
+        let squash = text.find("then create ONE commit").expect(&text);
+        assert!(moved < squash, "{text}");
     }
 
     #[tokio::test]

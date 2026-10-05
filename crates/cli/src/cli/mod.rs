@@ -1570,8 +1570,11 @@ pub struct FinishArgs {
     #[arg(long)]
     pub purge: bool,
     /// After finalize, collapse the plan's commits into one with
-    /// the supplied message. Combine with `--purge` to also strip
-    /// the plan's `.clank/` artifacts.
+    /// the supplied message. Commits in the range that are not the
+    /// plan's (adhoc, or another plan's) move ahead of it, each keeping
+    /// its own message and author; only one that will not apply there
+    /// refuses the squash, and then nothing is rewritten. Combine with
+    /// `--purge` to also strip the plan's `.clank/` artifacts.
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,
     /// Opt OUT of `finish.autosquash` for this one finish — keep the plan's
@@ -1919,7 +1922,8 @@ pub struct PurgeArgs {
     #[arg(long)]
     pub dry: bool,
     /// Collapse the plan-attributed range into a single commit
-    /// with the supplied message. Not pipeable to `git rebase` —
+    /// with the supplied message, moving commits that are not the
+    /// plan's ahead of it. Not pipeable to `git rebase` —
     /// see `--dry` output for the planned target tree.
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,

@@ -98,6 +98,7 @@ gix = { version = "0.84", default-features = false, features = [
     "status",                # in-process worktree status (dirty_stats); pulls dirwalk+index
     "excludes",              # Repository::excludes: git-accurate ignore check (nested .gitignore) for the status watch filter
     "tree-editor",           # edit_tree: build stripped trees for the rewrite engine
+    "merge",                 # merge_trees: replay a commit's change onto another tree in memory (squash reordering)
     "max-performance-safe",  # zlib-rs + parallel without C deps
     "parallel",              # Repository: Send under parallel feature
 ] }

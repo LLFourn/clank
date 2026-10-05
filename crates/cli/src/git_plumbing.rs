@@ -55,6 +55,104 @@ pub fn strip_tree(repo: &Path, commit_sha: &str, strip_paths: &[String]) -> anyh
         .to_string())
 }
 
+/// What re-applying a commit's change onto another tree produced.
+pub enum Replayed {
+    Tree(String),
+    /// The paths the change could not be applied to cleanly.
+    Conflicts(Vec<String>),
+}
+
+/// Re-apply `sha`'s CHANGE — its first parent to it — onto `onto_tree`,
+/// as cherry-pick would, entirely in the object database: the worktree,
+/// index and sequencer state are never touched, so a conflict leaves
+/// nothing to abort. A root commit's change is taken against the empty
+/// tree.
+pub fn replay_change(repo: &Path, sha: &str, onto_tree: &str) -> anyhow::Result<Replayed> {
+    let r = open(repo)?;
+    let commit = r
+        .find_commit(parse_oid(sha)?)
+        .with_context(|| format!("find commit `{sha}`"))?;
+    let theirs = commit
+        .tree_id()
+        .with_context(|| format!("tree of `{sha}`"))?
+        .detach();
+    let base = match commit.parent_ids().next() {
+        Some(parent) => r
+            .find_commit(parent)
+            .with_context(|| format!("find parent of `{sha}`"))?
+            .tree_id()
+            .with_context(|| format!("tree of the parent of `{sha}`"))?
+            .detach(),
+        None => r.empty_tree().id,
+    };
+    let options = r.tree_merge_options().context("tree merge options")?;
+    let mut outcome = r
+        .merge_trees(
+            base,
+            parse_oid(onto_tree)?,
+            theirs,
+            Default::default(),
+            options,
+        )
+        .with_context(|| format!("re-apply `{sha}`"))?;
+    let unresolved = gix::merge::tree::TreatAsUnresolved::git();
+    if outcome.has_unresolved_conflicts(unresolved) {
+        let mut paths: Vec<String> = outcome
+            .conflicts
+            .iter()
+            .filter(|c| c.is_unresolved(unresolved))
+            .flat_map(|c| {
+                [
+                    c.ours.location().to_string(),
+                    c.theirs.location().to_string(),
+                ]
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        return Ok(Replayed::Conflicts(paths));
+    }
+    Ok(Replayed::Tree(
+        outcome
+            .tree
+            .write()
+            .with_context(|| format!("write the tree `{sha}` re-applies to"))?
+            .detach()
+            .to_string(),
+    ))
+}
+
+/// The empty tree, written so a commit can name it.
+pub fn empty_tree(repo: &Path) -> anyhow::Result<String> {
+    let r = open(repo)?;
+    Ok(r.write_object(gix::objs::Tree::empty())
+        .context("write the empty tree")?
+        .detach()
+        .to_string())
+}
+
+/// [`strip_tree`] for a tree rather than a commit's.
+pub fn strip_tree_id(
+    repo: &Path,
+    tree_sha: &str,
+    strip_paths: &[String],
+) -> anyhow::Result<String> {
+    let r = open(repo)?;
+    let mut editor = r
+        .edit_tree(parse_oid(tree_sha)?)
+        .with_context(|| format!("edit tree `{tree_sha}`"))?;
+    for path in strip_paths {
+        editor
+            .remove(path.as_str())
+            .with_context(|| format!("strip `{path}`"))?;
+    }
+    Ok(editor
+        .write()
+        .context("write stripped tree")?
+        .detach()
+        .to_string())
+}
+
 /// Write a commit that REPLAYS `<original_sha>`'s identity onto a new
 /// `tree_sha` + `parent`: the original AUTHOR is preserved exactly,
 /// the COMMITTER is the ambient configured identity + now (a rewrite

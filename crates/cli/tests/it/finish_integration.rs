@@ -1074,9 +1074,9 @@ fn buried_squash_dry_is_a_noop_then_live_agrees() {
 }
 
 #[test]
-fn buried_squash_refuses_interleaved_foreign_and_names_it() {
-    // A foreign commit INSIDE [intro..finalized_at] still refuses (tree
-    // replay can't preserve it) — and the error NAMES the offender.
+fn buried_squash_moves_an_interleaved_foreign_commit_ahead_of_itself() {
+    // A foreign commit INSIDE [intro..finalized_at] of a plan already
+    // finished moves ahead of the squash; one after it is restacked.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
     let repo = env.repo();
@@ -1087,7 +1087,6 @@ fn buried_squash_refuses_interleaved_foreign_and_names_it() {
     // Interleaved mid-plan ad-hoc commit (untagged → foreign to foo).
     write(repo, "src/stray.rs", "// stray\n");
     commit(repo, "stray mid-plan commit");
-    let stray_sha = git_out(repo, &["rev-parse", "HEAD"]);
     // Simulate the finalize.
     std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
     std::fs::rename(
@@ -1098,18 +1097,16 @@ fn buried_squash_refuses_interleaved_foreign_and_names_it() {
     commit(repo, "[foo] finish");
     write(repo, "src/later.rs", "// later\n");
     commit(repo, "later work");
+    let tree_before = git_out(repo, &["rev-parse", "HEAD^{tree}"]);
 
-    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
-    let msg = "collapse foo\n\nshould refuse: stray is interleaved";
+    let msg = "collapse foo\n\nthe stray commit moves ahead of it";
     let args = finish_args(repo, "foo", Some(msg));
-    let err = block_on(clank::cli::finish::run(args)).expect_err("interleaved foreign refuses");
-    let text = err.to_string();
-    assert!(text.contains("interleaved"), "got: {text}");
-    assert!(
-        text.contains(&stray_sha[..7]) && text.contains("stray mid-plan commit"),
-        "error must NAME the offender; got: {text}"
+    block_on(clank::cli::finish::run(args)).expect("the stray commit moves ahead");
+    assert_eq!(
+        git_out(repo, &["log", "--reverse", "--format=%s"]),
+        "base\nstray mid-plan commit\n[foo] collapse foo\nlater work"
     );
-    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD^{tree}"]), tree_before);
 }
 
 #[test]
@@ -1140,4 +1137,232 @@ fn buried_purge_squash_strips_artifacts_from_restacked_commits() {
     );
     assert!(tree.lines().any(|l| l == "src/later.rs"));
     assert_eq!(git_out(repo, &["log", "-1", "--format=%s"]), "later work");
+}
+
+/// `base`, foo's intro, then an untagged fix, another plan's intro and
+/// foo's own work, interleaved.
+fn foo_interleaved_with_foreign_work(repo: &Path, fix: (&str, &str)) {
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/foo.rs", "foo v1\n");
+    commit(repo, "[foo] start foo");
+    write(repo, fix.0, fix.1);
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "commit",
+            "--quiet",
+            "--author",
+            "Adhoc <adhoc@x>",
+            "-m",
+            "fix something",
+        ],
+    );
+    write(repo, ".clank/plans/bar.md", "# bar\n\nbody\n");
+    commit(repo, "[bar] intro");
+    write(repo, "src/foo.rs", "foo v1\nfoo v2\n");
+    commit(repo, "[foo] finish foo");
+}
+
+#[test]
+fn a_squash_moves_foreign_commits_ahead_of_itself() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    foo_interleaved_with_foreign_work(repo, ("other.rs", "unrelated\n"));
+    let before = git_out(repo, &["rev-parse", "HEAD^{tree}"]);
+
+    let mut args = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));
+    args.force = true;
+    block_on(clank::cli::finish::run(args)).expect("foreign commits move ahead of the squash");
+
+    assert_eq!(
+        git_out(repo, &["log", "--reverse", "--format=%s"]),
+        "base\nfix something\n[bar] intro\n[foo] all of foo",
+        "the untagged fix and bar's intro come first, in order, then foo as one commit"
+    );
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%an", "HEAD~2"]),
+        "Adhoc",
+        "a moved commit keeps its author"
+    );
+    assert!(
+        repo.join(".clank/plans/bar.md").exists(),
+        "bar stays active"
+    );
+    assert!(repo.join(".clank/finished/foo.md").exists());
+    assert_eq!(
+        git_out(
+            repo,
+            &["diff", "--no-renames", "--name-only", &before, "HEAD"]
+        ),
+        ".clank/finished/foo.md\n.clank/plans/foo.md",
+        "moving commits changed no content: only the finalize rename differs"
+    );
+}
+
+/// The fix edits a file foo's own earlier commit created, so it cannot
+/// move ahead of foo. That is found before the plan is finalized, and
+/// nothing changes.
+#[test]
+fn a_foreign_commit_that_cannot_move_refuses_the_finish_before_it_lands() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    foo_interleaved_with_foreign_work(repo, ("src/foo.rs", "foo v1, fixed\n"));
+    let head = git_out(repo, &["rev-parse", "HEAD"]);
+
+    let mut dry = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));
+    dry.force = true;
+    dry.dry = true;
+    block_on(clank::cli::finish::run(dry)).expect("a dry run reports the blocker and exits clean");
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        head,
+        "--dry moved nothing"
+    );
+
+    let mut args = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));
+    args.force = true;
+    let err = block_on(clank::cli::finish::run(args)).expect_err("the move conflicts");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("fix something"), "{msg}");
+    assert!(msg.contains("src/foo.rs"), "{msg}");
+    assert_eq!(
+        git_out(repo, &["rev-parse", "HEAD"]),
+        head,
+        "nothing landed"
+    );
+    assert!(
+        repo.join(".clank/plans/foo.md").exists(),
+        "foo is still active"
+    );
+    assert!(!repo.join(".clank/finished/foo.md").exists());
+}
+
+/// An empty untagged commit is foreign AND classified Drop by the real
+/// preview: it contributes no change, yet it is still somebody's
+/// commit, so it moves, keeping its message, author and feedback.
+#[test]
+fn an_empty_foreign_commit_moves_ahead_with_its_identity_and_feedback() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "README", "base\n");
+    commit(repo, "base");
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/foo.rs", "foo v1\n");
+    commit(repo, "[foo] start foo");
+    git(
+        repo,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--author",
+            "Note Taker <note@x>",
+            "--date",
+            "2001-02-03T04:05:06Z",
+            "-m",
+            "a note\n\nwith a body",
+        ],
+    );
+    let note = git_out(repo, &["rev-parse", "HEAD"]);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{note}.md"),
+        "CONTINUE about the note\n",
+    );
+    write(repo, "src/foo.rs", "foo v1\nfoo v2\n");
+    commit(repo, "[foo] finish foo");
+
+    let mut args = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));
+    args.force = true;
+    block_on(clank::cli::finish::run(args)).expect("the empty commit moves ahead");
+
+    assert_eq!(
+        git_out(repo, &["log", "--reverse", "--format=%s"]),
+        "base\na note\n[foo] all of foo"
+    );
+    let moved = git_out(repo, &["rev-parse", "HEAD~1"]);
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%B", &moved]),
+        "a note\n\nwith a body"
+    );
+    assert_eq!(
+        git_out(repo, &["log", "-1", "--format=%an <%ae> %aI", &moved]),
+        "Note Taker <note@x> 2001-02-03T04:05:06Z"
+    );
+    let migrated: Vec<String> = std::fs::read_dir(repo.join(".clank/agents/codex/feedback"))
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stem = name.strip_suffix(".md")?;
+            moved
+                .starts_with(stem)
+                .then(|| std::fs::read_to_string(entry.path()).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        migrated,
+        ["CONTINUE about the note\n"],
+        "the note's feedback follows it to its own new commit"
+    );
+}
+
+/// `[foo] intro` is the root commit, then foo's work and an untagged
+/// commit. `fix` is that commit's file and body.
+fn root_plan_with_foreign_work(repo: &Path, fix: (&str, &str)) {
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/foo.rs", "foo v1\n");
+    commit(repo, "[foo] start foo");
+    write(repo, fix.0, fix.1);
+    commit(repo, "fix something");
+    write(repo, "src/foo.rs", "foo v1\nfoo v2\n");
+    commit(repo, "[foo] finish foo");
+}
+
+/// A plan that starts at the root has the empty tree before it; what
+/// moves ahead of it becomes the new root.
+#[test]
+fn a_root_plans_foreign_commit_becomes_the_new_root() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    root_plan_with_foreign_work(repo, ("other.rs", "unrelated\n"));
+
+    let mut args = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));
+    args.force = true;
+    block_on(clank::cli::finish::run(args)).expect("the fix moves ahead of a root plan");
+    assert_eq!(
+        git_out(repo, &["log", "--reverse", "--format=%s"]),
+        "fix something\n[foo] all of foo"
+    );
+    assert_eq!(
+        git_out(repo, &["ls-tree", "-r", "--name-only", "HEAD~1"]),
+        "other.rs",
+        "the new root carries only its own change"
+    );
+}
+
+#[test]
+fn a_root_plans_foreign_commit_that_cannot_move_rewrites_nothing() {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    root_plan_with_foreign_work(repo, ("src/foo.rs", "foo v1, fixed\n"));
+    let head = git_out(repo, &["rev-parse", "HEAD"]);
+
+    let mut args = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));
+    args.force = true;
+    let err = block_on(clank::cli::finish::run(args)).expect_err("the fix needs foo's file");
+    assert!(format!("{err:#}").contains("src/foo.rs"), "{err:#}");
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head);
+    assert!(repo.join(".clank/plans/foo.md").exists());
 }
