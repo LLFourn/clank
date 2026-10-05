@@ -426,27 +426,20 @@ pub(crate) fn event_badge(g: &crate::cli::github::timeline::MergedEvent) -> &str
 
 /// The source's configured glyph wins; the default names the backend.
 ///
-/// The glyph arrives ALREADY VALIDATED — `MergedEvent.glyph` is the
-/// snapshot's joined value, and `command_glyphs` refuses anything
-/// `glyph_refusal` rejects before it gets here. This doc used to say
-/// "trusted config" and "validated when the wait armed", which is the
-/// belief that let a newline reach a row (codex 9a53f39): config is
-/// not trusted for its origin, and a check at arm time says nothing
-/// about a value edited after it. A reader that obtains a glyph some
-/// OTHER way validates it itself.
-///
-/// Drawing it at all is the point — leaving it undrawn made the
-/// validation a guard with no feature behind it (codex db5821e).
+/// Interpret the icon at the display boundary too, so rows assembled
+/// without a timeline snapshot still cannot emit controls or empty badges.
 pub(crate) fn badge_of(
     glyph: Option<&str>,
     backend: crate::cli::github::timeline::Backend,
 ) -> &str {
-    glyph.unwrap_or(match backend {
-        crate::cli::github::timeline::Backend::Github => "gh",
-        crate::cli::github::timeline::Backend::Command => "cmd",
-        crate::cli::github::timeline::Backend::Timer => "timer",
-        crate::cli::github::timeline::Backend::Message => "✉",
-    })
+    glyph
+        .and_then(crate::cli::command_source::display_glyph)
+        .unwrap_or(match backend {
+            crate::cli::github::timeline::Backend::Github => "gh",
+            crate::cli::github::timeline::Backend::Command => "cmd",
+            crate::cli::github::timeline::Backend::Timer => "timer",
+            crate::cli::github::timeline::Backend::Message => "✉",
+        })
 }
 
 /// One-line description shared by the oneline and human renderers —

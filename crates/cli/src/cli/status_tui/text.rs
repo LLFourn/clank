@@ -5,6 +5,9 @@
 //! the span level, and only then serialized to ANSI so an escape is
 //! never split.
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 #[derive(Clone, PartialEq)]
 pub(super) enum Style {
     Plain,
@@ -105,13 +108,13 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
                 line_w = ww;
             } else {
                 // Token wider than the whole line — hard-break it.
-                for ch in word.chars() {
-                    let cw = char_width(ch);
+                for grapheme in word.graphemes(true) {
+                    let cw = display_width(grapheme);
                     if line_w + cw > width && !line.is_empty() {
                         out.push(std::mem::take(&mut line));
                         line_w = 0;
                     }
-                    line.push(ch);
+                    line.push_str(grapheme);
                     line_w += cw;
                 }
             }
@@ -330,162 +333,16 @@ pub(super) fn region_rule_elevated_with_note(
     format!("[48;5;238m{head}{}[0m", "─".repeat(fill))
 }
 
-/// The East-Asian Wide and Fullwidth code points — the ones a terminal
-/// draws in two cells. Generated from the Unicode Character Database
-/// (UCD 16.0.0) rather than hand-listed, so it is complete: an earlier
-/// hand-built version covered the emoji plane only and measured `⌛`
-/// (U+231B) as one column, and a later one still stopped at U+1FAFF and
-/// so missed U+20000 (codex on 5f271a6).
-const WIDE: &[(u32, u32)] = &[
-    (0x1100, 0x115F),
-    (0x231A, 0x231B),
-    (0x2329, 0x232A),
-    (0x23E9, 0x23EC),
-    (0x23F0, 0x23F0),
-    (0x23F3, 0x23F3),
-    (0x25FD, 0x25FE),
-    (0x2614, 0x2615),
-    (0x2630, 0x2637),
-    (0x2648, 0x2653),
-    (0x267F, 0x267F),
-    (0x268A, 0x268F),
-    (0x2693, 0x2693),
-    (0x26A1, 0x26A1),
-    (0x26AA, 0x26AB),
-    (0x26BD, 0x26BE),
-    (0x26C4, 0x26C5),
-    (0x26CE, 0x26CE),
-    (0x26D4, 0x26D4),
-    (0x26EA, 0x26EA),
-    (0x26F2, 0x26F3),
-    (0x26F5, 0x26F5),
-    (0x26FA, 0x26FA),
-    (0x26FD, 0x26FD),
-    (0x2705, 0x2705),
-    (0x270A, 0x270B),
-    (0x2728, 0x2728),
-    (0x274C, 0x274C),
-    (0x274E, 0x274E),
-    (0x2753, 0x2755),
-    (0x2757, 0x2757),
-    (0x2795, 0x2797),
-    (0x27B0, 0x27B0),
-    (0x27BF, 0x27BF),
-    (0x2B1B, 0x2B1C),
-    (0x2B50, 0x2B50),
-    (0x2B55, 0x2B55),
-    (0x2E80, 0x2E99),
-    (0x2E9B, 0x2EF3),
-    (0x2F00, 0x2FD5),
-    (0x2FF0, 0x303E),
-    (0x3041, 0x3096),
-    (0x3099, 0x30FF),
-    (0x3105, 0x312F),
-    (0x3131, 0x318E),
-    (0x3190, 0x31E5),
-    (0x31EF, 0x321E),
-    (0x3220, 0x3247),
-    (0x3250, 0xA48C),
-    (0xA490, 0xA4C6),
-    (0xA960, 0xA97C),
-    (0xAC00, 0xD7A3),
-    (0xF900, 0xFAFF),
-    (0xFE10, 0xFE19),
-    (0xFE30, 0xFE52),
-    (0xFE54, 0xFE66),
-    (0xFE68, 0xFE6B),
-    (0xFF01, 0xFF60),
-    (0xFFE0, 0xFFE6),
-    (0x16FE0, 0x16FE4),
-    (0x16FF0, 0x16FF1),
-    (0x17000, 0x187F7),
-    (0x18800, 0x18CD5),
-    (0x18CFF, 0x18D08),
-    (0x1AFF0, 0x1AFF3),
-    (0x1AFF5, 0x1AFFB),
-    (0x1AFFD, 0x1AFFE),
-    (0x1B000, 0x1B122),
-    (0x1B132, 0x1B132),
-    (0x1B150, 0x1B152),
-    (0x1B155, 0x1B155),
-    (0x1B164, 0x1B167),
-    (0x1B170, 0x1B2FB),
-    (0x1D300, 0x1D356),
-    (0x1D360, 0x1D376),
-    (0x1F004, 0x1F004),
-    (0x1F0CF, 0x1F0CF),
-    (0x1F18E, 0x1F18E),
-    (0x1F191, 0x1F19A),
-    (0x1F200, 0x1F202),
-    (0x1F210, 0x1F23B),
-    (0x1F240, 0x1F248),
-    (0x1F250, 0x1F251),
-    (0x1F260, 0x1F265),
-    (0x1F300, 0x1F320),
-    (0x1F32D, 0x1F335),
-    (0x1F337, 0x1F37C),
-    (0x1F37E, 0x1F393),
-    (0x1F3A0, 0x1F3CA),
-    (0x1F3CF, 0x1F3D3),
-    (0x1F3E0, 0x1F3F0),
-    (0x1F3F4, 0x1F3F4),
-    (0x1F3F8, 0x1F43E),
-    (0x1F440, 0x1F440),
-    (0x1F442, 0x1F4FC),
-    (0x1F4FF, 0x1F53D),
-    (0x1F54B, 0x1F54E),
-    (0x1F550, 0x1F567),
-    (0x1F57A, 0x1F57A),
-    (0x1F595, 0x1F596),
-    (0x1F5A4, 0x1F5A4),
-    (0x1F5FB, 0x1F64F),
-    (0x1F680, 0x1F6C5),
-    (0x1F6CC, 0x1F6CC),
-    (0x1F6D0, 0x1F6D2),
-    (0x1F6D5, 0x1F6D7),
-    (0x1F6DC, 0x1F6DF),
-    (0x1F6EB, 0x1F6EC),
-    (0x1F6F4, 0x1F6FC),
-    (0x1F7E0, 0x1F7EB),
-    (0x1F7F0, 0x1F7F0),
-    (0x1F90C, 0x1F93A),
-    (0x1F93C, 0x1F945),
-    (0x1F947, 0x1F9FF),
-    (0x1FA70, 0x1FA7C),
-    (0x1FA80, 0x1FA89),
-    (0x1FA8F, 0x1FAC6),
-    (0x1FACE, 0x1FADC),
-    (0x1FADF, 0x1FAE9),
-    (0x1FAF0, 0x1FAF8),
-    (0x20000, 0x2FFFD),
-    (0x30000, 0x3FFFD),
-];
-
-/// Display columns a char occupies in the terminal.
-///
-/// Complete for East-Asian Wide/Fullwidth via [`WIDE`], with no
-/// dependency. It does NOT implement zero-width combining marks, which
-/// this TUI does not draw — with one deliberate exception: U+FE0F is
-/// counted as 1. The selector occupies no cell itself, but it upgrades
-/// the preceding character to emoji presentation, which the terminal
-/// then draws in two cells instead of one; counting it is how that
-/// second cell is accounted for without clustering graphemes.
+/// Width of an isolated scalar. Complete graphemes are measured by
+/// `display_width`, because selectors, combining marks and joined emoji
+/// cannot be measured by summing scalar widths.
 pub(super) fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    let hit = WIDE.binary_search_by(|&(lo, hi)| {
-        if cp < lo {
-            std::cmp::Ordering::Greater
-        } else if cp > hi {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
-    if hit.is_ok() { 2 } else { 1 }
+    c.width().unwrap_or(0)
 }
 
+/// Terminal columns, using the same grapheme widths as wrapping and cuts.
 pub(crate) fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    s.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 /// Truncate to `cols` DISPLAY columns with a `…` ellipsis.
@@ -534,41 +391,18 @@ pub(super) fn cut_to(s: &str, cols: usize) -> Cut {
     if cols == 0 {
         return fits(String::new(), true);
     }
-    // Keep chars while they fit in cols-1 (reserving 1 for `…`).
+    // Keep whole graphemes, reserving one column for the ellipsis.
     let mut t = String::new();
     let mut w = 0;
-    for c in s.chars() {
-        let cw = char_width(c);
+    for grapheme in s.graphemes(true) {
+        let cw = display_width(grapheme);
         if w + cw > cols - 1 {
             break;
         }
-        t.push(c);
+        t.push_str(grapheme);
         w += cw;
     }
-    // A base kept WITHOUT its selector is not the glyph anyone asked
-    // for: cutting `U+2601 U+FE0F` between the two leaves a bare
-    // cloud, whose presentation the renderer then picks for itself --
-    // the exact ambiguity the selector exists to remove
-    // (the-cloud-is-always-the-cloud).
-    //
-    // Only that case. A selector that was KEPT always has its base,
-    // because the scan runs in order and a selector follows the char
-    // it belongs to -- so a retained trailing selector means the pair
-    // is whole, and dropping it would throw away a glyph that fits
-    // (codex 03c64bd).
-    if s.chars()
-        .nth(t.chars().count())
-        .is_some_and(is_variation_selector)
-    {
-        t.pop();
-    }
     fits(t, true)
-}
-
-/// `U+FE00`–`U+FE0F`: a mark that belongs to the char BEFORE it and
-/// says how to draw it. Never meaningful alone.
-fn is_variation_selector(c: char) -> bool {
-    matches!(c, '\u{FE00}'..='\u{FE0F}')
 }
 
 /// Strip a leading signal-lamp emoji (`"👀 frostsnap"` → `"frostsnap"`)
@@ -882,7 +716,7 @@ mod tests {
     /// that once did was deleted with the incomplete lookup it existed
     /// to compensate for, so a newly drawn glyph will simply be absent
     /// from here. That costs nothing, because completeness lives in
-    /// [`WIDE`] — which is generated from the UCD and covers every code
+    /// Unicode width data — which covers every code
     /// point — and this is a regression pin for the row that broke
     /// (ruthless on 07c5e04).
     const DRAWN: &[(char, usize)] = &[
@@ -917,7 +751,7 @@ mod tests {
         ('\u{2838}', 1),  // BRAILLE PATTERN DOTS-456
         ('\u{2839}', 1),  // BRAILLE PATTERN DOTS-1456
         ('\u{283C}', 1),  // BRAILLE PATTERN DOTS-3456
-        ('\u{FE0F}', 1),  // VARIATION SELECTOR-16 — see `char_width`
+        ('\u{FE0F}', 0),  // VARIATION SELECTOR-16 — measured with its base
         ('\u{1F3C1}', 2), // CHEQUERED FLAG
         ('\u{1F440}', 2), // EYES
         ('\u{1F4A4}', 2), // SLEEPING SYMBOL
@@ -968,9 +802,9 @@ mod tests {
             ('\u{2717}', 1),  // ✗ — narrow despite the company it keeps
             ('\u{2714}', 1),  // ✔
             ('\u{2192}', 1),  // →
-            ('\u{FE0F}', 1),  // selector: see `char_width`
+            ('\u{FE0F}', 0),  // selector: see `char_width`
             ('a', 1),
-            ('\u{0}', 1),
+            ('\u{0}', 0),      // a control has no printable cell
             ('\u{10FFFF}', 1), // last code point, must not panic
         ] {
             assert_eq!(
@@ -982,22 +816,28 @@ mod tests {
         }
     }
 
-    /// The ranges must stay sorted and disjoint: `char_width` binary
-    /// searches them, and an out-of-order or overlapping entry would
-    /// make it silently miss code points.
     #[test]
-    fn the_wide_ranges_are_sorted_and_disjoint() {
-        for w in WIDE.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            assert!(a.0 <= a.1, "range U+{:04X}..U+{:04X} is inverted", a.0, a.1);
-            assert!(
-                a.1 < b.0,
-                "U+{:04X}..U+{:04X} overlaps or precedes U+{:04X}..U+{:04X}",
-                a.0,
-                a.1,
-                b.0,
-                b.1
-            );
+    fn emoji_and_combining_clusters_keep_their_measured_width_when_cut_or_wrapped() {
+        for (icon, width) in [
+            ("💬", 2),
+            ("☁️", 2),
+            ("👩‍💻", 2),
+            ("🇦🇺", 2),
+            ("1️⃣", 2),
+            ("e\u{0301}", 1),
+        ] {
+            assert_eq!(display_width(icon), width, "{icon:?}");
+            let text = format!("{icon}abc");
+            for cols in 0..=6 {
+                let cut = truncate_to(&text, cols);
+                assert!(display_width(&cut) <= cols, "{icon:?} at {cols}: {cut:?}");
+                assert!(
+                    cut == "" || cut == "…" || cut.starts_with(icon),
+                    "partial icon: {cut:?}"
+                );
+            }
+            let wrapped = wrap(&format!("{icon}{icon}"), width);
+            assert_eq!(wrapped, vec![icon, icon]);
         }
     }
 }

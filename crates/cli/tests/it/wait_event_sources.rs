@@ -652,18 +652,6 @@ async fn a_command_source_that_cannot_run_fails_the_arm() {
         "the error names the source and what is wrong: {msg}"
     );
 
-    // A two-cell glyph would misalign every TUI row after it, and
-    // refusing at render is too late — so it refuses at arm.
-    let wide = r#"{"kind":"command","name":"noisy","command":["true"],"glyph":"💤"}"#;
-    let err = clank::cli::wait::run(wait_args(repo, vec![wide.into()]))
-        .await
-        .expect_err("a two-column glyph cannot sit in a one-column cell");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("noisy") && msg.contains("glyph"),
-        "the error names the source and the glyph: {msg}"
-    );
-
     // The companion — that a VALID source is not refused — is a lib
     // test (`cli::wait::tests::arm_time_validation_refuses_only_what_cannot_run`).
     // It cannot live here: arming a good source PARKS, and an idle

@@ -199,9 +199,9 @@ pub(crate) struct MergedEvent {
     /// the same reason: it is display config, so editing it retitles
     /// events already logged and the WAL stores no copy.
     ///
-    /// Trusted because it comes from config, and validated for a
-    /// one-column display width when the wait arms. A producer never
-    /// reaches it.
+    /// Normalized for safe display when read from current config. Its width
+    /// is measured by renderers and never affects admission. A producer
+    /// never reaches it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) glyph: Option<String>,
     /// Earliest display time across copies: each copy's github-side
@@ -383,7 +383,7 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
         // glyph is presentation config, never stored in the WAL, so
         // it is joined here exactly as a watch's prompt is
         // (github-watch-prompts).
-        let glyphs = command_glyphs(repo, &label, &mut notices);
+        let glyphs = command_glyphs(repo, &label);
         let events_dir = agent.path().join("events");
         let Ok(files) = std::fs::read_dir(&events_dir) else {
             continue;
@@ -558,23 +558,10 @@ fn delivery_alias(repo: &Path, recipient: &str, id: &str) -> (String, String) {
 /// This agent's configured command-source glyphs, keyed by the WAL
 /// stem its events are filed under.
 ///
-/// VALIDATED HERE, not trusted for having come from config. This
-/// reader deliberately loads the CURRENT config, independently of
-/// any wait — so an operator can edit a glyph after the events were
-/// logged, or open the log before the next arm, and neither path has
-/// run the arm-time check. A newline got through and broke every row
-/// after it (codex 9a53f39). Provenance is not a substitute for
-/// checking the value.
-///
-/// A refused glyph is REPORTED and dropped, so the event still shows
-/// with the backend's default badge: a bad character is a reason to
-/// lose the character, never the event. A source configured only via
-/// CLI `--event` has no config entry and falls back the same way.
-fn command_glyphs(
-    repo: &Path,
-    label: &str,
-    notices: &mut std::collections::BTreeSet<String>,
-) -> HashMap<String, String> {
+/// Read current presentation config independently of any wait. Unsupported
+/// icons quietly use the default badge; they cannot remove an event or
+/// generate repeated warnings as the timeline refreshes.
+fn command_glyphs(repo: &Path, label: &str) -> HashMap<String, String> {
     let Ok(author) = clank_core::ids::AgentLabel::parse(label) else {
         return HashMap::new();
     };
@@ -585,15 +572,8 @@ fn command_glyphs(
         .iter()
         .filter_map(|s| match s {
             clank_core::agent_config::WaitEventSource::Command(c) => {
-                let g = c.glyph.clone()?;
-                if let Some(why) = crate::cli::command_source::glyph_refusal(&g) {
-                    notices.insert(format!(
-                        "{label}: command source `{}` glyph {why} — showing the default badge",
-                        c.name
-                    ));
-                    return None;
-                }
-                Some((c.source_key(), g))
+                let g = crate::cli::command_source::display_glyph(c.glyph.as_deref()?)?;
+                Some((c.source_key(), g.to_string()))
             }
             _ => None,
         })
@@ -1133,16 +1113,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// A glyph EDITED after the events were logged is still checked.
-    ///
-    /// The join reads CURRENT config, independently of any wait, so
-    /// nothing here has run the arm-time validation: an operator can
-    /// change the glyph and open the log without arming again. A
-    /// newline got through and broke every row after it (codex
-    /// 9a53f39) — trusting the config's origin says nothing about
-    /// its current value.
+    /// Display normalization reads current config, independently of any wait.
+    /// Editing an icon retitles existing events without changing delivery.
     #[test]
-    fn a_glyph_edited_after_the_fact_is_refused_and_the_event_survives() {
+    fn an_edited_icon_falls_back_safely_without_hiding_events_or_repeating_notices() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let agents = crate::agent_store::agents_root(repo);
@@ -1199,23 +1173,23 @@ pub(crate) mod tests {
             .unwrap();
         };
 
-        // Each of these passes JSON deserialization and each breaks
-        // the row: a newline moves the cursor, a sleeping emoji takes
-        // two columns, and a base plus a combining mark is two
-        // scalars in a one-cell slot.
-        for bad in ["\n", "\u{1F4A4}", "e\u{0301}"] {
+        for bad in ["\n", "\u{1b}", "", "ab", "\u{0301}"] {
             write_glyph(bad);
+            for _ in 0..2 {
+                let snap = timeline_snapshot(repo);
+                assert_eq!(snap.events.len(), 1, "the EVENT survives a bad icon");
+                assert_eq!(snap.events[0].glyph, None, "{bad:?} must not reach display");
+                assert!(
+                    snap.notices.is_empty(),
+                    "fallback does not flood the timeline"
+                );
+            }
+        }
+        for icon in ["💬", "e\u{0301}", "👩‍💻", "☁️"] {
+            write_glyph(icon);
             let snap = timeline_snapshot(repo);
-            assert_eq!(snap.events.len(), 1, "the EVENT survives a bad glyph");
-            assert_eq!(
-                snap.events[0].glyph, None,
-                "{bad:?} must not reach the renderer",
-            );
-            assert!(
-                snap.notices.iter().any(|n| n.contains("deploys")),
-                "and the operator is told which source: {:?}",
-                snap.notices,
-            );
+            assert_eq!(snap.events[0].glyph.as_deref(), Some(icon));
+            assert!(snap.notices.is_empty());
         }
 
         // Fixing it fixes it, with no arm in between.

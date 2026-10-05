@@ -4057,6 +4057,61 @@ mod tests {
     /// back to asking nothing -- and the selected row is drawn
     /// inverted, a different path from the dim one.
     #[test]
+    fn event_icons_are_measured_and_kept_whole_in_both_row_states() {
+        use crate::cli::github::timeline::{Backend, DeliveryState};
+        use crate::cli::log::OnelineRow;
+        use crate::cli::status_tui::text::row_line;
+        for (configured, expected) in [
+            ("💬", "💬"),
+            ("👩‍💻", "👩‍💻"),
+            ("☁️", "☁️"),
+            ("\n", "cmd"),
+            ("\u{1b}", "cmd"),
+        ] {
+            for delivery in [
+                DeliveryState::Unwoken,
+                DeliveryState::Woken,
+                DeliveryState::Acknowledged,
+            ] {
+                let row = OnelineRow::Github {
+                    event_idx: 0,
+                    delivery,
+                    line: "event text".into(),
+                    unhandled: delivery != DeliveryState::Acknowledged,
+                    baseline: false,
+                    at: 100,
+                    backend: Backend::Command,
+                    glyph: Some(configured.into()),
+                };
+                let spans = log_row_spans(&row, 0, &Default::default(), 80);
+                let raw: String = spans.iter().map(|s| s.1.as_str()).collect();
+                assert!(raw.contains(&format!("{expected} event text")), "{raw:?}");
+                assert!(!raw.chars().any(char::is_control));
+                let event_at = raw.find("event text").unwrap();
+                assert_eq!(
+                    display_width(&raw[..event_at]),
+                    MARK_FIELD + 1 + display_width(expected) + 1
+                );
+                for cols in 0..=display_width(&raw) + 1 {
+                    let plain = visible(&row_line(&spans, false, "", cols));
+                    let selected = crate::cli::status_tui::fixtures::visible_untrimmed(&row_line(
+                        &spans, true, "", cols,
+                    ));
+                    assert_eq!(plain.trim_end(), selected.trim_end());
+                    assert!(display_width(&plain) <= cols);
+                    assert_eq!(display_width(&selected), cols);
+                    if expected != "cmd" && plain.contains(expected.chars().next().unwrap()) {
+                        assert!(
+                            plain.contains(expected),
+                            "partial icon at {cols}: {plain:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn all_delivery_states_keep_status_and_mail_badge_at_narrow_widths() {
         use crate::cli::github::timeline::{Backend, DeliveryState};
         use crate::cli::log::OnelineRow;

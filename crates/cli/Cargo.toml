@@ -4,11 +4,9 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-# The scalar-width/property source of truth for the config's glyph
-# boundary. NOT for rendering: `status_tui::text` keeps its own
-# UCD-generated WIDE table, and a glyph must satisfy BOTH or the row
-# will not lay out the way validation promised (codex 408c756).
+# Shared terminal width and grapheme boundaries for icons and row layout.
 unicode-width = "0.2"
+unicode-segmentation = "1"
 
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

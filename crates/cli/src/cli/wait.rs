@@ -1319,13 +1319,6 @@ pub(crate) fn resolve_wait_event_sources(
                         c.name
                     );
                 }
-                if let Some(why) = c
-                    .glyph
-                    .as_deref()
-                    .and_then(crate::cli::command_source::glyph_refusal)
-                {
-                    anyhow::bail!("command source `{}` glyph {why}", c.name);
-                }
             }
         }
     }
@@ -1668,17 +1661,13 @@ async fn run_command_source_with(
 ) {
     use crate::cli::command_source as cs;
 
-    // `resolve_wait_event_sources` refuses both of these at ARM time,
-    // so reaching them means a caller that built sources another way.
+    // `resolve_wait_event_sources` refuses empty commands at ARM time,
+    // so reaching this means a caller that built sources another way.
     // Kept as the last line of defence, not as the diagnosis: an
     // operator learns about a bad source when the wait refuses to
     // arm, not from a line in a log nobody reads.
     if src.command.is_empty() {
         eprintln!("wait: command source `{}` has an empty argv", src.name);
-        return;
-    }
-    if let Some(why) = src.glyph.as_deref().and_then(cs::glyph_refusal) {
-        eprintln!("wait: command source `{}` glyph {why}", src.name);
         return;
     }
     // No events dir (an ad-hoc wait) means no durable dedup: the
@@ -4087,6 +4076,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_wide_and_unsafe_icons_do_not_stop_either_event_producer() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let mut wide = command_source(
+            "signal",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' '{\"id\":\"wide\",\"kind\":\"message\",\"content\":\"signal delivered\"}'; sleep 300",
+            ],
+        );
+        wide.glyph = Some("💬".into());
+        let mut unsafe_icon = command_source(
+            "other",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' '{\"id\":\"unsafe\",\"kind\":\"message\",\"content\":\"other delivered\"}'; sleep 300",
+            ],
+        );
+        unsafe_icon.glyph = Some("\n".into());
+        let cfg = clank_core::agent_config::AgentConfig {
+            wait_events: vec![
+                clank_core::agent_config::WaitEventSource::Command(wide),
+                clank_core::agent_config::WaitEventSource::Command(unsafe_icon),
+            ],
+            ..Default::default()
+        };
+        crate::agent_store::save_agent_config(repo.path(), &author, &cfg).unwrap();
+        let declared = resolve_wait_event_sources(repo.path(), &author, &[]).unwrap();
+        let (mut rx, sources) = spawn_local(&declared, None, repo.path(), &author, &[], None);
+        let mut received = std::collections::BTreeMap::new();
+        for _ in 0..2 {
+            let (item, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("both configured producers must deliver")
+                .unwrap();
+            let WaitItem::CommandEvent {
+                name,
+                content,
+                failure,
+                ..
+            } = item
+            else {
+                panic!("expected command event");
+            };
+            assert!(!failure);
+            received.insert(name, content);
+        }
+        assert_eq!(
+            received.get("signal").map(String::as_str),
+            Some("signal delivered")
+        );
+        assert_eq!(
+            received.get("other").map(String::as_str),
+            Some("other delivered")
+        );
+        drop(sources);
+    }
+
+    #[tokio::test]
     async fn dropping_sources_ends_the_running_command_instead_of_detaching_it() {
         let repo = tempfile::tempdir().unwrap();
         let author = AgentLabel::parse("grok").unwrap();
@@ -4736,12 +4786,14 @@ mod tests {
             "{empty}"
         );
 
-        let wide = resolve(&format!(
-            r#"{{"kind":"command","name":"noisy","command":["true"],"glyph":"{}"}}"#,
-            '\u{1F4A4}'
-        ))
-        .expect("a two-column glyph cannot sit in a one-column cell");
-        assert!(wide.contains("noisy") && wide.contains("glyph"), "{wide}");
+        for glyph in ["💬", "👩‍💻", "\n", "", "ab", "\u{1b}"] {
+            let source = serde_json::json!({"kind":"command","name":"cosmetic","command":["true"],"glyph":glyph});
+            assert_eq!(
+                resolve(&source.to_string()),
+                None,
+                "icon {glyph:?} cannot prevent admission"
+            );
+        }
     }
 
     #[test]

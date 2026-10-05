@@ -5148,6 +5148,28 @@ pub(crate) async fn run_tui(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn remote_event_rows_share_safe_icon_interpretation_with_the_terminal() {
+        use crate::cli::github::timeline::{Backend, DeliveryState};
+        use crate::cli::log::OnelineRow;
+        for (icon, expected) in [("💬", "💬"), ("👩‍💻", "👩‍💻"), ("\n", "cmd"), ("", "cmd")]
+        {
+            let row = OnelineRow::Github {
+                event_idx: 0,
+                delivery: DeliveryState::Woken,
+                line: "event text".into(),
+                unhandled: true,
+                baseline: false,
+                at: 100,
+                backend: Backend::Command,
+                glyph: Some(icon.into()),
+            };
+            let value = serde_json::to_value(super::ledger_row(&row)).unwrap();
+            assert_eq!(value["glyph"], format!("✓ {expected}"));
+            assert_eq!(value["text"], "event text");
+        }
+    }
+
     /// `y` copies the reason that was RETAINED, not the one that was
     /// painted. The painted one is wrapped to the region and clipped
     /// to its height, which is how a reason arrives useless.

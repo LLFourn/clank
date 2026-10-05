@@ -116,82 +116,21 @@ pub(crate) fn parse_line(raw: &str) -> Option<Result<Line, Refused>> {
     Some(Ok(line))
 }
 
-/// Whether a configured glyph can be drawn in the one cell the row
-/// reserves for it.
-///
-/// A two-cell glyph misaligns every row after it, a control character
-/// moves the cursor, and a base-plus-selector pair can be split by
-/// truncation.
-///
-/// **EVERY reader of a configured glyph calls this, including the
-/// ones that only display.** This doc used to say the check happened
-/// at config load and that "the only way to get a bad glyph on screen
-/// is to not start at all" — which was the false invariant that
-/// produced a hole: the log and the TUI read the CURRENT config,
-/// independently of any wait, so an operator editing a glyph after
-/// the fact reached the renderer with a newline and nothing had
-/// checked it (codex 9a53f39). Validating at load does not make a
-/// value validated later; provenance is not a property of a value.
-/// A new reader of `CommandSource::glyph` calls this too.
-pub(crate) fn glyph_refusal(glyph: &str) -> Option<String> {
-    use unicode_width::UnicodeWidthChar;
+/// A safe, visible icon for display, or the backend's default badge.
+/// This is deliberately not a source-admission check. A cosmetic field
+/// cannot stop an event producer or an agent's hook-owned wait.
+pub(crate) fn display_glyph(glyph: &str) -> Option<&str> {
+    use unicode_segmentation::UnicodeSegmentation;
 
-    // Unicode data, not a hand-listed set. The first attempt at this
-    // was a denylist, and it missed U+05B0, U+061C, U+FE20 and
-    // U+E0100 (codex 408c756) — the same way this repo's own WIDE
-    // table records being wrong twice before it was generated from
-    // the UCD. A property boundary written by hand is a property
-    // boundary with holes.
-    let mut chars = glyph.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else {
-        return Some(if glyph.is_empty() {
-            "is empty".to_string()
-        } else {
-            format!(
-                "is {} characters; a glyph is exactly one",
-                glyph.chars().count()
-            )
-        });
-    };
-    // `width()` is None for exactly the C0/C1 controls: a newline or
-    // an ESC moves the cursor instead of filling the cell.
-    let Some(w) = c.width() else {
-        return Some(format!(
-            "U+{:04X} is a control character; it moves the cursor rather than filling a cell",
-            c as u32
-        ));
-    };
-    // Redundant with the width test below for the VERDICT — 0 is not
-    // 1 either way — and kept for the message, which is the part a
-    // reader can act on.
-    if w == 0 {
-        return Some(format!(
-            "U+{:04X} has no visible form of its own; it modifies the character before it",
-            c as u32
-        ));
+    let mut graphemes = glyph.graphemes(true);
+    if graphemes.next().is_none()
+        || graphemes.next().is_some()
+        || glyph.chars().any(|c| c.is_control() || c.is_whitespace())
+        || crate::cli::status_tui::text::display_width(glyph) == 0
+    {
+        return None;
     }
-    if w != 1 {
-        return Some(format!(
-            "U+{:04X} measures {w} display columns; the row reserves one",
-            c as u32
-        ));
-    }
-    // And the RENDERER has to agree, because it is what lays the row
-    // out. UNREACHABLE today and measured so: no scalar in the whole
-    // range has `unicode-width` 1 and renderer 2, which is why this
-    // cannot currently refuse anything the check above accepted. It
-    // stays because the two tables are versioned independently — the
-    // renderer's is generated from UCD 16.0.0, the crate tracks its
-    // own — and a drift would let a glyph validated as one cell be
-    // drawn as two. `the_two_width_models_agree_wherever_it_matters`
-    // is what notices if that day comes.
-    let cells = crate::cli::status_tui::text::display_width(glyph);
-    if cells != 1 {
-        return Some(format!(
-            "measures {cells} display columns to the renderer; the row reserves one"
-        ));
-    }
-    None
+    Some(glyph)
 }
 
 /// How long to wait before restarting a producer that stopped.
@@ -1296,89 +1235,38 @@ mod tests {
         }
     }
 
-    /// Width alone would accept things that are not glyphs.
-    ///
-    /// `display_width` counts every non-wide scalar as one, by
-    /// design — so this check cannot be a width check (codex
-    /// c6dc55f).
-    ///
-    /// The boundary is `unicode-width`'s judgement, not a list of
-    /// mine. U+110BD KAITHI NUMBER SIGN is the case that taught me
-    /// the difference: I assumed a format character must be invisible
-    /// and asserted it here, and the library reports width 1. Taking
-    /// the dependency and then hand-patching its answers would be the
-    /// denylist again with extra steps.
     #[test]
-    fn a_glyph_that_measures_one_cell_can_still_be_no_glyph() {
-        for (bad, what) in [
-            ("\n", "newline"),
-            ("\t", "tab"),
-            ("\u{1b}", "ESC"),
-            ("\u{0301}", "a lone combining acute"),
-            ("\u{200D}", "a zero-width joiner"),
-            ("\u{FE0F}", "a variation selector"),
-            ("\u{05B0}", "HEBREW POINT SHEVA"),
-            ("\u{061C}", "ARABIC LETTER MARK"),
-            ("\u{FE20}", "COMBINING LIGATURE LEFT HALF"),
-            ("\u{E0100}", "VARIATION SELECTOR-17"),
-            ("\u{0F71}", "TIBETAN VOWEL SIGN AA"),
-            ("\u{1AB0}", "COMBINING DOUBLED CIRCUMFLEX"),
-            ("\u{2064}", "INVISIBLE PLUS"),
+    fn icons_are_visible_graphemes_not_single_column_scalars() {
+        for glyph in ["*", "→", "💬", "💤", "☁️", "e\u{0301}", "👩‍💻", "🇦🇺", "1️⃣"]
+        {
+            assert_eq!(display_glyph(glyph), Some(glyph), "{glyph:?}");
+        }
+    }
+
+    #[test]
+    fn unsafe_or_non_renderable_icons_use_the_default_badge() {
+        for glyph in [
+            "",
+            "ab",
+            " ",
+            "\n",
+            "\t",
+            "\u{1b}",
+            "x\n",
+            "\u{0301}",
+            "\u{200D}",
+            "\u{FE0F}",
+            "\u{05B0}",
+            "\u{061C}",
+            "\u{FE20}",
+            "\u{E0100}",
+            "\u{0F71}",
+            "\u{1AB0}",
+            "\u{2064}",
+            "\u{202E}",
         ] {
-            assert_eq!(
-                crate::cli::status_tui::text::display_width(bad),
-                1,
-                "{what} measures one cell to the RENDERER, which is why its \
-                 width cannot be the test",
-            );
-            assert!(
-                glyph_refusal(bad).is_some(),
-                "{what} is not a glyph and must be refused",
-            );
+            assert_eq!(display_glyph(glyph), None, "{glyph:?}");
         }
-    }
-
-    #[test]
-    fn a_glyph_must_fit_the_cell_the_row_reserves() {
-        assert_eq!(glyph_refusal("*"), None);
-        assert_eq!(glyph_refusal("→"), None);
-        assert!(glyph_refusal("\u{1F4A4}").is_some(), "two cells");
-        assert!(
-            glyph_refusal("\u{2601}\u{FE0F}").is_some(),
-            "base plus selector"
-        );
-        assert!(glyph_refusal("ab").is_some());
-        assert!(glyph_refusal("").is_some());
-    }
-
-    /// The cross-check against the renderer is unreachable, and this
-    /// is the property that makes it so.
-    ///
-    /// Measured across the whole scalar range: nothing has
-    /// `unicode-width` 1 and renderer width 2. If a table update ever
-    /// breaks this, a glyph could validate at one cell and be DRAWN
-    /// at two — which is what the otherwise-dead guard is for.
-    #[test]
-    fn the_two_width_models_agree_wherever_it_matters() {
-        use unicode_width::UnicodeWidthChar;
-        let mut disagree = Vec::new();
-        for cp in 0u32..=0x10FFFF {
-            let Some(c) = char::from_u32(cp) else {
-                continue;
-            };
-            let Some(u) = c.width() else { continue };
-            if u != 1 {
-                continue;
-            }
-            if crate::cli::status_tui::text::display_width(&c.to_string()) != 1 {
-                disagree.push(cp);
-            }
-        }
-        assert!(
-            disagree.is_empty(),
-            "scalars the crate calls one cell and the renderer does not: {:04X?}",
-            &disagree[..disagree.len().min(8)],
-        );
     }
 }
 

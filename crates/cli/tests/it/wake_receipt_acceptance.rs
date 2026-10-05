@@ -296,9 +296,10 @@ impl Drop for Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_fallback_hook_receives_interrupting_producer_without_zellij_and_keeps_reply_owed() {
+async fn wide_icon_hook_receives_interrupting_producer_without_zellij_and_keeps_reply_owed() {
     let mut fixture = Fixture::new(Tool::Codex, true);
     fixture.source.interrupt = true;
+    fixture.source.glyph = Some("💬".into()); // Cosmetic width must not kill the native wait.
     fixture.enable_receipts(); // Persist the updated source policy alongside its receipt callback.
     let _lease = fixture.monitor_lease(); // No published monitor: attachment must fall back.
     let hook = fixture.hook_child(false).await;

@@ -600,10 +600,10 @@ pub struct CommandSource {
     /// in a successfully emitted hook wake. This is not acknowledgement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_command: Option<Vec<String>>,
-    /// The single character the log and the TUI draw this source's
-    /// events with. Config, not per-line, so an untrusted producer
-    /// cannot reach the renderer's layout; validated at load for a
-    /// display width of exactly one.
+    /// Optional icon for this source's events. Presentation only: it never
+    /// affects source admission or delivery. Renderers measure a visible
+    /// grapheme (including emoji) and use the default badge for unsafe or
+    /// unsupported display input. Config, not producer-supplied event text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glyph: Option<String>,
 }
