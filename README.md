@@ -727,11 +727,13 @@ Reply-required messages use a version-2 inbox record that older readers cannot
 treat as plain-ackable work. Install supporting binaries on every custodian before
 using this feature; mixed old/new message-operation writers are unsupported.
 
-Accepted replies appear in the timeline with a `✉` mail badge, their sender,
-destination and subject. A reply within the same repository merges with its
-recipient's inbox copy; only recipient copies count as pending work or ack
-targets. External replies show `sent →` locally, even if that repository is
-unavailable, without fetching it or claiming the recipient woke or acknowledged.
+Accepted replies appear in the timeline with a `✉` mail badge, their
+destination (`→ @agent`, with the repository's path when it is another one) and
+subject; the sender is in the event's details. A reply within the same
+repository merges with its recipient's inbox copy; only recipient copies count
+as pending work or ack targets. External replies carry the `→` sent mark
+locally, even if that repository is unavailable, without fetching it or
+claiming the recipient woke or acknowledged.
 In the TUI, open the reply to read its full body, endpoint, operation ID and
 original-message link. `clank log --json` preserves those fields as structured
 data. Pending reply intents remain visible in event detail and are not shown as
@@ -814,8 +816,10 @@ An already-armed local wait emits its normal context directly; it needs no detac
 interruption helper. Wake receipts and required replies keep their normal meaning.
 
 Event timelines use `?` for an event that has not been woken, `✓` for a wake
-that has not been acknowledged, and `✓✓` for acknowledgement. Messages carry
-an additional `✉` envelope badge. A wake proves successful output and flush to
+that has not been acknowledged, and `✓✓` for acknowledgement. After the mark
+comes the event's icon — `✉` for a message, a source's configured `glyph`, or
+a default for its kind — then who it is for: `@codex`, or `@claude,codex` when
+several agents hold it, and `@?` when that was never recorded. A wake proves successful output and flush to
 an agent's delivery adapter or explicit `events read`, not understanding or
 completion. Merely opening the timeline, inspecting events, or running a plain `wait`/`wait --peek`
 does not mark them woken. Legacy acknowledged events get double ticks; pending

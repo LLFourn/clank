@@ -4066,8 +4066,8 @@ mod tests {
             ("💬", "💬"),
             ("👩‍💻", "👩‍💻"),
             ("☁️", "☁️"),
-            ("\n", "cmd"),
-            ("\u{1b}", "cmd"),
+            ("\n", crate::cli::log::default_badge(Backend::Command)),
+            ("\u{1b}", crate::cli::log::default_badge(Backend::Command)),
         ] {
             for delivery in [
                 DeliveryState::Unwoken,
@@ -4101,7 +4101,9 @@ mod tests {
                     assert_eq!(plain.trim_end(), selected.trim_end());
                     assert!(display_width(&plain) <= cols);
                     assert_eq!(display_width(&selected), cols);
-                    if expected != "cmd" && plain.contains(expected.chars().next().unwrap()) {
+                    if expected != crate::cli::log::default_badge(Backend::Command)
+                        && plain.contains(expected.chars().next().unwrap())
+                    {
                         assert!(
                             plain.contains(expected),
                             "partial icon at {cols}: {plain:?}"
@@ -8889,13 +8891,19 @@ mod tests {
         let cmd = visible(line_with(&out, "a thing happened"));
 
         // Both states are MARKED. Neither is the absence of the other.
-        assert!(wants.contains("?  gh"), "unanswered must say so: {wants:?}");
+        let gh = crate::cli::log::default_badge(Backend::Github);
         assert!(
-            handled.contains("✓✓ gh"),
+            wants.contains(&format!("?  {gh}")),
+            "unanswered must say so: {wants:?}"
+        );
+        assert!(
+            handled.contains(&format!("✓✓ {gh}")),
             "handled must say so: {handled:?}"
         );
         assert!(
-            prewatch.contains("  gh") && !prewatch.contains('?') && !prewatch.contains('✓'),
+            prewatch.contains(&format!("  {gh}"))
+                && !prewatch.contains('?')
+                && !prewatch.contains('✓'),
             "pre-watch was never anyone's to answer, so it carries no mark: {prewatch:?}",
         );
         assert_ne!(
@@ -8904,11 +8912,17 @@ mod tests {
         );
 
         // The same marks mean the same thing on a command source.
-        assert!(cmd.contains("?  cmd"), "a cmd event marks alike: {cmd:?}");
+        assert!(
+            cmd.contains(&format!(
+                "?  {}",
+                crate::cli::log::default_badge(Backend::Command)
+            )),
+            "a cmd event marks alike: {cmd:?}"
+        );
 
         // The marks land in ONE column across rows whose describe
         // lines differ in length.
-        let col = |l: &str| l.find(['?', '✓']).or_else(|| l.find("  gh"));
+        let col = |l: &str| l.find(['?', '✓']).or_else(|| l.find(&format!("  {gh}")));
         assert_eq!(
             col(&wants),
             col(&handled),

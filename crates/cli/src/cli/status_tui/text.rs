@@ -416,6 +416,16 @@ pub(crate) fn safe_multiline(s: &str) -> String {
     out
 }
 
+/// All of `s` as ONE terminal line, nothing dropped: terminal control
+/// is removed as [`safe_multiline`] removes it, and the line breaks
+/// and tabs it keeps are shown as their control pictures (`␊`, `␉`).
+///
+/// For a name that identifies something, where [`one_line`]'s
+/// first-line preview would let two different names read the same.
+pub(crate) fn one_line_whole(s: &str) -> String {
+    safe_multiline(s).replace('\n', "␊").replace('\t', "␉")
+}
+
 /// [`safe_multiline`], with every line after the first indented by
 /// `indent` — for a body emitted INSIDE a list, where an unindented
 /// second line would read as the list's next item.

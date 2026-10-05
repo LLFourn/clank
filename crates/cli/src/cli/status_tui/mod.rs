@@ -5152,7 +5152,9 @@ pub(crate) mod tests {
     fn remote_event_rows_share_safe_icon_interpretation_with_the_terminal() {
         use crate::cli::github::timeline::{Backend, DeliveryState};
         use crate::cli::log::OnelineRow;
-        for (icon, expected) in [("💬", "💬"), ("👩‍💻", "👩‍💻"), ("\n", "cmd"), ("", "cmd")]
+        let fallback =
+            crate::cli::log::default_badge(crate::cli::github::timeline::Backend::Command);
+        for (icon, expected) in [("💬", "💬"), ("👩‍💻", "👩‍💻"), ("\n", fallback), ("", fallback)]
         {
             let row = OnelineRow::Github {
                 event_idx: 0,
@@ -5173,6 +5175,236 @@ pub(crate) mod tests {
     /// `y` copies the reason that was RETAINED, not the one that was
     /// painted. The painted one is wrapped to the region and clipped
     /// to its height, which is how a reason arrives useless.
+    /// Replies sent to two foreign repos that share a name, and to one
+    /// whose path holds a newline and an escape. Each row names its own
+    /// route, whole and safe, on every surface; the stored route keeps
+    /// every byte.
+    #[test]
+    fn foreign_routes_are_told_apart_and_drawn_safely() {
+        use crate::cli::github::log::{EventLog, MessageOperation, Transport};
+        use crate::cli::github::timeline;
+        use clank_core::{ids::AgentLabel, wait::MessageReplyRoute};
+        let repo = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(repo.path()).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = dunce::canonicalize(elsewhere.path()).unwrap();
+        let routes = [
+            elsewhere.join("a/life"),
+            elsewhere.join("b/life"),
+            elsewhere.join("c/li\nfe\u{1b}[2J"),
+        ];
+        let mut log = EventLog::open(
+            &crate::agent_store::agents_root(&root).join("worker/events"),
+            "messages",
+        )
+        .unwrap();
+        for (i, route) in routes.iter().enumerate() {
+            log.append_inbox(
+                Transport::Message,
+                None,
+                Some(&format!("original-{i}")),
+                Some(10 + i as u64),
+                &clank_core::wait::WaitItem::Message {
+                    presentation: None,
+                    handle: format!("handle-{i}"),
+                    from: Some("codex".into()),
+                    repo: Some(route.display().to_string()),
+                    subject: format!("question {i}"),
+                    body: format!("question {i}"),
+                    requires_reply: false,
+                    reply_route: None,
+                    selector: None,
+                },
+            )
+            .unwrap();
+            let parent = log.read_rows().unwrap().unwrap().rows.remove(i);
+            let op = MessageOperation {
+                id: format!("reply-{i}"),
+                repo: root.clone(),
+                author: AgentLabel::parse("worker").unwrap(),
+                original_seq: parent.seq,
+                original_ident: parent.ident,
+                original_handle: format!("handle-{i}"),
+                route: MessageReplyRoute {
+                    repo: route.clone(),
+                    agent: AgentLabel::parse("codex").unwrap(),
+                },
+                text: format!("answer {i}"),
+                at: 100 + i as u64,
+                acknowledge: false,
+            };
+            let state = log.begin_message_operation(&op).unwrap();
+            let mut destination = EventLog::open(
+                &crate::agent_store::agents_root(route).join("codex/events"),
+                "messages",
+            )
+            .unwrap();
+            let receipt = destination.accept_message_delivery(&op).unwrap();
+            log.accept_message_operation(&state, &receipt).unwrap();
+            destination.release_message_receipt(&receipt).unwrap();
+        }
+
+        let snapshot = timeline::timeline_snapshot(&root);
+        let sent: Vec<&timeline::MergedEvent> = snapshot
+            .events
+            .iter()
+            .filter(|e| !e.outgoing.is_empty())
+            .collect();
+        assert_eq!(sent.len(), 3, "{:?}", snapshot.notices);
+        let mut stored: Vec<std::path::PathBuf> = sent
+            .iter()
+            .map(|e| e.outgoing[0].destination.repo.clone())
+            .collect();
+        stored.sort();
+        assert_eq!(stored, routes, "the route itself keeps every byte");
+
+        let items = crate::cli::log::interleave(&[], &snapshot.events);
+        let rows =
+            crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
+        let event_rows: Vec<&crate::cli::log::OnelineRow> = rows
+            .iter()
+            .filter(|r| matches!(r, crate::cli::log::OnelineRow::Github { line, .. } if line.starts_with("→ @codex")))
+            .collect();
+        assert_eq!(event_rows.len(), 3);
+        let lines: Vec<String> = event_rows
+            .iter()
+            .map(|r| match r {
+                crate::cli::log::OnelineRow::Github { line, .. } => line.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = lines.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "two repos named `life` read alike: {lines:?}"
+        );
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("/c/li␊fe)")),
+            "the hostile path is shown whole, its break made visible: {lines:?}"
+        );
+
+        let plain = crate::cli::log::oneline_plain_lines(&rows);
+        let ledger = ledger_rows(&rows);
+        for line in &lines {
+            assert!(
+                plain.iter().any(|p| p.ends_with(line.as_str())),
+                "log: {line}"
+            );
+            assert!(ledger.iter().any(|r| &r.text == line), "remote: {line}");
+        }
+        for row in event_rows {
+            for selected in [false, true] {
+                let spans = render::log_row_spans(row, 0, &Default::default(), 300);
+                let drawn = text::row_line(&spans, selected, "", 300);
+                assert!(
+                    !drawn.contains("\u{1b}[2J") && !drawn.contains('\n'),
+                    "the drawn row carries no injected control: {drawn:?}"
+                );
+                let shown = crate::cli::status_tui::fixtures::visible(&drawn);
+                assert!(!shown.chars().any(char::is_control), "{shown:?}");
+                assert!(!shown.contains("[2J"), "{shown:?}");
+            }
+        }
+    }
+
+    /// One event held by two agents, one of them through two sources.
+    /// Every surface — the log, the TUI row, the remote page — says the
+    /// same thing about who it is for, whatever state it is in, and a
+    /// narrow terminal keeps the destination and cuts the content.
+    #[test]
+    fn every_surface_names_each_holder_once_whatever_the_state() {
+        use crate::cli::github::log::{EventLog, Transport};
+        use crate::cli::github::timeline;
+        let repo = tempfile::tempdir().unwrap();
+        let item = clank_core::wait::WaitItem::GithubEvent {
+            presentation: None,
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: Some("review".into()),
+            number: Some(7),
+            title: Some("Ship it, then tell the whole team about the release".into()),
+            actor: Some("alice".into()),
+            url: None,
+            instructions: None,
+            content: None,
+        };
+        let mut copies = Vec::new();
+        for (agent, source) in [
+            ("bob", "github-o-r-aaaa"),
+            ("alice", "github-o-r-aaaa"),
+            ("alice", "github-o-r-bbbb"),
+        ] {
+            let dir = repo.path().join(".clank/agents").join(agent).join("events");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut log = EventLog::open(&dir, source).unwrap();
+            let seq = log
+                .append_inbox(Transport::Poll, Some("feed-9"), None, Some(1_000), &item)
+                .unwrap();
+            copies.push((log, seq));
+        }
+        let text = "@alice,bob  o/r#7 pr_comment/review  “Ship it, then tell the whole team about the release”";
+
+        let mut seen = Vec::new();
+        for acked in [false, true] {
+            if acked {
+                for (log, seq) in &mut copies {
+                    log.append_ack(*seq).unwrap();
+                }
+            }
+            let snapshot = timeline::timeline_snapshot(repo.path());
+            assert_eq!(snapshot.events.len(), 1, "{:?}", snapshot.notices);
+            let event = &snapshot.events[0];
+            assert_eq!(event.members.len(), 3, "three copies, two holders");
+            let items = crate::cli::log::interleave(&[], &snapshot.events);
+            let rows = crate::cli::log::oneline_items_rows(
+                &items,
+                &Default::default(),
+                &Default::default(),
+            );
+            let badge = crate::cli::log::event_badge(event);
+            let state = event.delivery().glyph();
+
+            assert_eq!(
+                crate::cli::log::oneline_plain_lines(&rows),
+                [format!("{state} {badge} {text}")]
+            );
+            let ledger = ledger_rows(&rows);
+            assert_eq!(ledger[0].text, text);
+            assert_eq!(
+                ledger[0].glyph.as_deref(),
+                Some(format!("{state} {badge}").as_str())
+            );
+            let spans = render::log_row_spans(&rows[0], 0, &Default::default(), 200);
+            let wide =
+                crate::cli::status_tui::fixtures::visible(&text::row_line(&spans, false, "", 200));
+            assert!(wide.contains(text), "{wide:?}");
+
+            let narrow_cols = 32;
+            let spans = render::log_row_spans(&rows[0], 0, &Default::default(), narrow_cols);
+            let narrow = crate::cli::status_tui::fixtures::visible(&text::row_line(
+                &spans,
+                false,
+                "",
+                narrow_cols,
+            ));
+            assert!(
+                narrow.contains("@alice,bob"),
+                "the destination survives a narrow row: {narrow:?}"
+            );
+            assert!(
+                !narrow.contains("release"),
+                "the content is what gets cut: {narrow:?}"
+            );
+            assert!(text::display_width(&narrow) <= narrow_cols);
+            seen.push(state);
+        }
+        assert_eq!(seen, ["?", "✓✓"], "only the state mark moves");
+    }
+
     #[test]
     fn remote_ledger_preserves_three_delivery_markers_from_actual_wal() {
         use crate::cli::github::timeline::{self, DeliveryState};
@@ -5211,7 +5443,7 @@ pub(crate) mod tests {
                 row.glyph.as_deref(),
                 Some(format!("{} ✉", state.glyph()).as_str())
             );
-            let sent = web.iter().find(|r| r.text.contains("sent →")).unwrap();
+            let sent = web.iter().find(|r| r.text.starts_with("→ @")).unwrap();
             assert_eq!(sent.glyph.as_deref(), Some("→ ✉"));
         }
     }
@@ -5902,7 +6134,11 @@ pub(crate) mod tests {
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         let ledger = ledger_rows(&rows);
         assert_eq!(ledger[0].glyph.as_deref(), Some("→ ✉"));
-        assert!(ledger[0].text.contains("sent → coordinator"));
+        assert!(
+            ledger[0].text.starts_with("→ @coordinator ("),
+            "{}",
+            ledger[0].text
+        );
         assert_eq!(
             ledger[0].page, None,
             "outbound is not a git plan/commit page"

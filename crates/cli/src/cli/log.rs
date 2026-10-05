@@ -385,7 +385,7 @@ pub(crate) fn interleave_with_plain<'a>(
 /// textual markers (codex c917ba7).
 #[cfg(test)]
 fn gh_colored_row(g: &crate::cli::github::timeline::MergedEvent, mark: &str) -> String {
-    let line = gh_describe(g);
+    let line = event_row_text(g);
     let badge = event_badge(g);
     colored_event_row(badge, &line, g.baseline, mark)
 }
@@ -424,7 +424,7 @@ pub(crate) fn event_badge(g: &crate::cli::github::timeline::MergedEvent) -> &str
     badge_of(g.glyph.as_deref(), g.backend)
 }
 
-/// The source's configured glyph wins; the default names the backend.
+/// The source's configured glyph wins; the default shows the backend.
 ///
 /// Interpret the icon at the display boundary too, so rows assembled
 /// without a timeline snapshot still cannot emit controls or empty badges.
@@ -434,39 +434,80 @@ pub(crate) fn badge_of(
 ) -> &str {
     glyph
         .and_then(crate::cli::command_source::display_glyph)
-        .unwrap_or(match backend {
-            crate::cli::github::timeline::Backend::Github => "gh",
-            crate::cli::github::timeline::Backend::Command => "cmd",
-            crate::cli::github::timeline::Backend::Timer => "timer",
-            crate::cli::github::timeline::Backend::Message => "✉",
-        })
+        .unwrap_or(default_badge(backend))
 }
 
-/// One-line description shared by the oneline and human renderers —
-/// mirrors the `clank events` CLI's shape so the two surfaces read
-/// the same.
-fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
+/// The icon for a source that has none configured: a symbol for what
+/// kind of event it is, not a name the row would then repeat.
+pub(crate) fn default_badge(backend: crate::cli::github::timeline::Backend) -> &'static str {
+    match backend {
+        crate::cli::github::timeline::Backend::Github => "🐙",
+        crate::cli::github::timeline::Backend::Command => "⚡",
+        crate::cli::github::timeline::Backend::Timer => "⏰",
+        crate::cli::github::timeline::Backend::Message => "✉",
+    }
+}
+
+/// The row text every timeline surface shows — `clank log`, the TUI and
+/// the remote page — after the state mark and the icon.
+///
+/// The icon says what kind of event it is, so the row says who it is
+/// for and what it says. A source or kind name appears only where it
+/// tells the reader something the icon cannot: the source when it has
+/// no icon of its own, a kind that differs from its source, and
+/// github's repo, number and action. Who sent it and where it came
+/// from stay in the details and the structured output.
+///
+/// Before and after, for Life's sources:
+///
+/// ```text
+/// ? 💬 signal  signal  “can you book the dentist”   ->  ? 💬 @claude  “can you book the dentist”
+/// ✓ 🎙 voice  voice  “remind me at 5”                ->  ✓ 🎙 @assistent,claude  “remind me at 5”
+/// → ✉ message  codex  “done”  sent → codex (life)    ->  → ✉ → @codex (~/src/life)  “done”
+/// ```
+pub(crate) fn event_row_text(g: &crate::cli::github::timeline::MergedEvent) -> String {
+    use crate::cli::github::timeline::Backend;
     // Bodies and source names can contain lossless operator/producer text.
     // Every field entering a terminal row uses the existing single-line
     // projection; stored content and the full detail page stay unchanged.
     let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
-    // WHO first: scanning the timeline, the actor is the fastest way to
-    // tell your own activity from someone else's, so it leads rather
-    // than trailing after a title that can be long enough to truncate.
-    let mut out = String::new();
-    if let Some(a) = &g.actor {
-        out.push_str(&format!("{}  ", clean(a)));
-    }
-    out.push_str(&clean(&g.kind));
-    if let Some(d) = &g.detail {
-        out.push_str(&format!("/{}", clean(d)));
-    }
-    out.push_str(&format!("  {}", clean(&g.source)));
-    if let Some(n) = g.number {
-        out.push_str(&format!("#{n}"));
-    }
-    if g.failure {
-        out.push_str("  (this SOURCE is broken, not the world)");
+    let mut out = g.destination().to_string();
+    let iconless = g
+        .glyph
+        .as_deref()
+        .and_then(crate::cli::command_source::display_glyph)
+        .is_none();
+    let context = match g.backend {
+        Backend::Github => {
+            let mut c = clean(&g.source);
+            if let Some(n) = g.number {
+                c.push_str(&format!("#{n}"));
+            }
+            c.push(' ');
+            c.push_str(&clean(&g.kind));
+            if let Some(d) = &g.detail {
+                c.push_str(&format!("/{}", clean(d)));
+            }
+            Some(c)
+        }
+        Backend::Message => None,
+        // A broken source is named whatever its icon: which one to fix
+        // is the whole point of the row, and its kind is clank's own.
+        Backend::Command | Backend::Timer if g.failure => Some(clean(&g.source)),
+        Backend::Command | Backend::Timer => {
+            let named = iconless.then(|| clean(&g.source));
+            // A timer's kind is only ever its backend's name.
+            let kind = (g.backend == Backend::Command && g.kind != g.source && !g.kind.is_empty())
+                .then(|| clean(&g.kind));
+            match (named, kind) {
+                (Some(source), Some(kind)) => Some(format!("{source}/{kind}")),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+    };
+    if let Some(c) = context {
+        out.push_str(&format!("  {c}"));
     }
     if let Some(r) = &g.recurrence {
         out.push_str(&format!(
@@ -477,12 +518,8 @@ fn gh_describe(g: &crate::cli::github::timeline::MergedEvent) -> String {
     if let Some(t) = &g.content {
         out.push_str(&format!("  “{}”", clean(t)));
     }
-    for reply in &g.outgoing {
-        out.push_str(&format!(
-            "  sent → {} ({})",
-            clean(reply.destination.agent.as_str()),
-            clean(&reply.destination.repo.display().to_string())
-        ));
+    if g.failure {
+        out.push_str("  (this SOURCE is broken, not the world)");
     }
     out
 }
@@ -639,15 +676,18 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
                 started = true;
                 let mark = if g.baseline { "  (pre-watch)" } else { "" };
                 let badge = format!("{} {}", g.delivery().glyph(), event_badge(g));
-                let line = gh_describe(g);
+                let line = event_row_text(g);
                 if c {
                     println!("{}", colored_event_row(&badge, &line, g.baseline, mark));
                 } else {
                     println!("{badge} {line}{mark}");
                 }
 
-                if !g.seen_by.is_empty() {
-                    println!("Seen-by: {}", g.seen_by.join(", "));
+                // The row says who it is for; this is where it came from.
+                let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
+                println!("From: {}", clean(&g.source));
+                if let Some(actor) = &g.actor {
+                    println!("By:   {}", clean(actor));
                 }
                 if let Some(url) = &g.url {
                     println!("{url}");
@@ -887,7 +927,7 @@ pub(crate) enum OnelineRow {
         at: Option<i64>,
     },
     /// A merged github event interleaved into the timeline
-    /// (log-timeline-github-events); `line` is [`gh_describe`]'s
+    /// (log-timeline-github-events); `line` is [`event_row_text`]'s
     /// shape, shared with the CLI renderers. `baseline` = pre-watch
     /// history (rendered dimmed / marked, never open).
     Github {
@@ -964,7 +1004,7 @@ pub(crate) fn oneline_items_rows(
             TimelineItem::Github(idx, g) => out.push(OnelineRow::Github {
                 delivery: g.delivery(),
                 event_idx: *idx,
-                line: gh_describe(g),
+                line: event_row_text(g),
                 unhandled: g.unhandled,
                 baseline: g.baseline,
                 at: g.at,
@@ -1713,7 +1753,7 @@ mod json_output_tests {
         assert!(snapshot.notices.is_empty());
         assert_eq!(snapshot.events.len(), 1);
         let event = &snapshot.events[0];
-        let summary = gh_describe(event);
+        let summary = event_row_text(event);
         assert!(summary.contains("5 scheduled occurrences"), "{summary}");
         assert!(summary.contains("every 10s"));
         assert!(!summary.chars().any(char::is_control));
@@ -1781,7 +1821,7 @@ mod json_output_tests {
             );
             assert_eq!(event.unhandled, !acked);
             assert_eq!(event.content.as_deref(), source.content.as_deref());
-            assert_eq!(event_badge(event), "timer");
+            assert_eq!(event_badge(event), default_badge(timeline::Backend::Timer));
             let web = serde_json::to_value(event).unwrap();
             assert_eq!(web["backend"], "timer");
             assert_eq!(web["members"][0]["transport"], "timer");
@@ -1789,21 +1829,32 @@ mod json_output_tests {
             let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
             let lines = oneline_plain_lines(&rows);
             assert_eq!(lines.len(), 1);
-            assert!(lines[0].starts_with(if acked { "✓✓ timer " } else { "? timer " }));
+            let mark = if acked { "✓✓" } else { "?" };
+            assert!(
+                lines[0].starts_with(&format!(
+                    "{mark} {} ",
+                    default_badge(timeline::Backend::Timer)
+                )),
+                "{lines:?}"
+            );
             assert!(lines[0].contains("“Check deployment”"));
             assert!(!lines[0].chars().any(char::is_control), "{lines:?}");
             assert!(!lines[0].contains("Report result"));
             assert!(!lines[0].contains("[31m"));
             // The human log and the TUI row use this same description.
-            assert!(!gh_describe(event).chars().any(char::is_control));
+            assert!(!event_row_text(event).chars().any(char::is_control));
             let mut hostile_fields = event.clone();
             hostile_fields.source = "deploy\nsecond source".into();
             hostile_fields.actor = Some("\u{1b}]0;title\u{7}agent\r\nother".into());
             hostile_fields.detail = Some("\u{1b}[31mready\t".into());
             hostile_fields.kind = "timer\nother".into();
-            let described = gh_describe(&hostile_fields);
+            let described = event_row_text(&hostile_fields);
             assert!(!described.chars().any(char::is_control), "{described:?}");
-            assert_eq!(described, "agent  timer/ready  deploy  “Check deployment”");
+            assert_eq!(described, "@rev  deploy  “Check deployment”");
+            hostile_fields.backend = timeline::Backend::Github;
+            let described = event_row_text(&hostile_fields);
+            assert!(!described.chars().any(char::is_control), "{described:?}");
+            assert_eq!(described, "@rev  deploy timer/ready  “Check deployment”");
             let reviews = Default::default();
             let json = serde_json::to_value(json_items(&items, &reviews)).unwrap();
             assert_eq!(json[0]["kind"], "timer_event");
@@ -1834,9 +1885,11 @@ mod json_output_tests {
                 ..
             }
         ));
-        let described = gh_describe(reply);
-        assert!(described.contains("sent → coordinator"));
-        assert!(described.contains(&op.route.repo.display().to_string()));
+        let described = event_row_text(reply);
+        assert!(
+            described.starts_with(&format!("→ @coordinator ({})", op.route.repo.display())),
+            "an outgoing reply names its target and the repo it is in: {described}"
+        );
         assert_eq!(event_badge(reply), "✉");
         let reviews = Default::default();
         let json = serde_json::to_value(json_items(&items, &reviews)).unwrap();
@@ -2124,7 +2177,10 @@ mod json_output_tests {
         // Plain lines render the badge + open-work mark.
         let lines = oneline_plain_lines(&rows);
         assert!(
-            lines[0].starts_with("? gh ") && !lines[0].contains("⚠"),
+            lines[0].starts_with(&format!(
+                "? {} ",
+                default_badge(crate::cli::github::timeline::Backend::Github)
+            )) && !lines[0].contains("⚠"),
             "{lines:?}"
         );
     }
@@ -2222,7 +2278,10 @@ mod json_output_tests {
         assert_eq!(badge, crate::cli::github::timeline::Backend::Command);
         let lines = oneline_plain_lines(&rows);
         assert!(
-            lines.iter().any(|l| l.starts_with("? cmd ")),
+            lines.iter().any(|l| l.starts_with(&format!(
+                "? {} ",
+                default_badge(crate::cli::github::timeline::Backend::Command)
+            ))),
             "the gutter says what produced it: {lines:?}"
         );
         assert!(
@@ -2845,5 +2904,191 @@ mod tests {
         );
         // The name closes its run: last, at col 0.
         assert_eq!(lines[2], "foo", "umbrella name under its commits");
+    }
+}
+
+#[cfg(test)]
+mod event_row_tests {
+    use super::*;
+    use crate::cli::github::timeline::{Backend, MemberKey, MergedEvent, OutgoingReply};
+
+    fn event(backend: Backend, source: &str, kind: &str, seen_by: &[&str]) -> MergedEvent {
+        MergedEvent {
+            outgoing: Vec::new(),
+            recurrence: None,
+            at: 150,
+            backend,
+            glyph: None,
+            source: source.into(),
+            kind: kind.into(),
+            content: None,
+            body: None,
+            failure: false,
+            detail: None,
+            number: None,
+            actor: None,
+            url: None,
+            seen_by: seen_by.iter().map(|s| s.to_string()).collect(),
+            members: Vec::new(),
+            unhandled: true,
+            baseline: false,
+        }
+    }
+
+    fn saying(mut e: MergedEvent, glyph: Option<&str>, content: &str) -> MergedEvent {
+        e.glyph = glyph.map(str::to_string);
+        e.content = Some(content.into());
+        e
+    }
+
+    fn reply(from_repo: &str, to_repo: &str, agent: &str) -> OutgoingReply {
+        OutgoingReply {
+            operation_id: "op".into(),
+            delivery_id: "d".into(),
+            from: "claude".into(),
+            from_repo: from_repo.into(),
+            destination: clank_core::wait::MessageReplyRoute {
+                repo: to_repo.into(),
+                agent: clank_core::ids::AgentLabel::parse(agent).unwrap(),
+            },
+            original: MemberKey {
+                agent: "claude".into(),
+                source: "messages".into(),
+                seq: 1,
+                ident: "i".into(),
+            },
+            original_handle: "h".into(),
+            acknowledge: false,
+        }
+    }
+
+    /// The rows Life reported, which repeated the source's name where
+    /// its icon already says it.
+    #[test]
+    fn signal_voice_and_message_rows_say_who_they_are_for() {
+        let signal = saying(
+            event(Backend::Command, "signal", "signal", &["claude"]),
+            Some("💬"),
+            "can you book the dentist\nfor Thursday",
+        );
+        assert_eq!(
+            event_row_text(&signal),
+            "@claude  “can you book the dentist”"
+        );
+        let voice = saying(
+            event(Backend::Command, "voice", "voice", &["assistent", "claude"]),
+            Some("🎙"),
+            "remind me at 5",
+        );
+        assert_eq!(
+            event_row_text(&voice),
+            "@assistent,claude  “remind me at 5”"
+        );
+        let message = saying(
+            event(Backend::Message, "codex", "message", &["claude"]),
+            None,
+            "done",
+        );
+        assert_eq!(
+            event_row_text(&message),
+            "@claude  “done”",
+            "the sender is in the details, not in place of the recipient"
+        );
+        let item = TimelineItem::Github(0, &signal);
+        let rows = oneline_items_rows(&[item], &Default::default(), &Default::default());
+        assert_eq!(
+            oneline_plain_lines(&rows),
+            [format!(
+                "{} 💬 @claude  “can you book the dentist”",
+                signal.delivery().glyph()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_source_without_its_own_icon_is_named_and_a_distinct_kind_is_kept() {
+        let plain = saying(
+            event(Backend::Command, "deploys", "deploys", &["claude"]),
+            None,
+            "x",
+        );
+        assert_eq!(event_row_text(&plain), "@claude  deploys  “x”");
+        let kinded = saying(
+            event(Backend::Command, "deploys", "finished", &["claude"]),
+            None,
+            "x",
+        );
+        assert_eq!(event_row_text(&kinded), "@claude  deploys/finished  “x”");
+        let iconed = saying(
+            event(Backend::Command, "deploys", "finished", &["claude"]),
+            Some("🚀"),
+            "x",
+        );
+        assert_eq!(event_row_text(&iconed), "@claude  finished  “x”");
+        let mut broken = iconed.clone();
+        broken.kind = "clank.source-failure".into();
+        broken.failure = true;
+        assert_eq!(
+            event_row_text(&broken),
+            "@claude  deploys  “x”  (this SOURCE is broken, not the world)",
+            "a broken source is named whatever its icon"
+        );
+    }
+
+    #[test]
+    fn github_rows_keep_repo_number_and_action_but_not_the_actor() {
+        let mut pr = saying(
+            event(Backend::Github, "o/r", "pr_comment", &["claude"]),
+            None,
+            "Ship it",
+        );
+        pr.number = Some(12);
+        pr.detail = Some("review".into());
+        pr.actor = Some("alice".into());
+        assert_eq!(
+            event_row_text(&pr),
+            "@claude  o/r#12 pr_comment/review  “Ship it”"
+        );
+    }
+
+    #[test]
+    fn a_destination_nobody_recorded_is_shown_unknown_not_guessed() {
+        let orphan = saying(
+            event(Backend::Command, "deploys", "deploys", &[]),
+            Some("🚀"),
+            "x",
+        );
+        assert_eq!(event_row_text(&orphan), "@?  “x”");
+    }
+
+    #[test]
+    fn a_reply_names_its_target_and_the_repo_only_when_it_is_another() {
+        let mut here = saying(
+            event(Backend::Message, "claude", "message", &[]),
+            None,
+            "ok",
+        );
+        here.outgoing = vec![reply("/src/life", "/src/life", "codex")];
+        assert_eq!(event_row_text(&here), "→ @codex  “ok”");
+
+        let mut there = here.clone();
+        there.outgoing = vec![reply("/src/life", "/src/clank", "codex")];
+        assert_eq!(event_row_text(&there), "→ @codex (/src/clank)  “ok”");
+
+        let mut same_name = here.clone();
+        same_name.outgoing = vec![reply("/src/life", "/work/life", "codex")];
+        assert_eq!(
+            event_row_text(&same_name),
+            "→ @codex (/work/life)  “ok”",
+            "a repo is shown by its path, so one sharing the sender's name is not mistaken for it"
+        );
+
+        let mut both = there.clone();
+        both.seen_by = vec!["claude".into()];
+        assert_eq!(
+            event_row_text(&both),
+            "@claude → @codex (/src/clank)  “ok”",
+            "a local holder and a reply's target are both shown, each as what it is"
+        );
     }
 }

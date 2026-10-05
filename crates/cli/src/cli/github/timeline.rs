@@ -290,6 +290,27 @@ impl MergedEvent {
         DeliveryState::Acknowledged
     }
 
+    /// Who this event is for, from the copies that exist and the
+    /// routes replies were sent on — never the viewer, the sender or
+    /// the source's name.
+    pub(crate) fn destination(&self) -> Destination {
+        let mut outgoing: Vec<Recipient> = self
+            .outgoing
+            .iter()
+            .map(|reply| Recipient {
+                agent: reply.destination.agent.as_str().to_string(),
+                repo: (reply.destination.repo != reply.from_repo)
+                    .then(|| reply.destination.repo.clone()),
+            })
+            .collect();
+        outgoing.sort();
+        outgoing.dedup();
+        Destination {
+            local: self.seen_by.clone(),
+            outgoing,
+        }
+    }
+
     pub(crate) fn outgoing_only(&self) -> bool {
         self.members.is_empty() && !self.outgoing.is_empty()
     }
@@ -314,6 +335,63 @@ impl MergedEvent {
                 operation_id: o.operation_id.clone(),
             }))
             .collect()
+    }
+}
+
+/// Who an event is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Destination {
+    /// Local agents holding a copy, sorted and deduplicated.
+    pub(crate) local: Vec<String>,
+    /// Where replies were sent. Custody of a send, not evidence that
+    /// anyone there woke or acknowledged.
+    pub(crate) outgoing: Vec<Recipient>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Recipient {
+    pub(crate) agent: String,
+    /// Set when the recipient is in another repo, where the same label
+    /// may name a different agent. The whole path, because that is what
+    /// tells two of them apart: `/work/a/life` and `/work/b/life` are
+    /// different repos with one name.
+    pub(crate) repo: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Display for Destination {
+    /// `@foo,bar` for local holders, `→ @codex (~/src/life)` per route,
+    /// and `@?` when neither is known, rather than a guessed handler.
+    ///
+    /// Each name is made safe on its own and kept whole: a repo path may
+    /// legally hold a newline or an escape, and cutting at the first line
+    /// would let one name hide the next.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::cli::status_tui::text::one_line_whole;
+        let mut parts = Vec::new();
+        if !self.local.is_empty() {
+            let names: Vec<String> = self.local.iter().map(|l| one_line_whole(l)).collect();
+            parts.push(format!("@{}", names.join(",")));
+        }
+        for to in &self.outgoing {
+            let agent = one_line_whole(&to.agent);
+            parts.push(match &to.repo {
+                Some(repo) => format!("→ @{agent} ({})", one_line_whole(&repo_shown(repo))),
+                None => format!("→ @{agent}"),
+            });
+        }
+        if parts.is_empty() {
+            return f.write_str("@?");
+        }
+        f.write_str(&parts.join(" "))
+    }
+}
+
+/// A repo's path as its owner would type it: under their home, `~`.
+fn repo_shown(repo: &Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match home.as_deref().and_then(|h| repo.strip_prefix(h).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => repo.display().to_string(),
     }
 }
 
@@ -1108,7 +1186,10 @@ pub(crate) mod tests {
             "the configured glyph is the gutter badge: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.starts_with("? cmd ")),
+            lines.iter().any(|l| l.starts_with(&format!(
+                "? {} ",
+                crate::cli::log::default_badge(Backend::Command)
+            ))),
             "and an unconfigured source keeps the default: {lines:?}"
         );
     }
