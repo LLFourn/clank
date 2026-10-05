@@ -348,6 +348,128 @@ async fn timer_invocations_have_distinct_custody_and_old_calls_do_not_wake_peek(
 /// It used to be the command's completion
 /// (a-command-is-an-event-source-like-any-other): a source is a
 /// long-running producer now, so exiting is not news — a line is.
+/// A message keeps its lines from the producer that printed it to the
+/// reply that answers it.
+///
+/// Ingestion used to run the row preview `one_line` on the content, so
+/// every line after the first was gone before the event was stored. A
+/// later surface could render however it liked; there was nothing left
+/// to render. This drives the REAL path: one JSONL record from a real
+/// producer, the wait it wakes, the durable log, a replay, and a reply
+/// through the source's own `reply_command`.
+///
+/// The record's newlines are escaped inside its JSON string — it is ONE
+/// record, which is the producer contract, not one record per line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_multiline_message_survives_ingestion_storage_replay_and_reply() {
+    use clank_core::wait::WaitItem;
+    let _serial = common::serial();
+    let env = idle_env();
+    let repo = env.repo();
+
+    let raw = "Para one.\n\nPara two:\n  indented\n\tTabbed\tcols\n\
+               üñí 中文 ✓ 🎙\nColour \u{1b}[31mred\u{1b}[0m done\u{7}\n\
+               Title \u{1b}]0;evil\u{7}ok\r\nlast\n\
+               Bare esc\u{1b}\nkept\n\
+               Open \u{1b}]0;never ends\rnext\rafter";
+    // Everything a message is made of, kept; terminal control, gone whole.
+    // The last three lines are the losses codex found on 7233636: an ESC
+    // that took the newline after it, and an unterminated OSC that ran
+    // through CR-separated lines to the end of the message. A BARE CR, on
+    // purpose: after a CRLF the LF stops the sequence one byte later and
+    // the output is the same, so a CRLF here could not tell the fix from
+    // the bug — and a mutation run showed exactly that.
+    let expected = "Para one.\n\nPara two:\n  indented\n\tTabbed\tcols\n\
+                    üñí 中文 ✓ 🎙\nColour red done\nTitle ok\nlast\n\
+                    Bare esc\nkept\n\
+                    Open \nnext\nafter";
+
+    let record = serde_json::json!({
+        "id": "m1", "kind": "message", "requires_reply": true, "content": raw,
+    })
+    .to_string();
+    assert!(!record.contains('\n'), "the fixture is ONE JSONL record");
+    write(repo, "payload.jsonl", &format!("{record}\n"));
+    let reply_file = repo.join("reply.json");
+    let config = serde_json::json!({"wait_events": [{
+        "kind": "command",
+        "name": "signal",
+        "command": ["sh", "-c", format!(
+            "sleep 0.4; cat '{}'; sleep 300", repo.join("payload.jsonl").display()
+        )],
+        "reply_command": ["sh", "-c", format!("cat > '{}'", reply_file.display())],
+    }]})
+    .to_string();
+    write(repo, ".clank/agents/master/config.json", &config);
+    let args = |peek: bool| {
+        let mut a = wait_args(repo, Vec::new());
+        a.author = Some("master".into());
+        a.peek = peek;
+        a
+    };
+
+    // INGESTION: the wait wakes with the whole message.
+    let got = clank::cli::wait::items(args(false)).await.unwrap().unwrap();
+    let event = got
+        .iter()
+        .find(|i| matches!(i, WaitItem::CommandEvent { .. }))
+        .expect("woken by the message")
+        .clone();
+    let WaitItem::CommandEvent {
+        content,
+        requires_reply,
+        selector: Some(selector),
+        ..
+    } = &event
+    else {
+        panic!("a command event with a selector: {event:?}")
+    };
+    assert_eq!(content, expected, "the message as the agent receives it");
+    assert!(requires_reply, "the reply requirement rode along unchanged");
+
+    // STORAGE: the durable log holds exactly that body, so nothing that
+    // reads it later can be handed less.
+    let key = selector.split_once('@').unwrap().0;
+    let log = repo.join(format!(".clank/agents/master/events/{key}.jsonl"));
+    let stored = std::fs::read_to_string(&log).unwrap();
+    let encoded = serde_json::to_string(expected).unwrap();
+    assert!(
+        stored.contains(&encoded),
+        "the stored body is the whole message: {stored}"
+    );
+    assert!(!stored.contains("[31m"), "and carries no escape syntax");
+
+    // REPLAY: a later wait delivers the same item, byte for byte.
+    let replay = clank::cli::wait::items(args(false)).await.unwrap().unwrap();
+    assert!(replay.contains(&event), "replayed: {replay:?}");
+
+    // The receipt-aware READ is asserted in `events::read`'s own tests:
+    // it records delivery against a bound session, which this harness
+    // clears on purpose, and that module's identity seam supplies one
+    // without mutating the environment every other test shares.
+
+    // REPLY: still required, still routed — and the reply keeps its
+    // lines too, on its way back to the producer.
+    let answer = "Got it.\n\nWill do.";
+    clank::cli::events::run(clank::cli::EventsArgs {
+        command: clank::cli::EventsCmd::Ack(clank::cli::EventsAckArgs {
+            reply: Some(answer.into()),
+            repo: Some(repo.to_path_buf()),
+            author: Some("master".into()),
+            ids: vec![selector.clone()],
+        }),
+    })
+    .await
+    .expect("the reply is delivered and the event acked");
+    let delivered: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&reply_file).unwrap()).unwrap();
+    assert_eq!(delivered["reply"], answer, "{delivered}");
+    assert_eq!(delivered["id"], "m1");
+
+    let after = clank::cli::wait::items(args(true)).await.unwrap().unwrap();
+    assert!(!after.contains(&event), "answered, so no longer owed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_printed_event_wakes_a_parked_wait() {
     let _serial = common::serial();

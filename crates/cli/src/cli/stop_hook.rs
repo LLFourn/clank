@@ -2544,6 +2544,29 @@ fn render_wait_items(items: &[WaitItem], label: &AgentLabel, role: Role) -> Stri
     render_wait_items_ref(&refs, label, role)
 }
 
+/// An event's body, then what finishes it, for one line of a wake.
+///
+/// The body is the WHOLE message — it used to be capped at 300
+/// characters for timers and arrived pre-flattened for commands, so a
+/// second paragraph never reached the agent at all. A single-line body
+/// keeps the shape this line has always had. A multi-line one is
+/// indented under its item, so its later lines cannot read as the next
+/// item, and the ack moves to a line of its own: appended to the body's
+/// LAST line it read as part of the message rather than as the
+/// instruction for answering it.
+fn body_and_ack(content: Option<&str>, ack: &str) -> String {
+    const INDENT: &str = "      ";
+    let Some(content) = content.filter(|c| !c.is_empty()) else {
+        return ack.to_string();
+    };
+    let body = crate::cli::status_tui::text::indented_body(content, INDENT);
+    if body.contains('\n') && !ack.is_empty() {
+        format!(": {body}\n{INDENT}{}", ack.trim_start())
+    } else {
+        format!(": {body}{ack}")
+    }
+}
+
 fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) -> String {
     use clank_core::wait::WaitKind as K;
     let mut out = String::new();
@@ -2691,12 +2714,6 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                     .due_at
                     .map(|at| at.to_string())
                     .unwrap_or_else(|| "?".into());
-                let content = item
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.is_empty())
-                    .map(|c| format!(": {}", crate::cli::wait::one_line(c, 300)))
-                    .unwrap_or_default();
                 let ack = item
                     .selector
                     .as_deref()
@@ -2707,19 +2724,14 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                     .as_ref()
                     .map(|r| format!(" ({})", crate::cli::events::recurrence_summary(r)))
                     .unwrap_or_default();
+                let body = body_and_ack(item.content.as_deref(), &ack);
                 out.push_str(&format!(
-                    "  - timer: {name} due at {due}{recurrence}{content}{ack}\n"
+                    "  - timer: {name} due at {due}{recurrence}{body}\n"
                 ));
             }
             K::CommandEvent => {
                 let name = item.name.as_deref().unwrap_or("?");
                 let event = item.event.as_deref().unwrap_or("?");
-                let content = item
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.is_empty())
-                    .map(|c| format!(": {c}"))
-                    .unwrap_or_default();
                 // A source reporting itself broken is not news about
                 // the world, and the remedy is not to act on it.
                 let lead = if item.failure.unwrap_or(false) {
@@ -2741,7 +2753,8 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                         }
                     })
                     .unwrap_or_default();
-                out.push_str(&format!("  - {lead}: {name} {event}{content}{ack}\n"));
+                let body = body_and_ack(item.content.as_deref(), &ack);
+                out.push_str(&format!("  - {lead}: {name} {event}{body}\n"));
             }
             K::DraftChanged => {
                 let pr = item.pr.map(|n| format!("#{n}")).unwrap_or("?".into());
@@ -5633,10 +5646,85 @@ mod tests {
         );
         let items = parse_wait_json(wire.to_string().as_bytes()).unwrap();
         let hint = render_wait_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Master);
-        assert!(hint.contains("timer: deploy due at 1: check now"), "{hint}");
-        assert!(hint.contains("clank events ack timer-config-deploy-abcd@3"));
+        // The body arrives WHOLE, its second line indented under its
+        // item so it cannot read as the next one, and the ack on a line
+        // of its own rather than at the end of the message. This used to
+        // assert `check now` — the agent was told something the timer
+        // never said.
+        assert!(
+            hint.contains(
+                "  - timer: deploy due at 1: check\n      now\n      \
+                 — ack `clank events ack timer-config-deploy-abcd@3`\n"
+            ),
+            "{hint}"
+        );
         assert!(!hint.contains('\u{1b}'));
         assert!(hint.contains("fires until the event is acked"));
+    }
+
+    /// A command event wakes its agent with the WHOLE message, through
+    /// the same JSON wire the hook consumes from `clank wait --json`.
+    ///
+    /// Before this the wake carried the content raw, which was only safe
+    /// because ingestion had already cut it to one line. A second line
+    /// now arrives indented under its item — so it cannot be read as the
+    /// next item — and the reply recipe sits on its own line instead of at
+    /// the end of the message, where it read as something the producer
+    /// had said.
+    #[test]
+    fn a_command_wake_carries_the_whole_body_and_its_reply_recipe() {
+        let body = "Para one.\n\n  indented\n\tTabbed\nüñí ✓";
+        let item = clank_core::wait::WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
+            name: "signal".into(),
+            id: "m1".into(),
+            event: "message".into(),
+            content: body.into(),
+            at: None,
+            failure: false,
+            requires_reply: true,
+            reply_route: None,
+            selector: Some("command-signal-0@1".into()),
+        };
+        let wire = serde_json::json!({"items": [crate::cli::wait::render_json(&item)]});
+        let items = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        let hint = render_wait_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Master);
+
+        let at = hint.find("  - command: signal message: ").expect(&hint);
+        let mut lines = hint[at + "  - command: signal message: ".len()..].split('\n');
+        let mut got = vec![lines.next().unwrap().to_string()];
+        let mut rest: Vec<&str> = lines.collect();
+        // Everything indented under the item is body, then the recipe.
+        let recipe = rest
+            .iter()
+            .position(|l| l.starts_with("      — reply required"))
+            .expect(&hint);
+        got.extend(
+            rest.drain(..recipe)
+                .map(|l| l.strip_prefix("      ").unwrap_or(l).to_string()),
+        );
+        assert_eq!(got.join("\n"), body, "{hint}");
+        assert!(
+            rest[0].contains("clank events ack command-signal-0@1 --reply"),
+            "{hint}"
+        );
+
+        // A single-line body keeps exactly the shape it always had.
+        let mut one = item.clone();
+        if let clank_core::wait::WaitItem::CommandEvent { content, .. } = &mut one {
+            *content = "just this".into();
+        }
+        let wire = serde_json::json!({"items": [crate::cli::wait::render_json(&one)]});
+        let items = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        let hint = render_wait_items(&items, &AgentLabel::parse("codex").unwrap(), Role::Master);
+        assert!(
+            hint.contains(
+                "  - command: signal message: just this — reply required; use \
+                 `clank events ack command-signal-0@1 --reply <text>`\n"
+            ),
+            "{hint}"
+        );
     }
 
     #[test]

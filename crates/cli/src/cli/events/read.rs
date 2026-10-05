@@ -224,6 +224,101 @@ mod tests {
             .unwrap()
         );
     }
+    /// A RECEIPT-AWARE read hands over the whole message, lines intact.
+    ///
+    /// The event is built by real ingestion from one JSONL record, so this
+    /// is the body that command sources actually store — not a body typed
+    /// into the fixture. Read is where a person or an agent goes for the
+    /// full text when the wake or the row only summarised it, so if a line
+    /// were lost anywhere upstream, this is where it would show.
+    ///
+    /// Lives here rather than in the integration harness because the
+    /// receipt is recorded against a bound SESSION, and the harness clears
+    /// session identity on purpose; this module's `Ambient` seam supplies
+    /// one without touching the process environment other tests share.
+    #[test]
+    fn a_read_hands_over_the_whole_ingested_message_and_stamps_its_receipt() {
+        let (repo, reader, _) = fixture();
+        let dir = crate::agent_store::agents_root(repo.path()).join("reader/events");
+        let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
+            name: "signal".into(),
+            command: vec!["true".into()],
+            reply_command: None,
+            receipt_command: None,
+            glyph: None,
+        };
+        let raw = "Para one.\n\n  indented\n\tTabbed\tcols\nüñí 中文 ✓\n\
+                   Colour \u{1b}[31mred\u{1b}[0m done\r\nlast";
+        let expected = "Para one.\n\n  indented\n\tTabbed\tcols\nüñí 中文 ✓\n\
+                        Colour red done\nlast";
+        let record = serde_json::json!({"id": "m1", "kind": "message", "content": raw}).to_string();
+        let seen = crate::cli::source_ids::Seen::at(&dir, "command-signal-0");
+        let Some(crate::cli::command_source::Ingested::Emit { item, .. }) =
+            crate::cli::command_source::ingest_line(&src, &seen, &record)
+        else {
+            panic!("the record ingests")
+        };
+        let mut log = EventLog::open(&dir, "command-signal-0").unwrap();
+        log.append_inbox(Transport::Command, Some("m1"), None, None, &item)
+            .unwrap();
+        let rows = read_all(&dir).unwrap();
+        let log_path = dir.join("command-signal-0.jsonl");
+
+        // What an agent reading `--json` is handed.
+        let mut json = Vec::new();
+        present(
+            repo.path(),
+            &reader,
+            &rows,
+            &Default::default(),
+            "command-signal-0@1",
+            true,
+            &mut json,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["item"]["content"], expected);
+
+        // What a person reads: the body block, its continuation lines
+        // indented under `body:` and recovered exactly by removing that.
+        let mut human = Vec::new();
+        present(
+            repo.path(),
+            &reader,
+            &rows,
+            &Default::default(),
+            "command-signal-0@1",
+            false,
+            &mut human,
+        )
+        .unwrap();
+        let human = String::from_utf8(human).unwrap();
+        let start =
+            human.find("body:      ").expect("the full body is shown") + "body:      ".len();
+        let mut lines = human[start..].split('\n');
+        let mut body = vec![lines.next().unwrap().to_string()];
+        body.extend(
+            lines
+                .map_while(|l| l.strip_prefix("           "))
+                .map(str::to_string),
+        );
+        assert_eq!(body.join("\n"), expected, "{human}");
+
+        assert!(
+            state_of(&dir).row.woken_at.is_some(),
+            "delivery was recorded"
+        );
+        assert!(
+            String::from_utf8(std::fs::read(&log_path).unwrap())
+                .unwrap()
+                .contains(&serde_json::to_string(expected).unwrap()),
+            "and reading never rewrote the stored body"
+        );
+    }
+    fn state_of(dir: &Path) -> Sourced {
+        read_all(dir).unwrap().remove(0)
+    }
     struct Broken {
         flush: bool,
     }

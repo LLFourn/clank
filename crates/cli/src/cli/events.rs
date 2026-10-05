@@ -782,20 +782,11 @@ pub(crate) fn ack_members(
     Ok(n)
 }
 
-/// Terminal-safe text: non-newline control characters collapse to
-/// spaces, newlines survive (the events-show cleanup, shared with
-/// the TUI event page).
-pub(crate) fn sanitize_multiline(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
-        .collect()
-}
-
 /// The full body is useful when it exceeds the displayed single-line
 /// content summary, even if both fields contain the same stored text.
 fn shown_body(item: &WaitItem) -> Option<String> {
     let view = item.event_view()?;
-    let full = sanitize_multiline(view.body?);
+    let full = crate::cli::status_tui::text::safe_multiline(view.body?);
     let summary = view
         .content
         .map(|text| crate::cli::status_tui::text::one_line(text, usize::MAX));
@@ -847,7 +838,8 @@ fn render_full(
         writeln!(
             writer,
             "answer:    {}",
-            sanitize_multiline(&reply.text).replace('\n', "\n           ")
+            crate::cli::status_tui::text::safe_multiline(&reply.text)
+                .replace('\n', "\n           ")
         )?;
         writeln!(writer, "accepted:  {}", s.row.reply_accepted)?;
     }
@@ -878,12 +870,12 @@ fn render_full(
             writer,
             "reply to:  {} ({})",
             op.route.agent,
-            sanitize_multiline(&op.route.repo.display().to_string())
+            crate::cli::status_tui::text::safe_multiline(&op.route.repo.display().to_string())
         )?;
         writeln!(
             writer,
             "reply:     {}",
-            sanitize_multiline(&op.text).replace('\n', "\n           ")
+            crate::cli::status_tui::text::safe_multiline(&op.text).replace('\n', "\n           ")
         )?;
     }
     if let Some(url) = s.row.item.event_view().and_then(|v| v.github?.url) {
@@ -903,7 +895,7 @@ fn render_full(
         // Full text (multi-line preserved), but non-newline control
         // characters must not reach the terminal raw; continuation
         // lines align under the value column.
-        let clean = sanitize_multiline(p);
+        let clean = crate::cli::status_tui::text::safe_multiline(p);
         writeln!(
             writer,
             "prompt:    {}",
@@ -968,8 +960,11 @@ mod tests {
         assert_eq!(line, "timer  deploy  “Check deployment”");
         assert!(!line.chars().any(char::is_control));
         let body = shown_body(&row.row.item).expect("multiline content must be shown as a body");
-        assert!(body.contains("\nReport result \nFull body"), "{body:?}");
-        assert!(!body.chars().any(|c| c.is_control() && c != '\n'));
+        // Exact, not `contains`: the escapes go WHOLE (the old policy
+        // turned ESC into a space and left `[31m` behind), the tab
+        // survives as a tab, and the CRLF is one newline rather than a
+        // space and a newline.
+        assert_eq!(body, "Check deployment\t\nReport result\nFull body");
         let json = serde_json::to_value(json_row(&rows, row, &Default::default())).unwrap();
         assert_eq!(json["item"]["content"], content);
         let plain = WaitItem::TimerEvent {

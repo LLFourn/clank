@@ -2756,12 +2756,19 @@ fn render_human(item: &WaitItem) -> String {
                     parts.push(format!("#{n}"));
                 }
             }
-            if let Some(c) = v.content {
-                parts.push(if matches!(e, WaitItem::TimerEvent { .. }) {
-                    one_line(c, 300)
-                } else {
-                    c.to_string()
-                });
+            // The WHOLE body, safe for a terminal. A single line keeps its
+            // place in the row; more than one leaves the row and follows
+            // it indented — inline, the second line would start what
+            // reads as the next item, and the ack after it would sit at
+            // the end of the message instead of beside the event. Timer
+            // bodies used to be cut at 300 characters here, and command
+            // bodies arrived already cut to their first line.
+            let body = v
+                .content
+                .map(crate::cli::status_tui::text::safe_multiline)
+                .filter(|b| !b.is_empty());
+            if let Some(b) = body.as_deref().filter(|b| !b.contains('\n')) {
+                parts.push(b.to_string());
             }
             if let Some(g) = &v.github {
                 if let Some(a) = g.actor {
@@ -2785,6 +2792,12 @@ fn render_human(item: &WaitItem) -> String {
                 }
             }
             let mut line = parts.join("  ");
+            if let Some(b) = body.as_deref().filter(|b| b.contains('\n')) {
+                const INDENT: &str = "         ";
+                line.push('\n');
+                line.push_str(INDENT);
+                line.push_str(&crate::cli::status_tui::text::indented_body(b, INDENT));
+            }
             // The operator's per-watch prompt rides as ONE indented
             // follow-on line: control chars collapse (same treatment
             // as PR titles — operator text must not restructure the
@@ -3926,7 +3939,7 @@ mod shared_tests {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn recurring_timer_human_hint_is_one_line_and_reports_immutable_range() {
+    fn recurring_timer_human_hint_is_terminal_safe_and_carries_the_whole_body() {
         let r = crate::cli::timer_source::recurrence::Recurrence::from_generation(
             clank_core::agent_config::TimerGeneration {
                 name: "deploy\nextra\u{1b}".into(),
@@ -3948,7 +3961,25 @@ mod tests {
         let hint = super::render_human(&item);
         assert!(hint.contains("5 scheduled occurrences"), "{hint}");
         assert!(hint.contains("every 10s"));
-        assert!(!hint.chars().any(char::is_control));
+        // Terminal-safe: no escape and no control except the layout two.
+        // It used to forbid `\n` outright, because the body was flattened
+        // into the row — which is how a timer's second line was lost.
+        assert!(
+            !hint
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "{hint:?}"
+        );
+        // The NAME is an identifier and still cannot open a new line...
+        let header = hint.lines().next().unwrap();
+        assert!(header.contains("deploy extra"), "{header}");
+        // ...and the row carries NO copy of a multi-line body. A
+        // flattened one there — `check now` — is the very text the timer
+        // never said, and a mutation that left it in beside the real
+        // body below survived until this line existed.
+        assert!(!header.contains("check"), "{header}");
+        // ...while the BODY arrives whole, below the row it belongs to.
+        assert!(hint.ends_with("\n         check\n         now"), "{hint:?}");
     }
 
     use super::*;

@@ -75,6 +75,72 @@ pub(super) fn label(name: &str) -> Span {
     dim(format!("{name:>5}  "))
 }
 
+/// Where a tab advances to in a body, in display columns.
+pub(super) const TAB_STOP: usize = 4;
+
+/// Wrap a BODY to `width` columns, keeping every character it has.
+///
+/// Not [`wrap`], which is for prose rows: it splits on whitespace and
+/// rejoins with single spaces, so it erases leading indentation,
+/// collapses repeated spaces and turns a tab into one space. For a
+/// summary that is fine. For a message whose layout is part of what it
+/// says — a list, a table, a snippet of code — it made the detail page
+/// show something the producer never sent, while `clank events read`
+/// showed the real thing (codex on 7233636).
+///
+/// Nothing is dropped or merged. Each line keeps its indentation and
+/// internal spacing; a tab advances to the next multiple of
+/// [`TAB_STOP`], expanded to spaces so the width arithmetic stays true;
+/// a blank line is one blank row; and a line too wide for the pane is
+/// broken after its last space when that space lies in the text rather
+/// than its indentation, and hard otherwise. Graphemes are never split.
+///
+/// So the rows of one line, joined, give back that line with its tabs
+/// expanded — every part of the body stays reachable at any width.
+pub(super) fn wrap_body(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut expanded = String::with_capacity(line.len());
+        let mut col = 0usize;
+        for g in line.graphemes(true) {
+            if g == "\t" {
+                let pad = TAB_STOP - col % TAB_STOP;
+                expanded.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            } else {
+                expanded.push_str(g);
+                col += UnicodeWidthStr::width(g);
+            }
+        }
+        let mut row = String::new();
+        let mut used = 0usize;
+        for g in expanded.graphemes(true) {
+            let gw = UnicodeWidthStr::width(g);
+            if used + gw > width && !row.is_empty() {
+                let text_space = row
+                    .rfind(' ')
+                    .filter(|&at| row[..at].chars().any(|c| c != ' '));
+                match text_space {
+                    Some(at) => {
+                        let carried = row.split_off(at + 1);
+                        rows.push(std::mem::replace(&mut row, carried));
+                        used = display_width(&row);
+                    }
+                    None => {
+                        rows.push(std::mem::take(&mut row));
+                        used = 0;
+                    }
+                }
+            }
+            row.push_str(g);
+            used += gw;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Wrap `text` to `width` display columns, breaking on whitespace and
 /// hard-breaking a single token wider than `width` (a long id/URL
 /// can't overflow). `width == 0` degrades to one line per
@@ -222,36 +288,150 @@ pub(crate) fn one_line(s: &str, cols: usize) -> String {
     truncate_to(&first, cols)
 }
 
-/// `s` without its escape sequences — CSI (`ESC [ … final`), OSC
-/// (`ESC ] … BEL` or `ESC \`) and a lone `ESC x` — whole, so a
-/// coloured diagnostic loses its colour and not just its ESC, which
-/// left `[31m` in the text (codex on 5fd8a69).
+/// `s` without its terminal escape sequences, each removed WHOLE.
+///
+/// Whole, because dropping only the ESC leaves its syntax behind as
+/// text: `"\x1b[31mred"` became `" [31mred"`, and a test once pinned
+/// that as correct (codex on 5fd8a69, and again on 79e4476).
+///
+/// Every introducer a terminal acts on, 7-bit and 8-bit alike — an
+/// 8-bit C1 introducer is one codepoint and a terminal in the right
+/// mode treats it exactly like its two-byte form:
+///
+/// - CSI, `ESC [` or U+009B: parameter and intermediate bytes
+///   (0x20–0x3F) and one final byte (0x40–0x7E). A byte that is
+///   neither ends the sequence WITHOUT being consumed, so a malformed
+///   CSI followed by a newline keeps the newline.
+/// - OSC, `ESC ]` or U+009D: up to BEL, ST (`ESC \` or U+009C), or
+///   the end of the line — LF, CR or CRLF, none of them consumed.
+/// - DCS/SOS/PM/APC, `ESC P`/`X`/`^`/`_` or U+0090/0098/009E/009F: up
+///   to ST or the end of the line, likewise.
+/// - Any other `ESC x`: both characters — unless `x` is a line end or a
+///   tab, which is layout and stays; only the ESC goes.
+///
+/// The end of the LINE bounds a string sequence on purpose. A terminal
+/// waits for BEL or ST, so an unterminated OSC from a producer would
+/// otherwise swallow every paragraph after it — for message content
+/// that is silent loss. No legitimate title or hyperlink payload
+/// contains a newline, so stopping there costs nothing real.
 pub(super) fn strip_escapes(s: &str) -> String {
+    enum Seq {
+        Csi,
+        Osc,
+        Str,
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for c in chars.by_ref() {
+        let seq = match c {
+            // Peeked, not taken: a LAYOUT character after an ESC is not
+            // its final byte. Taking it unconditionally turned
+            // `first\x1b\nsecond` into `firstsecond` — a lost line, and
+            // stored, so lost for good (codex on 7233636).
+            '\x1b' => match chars.peek() {
+                Some('\n' | '\r' | '\t') | None => continue,
+                Some(_) => match chars.next() {
+                    Some('[') => Seq::Csi,
+                    Some(']') => Seq::Osc,
+                    Some('P' | 'X' | '^' | '_') => Seq::Str,
+                    _ => continue,
+                },
+            },
+            '\u{9b}' => Seq::Csi,
+            '\u{9d}' => Seq::Osc,
+            '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => Seq::Str,
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        match seq {
+            Seq::Csi => {
+                while let Some(&c) = chars.peek() {
+                    if ('\x20'..='\x3f').contains(&c) {
+                        chars.next();
+                        continue;
+                    }
                     if ('\x40'..='\x7e').contains(&c) {
+                        chars.next();
+                    }
+                    break;
+                }
+            }
+            Seq::Osc | Seq::Str => {
+                while let Some(&c) = chars.peek() {
+                    // Any line end bounds it, CR included. This runs
+                    // BEFORE `safe_multiline` turns a bare CR into a
+                    // newline, so checking LF alone let an unterminated
+                    // OSC run through `\r`-separated lines to the end.
+                    if c == '\n' || c == '\r' {
+                        break;
+                    }
+                    chars.next();
+                    if c == '\u{9c}' || (matches!(seq, Seq::Osc) && c == '\x07') {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
                         break;
                     }
                 }
             }
-            Some(']') => {
-                let mut prev = '\0';
-                for c in chars.by_ref() {
-                    if c == '\x07' || (prev == '\x1b' && c == '\\') {
-                        break;
-                    }
-                    prev = c;
+        }
+    }
+    out
+}
+
+/// Untrusted text made safe to show IN FULL: the one policy for any
+/// body a person or an agent will read whole.
+///
+/// It removes terminal control and nothing else. Lines, blank lines,
+/// indentation, tabs and every printable Unicode character survive;
+/// escape sequences go whole (see [`strip_escapes`]); `\r\n` and a lone
+/// `\r` become `\n`, since a bare carriage return redraws a terminal
+/// line over itself; and every other control character — the rest of
+/// C0, DEL and C1 — is dropped.
+///
+/// Deliberately NOT [`one_line`]. That is a PREVIEW, for a row with a
+/// fixed width, and it keeps only the first line. Used at command-
+/// event ingestion it threw every later line away before the event
+/// was ever stored, and nothing downstream could recover it.
+pub(crate) fn safe_multiline(s: &str) -> String {
+    let stripped = strip_escapes(s);
+    let mut out = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
                 }
+                out.push('\n');
             }
-            _ => {}
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// [`safe_multiline`], with every line after the first indented by
+/// `indent` — for a body emitted INSIDE a list, where an unindented
+/// second line would read as the list's next item.
+///
+/// A blank line stays blank rather than becoming a run of spaces, so
+/// stripping `indent` from each continuation line gives back exactly
+/// the safe body.
+pub(crate) fn indented_body(s: &str, indent: &str) -> String {
+    let safe = safe_multiline(s);
+    let mut lines = safe.split('\n');
+    let mut out = lines.next().unwrap_or("").to_string();
+    for line in lines {
+        out.push('\n');
+        if !line.is_empty() {
+            out.push_str(indent);
+            out.push_str(line);
         }
     }
     out
@@ -838,6 +1018,156 @@ mod tests {
             }
             let wrapped = wrap(&format!("{icon}{icon}"), width);
             assert_eq!(wrapped, vec![icon, icon]);
+        }
+    }
+
+    /// The policy every full body goes through, on each shape it has to
+    /// get right. Codex's charge on 79e4476 was that dropping only the
+    /// ESC leaves escape syntax in the message, so every introducer is
+    /// checked both ways a terminal accepts it.
+    #[test]
+    fn safe_multiline_removes_terminal_control_and_nothing_else() {
+        let safe = safe_multiline;
+
+        // Everything a message is made of survives unchanged.
+        let text = "para one\n\n  indented\tafter a tab\nüñí 中文 ✓ 🎙\n";
+        assert_eq!(safe(text), text);
+
+        // Escape sequences go WHOLE — never their syntax.
+        assert_eq!(safe("a\x1b[31mred\x1b[0mb"), "aredb", "7-bit CSI");
+        assert_eq!(safe("a\u{9b}31mred\u{9b}0mb"), "aredb", "8-bit CSI");
+        assert_eq!(safe("a\x1b]0;title\x07b"), "ab", "OSC to BEL");
+        assert_eq!(safe("a\x1b]8;;http://x\x1b\\b"), "ab", "OSC to 7-bit ST");
+        assert_eq!(safe("a\u{9d}0;title\u{9c}b"), "ab", "8-bit OSC to 8-bit ST");
+        assert_eq!(safe("a\x1bPq#0;2;0;0;0\x1b\\b"), "ab", "DCS (sixel) to ST");
+        assert_eq!(safe("a\x1b_payload\x1b\\b"), "ab", "APC to ST");
+        assert_eq!(safe("a\x1b7b\x1b8c"), "abc", "two-byte ESC x");
+
+        // A sequence that never terminates costs ONE LINE, not the rest
+        // of the message: a terminal would swallow everything after it,
+        // and for stored content that is silent loss of every paragraph.
+        assert_eq!(
+            safe("lost \x1b]0;never ends\nsecond paragraph"),
+            "lost \nsecond paragraph"
+        );
+        // A malformed CSI stops where it stops being CSI, and the byte
+        // that ended it is kept.
+        assert_eq!(safe("a\x1b[3\nb"), "a\nb");
+
+        // Isolated controls go; carriage returns become line ends rather
+        // than redrawing a line over itself.
+        assert_eq!(safe("a\x07b\x00c\x7fd\u{85}e"), "abcde");
+        assert_eq!(safe("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(safe("\x1b"), "", "a lone ESC at the end");
+
+        // An isolated ESC before LAYOUT loses only itself (codex on
+        // 7233636: these produced `firstsecond` and `first`).
+        assert_eq!(safe("first\x1b\nsecond"), "first\nsecond");
+        assert_eq!(safe("first\x1b\r\nsecond"), "first\nsecond");
+        assert_eq!(safe("first\x1b\rsecond"), "first\nsecond");
+        assert_eq!(safe("a\x1b\tb"), "a\tb");
+        // An unterminated string sequence ends at the line, whichever
+        // line end the producer used.
+        for (end, why) in [("\n", "LF"), ("\r\n", "CRLF"), ("\r", "bare CR")] {
+            assert_eq!(
+                safe(&format!("first\x1b]unterminated{end}second{end}third")),
+                "first\nsecond\nthird",
+                "unterminated OSC at {why}"
+            );
+            assert_eq!(
+                safe(&format!("first\x1bPq#0{end}second")),
+                "first\nsecond",
+                "unterminated DCS at {why}"
+            );
+        }
+    }
+
+    /// An indented body gives back exactly the safe body once the
+    /// indent is taken off its continuation lines — so an agent reading
+    /// a wake can recover the message, blank lines included.
+    #[test]
+    fn indented_body_round_trips_to_the_safe_body() {
+        let raw = "first\n\n  second\x1b[1m\n\tthird";
+        let indent = "      ";
+        let shown = indented_body(raw, indent);
+        assert_eq!(shown, "first\n\n        second\n      \tthird");
+        let recovered: Vec<&str> = shown
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    l
+                } else {
+                    l.strip_prefix(indent).unwrap_or(l)
+                }
+            })
+            .collect();
+        assert_eq!(recovered.join("\n"), safe_multiline(raw));
+    }
+
+    /// The ROW preview is still a preview: one line, no control, no
+    /// escape syntax. It is right for a row and wrong for a body, which
+    /// is why ingestion no longer uses it.
+    #[test]
+    fn one_line_remains_a_preview() {
+        assert_eq!(
+            one_line("first \x1b[31mred\nsecond", usize::MAX),
+            "first red"
+        );
+    }
+
+    /// A body keeps its layout at any width, and nothing in it becomes
+    /// unreachable. `wrap("  indented\tcols", 80)` gave
+    /// `["indented cols"]` — indentation gone, tab gone — and that was
+    /// the TUI detail page's rendering of a body (codex on 7233636).
+    #[test]
+    fn wrap_body_keeps_layout_and_every_character() {
+        // Wide enough: the line is untouched, tabs to the next stop.
+        assert_eq!(wrap_body("  indented\tcols", 80), ["  indented  cols"]);
+        assert_eq!(wrap_body("a    b", 80), ["a    b"], "repeated spaces");
+        assert_eq!(wrap_body("\tx", 80), ["    x"], "a leading tab");
+        assert_eq!(wrap_body("ab\tx", 80), ["ab  x"], "a tab mid-stop");
+        assert_eq!(
+            wrap_body("one\n\nthree", 80),
+            ["one", "", "three"],
+            "blank line"
+        );
+
+        // Narrow: break after a space in the text, never inside the
+        // indentation, and hard when there is no such space.
+        assert_eq!(wrap_body("  aa bb cc", 6), ["  aa ", "bb cc"]);
+        assert_eq!(wrap_body("    abcdefgh", 6), ["    ab", "cdefgh"]);
+        assert_eq!(wrap_body("中文中文", 5), ["中文", "中文"], "double-width");
+        assert_eq!(
+            wrap_body("e\u{301}e\u{301}e\u{301}", 2),
+            ["e\u{301}e\u{301}", "e\u{301}"],
+            "a combining mark stays with its base"
+        );
+        assert_eq!(wrap_body("🎙x", 1), ["🎙", "x"], "wider than the pane");
+
+        // Reachability, exactly: at every width, the rows of each line
+        // joined back give that line with its tabs expanded.
+        let body = "Para one is long enough to wrap.\n\n  indented    spaced\n\tcol\tcol\n中文 ✓ 🎙";
+        for width in 1..=40 {
+            let rows = wrap_body(body, width);
+            for row in &rows {
+                assert!(display_width(row) <= width.max(2), "{width}: {row:?}");
+            }
+            let mut rows = rows.into_iter();
+            for line in body.split('\n') {
+                let expanded = wrap_body(line, usize::MAX).remove(0);
+                // A blank line is exactly one row; any other takes rows
+                // until its text is back, and must not take more.
+                let mut got = String::new();
+                loop {
+                    got.push_str(&rows.next().expect("every line has its rows"));
+                    if got.len() >= expanded.len() {
+                        break;
+                    }
+                }
+                assert_eq!(got, expanded, "width {width}");
+            }
+            assert!(rows.next().is_none(), "no extra rows at width {width}");
         }
     }
 }

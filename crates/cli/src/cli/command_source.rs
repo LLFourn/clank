@@ -240,11 +240,13 @@ pub(crate) fn ingest_line(
             // Defaults to the source's name: with nothing filtering on
             // it, a producer that omits it means "one of mine".
             event: kind.unwrap_or_else(|| src.name.clone()),
-            // Untrusted text on its way to a TUI row and a web page:
-            // first line only, control bytes dropped.
-            content: crate::cli::status_tui::text::one_line(
+            // Untrusted, so terminal control goes — but this is the
+            // STORED body, and every later surface reads it. A row
+            // preview here (it was `one_line`) kept the first line and
+            // threw the rest away before the event existed, so nothing
+            // downstream could ever recover a second paragraph.
+            content: crate::cli::status_tui::text::safe_multiline(
                 line.content.as_deref().unwrap_or(""),
-                usize::MAX,
             ),
             at: line.at,
             failure: false,
@@ -515,7 +517,7 @@ fn failure_event(
         name: src.name.clone(),
         id: id.to_string(),
         event: FAILURE_KIND.to_string(),
-        content: crate::cli::status_tui::text::one_line(why, usize::MAX),
+        content: crate::cli::status_tui::text::safe_multiline(why),
         at: None,
         failure: true,
         requires_reply: false,
@@ -1158,16 +1160,23 @@ mod tests {
         assert!(parse_line("   ").is_none(), "a blank line is not an error");
     }
 
-    /// Content is untrusted text: one line, no control bytes.
+    /// The stored body is the WHOLE message, minus terminal control.
+    ///
+    /// This test used to assert the opposite — `!content.contains
+    /// ("second")` — because ingestion ran the row preview `one_line`
+    /// and kept only the first line. The event was stored already cut,
+    /// so no later surface could show a second paragraph however it
+    /// rendered. The half of the old test that was a real contract
+    /// stays: no escape reaches the body, and now not even its syntax.
     #[test]
-    fn content_cannot_carry_control_bytes_into_a_row() {
+    fn content_keeps_its_lines_and_loses_only_terminal_control() {
         let src = src_named("s");
         let dir = tmpdir();
         let seen = Seen::at(dir.path(), KEY);
         let what = ingest_line(
             &src,
             &seen,
-            r#"{"id":"1","kind":"k","content":"first\u001b[31mred\nsecond"}"#,
+            r#"{"id":"1","kind":"k","content":"first \u001b[31mred\u001b[0m\n\n  indented\tcol\r\nüñí 中文 ✓\u0007\u001b]0;title\u0007end"}"#,
         )
         .expect("not blank");
         let Ingested::Emit { item, .. } = what else {
@@ -1176,9 +1185,11 @@ mod tests {
         let WaitItem::CommandEvent { content, .. } = *item else {
             panic!("expected a command event")
         };
-        assert!(!content.contains('\u{1b}'), "no escapes: {content:?}");
-        assert!(!content.contains('\n'), "one line only: {content:?}");
-        assert!(content.starts_with("first") && !content.contains("second"));
+        assert_eq!(
+            content, "first red\n\n  indented\tcol\nüñí 中文 ✓end",
+            "every line, the blank one, the indent, the tab and the Unicode survive; \
+             the colour, the bell and the title sequence go whole, and CRLF is a newline"
+        );
     }
 
     /// The backend's directory is its own, distinct per source, and a

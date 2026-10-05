@@ -86,7 +86,7 @@ pub(crate) async fn deliver(
         if !status.success() {
             anyhow::bail!(
                 "backend callback exited {status}: {}",
-                crate::cli::events::sanitize_multiline(&tail).trim()
+                crate::cli::status_tui::text::safe_multiline(&tail).trim()
             );
         }
         Ok(())

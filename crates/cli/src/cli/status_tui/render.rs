@@ -2994,6 +2994,24 @@ fn event_action_row(a: EventAction) -> (&'static str, &'static str, &'static str
 /// control-char-sanitized (the events-show cleanup), scrolled with
 /// the plan page's document model so long multiline prompts are
 /// always reachable, with the pinned key-summary row last.
+/// An event's full text, as rows of the detail page.
+///
+/// ONE helper for both places a body is shown, because they had already
+/// drifted into the same mistake twice: each ran the prose wrapper over
+/// the body line by line. [`super::text::wrap_body`] keeps the layout
+/// the producer sent.
+fn push_body(body: &mut Vec<String>, text: &str, cols: usize) {
+    let width = cols.saturating_sub(4).max(1);
+    let safe = crate::cli::status_tui::text::safe_multiline(text);
+    for row in super::text::wrap_body(safe.trim_end_matches('\n'), width) {
+        body.push(if row.is_empty() {
+            String::new()
+        } else {
+            emit(&[plain(format!("  {row}"))], "", cols)
+        });
+    }
+}
+
 pub(super) fn render_event_detail(
     ep: &super::input::EventPage,
     actions: &[EventAction],
@@ -3002,7 +3020,7 @@ pub(super) fn render_event_detail(
     cols: usize,
 ) -> (Vec<String>, usize) {
     let ev = &ep.event;
-    let clean = |s: &str| crate::cli::events::sanitize_multiline(s).replace('\n', " ");
+    let clean = |s: &str| crate::cli::status_tui::text::safe_multiline(s).replace('\n', " ");
     let mut out: Vec<String> = Vec::new();
     // The SAME glyphs the timeline row uses. A page that called this
     // state something else made the reader translate between two
@@ -3074,7 +3092,7 @@ pub(super) fn render_event_detail(
                 } else {
                     // Same display-width wrap the prompts use, so wide
                     // glyphs stay reachable through the scroll.
-                    for line in crate::cli::events::sanitize_multiline(&b.body).lines() {
+                    for line in crate::cli::status_tui::text::safe_multiline(&b.body).lines() {
                         if line.is_empty() {
                             body.push(String::new());
                             continue;
@@ -3157,16 +3175,7 @@ pub(super) fn render_event_detail(
     // and it is the reason somebody opened the page.
     if let Some(full) = ev.body.as_deref().filter(|b| !b.trim().is_empty()) {
         body.push(emit(&[dim("  content".to_string())], "", cols));
-        let width = cols.saturating_sub(4).max(1);
-        for line in crate::cli::events::sanitize_multiline(full).lines() {
-            if line.is_empty() {
-                body.push(String::new());
-                continue;
-            }
-            for wrapped in super::text::wrap(line, width) {
-                body.push(emit(&[plain(format!("  {wrapped}"))], "", cols));
-            }
-        }
+        push_body(&mut body, full, cols);
     } else if let Some(t) = ev.content.as_deref() {
         use crate::cli::github::timeline::Backend;
         // Github's word for it is `title`; every other backend just
@@ -3189,18 +3198,7 @@ pub(super) fn render_event_detail(
             fact(&mut body, label, clean(t));
         } else {
             body.push(emit(&[dim("  content".to_string())], "", cols));
-            // The same display-width wrap the github body and the
-            // standing prompts use, at the same post-indent width.
-            let width = cols.saturating_sub(4).max(1);
-            for line in crate::cli::events::sanitize_multiline(t).lines() {
-                if line.is_empty() {
-                    body.push(String::new());
-                    continue;
-                }
-                for wrapped in super::text::wrap(line, width) {
-                    body.push(emit(&[plain(format!("  {wrapped}"))], "", cols));
-                }
-            }
+            push_body(&mut body, t, cols);
         }
     }
     if let Some(a) = ev.actor.as_deref() {
@@ -3234,9 +3232,12 @@ pub(super) fn render_event_detail(
         for (who, text) in &ep.prompts {
             let attributed = match who {
                 Some(agent) => {
-                    format!("[{agent}] {}", crate::cli::events::sanitize_multiline(text))
+                    format!(
+                        "[{agent}] {}",
+                        crate::cli::status_tui::text::safe_multiline(text)
+                    )
                 }
-                None => crate::cli::events::sanitize_multiline(text),
+                None => crate::cli::status_tui::text::safe_multiline(text),
             };
             // Display-width-aware wrapping at the ACTUAL post-indent
             // width (codex bd110f0: a scalar-count chunker let emit
@@ -8040,6 +8041,106 @@ mod tests {
         }
     }
 
+    /// A body keeps its LAYOUT on the detail page, at a narrow width.
+    ///
+    /// The page ran the prose wrapper over each body line, which splits
+    /// on whitespace and rejoins with single spaces: leading indentation
+    /// went, repeated spaces collapsed, and a tab became one space. So a
+    /// list or a snippet read differently here than in `clank events
+    /// read` (codex on 7233636). Both places a body is shown — a body
+    /// proper, and a command source's content standing in for one — go
+    /// through the same rows now, and every part stays reachable.
+    #[test]
+    fn a_body_keeps_its_layout_on_the_detail_page() {
+        let text = "Para one is a sentence long enough to wrap.\n\n  indented line\n\
+                    a    b\n\tcol\tcol\nend";
+        let cols = 24;
+        let mut ev = crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
+            recurrence: None,
+            at: 0,
+            backend: crate::cli::github::timeline::Backend::Message,
+            glyph: None,
+            source: "signal".into(),
+            kind: "message".into(),
+            failure: false,
+            content: Some("Para one".into()),
+            body: Some(text.into()),
+            detail: None,
+            number: None,
+            actor: None,
+            url: None,
+            seen_by: Vec::new(),
+            unhandled: true,
+            baseline: false,
+            members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
+                key: crate::cli::github::timeline::MemberKey {
+                    agent: "codex".into(),
+                    source: "command-signal-0".into(),
+                    seq: 1,
+                    ident: "k:m1".into(),
+                },
+                acked: false,
+                transport: crate::cli::github::log::Transport::Command,
+                content: None,
+            }],
+        };
+        let shown = |ev: &crate::cli::github::timeline::MergedEvent| -> Vec<String> {
+            let ep = super::super::input::EventPage {
+                target: ev.members[0].key.clone().into(),
+                retained: ev.page_keys(),
+                event: ev.clone(),
+                prompts: Vec::new(),
+                scroll: 0,
+                content: None,
+            };
+            render_event_detail(&ep, &[], 0, 400, cols)
+                .0
+                .iter()
+                .map(|l| visible(l))
+                .collect()
+        };
+        // Trailing whitespace trimmed, because `visible` trims each row's
+        // padding to the pane edge and a soft-wrap space at the end of a
+        // row is indistinguishable from that padding on a terminal. The
+        // spacing that IS visible — leading and internal — is compared
+        // exactly.
+        let expected: Vec<String> = crate::cli::status_tui::text::wrap_body(text, cols - 4)
+            .into_iter()
+            .map(|r| if r.is_empty() { r } else { format!("  {r}") })
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        // The layout facts the prose wrapper destroyed, checked directly.
+        assert!(
+            expected.contains(&"    indented line".to_string()),
+            "{expected:?}"
+        );
+        assert!(expected.contains(&"  a    b".to_string()), "{expected:?}");
+        assert!(
+            expected.contains(&"      col col".to_string()),
+            "{expected:?}"
+        );
+
+        for (path, ev) in [
+            ("a body", ev.clone()),
+            ("a command source's content", {
+                ev.body = None;
+                ev.content = Some(text.into());
+                ev.backend = crate::cli::github::timeline::Backend::Command;
+                ev
+            }),
+        ] {
+            let rows = shown(&ev);
+            assert!(
+                rows.windows(expected.len())
+                    .any(|w| w == expected.as_slice()),
+                "{path}: every row of the body, in order, with its layout:\n\
+                 expected {expected:#?}\nshown {rows:#?}"
+            );
+        }
+    }
+
     /// AN EVENT WITH A BODY SHOWS THE BODY, not its summary.
     ///
     /// A message's row is its subject and its body is the message; a
@@ -8442,12 +8543,13 @@ mod tests {
             out.last()
         );
 
-        // Prompt text is control-char sanitized at the shared
-        // events-show seam (a raw ESC inside operator text becomes a
-        // space; newlines survive for the wrap).
+        // Prompt text is sanitized at the shared seam: the escape
+        // sequence goes WHOLE and newlines survive for the wrap. This
+        // once asserted "a [31mb\nc" — the ESC turned into a space
+        // and its syntax left in the text, which is the bug, pinned.
         assert_eq!(
-            crate::cli::events::sanitize_multiline("a\u{1b}[31mb\nc"),
-            "a [31mb\nc"
+            crate::cli::status_tui::text::safe_multiline("a\u{1b}[31mb\nc"),
+            "ab\nc"
         );
         // A LONG prompt exceeds a short pane and is REACHABLE via
         // the scroll window rather than clipped forever.
