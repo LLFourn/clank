@@ -627,8 +627,12 @@ repository watcher uses `notify::PollWatcher`, and its cadence is unchanged.
 
 Command producers write one JSON object per stdout line, with an `id` unique
 within their source, and optional `content`, `kind`, `at` and `requires_reply`.
-Replaying an ID preserves its original event. To ask for an answer, configure
-the source with a separate reply handler:
+Replaying an ID preserves its original event. Clank runs each producer in a
+process group it owns, and ends that whole group — TERM, a short grace, then
+KILL — when its host stops, including on SIGTERM or SIGINT. If the host was
+SIGKILLed instead, the next host to take the source ends the old group before
+starting its own. A producer need not watch for its parent's death. To ask for
+an answer, configure the source with a separate reply handler:
 
 ```json
 {

@@ -1422,7 +1422,7 @@ fn spawn_local(
 
 /// Source tasks belong to the lifecycle owner, not the delivery queue.
 /// Local waits shut down and join them on return; monitor hosts retain them
-/// until retirement. Aborting also drops command process-group guards.
+/// until retirement. Aborting a command source retires its producer group.
 pub(crate) struct EventSources {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -1561,33 +1561,6 @@ impl Drop for GroupKill {
     }
 }
 
-/// A recording error is returned only after the unrecordable child is ended
-/// and reaped. The caller cannot enter its restart backoff holding that child.
-async fn record_producer_or_end(
-    mut child: tokio::process::Child,
-    store_dir: &std::path::Path,
-    key: &str,
-) -> std::io::Result<(tokio::process::Child, GroupKill)> {
-    use crate::cli::command_source as cs;
-    let mut group = GroupKill::over(child.id());
-    // Record before reading any event: SIGKILL must leave recovery evidence.
-    let recorded = match child.id() {
-        Some(pid) => cs::started_at(pid as i32)
-            .ok_or_else(|| std::io::Error::other("the system would not say when it started"))
-            .and_then(|started| cs::record_producer(store_dir, key, pid as i32, &started)),
-        None => Err(std::io::Error::other(
-            "it exited before it could be recorded",
-        )),
-    };
-    if let Err(error) = recorded {
-        group.terminate();
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return Err(error);
-    }
-    Ok((child, group))
-}
-
 /// Last-`cap`-bytes ring for a command source's interleaved output —
 /// bounded by construction, so a chatty child can't balloon memory.
 pub(crate) struct RingTail {
@@ -1617,7 +1590,7 @@ impl RingTail {
 
 /// One command source: a supervised producer streaming JSONL.
 ///
-/// The argv is spawned in its own process group and expected to STAY
+/// The argv is spawned into a group `source_group` owns and expected to STAY
 /// up, printing one JSON object per line on stdout; stderr is
 /// diagnostics. `clank wait` aborts its sources when it returns, so a
 /// restart is the normal path between arms and not an exception —
@@ -1707,9 +1680,9 @@ async fn run_command_source_with(
                     &mut presented,
                     events_dir,
                     &retire,
+                    std::sync::Arc::new(lease),
                 )
                 .await;
-                drop(lease);
                 return;
             }
             Ok(None) => {
@@ -1721,6 +1694,10 @@ async fn run_command_source_with(
                     );
                     warned_tail = true;
                 }
+                // The holder may be this process, whose group deferred
+                // its retirement and so still holds the lease.
+                crate::cli::source_group::OWNERS
+                    .retry_deferred(&cs::producer_path(&store_dir, &key));
                 // `read_rows` is the read-only inspector: a tailer
                 // must never quarantine a log it does not own.
                 if let Ok(log) = crate::cli::github::log::EventLog::open(&store_dir, &key)
@@ -1760,6 +1737,7 @@ async fn run_command_source_with(
 
 /// The LEASE HOLDER's runtime: it alone spawns the producer and
 /// writes the log.
+#[allow(clippy::too_many_arguments)]
 async fn run_leased_command_source(
     src: &clank_core::agent_config::CommandSource,
     tx: &crate::cli::event_source::EmissionSink,
@@ -1768,8 +1746,10 @@ async fn run_leased_command_source(
     presented: &mut std::collections::HashSet<(u64, String)>,
     events_dir: Option<std::path::PathBuf>,
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
+    lease: std::sync::Arc<crate::cli::github::log::IngestLease>,
 ) {
     use crate::cli::command_source as cs;
+    use crate::cli::source_group;
     use tokio::io::AsyncBufReadExt;
 
     let src = src.clone();
@@ -1884,8 +1864,27 @@ async fn run_leased_command_source(
 
     let mut failures: u32 = 0;
 
+    source_group::retire_on_termination();
     let mut deferral_warned = false;
+    // This host's own group, when its retirement could not confirm it
+    // ended. Still owned, so nothing replaces it until it does.
+    let mut unended: Option<source_group::Owned> = None;
     loop {
+        if let Some(owned) = unended.take()
+            && let Err((owned, why)) = owned.retire()
+        {
+            if !deferral_warned {
+                eprintln!(
+                    "wait: command source `{}` — {why}; not starting another until it is \
+                     settled",
+                    src.name
+                );
+                deferral_warned = true;
+            }
+            unended = Some(owned);
+            tokio::time::sleep(cs::TAIL_INTERVAL).await;
+            continue;
+        }
         // Holding the lease means the previous owner is GONE — a lease
         // lives as long as its process. What can survive it is the
         // CHILD, and starting a second one beside the first is how a
@@ -1915,35 +1914,29 @@ async fn run_leased_command_source(
         cmd.args(&src.command[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         // Its own directory, for whatever it needs to remember.
         match state_dir.as_deref() {
             Some(dir) => cmd.env("CLANK_SOURCE_STATE_DIR", dir),
             None => cmd.env_remove("CLANK_SOURCE_STATE_DIR"),
         };
-        let child = match cmd.spawn() {
-            Ok(c) => Some(c),
+        let launched = match source_group::launch(
+            &source_group::OWNERS,
+            &source_group::Arming::standard(),
+            &store_dir,
+            &key,
+            lease.clone(),
+            &mut cmd,
+        )
+        .await
+        {
+            Ok(launched) => Some(launched),
             Err(e) => {
-                eprintln!("wait: command source `{}` failed to spawn: {e}", src.name);
+                eprintln!("wait: command source `{}` did not start: {e}", src.name);
                 None
             }
         };
-        if let Some(child) = child {
-            let (mut child, _group) = match record_producer_or_end(child, &store_dir, &key).await {
-                Ok(owned) => owned,
-                Err(e) => {
-                    eprintln!(
-                        "wait: command source `{}` could not record its producer ({e}); ended it \
-                         rather than leaving one a SIGKILL would strand",
-                        src.name
-                    );
-                    failures = failures.saturating_add(1);
-                    tokio::time::sleep(cs::backoff(failures)).await;
-                    continue;
-                }
-            };
+        if let Some((owned, mut child)) = launched {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             if let Some(err) = stderr {
@@ -2024,10 +2017,15 @@ async fn run_leased_command_source(
                 }
             }
             let _ = child.wait().await;
-            // It ended with us still here, so `GroupKill` has it and
-            // the record would only point a successor at a pid that is
-            // already gone.
-            cs::clear_producer(&store_dir, &key);
+            // The command's end is not its group's: a descendant it
+            // left, and the anchor, are still there.
+            if let Err((owned, why)) = owned.retire() {
+                eprintln!(
+                    "wait: command source `{}` — {why}; not starting another until it is settled",
+                    src.name
+                );
+                unended = Some(owned);
+            }
         }
         // A run long enough to count as healthy clears the streak, so
         // a producer restarted nightly does not creep to the cap.
@@ -4358,49 +4356,6 @@ mod tests {
         }
     }
 
-    /// A producer that cannot be recorded is ended BEFORE the backoff.
-    ///
-    /// Leaving it running reinstates exactly the leak the record
-    /// exists to close: a SIGKILL would strand it with nothing written
-    /// down that could ever end it. And the backoff doubles to
-    /// `BACKOFF_CAP`, so holding the child until the retry would leave
-    /// an unrecorded producer alive for up to five minutes (codex on
-    /// 14ab92e).
-    ///
-    /// The spawn handle identifies the child even if cleanup beats its first
-    /// instruction. A record failure must return with that process ended and
-    /// reaped, before the supervisor can choose a restart backoff.
-    #[tokio::test]
-    async fn a_producer_that_cannot_be_recorded_is_ended_before_the_backoff() {
-        use crate::cli::command_source as cs;
-        let dir = tempfile::tempdir().unwrap();
-        let key = command_source("deploys", &["true"]).source_key();
-        std::fs::create_dir_all(cs::producer_path(dir.path(), &key).with_extension("producer.tmp"))
-            .unwrap();
-        let child = tokio::process::Command::new("/bin/sleep")
-            .arg("300")
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap() as i32;
-        let result = record_producer_or_end(child, dir.path(), &key).await;
-        assert!(
-            result.is_err(),
-            "the injected recording failure must be reached"
-        );
-        assert_eq!(
-            crate::signal::probe_process(pid),
-            crate::signal::Probe::Gone,
-            "a recording error must not return a still-running child to the backoff caller"
-        );
-        assert_eq!(
-            cs::group_of(crate::signal::Pgid::new(pid).unwrap()),
-            cs::Group::Empty
-        );
-        assert!(!cs::producer_path(dir.path(), &key).exists());
-    }
-
     /// A deferral withholds the launch, and does not overwrite the
     /// record that caused it.
     ///
@@ -4439,7 +4394,11 @@ mod tests {
         );
         let key = src.source_key();
         // The record of a producer nobody can confirm is gone.
-        cs::record_producer(&events, &key, 4242, "Thu 1 Oct 16:58:08 2026").unwrap();
+        std::fs::write(
+            cs::producer_path(&events, &key),
+            br#"{"pgid":4242,"started":"Thu 1 Oct 16:58:08 2026"}"#,
+        )
+        .unwrap();
         let before = std::fs::read(cs::producer_path(&events, &key)).unwrap();
 
         let defer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -4491,34 +4450,37 @@ mod tests {
         let _ = task.await;
     }
 
-    /// A running producer is written down, so a successor can find it.
+    /// A running producer's group is written down, led by its anchor,
+    /// and ended when the source's task is cancelled.
     ///
-    /// `GroupKill` covers every orderly end and none of SIGKILL: the
-    /// guard never runs, the group is reparented to init, and the
-    /// user's command goes on running. The next owner of the source is
-    /// the only thing that can notice, and only through this record.
     /// Driven through `run_command_source` because an unwired record
     /// is exactly the failure — the recognition and signalling have
-    /// their own tests in `command_source.rs`.
-    #[tokio::test]
-    async fn a_live_producer_is_recorded_for_its_successor() {
+    /// their own tests in `command_source.rs` and `source_group.rs`.
+    /// Cancellation is how a monitor's stand-down, a config change and
+    /// a returning wait all end their sources.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_producer_is_recorded_for_its_successor_and_ended_with_its_task() {
         use crate::cli::command_source as cs;
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().to_path_buf();
+        let pidfile = dir.path().join("pid");
         let src = command_source(
             "deploys",
             &[
                 "sh",
                 "-c",
-                // One event, then keep running: the record must
-                // describe a producer that is still there.
-                r#"printf '{"id":"A","content":"x"}\n'; sleep 300"#,
+                Box::leak(
+                    format!(
+                        r#"echo $$ > '{}'; printf '{{"id":"A","content":"x"}}\n'; exec sleep 300"#,
+                        pidfile.display()
+                    )
+                    .into_boxed_str(),
+                ),
             ],
         );
         let key = src.source_key();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let task = tokio::spawn(run_command_source(
             src,
@@ -4534,26 +4496,325 @@ mod tests {
         let body = std::fs::read(cs::producer_path(&events, &key))
             .expect("a running producer is recorded");
         let record: cs::Producer = serde_json::from_slice(&body).unwrap();
-        assert!(
-            !record.started.is_empty(),
-            "the record carries the INCARNATION, which is what survives \
-             the exec that `sh -c` performs: {record:?}"
-        );
+        let cs::Producer::Anchored { pgid, .. } = record else {
+            panic!("a new host writes an anchored record: {record:?}")
+        };
         assert_eq!(
-            cs::started_at(record.pgid).as_deref(),
-            Some(record.started.as_str()),
-            "and it is the live child's own start time"
+            cs::leader_of(&record),
+            cs::Leader::Same,
+            "and its leader is the live anchor it names"
         );
+        let command: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(command, pgid, "the command does not lead its group");
         // SAFETY: a plain query, no memory effects.
-        let group = unsafe { libc::getpgid(record.pgid) };
         assert_eq!(
-            group, record.pgid,
-            "the recorded pid must BE the group leader, since what gets \
-             signalled later is the whole group"
+            unsafe { libc::getpgid(command) },
+            pgid,
+            "it runs INSIDE the recorded group, which is what gets signalled"
         );
 
         task.abort();
         let _ = task.await;
+        let group = crate::signal::Pgid::new(pgid).unwrap();
+        assert_eq!(cs::group_of(group), cs::Group::Empty);
+        assert!(!cs::producer_path(&events, &key).exists());
+    }
+
+    const HOST_FIXTURE: &str = "CLANK_TEST_SOURCE_HOST_DIR";
+    const HOST_MODE: &str = "CLANK_TEST_SOURCE_HOST_MODE";
+
+    /// Not a test: the host process the tests below signal, entered by
+    /// re-running this test binary with `HOST_FIXTURE` set. Without it
+    /// this returns at once.
+    ///
+    /// A separate process because the wiring under test is what a
+    /// process does when it is signalled or exits, which the test
+    /// process cannot do to itself and survive.
+    #[test]
+    fn source_host_fixture() {
+        let Some(dir) = std::env::var_os(HOST_FIXTURE).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var(HOST_MODE).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            use crate::cli::source_group;
+            let src = fixture_source(&dir);
+            let key = src.source_key();
+            if mode == "unarmed" {
+                let lease = std::sync::Arc::new(
+                    crate::cli::github::log::IngestLease::try_acquire(&dir, &key)
+                        .unwrap()
+                        .unwrap(),
+                );
+                let _recorded = source_group::Spawned::spawn(&source_group::anchor_program())
+                    .unwrap()
+                    .record(&source_group::OWNERS, &dir, &key, lease)
+                    .unwrap();
+                std::fs::write(dir.join("ready"), "").unwrap();
+                std::future::pending::<()>().await;
+            }
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
+            let _task = tokio::spawn(run_command_source(src, tx, Some(dir.clone()), key));
+            while !dir.join("producer").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            std::fs::write(dir.join("ready"), "").unwrap();
+            if mode == "exit" {
+                source_group::exit(7);
+            }
+            std::future::pending::<()>().await;
+        });
+    }
+
+    fn fixture_source(dir: &Path) -> clank_core::agent_config::CommandSource {
+        command_source(
+            "fixture",
+            &[
+                "sh",
+                "-c",
+                Box::leak(
+                    format!(
+                        "echo $$ > '{}'; exec sleep 300",
+                        dir.join("producer").display()
+                    )
+                    .into_boxed_str(),
+                ),
+            ],
+        )
+    }
+
+    /// A fixture host, SIGKILLed if a test leaves it running.
+    struct FixtureHost(Option<std::process::Child>);
+
+    impl FixtureHost {
+        async fn start(dir: &Path, mode: &str) -> Self {
+            use std::os::unix::process::CommandExt;
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::wait::tests::source_host_fixture",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(HOST_FIXTURE, dir)
+                .env(HOST_MODE, mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let host = Self(Some(child));
+            for _ in 0..6000 {
+                if dir.join("ready").exists() {
+                    return host;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the fixture host never became ready");
+        }
+
+        fn pid(&self) -> crate::signal::Pid {
+            crate::signal::Pid::new(self.0.as_ref().unwrap().id() as i32).unwrap()
+        }
+
+        async fn ended(mut self) -> std::process::ExitStatus {
+            let mut child = self.0.take().unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || child.wait().unwrap()),
+            )
+            .await
+            .expect("the fixture host did not end")
+            .unwrap()
+        }
+    }
+
+    impl Drop for FixtureHost {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn anchored_pgid(dir: &Path, key: &str) -> crate::signal::Pgid {
+        use crate::cli::command_source as cs;
+        let record: cs::Producer =
+            serde_json::from_slice(&std::fs::read(cs::producer_path(dir, key)).unwrap()).unwrap();
+        crate::signal::Pgid::new(record.pgid()).unwrap()
+    }
+
+    /// The handler a host installs, driven by the signals themselves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_told_to_stop_takes_its_producer_group_with_it() {
+        use crate::cli::command_source as cs;
+        use crate::cli::source_group::tests as host;
+        use std::os::unix::process::ExitStatusExt;
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = fixture_source(dir.path()).source_key();
+            let fixture = FixtureHost::start(dir.path(), "host").await;
+            let producer = host::pid_in(&dir.path().join("producer")).await;
+            let group = anchored_pgid(dir.path(), &key);
+
+            crate::signal::signal_process(fixture.pid(), sig);
+            let status = fixture.ended().await;
+            assert_eq!(status.signal(), Some(sig), "it ends as the signal ends it");
+            assert!(
+                host::gone(producer).await,
+                "signal {sig}: the producer survived"
+            );
+            assert_eq!(cs::group_of(group), cs::Group::Empty, "signal {sig}");
+            assert!(
+                !cs::producer_path(dir.path(), &key).exists(),
+                "signal {sig}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_that_exits_takes_its_producer_group_with_it() {
+        use crate::cli::command_source as cs;
+        use crate::cli::source_group::tests as host;
+        let dir = tempfile::tempdir().unwrap();
+        let key = fixture_source(dir.path()).source_key();
+        let fixture = FixtureHost::start(dir.path(), "exit").await;
+        let producer = host::pid_in(&dir.path().join("producer")).await;
+        let status = fixture.ended().await;
+        assert_eq!(status.code(), Some(7));
+        assert!(host::gone(producer).await);
+        assert!(!cs::producer_path(dir.path(), &key).exists());
+    }
+
+    /// Real host death: nothing in the host runs, its pipes close, and
+    /// its successor finds what it left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sigkilled_hosts_group_is_ended_by_its_successor() {
+        use crate::cli::command_source as cs;
+        use crate::cli::source_group::tests as host;
+        for mode in ["unarmed", "host"] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = fixture_source(dir.path()).source_key();
+            let fixture = FixtureHost::start(dir.path(), mode).await;
+            let group = anchored_pgid(dir.path(), &key);
+            let producer = if mode == "host" {
+                Some(host::pid_in(&dir.path().join("producer")).await)
+            } else {
+                None
+            };
+
+            crate::signal::signal_process(fixture.pid(), libc::SIGKILL);
+            fixture.ended().await;
+            if mode == "unarmed" {
+                assert!(
+                    host::gone(group.get()).await,
+                    "an unarmed anchor outlived its host's activation pipe"
+                );
+            }
+            let (events, k) = (dir.path().to_path_buf(), key.clone());
+            let out = tokio::task::spawn_blocking(move || cs::reap_previous_producer(&events, &k))
+                .await
+                .unwrap();
+            assert_eq!(out, cs::Retired::Clear, "{mode}");
+            if let Some(producer) = producer {
+                assert!(host::gone(producer).await, "{mode}");
+            }
+            assert_eq!(cs::group_of(group), cs::Group::Empty, "{mode}");
+            assert!(!cs::producer_path(dir.path(), &key).exists(), "{mode}");
+        }
+    }
+
+    /// Life's shape, both ways: a host replaced by SIGTERM, and one
+    /// replaced by SIGKILL, leaves no producer of its own running when
+    /// its successor starts one. The successor's producer is the
+    /// witness, checking the old one the moment it starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_hosts_producer_is_gone_before_its_successor_starts_one() {
+        use crate::cli::source_group::{self, tests as host};
+        for sigkilled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let events = dir.path().to_path_buf();
+            let oldfile = dir.path().join("old");
+            let witness = |old: i32| {
+                command_source(
+                    "signal",
+                    &[
+                        "sh",
+                        "-c",
+                        Box::leak(
+                            format!(
+                                r#"if kill -0 {old} 2>/dev/null; then v=alive; else v=dead; fi; printf '{{"id":"A","content":"%s"}}\n' "$v"; exec sleep 300"#
+                            )
+                            .into_boxed_str(),
+                        ),
+                    ],
+                )
+            };
+            let key = witness(0).source_key();
+
+            let owners = host::owners();
+            let lease = std::sync::Arc::new(
+                crate::cli::github::log::IngestLease::try_acquire(&events, &key)
+                    .unwrap()
+                    .unwrap(),
+            );
+            let (owned, child) = source_group::launch(
+                owners,
+                &source_group::Arming::standard(),
+                &events,
+                &key,
+                lease,
+                &mut host::sh(&format!(
+                    "echo $$ > '{}'; exec sleep 300",
+                    oldfile.display()
+                )),
+            )
+            .await
+            .unwrap();
+            let old = host::pid_in(&oldfile).await;
+            if sigkilled {
+                let anchor = owned.pgid().get();
+                owned.abandon();
+                drop(child);
+                host::init_stands_in_for(anchor);
+                host::init_stands_in_for(old);
+            } else {
+                tokio::task::spawn_blocking(|| owners.retire_all())
+                    .await
+                    .unwrap();
+                drop(owned);
+            }
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let tx = crate::cli::event_source::EmissionSink::from(tx);
+            let task = tokio::spawn(run_command_source(
+                witness(old),
+                tx,
+                Some(events.clone()),
+                key.clone(),
+            ));
+            let (item, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("the successor started nothing")
+                .expect("the channel closed");
+            let WaitItem::CommandEvent { content, .. } = item else {
+                panic!("expected a command event, got {item:?}")
+            };
+            assert_eq!(content, "dead", "sigkilled: {sigkilled}");
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// Through `run_command_source`, not the helpers: the mechanism

@@ -56,7 +56,7 @@ pub fn block_until_owner_gone<R: Read>(mut owner: R) {
 pub fn spawn_stdin_sentinel() {
     std::thread::spawn(|| {
         block_until_owner_gone(std::io::stdin().lock());
-        std::process::exit(0);
+        crate::cli::source_group::exit(0);
     });
 }
 

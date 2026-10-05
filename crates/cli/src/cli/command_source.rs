@@ -1281,34 +1281,101 @@ mod tests {
     }
 }
 
-/// What a producer recorded about the child it spawned, so a successor
-/// can RECOGNISE it before signalling anything.
+/// What a host recorded about the process group its producer runs in,
+/// so a successor can RECOGNISE it before signalling anything.
 ///
-/// A command source's child runs in its own process group with a
-/// `GroupKill` guard, which covers every orderly end. It does not
-/// cover SIGKILL: the guard never runs, the group is reparented to
+/// The host's own retirement covers every end it lives through. It
+/// does not cover SIGKILL: nothing runs, the group is reparented to
 /// init, and the user's command goes on running. The next owner of
 /// this source is the only thing in a position to notice, and it can
 /// only notice what was written down.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Producer {
-    /// The child is its own group leader (`process_group(0)`), so this
-    /// is both its pid and its group.
-    pub(crate) pgid: i32,
-    /// When that pid began, as the system reports it.
-    ///
-    /// The INCARNATION, which is what makes a pid an identity. A pid
-    /// alone is a number the kernel re-issues; `argv[0]` was tried and
-    /// is wrong in both directions — a recycled pid running another
-    /// copy of the same command matches, and the ordinary
-    /// `sh -c '<cmd>'` form EXECS, so the live process reports the
-    /// exec'd name and the producer stops recognising its own child
-    /// (codex on 697807a). A start time survives exec and separates
-    /// incarnations, which is exactly the pair of properties needed.
-    pub(crate) started: String,
+#[serde(try_from = "OnDisk", into = "OnDisk")]
+pub(crate) enum Producer {
+    /// Led by a clank anchor (`source_group`) that outlives every
+    /// other member, identified by a birth the kernel reports as
+    /// numbers — so no reader's `TZ` or locale can make the same
+    /// process look like another.
+    Anchored {
+        pgid: i32,
+        birth: crate::proc_identity::ProcToken,
+    },
+    /// Written before records were versioned: the user's command led
+    /// its own group, identified by `ps -o lstart` as rendered under
+    /// whatever `TZ` and locale THAT process had. Nobody wrote that
+    /// environment down, so a mismatch here proves nothing about
+    /// reuse — the same process reads `08:43:52` under `TZ=UTC` and
+    /// `19:43:52` under `TZ=Australia/Sydney`.
+    Legacy { pgid: i32, started: String },
 }
 
-/// What the system says about a live process.
+impl Producer {
+    pub(crate) fn pgid(&self) -> i32 {
+        match self {
+            Producer::Anchored { pgid, .. } | Producer::Legacy { pgid, .. } => *pgid,
+        }
+    }
+}
+
+/// The version an anchored record carries. Legacy records carry none.
+const ANCHORED: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OnDisk {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<u32>,
+    pgid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    birth: Option<crate::proc_identity::ProcToken>,
+}
+
+impl TryFrom<OnDisk> for Producer {
+    type Error = String;
+
+    fn try_from(raw: OnDisk) -> Result<Self, String> {
+        match raw {
+            OnDisk {
+                version: Some(ANCHORED),
+                pgid,
+                started: None,
+                birth: Some(birth),
+            } => Ok(Producer::Anchored { pgid, birth }),
+            OnDisk {
+                version: None,
+                pgid,
+                started: Some(started),
+                birth: None,
+            } => Ok(Producer::Legacy { pgid, started }),
+            OnDisk {
+                version: Some(v), ..
+            } if v != ANCHORED => Err(format!("record version {v} is not one this clank reads")),
+            _ => Err("neither an anchored nor a legacy producer record".into()),
+        }
+    }
+}
+
+impl From<Producer> for OnDisk {
+    fn from(record: Producer) -> Self {
+        match record {
+            Producer::Anchored { pgid, birth } => OnDisk {
+                version: Some(ANCHORED),
+                pgid,
+                started: None,
+                birth: Some(birth),
+            },
+            Producer::Legacy { pgid, started } => OnDisk {
+                version: None,
+                pgid,
+                started: Some(started),
+                birth: None,
+            },
+        }
+    }
+}
+
+/// What `ps` says about a live process, for a legacy record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Observed {
     pub(crate) pgid: i32,
@@ -1345,14 +1412,78 @@ pub(crate) enum Group {
     Unknown,
 }
 
-/// Whether a live process is the same INCARNATION that was recorded.
+/// Whether a recorded group's leader is the process that was recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Leader {
+    /// The recorded incarnation, still leading the recorded group.
+    Same,
+    /// A different incarnation holds the pid, by an identity no
+    /// environment can vary. The recorded one has ended.
+    Different,
+    /// A legacy record's rendering does not match the live process.
+    /// NOT `Different`: the rendering depends on an environment nobody
+    /// recorded, so this is as consistent with our own producer as
+    /// with a stranger.
+    Unmatched,
+    Gone,
+    Unknown,
+}
+
+/// Whether a live process is the same INCARNATION a legacy record
+/// names.
 ///
-/// Identity only. Whether it may be signalled is a separate question
-/// with a separate answer — conflating them let "this pid is somebody
-/// else's now" and "this is ours and still running" reach the same
-/// conclusion (codex on 14ab92e).
-pub(crate) fn same_incarnation(record: &Producer, seen: &Observed) -> bool {
-    !record.started.is_empty() && seen.pgid == record.pgid && seen.started == record.started
+/// `argv[0]` was tried and is wrong in both directions — a recycled
+/// pid running another copy of the same command matches, and the
+/// ordinary `sh -c '<cmd>'` form EXECS, so the live process reports
+/// the exec'd name and the producer stops recognising its own child
+/// (codex on 697807a). A start time survives exec and separates
+/// incarnations.
+pub(crate) fn same_incarnation(pgid: i32, started: &str, seen: &Observed) -> bool {
+    !started.is_empty() && seen.pgid == pgid && seen.started == started
+}
+
+/// A legacy record's leader, judged only by the rendering this
+/// process's own environment produces.
+///
+/// Other environments are never tried. A guessed `TZ` is not the
+/// recorder's, and searching widens the dangerous matches rather than
+/// recovering lost provenance: a Sydney record of an 08:45 UTC start
+/// reads `19:45`, and a stranger that took the pid at 19:45 UTC reads
+/// exactly that in UTC (codex on fd20615).
+pub(crate) fn legacy_leader(pgid: i32, started: &str, look: Look) -> Leader {
+    match look {
+        Look::Gone => Leader::Gone,
+        Look::Unknown => Leader::Unknown,
+        Look::Alive(seen) if same_incarnation(pgid, started, &seen) => Leader::Same,
+        Look::Alive(_) => Leader::Unmatched,
+    }
+}
+
+/// An anchored record's leader, from an inspection against its birth.
+pub(crate) fn anchored_leader(
+    pgid: i32,
+    seen: crate::proc_identity::inspect::Inspection,
+) -> Leader {
+    use crate::proc_identity::inspect::Inspection;
+    match seen {
+        Inspection::Verified(details) if details.group == Ok(pgid) => Leader::Same,
+        // Our anchor never changes group, so this is not a state the
+        // record describes.
+        Inspection::Verified(_) => Leader::Unknown,
+        Inspection::Mismatched => Leader::Different,
+        Inspection::Ended => Leader::Gone,
+        Inspection::Unavailable(_) => Leader::Unknown,
+    }
+}
+
+/// The recorded group's leader, as this system reports it.
+pub(crate) fn leader_of(record: &Producer) -> Leader {
+    match record {
+        Producer::Anchored { pgid, birth } => {
+            anchored_leader(*pgid, crate::proc_identity::inspect::inspect(*pgid, birth))
+        }
+        Producer::Legacy { pgid, started } => legacy_leader(*pgid, started, look(*pgid)),
+    }
 }
 
 /// Where a source records its producer, beside that source's log.
@@ -1360,24 +1491,18 @@ pub(crate) fn producer_path(store_dir: &std::path::Path, key: &str) -> std::path
     store_dir.join(format!("{key}.producer"))
 }
 
-/// Note that `pgid` is this source's producer, for a successor to find.
+/// Note that the group `pgid` leads is this source's producer, for a
+/// successor to find.
 ///
 /// Written through a temp file and renamed, because this is RECOVERY
 /// evidence: a truncating write interrupted by the very SIGKILL this
 /// exists to survive would leave a record that parses as nothing.
-/// Returns what went wrong, since a producer that cannot be recorded
-/// is one the caller must end rather than run.
 pub(crate) fn record_producer(
     store_dir: &std::path::Path,
     key: &str,
-    pgid: i32,
-    started: &str,
+    record: &Producer,
 ) -> std::io::Result<()> {
-    let record = Producer {
-        pgid,
-        started: started.to_string(),
-    };
-    let body = serde_json::to_vec(&record)
+    let body = serde_json::to_vec(record)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let path = producer_path(store_dir, key);
     let tmp = path.with_extension("producer.tmp");
@@ -1385,29 +1510,18 @@ pub(crate) fn record_producer(
     std::fs::rename(&tmp, &path)
 }
 
-/// Forget it, because it has been dealt with or ended cleanly.
-pub(crate) fn clear_producer(store_dir: &std::path::Path, key: &str) {
-    let _ = std::fs::remove_file(producer_path(store_dir, key));
-}
-
-/// Ask the system about one pid.
+/// Ask `ps` about one pid, for a legacy record.
 ///
 /// Death is settled by `kill(pid, 0)` and never by `ps`: a failed
 /// query is not evidence of absence, and on this platform even a
 /// missing pid writes to stderr, so no amount of reading `ps`'s
 /// output distinguishes "gone" from "that question did not work"
-/// (codex on 8d3d669). `ESRCH` does distinguish it, in one syscall,
-/// with nothing to parse.
+/// (codex on 8d3d669).
 ///
-/// `ps` is then asked only for the DETAILS — a start time, which macOS
-/// offers no `/proc` for and `libc` exposes only through `sysctl` with
-/// a different shape per platform.
-///
-/// `lstart` is compared as an opaque string, normalised only for the
-/// padding `ps` adds. Both sides go through this same function, so a
-/// format this build does not anticipate makes the comparison FAIL,
-/// and a failed comparison signals nothing — which is the direction to
-/// be wrong in.
+/// The environment is deliberately NOT pinned. A legacy record was
+/// rendered under its recorder's environment, so the only comparison
+/// that is not a guess is the one the record's own era made: this
+/// process's rendering against the stored string.
 pub(crate) fn look(pid: i32) -> Look {
     // `Theirs` is not `Gone`: a pid that exists and is somebody else's
     // must not be read as a spent record, and `ps` below is what says
@@ -1441,8 +1555,6 @@ pub(crate) fn look(pid: i32) -> Look {
 ///
 /// `kill(-pgid, 0)` asks the kernel directly, which is the group-level
 /// counterpart of the `ESRCH` check above and needs no enumeration.
-/// `EPERM` counts as OCCUPIED: it means the group exists and is
-/// somebody else's, which is every reason not to call it empty.
 pub(crate) fn group_of(pgid: crate::signal::Pgid) -> Group {
     group_from(crate::signal::probe_group(pgid))
 }
@@ -1461,14 +1573,6 @@ fn group_from(probe: crate::signal::Probe) -> Group {
     }
 }
 
-/// When a live pid began, for recording a producer we just spawned.
-pub(crate) fn started_at(pid: i32) -> Option<String> {
-    match look(pid) {
-        Look::Alive(o) => Some(o.started),
-        _ => None,
-    }
-}
-
 /// What the recorded group IS, from its leader and its occupancy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Standing {
@@ -1476,8 +1580,8 @@ pub(crate) enum Standing {
     Gone,
     /// Still ours, and still ours to end.
     Ours,
-    /// The id names another group now — which means ours ENDED, since
-    /// the id could not have been reused otherwise.
+    /// The id names another incarnation now, proven by an identity no
+    /// environment varies — which means ours ENDED.
     Theirs,
     /// Members remain and there is no leader to identify them by.
     ///
@@ -1491,6 +1595,10 @@ pub(crate) enum Standing {
     /// miniature, so this earns no signal — and, because it is equally
     /// no evidence that our producer has ended, no replacement either.
     Unidentified,
+    /// A live leader a legacy record cannot be matched against. As
+    /// consistent with ours as with a stranger, so it earns neither a
+    /// signal nor a replacement.
+    Unrecognised,
     /// Could not be established.
     Unsure,
 }
@@ -1505,32 +1613,31 @@ pub(crate) enum Standing {
 /// tell "our group, leader exited, descendants remain" from "our group
 /// ended, the number was re-issued, that group's leader exited too,
 /// its descendants remain". Both read as a missing leader over an
-/// occupied group, and only one of them is ours to kill.
-///
-/// So a missing leader buys nothing: that is `Unidentified`, which
-/// earns neither a signal nor a replacement.
-pub(crate) fn standing(record: &Producer, leader: &Look, group: &Group) -> Standing {
+/// occupied group, and only one of them is ours to kill. An anchored
+/// group never reaches that question: its anchor is killed last.
+pub(crate) fn standing(leader: &Leader, group: &Group) -> Standing {
     match (leader, group) {
-        (Look::Unknown, _) | (_, Group::Unknown) => Standing::Unsure,
-        (Look::Alive(seen), _) if !same_incarnation(record, seen) => Standing::Theirs,
-        (Look::Alive(_), Group::Occupied) => Standing::Ours,
+        (Leader::Unknown, _) | (_, Group::Unknown) => Standing::Unsure,
+        (Leader::Different, _) => Standing::Theirs,
+        (Leader::Unmatched, _) => Standing::Unrecognised,
+        (Leader::Same, Group::Occupied) => Standing::Ours,
         // A live leader over an empty group cannot both be true.
-        (Look::Alive(_), Group::Empty) => Standing::Unsure,
-        (Look::Gone, Group::Empty) => Standing::Gone,
-        (Look::Gone, Group::Occupied) => Standing::Unidentified,
+        (Leader::Same, Group::Empty) => Standing::Unsure,
+        (Leader::Gone, Group::Empty) => Standing::Gone,
+        (Leader::Gone, Group::Occupied) => Standing::Unidentified,
     }
 }
 
 /// Whether a source may start a producer yet.
 ///
 /// A RESULT, not a courtesy. The whole point of retiring the previous
-/// owner's child is that a second one must not run beside it, so the
-/// outcome has to reach the decision it exists to gate — and
+/// owner's group is that a second producer must not run beside it, so
+/// the outcome has to reach the decision it exists to gate — and
 /// `record_producer` would overwrite the only evidence of the first
 /// one on its way past (codex on 8d3d669).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Retired {
-    /// The recorded group is empty. Launch.
+    /// The recorded group is empty and its record is gone. Launch.
     Clear,
     /// It may still have members, or its state could not be
     /// established. Its record is kept, the backlog keeps being
@@ -1538,35 +1645,58 @@ pub(crate) enum Retired {
     Deferred(String),
 }
 
-/// End a previous owner's producer, if one is still running.
-///
-/// Called by whoever has just taken this source's ingest lease, which
-/// means the previous owner is gone — a lease is held for the life of
-/// its process. What may survive it is the process GROUP, and starting
-/// a second producer beside it is how a SIGKILLed monitor's command
-/// sources accumulate.
-///
-/// The LEASE is the entitlement to signal, not the orphan's parentage.
-/// An earlier version demanded `ppid == 1`, which is what an orphan
-/// looks like here but NOT on a Linux session with a subreaper, where
-/// orphans reparent to the session manager instead. That would have
-/// left such a group forever unsignalled and so forever deferred —
-/// the source never running again — in exchange for a guarantee the
-/// lease already gives.
-pub(crate) fn reap_previous_producer(store_dir: &std::path::Path, key: &str) -> Retired {
-    reap_previous_producer_with(
-        store_dir,
-        key,
-        look,
-        group_of,
-        crate::signal::signal_group,
-        ESCALATE_AFTER,
-        std::time::Instant::now,
-    )
+/// The system calls a retirement makes, so the whole decision is
+/// reachable without a process to kill — a test that signalled a real
+/// group would be a test that can kill this machine's own processes
+/// whenever the decision under test is wrong.
+pub(crate) trait Os {
+    fn leader(&self, record: &Producer) -> Leader;
+    fn group(&self, pgid: crate::signal::Pgid) -> Group;
+    fn signal(&self, pgid: crate::signal::Pgid, sig: libc::c_int);
+    /// Collect any of the group's members that are THIS process's
+    /// children. An exited child nobody has waited for still occupies
+    /// its group, so a host verifying its own group empty has to reap
+    /// first; for an inherited group, init already does.
+    fn collect(&self);
+    fn pause(&self, d: std::time::Duration);
+    fn now(&self) -> std::time::Instant;
 }
 
-/// How long a producer is given to end on a `SIGTERM` before `SIGKILL`.
+/// The real system, collecting the given children.
+pub(crate) struct Native<'a> {
+    pub(crate) children: &'a [crate::signal::Pid],
+}
+
+impl Os for Native<'_> {
+    fn leader(&self, record: &Producer) -> Leader {
+        leader_of(record)
+    }
+    fn group(&self, pgid: crate::signal::Pgid) -> Group {
+        group_of(pgid)
+    }
+    fn signal(&self, pgid: crate::signal::Pgid, sig: libc::c_int) {
+        crate::signal::signal_group(pgid, sig)
+    }
+    fn collect(&self) {
+        for child in self.children {
+            crate::signal::collect_exited_child(*child);
+        }
+    }
+    fn pause(&self, d: std::time::Duration) {
+        std::thread::sleep(d)
+    }
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+}
+
+/// How long a group is given to end on a `SIGTERM` before `SIGKILL`.
 pub(crate) const ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How often, and how many times, a retirement looks again for a
+/// group in transition to settle.
+const SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+const SETTLE_LOOKS: u32 = 40;
 
 /// How long an identification stays good enough to escalate on when
 /// the leader has since gone.
@@ -1582,10 +1712,9 @@ pub(crate) const IDENTIFICATION_KEEPS: std::time::Duration = std::time::Duration
 /// Whether an escalation may still be sent.
 ///
 /// `sleep` gives a MINIMUM delay and never a maximum gap in
-/// observation. Two things therefore have to hold, and the old code
-/// checked neither: the leader must not have been replaced by a
-/// different live one, and the identification must not have aged out
-/// while this process was not running.
+/// observation. Two things therefore have to hold: the leader must not
+/// have been replaced by a different live one, and the identification
+/// must not have aged out while this process was not running.
 pub(crate) fn may_escalate(
     seen: &Standing,
     since_identified: std::time::Duration,
@@ -1600,33 +1729,158 @@ pub(crate) fn may_escalate(
         // ours — which is the claim a clock can check and a sleep
         // cannot.
         Standing::Unidentified => since_identified <= keeps,
-        // A different live leader means the id is already somebody
-        // else's; the rest are no evidence at all.
-        Standing::Theirs | Standing::Gone | Standing::Unsure => false,
+        Standing::Theirs | Standing::Gone | Standing::Unrecognised | Standing::Unsure => false,
     }
 }
 
-/// [`reap_previous_producer`] with the system calls supplied, so the
-/// whole decision is reachable without a process to kill — a test that
-/// signalled a real group would be a test that can kill this machine's
-/// own processes whenever the decision under test is wrong.
+/// Whose group a retirement is ending, for what it reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Whose {
+    /// A previous host's, found through its record.
+    Inherited,
+    /// This process's own.
+    Own,
+}
+
+/// End a recorded group: TERM, a grace, KILL, and confirmation that
+/// it is empty — once, bounded.
+///
+/// The record at `path` is removed ONLY once the group is confirmed
+/// empty (or proven to be another incarnation's). Every exit that
+/// stops short of that leaves it in place, so a host that dies at any
+/// point in here leaves its successor something to finish with.
+pub(crate) fn retire(
+    path: &std::path::Path,
+    record: &Producer,
+    os: &impl Os,
+    whose: Whose,
+) -> Retired {
+    // Validated BEFORE anything is looked at or signalled, and the
+    // validation is what the rest of this function then carries: a
+    // record naming one of the special ids cannot have come from
+    // `record_producer` — a child's pid is never 0 or 1 — so it is
+    // evidence from somewhere else, and nothing here will act on it.
+    let Some(pgid) = crate::signal::Pgid::new(record.pgid()) else {
+        return Retired::Deferred(format!(
+            "{} names pgid {}, which is not a process group; remove it",
+            path.display(),
+            record.pgid()
+        ));
+    };
+
+    let now = || standing(&os.leader(record), &os.group(pgid));
+    // Bounded, and spent once per question: this settles a transition,
+    // it does not watch a group.
+    let settled = |until: fn(&Standing) -> bool| {
+        os.collect();
+        let mut seen = now();
+        for _ in 0..SETTLE_LOOKS {
+            if until(&seen) {
+                break;
+            }
+            os.pause(SETTLE_STEP);
+            os.collect();
+            seen = now();
+        }
+        seen
+    };
+    let spent = || {
+        let _ = std::fs::remove_file(path);
+        Retired::Clear
+    };
+
+    // A child of ours that has just exited is still a member until it
+    // is reaped, and reads meanwhile as a group with no leader — so
+    // somebody else's. That is a moment, not an answer.
+    match settled(|s| !matches!(s, Standing::Unidentified | Standing::Unsure)) {
+        Standing::Gone | Standing::Theirs => return spent(),
+        Standing::Unsure => {
+            return Retired::Deferred(format!(
+                "cannot tell what has become of the producer group (pgid {pgid})"
+            ));
+        }
+        Standing::Unidentified => {
+            return Retired::Deferred(format!(
+                "pgid {pgid} has members but no leader to identify them by, so they may not \
+                 be this source's — neither signalling them nor replacing them is safe; \
+                 remove {} once you have established what they are",
+                path.display()
+            ));
+        }
+        Standing::Unrecognised => {
+            return Retired::Deferred(format!(
+                "{} was written by an earlier clank, and its start time does not match the \
+                 live pid {pgid} under this environment — that may be the same producer \
+                 rendered under another TZ or locale, so neither signalling it nor \
+                 replacing it is safe; remove the record once you have established what \
+                 pid {pgid} is",
+                path.display()
+            ));
+        }
+        Standing::Ours => {}
+    }
+
+    // IDENTIFIED, and the moment of it is recorded rather than assumed.
+    let identified_at = os.now();
+    if whose == Whose::Inherited {
+        eprintln!("wait: a command source left a producer behind (pgid {pgid}); ending it");
+    }
+    os.signal(pgid, libc::SIGTERM);
+    os.pause(ESCALATE_AFTER);
+    os.collect();
+
+    // Looked at AGAIN, leader included: the term may have ended the
+    // leader while a descendant ignored it, and it may equally have
+    // ended the whole group and let the id be re-issued. Occupancy
+    // alone cannot tell those apart, and the gap is MEASURED rather
+    // than assumed to be the sleep.
+    if may_escalate(
+        &now(),
+        os.now().saturating_duration_since(identified_at),
+        IDENTIFICATION_KEEPS,
+    ) {
+        os.signal(pgid, libc::SIGKILL);
+    }
+
+    match settled(|s| matches!(s, Standing::Gone | Standing::Theirs)) {
+        Standing::Gone | Standing::Theirs => spent(),
+        Standing::Ours | Standing::Unidentified | Standing::Unrecognised => {
+            Retired::Deferred(format!("the producer group (pgid {pgid}) is still running"))
+        }
+        Standing::Unsure => Retired::Deferred(format!(
+            "cannot tell whether the producer group (pgid {pgid}) has ended"
+        )),
+    }
+}
+
+/// End a previous owner's producer group, if one is still running.
+///
+/// Called by whoever has just taken this source's ingest lease, which
+/// means the previous owner is gone — a lease is held for the life of
+/// its process. What may survive it is the process GROUP, and starting
+/// a second producer beside it is how a SIGKILLed monitor's command
+/// sources accumulate.
+///
+/// The LEASE is the entitlement to signal, not the orphan's parentage.
+/// An earlier version demanded `ppid == 1`, which is what an orphan
+/// looks like here but NOT on a Linux session with a subreaper, where
+/// orphans reparent to the session manager instead.
+pub(crate) fn reap_previous_producer(store_dir: &std::path::Path, key: &str) -> Retired {
+    reap_previous_producer_with(store_dir, key, &Native { children: &[] })
+}
+
+/// [`reap_previous_producer`] with the system calls supplied.
 pub(crate) fn reap_previous_producer_with(
     store_dir: &std::path::Path,
     key: &str,
-    look: impl Fn(i32) -> Look,
-    group_of: impl Fn(crate::signal::Pgid) -> Group,
-    signal: impl Fn(crate::signal::Pgid, libc::c_int),
-    escalate_after: std::time::Duration,
-    clock: impl Fn() -> std::time::Instant,
+    os: &impl Os,
 ) -> Retired {
     let path = producer_path(store_dir, key);
     let record = match std::fs::read(&path) {
         Ok(body) => match serde_json::from_slice::<Producer>(&body) {
             Ok(record) => record,
             // Evidence that cannot be read is UNKNOWN prior state, not
-            // absence, and a launch would overwrite it. The rename in
-            // `record_producer` should make this unreachable; if it is
-            // ever reached, the path is named so it can be dealt with.
+            // absence, and a launch would overwrite it.
             Err(e) => {
                 return Retired::Deferred(format!(
                     "{} is not a usable producer record ({e}); remove it if no producer \
@@ -1641,88 +1895,38 @@ pub(crate) fn reap_previous_producer_with(
             return Retired::Deferred(format!("cannot read {} ({e})", path.display()));
         }
     };
-    // Validated BEFORE anything is looked at or signalled, and the
-    // validation is what the rest of this function then carries: a
-    // record naming one of the special ids cannot have come from
-    // `record_producer` — a child's pid is never 0 or 1 — so it is
-    // evidence from somewhere else, and nothing here will act on it.
-    let Some(pgid) = crate::signal::Pgid::new(record.pgid) else {
-        return Retired::Deferred(format!(
-            "{} names pgid {}, which is not a process group; remove it",
-            path.display(),
-            record.pgid
-        ));
-    };
-
-    let now = |record: &Producer| standing(record, &look(pgid.get()), &group_of(pgid));
-    let spent = || {
-        let _ = std::fs::remove_file(&path);
-        Retired::Clear
-    };
-
-    match now(&record) {
-        Standing::Gone | Standing::Theirs => return spent(),
-        Standing::Unsure => {
-            return Retired::Deferred(format!(
-                "cannot tell what has become of the previous producer's group (pgid {pgid})"
-            ));
-        }
-        Standing::Unidentified => {
-            return Retired::Deferred(format!(
-                "pgid {pgid} has members but no leader to identify them by, so they may not \
-                 be this source's — neither signalling them nor replacing them is safe; \
-                 remove {} once you have established what they are",
-                path.display()
-            ));
-        }
-        Standing::Ours => {}
-    }
-
-    // IDENTIFIED, and the moment of it is recorded rather than assumed.
-    let identified_at = clock();
-    eprintln!("wait: command source `{key}` left a producer behind (pgid {pgid}); ending it");
-    signal(pgid, libc::SIGTERM);
-    std::thread::sleep(escalate_after);
-
-    // Looked at AGAIN, leader included: the term may have ended the
-    // leader while a descendant ignored it, and it may equally have
-    // ended the whole group and let the id be re-issued. Occupancy
-    // alone cannot tell those apart, and the gap is MEASURED rather
-    // than assumed to be the sleep.
-    let seen = now(&record);
-    if may_escalate(
-        &seen,
-        clock().saturating_duration_since(identified_at),
-        IDENTIFICATION_KEEPS,
-    ) {
-        signal(pgid, libc::SIGKILL);
-        std::thread::sleep(escalate_after);
-    }
-
-    match now(&record) {
-        Standing::Gone | Standing::Theirs => spent(),
-        Standing::Ours | Standing::Unidentified => Retired::Deferred(format!(
-            "the previous producer's group (pgid {pgid}) is still running"
-        )),
-        Standing::Unsure => Retired::Deferred(format!(
-            "cannot tell whether the previous producer's group (pgid {pgid}) has ended"
-        )),
-    }
+    retire(&path, &record, os, Whose::Inherited)
 }
 
 #[cfg(test)]
 mod producer_tests {
     use super::*;
     use crate::signal::Pgid;
+    use std::os::unix::process::CommandExt;
     use std::time::Duration;
 
     const WHEN: &str = "Thu 1 Oct 16:58:08 2026";
 
-    fn record() -> Producer {
-        Producer {
-            pgid: 4242,
-            started: WHEN.into(),
-        }
+    fn birth() -> crate::proc_identity::ProcToken {
+        crate::proc_identity::ProcToken::MacStart { sec: 7, usec: 8 }
+    }
+
+    /// An anchored record of group 4242, as a host writes one.
+    fn recorded(dir: &std::path::Path) {
+        record_producer(
+            dir,
+            "src-1",
+            &Producer::Anchored {
+                pgid: 4242,
+                birth: birth(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// The bytes an earlier clank wrote, before records were versioned.
+    fn legacy_bytes(pgid: i32, started: &str) -> Vec<u8> {
+        format!(r#"{{"pgid":{pgid},"started":"{started}"}}"#).into_bytes()
     }
 
     fn alive() -> Observed {
@@ -1974,14 +2178,15 @@ mod producer_tests {
 
     #[test]
     fn identity_is_the_incarnation_not_the_name() {
-        assert!(same_incarnation(&record(), &alive()));
+        assert!(same_incarnation(4242, WHEN, &alive()));
 
         // The case that made a NAME wrong in the permissive direction:
         // a pid re-issued to another copy of the same command. There
         // is no name here to be fooled by, and the start time differs.
         assert!(
             !same_incarnation(
-                &record(),
+                4242,
+                WHEN,
                 &Observed {
                     started: "Thu 1 Oct 17:04:00 2026".into(),
                     ..alive()
@@ -1991,7 +2196,8 @@ mod producer_tests {
         );
         assert!(
             !same_incarnation(
-                &record(),
+                4242,
+                WHEN,
                 &Observed {
                     pgid: 77,
                     ..alive()
@@ -2001,10 +2207,8 @@ mod producer_tests {
         );
         assert!(
             !same_incarnation(
-                &Producer {
-                    started: String::new(),
-                    ..record()
-                },
+                4242,
+                "",
                 &Observed {
                     started: String::new(),
                     ..alive()
@@ -2013,6 +2217,24 @@ mod producer_tests {
             "and an unknown start time is not an identity, even when the \
              live process reports one just as empty"
         );
+    }
+
+    /// A legacy rendering that does not match proves nothing about
+    /// reuse, because nobody wrote down the environment it was
+    /// rendered in.
+    #[test]
+    fn a_legacy_mismatch_is_unmatched_and_never_different() {
+        let stranger = Look::Alive(Observed {
+            started: "Thu 1 Oct 17:04:00 2026".into(),
+            ..alive()
+        });
+        assert_eq!(
+            legacy_leader(4242, WHEN, Look::Alive(alive())),
+            Leader::Same
+        );
+        assert_eq!(legacy_leader(4242, WHEN, stranger), Leader::Unmatched);
+        assert_eq!(legacy_leader(4242, WHEN, Look::Gone), Leader::Gone);
+        assert_eq!(legacy_leader(4242, WHEN, Look::Unknown), Leader::Unknown);
     }
 
     /// `ps` output this build cannot read must not read as death.
@@ -2079,129 +2301,144 @@ mod producer_tests {
 
     #[test]
     fn only_a_live_leader_identifies_a_group() {
-        let live = Look::Alive(alive());
-        let stranger = Look::Alive(Observed {
-            started: "Thu 1 Oct 17:04:00 2026".into(),
-            ..alive()
-        });
-
-        assert_eq!(standing(&record(), &live, &Group::Occupied), Standing::Ours);
+        assert_eq!(standing(&Leader::Same, &Group::Occupied), Standing::Ours);
+        assert_eq!(standing(&Leader::Gone, &Group::Empty), Standing::Gone);
         assert_eq!(
-            standing(&record(), &Look::Gone, &Group::Empty),
-            Standing::Gone
-        );
-        assert_eq!(
-            standing(&record(), &Look::Gone, &Group::Occupied),
+            standing(&Leader::Gone, &Group::Occupied),
             Standing::Unidentified,
             "members with no leader to identify them by are not ours by \
              default: our group may have ended long ago and the number \
              been re-issued to a group whose leader has also exited"
         );
+        for group in [Group::Occupied, Group::Empty] {
+            assert_eq!(
+                standing(&Leader::Different, &group),
+                Standing::Theirs,
+                "a live leader of another incarnation, by an identity no \
+                 environment varies, means the id was reused after ours ended"
+            );
+            assert_eq!(
+                standing(&Leader::Unmatched, &group),
+                Standing::Unrecognised,
+                "an unmatched legacy rendering is not that proof"
+            );
+        }
         assert_eq!(
-            standing(&record(), &stranger, &Group::Occupied),
-            Standing::Theirs,
-            "a live leader of another incarnation means the id was reused, \
-             which could only happen after ours ended"
-        );
-        assert_eq!(
-            standing(&record(), &stranger, &Group::Empty),
-            Standing::Theirs
-        );
-        assert_eq!(
-            standing(&record(), &live, &Group::Empty),
+            standing(&Leader::Same, &Group::Empty),
             Standing::Unsure,
             "a live leader in an empty group is not something to act on"
         );
         for group in [Group::Empty, Group::Occupied, Group::Unknown] {
-            assert_eq!(
-                standing(&record(), &Look::Unknown, &group),
-                Standing::Unsure
-            );
+            assert_eq!(standing(&Leader::Unknown, &group), Standing::Unsure);
         }
-        assert_eq!(
-            standing(&record(), &live, &Group::Unknown),
-            Standing::Unsure
-        );
+        assert_eq!(standing(&Leader::Same, &Group::Unknown), Standing::Unsure);
     }
 
     /// Scripted observations, so a sequence can be driven.
     ///
     /// The leader and the group are scripted SEPARATELY, because the
-    /// code asks them separately: the escalation probes the group
-    /// alone, on the strength of an identification it already made. A
-    /// script that runs out repeats its last answer, so a test lists
-    /// only the observations it cares about.
-    fn reap_over(
-        dir: &std::path::Path,
-        looks: Vec<Look>,
-        groups: Vec<Group>,
-    ) -> (Retired, Vec<(i32, libc::c_int)>) {
-        // A clock that does not move: the attempt is as prompt as the
-        // sleep claims, which is the ordinary case.
-        reap_over_taking(dir, looks, groups, Duration::ZERO)
+    /// code asks them separately. A script that runs out repeats its
+    /// last answer, so a test lists only the observations it cares
+    /// about. Every group observation also notes whether the record
+    /// still existed at that moment.
+    struct Scripted {
+        leaders: std::cell::RefCell<(std::vec::IntoIter<Leader>, Leader)>,
+        groups: std::cell::RefCell<(std::vec::IntoIter<Group>, Group)>,
+        sent: std::cell::RefCell<Vec<(i32, libc::c_int)>>,
+        record_at_each_group_look: std::cell::RefCell<Vec<(Group, bool)>>,
+        record: std::path::PathBuf,
+        looked: std::cell::Cell<bool>,
+        reads: std::cell::Cell<u32>,
+        started: std::time::Instant,
+        took: Duration,
     }
 
-    /// [`reap_over`] with the time this attempt actually took.
-    ///
-    /// Injected, because the hazard is precisely that `sleep` reports a
-    /// minimum and the world supplies the maximum — a stopped process
-    /// resumes with its sleep "over" and an arbitrary gap behind it.
-    /// A test cannot wait that out and must not try.
+    impl Scripted {
+        fn new(dir: &std::path::Path, leaders: Vec<Leader>, groups: Vec<Group>) -> Self {
+            Self {
+                leaders: std::cell::RefCell::new((leaders.into_iter(), Leader::Unknown)),
+                groups: std::cell::RefCell::new((groups.into_iter(), Group::Unknown)),
+                sent: Default::default(),
+                record_at_each_group_look: Default::default(),
+                record: producer_path(dir, "src-1"),
+                looked: Default::default(),
+                reads: Default::default(),
+                started: std::time::Instant::now(),
+                took: Duration::ZERO,
+            }
+        }
+    }
+
+    impl Os for Scripted {
+        fn leader(&self, _: &Producer) -> Leader {
+            self.looked.set(true);
+            let mut s = self.leaders.borrow_mut();
+            if let Some(next) = s.0.next() {
+                s.1 = next;
+            }
+            s.1.clone()
+        }
+        fn group(&self, _: crate::signal::Pgid) -> Group {
+            let mut s = self.groups.borrow_mut();
+            if let Some(next) = s.0.next() {
+                s.1 = next;
+            }
+            self.record_at_each_group_look
+                .borrow_mut()
+                .push((s.1.clone(), self.record.exists()));
+            s.1.clone()
+        }
+        // Recorded as plain numbers, so an assertion about what was
+        // signalled names the GROUP without the type in the way.
+        fn signal(&self, pgid: crate::signal::Pgid, sig: libc::c_int) {
+            self.sent.borrow_mut().push((pgid.get(), sig));
+        }
+        fn collect(&self) {}
+        fn pause(&self, _: Duration) {}
+        // Injected, because the hazard is precisely that `sleep`
+        // reports a minimum and the world supplies the maximum. The
+        // first read is the identification; every one after it is the
+        // gap being measured.
+        fn now(&self) -> std::time::Instant {
+            self.reads.set(self.reads.get() + 1);
+            if self.reads.get() <= 1 {
+                self.started
+            } else {
+                self.started + self.took
+            }
+        }
+    }
+
+    fn reap_over(
+        dir: &std::path::Path,
+        leaders: Vec<Leader>,
+        groups: Vec<Group>,
+    ) -> (Retired, Vec<(i32, libc::c_int)>) {
+        reap_over_taking(dir, leaders, groups, Duration::ZERO)
+    }
+
     fn reap_over_taking(
         dir: &std::path::Path,
-        looks: Vec<Look>,
+        leaders: Vec<Leader>,
         groups: Vec<Group>,
         took: Duration,
     ) -> (Retired, Vec<(i32, libc::c_int)>) {
-        let started = std::time::Instant::now();
-        let reads = std::cell::Cell::new(0u32);
-        let clock = || {
-            reads.set(reads.get() + 1);
-            // The first read is the identification; every one after it
-            // is the gap being measured.
-            if reads.get() <= 1 {
-                started
-            } else {
-                started + took
-            }
+        let os = Scripted {
+            took,
+            ..Scripted::new(dir, leaders, groups)
         };
-        let looks = std::cell::RefCell::new((looks.into_iter(), Look::Unknown));
-        let groups = std::cell::RefCell::new((groups.into_iter(), Group::Unknown));
-        let sent = std::cell::RefCell::new(Vec::new());
-        let out = reap_previous_producer_with(
-            dir,
-            "src-1",
-            |_| {
-                let mut s = looks.borrow_mut();
-                if let Some(next) = s.0.next() {
-                    s.1 = next;
-                }
-                s.1.clone()
-            },
-            |_| {
-                let mut s = groups.borrow_mut();
-                if let Some(next) = s.0.next() {
-                    s.1 = next;
-                }
-                s.1.clone()
-            },
-            // Recorded as plain numbers, so an assertion about what was
-            // signalled names the GROUP without the type in the way.
-            |pgid, sig| sent.borrow_mut().push((pgid.get(), sig)),
-            std::time::Duration::ZERO,
-            clock,
-        );
-        (out, sent.into_inner())
+        let out = reap_previous_producer_with(dir, "src-1", &os);
+        (out, os.sent.into_inner())
     }
 
     #[test]
     fn a_recorded_orphan_is_terminated_then_killed_and_forgotten() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
 
         let (out, sent) = reap_over(
             dir.path(),
-            vec![Look::Alive(alive()), Look::Gone],
+            vec![Leader::Same, Leader::Gone],
             vec![Group::Occupied, Group::Occupied, Group::Empty],
         );
         assert_eq!(
@@ -2228,12 +2465,12 @@ mod producer_tests {
     #[test]
     fn a_descendant_that_outlives_its_leader_is_still_ended() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
 
         let (out, sent) = reap_over(
             dir.path(),
             // Identified, then the leader goes while the group does not.
-            vec![Look::Alive(alive()), Look::Gone],
+            vec![Leader::Same, Leader::Gone],
             vec![Group::Occupied, Group::Occupied, Group::Empty],
         );
         assert_eq!(
@@ -2248,13 +2485,9 @@ mod producer_tests {
     #[test]
     fn a_group_that_will_not_end_withholds_the_launch() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
 
-        let (out, sent) = reap_over(
-            dir.path(),
-            vec![Look::Alive(alive())],
-            vec![Group::Occupied],
-        );
+        let (out, sent) = reap_over(dir.path(), vec![Leader::Same], vec![Group::Occupied]);
         assert_eq!(sent, vec![(4242, libc::SIGTERM), (4242, libc::SIGKILL)]);
         assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
         assert!(
@@ -2273,18 +2506,15 @@ mod producer_tests {
     #[test]
     fn a_replacement_leader_between_the_term_and_the_kill_cancels_it() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
 
         let (out, sent) = reap_over(
             dir.path(),
             vec![
-                Look::Alive(alive()),
+                Leader::Same,
                 // Our group ended and the number is already somebody
                 // else's, with a leader that says so.
-                Look::Alive(Observed {
-                    started: "Thu 1 Oct 17:04:00 2026".into(),
-                    ..alive()
-                }),
+                Leader::Different,
             ],
             vec![Group::Occupied],
         );
@@ -2307,13 +2537,13 @@ mod producer_tests {
     #[test]
     fn an_attempt_that_took_too_long_does_not_escalate() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
 
         let (out, sent) = reap_over_taking(
             dir.path(),
             // Identified, then the leader is gone and members remain —
             // which is the one case that rests on the gap being short.
-            vec![Look::Alive(alive()), Look::Gone],
+            vec![Leader::Same, Leader::Gone],
             vec![Group::Occupied],
             IDENTIFICATION_KEEPS + Duration::from_millis(1),
         );
@@ -2332,7 +2562,7 @@ mod producer_tests {
         // elapsed time deciding and not the shape of the sequence.
         let (out, sent) = reap_over_taking(
             dir.path(),
-            vec![Look::Alive(alive()), Look::Gone],
+            vec![Leader::Same, Leader::Gone],
             vec![Group::Occupied, Group::Occupied, Group::Empty],
             IDENTIFICATION_KEEPS,
         );
@@ -2354,7 +2584,12 @@ mod producer_tests {
         assert!(may_escalate(&Standing::Unidentified, keeps, keeps));
         assert!(!may_escalate(&Standing::Unidentified, late, keeps));
         // And the rest are not evidence at all.
-        for s in [Standing::Theirs, Standing::Gone, Standing::Unsure] {
+        for s in [
+            Standing::Theirs,
+            Standing::Gone,
+            Standing::Unrecognised,
+            Standing::Unsure,
+        ] {
             assert!(!may_escalate(&s, prompt, keeps), "{s:?}");
         }
     }
@@ -2372,9 +2607,9 @@ mod producer_tests {
     #[test]
     fn a_recycled_group_whose_leader_also_ended_is_never_signalled() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
 
-        let (out, sent) = reap_over(dir.path(), vec![Look::Gone], vec![Group::Occupied]);
+        let (out, sent) = reap_over(dir.path(), vec![Leader::Gone], vec![Group::Occupied]);
         assert!(
             sent.is_empty(),
             "nothing identifies these members as ours, so nothing may be sent"
@@ -2404,37 +2639,30 @@ mod producer_tests {
         assert_eq!(out, Retired::Clear);
 
         // A record whose group has provably gone.
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
-        let (out, sent) = reap_over(dir.path(), vec![Look::Gone], vec![Group::Empty]);
+        recorded(dir.path());
+        let (out, sent) = reap_over(dir.path(), vec![Leader::Gone], vec![Group::Empty]);
         assert!(sent.is_empty(), "a group that has ended needs no signal");
         assert_eq!(out, Retired::Clear);
         assert!(!producer_path(dir.path(), "src-1").exists());
 
         // A live leader of another incarnation: the id was reused, so
         // ours ended, and whatever is in that group now is theirs.
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
-        let (out, sent) = reap_over(
-            dir.path(),
-            vec![Look::Alive(Observed {
-                started: "Thu 1 Oct 17:04:00 2026".into(),
-                ..alive()
-            })],
-            vec![Group::Occupied],
-        );
+        recorded(dir.path());
+        let (out, sent) = reap_over(dir.path(), vec![Leader::Different], vec![Group::Occupied]);
         assert!(sent.is_empty(), "a recycled id must never be signalled");
         assert_eq!(out, Retired::Clear);
 
         // A look that FAILED keeps the record AND withholds the
         // launch: the record is the only evidence the group exists,
         // and a launch would overwrite it on its way past.
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
-        let (out, sent) = reap_over(dir.path(), vec![Look::Unknown], vec![Group::Empty]);
+        recorded(dir.path());
+        let (out, sent) = reap_over(dir.path(), vec![Leader::Unknown], vec![Group::Empty]);
         assert!(sent.is_empty());
         assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
         assert!(producer_path(dir.path(), "src-1").exists());
 
         // A group whose state cannot be established, likewise.
-        let (out, _) = reap_over(dir.path(), vec![Look::Gone], vec![Group::Unknown]);
+        let (out, _) = reap_over(dir.path(), vec![Leader::Gone], vec![Group::Unknown]);
         assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
         assert!(producer_path(dir.path(), "src-1").exists());
     }
@@ -2451,35 +2679,15 @@ mod producer_tests {
     fn a_record_naming_a_special_id_signals_nothing() {
         for pgid in [1i32, 0, -1] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(
-                producer_path(dir.path(), "src-1"),
-                serde_json::to_vec(&Producer {
-                    pgid,
-                    started: WHEN.into(),
-                })
-                .unwrap(),
-            )
-            .unwrap();
+            std::fs::write(producer_path(dir.path(), "src-1"), legacy_bytes(pgid, WHEN)).unwrap();
 
-            let looked = std::cell::Cell::new(false);
-            let sent = std::cell::RefCell::new(Vec::new());
-            let out = reap_previous_producer_with(
-                dir.path(),
-                "src-1",
-                |_| {
-                    looked.set(true);
-                    Look::Alive(Observed {
-                        pgid,
-                        started: WHEN.into(),
-                    })
-                },
-                |_| Group::Occupied,
-                |pgid, sig| sent.borrow_mut().push((pgid, sig)),
-                std::time::Duration::ZERO,
-                std::time::Instant::now,
+            let os = Scripted::new(dir.path(), vec![Leader::Same], vec![Group::Occupied]);
+            let out = reap_previous_producer_with(dir.path(), "src-1", &os);
+            assert!(os.sent.borrow().is_empty(), "pgid {pgid} was signalled");
+            assert!(
+                !os.looked.get(),
+                "pgid {pgid} was not even worth looking at"
             );
-            assert!(sent.borrow().is_empty(), "pgid {pgid} was signalled");
-            assert!(!looked.get(), "pgid {pgid} was not even worth looking at");
             assert!(matches!(out, Retired::Deferred(_)), "pgid {pgid}: {out:?}");
         }
     }
@@ -2530,11 +2738,17 @@ mod producer_tests {
     #[test]
     fn a_record_is_published_whole_or_not_at_all() {
         let dir = tempfile::tempdir().unwrap();
-        record_producer(dir.path(), "src-1", 4242, WHEN).unwrap();
+        recorded(dir.path());
         let back: Producer =
             serde_json::from_slice(&std::fs::read(producer_path(dir.path(), "src-1")).unwrap())
                 .unwrap();
-        assert_eq!(back, record());
+        assert_eq!(
+            back,
+            Producer::Anchored {
+                pgid: 4242,
+                birth: birth()
+            }
+        );
         assert!(
             !producer_path(dir.path(), "src-1")
                 .with_extension("producer.tmp")
@@ -2545,6 +2759,231 @@ mod producer_tests {
         // An unwritable directory is reported, not swallowed: the
         // caller decides whether to run an unrecorded producer.
         let gone = dir.path().join("not-there");
-        assert!(record_producer(&gone, "src-1", 4242, WHEN).is_err());
+        assert!(
+            record_producer(
+                &gone,
+                "src-1",
+                &Producer::Anchored {
+                    pgid: 4242,
+                    birth: birth()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    /// The record outlives the group's last member, never the other
+    /// way round: a host that dies anywhere inside a retirement leaves
+    /// its successor the record of whatever it had not yet ended.
+    #[test]
+    fn the_record_outlives_every_member_of_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path());
+        let os = Scripted::new(
+            dir.path(),
+            vec![Leader::Same, Leader::Same, Leader::Same, Leader::Gone],
+            vec![
+                Group::Occupied,
+                Group::Occupied,
+                Group::Occupied,
+                Group::Empty,
+            ],
+        );
+        let out = reap_previous_producer_with(dir.path(), "src-1", &os);
+        assert_eq!(out, Retired::Clear);
+        let looks = os.record_at_each_group_look.into_inner();
+        assert!(looks.iter().any(|(g, _)| *g == Group::Occupied));
+        for (group, record_existed) in &looks {
+            if *group == Group::Occupied {
+                assert!(
+                    record_existed,
+                    "the record went while members remained: {looks:?}"
+                );
+            }
+        }
+        assert!(!producer_path(dir.path(), "src-1").exists());
+    }
+
+    #[test]
+    fn a_legacy_record_reads_as_the_bytes_an_earlier_clank_wrote() {
+        let back: Producer = serde_json::from_slice(&legacy_bytes(4242, WHEN)).unwrap();
+        assert_eq!(
+            back,
+            Producer::Legacy {
+                pgid: 4242,
+                started: WHEN.into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_record_of_an_unknown_version_withholds_the_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            producer_path(dir.path(), "src-1"),
+            br#"{"version":9,"pgid":4242,"birth":{"v":"mac1","sec":1,"usec":2}}"#,
+        )
+        .unwrap();
+        let (out, sent) = reap_over(dir.path(), vec![Leader::Same], vec![Group::Occupied]);
+        assert!(sent.is_empty());
+        let Retired::Deferred(why) = out else {
+            panic!("an unreadable version is not a first launch: {out:?}")
+        };
+        assert!(why.contains("version 9"), "{why}");
+        assert!(producer_path(dir.path(), "src-1").exists());
+    }
+
+    /// A live process, `ps`-rendered under `tz`.
+    fn lstart_under(pid: i32, tz: &str) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p"])
+            .arg(pid.to_string())
+            .env("TZ", tz)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A live producer recorded by an earlier clank under another
+    /// `TZ`: the same process, read differently. That is not reuse, so
+    /// it is neither signalled nor replaced.
+    #[test]
+    fn a_legacy_record_rendered_under_another_tz_defers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let Look::Alive(here) = look(pid) else {
+            panic!("the child is running")
+        };
+        let elsewhere = ["Pacific/Kiritimati", "Etc/GMT+12"]
+            .into_iter()
+            .map(|tz| lstart_under(pid, tz))
+            .find(|rendered| !rendered.is_empty() && *rendered != here.started)
+            .expect("one of two zones 26 hours apart renders differently");
+        std::fs::write(
+            producer_path(dir.path(), "src-1"),
+            legacy_bytes(pid, &elsewhere),
+        )
+        .unwrap();
+
+        let out = reap_previous_producer(dir.path(), "src-1");
+        let Retired::Deferred(why) = out else {
+            panic!("an unmatched legacy record was treated as settled: {out:?}")
+        };
+        assert!(why.contains("src-1.producer"), "{why}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "our own producer was signalled for rendering differently"
+        );
+        assert!(producer_path(dir.path(), "src-1").exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// The legacy collision a guessed environment would authorise: a
+    /// Sydney record of an 08:45 UTC start reads `19:45`, and the
+    /// stranger that later took the pid at 19:45 UTC reads exactly that
+    /// in UTC. In the caller's own (Sydney) environment it reads
+    /// otherwise. Pure, so no real process is endangered.
+    #[test]
+    fn a_reused_pid_matching_under_a_guessed_tz_is_never_signalled() {
+        struct SydneyCaller {
+            sent: std::cell::RefCell<Vec<libc::c_int>>,
+        }
+        impl Os for SydneyCaller {
+            fn leader(&self, record: &Producer) -> Leader {
+                let Producer::Legacy { pgid, started } = record else {
+                    unreachable!()
+                };
+                legacy_leader(
+                    *pgid,
+                    started,
+                    Look::Alive(Observed {
+                        pgid: *pgid,
+                        started: "Tue 6 Oct 06:45:00 2026".into(),
+                    }),
+                )
+            }
+            fn group(&self, _: crate::signal::Pgid) -> Group {
+                Group::Occupied
+            }
+            fn signal(&self, _: crate::signal::Pgid, sig: libc::c_int) {
+                self.sent.borrow_mut().push(sig);
+            }
+            fn collect(&self) {}
+            fn pause(&self, _: Duration) {}
+            fn now(&self) -> std::time::Instant {
+                std::time::Instant::now()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            producer_path(dir.path(), "src-1"),
+            legacy_bytes(4242, "Mon 5 Oct 19:45:00 2026"),
+        )
+        .unwrap();
+        let os = SydneyCaller {
+            sent: Default::default(),
+        };
+        let out = reap_previous_producer_with(dir.path(), "src-1", &os);
+        assert!(os.sent.borrow().is_empty(), "a stranger was signalled");
+        assert!(matches!(out, Retired::Deferred(_)), "{out:?}");
+        assert!(producer_path(dir.path(), "src-1").exists());
+    }
+
+    /// An anchored record's identity is read as numbers, so there is
+    /// no environment for a reader to differ in — and it still tells a
+    /// reused pid apart.
+    #[test]
+    fn an_anchored_identity_has_no_rendering_and_still_tells_reuse_apart() {
+        use crate::proc_identity::ProcToken;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let birth = crate::proc_identity::token_for(pid).unwrap();
+        let ours = Producer::Anchored {
+            pgid: pid,
+            birth: birth.clone(),
+        };
+        record_producer(dir.path(), "src-1", &ours).unwrap();
+        let bytes = std::fs::read_to_string(producer_path(dir.path(), "src-1")).unwrap();
+        assert!(!bytes.contains("started"), "{bytes}");
+        assert_eq!(leader_of(&ours), Leader::Same);
+
+        let reused = Producer::Anchored {
+            pgid: pid,
+            birth: match birth {
+                ProcToken::MacStart { sec, usec } => ProcToken::MacStart {
+                    sec,
+                    usec: usec + 1,
+                },
+                ProcToken::LinuxStart { ticks, boot } => ProcToken::LinuxStart {
+                    ticks: ticks + 1,
+                    boot,
+                },
+                ProcToken::Unrecognised => unreachable!(),
+            },
+        };
+        assert_eq!(leader_of(&reused), Leader::Different);
+        record_producer(dir.path(), "src-1", &reused).unwrap();
+        assert_eq!(reap_previous_producer(dir.path(), "src-1"), Retired::Clear);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a different incarnation's process was signalled"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

@@ -153,6 +153,21 @@ pub fn signal_process(pid: Pid, sig: libc::c_int) {
     }
 }
 
+/// Reap `pid` if it is this process's child and has exited, without
+/// waiting for it.
+///
+/// An exited child that nobody has waited for is still a member of
+/// its process group, so a host that has just killed its own group
+/// cannot see it empty until it does this. `ECHILD` — not our child,
+/// or already reaped by the runtime — leaves nothing to do.
+pub fn collect_exited_child(pid: Pid) {
+    let mut status = 0;
+    // SAFETY: WNOHANG never blocks, and `status` is a valid out-pointer.
+    unsafe {
+        libc::waitpid(pid.get(), &mut status, libc::WNOHANG);
+    }
+}
+
 /// A `kill` return read as an errno, with `None` meaning it succeeded.
 fn outcome(rc: i32) -> Option<i32> {
     (rc != 0).then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0))

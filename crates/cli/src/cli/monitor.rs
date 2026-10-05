@@ -2547,7 +2547,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                     "monitor: cancellation had not taken effect after \
                                      {SETTLE_BUDGET:?}; exiting with the lease held"
                                 );
-                                std::process::exit(STOOD_DOWN_EXIT);
+                                crate::cli::source_group::exit(STOOD_DOWN_EXIT);
                             }
                         }
                     }
@@ -2682,7 +2682,7 @@ fn watch_the_fold(tick: std::sync::Arc<std::sync::atomic::AtomicU64>, every: Dur
                         "monitor: the fold has not advanced past {seen} in {:?}; standing down so the lease frees",
                         every * limit
                     );
-                    std::process::exit(STOOD_DOWN_EXIT);
+                    crate::cli::source_group::exit(STOOD_DOWN_EXIT);
                 }
             }
         }

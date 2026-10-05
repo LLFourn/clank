@@ -2925,10 +2925,9 @@ fn emit_wire(
     Ok((code, presented))
 }
 
-/// Render the outcome to the per-tool wire shape and exit.
-/// This is the ONLY place in the binary that calls
-/// `process::exit` directly — main()'s normal flow can't be
-/// trusted to pick the right code for the hook protocol.
+/// Render the outcome to the per-tool wire shape and exit —
+/// main()'s normal flow can't be trusted to pick the right code for
+/// the hook protocol.
 async fn emit_and_exit(outcome: HookOutcome, tool: Tool, capture: ReceiptCapture) -> ! {
     let code = emit_delivery(
         outcome,
@@ -2938,7 +2937,7 @@ async fn emit_and_exit(outcome: HookOutcome, tool: Tool, capture: ReceiptCapture
         &mut std::io::stderr(),
     )
     .await;
-    std::process::exit(code)
+    crate::cli::source_group::exit(code)
 }
 async fn emit_delivery(
     mut outcome: HookOutcome,

@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = dispatch(Cli::parse()).await {
         let code = exit_code_for(&e);
         eprintln!("{e:#}");
-        std::process::exit(code);
+        clank::cli::source_group::exit(code);
     }
     Ok(())
 }
