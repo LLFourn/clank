@@ -72,7 +72,7 @@ pub enum Command {
     /// (`--to`), or `--master` for whoever that repo's roster names
     /// master. The message wakes its agent until it is handled.
     Send(crate::cli::SendArgs),
-    /// Submit a message to an agent's terminal, then interrupt its current turn
+    /// Interrupt an agent's current turn, then submit a message to its terminal
     ///
     /// The escape hatch for when `clank send` cannot be delivered —
     /// a wedged hook, a stale binding, a wake that never fires. It

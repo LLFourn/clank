@@ -1,4 +1,4 @@
-//! `clank nudge`: submit a message, then interrupt the agent's current turn.
+//! `clank nudge`: interrupt the agent's current turn, then submit a message.
 //!
 //! `clank send` is the right mechanism and has a failure mode it
 //! cannot report: it writes a durable inbox row and trusts the agent's
@@ -22,7 +22,7 @@ pub async fn run(args: NudgeArgs) -> anyhow::Result<()> {
 
     open_zellij::require_zellij()?;
     let (found, tool) = super::pane_target::discover(repo.clone(), to.clone()).await?;
-    crate::cli::pane_input::submit_and_interrupt_async(&found.session, &found.pane, tool, &body)
+    crate::cli::pane_input::interrupt_and_submit_async(&found.session, &found.pane, tool, &body)
         .await?;
     println!(
         "nudged `{to}` in {} (session {}, pane {})",

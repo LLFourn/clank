@@ -774,9 +774,20 @@ or polls for completion. Relative profile paths with unknown launch cwd are
 refused. A read-only preflight failure permits verified terminal fallback;
 uncertainty after native control forbids a second transport attempt.
 
-The verified Zellij pane receives a brief inbox instruction, then Ctrl+C for
-Grok or Escape for other providers. `clank nudge` uses the same submission/cancellation sequence with your
-message and remains independent of hook and binding health. Launch provenance
+The verified Zellij pane first receives Ctrl+C for Grok or Escape for other
+providers, then a brief inbox instruction. `clank nudge` uses the same
+interrupt-then-submit sequence with your message and remains independent of
+hook and binding health. Interrupting first is what lets an IDLE agent keep the
+message: submitting first started a turn that the interrupt then cancelled, and
+the interrupt key is inert at an idle prompt for every supported provider. For
+a BUSY agent the terminal path is best-effort. The message follows the interrupt
+directly, and what happens to input arriving while a turn is still being
+cancelled is up to the provider. Claude documents that input submitted while
+busy is queued and sent after Escape; for Codex, Grok and opencode it is not
+established. If the interrupt's delivery is not confirmed, no message is
+submitted. The key may still have landed, so the failure is not reported as
+safe to repeat. A message whose submission is unconfirmed is never resent
+automatically. Launch provenance
 must corroborate the actual running provider; restart older panes through an
 updated Clank launcher if that evidence is missing. Accepted terminal bytes are
 not proof that a subprocess stopped or an event was read.
