@@ -33,7 +33,6 @@ pub(crate) async fn try_wake(repo: &Path, label: &AgentLabel) -> anyhow::Result<
 }
 
 fn target(repo: &Path, label: &AgentLabel) -> Option<(String, PathBuf)> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let session = crate::agent_store::load_agent_config(repo, label)
         .ok()??
         .session?;
@@ -50,11 +49,18 @@ fn target(repo: &Path, label: &AgentLabel) -> Option<(String, PathBuf)> {
     // candidate; loaded-thread, cwd and binding checks authorize its use below.
     let default_home = std::env::var_os("HOME").map(PathBuf::from)?;
     let socket = profile_socket(desc.launch.as_ref(), &default_home)?;
-    let metadata = std::fs::symlink_metadata(&socket).ok()?;
-    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
-        return None;
-    }
+    let socket = own_socket(&socket, unsafe { libc::geteuid() })?;
     Some((session.id.as_str().to_owned(), socket))
+}
+
+/// The socket `path` leads to, if it is one and `owner` owns it. Codex
+/// publishes its control socket as a link into its daemon's directory, so
+/// the checks are made on where the link ends, and that is what is used.
+fn own_socket(path: &Path, owner: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let socket = std::fs::canonicalize(path).ok()?;
+    let metadata = std::fs::symlink_metadata(&socket).ok()?;
+    (metadata.file_type().is_socket() && metadata.uid() == owner).then_some(socket)
 }
 
 fn profile_socket(
@@ -708,8 +714,15 @@ mod tests {
         };
         tokio::join!(control, script);
     }
+    /// Through the published path, whether it is the socket itself or a
+    /// link to one elsewhere, as Codex 0.160 publishes it.
     #[tokio::test]
     async fn bound_profile_socket_drives_real_transport_without_zellij() {
+        bound_profile_socket_drives(false).await;
+        bound_profile_socket_drives(true).await;
+    }
+
+    async fn bound_profile_socket_drives(linked: bool) {
         use super::super::teams_config::{AgentDescription, RosterRole};
         use clank_core::{agent_config::LaunchConfig, ids::SessionId};
         let repo = tempfile::tempdir_in("/tmp").unwrap();
@@ -739,7 +752,15 @@ mod tests {
         .unwrap();
         let socket = profile_socket(Some(&launch), Path::new("/irrelevant")).unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let daemon = tempfile::tempdir_in("/tmp").unwrap();
+        let listener = if linked {
+            let real = daemon.path().join("control.sock");
+            let listener = tokio::net::UnixListener::bind(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &socket).unwrap();
+            listener
+        } else {
+            tokio::net::UnixListener::bind(socket).unwrap()
+        };
         let script = async {
             let (stream, _) = listener.accept().await.unwrap();
             let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -774,8 +795,45 @@ mod tests {
                 }
             }
         };
-        let (result, ()) = tokio::join!(try_wake(repo.path(), &label), script);
+        // A refused target never connects, and the script would wait for
+        // it forever.
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(try_wake(repo.path(), &label), script)
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the wake never reached the socket (linked: {linked})"));
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn only_a_socket_this_user_owns_is_used_wherever_its_link_leads() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let me = unsafe { libc::geteuid() };
+        let real = dir.path().join("real.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let link = dir.path().join("published.sock");
+        symlink(&real, &link).unwrap();
+        let chained = dir.path().join("chained.sock");
+        symlink(&link, &chained).unwrap();
+        assert_eq!(own_socket(&real, me), Some(real.clone()));
+        assert_eq!(own_socket(&link, me), Some(real.clone()), "a link to it");
+        assert_eq!(
+            own_socket(&chained, me),
+            Some(real.clone()),
+            "a link to a link"
+        );
+
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let to_file = dir.path().join("to-file.sock");
+        symlink(&file, &to_file).unwrap();
+        assert_eq!(own_socket(&to_file, me), None, "a link to a regular file");
+        let dangling = dir.path().join("dangling.sock");
+        symlink(dir.path().join("gone"), &dangling).unwrap();
+        assert_eq!(own_socket(&dangling, me), None, "a dangling link");
+        assert_eq!(own_socket(&link, me + 1), None, "another user's socket");
     }
 
     #[test]
