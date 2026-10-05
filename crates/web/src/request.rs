@@ -11,6 +11,9 @@ pub const ACTION_KIND: &str = "browser_request";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum BrowserRequest {
+    TranscriptImage {
+        ask: TranscriptImage,
+    },
     Say {
         pane: String,
         label: String,
@@ -50,6 +53,38 @@ pub enum BrowserRequest {
     Site {
         path: String,
     },
+}
+
+/// A retained attachment, never a filesystem path. The window and content key
+/// prevent a delayed request from returning an image from a replacement turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptImage {
+    pub agent: String,
+    pub session: String,
+    pub generation: u32,
+    pub turn: String,
+    pub index: usize,
+    pub key: String,
+    pub preview: bool,
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    #[test]
+    fn attachment_requests_roundtrip_without_any_filesystem_authority() {
+        let value = serde_json::json!({"agent":"a","session":"s","generation":1,"turn":"t","index":0,"key":"content","preview":true});
+        let ask: TranscriptImage = serde_json::from_value(value.clone()).unwrap();
+        let request = BrowserRequest::TranscriptImage { ask };
+        assert_eq!(
+            BrowserRequest::from_action(request.clone().into_action()).unwrap(),
+            request
+        );
+        let mut path = value;
+        path["path"] = serde_json::json!("/private/file.png");
+        assert!(serde_json::from_value::<TranscriptImage>(path).is_err());
+    }
 }
 
 /// Recovery targets the existing owner, never a transcript or a new session.

@@ -164,6 +164,7 @@ impl WebService {
                     | "questions/answer"
                     | "agents/reopen"
                     | "upload"
+                    | "transcript/image"
             ) | (Method::GET, "agents/candidates")
         ) || (method == Method::GET && path.starts_with("html/"));
         if !recognized {
@@ -219,8 +220,10 @@ impl WebService {
                 | "questions/reconnect"
                 | "questions/answer"
                 | "agents/reopen",
+                // Image reads use the same admission and bridge action path.
             )
-            | (Method::GET, "agents/candidates") => self.action(req, lease, &path).await,
+            | (Method::GET, "agents/candidates")
+            | (Method::POST, "transcript/image") => self.action(req, lease, &path).await,
             (Method::GET, path) if path.starts_with("html/") => self.action(req, lease, path).await,
             _ => unreachable!("recognized route already checked"),
         }
@@ -258,7 +261,7 @@ impl WebService {
             "text/html; charset=utf-8",
         );
         let policy = format!(
-            "default-src 'none'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; font-src 'self'; connect-src 'self'; frame-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            "default-src 'none'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self'; frame-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
         );
         response
             .headers_mut()
@@ -482,6 +485,9 @@ fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
             let input: ReopenInput = serde_json::from_slice(bytes)?;
             BrowserRequest::Reopen { label: input.label }
         }
+        "transcript/image" => BrowserRequest::TranscriptImage {
+            ask: serde_json::from_slice(bytes)?,
+        },
         "queue" | "stash" | "agents" => {
             let ask: serde_json::Value = serde_json::from_slice(bytes)?;
             anyhow::ensure!(ask.is_object(), "expected an object");
@@ -1018,6 +1024,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("href=\"/app/team/xterm.css\""));
         assert!(response.contains("content-security-policy:"));
+        assert!(response.contains("img-src 'self' data: blob:"));
         assert!(!response.contains("/*__CLANK_DOOR__*/"));
 
         let mut traversal = TcpStream::connect(addr).await.unwrap();
@@ -1170,6 +1177,39 @@ mod tests {
         assert_eq!(native_ask.id, "18446744073709551615");
         assert_eq!(native_ask.answers["private"][0].len(), 100_000);
         drop(calls_now);
+
+        // Image descriptors use the admitted, same-origin action route. Neither
+        // a connector credential nor a path in the body grants browser access.
+        let image = serde_json::json!({"agent":"codex", "session":"s1", "generation":1,
+            "turn":"image-1", "index":0, "key":"retained-content", "preview":true});
+        for (cookie, origin, status) in [
+            ("session=allowed", format!("http://{addr}"), 204),
+            ("", format!("http://{addr}"), 401),
+            ("session=allowed", "http://other.example".into(), 403),
+        ] {
+            let body = image.to_string();
+            let mut request = TcpStream::connect(addr).await.unwrap();
+            request.write_all(format!("POST /app/team/transcript/image HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), request.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .starts_with(&format!("HTTP/1.1 {status}"))
+            );
+        }
+        assert!(
+            matches!(calls.lock().await.last(), Some(BrowserRequest::TranscriptImage { ask })
+            if ask.agent == "codex" && ask.key == "retained-content")
+        );
+        assert_eq!(
+            calls.lock().await.len(),
+            3,
+            "refused image reads never reach the repo"
+        );
         let bytes = vec![0xa5; 128 * 1024 + 3];
         let mut upload = TcpStream::connect(addr).await.unwrap();
         upload.write_all(format!(
@@ -1203,7 +1243,7 @@ mod tests {
             String::from_utf8(response).unwrap()
         });
         tokio::time::timeout(Duration::from_secs(3), async {
-            while calls.lock().await.len() != 3 {
+            while !matches!(calls.lock().await.last(), Some(BrowserRequest::Say { text, .. }) if text == "hang") {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1233,6 +1273,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let dispatched_before_disconnect = calls.lock().await.len();
         let mut disconnected = TcpStream::connect(addr).await.unwrap();
         disconnected.write_all(ask.as_bytes()).await.unwrap();
         let mut response = Vec::new();
@@ -1247,7 +1288,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
         assert_eq!(
             calls.lock().await.len(),
-            3,
+            dispatched_before_disconnect,
             "a disconnected request cannot reach the repo"
         );
         server.abort();

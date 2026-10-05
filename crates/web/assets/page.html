@@ -258,15 +258,28 @@
   .turn pre { margin: 6px 0 0; padding: 8px 10px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; max-height: 40vh; overflow: auto; }
   /* A picture, as pasted: no wider than the column, no taller than
      most of the screen; the full thing a tap away. */
-  .turn .shot { display: block; max-width: 100%; max-height: 60vh; margin: 6px 0 0; border-radius: 6px; border: 1px solid var(--edge); cursor: zoom-in; }
+  .turn .attachment { display: inline-flex; vertical-align: top; flex-direction: column; width: min(280px, 100%); margin: 6px 8px 0 0; }
+  .turn .shot-button { width: 100%; height: 180px; display: flex; align-items: center; justify-content: center; padding: 6px; border: 1px solid var(--edge); border-radius: 8px; background: var(--base); color: var(--muted); cursor: zoom-in; overflow: hidden; }
+  .turn .shot { width: auto; height: auto; max-width: 100%; max-height: 100%; min-width: 0; min-height: 0; object-fit: contain; }
+  .turn .attachment-caption { font-size: 12px; color: var(--muted); margin-top: 4px; height: 2.8em; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .turn .attachment-actions { height: 24px; }
+  .turn .image-retry { font-size: 12px; align-self: flex-start; }
   .turn .shots { margin-top: 6px; }
   .turn .unshipped { color: var(--muted); font-size: 12px; }
   /* The full picture, in the page: a browser will not open a data
      URL as a page of its own, so the viewer is ours — natural size,
      scrollable, gone on a tap or Escape. */
-  .viewer { display: none; position: fixed; inset: 0; z-index: 6; background: rgba(0, 0, 0, .88); overflow: auto; cursor: zoom-out; }
-  .viewer.open { display: block; }
-  .viewer img { display: block; margin: 24px auto; max-width: none; }
+  .viewer { position: fixed; border: 0; padding: 16px; width: 100vw; height: 100dvh; max-width: 100vw; max-height: 100dvh; margin: 0; background: rgba(0, 0, 0, .94); color: white; }
+  .viewer::backdrop { background: rgba(0, 0, 0, .88); }
+  .viewer header { display: flex; align-items: center; gap: 12px; height: 44px; }
+  .viewer header span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .viewer button { flex-shrink: 0; color: white; border: 1px solid #777; border-radius: 6px; background: #222; padding: 7px 12px; }
+  .viewer .image-stage { height: calc(100% - 44px); overflow: auto; display: flex; align-items: center; justify-content: center; min-height: 0; }
+  .viewer img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
+  .viewer.zoomed .image-stage { display: block; }
+  .viewer.zoomed img { max-width: none; max-height: none; margin: auto; }
+  .task-status { color: var(--muted); font-size: 12px; margin: 8px 0; }
+  .task-record summary, .call-record summary { color: var(--muted); font-size: 12px; }
   .turn pre[hidden] { display: none; }
 
   /* Terminal: the pane at its desktop size, in a scroller. */
@@ -496,7 +509,7 @@
       </div>
     </div>
   </form>
-  <div class="viewer" id="viewer" role="dialog" aria-label="Full-size image"></div>
+  <dialog class="viewer" id="viewer" aria-label="Expanded image"><header><span class="image-label"></span><button class="image-zoom" type="button" disabled>Actual size</button><button class="image-close" type="button" autofocus>Close</button></header><div class="image-stage" role="status"></div></dialog>
   <aside class="ledger" id="ledger">
     <div class="lhead"><span class="session" id="session"></span></div>
     <div class="facts" id="facts"></div>
@@ -758,7 +771,7 @@
   // a tool's output arriving, and timestamps alone cannot tell two
   // turns in the same second apart — or any turn whose harness sent
   // no timestamp at all (codex on e14c244).
-  const mark = (t) => `${t.id}/${t.body.kind}/${(t.body.text || '').length}/${t.body.output == null ? '-' : t.body.output.length}`;
+  const mark = (t) => `${t.id}/${t.body.kind}/${(t.body.text || '').length}/${t.body.output == null ? '-' : t.body.output.length}/${(t.body.tasks || []).map(task => task.id + ':' + task.status + ':' + (task.output?.length ?? '-')).join(',')}/${t.body.key || (t.body.images || []).map(image => image.key).join(',')}`;
   const sig = (list) => list.map(mark).join(',');
   // A count of the times an agent's transcript actually CHANGED. An
   // identical replay does not move it, so a deliberate Stop survives
@@ -1176,21 +1189,95 @@
       const wrapper = b.live_entry ? 'form' : 'div';
       return `${age}<section class="question-card"><div class="question-caption"></div><${wrapper} class="${b.live_entry ? 'question-answer' : 'question-record'}"><div class="question-fields"></div><button class="question-submit" type="submit" hidden>Submit answer</button></${wrapper}><div class="question-note" role="status" aria-live="polite"></div><div class="question-notice" role="alert"></div><button class="question-terminal" type="button">View in Terminal</button><button class="question-reconnect" type="button" hidden>Reconnect questions</button><button class="question-discard" type="button" hidden>Discard answer draft</button><details class="question-result" hidden><summary>Recorded result</summary><pre></pre></details></section>`;
     }
-    return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><pre class="out"></pre><div class="shots"></div></details>`;
+    return `${age}<details class="tool"><summary><span class="name"></span> <span class="in"></span><span class="pending"></span></summary><pre class="in"></pre><div class="task-status" hidden></div><pre class="out"></pre><details class="task-record" hidden><summary>Task details</summary><pre></pre></details><details class="call-record" hidden><summary>Call details</summary><pre></pre></details><div class="shots"></div></details>`;
   }
-  // An image the transcript carried: the picture on a data URL, the
-  // full thing in a new tab; one over the cap named by its size.
-  function shotHtml(img) {
-    if (img.data == null) return `<span class="unshipped">image, ${mb(img.bytes)} — not shown</span>`;
-    const src = `data:${img.media_type};base64,${img.data}`;
-    return `<img class="shot" loading="lazy" src="${esc(src)}" alt="pasted image">`;
+  // Descriptors travel with turns. Pixels are an authenticated, on-demand
+  // request into a specific retained conversation window, never a local path.
+  const viewerEl = $('viewer'), imageEntries = new Map();
+  let expanded = null;
+  function imageUrl(picture) {
+    if (!['image/png','image/jpeg','image/gif','image/webp'].includes(picture.media_type)) throw Error('Unsupported image format.');
+    const bytes = Uint8Array.from(atob(picture.data), c => c.charCodeAt(0));
+    return URL.createObjectURL(new Blob([bytes], {type: picture.media_type}));
   }
-  const viewerEl = $('viewer');
-  function showFull(src) {
-    viewerEl.innerHTML = `<img src="${esc(src)}" alt="pasted image, full size">`;
-    viewerEl.classList.add('open');
+  async function imageRequest(entry, preview, signal) {
+    // Old snapshots in an already-open page may still have inline pixels.
+    if (entry.image.data != null) return entry.image;
+    const reply = await fetch(route('/transcript/image'), {method:'POST', headers:{'content-type':'application/json'},
+      body:JSON.stringify({...entry.ref, preview}), signal});
+    if (!reply.ok) throw Error(await reply.text());
+    return reply.json();
   }
-  function hideFull() { viewerEl.classList.remove('open'); viewerEl.innerHTML = ''; }
+  async function loadThumbnail(entry) {
+    if (entry.loading || entry.url || !entry.button.isConnected) return;
+    entry.loading = true;
+    entry.retry.hidden = true;
+    entry.button.textContent = 'Loading preview…';
+    const controller = new AbortController(); entry.controller = controller;
+    try {
+      const picture = await imageRequest(entry, true, controller.signal);
+      if (!entry.button.isConnected) return;
+      entry.url = imageUrl(picture);
+      entry.caption.textContent = entry.image.label || 'Image attachment';
+      const image = document.createElement('img'); image.className = 'shot';
+      image.alt = entry.image.label || 'Image attachment'; image.src = entry.url;
+      image.onerror = () => { entry.button.textContent = 'Preview unavailable — open original'; entry.retry.hidden = false; };
+      entry.button.replaceChildren(image);
+    } catch (error) {
+      if (!entry.button.isConnected || controller.signal.aborted) return;
+      entry.button.textContent = 'Preview unavailable — open original';
+      entry.caption.textContent = (entry.image.label || 'Image attachment') + ': ' + error.message;
+      entry.caption.title = entry.caption.textContent;
+      entry.retry.hidden = false;
+    } finally { entry.loading = false; }
+  }
+  const imageObserver = new IntersectionObserver(entries => {
+    for (const item of entries) if (item.isIntersecting) {
+      const entry = imageEntries.get(item.target);
+      imageObserver.unobserve(item.target);
+      if (entry) loadThumbnail(entry);
+    }
+  }, {rootMargin: '120px'});
+  function pruneImages() {
+    for (const entry of imageEntries.values()) if (!entry.button.isConnected) {
+      imageObserver.unobserve(entry.button); entry.controller?.abort();
+      if (entry.url) URL.revokeObjectURL(entry.url);
+      if (expanded?.entry === entry) hideFull();
+      imageEntries.delete(entry.button);
+    }
+  }
+  async function showFull(entry) {
+    hideFull();
+    const current = {entry, controller: new AbortController(), url: null}; expanded = current;
+    viewerEl.querySelector('.image-label').textContent = entry.image.label || 'Image attachment';
+    const stage = viewerEl.querySelector('.image-stage'); stage.textContent = 'Loading original…';
+    viewerEl.querySelector('.image-zoom').disabled = true;
+    viewerEl.showModal();
+    try {
+      const picture = await imageRequest(entry, false, current.controller.signal);
+      if (expanded !== current) return;
+      current.url = imageUrl(picture);
+      const image = document.createElement('img'); image.alt = entry.image.label || 'Image attachment';
+      image.src = current.url;
+      image.onerror = () => { if(expanded === current) stage.textContent = 'The original could not be displayed. Close and try again.'; };
+      stage.replaceChildren(image); viewerEl.querySelector('.image-zoom').disabled = false;
+    } catch(error) {
+      if (expanded === current) stage.textContent = error.message + ' Close and try again.';
+    }
+  }
+  function hideFull() {
+    const old = expanded; expanded = null;
+    old?.controller.abort(); if (old?.url) URL.revokeObjectURL(old.url);
+    if (viewerEl.open) viewerEl.close();
+    viewerEl.classList.remove('zoomed'); viewerEl.querySelector('.image-stage').replaceChildren();
+    viewerEl.querySelector('.image-zoom').textContent = 'Actual size';
+    if (old?.entry.button.isConnected) old.entry.button.focus({preventScroll:true});
+  }
+  viewerEl.querySelector('.image-close').addEventListener('click', hideFull);
+  viewerEl.addEventListener('cancel', e => { e.preventDefault(); hideFull(); });
+  viewerEl.querySelector('.image-zoom').addEventListener('click', e => {
+    const zoomed = viewerEl.classList.toggle('zoomed'); e.target.textContent = zoomed ? 'Fit image' : 'Actual size';
+  });
   async function requestQuestionRecovery(button, ask, notify) {
     if(button.disabled)return;
     button.disabled=true;
@@ -1207,16 +1294,28 @@
     requestQuestionRecovery(button,{agent:entry.agent,session:entry.session,owner:entry.owner},
       message=>{if(questionEntries.get(entry.key)===entry)entry.notice=message;});
   }
-  viewsEl.addEventListener('click', (e) => { const img = e.target.closest('img.shot'); if (img) showFull(img.getAttribute('src')); });
-  viewerEl.addEventListener('click', hideFull);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && viewerEl.classList.contains('open')) hideFull(); });
-  function mb(bytes) { return (bytes / 1048576).toFixed(1) + ' MB'; }
-  function fillShots(box, images, key) {
-    // Repainted only when the set changes: a rebuilt <img> reloads.
-    const k = images.map((i) => (i.data ? i.data.length : 'x') + ':' + i.bytes).join(',');
-    if (box.dataset.k === k) return;
-    box.dataset.k = k;
-    box.innerHTML = images.map(shotHtml).join('');
+  function fillShots(box, images, turn) {
+    const label = box.closest('.turns').dataset.agent, window = agents.get(label);
+    const identity = JSON.stringify([label, window?.session, window?.generation, turn.id,
+      images.map(i => [i.key || i.data, i.label])]);
+    if (box.dataset.k === identity) return;
+    box.dataset.k = identity; box.replaceChildren();
+    images.forEach((image, index) => {
+      const holder = document.createElement('span'); holder.className = 'attachment';
+      const button = document.createElement('button'); button.className = 'shot-button'; button.type = 'button';
+      button.textContent = 'Image preview'; button.setAttribute('aria-label', 'Expand ' + (image.label || 'image attachment'));
+      const caption = document.createElement('span'); caption.className = 'attachment-caption'; caption.textContent = image.label || 'Image attachment';
+      const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'image-retry'; retry.textContent = 'Retry preview'; retry.hidden = true;
+      const actions = document.createElement('span'); actions.className = 'attachment-actions'; actions.append(retry);
+      holder.append(button, caption, actions); box.append(holder);
+      const entry = {image, button, caption, retry, ref:{agent:label, session:window?.session, generation:window?.generation,
+        turn:turn.id, index, key:image.key}};
+      imageEntries.set(button, entry);
+      button.addEventListener('click', () => showFull(entry));
+      retry.addEventListener('click', () => { if(entry.url) URL.revokeObjectURL(entry.url); entry.url=null; loadThumbnail(entry); });
+      imageObserver.observe(button);
+    });
+    pruneImages();
   }
   function fillTurn(el, t) {
     const b = t.body;
@@ -1231,19 +1330,27 @@
       return;
     }
     if (b.kind === 'thinking') { el.querySelector('.text').textContent = b.text; return; }
-    if (b.kind === 'image') { fillShots(el.querySelector('.shots'), [b]); return; }
+    if (b.kind === 'image') { fillShots(el.querySelector('.shots'), [b], t); return; }
     if (b.kind === 'tool' && b.question) { fillQuestion(el, b); return; }
-    el.querySelector('summary .name').textContent = b.name;
+    const grokTerminal = ['run_terminal_command', 'get_command_or_subagent_output'].includes(b.name);
+    el.querySelector('summary .name').textContent = grokTerminal ? '' : b.name;
     // What the call SAYS it is doing, and the call itself to read. A
     // turn from before those were derived has neither, and falls back
     // to the input it always had, as a prose turn does without html.
     el.querySelector('summary .in').textContent = b.title || b.input.slice(0, 120);
-    el.querySelector('summary .pending').textContent = b.output == null ? ' …' : '';
+    const tasks = b.tasks || [];
+    el.querySelector('summary .pending').textContent = tasks.length ? ' · ' + [...new Set(tasks.map(task => task.status))].join(', ') : b.output == null ? ' …' : '';
     el.querySelector('pre.in').textContent = b.detail || b.input;
     const out = el.querySelector('pre.out');
-    out.textContent = b.output == null ? '' : b.output;
-    out.hidden = b.output == null;
-    fillShots(el.querySelector('.shots'), b.images || []);
+    out.textContent = tasks.length ? tasks.filter(task => task.output != null).map(task => task.output).join('\n\n') : b.output || '';
+    out.hidden = tasks.length ? !tasks.some(task => task.output != null) : b.output == null;
+    const task = el.querySelector('.task-status'); task.hidden = !tasks.length;
+    task.textContent = tasks.map(task => 'Background task ' + task.status).join(' · ');
+    const record = el.querySelector('.task-record'); record.hidden = !tasks.length;
+    record.querySelector('pre').textContent = tasks.length ? b.output : '';
+    const call = el.querySelector('.call-record'); call.hidden = !grokTerminal;
+    call.querySelector('pre').textContent = b.name + '\n' + b.input;
+    fillShots(el.querySelector('.shots'), b.images || [], t);
   }
   function questionKey(agent, window, request) {
     return JSON.stringify([agent, window.session, window.owner, request.id, request.turn, request.item]);
@@ -1578,10 +1685,11 @@
       recovery.querySelector('button').disabled=!live || nativeWindow.reason?.startsWith('Connecting') || nativeWindow.reason?.startsWith('Reconnecting');
     }
     const box = v.transcript.querySelector('.turns');
+    box.dataset.agent = label;
     const w = agents.get(label);
     const shown = questionTurns(label, (w ? w.turns : []).filter((t) => t.who !== 'harness'));
     const outgoing = outbox.filter((e) => e.agent === label && e.session === boundSession(label));
-    if (!shown.length && !outgoing.length) { box.innerHTML = `<div class="turn empty-note"><span class="text">Nothing said yet.</span></div>`; return; }
+    if (!shown.length && !outgoing.length) { box.innerHTML = `<div class="turn empty-note"><span class="text">Nothing said yet.</span></div>`; pruneImages(); return; }
     if (box.querySelector('.empty-note')) box.innerHTML = '';
     const atBottom = v.transcript.scrollTop + v.transcript.clientHeight >= v.transcript.scrollHeight - 40;
     const keep = new Set();
@@ -1624,7 +1732,7 @@
       } else if (g !== cursor) {
         box.insertBefore(g, cursor);
       }
-      const running = slot.turns.some((t) => t.body.output == null);
+      const running = slot.turns.some((t) => t.body.output == null || (t.body.tasks || []).some(task => task.status === 'running'));
       g.querySelector('summary').textContent = `${running ? 'Running' : 'Ran'} ${slot.turns.length} commands${running ? '…' : ''}`;
       const members = g.querySelector('.members');
       const mine = new Set();
@@ -1638,6 +1746,7 @@
       cursor = placeOutgoing(box, entry, cursor);
     }
     for (const el of [...box.children]) if (!keep.has(el.dataset.id)) el.remove();
+    pruneImages();
     if (atBottom) v.transcript.scrollTop = v.transcript.scrollHeight;
   }
 

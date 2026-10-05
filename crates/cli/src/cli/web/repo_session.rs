@@ -21,6 +21,7 @@ pub(crate) struct RepoSession {
     cancelled: watch::Receiver<bool>,
     questions: Option<Arc<super::native_questions::Owners>>,
     claude_questions: Option<Arc<super::claude_questions::Registry>>,
+    images: super::transcript_images::Images,
 }
 
 impl RepoSession {
@@ -43,6 +44,7 @@ impl RepoSession {
             cancelled,
             questions: None,
             claude_questions: None,
+            images: Default::default(),
         }
     }
     pub(crate) fn with_questions(
@@ -65,6 +67,9 @@ impl RepoSession {
             return plain(503, "the repo connector is stopping");
         }
         match request {
+            BrowserRequest::TranscriptImage { ask } => {
+                self.images.get(&self.feed, &self.blocking, ask).await
+            }
             BrowserRequest::QuestionReconnect { ask } => match &self.questions {
                 Some(questions) => questions.reconnect(ask),
                 None => plain(409, "native question recovery is unavailable"),

@@ -513,20 +513,10 @@ impl Feed {
             {
                 return Vec::new();
             }
-            let Some(turn) = window.turns.iter_mut().find(|t| t.id == id) else {
-                return Vec::new();
-            };
-            let Body::Tool {
-                output: slot,
-                images: shots,
-                ..
-            } = &mut turn.body
-            else {
-                return Vec::new();
-            };
-            *slot = Some(output);
-            *shots = images;
-            vec![turn_frame(agent, session, generation, turn)]
+            super::transcript::apply_tool_output(&mut window.turns, id, output, images)
+                .into_iter()
+                .map(|at| turn_frame(agent, session, generation, &window.turns[at]))
+                .collect()
         });
     }
 
@@ -541,6 +531,39 @@ impl Feed {
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Retained {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn image(
+        &self,
+        ask: &clank_web::request::TranscriptImage,
+    ) -> Option<super::transcript::Image> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let window = state.turns.get(&ask.agent)?;
+        if window.session != ask.session || window.generation != ask.generation {
+            return None;
+        }
+        let turn = window.turns.iter().find(|turn| turn.id == ask.turn)?;
+        let image = match &turn.body {
+            Body::Image { image } if ask.index == 0 => image,
+            Body::Tool { images, .. } => images.get(ask.index)?,
+            _ => return None,
+        };
+        (image.key == ask.key).then(|| image.clone())
+    }
+
+    pub(crate) fn image_keys(&self) -> std::collections::HashSet<String> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .turns
+            .values()
+            .flat_map(|window| window.turns.iter())
+            .flat_map(|turn| match &turn.body {
+                Body::Image { image } => std::slice::from_ref(image),
+                Body::Tool { images, .. } => images.as_slice(),
+                _ => &[],
+            })
+            .map(|image| image.key.clone())
+            .collect()
     }
 }
 
@@ -1029,6 +1052,7 @@ mod tests {
             at: Some(1_000),
             who: super::super::transcript::Who::Agent,
             body: Body::Tool {
+                tasks: Vec::new(),
                 question: None,
                 name: "Bash".into(),
                 input: "ls".into(),

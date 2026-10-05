@@ -20,6 +20,7 @@ mod feed;
 mod native_questions;
 mod repo_session;
 mod transcript;
+mod transcript_images;
 pub(crate) mod tunnel;
 
 use std::path::{Path, PathBuf};
@@ -592,16 +593,7 @@ fn window_turns(
             match parsed {
                 transcript::Parsed::Turn(t) => turns.push(t),
                 transcript::Parsed::ToolOutput { id, output, images } => {
-                    if let Some(t) = turns.iter_mut().find(|t| t.id == id)
-                        && let transcript::Body::Tool {
-                            output: slot,
-                            images: shots,
-                            ..
-                        } = &mut t.body
-                    {
-                        *slot = Some(output);
-                        *shots = images;
-                    }
+                    transcript::apply_tool_output(&mut turns, &id, output, images);
                 }
             }
         }
@@ -1042,6 +1034,51 @@ fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replay_and_incremental_task_observations_have_the_same_turns_and_ids() {
+        use clank_core::vocab::Tool;
+        let records = [
+            serde_json::json!({"type":"assistant","tool_calls":[
+                {"id":"register","name":"run_terminal_command","arguments":{"command":"clank wait"}},
+                {"id":"observe","name":"get_command_or_subagent_output","arguments":{"task_ids":["fixture"]}}]}),
+            // A background result can arrive before its registration result.
+            serde_json::json!({"type":"tool_result","tool_call_id":"observe","content":
+                "=== Task fixture ===\nCommand: clank wait\nStatus: completed\nDuration: 1s\nExit Code: 0\nOutput File: /tmp/fixture.log\n\nactual output\n"}),
+            serde_json::json!({"type":"tool_result","tool_call_id":"register","content":
+                "<task-id>fixture</task-id>\n<task-type>bash</task-type>\n<output-file>/tmp/fixture.log</output-file>\n<status>running</status>\n<summary>Background task started</summary>"}),
+        ];
+        let lines: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(at, record)| transcript::TranscriptLine {
+                offset: at as u64 * 100,
+                text: record.to_string(),
+            })
+            .collect();
+        let replay = super::window_turns(Tool::Grok, &lines);
+        let feed = Feed::new();
+        feed.claim_turns("grok", 1, Some("fixture-session"));
+        feed.turns_reset("grok", 1, "fixture-session", 1, vec![]);
+        for line in &lines {
+            for item in transcript::parse_at(Tool::Grok, &line.text, line.offset) {
+                match item {
+                    transcript::Parsed::Turn(turn) => {
+                        feed.turn("grok", 1, "fixture-session", 1, turn)
+                    }
+                    transcript::Parsed::ToolOutput { id, output, images } => {
+                        feed.tool_output("grok", 1, "fixture-session", 1, &id, output, images)
+                    }
+                }
+            }
+        }
+        assert_eq!(feed.snapshot().turns["grok"].turns, replay);
+        assert!(
+            matches!(&replay[0].body, transcript::Body::Tool { tasks, .. }
+            if tasks[0].status == "completed" && tasks[0].output.as_deref() == Some("actual output"))
+        );
+        assert_eq!(replay[0].id, "grok-tool:register");
+    }
+
     use super::*;
 
     #[test]

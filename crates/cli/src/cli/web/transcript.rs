@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 
 use clank_core::vocab::Tool;
 
+mod grok_task;
 pub(super) mod questions;
+pub(crate) use grok_task::BackgroundTask;
+pub(crate) use grok_task::apply as apply_tool_output;
 
 /// Who a turn belongs to. `Harness` is the tool talking to its own
 /// model — a stop-hook nudge, an environment note — which must not
@@ -51,6 +54,8 @@ pub(crate) enum Body {
     /// the output arriving later is an upsert of the same id. Images
     /// in the output ride with it.
     Tool {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tasks: Vec<BackgroundTask>,
         /// Read-only recorded question content. A transcript never grants
         /// permission to answer a live provider request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +190,20 @@ pub(crate) fn told(name: &str, input: &str) -> Told {
                 .filter(|v| !v.trim().is_empty())
         })
     };
+    if name == "run_terminal_command"
+        && let Some(command) = fields.get("command").and_then(|value| value.as_str())
+    {
+        return Told {
+            title: to_a_line(command),
+            detail: command.to_owned(),
+        };
+    }
+    if name == "get_command_or_subagent_output" {
+        return Told {
+            title: "Read background output".into(),
+            detail: input.into(),
+        };
+    }
     let title = titled(headline(name))
         // Whatever it does have that reads as a line, so a tool nobody
         // taught this still says something; and its own name when
@@ -235,27 +254,42 @@ impl Body {
     }
 }
 
-/// One image out of a transcript: its type and base64 data — or, over
-/// [`IMAGE_CAP`] decoded, no data and its size, so the page can name
-/// what it will not carry.
+/// Retained original shared by feed snapshots. Only its descriptor travels
+/// with turns; pixels are requested through the authenticated image action.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Image {
     pub(crate) media_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) data: Option<String>,
+    #[serde(skip)]
+    pub(crate) data: Option<std::sync::Arc<str>>,
     pub(crate) bytes: usize,
+    #[serde(default)]
+    pub(crate) key: String,
+    #[serde(default)]
+    pub(crate) label: String,
 }
 
-/// The largest image shipped to the page, decoded.
-pub(crate) const IMAGE_CAP: usize = 2 * 1024 * 1024;
-
 impl Image {
-    fn new(media_type: &str, base64: &str) -> Self {
+    fn unavailable(label: String) -> Self {
+        Self {
+            media_type: "image/png".into(),
+            data: None,
+            bytes: 0,
+            key: blake3::hash(label.as_bytes()).to_hex().to_string(),
+            label,
+        }
+    }
+    pub(super) fn new(media_type: &str, base64: &str) -> Self {
         let bytes = base64.trim_end_matches('=').len() * 3 / 4;
+        let mut hash = blake3::Hasher::new();
+        hash.update(media_type.as_bytes());
+        hash.update(&[0]);
+        hash.update(base64.as_bytes());
         Self {
             media_type: media_type.to_string(),
-            data: (bytes <= IMAGE_CAP).then(|| base64.to_string()),
+            data: Some(base64.into()),
             bytes,
+            key: hash.finalize().to_hex().to_string(),
+            label: "Image attachment".into(),
         }
     }
 
@@ -453,6 +487,7 @@ mod claude {
                             at,
                             who: Who::Agent,
                             body: Body::Tool {
+                                tasks: Vec::new(),
                                 question: questions::parse(Tool::Claude, &name, &input),
                                 name,
                                 input,
@@ -536,6 +571,22 @@ mod claude {
 mod codex {
     use super::*;
 
+    fn attachment_label(block: &serde_json::Value) -> Option<String> {
+        if block.get("type")?.as_str()? != "input_text" {
+            return None;
+        }
+        let marker = block.get("text")?.as_str()?.trim();
+        let name = marker
+            .strip_prefix("<image name=")?
+            .strip_suffix("\">")?
+            .rsplit_once(" path=\"")?
+            .0;
+        if name.is_empty() || name.contains(['<', '>', '\n']) {
+            return None;
+        }
+        Some(name.trim_matches(['[', ']']).to_owned())
+    }
+
     pub(super) fn parse(line: &str) -> Vec<Parsed> {
         let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
             return Vec::new();
@@ -588,23 +639,56 @@ mod codex {
                     let text = p.get("content").map(text_of).unwrap_or_default();
                     return vec![text_turn(msg, text)];
                 };
-                let out: Vec<Parsed> = blocks
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, b)| {
-                        if let Some(image) = image_block(b) {
-                            return Some(Parsed::Turn(Turn {
-                                id: format!("{msg}:{i}"),
-                                at,
-                                who: who(""),
-                                body: Body::Image { image },
-                            }));
-                        }
-                        let text = b.get("text")?.as_str()?;
-                        (!text.is_empty())
-                            .then(|| text_turn(format!("{msg}:{i}"), text.to_string()))
-                    })
-                    .collect();
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < blocks.len() {
+                    let b = &blocks[i];
+                    // The actual Codex wrapper is three adjacent structured
+                    // content items. A text string merely resembling markup
+                    // is never authority to hide text or read its local path.
+                    if let Some(label) = attachment_label(b)
+                        && blocks
+                            .get(i + 1)
+                            .and_then(|b| b.get("type"))
+                            .and_then(|v| v.as_str())
+                            == Some("input_image")
+                        && blocks.get(i + 2).is_some_and(|b| {
+                            b.get("type").and_then(|v| v.as_str()) == Some("input_text")
+                                && b.get("text")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|text| text.trim() == "</image>")
+                        })
+                    {
+                        let mut image = image_block(&blocks[i + 1])
+                            .unwrap_or_else(|| Image::unavailable(label.clone()));
+                        image.label = label;
+                        out.push(Parsed::Turn(Turn {
+                            id: format!("{msg}:{}", i + 1),
+                            at,
+                            who: who(""),
+                            body: Body::Image { image },
+                        }));
+                        i += 3;
+                        continue;
+                    }
+                    if b.get("type").and_then(|v| v.as_str()) == Some("input_image") {
+                        let image = image_block(b)
+                            .unwrap_or_else(|| Image::unavailable("Image attachment".into()));
+                        out.push(Parsed::Turn(Turn {
+                            id: format!("{msg}:{i}"),
+                            at,
+                            who: who(""),
+                            body: Body::Image { image },
+                        }));
+                    } else if let Some(text) = b
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .filter(|text| !text.is_empty())
+                    {
+                        out.push(text_turn(format!("{msg}:{i}"), text.to_owned()));
+                    }
+                    i += 1;
+                }
                 if out.is_empty() {
                     // Nothing readable in the list: the message still
                     // happened, so its (empty) words stand in.
@@ -646,6 +730,7 @@ mod codex {
                     at,
                     who: Who::Agent,
                     body: Body::Tool {
+                        tasks: Vec::new(),
                         question: questions::parse(Tool::Codex, &name, &input),
                         name,
                         input,
@@ -733,6 +818,7 @@ mod grok {
                             at: None,
                             who: Who::Agent,
                             body: Body::Tool {
+                                tasks: Vec::new(),
                                 question: None,
                                 name,
                                 input,
@@ -904,7 +990,24 @@ impl Tail {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let start = len.saturating_sub(window);
+        let mut start = len.saturating_sub(window);
+        // Expand to the start of the boundary record. A single attachment
+        // may exceed the lookback budget; dropping its head loses the whole
+        // image on reconnect, or an in-progress record on its next append.
+        let mut cursor = start;
+        let mut chunk = [0u8; 8192];
+        while cursor > 0 {
+            let from = cursor.saturating_sub(chunk.len() as u64);
+            let size = (cursor - from) as usize;
+            file.seek(SeekFrom::Start(from))?;
+            file.read_exact(&mut chunk[..size])?;
+            if let Some(at) = chunk[..size].iter().rposition(|b| *b == b'\n') {
+                start = from + at as u64 + 1;
+                break;
+            }
+            cursor = from;
+            start = from;
+        }
         file.seek(SeekFrom::Start(start))?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
@@ -912,19 +1015,7 @@ impl Tail {
         // sampled before it: bytes appended during the read would
         // otherwise be read twice (codex on 056a342).
         let pos = start + buf.len() as u64;
-        // Whatever precedes the first newline in a mid-file window is
-        // the tail of a line we did not read the head of. Whatever
-        // follows the LAST newline is a record still being written —
-        // kept, so it completes on a later poll rather than vanishing.
-        let (body, body_start): (&[u8], u64) = if start > 0 {
-            match buf.iter().position(|b| *b == b'\n') {
-                Some(i) => (&buf[i + 1..], start + i as u64 + 1),
-                None => (&[], pos),
-            }
-        } else {
-            (&buf, 0)
-        };
-        let (lines, partial) = whole_lines(body, body_start);
+        let (lines, partial) = whole_lines(&buf, start);
         Ok((
             Self {
                 path: path.to_path_buf(),
@@ -1152,7 +1243,10 @@ mod tests {
         let old = serde_json::json!({"kind":"tool","name":"Bash","input":"ls",
             "output":null});
         let old: Body = serde_json::from_value(old).unwrap();
-        assert!(matches!(old, Body::Tool { question: None, .. }));
+        assert!(matches!(
+            old,
+            Body::Tool { tasks, question: None, .. } if tasks.is_empty()
+        ));
     }
 
     /// Both agents' fixtures, through the parser rather than the
@@ -1486,6 +1580,71 @@ mod tests {
 
     const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
+    #[test]
+    fn codex_attachment_wrappers_are_structural_and_keep_order_and_identity() {
+        // Shape observed in this session's response_item user record. Local
+        // path text is metadata, never permission to read a file.
+        let opening = serde_json::json!({"type":"input_text","text":"<image name=[Image #1] path=\"/var/private/screenshot.png\">"});
+        let image = serde_json::json!({"type":"input_image","image_url":format!("data:image/png;base64,{PNG}")});
+        let closing = serde_json::json!({"type":"input_text","text":"</image>"});
+        let prose = |text| serde_json::json!({"type":"input_text","text":text});
+        let record = |content| {
+            serde_json::json!({"type":"response_item","payload":{"type":"message","id":"user-images","role":"user","content":content}}).to_string()
+        };
+        let content = serde_json::json!([prose("before"),opening,image,closing,prose("between"),
+            opening,{"type":"input_image","image_url":"file:///must-not-read.png"},closing,prose("after")]);
+        let line = record(content);
+        let got = parse_at(Tool::Codex, &line, 100);
+        assert_eq!(got, parse_at(Tool::Codex, &line, 100), "replay is stable");
+        assert_eq!(got.len(), 5);
+        assert!(
+            matches!(&turn(&got[1]).body, Body::Image { image } if png(image) && image.label == "Image #1")
+        );
+        assert!(turn(&got[1]).id.ends_with(":2"));
+        assert!(matches!(&turn(&got[3]).body, Body::Image { image } if image.data.is_none()));
+        for (at, expected) in [(0, "before"), (2, "between"), (4, "after")] {
+            assert!(matches!(&turn(&got[at]).body, Body::Text { text,.. } if text == expected));
+        }
+        let literal = parse(
+            Tool::Codex,
+            &record(serde_json::json!([
+                opening,
+                prose("literal markup"),
+                closing
+            ])),
+        );
+        assert_eq!(
+            literal.len(),
+            3,
+            "text resembling a wrapper alone stays visible"
+        );
+        assert!(
+            matches!(&turn(&literal[0]).body,Body::Text{text,..} if text.starts_with("<image"))
+        );
+    }
+
+    #[test]
+    fn a_boundary_record_larger_than_the_lookback_survives_reconnect_and_append() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "old record").unwrap();
+        let record = format!("image:{}", "x".repeat(4096));
+        write!(file, "{record}").unwrap();
+        file.flush().unwrap();
+        let (mut tail, lines) = Tail::open(&path, 100).unwrap();
+        assert!(lines.is_empty());
+        writeln!(file).unwrap();
+        file.flush().unwrap();
+        let completed = tail.poll().unwrap();
+        assert_eq!(completed.lines[0].text, record);
+        assert_eq!(completed.lines[0].offset, 11);
+        assert!(tail.poll().unwrap().lines.is_empty());
+        let (_, replay) = Tail::open(&path, 100).unwrap();
+        assert_eq!(replay, completed.lines);
+    }
+
     fn png(image: &Image) -> bool {
         image.media_type == "image/png" && image.data.as_deref() == Some(PNG) && image.bytes == 70
     }
@@ -1493,7 +1652,7 @@ mod tests {
     /// A pasted picture is a turn of the person's, beside the text it
     /// came with — which is the person's too, not a harness note, list
     /// or no list; a picture in a tool's result rides on the output;
-    /// one over the cap is named, not shipped.
+    /// originals are retained, while snapshots ship only descriptors.
     #[test]
     fn a_pasted_image_is_a_turn_of_the_persons() {
         let line = |content: serde_json::Value| {
@@ -1534,17 +1693,25 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        let big = "A".repeat(IMAGE_CAP / 3 * 4 + 400);
+        let big = "A".repeat(3 * 1024 * 1024);
         let got = parse(
             Tool::Claude,
             &line(
-                serde_json::json!([{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":big}}]),
+                serde_json::json!([{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":big.clone()}}]),
             ),
         );
         match &turn(&got[0]).body {
             Body::Image { image } => {
-                assert_eq!(image.data, None, "over the cap: not shipped");
-                assert!(image.bytes > IMAGE_CAP);
+                assert_eq!(
+                    image.data.as_deref(),
+                    Some(big.as_str()),
+                    "original retained without a size cutoff"
+                );
+                assert!(image.bytes > 2 * 1024 * 1024);
+                assert!(
+                    serde_json::to_value(image).unwrap().get("data").is_none(),
+                    "snapshots contain descriptors, not pixels"
+                );
                 assert_eq!(image.media_type, "image/jpeg");
             }
             other => panic!("{other:?}"),
@@ -1591,10 +1758,10 @@ mod tests {
         assert_eq!(
             got.len(),
             1,
-            "no picture, and the message's (empty) words stand in"
+            "a missing image keeps one attachment placeholder"
         );
-        assert_eq!(turn(&got[0]).id, "m7");
-        assert!(matches!(&turn(&got[0]).body, Body::Text { text, .. } if text.is_empty()));
+        assert_eq!(turn(&got[0]).id, "m7:0");
+        assert!(matches!(&turn(&got[0]).body, Body::Image { image } if image.data.is_none()));
 
         // Mixed content keeps its order: a caption, its picture, the
         // next caption, its picture — each by its block.
