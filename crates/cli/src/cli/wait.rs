@@ -2070,6 +2070,12 @@ struct BlockResult {
     suppress_all: bool,
 }
 
+/// Whether a block is pending for this agent: a question for a person
+/// that no automatic action may talk over.
+pub(crate) fn blocked(repo: &Path, author: &AgentLabel) -> bool {
+    check_blocks(repo, author).suppress_all
+}
+
 fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     let blocks = scan_blocks(repo);
     let mut result = BlockResult {

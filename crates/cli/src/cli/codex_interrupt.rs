@@ -1,6 +1,7 @@
 //! One-shot native control of an already loaded, currently bound Codex thread.
 //! No thread resume, history subscription, periodic probe or detached reader.
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use clank_core::{Tool, ids::AgentLabel};
@@ -139,6 +140,130 @@ fn terminal(turn: &Value) -> bool {
     )
 }
 
+/// The read-only checks every control action makes first: the thread is
+/// loaded, belongs to this repo, and its latest turn has a known status.
+async fn preflight<S: AsyncRead + AsyncWrite + Unpin>(
+    rpc: &mut Rpc<S>,
+    repo: &Path,
+    thread: &str,
+) -> anyhow::Result<Option<Value>> {
+    rpc.call("initialize", json!({"clientInfo":{"name":"clank","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
+    rpc.notify("initialized", json!({})).await?;
+    let loaded = rpc.call("thread/loaded/list", json!({})).await?;
+    if !loaded
+        .get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(thread)))
+    {
+        bail!("bound Codex thread is not loaded");
+    }
+    let summary = rpc
+        .call(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":false}),
+        )
+        .await?;
+    let summary = summary
+        .get("thread")
+        .context("Codex thread summary missing")?;
+    let cwd = summary
+        .get("cwd")
+        .and_then(Value::as_str)
+        .context("Codex thread cwd missing")?;
+    if summary.get("id").and_then(Value::as_str) != Some(thread)
+        || dunce::canonicalize(cwd)? != dunce::canonicalize(repo)?
+    {
+        bail!("Codex thread does not belong to target repo");
+    }
+    let latest = rpc.latest(thread).await?;
+    if latest.as_ref().is_some_and(|turn| {
+        !terminal(turn) && turn.get("status").and_then(Value::as_str) != Some("inProgress")
+    }) {
+        bail!("unknown Codex turn status");
+    }
+    Ok(latest)
+}
+
+/// Start one recovery turn on a bound Codex thread whose latest turn is
+/// `failed_turn`, failed. Anything else — a newer turn, a running one, a
+/// binding that moved — is refused, and nothing is ever interrupted.
+///
+/// A failure before `turn/start` is sent leaves nothing done
+/// (`Unavailable`); a failure after it may not have (`Indeterminate`).
+pub(crate) async fn start_if_failed(
+    repo: &Path,
+    label: &AgentLabel,
+    failed_turn: &str,
+    wake: &str,
+) -> crate::cli::recovery::Answer {
+    use crate::cli::recovery::Answer;
+    let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
+        return Answer::Unavailable;
+    };
+    let connect = async {
+        let stream = tokio::net::UnixStream::connect(socket).await.ok()?;
+        let (socket, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+            .await
+            .ok()?;
+        Some(socket)
+    };
+    let Ok(Some(socket)) = tokio::time::timeout(BEFORE_SENDING, connect).await else {
+        return Answer::Unavailable;
+    };
+    let mut rpc = Rpc { socket, next_id: 1 };
+    start_after(&mut rpc, repo, &thread, failed_turn, wake, || {
+        super::event_interrupt::blocking(|| {
+            crate::agent_store::resolve_role(repo, label).is_ok()
+                && crate::agent_store::binding_matches(repo, label, Tool::Codex, &thread)
+        })
+    })
+    .await
+}
+
+/// How long a recovery start may take before anything is sent, and after.
+/// Both well inside `recovery::ANSWER_WITHIN`, so the transport's own
+/// answer, not the episode's deadline, says which side of the send it was.
+const BEFORE_SENDING: Duration = Duration::from_secs(15);
+const AFTER_SENDING: Duration = Duration::from_secs(30);
+
+async fn start_after<S: AsyncRead + AsyncWrite + Unpin>(
+    rpc: &mut Rpc<S>,
+    repo: &Path,
+    thread: &str,
+    failed_turn: &str,
+    wake: &str,
+    still_bound: impl Fn() -> bool,
+) -> crate::cli::recovery::Answer {
+    use crate::cli::recovery::Answer;
+    let Ok(Ok(latest)) = tokio::time::timeout(BEFORE_SENDING, preflight(rpc, repo, thread)).await
+    else {
+        return Answer::Unavailable;
+    };
+    let failed_is_latest = latest.as_ref().is_some_and(|turn| {
+        turn.get("id").and_then(Value::as_str) == Some(failed_turn)
+            && turn.get("status").and_then(Value::as_str) == Some("failed")
+    });
+    if !failed_is_latest || !still_bound() {
+        return Answer::Refused;
+    }
+    let start = rpc.call(
+        "turn/start",
+        json!({"threadId":thread,"input":[{"type":"text","text":wake}]}),
+    );
+    match tokio::time::timeout(AFTER_SENDING, start)
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer to turn/start")))
+    {
+        Ok(result) => Answer::Submitted {
+            started: result
+                .pointer("/turn/id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+        Err(_) => Answer::Indeterminate,
+    }
+}
+
 async fn wake<S: AsyncRead + AsyncWrite + Unpin>(
     rpc: &mut Rpc<S>,
     repo: &Path,
@@ -147,27 +272,7 @@ async fn wake<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> anyhow::Result<bool> {
     // Everything in this preflight is read-only. Unsupported versions, absent
     // live threads, and foreign profiles can still use verified pane targeting.
-    let preflight = async {
-        rpc.call("initialize", json!({"clientInfo":{"name":"clank","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
-        rpc.notify("initialized", json!({})).await?;
-        let loaded = rpc.call("thread/loaded/list", json!({})).await?;
-        if !loaded.get("data").and_then(Value::as_array).is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(thread))) {
-            bail!("bound Codex thread is not loaded");
-        }
-        let summary = rpc.call("thread/read", json!({"threadId":thread,"includeTurns":false})).await?;
-        let summary = summary.get("thread").context("Codex thread summary missing")?;
-        let cwd = summary.get("cwd").and_then(Value::as_str).context("Codex thread cwd missing")?;
-        if summary.get("id").and_then(Value::as_str) != Some(thread)
-            || dunce::canonicalize(cwd)? != dunce::canonicalize(repo)? {
-            bail!("Codex thread does not belong to target repo");
-        }
-        let latest = rpc.latest(thread).await?;
-        if latest.as_ref().is_some_and(|turn| !terminal(turn) && turn.get("status").and_then(Value::as_str) != Some("inProgress")) {
-            bail!("unknown Codex turn status");
-        }
-        Ok::<_, anyhow::Error>(latest)
-    }.await;
-    let Ok(latest) = preflight else {
+    let Ok(latest) = preflight(rpc, repo, thread).await else {
         return Ok(false);
     };
     if !still_bound() {
@@ -296,6 +401,150 @@ mod tests {
         let (result, ()) = tokio::join!(control, script);
         assert!(result.unwrap());
     }
+    /// Nothing more reaches the server once the client is done.
+    async fn assert_silent(server: &mut WebSocketStream<tokio::io::DuplexStream>) {
+        match server.next().await {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+            Some(Ok(other)) => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_starts_only_after_the_failed_turn_and_never_interrupts() {
+        use crate::cli::recovery::Answer;
+        let repo = tempfile::tempdir().unwrap();
+        let (mut client, mut server) = pair().await;
+        let (answer, ()) = tokio::join!(
+            start_after(
+                &mut client,
+                repo.path(),
+                "thread",
+                "old",
+                "retry wake",
+                || true
+            ),
+            async {
+                preflight(&mut server, repo.path(), "failed").await;
+                let req = request(&mut server, "turn/start", json!({"turn":{"id":"new"}})).await;
+                assert_eq!(
+                    req["params"]["input"],
+                    json!([{"type":"text","text":"retry wake"}])
+                );
+            }
+        );
+        assert_eq!(
+            answer,
+            Answer::Submitted {
+                started: Some("new".into())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_anything_but_the_failed_turn_and_sends_nothing() {
+        use crate::cli::recovery::Answer;
+        for (failed_turn, status, bound) in [
+            ("old", "inProgress", true),
+            ("old", "completed", true),
+            ("old", "interrupted", true),
+            ("other", "failed", true),
+            ("old", "failed", false),
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            let (mut client, mut server) = pair().await;
+            let (answer, ()) = tokio::join!(
+                start_after(
+                    &mut client,
+                    repo.path(),
+                    "thread",
+                    failed_turn,
+                    "wake",
+                    || bound
+                ),
+                preflight(&mut server, repo.path(), status)
+            );
+            assert_eq!(
+                answer,
+                Answer::Refused,
+                "{failed_turn} {status} bound={bound}"
+            );
+            drop(client);
+            assert_silent(&mut server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_that_may_have_landed_is_indeterminate_and_one_that_never_began_is_unavailable()
+    {
+        use crate::cli::recovery::Answer;
+        let repo = tempfile::tempdir().unwrap();
+        let (mut client, mut server) = pair().await;
+        let (answer, ()) = tokio::join!(
+            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            async {
+                preflight(&mut server, repo.path(), "failed").await;
+                let Message::Text(text) = server.next().await.unwrap().unwrap() else {
+                    panic!("text request expected");
+                };
+                let req: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(req["method"], "turn/start");
+                server
+                    .send(Message::Text(
+                        json!({"id":req["id"],"error":{"code":-32000,"message":"busy"}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        );
+        assert_eq!(answer, Answer::Indeterminate);
+
+        let (mut client, mut server) = pair().await;
+        let (answer, ()) = tokio::join!(
+            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            async {
+                request(&mut server, "initialize", json!({})).await;
+                request(&mut server, "initialized", Value::Null).await;
+                request(&mut server, "thread/loaded/list", json!({"data":[]})).await;
+            }
+        );
+        assert_eq!(
+            answer,
+            Answer::Unavailable,
+            "a thread that is not loaded was never touched"
+        );
+    }
+
+    /// A server that stops answering cannot hold the attempt past its
+    /// bound, and which side of the send it went quiet on decides whether
+    /// anything may have happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_server_is_bounded_on_both_sides_of_the_send() {
+        use crate::cli::recovery::Answer;
+        let repo = tempfile::tempdir().unwrap();
+        let (mut client, mut server) = pair().await;
+        let (answer, _server) = tokio::join!(
+            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            async {
+                let _ = server.next().await;
+                server
+            }
+        );
+        assert_eq!(answer, Answer::Unavailable, "quiet before turn/start");
+
+        let (mut client, mut server) = pair().await;
+        let (answer, _server) = tokio::join!(
+            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            async {
+                preflight(&mut server, repo.path(), "failed").await;
+                let _ = server.next().await;
+                server
+            }
+        );
+        assert_eq!(answer, Answer::Indeterminate, "quiet after turn/start");
+    }
+
     #[tokio::test]
     async fn idle_starts_without_interrupt() {
         let repo = tempfile::tempdir().unwrap();

@@ -54,6 +54,7 @@ pub mod pr_review;
 mod presentation;
 pub mod purge;
 pub mod queue;
+pub(crate) mod recovery;
 pub mod rereview;
 pub mod rewire;
 pub mod rewrite;
@@ -1157,6 +1158,52 @@ pub struct StopHookArgs {
     /// static hook entry and the behavior cannot drift.
     #[arg(long = "loop", value_enum)]
     pub loop_mode: Option<LoopModeArg>,
+    /// Report a turn the harness saw start or end, for a harness that has
+    /// no readable record of its own (OpenCode's plugin). Prints whether
+    /// clank will retry through a recovery helper or only tell a person.
+    #[arg(long, value_enum)]
+    pub observe: Option<ObserveArg>,
+    /// The harness's id for the observed turn.
+    #[arg(long, requires = "observe")]
+    pub turn_id: Option<String>,
+    /// The harness's name for a failure's error, with `--observe failed`.
+    #[arg(long, requires = "observe")]
+    pub class: Option<String>,
+    /// The failure's HTTP status, when the harness reports one.
+    #[arg(long, requires = "observe")]
+    pub status: Option<u16>,
+    /// Park as this session's recovery helper: wait for the monitor to
+    /// authorize one retry, then print it. Never takes inbox work.
+    #[arg(long, conflicts_with_all = ["observe", "recovery_reply", "session_start"])]
+    pub recovery_helper: bool,
+    /// Answer a recovery attempt this helper was handed.
+    #[arg(long, value_enum, requires = "attempt")]
+    pub recovery_reply: Option<RecoveryReplyArg>,
+    #[arg(long, requires = "opened_by")]
+    pub attempt: Option<u32>,
+    /// The failed turn whose episode the attempt belongs to, as the
+    /// monitor handed it.
+    #[arg(long, requires = "attempt")]
+    pub opened_by: Option<String>,
+    /// The turn the attempt started, when the harness named it.
+    #[arg(long, requires = "recovery_reply")]
+    pub started: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ObserveArg {
+    Started,
+    Completed,
+    Failed,
+    Interrupted,
+    Retry,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RecoveryReplyArg {
+    Submitted,
+    Refused,
+    Indeterminate,
 }
 
 /// `--loop` value for the claude stop hook.

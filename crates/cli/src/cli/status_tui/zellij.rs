@@ -1970,6 +1970,7 @@ mod tests {
                 tool: "claude".into(),
                 invocation: "claude".into(),
                 session: None,
+                waiting_for_you: None,
 
                 attending: None,
             })
@@ -3188,6 +3189,7 @@ mod tests {
                     tool: "claude".into(),
                     invocation: "claude".into(),
                     session: None,
+                    waiting_for_you: None,
 
                     attending: None,
                 },
@@ -3199,6 +3201,7 @@ mod tests {
                     tool: "codex".into(),
                     invocation: "codex".into(),
                     session: None,
+                    waiting_for_you: None,
 
                     attending: None,
                 },

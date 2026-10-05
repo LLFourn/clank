@@ -38,7 +38,17 @@ const { ClankPlugin } = await import(pathToFileURL(pluginPath))
 // result and counts an "arm".
 const waits = []
 let arms = 0
-const $ = () => {
+const reported = (values) => values.flat().includes("--observe")
+const $ = (_strings, ...values) => {
+  if (reported(values)) {
+    const handle = {
+      env: () => handle,
+      quiet: () => handle,
+      nothrow: () => handle,
+      then: (resolve) => resolve({ exitCode: 0, stdout: '{"recovery":"notice"}\n', stderr: "" }),
+    }
+    return handle
+  }
   arms += 1
   const result = waits.shift() ?? { exitCode: 0, stdout: "", stderr: "" }
   const handle = {
@@ -115,7 +125,8 @@ const fire = (type, sessionID) => hooks.event({ event: { type, properties: { ses
 const settle = () => new Promise((r) => setTimeout(r, 0))
 
 const SID = "ses_0test0000000000000000000000"
-const userMsg = (mid) => ({
+let lastUser
+const userMsg = (mid) => ((lastUser = mid), {
   event: {
     type: "message.updated",
     properties: { sessionID: SID, info: { id: mid, role: "user" } },
@@ -174,6 +185,7 @@ const abortMsg = () => ({
       sessionID: SID,
       info: {
         id: "msg_asst_abort",
+        parentID: lastUser,
         role: "assistant",
         error: { name: "MessageAbortedError" },
       },
@@ -224,36 +236,57 @@ assert(injections.length === 3, "an abort during the wait must discard its conti
 const makeSection = () => {
   const armSessions = []
   const results = []
+  const commands = []
   const $f = (strings, ...values) => {
     let sid
     try {
       sid = JSON.parse(values[0]).session_id
     } catch {}
-    armSessions.push(sid)
+    commands.push({ text: strings.join(" ").replace(/\s+/g, " "), values: values.slice(1).flat() })
     const handle = {
       env: () => handle,
       quiet: () => handle,
       nothrow: () => handle,
+      then: undefined,
+    }
+    if (reported(values)) {
+      // A report is not a wait: it neither arms nor takes a wait's result.
+      handle.then = (resolve) => {
+        const answer = { exitCode: 0, stdout: (state.observeAnswer ?? '{"recovery":"notice"}') + "\n", stderr: "" }
+        if (state.holdReports) state.heldReports.push(() => resolve(answer))
+        else resolve(answer)
+      }
+      return handle
+    }
+    armSessions.push(sid)
+    Object.assign(handle, {
       then: (resolve) => {
         if (results[0] === "pending") {
           results.shift()
           return // never resolves: the wait stays in flight
         }
+        if (typeof results[0] === "function") {
+          results.shift()(resolve) // resolves when the test says so
+          return
+        }
         resolve(results.shift() ?? { exitCode: 0, stdout: "", stderr: "" })
       },
-    }
+    })
     return handle
   }
   const injections2 = []
+  const prompts2 = []
   const toasts2 = []
   const logs2 = []
   const statuses2 = new Map()
-  const state = { deferStatus: false }
+  const state = { deferStatus: false, heldReports: [] }
   const statusReleases = []
   const client2 = {
     session: {
       promptAsync: async (req) => {
         injections2.push(req.path.id)
+        prompts2.push(req.body)
+        return state.promptResult
       },
       status: async () => {
         // A deferred answer still carries the state at CALL time —
@@ -272,7 +305,7 @@ const makeSection = () => {
     tui: { showToast: async (req) => toasts2.push(req.body) },
     app: { log: async (req) => logs2.push(req.body) },
   }
-  return { $f, armSessions, results, client2, injections2, toasts2, logs2, statuses: statuses2, state, statusReleases }
+  return { $f, armSessions, results, commands, client2, injections2, prompts2, toasts2, logs2, statuses: statuses2, state, statusReleases }
 }
 
 const TOKEN = "ses_0bootstrap00000000000000000"
@@ -528,6 +561,186 @@ const setToken = (v) => {
   s.statusReleases.forEach((release) => release())
   await settle()
   assert(s.armSessions.length === 2, "a user turn during status check must cancel renewal")
+}
+
+const reportsOf = (s) => s.commands.filter((c) => c.values.includes("--observe")).map((c) => c.values)
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+// 12. A provider error is reported against its turn, and nothing is
+// re-injected on the idle that follows: an immediate re-arm repeats the
+// failure for as long as it lasts. A person's next prompt gives the
+// session back to the ordinary loop.
+{
+  const s = makeSection()
+  const F = "ses_0failed000000000000000000"
+  const hooks = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  const event = (type, properties) => hooks.event({ event: { type, properties: { sessionID: F, ...properties } } })
+  const waits = () =>
+    s.commands.filter((c) => c.values.length === 0 && c.text.trim() === "echo | clank stop-hook --tool opencode").length
+  const failure = { id: "asst_1", parentID: "user_1", role: "assistant", error: { name: "APIError", data: { statusCode: 529 } } }
+  await event("message.updated", { info: { id: "user_1", role: "user" } })
+  await event("message.updated", { info: failure })
+  await settle()
+  await settle()
+  assert(
+    same(reportsOf(s), [
+      ["--observe", "started", "--turn-id", "user_1"],
+      ["--observe", "failed", "--turn-id", "user_1", "--class", "APIError", "--status", "529"],
+    ]),
+    `the turn and its failure are reported: ${JSON.stringify(reportsOf(s))}`,
+  )
+  await event("message.updated", { info: failure })
+  await event("session.idle")
+  await settle()
+  assert(reportsOf(s).length === 2, `a re-update or the idle reports nothing more: ${JSON.stringify(reportsOf(s))}`)
+  assert(waits() === 0, `no wait is armed after a provider error: ${JSON.stringify(s.commands)}`)
+  assert(s.injections2.length === 0, "nothing is re-injected")
+
+  await event("message.updated", { info: { id: "user_2", role: "user" } })
+  await event("session.idle")
+  await settle()
+  await settle()
+  assert(waits() === 1, `a person's prompt restores the ordinary loop: ${JSON.stringify(s.commands)}`)
+  assert(
+    same(reportsOf(s).slice(2), [
+      ["--observe", "started", "--turn-id", "user_2"],
+      ["--observe", "completed", "--turn-id", "user_2"],
+    ]),
+    `a turn that finished is reported finished: ${JSON.stringify(reportsOf(s))}`,
+  )
+}
+
+// 13. Only when clank answers "helper": the retry is submitted with its tag
+// as the message id and the answer goes back to clank, naming the attempt.
+// Anything but a 204 is indeterminate, and a retry that arrives after a
+// person prompted again is refused without prompting.
+for (const [label, promptResult, stale, expected] of [
+  ["accepted", { response: { status: 204 } }, false, "submitted"],
+  ["no 204", {}, false, "indeterminate"],
+  ["stale", { response: { status: 204 } }, true, "refused"],
+]) {
+  const s = makeSection()
+  const H = "ses_0helper000000000000000000"
+  const hooks = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  const event = (type, info) => hooks.event({ event: { type, properties: { sessionID: H, info } } })
+  s.state.promptResult = promptResult
+  s.state.observeAnswer = '{"recovery":"helper"}'
+  let release
+  s.results.push((resolve) => {
+    release = () =>
+      resolve({ exitCode: 0, stdout: '{"opened_by":"u1","n":1,"tag":"msg_tag","wake":"retry now"}\n', stderr: "" })
+  })
+  await event("message.updated", { id: "u1", role: "user" })
+  await event("message.updated", { id: "a1", parentID: "u1", role: "assistant", error: { name: "APIError", data: { statusCode: 500 } } })
+  await settle()
+  await settle()
+  assert(typeof release === "function", `${label}: the helper parks: ${JSON.stringify(s.commands)}`)
+  if (stale) await event("message.updated", { id: "u9", role: "user" })
+  release()
+  await settle()
+  await settle()
+  const replies = s.commands.filter((c) => c.text.includes("--recovery-reply"))
+  assert(replies.length === 1, `${label}: one reply: ${JSON.stringify(s.commands)}`)
+  assert(same(replies[0].values, [expected, "1", "u1"]), `${label}: ${JSON.stringify(replies[0].values)}`)
+  if (stale) {
+    assert(s.prompts2.length === 0, `${label}: a stale retry prompts nothing`)
+  } else {
+    assert(s.prompts2.length === 1 && s.prompts2[0].messageID === "msg_tag", `${label}: tagged prompt ${JSON.stringify(s.prompts2)}`)
+  }
+}
+
+// 14. Reports reach clank in the order the session produced them: a
+// failure seen while its turn's start is still being reported waits for
+// it. A session error names its session or is not this session's; an
+// interrupted turn is reported as one, and its idle as nothing more.
+{
+  const s = makeSection()
+  const O = "ses_0ordered00000000000000000"
+  const hooks = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  const event = (type, properties) => hooks.event({ event: { type, properties } })
+  s.state.holdReports = true
+  await event("message.updated", { sessionID: O, info: { id: "u1", role: "user" } })
+  await event("session.error", { sessionID: O, error: { name: "ProviderAuthError" } })
+  await settle()
+  assert(reportsOf(s).length === 1, `the failure waits for the start: ${JSON.stringify(reportsOf(s))}`)
+  s.state.holdReports = false
+  s.state.heldReports.shift()()
+  await settle()
+  await settle()
+  assert(
+    same(reportsOf(s), [
+      ["--observe", "started", "--turn-id", "u1"],
+      ["--observe", "failed", "--turn-id", "u1", "--class", "ProviderAuthError"],
+    ]),
+    `in order, against its turn: ${JSON.stringify(reportsOf(s))}`,
+  )
+
+  await event("session.error", { error: { name: "APIError" } })
+  await settle()
+  assert(reportsOf(s).length === 2, "an error naming no session is nobody's")
+
+  await event("message.updated", { sessionID: O, info: { id: "u2", role: "user" } })
+  await event("message.updated", { sessionID: O, info: { id: "a2", parentID: "u2", role: "assistant", error: { name: "MessageAbortedError" } } })
+  await event("session.idle", { sessionID: O })
+  await settle()
+  await settle()
+  assert(
+    same(reportsOf(s).slice(2), [
+      ["--observe", "started", "--turn-id", "u2"],
+      ["--observe", "interrupted", "--turn-id", "u2"],
+    ]),
+    `an interrupted turn: ${JSON.stringify(reportsOf(s))}`,
+  )
+}
+
+// 15. An old turn's late update is that turn's, never the current one's:
+// it is reported against its own turn, and does not stop the new turn's
+// loop. An idle's "completed" is followed by the turn's real end when the
+// update saying it was stopped comes after the idle. A session error after
+// its turn ended belongs to no turn.
+{
+  const s = makeSection()
+  const L = "ses_0late000000000000000000000"
+  const hooks = await ClankPlugin({ client: s.client2, $: s.$f, directory: "/fake/repo" })
+  const event = (type, properties) => hooks.event({ event: { type, properties: { sessionID: L, ...properties } } })
+  const waits = () =>
+    s.commands.filter((c) => c.values.length === 0 && c.text.trim() === "echo | clank stop-hook --tool opencode").length
+  const oldFailure = { id: "a_old", parentID: "user_old", role: "assistant", error: { name: "APIError", data: { statusCode: 500 } } }
+  await event("message.updated", { info: { id: "user_old", role: "user" } })
+  await event("message.updated", { info: oldFailure })
+  await event("message.updated", { info: { id: "user_new", role: "user" } })
+  await event("message.updated", { info: oldFailure })
+  await event("session.idle")
+  await settle()
+  await settle()
+  assert(
+    same(reportsOf(s), [
+      ["--observe", "started", "--turn-id", "user_old"],
+      ["--observe", "failed", "--turn-id", "user_old", "--class", "APIError", "--status", "500"],
+      ["--observe", "started", "--turn-id", "user_new"],
+      ["--observe", "completed", "--turn-id", "user_new"],
+    ]),
+    `a replayed old failure is not the new turn's: ${JSON.stringify(reportsOf(s))}`,
+  )
+  assert(waits() === 1, `the new turn's loop goes on: ${JSON.stringify(s.commands)}`)
+
+  await event("message.updated", { info: { id: "a_new", parentID: "user_new", role: "assistant", error: { name: "MessageAbortedError" } } })
+  await event("session.error", { error: { name: "APIError" } })
+  await settle()
+  await settle()
+  assert(
+    same(reportsOf(s).slice(4), [["--observe", "interrupted", "--turn-id", "user_new"]]),
+    `the stop that followed the idle is the turn's end: ${JSON.stringify(reportsOf(s))}`,
+  )
+  // A first report of an old turn's failure, arriving after a newer
+  // prompt, leaves the newer turn's loop alone.
+  await event("message.updated", { info: { id: "user_p", role: "user" } })
+  await event("message.updated", { info: { id: "user_q", role: "user" } })
+  await event("message.updated", { info: { id: "a_p", parentID: "user_p", role: "assistant", error: { name: "APIError" } } })
+  await event("session.idle")
+  await settle()
+  await settle()
+  assert(waits() === 2, `an old turn's failure does not stop the new turn's loop: ${JSON.stringify(s.commands)}`)
 }
 
 console.log("OK")

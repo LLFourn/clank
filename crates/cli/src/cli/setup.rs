@@ -3807,20 +3807,14 @@ mod tests {
     #[test]
     fn opencode_plugin_keys_the_abort_on_the_assistant_message() {
         let src = OPENCODE_PLUGIN;
-        // The FACT, not a heuristic (elapsed time, empty output).
-        assert!(src.contains(r#"info.error?.name === "MessageAbortedError""#));
+        // The FACT, not a heuristic (elapsed time, empty output): the
+        // assistant message's error, or a session error.
+        assert!(src.contains(r#"error?.name === "MessageAbortedError""#));
         assert!(src.contains(r#"info?.role === "assistant""#));
-        // Read from the message, NOT session.error: that event's
-        // schema makes sessionID optional, so it cannot attribute an
-        // abort to a session.
-        // The QUOTED event name: a real subscription must name it as a
-        // string. Matching bare `session.error` would also hit the
-        // comment explaining why it is not used, and a check that
-        // deletes its own rationale teaches nothing.
-        assert!(
-            !src.contains("\"session.error\""),
-            "session.error cannot attribute an abort — its sessionID is optional"
-        );
+        // session.error's schema makes sessionID optional. One without it
+        // is dropped before anything reads it, never guessed at.
+        let unattributed = src.find("if (!id) return").expect("no-session guard");
+        assert!(unattributed < src.find("\"session.error\"").expect("session.error"));
         // The latch clears when the human prompts again.
         assert!(src.contains("aborted.delete(id)"));
         // Checked before arming, before renewing after a deadline,

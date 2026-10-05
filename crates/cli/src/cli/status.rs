@@ -184,6 +184,10 @@ pub(crate) struct AgentAutoRow {
     /// the hook rewrites it at every turn-end, so there is nothing
     /// here to maintain.
     pub(crate) attending: Option<crate::cli::stop_hook::Attended>,
+    /// Why this agent's pending work is waiting for a person: its turn
+    /// failed and the monitor will not, or can no longer, retry it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) waiting_for_you: Option<String>,
 }
 
 /// The invocation that runs an agent: launch command (or the bare tool
@@ -283,6 +287,9 @@ fn roster_auto_rows(
             invocation: agent_invocation(desc),
             session,
             attending: crate::cli::stop_hook::read_attended(
+                &crate::agent_store::agents_root(repo).join(label.as_str()),
+            ),
+            waiting_for_you: crate::cli::recovery::waiting_for_you(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
             ),
         });
@@ -784,6 +791,9 @@ impl StatusSnapshot {
             let _ = writeln!(out, "  {url}");
         }
         for row in &self.agents {
+            if let Some(why) = &row.waiting_for_you {
+                let _ = writeln!(out, "waiting for you: {} → {why}", row.label);
+            }
             if let Some(a) = &row.attending {
                 let _ = writeln!(
                     out,
@@ -2536,6 +2546,7 @@ mod dirty_and_wake_tests {
             tool: "claude".to_string(),
             invocation: "claude".to_string(),
             session: None,
+            waiting_for_you: None,
             attending,
         }
     }
@@ -2608,6 +2619,20 @@ mod dirty_and_wake_tests {
         snap.agents = vec![agent_row("claude", Some(marker("bj0onbq1u", None, None)))];
         assert!(
             snap.to_human().contains("attending: claude → bj0onbq1u"),
+            "{}",
+            snap.to_human()
+        );
+    }
+
+    #[test]
+    fn an_agent_left_to_a_person_says_so() {
+        let mut snap = minimal_snapshot();
+        let mut row = agent_row("codex", None);
+        row.waiting_for_you = Some("codex's turn failed (server_overloaded)".into());
+        snap.agents = vec![row];
+        assert!(
+            snap.to_human()
+                .contains("waiting for you: codex → codex's turn failed (server_overloaded)"),
             "{}",
             snap.to_human()
         );

@@ -111,6 +111,9 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     if Tool::from(args.tool) == Tool::Grok {
         return super::grok_hook::hook(args);
     }
+    if args.observe.is_some() || args.recovery_helper || args.recovery_reply.is_some() {
+        return run_recovery(args).await;
+    }
     if args.session_start {
         return run_session_start(args).await;
     }
@@ -125,6 +128,154 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
         Err(e) => HookOutcome::Diagnostic { message: e },
     };
     emit_and_exit(outcome, tool, capture).await;
+}
+
+/// The recovery modes: reporting an observed turn, parking as a recovery
+/// helper, and answering an attempt. Each speaks for the bound session
+/// named on stdin and stays silent for any other.
+async fn run_recovery(args: StopHookArgs) -> anyhow::Result<()> {
+    let tool: Tool = args.tool.into();
+    let input = read_hook_stdin().map_err(|e| anyhow::anyhow!(e))?;
+    let repo = resolve_hook_repo(args.repo.as_deref(), &input).map_err(|e| anyhow::anyhow!(e))?;
+    let label = resolve_identity_for_hook_in(&repo, tool, &input.session_id, &Process)?;
+    let session = input.session_id.as_str().to_string();
+    if !crate::agent_store::binding_matches(&repo, &label, tool, &session) {
+        return Ok(());
+    }
+    let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
+    if let Some(line) = observation(&args, tool, &session) {
+        crate::cli::recovery::observe(&agent_dir, &line)?;
+        let helper = crate::cli::recovery::transport_for(tool)
+            == Some(crate::cli::recovery::Transport::Helper);
+        println!(
+            "{}",
+            serde_json::json!({"recovery": if helper { "helper" } else { "notice" }})
+        );
+        return Ok(());
+    }
+    if let (Some(answer), Some(n), Some(opened_by)) =
+        (args.recovery_reply, args.attempt, args.opened_by)
+    {
+        crate::cli::recovery::write_reply(
+            &agent_dir,
+            &crate::cli::recovery::Reply {
+                session,
+                opened_by,
+                n,
+                answer: match answer {
+                    crate::cli::RecoveryReplyArg::Submitted => {
+                        crate::cli::recovery::ReplyAnswer::Submitted
+                    }
+                    crate::cli::RecoveryReplyArg::Refused => {
+                        crate::cli::recovery::ReplyAnswer::Refused
+                    }
+                    crate::cli::RecoveryReplyArg::Indeterminate => {
+                        crate::cli::recovery::ReplyAnswer::Indeterminate
+                    }
+                },
+                started: args.started,
+            },
+        )?;
+        return Ok(());
+    }
+    let Some(dispatch) = await_recovery(&repo, &label, tool, &session).await else {
+        return Ok(());
+    };
+    if tool == Tool::Claude {
+        // Claude's asyncRewake wakes the session on exit 2 with the text on
+        // stderr. Recorded as submitted first: once this process exits it
+        // cannot answer, and an unconfirmed submission escalates on its own.
+        let n = dispatch["n"].as_u64().unwrap_or_default() as u32;
+        crate::cli::recovery::write_reply(
+            &agent_dir,
+            &crate::cli::recovery::Reply {
+                session,
+                opened_by: dispatch["opened_by"].as_str().unwrap_or_default().into(),
+                n,
+                answer: crate::cli::recovery::ReplyAnswer::Submitted,
+                started: None,
+            },
+        )?;
+        eprintln!("{}", dispatch["wake"].as_str().unwrap_or_default());
+        crate::cli::source_group::exit(2);
+    }
+    println!("{dispatch}");
+    Ok(())
+}
+
+/// The line `--observe` adds to the session's record, in the shape the
+/// monitor's reader takes it.
+fn observation(args: &StopHookArgs, tool: Tool, session: &str) -> Option<serde_json::Value> {
+    let turn = match args.observe? {
+        crate::cli::ObserveArg::Started => "started",
+        crate::cli::ObserveArg::Completed => "completed",
+        crate::cli::ObserveArg::Failed => "failed",
+        crate::cli::ObserveArg::Interrupted => "interrupted",
+        crate::cli::ObserveArg::Retry => "retry",
+    };
+    let class = args.class.as_deref().map(|name| match tool {
+        Tool::OpenCode => crate::cli::recovery::opencode_class(name, args.status).to_string(),
+        _ => name.to_string(),
+    });
+    Some(serde_json::json!({
+        "session": session,
+        "turn": turn,
+        "id": args.turn_id,
+        "class": class.unwrap_or_else(|| "unknown".into()),
+        "at": crate::cli::recovery::unix_now(),
+    }))
+}
+
+/// Wait on the monitor for this session's one authorized retry. Nothing
+/// printed means none came: the monitor went, the binding moved, or the
+/// helper was refused.
+async fn await_recovery(
+    repo: &Path,
+    label: &AgentLabel,
+    tool: Tool,
+    session: &str,
+) -> Option<serde_json::Value> {
+    use crate::cli::monitor::{Attached, Holder, Note, Who};
+    let Attached::Shared(mut conn) = crate::cli::monitor::attach_or_spawn_with(
+        repo,
+        Who::RecoveryHelper {
+            author: label.to_string(),
+            holder: Holder {
+                tool,
+                session: session.to_string(),
+            },
+        },
+        crate::cli::monitor::spawn_monitor,
+    )
+    .await
+    else {
+        return None;
+    };
+    tokio::task::spawn_blocking(move || {
+        loop {
+            let deadline = std::time::Instant::now() + crate::cli::monitor::BEAT_GRACE;
+            match conn.note(deadline) {
+                Ok(Note::Recover {
+                    opened_by,
+                    n,
+                    tag,
+                    wake,
+                }) => {
+                    return Some(serde_json::json!({
+                        "opened_by": opened_by,
+                        "n": n,
+                        "tag": tag,
+                        "wake": wake,
+                    }));
+                }
+                Ok(Note::Beat) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The decoded Stop turn, shared by the installed hook and tests.
@@ -1556,6 +1707,15 @@ fn short_duration(d: time::Duration) -> String {
 pub(crate) fn read_attended(agent_dir: &Path) -> Option<Attended> {
     let raw = std::fs::read_to_string(attended_path(agent_dir)).ok()?;
     serde_json::from_str::<Attended>(&raw).ok()
+}
+
+/// Whether the agent is attending to work that is provably still
+/// running: its marker's recorded process still holds its token.
+///
+/// The monitor's question, asked without a hook's input. A marker alone
+/// is not attendance; neither is a pid the kernel has re-issued.
+pub(crate) fn attendance_is_live(agent_dir: &Path) -> bool {
+    read_attending(agent_dir).is_some_and(|a| a.work_alive())
 }
 
 /// READ the marker. No effect, so it can be gathered as evidence
@@ -3403,6 +3563,101 @@ mod tests {
             correlation: Correlation::TaskId,
         };
         std::fs::write(dir.join("attending"), serde_json::to_string(&rec).unwrap()).unwrap();
+    }
+
+    /// The argv the OpenCode plugin sends (its harness asserts these)
+    /// becomes lines the monitor reads as that session's turns, against
+    /// the turn each names.
+    #[test]
+    fn the_plugins_reports_are_read_as_the_sessions_turns() {
+        use crate::cli::recovery::{Fact, Outcome, RecordReader};
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            args: crate::cli::StopHookArgs,
+        }
+        let line = |argv: &[&str], session: &str| {
+            let t =
+                <T as clap::Parser>::try_parse_from(["t", "--tool", "opencode"].iter().chain(argv))
+                    .unwrap();
+            observation(&t.args, Tool::OpenCode, session)
+                .unwrap()
+                .to_string()
+        };
+        let mut reader = RecordReader::new(Tool::OpenCode, "ses_a");
+        let facts: Vec<_> = [
+            line(&["--observe", "started", "--turn-id", "user_1"], "ses_a"),
+            line(
+                &[
+                    "--observe",
+                    "failed",
+                    "--turn-id",
+                    "x",
+                    "--class",
+                    "ProviderAuthError",
+                ],
+                "ses_b",
+            ),
+            line(&["--observe", "retry"], "ses_a"),
+            line(
+                &[
+                    "--observe",
+                    "failed",
+                    "--turn-id",
+                    "user_1",
+                    "--class",
+                    "APIError",
+                    "--status",
+                    "529",
+                ],
+                "ses_a",
+            ),
+        ]
+        .iter()
+        .filter_map(|l| reader.read(l))
+        .collect();
+        assert_eq!(
+            facts,
+            [
+                Fact::Started {
+                    id: "user_1".into(),
+                    text: None
+                },
+                Fact::NativeRetry,
+                Fact::Ended {
+                    id: Some("user_1".into()),
+                    outcome: Outcome::Failed("overloaded".into())
+                },
+            ]
+        );
+    }
+
+    /// The monitor's attendance: a marker counts only while its recorded
+    /// process still holds the identity it was recorded with.
+    #[test]
+    fn attendance_is_live_only_while_its_process_is_the_one_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!attendance_is_live(dir.path()), "no marker");
+        let me = std::process::id() as i32;
+        write_attending_pid(dir.path(), "task", Some(me));
+        assert!(
+            !attendance_is_live(dir.path()),
+            "a pid with no identity proves nothing"
+        );
+        let rec = Attending {
+            expect: None,
+            desc: None,
+            token: crate::proc_identity::token_for(me),
+            task: "task".into(),
+            pid: Some(me),
+            correlation: Correlation::TaskId,
+        };
+        std::fs::write(
+            dir.path().join("attending"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+        assert!(attendance_is_live(dir.path()));
     }
 
     fn wait_output(items: serde_json::Value) -> std::process::Output {

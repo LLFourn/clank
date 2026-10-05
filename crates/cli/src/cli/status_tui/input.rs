@@ -3501,6 +3501,7 @@ mod tests {
             tool: "codex".into(),
             invocation: "codex".into(),
             session: None,
+            waiting_for_you: None,
 
             attending: None,
         }];
@@ -4257,6 +4258,7 @@ mod tests {
                 tool: "claude".to_string(),
                 invocation: "claude".to_string(),
                 session: None,
+                waiting_for_you: None,
 
                 attending: attending
                     .contains(&i)

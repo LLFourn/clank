@@ -126,6 +126,10 @@ pub(crate) enum Who {
     /// A read-only fold subscription. Any number, no identity, and
     /// never any items.
     Observer,
+    /// A harness's recovery helper: waits for the monitor's decision to
+    /// retry a failed turn and never takes inbox work, so its presence is
+    /// not evidence the agent is waiting for any (`recovery.rs`).
+    RecoveryHelper { author: String, holder: Holder },
 }
 
 /// What a client says on connecting.
@@ -160,6 +164,15 @@ pub(crate) enum Note {
         items: Vec<WaitItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_cwd: Option<std::path::PathBuf>,
+    },
+    /// A recovery helper's one authorized attempt: submit `wake` and
+    /// answer through `recovery::reply_path`.
+    Recover {
+        /// With `n`, which attempt the helper's answer is for.
+        opened_by: String,
+        n: u32,
+        tag: String,
+        wake: String,
     },
     /// Proof of life, and nothing else.
     ///
@@ -2281,6 +2294,7 @@ pub(crate) fn published_in(dir: &std::path::Path, repo: &std::path::Path, me: u3
 enum Served {
     Agent { author: AgentLabel },
     Observer,
+    Helper { author: AgentLabel },
 }
 
 #[derive(Debug)]
@@ -2452,6 +2466,16 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     for author in roster_authors(&repo) {
         owned.interrupting.notify(&repo, author);
     }
+    // Agents whose turn failed with nothing left to wake them.
+    let (recovery_answers, mut answered) = tokio::sync::mpsc::unbounded_channel::<RecoveryAnswer>();
+    let mut recovery = crate::cli::recovery::Driver::new(
+        repo.as_ref().clone(),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default(),
+    );
+    let (record_changes, mut changed_records) = tokio::sync::mpsc::unbounded_channel();
+    let records = crate::cli::recovery::RecordWatch::spawn(record_changes);
     loop {
         let timer_deadline = hosted
             .values()
@@ -2461,7 +2485,33 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     .and_then(|timers| timers.next_deadline())
             })
             .min();
+        let recovery_due = recovery.next_due().map(|at| {
+            let wait = at.saturating_sub(crate::cli::recovery::unix_now());
+            tokio::time::Instant::now() + Duration::from_secs(wait)
+        });
         tokio::select! {
+            _ = crate::cli::timer_source::deadline(recovery_due) => {
+                let acts = recovery.due(crate::cli::recovery::unix_now(), |author, session| {
+                    recovery_gate(&repo, &clients, author, session)
+                });
+                act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+            }
+            Some((author, attempt, answer)) = answered.recv() => {
+                let acts = recovery.answer(&author, &attempt, answer, crate::cli::recovery::unix_now());
+                act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+            }
+            Some(event) = changed_records.recv() => {
+                let mut events = std::collections::BTreeSet::from([event]);
+                while let Ok(more) = changed_records.try_recv() {
+                    events.insert(more);
+                }
+                let now = crate::cli::recovery::unix_now();
+                let mut acts = Vec::new();
+                for event in events {
+                    acts.extend(recovery.changed(event, now));
+                }
+                act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+            }
             _ = crate::cli::timer_source::deadline(timer_deadline) => {
                 for host in hosted.values_mut() {
                     if let Some(timers) = &mut host.timers { timers.due(); }
@@ -2635,6 +2685,13 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         // before there was a state to present it
                         // against.
                         leaving.extend(serve_to_cached(&repo, &mut clients, &state, None, &mut pending, &mut timer_backlogs, &hosted));
+                        let now = crate::cli::recovery::unix_now();
+                        let mut acts = recovery.reconcile(
+                            recovery_facts(&repo, &state, &clients, &hosted, &mut timer_backlogs),
+                            now,
+                        );
+                        acts.extend(recovery.replies(now));
+                        act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
                         folded_state = Some(state);
                     }
                     // The counter stays where it is, so the
@@ -2652,6 +2709,258 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// What the monitor knows about each bound roster agent, for recovery.
+///
+/// Obligation is what a newly arriving waiter would be handed, derived as
+/// a delivery would derive it but into a set no client owns. It is only
+/// derived for an agent with no deliverer, which is the only kind that
+/// can be stuck.
+fn recovery_facts(
+    repo: &std::path::Path,
+    state: &crate::repo_state::RepoState,
+    clients: &[Client],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+) -> Vec<crate::cli::recovery::Facts> {
+    let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
+    let head = crate::git_io::head_commit_at(repo, state);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut facts = Vec::new();
+    for author in roster_authors(repo) {
+        let Ok(cfg) = crate::agent_store::load_agent_config(repo, &author) else {
+            continue;
+        };
+        let Some(session) = cfg.as_ref().and_then(|c| c.session.clone()) else {
+            continue;
+        };
+        let delivering = clients
+            .iter()
+            .any(|c| matches!(&c.who, Served::Agent { author: a } if a == &author));
+        let auto = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
+            == clank_core::AutoMode::On;
+        let obligated = !delivering
+            && owes_anything(
+                repo,
+                state,
+                &author,
+                hosted,
+                timer_backlogs,
+                &reviews,
+                head.as_ref(),
+            );
+        facts.push(crate::cli::recovery::Facts {
+            agent_dir: crate::agent_store::agents_root(repo).join(author.as_str()),
+            author,
+            session,
+            auto,
+            delivering,
+            obligated,
+        });
+    }
+    facts
+}
+
+fn owes_anything(
+    repo: &std::path::Path,
+    state: &crate::repo_state::RepoState,
+    author: &AgentLabel,
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
+    head: Option<&clank_core::wait::HeadCommit>,
+) -> bool {
+    let Ok(inputs) = crate::cli::wait::derive_wait_inputs(repo, author) else {
+        return false;
+    };
+    let status = state.fold.derive_status(reviews, &inputs.work_policy, head);
+    let current;
+    let sources = match hosted.get(author) {
+        Some(host) => &host.spec,
+        None => {
+            current = hostable(repo, author).unwrap_or_default();
+            &current
+        }
+    };
+    let mut shown = Default::default();
+    let mut external =
+        crate::cli::event_source::owed_from_sources(repo, author, sources, &mut shown);
+    external.extend(
+        timer_backlogs
+            .entry(author.clone())
+            .or_insert_with(|| {
+                crate::cli::timer_source::Backlog::new(
+                    crate::agent_store::agents_root(repo)
+                        .join(author.as_str())
+                        .join("events"),
+                    Default::default(),
+                )
+            })
+            .owed(&mut shown),
+    );
+    !crate::cli::wait::owed_for(repo, author, &inputs, &status, &state.fold, &mut external)
+        .is_empty()
+}
+
+/// A transport's answer, and the attempt it answers.
+type RecoveryAnswer = (
+    AgentLabel,
+    crate::cli::recovery::AttemptRef,
+    crate::cli::recovery::Answer,
+);
+
+/// Whether a due recovery attempt may go ahead now, from the agent as it
+/// is at this moment rather than at the last fold: never over a pending
+/// question or a live attendance, and never once a deliverer, a new
+/// binding or auto mode turned off has made it someone else's call.
+fn recovery_gate(
+    repo: &std::path::Path,
+    clients: &[Client],
+    author: &AgentLabel,
+    session: &str,
+) -> crate::cli::recovery::Gate {
+    use crate::cli::recovery::Gate;
+    let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, author) else {
+        return Gate::SessionChanged;
+    };
+    if cfg
+        .session
+        .as_ref()
+        .is_none_or(|s| s.id.as_str() != session)
+    {
+        return Gate::SessionChanged;
+    }
+    if clients
+        .iter()
+        .any(|c| matches!(&c.who, Served::Agent { author: a } if a == author))
+    {
+        return Gate::Deliverer;
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref())
+        != clank_core::AutoMode::On
+    {
+        return Gate::AutoOff;
+    }
+    let dir = crate::agent_store::agents_root(repo).join(author.as_str());
+    if crate::cli::wait::blocked(repo, author) || crate::cli::stop_hook::attendance_is_live(&dir) {
+        Gate::Hold
+    } else {
+        Gate::Go
+    }
+}
+
+/// Carry out what recovery decided.
+fn act_on_recovery(
+    repo: &std::path::Path,
+    clients: &[Client],
+    acts: Vec<crate::cli::recovery::Act>,
+    answers: &tokio::sync::mpsc::UnboundedSender<RecoveryAnswer>,
+    records: &crate::cli::recovery::RecordWatch,
+    owned: &mut OwnedTasks,
+) {
+    use crate::cli::recovery::{Act, Answer, Transport};
+    for act in acts {
+        match act {
+            Act::Watch(path) => records.watch(path),
+            Act::Unwatch(path) => records.unwatch(path),
+            Act::Notice { author, key, text } => {
+                if let Err(e) = write_recovery_notice(repo, &author, &key, &text) {
+                    eprintln!("monitor: could not record `{author}`'s recovery notice: {e}");
+                }
+            }
+            Act::Dispatch {
+                author,
+                attempt,
+                transport: Transport::Helper,
+                tag,
+                ..
+            } => {
+                let helper = clients.iter().find(|c| {
+                    matches!(&c.who, Served::Helper { author: a } if a == &author)
+                        && c.holder
+                            .as_ref()
+                            .is_some_and(|h| h.session == attempt.session)
+                });
+                let sent = helper.is_some_and(|c| {
+                    send_note(
+                        c,
+                        &Note::Recover {
+                            opened_by: attempt.opened_by.clone(),
+                            n: attempt.n,
+                            wake: crate::cli::recovery::wake_text(&tag),
+                            tag,
+                        },
+                    )
+                });
+                if !sent {
+                    let _ = answers.send((author, attempt, Answer::Unavailable));
+                }
+            }
+            Act::Dispatch {
+                author,
+                attempt,
+                transport: Transport::CodexStart,
+                tag,
+                target,
+            } => {
+                let repo = repo.to_path_buf();
+                let answers = answers.clone();
+                owned.departing.push(tokio::spawn(async move {
+                    let answer = crate::cli::codex_interrupt::start_if_failed(
+                        &repo,
+                        &author,
+                        &target,
+                        &crate::cli::recovery::wake_text(&tag),
+                    )
+                    .await;
+                    let _ = answers.send((author, attempt, answer));
+                }));
+            }
+        }
+    }
+}
+
+/// Tell the agent's timeline why its pending work is waiting, as a row
+/// that is already handled: a notice for a person, not work for the
+/// agent, and written once per episode.
+fn write_recovery_notice(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    key: &str,
+    text: &str,
+) -> std::io::Result<()> {
+    let dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    std::fs::create_dir_all(&dir)?;
+    let mut log = crate::cli::github::log::EventLog::open(&dir, "clank-recovery")?;
+    let seq = log.append_inbox(
+        crate::cli::github::log::Transport::Command,
+        Some(key),
+        None,
+        Some(crate::cli::recovery::unix_now()),
+        &WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
+            name: "recovery".into(),
+            id: key.into(),
+            event: "recovery".into(),
+            content: text.into(),
+            at: None,
+            failure: false,
+            requires_reply: false,
+            reply_route: None,
+            selector: None,
+        },
+    )?;
+    let ident = log
+        .read_rows()?
+        .and_then(|read| read.rows.into_iter().find(|row| row.seq == seq))
+        .map(|row| row.ident)
+        .ok_or_else(|| std::io::Error::other("the notice was not found after it was written"))?;
+    log.append_checked_ack(seq, &ident)
 }
 
 /// Watch the fold from a thread of its own, and stand down if it stops.
@@ -2998,7 +3307,7 @@ fn automatic_grok_client(repo: &std::path::Path, client: &Client) -> bool {
 }
 
 fn client_refusal(repo: &std::path::Path, client: &Client) -> Option<String> {
-    let Served::Agent { author } = &client.who else {
+    let (Served::Agent { author } | Served::Helper { author }) = &client.who else {
         return None;
     };
     let holder = client.holder.as_ref()?;
@@ -3131,6 +3440,17 @@ fn revoked(err: &anyhow::Error) -> bool {
 fn served_for(repo: &std::path::Path, who: Who) -> Result<Served, Welcome> {
     match who {
         Who::Observer => Ok(Served::Observer),
+        Who::RecoveryHelper { author, .. } => match served_for(
+            repo,
+            Who::Agent {
+                author,
+                holder: None,
+                has_cli_sources: false,
+            },
+        )? {
+            Served::Agent { author } => Ok(Served::Helper { author }),
+            other => Ok(other),
+        },
         Who::Agent { author, .. } => {
             let author = AgentLabel::parse(&author).map_err(|e| Welcome::Decline {
                 proto: PROTO,
@@ -3220,6 +3540,7 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
                 who,
                 match hello.who {
                     Who::Agent { holder, .. } => holder,
+                    Who::RecoveryHelper { holder, .. } => Some(holder),
                     Who::Observer => None,
                 },
             )
@@ -3255,6 +3576,7 @@ impl Served {
         match self {
             Served::Agent { author, .. } => author.to_string(),
             Served::Observer => "an observer".to_string(),
+            Served::Helper { author } => format!("{author}'s recovery helper"),
         }
     }
 }
@@ -3753,7 +4075,7 @@ fn serve_to_cached(
             // point: it asked to know the fold moved, and deriving
             // somebody's work to tell it that would be the duplicated
             // refold this plan exists to delete.
-            Served::Observer => Note::Beat,
+            Served::Observer | Served::Helper { .. } => Note::Beat,
             Served::Agent { author, .. } => {
                 let inputs = match crate::cli::wait::derive_wait_inputs(repo, author) {
                     Ok(inputs) => inputs,
@@ -3856,7 +4178,7 @@ fn serve_to_cached(
         let woke = matches!(&note, Note::Items { .. });
         let author = match &client.who {
             Served::Agent { author, .. } => Some(author.clone()),
-            Served::Observer => None,
+            Served::Observer | Served::Helper { .. } => None,
         };
         let sent = send_note(&client, &note);
         if sent && !woke {
@@ -3912,6 +4234,374 @@ fn send_note(client: &Client, note: &Note) -> bool {
             eprintln!("monitor: `{}` is gone; dropping it", client.who.name());
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::cli::recovery::{Act, Answer, AttemptRef, Gate, Transport};
+
+    fn client(who: Served, session: &str) -> (Client, tokio::sync::mpsc::Receiver<String>) {
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        (
+            Client {
+                who,
+                out,
+                writer: None,
+                holder: Some(Holder {
+                    tool: clank_core::Tool::OpenCode,
+                    session: session.into(),
+                }),
+                shown: Default::default(),
+            },
+            queued,
+        )
+    }
+
+    fn attempt() -> AttemptRef {
+        AttemptRef {
+            session: "session-one".into(),
+            opened_by: "t1".into(),
+            n: 1,
+        }
+    }
+
+    fn dispatch(author: &AgentLabel) -> Act {
+        Act::Dispatch {
+            author: author.clone(),
+            attempt: attempt(),
+            transport: Transport::Helper,
+            tag: "tag-1".into(),
+            target: "t1".into(),
+        }
+    }
+
+    fn records() -> crate::cli::recovery::RecordWatch {
+        crate::cli::recovery::RecordWatch::spawn(tokio::sync::mpsc::unbounded_channel().0)
+    }
+
+    /// The authorized attempt reaches that session's helper and nobody
+    /// else: not the agent's ordinary wait, and not a helper for another
+    /// session of the same agent.
+    #[tokio::test]
+    async fn a_dispatch_reaches_only_that_sessions_helper() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("opencode").unwrap();
+        let (agent, mut agent_rx) = client(
+            Served::Agent {
+                author: author.clone(),
+            },
+            "session-one",
+        );
+        let (stale, mut stale_rx) = client(
+            Served::Helper {
+                author: author.clone(),
+            },
+            "session-two",
+        );
+        let (helper, mut helper_rx) = client(
+            Served::Helper {
+                author: author.clone(),
+            },
+            "session-one",
+        );
+        let clients = vec![agent, stale, helper];
+        let (tx, mut answers) = tokio::sync::mpsc::unbounded_channel();
+        let mut owned = OwnedTasks::default();
+        act_on_recovery(
+            repo.path(),
+            &clients,
+            vec![dispatch(&author)],
+            &tx,
+            &records(),
+            &mut owned,
+        );
+
+        let note: Note = serde_json::from_str(helper_rx.try_recv().unwrap().trim_end()).unwrap();
+        assert_eq!(
+            note,
+            Note::Recover {
+                opened_by: "t1".into(),
+                n: 1,
+                tag: "tag-1".into(),
+                wake: crate::cli::recovery::wake_text("tag-1"),
+            }
+        );
+        assert!(
+            agent_rx.try_recv().is_err(),
+            "an ordinary wait is never handed a retry"
+        );
+        assert!(stale_rx.try_recv().is_err(), "nor another session's helper");
+        assert!(
+            answers.try_recv().is_err(),
+            "a delivered dispatch answers through its helper"
+        );
+
+        act_on_recovery(
+            repo.path(),
+            &[],
+            vec![dispatch(&author)],
+            &tx,
+            &records(),
+            &mut owned,
+        );
+        assert_eq!(
+            answers.try_recv().unwrap(),
+            (author, attempt(), Answer::Unavailable)
+        );
+    }
+
+    /// A helper is kept alive with beats and is never handed inbox work,
+    /// so its presence is never mistaken for an agent waiting for some.
+    #[tokio::test]
+    async fn a_helper_is_served_beats_never_work() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("opencode").unwrap();
+        let held = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
+            name: "x".into(),
+            id: "x".into(),
+            event: "x".into(),
+            content: "work".into(),
+            at: None,
+            failure: false,
+            requires_reply: false,
+            reply_route: None,
+            selector: None,
+        };
+        let mut pending = vec![(author.clone(), held)];
+        let (mut helper, mut helper_rx) = client(
+            Served::Helper {
+                author: author.clone(),
+            },
+            "session-one",
+        );
+        helper.holder = None;
+        let mut clients = vec![helper];
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        let note: Note = serde_json::from_str(helper_rx.try_recv().unwrap().trim_end()).unwrap();
+        assert_eq!(note, Note::Beat);
+        assert_eq!(clients.len(), 1, "it stays parked");
+        assert_eq!(pending.len(), 1, "the work is still held for a deliverer");
+
+        // A helper for a session that does not own the agent is refused,
+        // like any other client of a superseded session.
+        let (stale, mut stale_rx) = client(
+            Served::Helper {
+                author: author.clone(),
+            },
+            "session-one",
+        );
+        let mut clients = vec![stale];
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        let note: Note = serde_json::from_str(stale_rx.try_recv().unwrap().trim_end()).unwrap();
+        assert!(matches!(note, Note::Refused { .. }), "{note:?}");
+        assert!(clients.is_empty());
+    }
+
+    /// A notice is a row a person sees in the timeline, already handled:
+    /// it tells, and owes the agent nothing.
+    #[tokio::test]
+    async fn a_notice_is_a_handled_timeline_row() {
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut owned = OwnedTasks::default();
+        act_on_recovery(
+            repo.path(),
+            &[],
+            vec![Act::Notice {
+                author: author.clone(),
+                key: "session-one:t1".into(),
+                text: "codex's turn failed (server_overloaded)".into(),
+            }],
+            &tx,
+            &records(),
+            &mut owned,
+        );
+        let snapshot = crate::cli::github::timeline::timeline_snapshot(repo.path());
+        assert_eq!(snapshot.events.len(), 1, "{:?}", snapshot.notices);
+        let event = &snapshot.events[0];
+        assert_eq!(
+            event.content.as_deref(),
+            Some("codex's turn failed (server_overloaded)")
+        );
+        assert!(!event.unhandled, "a notice is not work");
+        assert_eq!(event.seen_by, vec!["codex".to_string()]);
+    }
+
+    /// Obligation is what a newly arriving waiter would be handed, a
+    /// deliverer is an ordinary wait, and a recovery helper is not one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn facts_name_who_owes_work_and_who_is_waiting_for_it() {
+        use crate::cli::github::log::{EventLog, Transport as Wal};
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
+        )
+        .unwrap();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let timer = clank_core::agent_config::TimerSource {
+            interrupt: false,
+            name: "check".into(),
+            repeat_every: None,
+            due_at: "1970-01-01T00:01:40Z".into(),
+            content: Some("scheduled work".into()),
+        };
+        crate::agent_store::update_agent_config(repo.path(), &codex, |config| {
+            config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
+                timer.clone(),
+            )];
+        })
+        .unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &codex,
+            clank_core::Tool::Codex,
+            &clank_core::ids::SessionId::parse("session-one").unwrap(),
+        )
+        .unwrap();
+        let events = crate::agent_store::agents_root(repo.path()).join("codex/events");
+        std::fs::create_dir_all(&events).unwrap();
+        let mut log = EventLog::open(&events, &timer.source_key(None)).unwrap();
+        let seq = log
+            .append_inbox(
+                Wal::Timer,
+                Some("timer/100"),
+                None,
+                Some(100),
+                &WaitItem::TimerEvent {
+                    presentation: None,
+                    name: "check".into(),
+                    recurrence: None,
+                    id: "timer/100".into(),
+                    due_at: 100,
+                    content: "scheduled work".into(),
+                    selector: None,
+                },
+            )
+            .unwrap();
+        let state = folded(repo.path()).await.unwrap();
+        let facts = |clients: &[Client]| {
+            recovery_facts(
+                repo.path(),
+                &state,
+                clients,
+                &Default::default(),
+                &mut Default::default(),
+            )
+        };
+
+        let alone = facts(&[]);
+        assert_eq!(
+            alone.len(),
+            1,
+            "an agent with no bound session is not considered"
+        );
+        assert!(alone[0].obligated && !alone[0].delivering, "{alone:?}");
+
+        let (helper, _rx) = client(
+            Served::Helper {
+                author: codex.clone(),
+            },
+            "session-one",
+        );
+        let with_helper = facts(&[helper]);
+        assert!(
+            with_helper[0].obligated && !with_helper[0].delivering,
+            "a helper is not a deliverer"
+        );
+
+        let (waiter, _rx) = client(
+            Served::Agent {
+                author: codex.clone(),
+            },
+            "session-one",
+        );
+        let with_waiter = facts(&[waiter]);
+        assert!(with_waiter[0].delivering, "an ordinary wait is a deliverer");
+
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        log.append_checked_ack(seq, &ident).unwrap();
+        let state = folded(repo.path()).await.unwrap();
+        let handled = recovery_facts(
+            repo.path(),
+            &state,
+            &[],
+            &Default::default(),
+            &mut Default::default(),
+        );
+        assert!(
+            !handled[0].obligated,
+            "handled work owes nothing: {handled:?}"
+        );
+    }
+
+    /// A due attempt is decided against the agent as it is now: its
+    /// binding, its deliverer, its auto mode and its attendance.
+    #[test]
+    fn the_gate_reads_the_agent_as_it_is_now() {
+        let repo = tempfile::tempdir().unwrap();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let gate = |clients: &[Client]| recovery_gate(repo.path(), clients, &codex, "session-one");
+        assert_eq!(gate(&[]), Gate::SessionChanged, "never bound");
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &codex,
+            clank_core::Tool::Codex,
+            &clank_core::ids::SessionId::parse("session-one").unwrap(),
+        )
+        .unwrap();
+        crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::On).unwrap();
+        assert_eq!(gate(&[]), Gate::Go);
+        assert_eq!(
+            recovery_gate(repo.path(), &[], &codex, "session-two"),
+            Gate::SessionChanged
+        );
+
+        let (waiter, _rx) = client(
+            Served::Agent {
+                author: codex.clone(),
+            },
+            "session-one",
+        );
+        assert_eq!(gate(&[waiter]), Gate::Deliverer);
+
+        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        let me = std::process::id() as i32;
+        std::fs::write(
+            dir.join("attending"),
+            serde_json::json!({
+                "task": "build",
+                "pid": me,
+                "token": crate::proc_identity::token_for(me),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(gate(&[]), Gate::Hold);
+
+        crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::Off).unwrap();
+        assert_eq!(gate(&[]), Gate::AutoOff);
+    }
+
+    #[test]
+    fn a_helpers_hello_round_trips() {
+        let who = Who::RecoveryHelper {
+            author: "opencode".into(),
+            holder: Holder {
+                tool: clank_core::Tool::OpenCode,
+                session: "session-one".into(),
+            },
+        };
+        let wire = serde_json::to_string(&who).unwrap();
+        assert!(wire.contains(r#""as":"recovery_helper""#), "{wire}");
+        assert_eq!(serde_json::from_str::<Who>(&wire).unwrap(), who);
     }
 }
 
@@ -9219,6 +9909,7 @@ mod tests {
         match note {
             Note::Refused { why } => panic!("unexpected refusal: {why}"),
             Note::Beat { .. } => {}
+            Note::Recover { .. } => panic!("a wait is never sent a recovery"),
             Note::Items { items, .. } => assert!(
                 !items.contains(&held),
                 "another author's transient must not be delivered here: {items:?}"

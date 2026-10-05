@@ -19,7 +19,7 @@ pub(crate) mod door;
 mod feed;
 mod native_questions;
 mod repo_session;
-mod transcript;
+pub(crate) mod transcript;
 mod transcript_images;
 pub(crate) mod tunnel;
 
