@@ -1155,7 +1155,18 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(!owners.owns(id));
-        assert!(!held(), "a confirmed retirement releases the lease");
+        // A fork elsewhere in this test process inherits the lease's
+        // descriptor until its exec closes it, holding the flock for
+        // that moment; only a lease held past it was not released.
+        let mut released = false;
+        for _ in 0..200 {
+            if !held() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(released, "a confirmed retirement releases the lease");
         assert!(gone(producer).await);
         assert!(!cs::producer_path(dir.path(), "src").exists());
     }
