@@ -1298,7 +1298,7 @@ fn apply_detail_action(
         None => return Mode::AgentPanel { sel: 0 },
     };
     let Ok(label) = clank_core::ids::AgentLabel::parse(&label_str) else {
-        return Mode::AgentPanel { sel: idx };
+        return Mode::AgentPanel { sel: agent_row };
     };
     match action {
         DetailAction::ToggleAuto => {
@@ -1826,6 +1826,14 @@ fn refind_entry(
     if let Some(now) = scroll::find_entry(snapshot, head, &held) {
         log.follow(now);
     }
+}
+
+/// Where `Up` at the log's top goes: onto the panel row drawn directly
+/// above the log, whichever region that is.
+fn log_up_crossing(log: &LogView, snapshot: &StatusSnapshot, cols: usize) -> Option<Mode> {
+    crosses_into_panel(log.cursor, log.offset, snapshot.agents.len()).then(|| Mode::AgentPanel {
+        sel: panel_row_list(snapshot, cols).len().saturating_sub(1),
+    })
 }
 
 /// Whether scroll entry `i` is a run's end rule, the log's rows starting
@@ -5036,12 +5044,10 @@ pub(crate) async fn run_tui(
                                     detail = Some(Overlay::notice(n));
                                 }
                             }
-                            Key::Up => {
-                                match log_up_target(log.cursor, log.offset, snapshot.agents.len()) {
-                                    Some(sel) => mode = Mode::AgentPanel { sel },
-                                    None => log.up(total, &|i| is_rule(&snapshot, head, i)),
-                                }
-                            }
+                            Key::Up => match log_up_crossing(&log, &snapshot, cols as usize) {
+                                Some(panel) => mode = panel,
+                                None => log.up(total, &|i| is_rule(&snapshot, head, i)),
+                            },
                             Key::Down => log.down(total, &|i| is_rule(&snapshot, head, i)),
                             Key::PageUp => {
                                 log.page_up(page, total, &|i| is_rule(&snapshot, head, i))
@@ -10743,6 +10749,92 @@ pub(crate) mod tests {
             row_position(&narrow, PanelRow::Wait(0)),
             add_row_index(&narrow)
         );
+    }
+
+    /// Up at the log's top lands on the row drawn directly above the
+    /// log, past a wait row, the queue, the drafts and grouped sources:
+    /// the last source row. Down from it returns to the log's first entry.
+    #[test]
+    fn up_from_the_log_lands_on_the_row_above_it() {
+        use crate::cli::status_tui::input::{PanelAction, PanelRow, agent_panel_action};
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        s.queue = vec![crate::cli::status::QueueItemView {
+            priority: 500,
+            name: "queued-idea".into(),
+            path: std::path::PathBuf::new(),
+        }];
+        s.drafts = vec![crate::cli::queue::Draft {
+            name: "idea".into(),
+            path: "idea.md".into(),
+            title: None,
+            modified: None,
+        }];
+        s.sources = vec![
+            command_source("alpha", "signal"),
+            command_source("alpha", "voice"),
+            command_source("beta", "voice"),
+        ];
+        let rows = panel_row_list(&s, 120);
+        assert!(
+            rows.contains(&PanelRow::Wait(0)),
+            "premise: a wait row {rows:?}"
+        );
+        let topped = LogView::new();
+        let Some(Mode::AgentPanel { sel }) = log_up_crossing(&topped, &s, 120) else {
+            panic!("crosses");
+        };
+        assert_eq!(rows[sel], PanelRow::Source(1), "the voice row, the last");
+        assert_eq!(
+            agent_panel_action(sel, &rows, crate::cli::status_tui::input::Key::Down),
+            PanelAction::EnterLog
+        );
+
+        let mut bare = two_agent_snap();
+        bare.stash = vec![];
+        bare.queue = vec![];
+        let rows = panel_row_list(&bare, 120);
+        let Some(Mode::AgentPanel { sel }) = log_up_crossing(&topped, &bare, 120) else {
+            panic!("crosses");
+        };
+        assert_eq!(rows[sel], PanelRow::Remote, "the last row, not + add");
+
+        let mut mid = LogView::new();
+        mid.cursor = 3;
+        mid.offset = 2;
+        assert_eq!(log_up_crossing(&mid, &s, 120), None, "mid-log");
+        let mut burst = LogView::new();
+        burst.offset = 4;
+        assert_eq!(
+            log_up_crossing(&burst, &s, 120),
+            None,
+            "viewport mid-scroll"
+        );
+        s.agents.clear();
+        assert_eq!(log_up_crossing(&topped, &s, 120), None, "no roster");
+    }
+
+    /// An agent whose label no longer parses leaves its page for its own
+    /// row, not for whatever row sits at its index.
+    #[test]
+    fn a_detail_page_on_an_unparseable_agent_returns_to_its_row() {
+        let repo = detail_repo();
+        let me = std::process::id() as i32;
+        let mut s = snap_attending(Some(attended("t1", "2026-08-20T14:51:09Z", Some(me), true)));
+        s.agents[1].label = "a/b".into();
+        let rows = panel_row_list(&s, 120);
+        let agent_row = row_position(&rows, crate::cli::status_tui::input::PanelRow::Agent(1));
+        assert_ne!(agent_row, 1, "premise: the wait above moves it");
+        let next = apply_detail_action(
+            DetailAction::ToggleAuto,
+            1,
+            0,
+            &mut s,
+            repo.path(),
+            &mut None,
+            agent_row,
+        );
+        assert_eq!(next, Mode::AgentPanel { sel: agent_row });
     }
 
     /// The queue-row target, with a wait above it: the old formula

@@ -355,18 +355,17 @@ pub(super) fn land(
     found.unwrap_or(cursor)
 }
 
-/// The log-side half of continuous navigation: pressing `Up` in the
-/// log returns `Some(panel_row)` when the log is FULLY AT ITS TOP —
-/// cursor on the first entry AND the viewport offset at 0 — (cross back
-/// into the panel, landing on the row adjacent to the log), else `None`
-/// (move the cursor up). The OFFSET guard matters for mouse wheels: the
+/// The log-side half of continuous navigation: `Up` in the log crosses
+/// back into the panel only when the log is FULLY AT ITS TOP — cursor
+/// on the first entry AND the viewport offset at 0 — and there is a
+/// roster to cross to; otherwise it moves the cursor up. The OFFSET guard matters for mouse wheels: the
 /// terminal turns a wheel notch into a BURST of Ups drained in one event
 /// batch, so the cursor can hit 0 while the viewport is still mid-scroll
 /// (no paint has settled the offset yet) — the burst must BUMP at the
 /// top, not teleport into the panel over a half-scrolled log. Pure so
 /// the boundary stays tested.
-pub(super) fn log_up_target(cursor: usize, offset: usize, agents_len: usize) -> Option<usize> {
-    (cursor == 0 && offset == 0 && agents_len > 0).then_some(agents_len)
+pub(super) fn crosses_into_panel(cursor: usize, offset: usize, agents_len: usize) -> bool {
+    cursor == 0 && offset == 0 && agents_len > 0
 }
 
 /// Derive the viewport top so the cursor entry stays visible, moving the
@@ -488,20 +487,16 @@ mod tests {
     }
 
     #[test]
-    fn log_up_target_crosses_to_panel_only_when_fully_topped() {
-        // Cursor on the first entry AND viewport at the top: Up crosses
-        // back to the panel row adjacent to the log (index ==
-        // agents.len()); otherwise it moves the cursor up (None).
-        assert_eq!(log_up_target(0, 0, 2), Some(2), "fully topped → cross");
-        assert_eq!(log_up_target(3, 2, 2), None, "mid-log → move cursor up");
+    fn up_crosses_into_the_panel_only_when_fully_topped() {
+        assert!(crosses_into_panel(0, 0, 2), "fully topped → cross");
+        assert!(!crosses_into_panel(3, 2, 2), "mid-log → move cursor up");
         // The mouse-wheel-burst state: cursor already walked to 0 within
         // one drained batch, but no paint has settled the offset yet —
         // the burst must BUMP at the top, never cross over a
         // half-scrolled log.
-        assert_eq!(log_up_target(0, 4, 2), None, "viewport mid-scroll → bump");
-        assert_eq!(
-            log_up_target(0, 0, 0),
-            None,
+        assert!(!crosses_into_panel(0, 4, 2), "viewport mid-scroll → bump");
+        assert!(
+            !crosses_into_panel(0, 0, 0),
             "no roster → nothing to cross to"
         );
     }
