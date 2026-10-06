@@ -1561,21 +1561,25 @@ fn rebind_remove_confirm_after_refresh(
 
 /// The log viewport's scroll state, bundled so the invariants that used
 /// to live in loose-variable comments are enforced by methods:
-/// - the `offset` (viewport top) is always DERIVED from the `cursor` via
-///   [`settle`](LogView::settle) — never set independently while the log
-///   is focused (the one exception, crossing in from the panel, goes
-///   through [`enter_first`](LogView::enter_first), which resets both);
+/// - the viewport (`lift`, `offset`) is HELD between frames and moved
+///   only by [`settle`](LogView::settle), which keeps the cursor on
+///   screen, and by [`follow`](LogView::follow), which carries it over a
+///   refresh; crossing in from the panel goes through
+///   [`enter_first`](LogView::enter_first), which resets all three;
 /// - `fill` (permission to do the top-up IO) is REQUESTED by input/data/
 ///   resize events and consumed once per fill — an animation tick never
 ///   requests it, so a tick stays a pure repaint.
 ///
 /// The cursor moves are methods so the loop reads as intent
 /// (`log.page_down(page)`) and the saturation lives in one place.
+#[derive(Clone)]
 struct LogView {
     /// Selected entry — index into the scroll sequence.
     cursor: usize,
-    /// Viewport top, derived from `cursor`.
+    /// Viewport top.
     offset: usize,
+    /// Header rows lifted off the top for the log.
+    lift: usize,
     /// Log fetch-window size; grows on demand until `complete`.
     window: usize,
     /// Cursor for the next older fixed-size page.
@@ -1595,6 +1599,7 @@ impl LogView {
         Self {
             cursor: 0,
             offset: 0,
+            lift: 0,
             window: 30,
             next: None,
             complete: false,
@@ -1608,27 +1613,39 @@ impl LogView {
         self.fill = true;
     }
 
-    /// Settle the viewport for the paint: clamp the cursor into the
-    /// loaded length and DERIVE the offset from it when the log is
-    /// focused; otherwise just keep the last page full.
+    /// Settle the viewport for the paint, moving it no more than keeping
+    /// the cursor on screen needs. A focused log at its top is composed
+    /// with the header: `lift_for(n)` lifts enough of it for the `n`
+    /// entries above the cursor, so the header goes as the cursor
+    /// descends and returns as it climbs. Scrolled, the log holds its
+    /// lift, taking more of the header before it scrolls further. The
+    /// unfocused log keeps its last page full, and its lift for when
+    /// focus comes back from a page.
     fn settle(
         &mut self,
-        capacity: usize,
         total: usize,
         focused: bool,
+        lift_for: impl Fn(usize) -> usize,
+        capacity_at: impl Fn(usize) -> usize,
         unselectable: impl Fn(usize) -> bool,
     ) {
-        if focused {
-            self.cursor = land(
-                self.cursor.min(total.saturating_sub(1)),
-                total,
-                self.rising,
-                unselectable,
-            );
-            self.offset = scroll_to_show(self.cursor, self.offset, capacity, total);
-        } else {
-            self.offset = self.offset.min(total.saturating_sub(capacity.max(1)));
+        if !focused {
+            self.offset = self.offset.min(total.saturating_sub(capacity_at(0).max(1)));
+            return;
         }
+        self.cursor = land(
+            self.cursor.min(total.saturating_sub(1)),
+            total,
+            self.rising,
+            unselectable,
+        );
+        self.offset = self.offset.min(self.cursor);
+        self.lift = if self.offset == 0 {
+            lift_for(self.cursor)
+        } else {
+            self.lift.max(lift_for(self.cursor - self.offset))
+        };
+        self.offset = scroll_to_show(self.cursor, self.offset, capacity_at(self.lift), total);
     }
 
     // Each move lands at once, before the next key in the same batch or an
@@ -1656,11 +1673,92 @@ impl LogView {
     fn jump_bottom(&mut self, total: usize, rule: &dyn Fn(usize) -> bool) {
         self.moved(total.saturating_sub(1), false, total, rule);
     }
+    /// Keep the selected entry where it sat on screen after a refresh
+    /// moved it to `now`: the rows that arrived above it go above the
+    /// viewport, and the header keeps its lift.
+    fn follow(&mut self, now: usize) {
+        self.offset = (self.offset + now).saturating_sub(self.cursor);
+        self.cursor = now;
+    }
     /// Enter the log at its first entry (crossing in from the panel) —
     /// the one place offset is reset directly, alongside the cursor.
     fn enter_first(&mut self) {
         self.cursor = 0;
         self.offset = 0;
+        self.lift = 0;
+    }
+}
+
+/// The view to paint, with `log` settled into exactly the capacity the
+/// render will draw (see [`LogView::settle`]). `head` counts the ask
+/// lines before the log rows, and the history must already be topped
+/// up, so the cursor clamps here as the paint will.
+fn settle_frame<'a>(
+    log: &mut LogView,
+    snapshot: &StatusSnapshot,
+    view: PanelView<'a>,
+    rows: u16,
+    cols: u16,
+    frame: usize,
+    head: usize,
+) -> PanelView<'a> {
+    let log_focused = view.mode.log_focused();
+    let total = head + snapshot.log_rows.len();
+    // From the TRUE header length: a clipped render reports capacity 0
+    // however deep the header overflows (codex be2b054).
+    let header_len = render::scrollable_header(snapshot, rows, cols, frame, &view).len();
+    log.settle(
+        total,
+        log_focused,
+        |above| pressure_lift(log_focused, rows as usize, header_len, above, total),
+        |lift| {
+            log_budget(
+                rows as usize,
+                header_len,
+                lift,
+                !snapshot.agents.is_empty(),
+                log_focused,
+                total,
+            )
+            .capacity
+        },
+        |i| is_rule(snapshot, head, i),
+    );
+    PanelView {
+        lift: log.lift,
+        log_cursor: log.cursor,
+        ..view
+    }
+}
+
+/// The log entry a refresh must keep selected, including under a page
+/// opened from it.
+fn held_entry(
+    mode: Mode,
+    snapshot: &StatusSnapshot,
+    cols: u16,
+    log: &LogView,
+) -> Option<scroll::HeldEntry> {
+    if mode.panel_tops_log() {
+        return None;
+    }
+    let head = block_ask_spans(snapshot, cols as usize).len();
+    scroll::hold_entry(snapshot, head, log.cursor)
+}
+
+/// Put the cursor back on `held` in the refreshed `snapshot`, on the
+/// screen row it was on. An entry the refresh dropped leaves the cursor
+/// where it was.
+fn refind_entry(
+    log: &mut LogView,
+    held: Option<scroll::HeldEntry>,
+    snapshot: &StatusSnapshot,
+    cols: u16,
+) {
+    let Some(held) = held else { return };
+    let head = block_ask_spans(snapshot, cols as usize).len();
+    if let Some(now) = scroll::find_entry(snapshot, head, &held) {
+        log.follow(now);
     }
 }
 
@@ -1682,9 +1780,10 @@ fn is_rule(snapshot: &StatusSnapshot, head: usize, i: usize) -> bool {
 /// at once. Enforced HERE on every loop pass — not by per-transition
 /// discipline — so no panel entry path (the Up-crossing, Tab's teleport
 /// from any depth, a refresh rebind, or any future one) can violate it.
-/// Idempotent; a no-op while the log owns focus.
+/// Idempotent. Pages the panel opens find the log already topped, and
+/// a page opened from a log entry returns to the viewport it left.
 fn enforce_panel_tops_log(mode: Mode, log: &mut LogView) {
-    if !matches!(mode, Mode::LogScroll) {
+    if mode.panel_tops_log() {
         log.enter_first();
     }
 }
@@ -3277,7 +3376,6 @@ pub(crate) async fn run_tui(
             continue;
         }
 
-        let log_focused = matches!(mode, Mode::LogScroll);
         // Presence may have moved an agent page's action list since
         // the last frame; the cursor follows its action before this
         // one paints.
@@ -3441,33 +3539,7 @@ pub(crate) async fn run_tui(
             mode = Mode::AgentPanel { sel: 0 };
             continue;
         }
-        // Pressure lift (tui-short-pane-whole-scroll): in a short pane a
-        // focused log keeps a working viewport by lifting scrollable
-        // header rows off the top, growing with the cursor's descent so
-        // the header restores as the selection walks back up. Derived
-        // from the TRUE header length (a clipped render reports
-        // capacity 0 however deep the header overflows — codex be2b054)
-        // and the POST-FILL total (the policy clamps the cursor exactly
-        // as settle will). Capacity comes from the SAME budget function
-        // the render draws, so no probe render is needed.
-        let header_len = render::scrollable_header(&snapshot, rows, cols, frame, &view).len();
-        let lift = pressure_lift(log_focused, rows as usize, header_len, log.cursor, total);
-        let capacity = log_budget(
-            rows as usize,
-            header_len,
-            lift,
-            !snapshot.agents.is_empty(),
-            log_focused,
-            total,
-        )
-        .capacity;
-        // Derive the viewport from the cursor (focused) or keep the last
-        // page full (unfocused) — see [`LogView::settle`].
-        log.settle(capacity, total, log_focused, |i| {
-            is_rule(&snapshot, head, i)
-        });
-        // Rebuild the view with the clamped cursor/offset for the paint.
-        let view = PanelView { lift, ..view };
+        let view = settle_frame(&mut log, &snapshot, view, rows, cols, frame, head);
         // `screen_total` is the current screen's virtual content height
         // (log rows; plan page chrome + full document) — the plan page's
         // body-scroll clamp reads it, mirroring the overlay pattern.
@@ -5070,6 +5142,7 @@ pub(crate) async fn run_tui(
                 // status walk racing a worktree mutation is routine)
                 // and must not advance the accepted signature — see
                 // [`apply_refresh`].
+                let held = held_entry(mode, &snapshot, cols, &log);
                 let rebuilt = StatusSnapshot::build_async(
                     &repo,
                     &basename,
@@ -5115,6 +5188,7 @@ pub(crate) async fn run_tui(
                 snapshot.github_events = fresh.github_events;
                 snapshot.log_next = fresh.next.clone();
                 log.next = fresh.next;
+                refind_entry(&mut log, held, &snapshot, cols);
                 if refresh_ok {
                     last_sig = sig;
                     refresh_retry_at = None;
@@ -6831,12 +6905,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn log_view_settle_derives_offset_and_enter_first_resets() {
+    fn log_view_settle_shows_the_cursor_and_enter_first_resets() {
         let mut v = LogView::new();
         // Focused: cursor below the window pulls the offset down to reveal
         // it (matches scroll_to_show), and a cursor past the end clamps.
         v.cursor = 50;
-        v.settle(10, 20, true, |_| false);
+        v.settle(20, true, |_| 0, |_| 10, |_| false);
         assert_eq!(v.cursor, 19, "cursor clamped into the loaded length");
         assert_eq!(v.offset, scroll_to_show(19, 0, 10, 20));
         // Unfocused: the cursor is NOT clamped; only the offset is held to
@@ -6844,12 +6918,12 @@ pub(crate) mod tests {
         let mut u = LogView::new();
         u.cursor = 50;
         u.offset = 999;
-        u.settle(10, 20, false, |_| false);
+        u.settle(20, false, |_| 0, |_| 10, |_| false);
         assert_eq!(u.cursor, 50, "unfocused leaves the cursor alone");
         assert_eq!(u.offset, 10, "offset held to the last full page");
-        // enter_first resets both (the one place offset is set directly).
+        v.lift = 3;
         v.enter_first();
-        assert_eq!((v.cursor, v.offset), (0, 0));
+        assert_eq!((v.cursor, v.offset, v.lift), (0, 0, 0));
     }
 
     /// A run's end rule is a line in the log but never a place the cursor
@@ -6867,7 +6941,7 @@ pub(crate) mod tests {
         let mut one_by_one = LogView::new();
         for _ in 0..3 {
             one_by_one.down(7, &rule);
-            one_by_one.settle(10, 7, true, rule);
+            one_by_one.settle(7, true, |_| 0, |_| 10, rule);
         }
         assert_eq!(batched.cursor, one_by_one.cursor);
         assert_eq!(batched.cursor, 4);
@@ -8603,7 +8677,7 @@ pub(crate) mod tests {
 
     #[test]
     fn panel_focus_forces_the_log_to_its_top() {
-        // THE INVARIANT: any panel-family mode ⟹ log topped. A wheel
+        // THE INVARIANT: panel focus ⟹ log topped. A wheel
         // burst used to cross into the panel mid-batch, freezing a
         // mid-scroll viewport under the focused panel; Tab could do the
         // same from any depth. The loop-pass enforcement makes the state
@@ -8614,29 +8688,433 @@ pub(crate) mod tests {
         enforce_panel_tops_log(Mode::AgentPanel { sel: 0 }, &mut log);
         assert_eq!((log.cursor, log.offset), (0, 0), "panel focus tops the log");
 
-        // Every panel-family mode enforces; the log mode never touches it.
+        // The log, and the pages its entries open, keep its viewport
+        // for Back to return to.
         for mode in [
-            Mode::AddPicker { sel: 0 },
-            Mode::AgentDetail { idx: 0, sel: 0 },
-            Mode::Confirm {
-                action: ConfirmAction::RemoveAgent { idx: 0 },
-            },
+            Mode::LogScroll,
+            Mode::CommitPage { sel: 0 },
+            Mode::EventDetail { sel: 0 },
+            Mode::PlanDetail { sel: 0 },
         ] {
             let mut log = LogView::new();
-            log.cursor = 3;
-            log.offset = 3;
+            log.cursor = 7;
+            log.offset = 5;
             enforce_panel_tops_log(mode, &mut log);
-            assert_eq!((log.cursor, log.offset), (0, 0), "{mode:?}");
+            assert_eq!((log.cursor, log.offset), (7, 5), "{mode:?}");
         }
+    }
+
+    fn numbered_commit(i: usize) -> crate::cli::log::OnelineRow {
+        crate::cli::log::OnelineRow::Commit {
+            at: 0,
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:040x}", i + 1)).unwrap(),
+            subject: format!("subject {i}"),
+            marker: crate::cli::log::RowMarker::Plain,
+            stands_for: None,
+        }
+    }
+
+    fn long_log_snap(n: usize) -> StatusSnapshot {
+        let mut s = two_agent_snap();
+        s.log_rows = (0..n).map(numbered_commit).collect();
+        s
+    }
+
+    fn log_frame(mode: Mode) -> PanelView<'static> {
+        PanelView {
+            source_page: None,
+            plan_page: None,
+            commit_page: None,
+            event_page: None,
+            wait_page: None,
+            wait_process: None,
+            wait_scroll: 0,
+            seen_session: None,
+            clear_target: None,
+            plan_input: None,
+            mode,
+            picker: &[],
+            log_cursor: 0,
+            reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
+            remote: Default::default(),
+            remote_detail: None,
+            remote_page: None,
+            presence: None,
+            lost: Default::default(),
+            lift: 0,
+        }
+    }
+
+    /// One pass of the loop's paint: settle, then render what it drew.
+    fn paint_log(log: &mut LogView, s: &StatusSnapshot, mode: Mode, rows: u16) -> Vec<String> {
+        let view = settle_frame(log, s, log_frame(mode), rows, 60, 0, 0);
+        render_at(s, rows, 60, log.offset, 0, &view)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect()
+    }
+
+    fn selected_subject(log: &LogView, s: &StatusSnapshot) -> String {
+        match &s.log_rows[log.cursor] {
+            crate::cli::log::OnelineRow::Commit { subject, .. } => subject.clone(),
+            other => panic!("cursor on {other:?}"),
+        }
+    }
+
+    fn shows(screen: &[String], subject: &str) -> bool {
+        screen.iter().any(|l| l.contains(subject))
+    }
+
+    #[test]
+    fn the_log_takes_the_pane_as_its_cursor_descends_and_gives_it_back() {
+        let s = long_log_snap(30);
+        let rule = |i: usize| is_rule(&s, 0, i);
         let mut log = LogView::new();
-        log.cursor = 7;
-        log.offset = 5;
-        enforce_panel_tops_log(Mode::LogScroll, &mut log);
+        let top = paint_log(&mut log, &s, Mode::LogScroll, 12);
+        assert!(shows(&top, "add agent"), "{top:#?}");
+        let mut lifts = vec![];
+        for _ in 0..20 {
+            log.down(30, &rule);
+            let screen = paint_log(&mut log, &s, Mode::LogScroll, 12);
+            assert!(shows(&screen, &selected_subject(&log, &s)), "{screen:#?}");
+            lifts.push(settle_frame(&mut log, &s, log_frame(Mode::LogScroll), 12, 60, 0, 0).lift);
+        }
+        assert!(lifts.windows(2).all(|w| w[0] <= w[1]), "{lifts:?}");
+        let deep = paint_log(&mut log, &s, Mode::LogScroll, 12);
+        assert!(!shows(&deep, "add agent"), "{deep:#?}");
+        let entries = deep.iter().filter(|l| l.contains("subject ")).count();
         assert_eq!(
-            (log.cursor, log.offset),
-            (7, 5),
-            "log focus keeps its scroll state"
+            entries,
+            12 - 2,
+            "every row but the bar and the log's rule: {deep:#?}"
         );
+        for _ in 0..20 {
+            log.up(30, &rule);
+            let screen = paint_log(&mut log, &s, Mode::LogScroll, 12);
+            assert!(shows(&screen, &selected_subject(&log, &s)), "{screen:#?}");
+        }
+        assert_eq!(paint_log(&mut log, &s, Mode::LogScroll, 12), top);
+    }
+
+    #[test]
+    fn leaving_the_log_for_the_panel_gives_the_header_back() {
+        let s = long_log_snap(30);
+        let mut log = LogView::new();
+        let panel = Mode::AgentPanel { sel: 0 };
+        let fresh = paint_log(&mut log, &s, panel, 12);
+        log.page_down(20, 30, &|_| false);
+        paint_log(&mut log, &s, Mode::LogScroll, 12);
+        enforce_panel_tops_log(panel, &mut log);
+        assert_eq!(paint_log(&mut log, &s, panel, 12), fresh);
+    }
+
+    #[test]
+    fn a_log_that_fits_with_its_header_never_lifts() {
+        let s = long_log_snap(4);
+        let mut log = LogView::new();
+        let top = paint_log(&mut log, &s, Mode::LogScroll, 30);
+        for _ in 0..4 {
+            log.down(4, &|_| false);
+            let screen = paint_log(&mut log, &s, Mode::LogScroll, 30);
+            assert_eq!(screen.len(), top.len());
+            assert!(shows(&screen, "add agent"), "{screen:#?}");
+            assert!((0..4).all(|i| shows(&screen, &format!("subject {i}"))));
+        }
+    }
+
+    #[test]
+    fn a_resize_while_expanded_keeps_the_selection_on_screen() {
+        let s = long_log_snap(40);
+        let mut log = LogView::new();
+        log.page_down(25, 40, &|_| false);
+        paint_log(&mut log, &s, Mode::LogScroll, 30);
+        let held = selected_subject(&log, &s);
+        for rows in [6u16, 3, 2, 40, 12] {
+            let screen = paint_log(&mut log, &s, Mode::LogScroll, rows);
+            assert_eq!(selected_subject(&log, &s), held);
+            assert!(shows(&screen, &held), "rows {rows}: {screen:#?}");
+        }
+    }
+
+    #[test]
+    fn a_refresh_with_a_new_leading_event_keeps_the_selected_entry() {
+        let mut s = long_log_snap(30);
+        let mut log = LogView::new();
+        log.page_down(15, 30, &|_| false);
+        paint_log(&mut log, &s, Mode::LogScroll, 12);
+        for _ in 0..4 {
+            log.up(30, &|_| false);
+        }
+        let before = paint_log(&mut log, &s, Mode::LogScroll, 12);
+        let held_subject = selected_subject(&log, &s);
+        assert!(log.cursor > log.offset, "premise: not at an edge");
+        let row = log.cursor - log.offset;
+        let held = held_entry(Mode::LogScroll, &s, 60, &log);
+        s.log_rows.insert(0, numbered_commit(100));
+        s.log_rows.insert(0, numbered_commit(101));
+        refind_entry(&mut log, held, &s, 60);
+        let after = paint_log(&mut log, &s, Mode::LogScroll, 12);
+        assert_eq!(selected_subject(&log, &s), held_subject);
+        assert_eq!(log.cursor - log.offset, row, "the same screen row");
+        assert_eq!(after, before, "nothing in view moved");
+    }
+
+    /// The rows an event's index points into are rebuilt by every
+    /// refresh, so the event is found by its keys.
+    #[test]
+    fn a_refresh_keeps_a_selected_event_whose_index_moved() {
+        use crate::cli::github::log::{EventLog, Transport};
+        use crate::cli::github::timeline;
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".clank/agents/bob/events");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut events = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
+        let item = |number: u64| clank_core::wait::WaitItem::GithubEvent {
+            presentation: None,
+            repo: "o/r".into(),
+            event: "pr_comment".into(),
+            detail: None,
+            number: Some(number),
+            title: Some(format!("event {number}")),
+            actor: Some("alice".into()),
+            url: None,
+            instructions: None,
+            content: None,
+        };
+        let read = |s: &mut StatusSnapshot| {
+            let read = timeline::timeline_snapshot(repo.path());
+            let items = crate::cli::log::interleave(&[], &read.events);
+            s.log_rows = crate::cli::log::oneline_items_rows(
+                &items,
+                &Default::default(),
+                &Default::default(),
+            );
+            s.github_events = read.events;
+        };
+        for n in 1..=3 {
+            events
+                .append_inbox(
+                    Transport::Poll,
+                    Some(&format!("f{n}")),
+                    None,
+                    Some(n * 1_000),
+                    &item(n),
+                )
+                .unwrap();
+        }
+        let mut s = two_agent_snap();
+        read(&mut s);
+        let selected = |log: &LogView, s: &StatusSnapshot| match &s.log_rows[log.cursor] {
+            crate::cli::log::OnelineRow::Github {
+                event_idx, line, ..
+            } => (s.github_events[*event_idx].page_keys(), line.clone()),
+            other => panic!("{other:?}"),
+        };
+        let mut log = LogView::new();
+        log.down(3, &|_| false);
+        let (before, _) = selected(&log, &s);
+        let held = held_entry(Mode::LogScroll, &s, 60, &log);
+        events
+            .append_inbox(Transport::Poll, Some("f4"), None, Some(4_000), &item(4))
+            .unwrap();
+        // A second holder's copy joins the selected event to a key it
+        // did not have.
+        let dir = repo.path().join(".clank/agents/alice/events");
+        std::fs::create_dir_all(&dir).unwrap();
+        EventLog::open(&dir, "github-o-r-aaaa")
+            .unwrap()
+            .append_inbox(Transport::Poll, Some("f2"), None, Some(2_000), &item(2))
+            .unwrap();
+        read(&mut s);
+        refind_entry(&mut log, held, &s, 60);
+        let (after, line) = selected(&log, &s);
+        assert!(line.contains("event 2"), "{line}");
+        assert!(after.len() > before.len() && before.iter().all(|k| after.contains(k)));
+        assert_eq!(log.cursor, 2, "one newer event above it");
+    }
+
+    /// The paint highlights the cursor settle clamped, not the one the
+    /// frame's view was built with.
+    #[test]
+    fn the_painted_cursor_is_the_settled_one() {
+        let s = long_log_snap(30);
+        let mut log = LogView::new();
+        log.cursor = 50;
+        let view = settle_frame(&mut log, &s, log_frame(Mode::LogScroll), 12, 60, 0, 0);
+        assert_eq!((view.log_cursor, log.cursor), (29, 29));
+    }
+
+    #[test]
+    fn an_authors_verdicts_are_told_apart_by_the_commit_they_review() {
+        use crate::cli::log::OnelineRow;
+        let review = || OnelineRow::Review {
+            verdict: clank_core::vocab::Verdict::Continue,
+            author: "codex".into(),
+            summary: "ok".into(),
+            at: None,
+        };
+        let mut s = two_agent_snap();
+        s.log_rows = vec![review(), numbered_commit(2), review(), numbered_commit(1)];
+        let mut log = LogView::new();
+        log.cursor = 2;
+        let held = held_entry(Mode::LogScroll, &s, 60, &log);
+        s.log_rows.splice(0..0, [review(), numbered_commit(3)]);
+        refind_entry(&mut log, held, &s, 60);
+        assert_eq!(log.cursor, 4, "not the review of 2, now where it sat");
+    }
+
+    /// Partway down, with part of the header lifted: what is in view
+    /// stays in view, header included, and the selection sits on the
+    /// same terminal row.
+    fn partly_lifted(s: &StatusSnapshot) -> (LogView, Vec<String>) {
+        let mut log = LogView::new();
+        let mut screen = paint_log(&mut log, s, Mode::LogScroll, 12);
+        for _ in 0..s.log_rows.len() {
+            if log.lift >= 2 {
+                break;
+            }
+            log.down(s.log_rows.len(), &|_| false);
+            screen = paint_log(&mut log, s, Mode::LogScroll, 12);
+        }
+        assert!(log.lift >= 2, "premise: the header lifts partway");
+        assert!(
+            shows(&screen, "add agent"),
+            "premise: header partly shown {screen:#?}"
+        );
+        (log, screen)
+    }
+
+    #[test]
+    fn a_refresh_partway_down_moves_nothing_on_screen() {
+        let mut s = long_log_snap(40);
+        let (mut log, before) = partly_lifted(&s);
+        let held = held_entry(Mode::LogScroll, &s, 60, &log);
+        for n in 100..103 {
+            s.log_rows.insert(0, numbered_commit(n));
+        }
+        refind_entry(&mut log, held, &s, 60);
+        assert_eq!(paint_log(&mut log, &s, Mode::LogScroll, 12), before);
+        let (offset, lift) = (log.offset, log.lift);
+        let mut deeper = log.clone();
+        while deeper.lift == lift && deeper.cursor < 40 {
+            deeper.down(s.log_rows.len(), &|_| false);
+            paint_log(&mut deeper, &s, Mode::LogScroll, 12);
+        }
+        assert_eq!(
+            (deeper.offset, deeper.lift),
+            (offset, lift + 1),
+            "the header goes before the log scrolls"
+        );
+        let mut fresh = LogView::new();
+        let top = paint_log(&mut fresh, &s, Mode::LogScroll, 12);
+        for _ in 0..40 {
+            log.up(s.log_rows.len(), &|_| false);
+            paint_log(&mut log, &s, Mode::LogScroll, 12);
+        }
+        assert_eq!(
+            paint_log(&mut log, &s, Mode::LogScroll, 12),
+            top,
+            "the top of the log brings the whole header back"
+        );
+    }
+
+    #[test]
+    fn a_refresh_under_a_page_partway_down_returns_to_the_same_frame() {
+        let mut s = long_log_snap(40);
+        let (mut log, before) = partly_lifted(&s);
+        let page = Mode::CommitPage { sel: 0 };
+        paint_log(&mut log, &s, page, 12);
+        assert!(log.lift >= 2, "the page leaves the log's lift alone");
+        let held = held_entry(page, &s, 60, &log);
+        s.log_rows.insert(0, numbered_commit(100));
+        refind_entry(&mut log, held, &s, 60);
+        paint_log(&mut log, &s, page, 12);
+        assert_eq!(paint_log(&mut log, &s, Mode::LogScroll, 12), before);
+    }
+
+    #[test]
+    fn a_header_that_grows_under_a_refresh_keeps_the_selection_in_view() {
+        let mut s = long_log_snap(40);
+        let (mut log, _) = partly_lifted(&s);
+        let selected = selected_subject(&log, &s);
+        let held = held_entry(Mode::LogScroll, &s, 60, &log);
+        s.log_rows.insert(0, numbered_commit(100));
+        for i in 0..6 {
+            s.agents.push(agent_row(
+                &format!("extra{i}"),
+                crate::cli::teams_config::RosterRole::Commit,
+                clank_core::vocab::AutoMode::On,
+            ));
+        }
+        refind_entry(&mut log, held, &s, 60);
+        let screen = paint_log(&mut log, &s, Mode::LogScroll, 12);
+        assert_eq!(selected_subject(&log, &s), selected);
+        assert!(shows(&screen, &selected), "{screen:#?}");
+        assert_eq!(screen.len(), 12);
+    }
+
+    #[test]
+    fn a_recurring_entry_is_found_where_it_was_selected() {
+        use crate::cli::log::OnelineRow;
+        let notice = || OnelineRow::Notice("log unreadable".into());
+        let mut s = two_agent_snap();
+        s.log_rows = vec![
+            notice(),
+            numbered_commit(1),
+            notice(),
+            numbered_commit(2),
+            notice(),
+        ];
+        let mut log = LogView::new();
+        log.cursor = 2;
+        let held = held_entry(Mode::LogScroll, &s, 60, &log);
+        // The refresh reads the same window: a row in at the top pushes
+        // one out at the bottom.
+        s.log_rows.insert(0, numbered_commit(3));
+        s.log_rows.pop();
+        refind_entry(&mut log, held, &s, 60);
+        assert_eq!(log.cursor, 3);
+    }
+
+    #[test]
+    fn a_page_opened_from_the_log_returns_to_its_entry_across_a_refresh() {
+        let mut s = long_log_snap(30);
+        let mut log = LogView::new();
+        log.page_down(15, 30, &|_| false);
+        let before = paint_log(&mut log, &s, Mode::LogScroll, 12);
+        let page = Mode::CommitPage { sel: 0 };
+        enforce_panel_tops_log(page, &mut log);
+        let held = held_entry(page, &s, 60, &log);
+        s.log_rows.insert(0, numbered_commit(100));
+        refind_entry(&mut log, held, &s, 60);
+        enforce_panel_tops_log(page, &mut log);
+        assert_eq!(paint_log(&mut log, &s, Mode::LogScroll, 12), before);
+    }
+
+    #[test]
+    fn a_batch_of_moves_then_enter_opens_the_entry_it_landed_on() {
+        let mut s = long_log_snap(12);
+        s.log_rows.insert(3, crate::cli::log::OnelineRow::RunEnd);
+        let rule = |i: usize| is_rule(&s, 0, i);
+        let mut log = LogView::new();
+        paint_log(&mut log, &s, Mode::LogScroll, 8);
+        for _ in 0..3 {
+            log.down(13, &rule);
+        }
+        let ask = block_ask_spans(&s, 60);
+        let seq = build_scroll(&s, &ask);
+        let opened = match entry_target(&seq, log.cursor) {
+            Some(EntryTarget::Commit { sha, .. }) => sha,
+            _ => panic!("not a commit"),
+        };
+        let screen = paint_log(&mut log, &s, Mode::LogScroll, 8);
+        let crate::cli::log::OnelineRow::Commit { sha, subject, .. } = &s.log_rows[log.cursor]
+        else {
+            panic!("the rule is never a position");
+        };
+        assert_eq!(&opened, sha);
+        assert!(shows(&screen, subject));
     }
 
     /// The page's facts come from the source it opened on, never the

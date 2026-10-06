@@ -233,6 +233,102 @@ pub(super) fn build_scroll<'a>(
     seq
 }
 
+/// What a log entry IS, independent of where it sits: rows a refresh
+/// adds above the selection move its index, never this.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum EntryId {
+    Commit(crate::lifecycle::CommitSha),
+    /// Reviews and banners carry the commit below them; an author's
+    /// verdicts recur across commits and a plan's name across runs.
+    Review {
+        author: String,
+        at: Option<i64>,
+        commit: Option<crate::lifecycle::CommitSha>,
+    },
+    Header {
+        plan: Option<String>,
+        commit: Option<crate::lifecycle::CommitSha>,
+    },
+    /// Any shared key is the same event: a merge can gain members.
+    Event(Vec<crate::cli::github::timeline::EventKey>),
+    Notice(String),
+}
+
+/// A selected entry, held across a refresh: which entry, and which of
+/// its occurrences when it recurs, counted from the top so rows added
+/// above it leave both alone.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HeldEntry {
+    id: EntryId,
+    nth: usize,
+}
+
+/// Hold scroll entry `i`, the log's rows starting after `head` ask
+/// lines. Ask lines and run-end rules have no identity to hold.
+pub(super) fn hold_entry(snap: &StatusSnapshot, head: usize, i: usize) -> Option<HeldEntry> {
+    let at = i.checked_sub(head)?;
+    let below = snap.log_rows.get(at + 1..)?.iter().find_map(row_commit);
+    let id = identify(snap, snap.log_rows.get(at)?, below)?;
+    let nth = occurrences(snap, head, &id).position(|j| j == i)?;
+    Some(HeldEntry { id, nth })
+}
+
+/// Where the held entry now sits, if the refresh kept it.
+pub(super) fn find_entry(snap: &StatusSnapshot, head: usize, held: &HeldEntry) -> Option<usize> {
+    occurrences(snap, head, &held.id).nth(held.nth)
+}
+
+fn occurrences(snap: &StatusSnapshot, head: usize, id: &EntryId) -> impl Iterator<Item = usize> {
+    let same = |other: &EntryId| match (id, other) {
+        (EntryId::Event(a), EntryId::Event(b)) => a.iter().any(|k| b.contains(k)),
+        _ => id == other,
+    };
+    let mut below = None;
+    let mut found = vec![];
+    for (at, row) in snap.log_rows.iter().enumerate().rev() {
+        if identify(snap, row, below).is_some_and(|e| same(&e)) {
+            found.push(head + at);
+        }
+        below = row_commit(row).or(below);
+    }
+    found.into_iter().rev()
+}
+
+fn row_commit(row: &crate::cli::log::OnelineRow) -> Option<&crate::lifecycle::CommitSha> {
+    use crate::cli::log::OnelineRow;
+    match row {
+        OnelineRow::Commit { sha, .. } | OnelineRow::PlainCommit { sha, .. } => Some(sha),
+        _ => None,
+    }
+}
+
+fn identify(
+    snap: &StatusSnapshot,
+    row: &crate::cli::log::OnelineRow,
+    below: Option<&crate::lifecycle::CommitSha>,
+) -> Option<EntryId> {
+    use crate::cli::log::OnelineRow;
+    Some(match row {
+        OnelineRow::Commit { sha, .. } | OnelineRow::PlainCommit { sha, .. } => {
+            EntryId::Commit(sha.clone())
+        }
+        OnelineRow::Review { author, at, .. } => EntryId::Review {
+            author: author.clone(),
+            at: *at,
+            commit: below.cloned(),
+        },
+        OnelineRow::Header { plan, .. } => EntryId::Header {
+            plan: plan.clone(),
+            commit: below.cloned(),
+        },
+        OnelineRow::Github { event_idx, .. } => {
+            EntryId::Event(snap.github_events.get(*event_idx)?.page_keys())
+        }
+        OnelineRow::Notice(text) => EntryId::Notice(text.clone()),
+        OnelineRow::RunEnd => return None,
+    })
+}
+
 /// Where a cursor that may have come to rest on a row nothing selects
 /// (a run's end rule) lands: the nearest selectable row the way it was
 /// moving, else the nearest the other way.
@@ -917,10 +1013,6 @@ mod tests {
     }
 }
 
-/// The focused log's guaranteed viewport in a short pane, once the
-/// selection has descended far enough (tui-short-pane-whole-scroll).
-pub(super) const MIN_LOG_ROWS: usize = 5;
-
 /// What divides the (lifted) header from the log entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Divider {
@@ -993,9 +1085,12 @@ pub(super) fn log_budget(
 /// - The target is `1 + cursor` (one entry visible even at
 ///   cursor-at-top — with an over-tall header that means the header is
 ///   partially hidden from the start; selection visibility outranks
-///   the full header), capped at [`MIN_LOG_ROWS`], the entries that
-///   exist, and what ANY lift can achieve at this height (rows == 1:
-///   nothing can — the bar owns the pane, the stated degradation).
+///   the full header), capped at the entries that exist and what ANY
+///   lift can achieve at this height (rows == 1: nothing can — the bar
+///   owns the pane, the stated degradation). Uncapped otherwise, so
+///   descending the log lifts the header away row by row until the log
+///   has the pane under the bar, and climbing back brings it back, as a
+///   plan page's document does.
 pub(super) fn pressure_lift(
     log_focused: bool,
     rows: usize,
@@ -1009,7 +1104,7 @@ pub(super) fn pressure_lift(
     let cursor = cursor.min(total - 1);
     let budget_at = |lift: usize| log_budget(rows, header_len, lift, true, true, total);
     let max_capacity = budget_at(header_len).capacity;
-    let target = (1 + cursor).min(MIN_LOG_ROWS).min(total).min(max_capacity);
+    let target = (1 + cursor).min(total).min(max_capacity);
     if target == 0 {
         return 0;
     }

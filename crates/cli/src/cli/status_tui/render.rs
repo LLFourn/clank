@@ -5811,7 +5811,7 @@ mod tests {
         assert_eq!(pressure_lift(true, 40, 7, 9, 12), 0);
         // rows==10, header 7 (the two-agent fixture shape): full header
         // + one entry coexist at the top; the lift grows with descent
-        // to the min_log target and no further.
+        // until the header is gone and the log has the pane.
         assert_eq!(
             pressure_lift(true, 10, 7, 0, 12),
             0,
@@ -5824,8 +5824,13 @@ mod tests {
         );
         assert_eq!(
             pressure_lift(true, 10, 7, 9, 12),
-            4,
-            "capped at the min_log target"
+            7,
+            "the whole header lifts away"
+        );
+        assert_eq!(
+            pressure_lift(true, 10, 7, 30, 40),
+            7,
+            "and stays away however far the log descends"
         );
         // OVER-TALL header (codex be2b054): rows==10, header 20. Even at
         // cursor-at-top one entry row is guaranteed — the header is
@@ -5835,11 +5840,11 @@ mod tests {
             13,
             "one entry over a full header"
         );
-        // …and descent still reaches the full min_log viewport.
+        // …and descent lifts all of it, the log taking the pane.
         assert_eq!(
             pressure_lift(true, 10, 20, 9, 12),
-            17,
-            "min_log despite the overflow"
+            20,
+            "the full log viewport despite the overflow"
         );
         // Height-conditional chrome: rows==4 → min_log 2; rows==2 → the
         // rule yields (chrome 1, min_log 1, ALL header hidden for the
@@ -5909,12 +5914,13 @@ mod tests {
 
     /// Emulate the loop for a cursor walk: derive the lift from the
     /// true header length, probe capacity under it, settle the window,
-    /// and assert the selection is always visible with the min_log
-    /// target honored once descent allows it.
+    /// and assert the selection is always visible, with every entry
+    /// above it on screen until the log has the pane under the bar and
+    /// its rule.
     fn walk_asserting_visibility(s: &StatusSnapshot, rows: u16, total: usize) {
         use super::super::scroll::{pressure_lift, scroll_to_show};
         let header_len = scrollable_header(s, rows, 60, 0, &lift_view(0, 0)).len();
-        let min_log = 5.min(rows as usize - 2);
+        let pane = rows as usize - 2;
         let mut offset = 0usize;
         let mut last_header_visible = usize::MAX;
         for cursor in 0..8 {
@@ -5923,7 +5929,7 @@ mod tests {
             offset = scroll_to_show(cursor, offset, cap, total);
             let (out, cap) = render_at(s, rows, 60, offset, 0, &lift_view(cursor, lift));
             assert!(!out.is_empty(), "bar row present");
-            let target = (1 + cursor).min(min_log);
+            let target = (1 + cursor).min(pane);
             assert!(
                 cap >= target,
                 "cursor {cursor}: capacity {cap} ≥ target {target}"

@@ -1649,6 +1649,11 @@ impl Mode {
     pub(super) fn log_focused(self) -> bool {
         matches!(self, Mode::LogScroll)
     }
+    /// The panel has focus, and the log under it sits at its top. Every
+    /// other mode is the log or a page over it, which keeps its place.
+    pub(super) fn panel_tops_log(self) -> bool {
+        matches!(self, Mode::AgentPanel { .. })
+    }
     /// The agent-panel cursor row, else `None` (picker/confirm/log have
     /// no agent-row cursor).
     pub(super) fn selected(self) -> Option<usize> {
