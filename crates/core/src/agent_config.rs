@@ -946,6 +946,7 @@ mod tests {
     fn cmd(name: &str) -> CommandSource {
         CommandSource {
             interrupt: false,
+            interrupt_message: None,
             name: name.into(),
             command: vec!["true".into()],
             reply_command: None,
@@ -1196,6 +1197,7 @@ mod tests {
         // the branches filter round-trip…
         let src = WaitEventSource::Github(GithubSource {
             interrupt: false,
+            interrupt_message: None,
             repo: "o/r".into(),
             events: vec![GithubEventKind::PrUpdated, GithubEventKind::BranchPush],
             watch: Vec::new(),

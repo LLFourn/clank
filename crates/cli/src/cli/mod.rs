@@ -75,6 +75,7 @@ pub(crate) mod timer_source;
 pub mod unfinish;
 pub mod wait;
 mod wake_receipt;
+pub(crate) mod wake_repeat;
 pub(crate) mod web;
 
 #[derive(Args, Debug)]

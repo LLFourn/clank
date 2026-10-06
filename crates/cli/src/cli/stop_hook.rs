@@ -369,6 +369,9 @@ async fn compute_outcome_capturing(
     capture: &mut ReceiptCapture,
 ) -> HookOutcome {
     let live_ids = input.live_task_ids();
+    // Read now, before the wait: where in the agent's record this Stop
+    // came from, not wherever the record has got to by delivery.
+    let boundary = native_boundary(tool, &input);
 
     // Resolve repo: explicit --repo (testing) > hook stdin cwd.
     let repo = match resolve_hook_repo(repo_override, &input) {
@@ -484,11 +487,12 @@ async fn compute_outcome_capturing(
                     input.session_id.as_str(),
                     tool,
                     |items| {
-                        *capture = ReceiptCapture::selected(
+                        *capture = ReceiptCapture::delivering(
                             &repo,
                             &label,
                             tool,
-                            input.session_id.as_str(),
+                            &input,
+                            boundary.as_ref(),
                             items,
                         );
                     },
@@ -508,6 +512,18 @@ async fn compute_outcome_capturing(
         };
     }
     outcome
+}
+
+/// The continuation with its repetition stated, once the same items have
+/// been delivered enough times. Only the wording changes.
+fn escalated(outcome: HookOutcome, count: u32) -> HookOutcome {
+    match (outcome, super::wake_repeat::escalation(count)) {
+        (HookOutcome::Continue { mut reason }, Some(more)) => {
+            reason.push_str(&more);
+            HookOutcome::Continue { reason }
+        }
+        (outcome, _) => outcome,
+    }
 }
 
 /// Everything the turn-end decision reads, gathered before any of it
@@ -2495,6 +2511,26 @@ pub(crate) struct WaitItem {
 }
 
 impl WaitItem {
+    /// What makes this the same item on another delivery: an event's own
+    /// durable key, or a workflow item's typed fields. Never its rendering.
+    pub(crate) fn identity(&self) -> String {
+        if let Some(p) = &self.presentation {
+            return format!("event {}@{} {}", p.source, p.seq, p.ident);
+        }
+        let opt = |v: &Option<String>| v.clone().unwrap_or_default();
+        format!(
+            "{} plan={} sha={} next={} reason={} name={} pr={} handle={}",
+            self.raw_kind(),
+            opt(&self.plan),
+            opt(&self.sha),
+            opt(&self.next),
+            self.reason.as_ref().map_or("", Tag::raw),
+            opt(&self.name),
+            self.pr.map(|n| n.to_string()).unwrap_or_default(),
+            opt(&self.handle),
+        )
+    }
+
     /// The wake's kind, already typed by the parse. `None` for a tag
     /// this build has no arm for.
     fn wake_kind(&self) -> Option<clank_core::wait::WaitKind> {
@@ -2968,6 +3004,9 @@ struct ReceiptCapture {
     binding: Option<ReceiptBinding>,
     prepared: super::wake_receipt::Prepared,
     selected: Vec<clank_core::wait::EventPresentation>,
+    /// This delivery and the agent dir its count is kept in: counted only
+    /// as it is sent.
+    counting: Option<(PathBuf, super::wake_repeat::Delivery)>,
 }
 impl ReceiptCapture {
     fn selected(
@@ -2986,9 +3025,58 @@ impl ReceiptCapture {
             }),
             prepared: super::wake_receipt::prepare(repo, author, receipt_candidates(items)),
             selected: selected_presentations(items),
+            counting: None,
         }
     }
 }
+
+impl ReceiptCapture {
+    /// What delivering `items` to this session carries along: its
+    /// receipts, presentations, and the repeat count it would make.
+    fn delivering(
+        repo: &Path,
+        author: &AgentLabel,
+        tool: Tool,
+        input: &HookInput,
+        boundary: Option<&super::wake_repeat::Boundary>,
+        items: &[WaitItem],
+    ) -> Self {
+        let agent_dir = crate::agent_store::agents_root(repo).join(author.as_str());
+        Self {
+            counting: Some((agent_dir, delivery_of(input, boundary, items))),
+            ..Self::selected(repo, author, tool, input.session_id.as_str(), items)
+        }
+    }
+}
+
+/// Where this Stop comes from in the agent's own record, read when the
+/// hook is invoked, before any waiting: what places it among the Stops
+/// already counted.
+fn native_boundary(tool: Tool, input: &HookInput) -> Option<super::wake_repeat::Boundary> {
+    let record = Path::new(input.transcript_path.as_deref()?);
+    match tool {
+        Tool::Claude => super::wake_repeat::claude_boundary(record),
+        Tool::Codex => super::wake_repeat::codex_boundary(record, input.turn_id.as_deref()?),
+        _ => None,
+    }
+}
+
+/// What delivering `items` is: the session, the items' identities, and
+/// where in the agent's record the Stop came from.
+fn delivery_of(
+    input: &HookInput,
+    boundary: Option<&super::wake_repeat::Boundary>,
+    items: &[WaitItem],
+) -> super::wake_repeat::Delivery {
+    super::wake_repeat::Delivery {
+        session: input.session_id.as_str().to_string(),
+        items: items.iter().map(WaitItem::identity).collect(),
+        turn: boundary.map(|b| b.turn.clone()),
+        position: boundary.map(|b| b.position),
+        human_turn: boundary.is_some_and(|b| b.human),
+    }
+}
+
 struct ReceiptBinding {
     repo: PathBuf,
     author: AgentLabel,
@@ -3102,7 +3190,7 @@ async fn emit_and_exit(outcome: HookOutcome, tool: Tool, capture: ReceiptCapture
 async fn emit_delivery(
     mut outcome: HookOutcome,
     tool: Tool,
-    capture: ReceiptCapture,
+    mut capture: ReceiptCapture,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> i32 {
@@ -3115,7 +3203,31 @@ async fn emit_delivery(
             why: SilentReason::StaleBinding,
         };
     }
-    let emission = emit_wire(&outcome, tool, stdout, stderr);
+    let emission = match capture.counting.take() {
+        Some((agent_dir, delivery)) if matches!(outcome, HookOutcome::Continue { .. }) => {
+            let binding = capture.binding.as_ref();
+            super::wake_repeat::send_counted(
+                &agent_dir,
+                &delivery,
+                || binding.is_some_and(|b| b.current()),
+                |count| match count {
+                    Some(count) => {
+                        emit_wire(&escalated(outcome.clone(), count), tool, stdout, stderr)
+                    }
+                    // Rebound while waiting: this session is no longer the agent's.
+                    None => emit_wire(
+                        &HookOutcome::Silent {
+                            why: SilentReason::StaleBinding,
+                        },
+                        tool,
+                        stdout,
+                        stderr,
+                    ),
+                },
+            )
+        }
+        _ => emit_wire(&outcome, tool, stdout, stderr),
+    };
     let fallback_code = if matches!(outcome, HookOutcome::Continue { .. }) && tool == Tool::Claude {
         CLAUDE_CONTINUATION_EXIT
     } else {
@@ -3241,6 +3353,253 @@ mod tests {
             },
         );
         (outcome, capture)
+    }
+
+    /// A Codex fixture whose rollout records each answer as a turn event.
+    struct Continuations {
+        fixture: super::super::wake_receipt::fixtures::Fixture,
+        rollout: PathBuf,
+    }
+
+    impl Continuations {
+        fn new() -> Self {
+            let fixture = super::super::wake_receipt::fixtures::Fixture::new();
+            let rollout = fixture.repo.join("rollout.jsonl");
+            std::fs::write(
+                &rollout,
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+            )
+            .unwrap();
+            Self { fixture, rollout }
+        }
+
+        fn append(&self, line: &str) {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.rollout)
+                .unwrap();
+            writeln!(f, "{line}").unwrap();
+        }
+
+        /// The agent answers, and its turn ends.
+        fn answer(&self) {
+            self.append(r#"{"type":"event_msg","payload":{"type":"agent_message"}}"#);
+        }
+
+        /// What the hook captures when invoked now, saying `said`.
+        fn capture(&self, said: Option<&str>) -> (HookOutcome, ReceiptCapture) {
+            let (_, items) = parse_items(&self.fixture);
+            self.capture_of(said, &items)
+        }
+
+        /// The same, delivering `items`.
+        fn capture_of(
+            &self,
+            said: Option<&str>,
+            items: &[WaitItem],
+        ) -> (HookOutcome, ReceiptCapture) {
+            let input = HookInput {
+                session_id: clank_core::SessionId::parse(&self.fixture.session).unwrap(),
+                cwd: self.fixture.repo.display().to_string(),
+                transcript_path: Some(self.rollout.display().to_string()),
+                stop_hook_active: true,
+                last_assistant_message: said.map(str::to_string),
+                turn_id: Some("turn-1".into()),
+                background_tasks: Vec::new(),
+            };
+            let boundary = native_boundary(Tool::Codex, &input);
+            let (outcome, _) = receipt_outcome(&self.fixture, Tool::Codex);
+            let capture = ReceiptCapture::delivering(
+                &self.fixture.repo,
+                &self.fixture.author,
+                Tool::Codex,
+                &input,
+                boundary.as_ref(),
+                items,
+            );
+            (outcome, capture)
+        }
+
+        /// Send a captured continuation; the text the agent was given.
+        async fn send(
+            &self,
+            (outcome, capture): (HookOutcome, ReceiptCapture),
+            fail: bool,
+        ) -> String {
+            let mut writer = ReceiptWriter::new(self.fixture.marker());
+            writer.fail_flush = fail;
+            emit_delivery(outcome, Tool::Codex, capture, &mut writer, &mut Vec::new()).await;
+            let sent: serde_json::Value = serde_json::from_slice(&writer.bytes).unwrap_or_default();
+            sent["reason"].as_str().unwrap_or_default().to_string()
+        }
+
+        fn dir(&self) -> PathBuf {
+            crate::agent_store::agents_root(&self.fixture.repo).join(self.fixture.author.as_str())
+        }
+
+        fn count(&self) -> Option<u32> {
+            super::super::wake_repeat::load(&self.dir()).map(|r| r.count)
+        }
+    }
+
+    /// Distinct continuations count whatever they say, the same words
+    /// every time or none; the same Stop seen again, even after bookkeeping
+    /// appends to its record, does not; a send that fails counts nothing;
+    /// and the text states the count committed.
+    #[tokio::test]
+    async fn repeated_delivery_is_counted_by_continuation_not_by_what_was_said() {
+        let c = Continuations::new();
+        for n in 1..=5u32 {
+            c.answer();
+            let said = (n != 3).then_some("still paused");
+            let reason = c.send(c.capture(said), false).await;
+            assert_eq!(c.count(), Some(n));
+            assert_eq!(
+                reason.contains(&format!("{n} times unchanged")),
+                n >= 4,
+                "delivery {n}"
+            );
+        }
+        c.append(r#"{"type":"event_msg","payload":{"type":"token_count"}}"#);
+        c.send(c.capture(Some("still paused")), false).await;
+        assert_eq!(c.count(), Some(5), "the same Stop, after bookkeeping");
+        c.answer();
+        c.send(c.capture(Some("still paused")), true).await;
+        assert_eq!(
+            c.count(),
+            Some(5),
+            "a continuation that never reached the agent"
+        );
+    }
+
+    /// Another item set's delivery, as the hook would parse it: the same
+    /// event under another presentation key.
+    fn other_items(fixture: &super::super::wake_receipt::fixtures::Fixture) -> Vec<WaitItem> {
+        let mut json =
+            serde_json::to_value(super::super::wait::render_json(&fixture.item)).unwrap();
+        json["presentation"] = serde_json::json!({"source":"other","seq":99,"ident":"other"});
+        vec![serde_json::from_value(json).unwrap()]
+    }
+
+    /// A capture overtaken by four newer deliveries of other items is sent
+    /// with no count of its own and none of theirs, and leaves theirs
+    /// alone; so is other items' capture at the same place in the record.
+    #[tokio::test]
+    async fn an_overtaken_capture_never_states_another_sets_count() {
+        let c = Continuations::new();
+        c.answer();
+        c.send(c.capture(None), false).await;
+        c.answer();
+        let old = c.capture(None);
+        let b = other_items(&c.fixture);
+        for _ in 0..4 {
+            c.answer();
+            c.send(c.capture_of(None, &b), false).await;
+        }
+        assert_eq!(c.count(), Some(4));
+        let said = c.send(old, false).await;
+        assert!(!said.contains("times unchanged"), "{said}");
+        assert_eq!(c.count(), Some(4));
+        let same_place = c.send(c.capture(None), false).await;
+        assert!(
+            !same_place.contains("times unchanged"),
+            "other items at the same place"
+        );
+        assert_eq!(c.count(), Some(4));
+    }
+
+    /// A sender that waits for the lock while the session is rebound sends
+    /// the agent nothing and counts nothing.
+    #[test]
+    fn a_rebind_while_the_sender_waits_sends_nothing() {
+        let c = Continuations::new();
+        c.answer();
+        let capture = c.capture(None);
+        let held = super::super::wake_repeat::hold(&c.dir());
+        let sent = std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(c.send(capture, false))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::agent_store::bind_session_to_agent(
+                &c.fixture.repo,
+                &c.fixture.author,
+                Tool::Codex,
+                &clank_core::SessionId::parse("replacement-session").unwrap(),
+            )
+            .unwrap();
+            drop(held);
+            sender.join().unwrap()
+        });
+        assert_eq!(sent, "", "nothing reached the agent");
+        assert_eq!(c.count(), None);
+    }
+
+    /// Captures sent out of order: the later-placed one, sent first, is
+    /// counted if it succeeds; the earlier-placed one, sent after, is then
+    /// overtaken and counts nothing, so two successes out of order count
+    /// once. A failure never inflates, and a capture never sent counts
+    /// nothing.
+    #[tokio::test]
+    async fn continuations_sent_out_of_order_are_counted_conservatively() {
+        for (later_ok, earlier_ok, count) in [
+            (true, true, Some(1)),
+            (true, false, Some(1)),
+            (false, true, Some(1)),
+            (false, false, None),
+        ] {
+            let c = Continuations::new();
+            c.answer();
+            let earlier = c.capture(None);
+            c.answer();
+            let later = c.capture(None);
+            c.answer();
+            let _never_sent = c.capture(None);
+            let said_later = c.send(later, !later_ok).await;
+            let said_earlier = c.send(earlier, !earlier_ok).await;
+            assert_eq!(c.count(), count, "{later_ok} {earlier_ok}");
+            assert!(
+                !said_later.contains("times unchanged")
+                    && !said_earlier.contains("times unchanged")
+            );
+        }
+    }
+
+    /// A reset between a capture and its send stands: the send counts from
+    /// it and states that count, never the one there was when captured.
+    #[tokio::test]
+    async fn a_send_after_a_reset_counts_from_the_reset() {
+        let c = Continuations::new();
+        for _ in 0..3 {
+            c.answer();
+            c.send(c.capture(None), false).await;
+        }
+        c.answer();
+        let late = c.capture(None);
+        super::super::wake_repeat::forget_if_stale(
+            &c.dir(),
+            || Some(c.fixture.session.clone()),
+            &["something else".to_string()],
+            super::super::wake_repeat::now_ns(),
+        );
+        let said = c.send(late, false).await;
+        assert_eq!(c.count(), Some(1));
+        assert!(
+            !said.contains("times unchanged"),
+            "no escalation from before the reset"
+        );
+    }
+
+    fn parse_items(
+        fixture: &super::super::wake_receipt::fixtures::Fixture,
+    ) -> (Vec<serde_json::Value>, Vec<WaitItem>) {
+        let json = serde_json::to_value(super::super::wait::render_json(&fixture.item)).unwrap();
+        let item: WaitItem = serde_json::from_value(json.clone()).unwrap();
+        (vec![json], vec![item])
     }
 
     #[tokio::test]

@@ -188,6 +188,10 @@ pub(crate) struct AgentAutoRow {
     /// failed and the monitor will not, or can no longer, retry it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_for_you: Option<String>,
+    /// How many times in a row the same items have been delivered, once
+    /// that reaches the escalation threshold. A count, not a verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repeated: Option<u32>,
 }
 
 /// The invocation that runs an agent: launch command (or the bare tool
@@ -278,6 +282,14 @@ fn roster_auto_rows(
             .flatten();
         let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
         let session = cfg.as_ref().and_then(|c| c.session.clone());
+        let repeated = crate::cli::wake_repeat::load(
+            &crate::agent_store::agents_root(repo).join(label.as_str()),
+        )
+        .filter(|r| {
+            r.count >= crate::cli::wake_repeat::ESCALATE_AT
+                && session.as_ref().is_some_and(|s| s.id.as_str() == r.session)
+        })
+        .map(|r| r.count);
         rows.push(AgentAutoRow {
             label: label.as_str().to_string(),
             role,
@@ -292,6 +304,7 @@ fn roster_auto_rows(
             waiting_for_you: crate::cli::recovery::waiting_for_you(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
             ),
+            repeated,
         });
     }
     rows
@@ -793,6 +806,13 @@ impl StatusSnapshot {
         for row in &self.agents {
             if let Some(why) = &row.waiting_for_you {
                 let _ = writeln!(out, "waiting for you: {} → {why}", row.label);
+            }
+            if let Some(n) = row.repeated {
+                let _ = writeln!(
+                    out,
+                    "repeating: {} → same items delivered {n} times",
+                    row.label
+                );
             }
             if let Some(a) = &row.attending {
                 let _ = writeln!(
@@ -2547,6 +2567,7 @@ mod dirty_and_wake_tests {
             invocation: "claude".to_string(),
             session: None,
             waiting_for_you: None,
+            repeated: None,
             attending,
         }
     }
@@ -2622,6 +2643,67 @@ mod dirty_and_wake_tests {
             "{}",
             snap.to_human()
         );
+    }
+
+    /// The status reports the count it measured, never a verdict on the
+    /// agent; a recorded repeat below the threshold, or for a session that
+    /// is no longer bound, is not shown.
+    #[test]
+    fn a_repeating_agent_is_reported_by_its_count() {
+        let mut snap = minimal_snapshot();
+        let mut row = agent_row("claude", None);
+        row.repeated = Some(6);
+        snap.agents = vec![row];
+        let text = snap.to_human();
+        assert!(
+            text.contains("repeating: claude → same items delivered 6 times"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("ignor") && !text.contains("inactive"),
+            "{text}"
+        );
+
+        let repo = tempfile::tempdir().unwrap();
+        let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &label,
+            clank_core::Tool::Claude,
+            &clank_core::SessionId::parse("session-one").unwrap(),
+        )
+        .unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+        let shown = |count: u32, session: &str| {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                crate::cli::wake_repeat::path(&dir),
+                serde_json::to_vec(&crate::cli::wake_repeat::Repeat {
+                    session: session.into(),
+                    items: vec!["a".into()],
+                    count,
+                    turn: None,
+                    high: None,
+                    at_ns: 0,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            let set = crate::cli::teams_config::RegisteredSet {
+                master: label.clone(),
+                master_desc: crate::cli::teams_config::AgentDescription {
+                    tool: clank_core::Tool::Claude,
+                    launch: None,
+                    initial_prompt: None,
+                },
+                members: Vec::new(),
+            };
+            roster_auto_rows(repo.path(), None, &set)[0].repeated
+        };
+        assert_eq!(shown(5, "session-one"), Some(5));
+        assert_eq!(shown(3, "session-one"), None, "below the threshold");
+        assert_eq!(shown(5, "session-old"), None, "another session's count");
     }
 
     #[test]

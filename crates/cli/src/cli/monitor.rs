@@ -2668,6 +2668,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 // rebuild would show the watchdog progress that never
                 // happened — the invariant this plan set for itself
                 // (codex on 13e9fa7).
+                // Before the fold reads anything: a delivery counted after
+                // this is newer than the state it folds.
+                let folded_from = crate::cli::wake_repeat::now_ns();
                 match advance(&repo, fold, &heartbeat).await {
                     Some((next, state)) => {
                         fold = next;
@@ -2687,7 +2690,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         leaving.extend(serve_to_cached(&repo, &mut clients, &state, None, &mut pending, &mut timer_backlogs, &hosted));
                         let now = crate::cli::recovery::unix_now();
                         let mut acts = recovery.reconcile(
-                            recovery_facts(&repo, &state, &clients, &hosted, &mut timer_backlogs),
+                            recovery_facts(&repo, &state, folded_from, &clients, &hosted, &mut timer_backlogs),
                             now,
                         );
                         acts.extend(recovery.replies(now));
@@ -2720,6 +2723,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
 fn recovery_facts(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
+    folded_from: u128,
     clients: &[Client],
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
@@ -2743,8 +2747,14 @@ fn recovery_facts(
             .any(|c| matches!(&c.who, Served::Agent { author: a } if a == &author));
         let auto = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
             == clank_core::AutoMode::On;
-        let obligated = !delivering
-            && owes_anything(
+        let counted = crate::cli::wake_repeat::load(
+            &crate::agent_store::agents_root(repo).join(author.as_str()),
+        )
+        .is_some();
+        let owed = if delivering && !counted {
+            Vec::new()
+        } else {
+            owed_items(
                 repo,
                 state,
                 &author,
@@ -2752,7 +2762,12 @@ fn recovery_facts(
                 timer_backlogs,
                 &reviews,
                 head.as_ref(),
-            );
+            )
+        };
+        let obligated = !delivering && !owed.is_empty();
+        if counted {
+            forget_stale_repeat(repo, &author, &owed, folded_from);
+        }
         let attending = obligated && recovery_gate_holds(repo, &author);
         facts.push(crate::cli::recovery::Facts {
             agent_dir: crate::agent_store::agents_root(repo).join(author.as_str()),
@@ -2768,7 +2783,34 @@ fn recovery_facts(
     facts
 }
 
-fn owes_anything(
+/// Clear a recorded repeat that no longer describes the agent, so status
+/// stops showing it before the next delivery would.
+fn forget_stale_repeat(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    owed: &[WaitItem],
+    read_at: u128,
+) {
+    let dir = crate::agent_store::agents_root(repo).join(author.as_str());
+    let owed: Vec<String> = owed
+        .iter()
+        .filter_map(|item| {
+            let json = serde_json::to_value(crate::cli::wait::render_json(item)).ok()?;
+            serde_json::from_value::<crate::cli::stop_hook::WaitItem>(json).ok()
+        })
+        .map(|item| item.identity())
+        .collect();
+    let bound = || {
+        crate::agent_store::load_agent_config(repo, author)
+            .ok()
+            .flatten()
+            .and_then(|c| c.session)
+            .map(|s| s.id.as_str().to_string())
+    };
+    crate::cli::wake_repeat::forget_if_stale(&dir, bound, &owed, read_at);
+}
+
+fn owed_items(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
     author: &AgentLabel,
@@ -2776,9 +2818,9 @@ fn owes_anything(
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
-) -> bool {
+) -> Vec<WaitItem> {
     let Ok(inputs) = crate::cli::wait::derive_wait_inputs(repo, author) else {
-        return false;
+        return Vec::new();
     };
     let status = state.fold.derive_status(reviews, &inputs.work_policy, head);
     let current;
@@ -2805,8 +2847,7 @@ fn owes_anything(
             })
             .owed(&mut shown),
     );
-    !crate::cli::wait::owed_for(repo, author, &inputs, &status, &state.fold, &mut external)
-        .is_empty()
+    crate::cli::wait::owed_for(repo, author, &inputs, &status, &state.fold, &mut external)
 }
 
 /// A question or block is pending, or the agent provably attends to work.
@@ -4509,6 +4550,7 @@ mod recovery_tests {
             recovery_facts(
                 repo.path(),
                 &state,
+                crate::cli::wake_repeat::now_ns(),
                 clients,
                 &Default::default(),
                 &mut Default::default(),
@@ -4528,6 +4570,74 @@ mod recovery_tests {
             "the configured interval"
         );
         assert!(!alone[0].attending);
+
+        // A count that still describes the agent survives folds, a standing
+        // block included; a change of session or of block clears it.
+        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        std::fs::create_dir_all(dir.join("blocks")).unwrap();
+        std::fs::write(dir.join("blocks/mic.md"), "Which microphone?").unwrap();
+        let owed: Vec<String> = owed_items(
+            repo.path(),
+            &state,
+            &codex,
+            &Default::default(),
+            &mut Default::default(),
+            &crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo.path(), state.head.as_ref()),
+            crate::git_io::head_commit_at(repo.path(), &state).as_ref(),
+        )
+        .iter()
+        .map(|item| {
+            let json = serde_json::to_value(crate::cli::wait::render_json(item)).unwrap();
+            serde_json::from_value::<crate::cli::stop_hook::WaitItem>(json)
+                .unwrap()
+                .identity()
+        })
+        .collect();
+        assert!(
+            owed.iter().any(|id| id.starts_with("blocked")) && owed.len() > 1,
+            "the block and the event it does not withhold: {owed:?}"
+        );
+        let deliver = |session: &str, n: u32| {
+            let delivery = crate::cli::wake_repeat::Delivery {
+                session: session.into(),
+                items: owed.clone(),
+                position: Some(n.into()),
+                ..Default::default()
+            };
+            crate::cli::wake_repeat::send_counted(&dir, &delivery, || true, |_| Ok(((), true)))
+                .unwrap();
+        };
+        for n in 1..=4 {
+            deliver("session-one", n);
+            facts(&[]);
+        }
+        assert_eq!(crate::cli::wake_repeat::load(&dir).unwrap().count, 4);
+        let (waiter, _rx) = client(
+            Served::Agent {
+                author: codex.clone(),
+            },
+            "session-one",
+        );
+        facts(&[waiter]);
+        assert_eq!(
+            crate::cli::wake_repeat::load(&dir).unwrap().count,
+            4,
+            "an attached waiter does not make an unchanged count stale"
+        );
+        std::fs::remove_file(dir.join("blocks/mic.md")).unwrap();
+        facts(&[]);
+        assert_eq!(
+            crate::cli::wake_repeat::load(&dir),
+            None,
+            "the block was answered"
+        );
+        deliver("session-two", 1);
+        facts(&[]);
+        assert_eq!(
+            crate::cli::wake_repeat::load(&dir),
+            None,
+            "another session's count"
+        );
         let marker = crate::agent_store::agents_root(repo.path()).join("codex/attending");
         let me = std::process::id() as i32;
         std::fs::write(
@@ -4573,6 +4683,7 @@ mod recovery_tests {
         let handled = recovery_facts(
             repo.path(),
             &state,
+            crate::cli::wake_repeat::now_ns(),
             &[],
             &Default::default(),
             &mut Default::default(),

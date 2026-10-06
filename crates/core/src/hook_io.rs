@@ -52,6 +52,10 @@ pub struct HookInput {
     pub stop_hook_active: bool,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    /// Codex's id for the turn this Stop ends. Claude and OpenCode do not
+    /// send one.
+    #[serde(default)]
+    pub turn_id: Option<String>,
     /// Claude's in-flight background work at turn end:
     /// `run_in_background` shells, subagents, MCP monitors, … . Claude
     /// lists ONLY live tasks here (`[]` once they finish) and re-fires

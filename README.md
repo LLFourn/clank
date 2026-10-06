@@ -463,6 +463,31 @@ Auto-mode is per-agent (`clank auto on|off|status`), inheriting a
 user-global default (`~/.clank/config.json`'s `"auto"`) when unset —
 `clank doctor` shows the effective value with its provenance.
 
+The Stop hook counts how many times in a row it delivers the same items to an
+agent's session.
+- **What counts:** only continuations it actually sent. Peeks, inspection,
+  reconnects and failed sends never count.
+- **Duplicates:** a Stop is placed by the agent's own record when the hook is
+  invoked (Claude's newest turn, or Codex's newest turn event), never by what
+  the agent said. A Stop placed at or before one already counted is not counted
+  again. OpenCode keeps no such record, so each continuation counts.
+- **Escalation:** from the fourth unchanged delivery the message adds the count,
+  and says:
+  - ending a turn does not discharge pending work;
+  - the user's latest instruction, any explicit pause, and the stated reason for
+    a rejected action are followed;
+  - a real dependency on the user belongs in `clank block create <name> -m "…"`.
+
+  A block pauses review work only; messages and events are still delivered.
+- **Resets:** the count resets when the items, the session, or the blocks (which
+  are among the items) change. A standing block does not reset it. On Claude, a
+  turn that Claude records as a person's also resets it; elsewhere a turn of
+  unknown origin never does.
+- **Status:** `clank status` shows `repeating: <agent> → same items delivered N
+  times` while the count is at or past four.
+- **Limits:** only the wording changes; every item is still delivered. Grok hands
+  work over through its own wait and is not counted.
+
 ## Extra wake sources
 
 ### Scheduled and recurring events
