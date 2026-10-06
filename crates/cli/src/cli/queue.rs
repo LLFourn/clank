@@ -97,7 +97,7 @@ fn pick_body_source(
     // then `queue add <name>` consumes it. Legacy `.clank/stubs/` is read
     // as a one-release fallback so an un-migrated repo's in-flight drafts
     // aren't orphaned — REMOVE this fallback once repos are migrated.
-    let drafts_path = repo.join(format!(".clank/drafts/{name}.md"));
+    let drafts_path = drafts_dir(repo).join(format!("{name}.md"));
     let legacy = repo.join(format!(".clank/stubs/{name}.md"));
     let path = [drafts_path, legacy].into_iter().find(|p| p.is_file());
     if let Some(path) = path {
@@ -146,6 +146,119 @@ fn normalize_and_validate(name: &str, source: BodySource) -> anyhow::Result<Stri
 
 fn queue_dir(repo: &Path) -> PathBuf {
     repo.join(".clank/queue")
+}
+
+/// The priority `queue add` gives an entry when none is asked for.
+pub(crate) const ADD_PRIORITY: u16 = 500;
+
+fn drafts_dir(repo: &Path) -> PathBuf {
+    repo.join(".clank/drafts")
+}
+
+/// A plan idea waiting in `.clank/drafts/`, as `queue add <name>` would
+/// find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Draft {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    /// Its first heading's text, if it has one.
+    pub(crate) title: Option<String>,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+/// Every draft, newest first and then by name. A draft is a `.md` file
+/// whose stem is a plan name: whether its body can be queued yet is the
+/// actions' question, so one that cannot is still listed and readable.
+pub(crate) fn scan_drafts(repo: &Path) -> Vec<Draft> {
+    let Ok(dir) = std::fs::read_dir(drafts_dir(repo)) else {
+        return Vec::new();
+    };
+    let mut drafts: Vec<Draft> = dir
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                return None;
+            }
+            let name = path.file_stem()?.to_str()?.to_string();
+            validate_name(&name).ok()?;
+            let title = std::fs::read_to_string(&path).ok().and_then(|body| {
+                body.lines()
+                    .map(str::trim)
+                    .find(|l| l.starts_with('#'))
+                    .map(|l| l.trim_start_matches('#').trim().to_string())
+                    .filter(|l| !l.is_empty())
+            });
+            Some(Draft {
+                name,
+                modified: e.metadata().ok().and_then(|m| m.modified().ok()),
+                title,
+                path,
+            })
+        })
+        .collect();
+    drafts.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    drafts
+}
+
+fn draft_source(repo: &Path, name: &str) -> anyhow::Result<BodySource> {
+    let path = drafts_dir(repo).join(format!("{name}.md"));
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("reading `{}`: {e}", path.display()))?;
+    Ok(BodySource {
+        raw,
+        kind: BodySourceKind::DraftsDir(path),
+    })
+}
+
+/// `queue add <name>` for a draft: consumed into the queue at the default
+/// priority, or refused with the draft left where it is. Returns the
+/// queue entry's path.
+pub(crate) fn queue_draft(repo: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    validate_name(name)?;
+    add(repo, name, ADD_PRIORITY, draft_source(repo, name)?)
+}
+
+/// Queue a draft and promote it, admitted as one: everything that can
+/// refuse — an active plan, the name, the body, a queue or plan of the
+/// same name — is checked under the plan-mutation lock before the draft
+/// is consumed. A failure after that names the queue file now holding
+/// the body.
+pub(crate) fn promote_draft(repo: &Path, name: &str) -> anyhow::Result<()> {
+    validate_name(name)?;
+    let admission = super::plan_mutation::lock(repo)?;
+    admission.empty_state()?;
+    let source = draft_source(repo, name)?;
+    // `add` refuses a bad body or a queued name before it consumes the
+    // draft; a taken plan name would only refuse after.
+    if repo.join(crate::init_facts::plan_md_rel(name)).exists() {
+        anyhow::bail!("plan `{name}` already exists in plans/");
+    }
+    let queued = add(repo, name, ADD_PRIORITY, source)?;
+    let entry = scan_queue(repo)
+        .into_iter()
+        .find(|e| e.path == queued)
+        .ok_or_else(|| {
+            anyhow::anyhow!("`{name}` was queued as {} but is gone", queued.display())
+        })?;
+    promote_admitted(repo, &entry).map_err(|e| {
+        // Once the promotion has moved the body into plans/, its own
+        // error names that file; only a failure before the move leaves
+        // it in the queue.
+        if queued.exists() {
+            e.context(format!(
+                "`{name}` was queued as {} but not promoted",
+                queued.display()
+            ))
+        } else {
+            e
+        }
+    })
 }
 
 pub type QueueEntry = priority_dir::Entry;
@@ -444,11 +557,16 @@ pub fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
 
 /// Promote THIS entry, whatever else shares its name.
 pub fn promote_entry(repo: &Path, entry: &QueueEntry) -> anyhow::Result<()> {
-    let name = entry.name.clone();
-    let name = name.as_str();
-    validate_name(name)?;
+    validate_name(&entry.name)?;
     let admission = super::plan_mutation::lock(repo)?;
     admission.empty_state()?;
+    promote_admitted(repo, entry)
+}
+
+/// The promotion itself; the caller holds the plan-mutation lock and has
+/// checked that no plan is active.
+fn promote_admitted(repo: &Path, entry: &QueueEntry) -> anyhow::Result<()> {
+    let name = entry.name.as_str();
     let plan_path = crate::init_facts::plan_md_rel(name);
     let dest = repo.join(&plan_path);
     std::fs::create_dir_all(dest.parent().unwrap())?;
@@ -467,9 +585,15 @@ pub fn promote_entry(repo: &Path, entry: &QueueEntry) -> anyhow::Result<()> {
             anyhow::anyhow!("moving `{}` into plans: {e}", entry.path.display())
         }
     })?;
-    crate::git_plumbing::stage(repo, &plan_path)?;
     let msg = format!("[{name}] intro");
-    crate::git_plumbing::commit_pathspec(repo, &plan_path, &msg)?;
+    crate::git_plumbing::stage(repo, &plan_path)
+        .and_then(|()| crate::git_plumbing::commit_pathspec(repo, &plan_path, &msg))
+        .map_err(|e| {
+            e.context(format!(
+                "`{name}` is at {}, but its intro was not committed",
+                dest.display()
+            ))
+        })?;
     Ok(())
 }
 
@@ -488,7 +612,7 @@ pub fn unqueue(repo: &Path, name: &str) -> anyhow::Result<PathBuf> {
 /// Take THIS entry out of the queue, whatever else shares its name.
 pub fn unqueue_entry(repo: &Path, entry: &QueueEntry) -> anyhow::Result<PathBuf> {
     let name = entry.name.as_str();
-    let drafts = repo.join(".clank/drafts");
+    let drafts = drafts_dir(repo);
     let dest = drafts.join(format!("{name}.md"));
     std::fs::create_dir_all(&drafts)?;
     // The same hazard as a promote: two entries of one name both want
@@ -737,6 +861,138 @@ mod tests {
         assert_eq!(entry.priority, 120);
         let draft = unqueue(repo, "solo").unwrap();
         assert!(draft.ends_with(".clank/drafts/solo.md"));
+    }
+
+    fn aged(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Every draft is listed, newest first and then by name, with its
+    /// first heading; one whose body cannot be queued yet is still there
+    /// to read. What is not a draft is not.
+    #[test]
+    fn drafts_are_listed_newest_first_whether_or_not_they_can_be_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let d = repo.join(".clank/drafts");
+        for (name, body, at) in [
+            ("older", "# A plan title\n\nbody\n", 100),
+            ("beta", "no heading here\n", 200),
+            ("alpha", "# alpha\n", 200),
+            ("zeta", "# zeta\n\nnewest\n", 300),
+        ] {
+            write(&d.join(format!("{name}.md")), body);
+            aged(&d.join(format!("{name}.md")), at);
+        }
+        write(&d.join("notes.txt"), "not markdown");
+        write(&d.join(".hidden.md"), "# x\n\ny\n");
+        write(&d.join("_.md"), "# x\n\ny\n");
+        std::fs::create_dir_all(d.join("dir.md")).unwrap();
+        let drafts = scan_drafts(repo);
+        assert_eq!(
+            drafts.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["zeta", "alpha", "beta", "older"]
+        );
+        assert_eq!(drafts[1].title.as_deref(), Some("alpha"), "header-only");
+        assert_eq!(drafts[2].title, None);
+        assert_eq!(drafts[3].title.as_deref(), Some("A plan title"));
+        assert!(scan_drafts(&repo.join("nowhere")).is_empty());
+    }
+
+    /// Queueing a draft is `queue add <name>`: consumed into the queue at
+    /// the default priority; a body that cannot be queued is refused with
+    /// the command's message and stays a draft.
+    #[test]
+    fn a_draft_is_queued_as_queue_add_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(&repo.join(".clank/drafts/idea.md"), "# idea\n\nbody\n");
+        let queued = queue_draft(repo, "idea").unwrap();
+        assert_eq!(
+            queued,
+            repo.join(format!(".clank/queue/{ADD_PRIORITY:03}-idea.md"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&queued).unwrap(),
+            "# idea\n\nbody\n"
+        );
+        assert!(scan_drafts(repo).is_empty(), "consumed");
+        write(&repo.join(".clank/drafts/empty.md"), "# empty\n");
+        let refused = queue_draft(repo, "empty").unwrap_err().to_string();
+        assert!(refused.contains("empty after the header"), "{refused}");
+        assert_eq!(scan_drafts(repo).len(), 1, "still a draft");
+    }
+
+    /// Promoting a draft queues it and promotes it; anything that refuses
+    /// does so before the draft is touched.
+    #[test]
+    fn a_draft_is_promoted_or_left_untouched() {
+        let dir = git_repo();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        write(&repo.join(".clank/drafts/empty.md"), "# empty\n");
+        let refused = promote_draft(repo, "empty").unwrap_err().to_string();
+        assert!(refused.contains("empty after the header"), "{refused}");
+        assert!(repo.join(".clank/drafts/empty.md").exists());
+
+        write(&repo.join(".clank/drafts/idea.md"), "# idea\n\nbody\n");
+        write(&repo.join(".clank/plans/bar.md"), "# bar\n\nactive\n");
+        git(&["add", "-f", ".clank/plans/bar.md"]);
+        git(&["commit", "-q", "-m", "[bar] intro"]);
+        let refused = format!("{:#}", promote_draft(repo, "idea").unwrap_err());
+        assert!(refused.contains("already active"), "{refused}");
+        assert!(repo.join(".clank/drafts/idea.md").exists(), "not consumed");
+        assert!(scan_queue(repo).is_empty(), "not queued");
+
+        git(&["rm", "-q", ".clank/plans/bar.md"]);
+        git(&["commit", "-q", "-m", "drop bar"]);
+        write(&repo.join(".clank/plans/idea.md"), "# idea\n\ntaken\n");
+        let refused = format!("{:#}", promote_draft(repo, "idea").unwrap_err());
+        assert!(refused.contains("already exists"), "{refused}");
+        assert!(repo.join(".clank/drafts/idea.md").exists(), "not consumed");
+        std::fs::remove_file(repo.join(".clank/plans/idea.md")).unwrap();
+
+        // Git refuses the intro after the body moved into plans/: the
+        // error names where the body is now, and nothing claims the queue
+        // file it passed through still holds it.
+        let hook = repo.join(".git/hooks/pre-commit");
+        write(&hook, "#!/bin/sh\nexit 1\n");
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        write(&repo.join(".clank/drafts/late.md"), "# late\n\nkept\n");
+        let said = format!("{:#}", promote_draft(repo, "late").unwrap_err());
+        let plan = repo.join(".clank/plans/late.md");
+        assert!(said.contains(&plan.display().to_string()), "{said}");
+        assert!(said.contains("not committed"), "{said}");
+        assert!(!said.contains(".clank/queue"), "{said}");
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "# late\n\nkept\n");
+        assert!(scan_queue(repo).is_empty() && scan_drafts(repo).iter().all(|d| d.name != "late"));
+        std::fs::remove_file(&hook).unwrap();
+        git(&["rm", "-q", "--cached", ".clank/plans/late.md"]);
+        std::fs::remove_file(&plan).unwrap();
+
+        promote_draft(repo, "idea").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".clank/plans/idea.md")).unwrap(),
+            "# idea\n\nbody\n"
+        );
+        assert!(!repo.join(".clank/drafts/idea.md").exists());
+        assert!(scan_queue(repo).is_empty());
     }
 
     #[test]

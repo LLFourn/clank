@@ -1577,7 +1577,7 @@ pub struct PickArgs {
 #[derive(Args, Debug)]
 pub struct QueueAddArgs {
     pub name: String,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = crate::cli::queue::ADD_PRIORITY)]
     pub priority: u16,
     /// Inline body. Multi-line allowed (newlines preserved). `-m -`
     /// reads it from stdin. Omit to take the body from

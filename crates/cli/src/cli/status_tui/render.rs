@@ -198,6 +198,9 @@ pub(super) fn render_at(
             cols,
         );
     }
+    if let Mode::DraftsList { sel } = mode {
+        return render_drafts_list(snap, sel, rows, cols);
+    }
     if let Mode::PriorityPage { value } = mode {
         let stem = view.plan_page.map(|p| p.stem.as_str()).unwrap_or("");
         return render_priority_page(stem, value, rows, cols);
@@ -265,6 +268,8 @@ pub(super) fn render_at(
             ConfirmAction::StashPlan
             | ConfirmAction::UnqueuePlan
             | ConfirmAction::PromotePlan
+            | ConfirmAction::QueueDraft
+            | ConfirmAction::PromoteDraft
             | ConfirmAction::RestorePlan
             | ConfirmAction::DropStashedPlan { .. }
             | ConfirmAction::PurgeArtifacts
@@ -644,6 +649,7 @@ pub(super) fn scrollable_header(
             .collect::<Vec<_>>(),
         snap.stash.len(),
         snap.queue.len(),
+        !snap.drafts.is_empty(),
     );
     let at = |row: PanelRow| panel.iter().position(|r| *r == row);
     if !snap.agents.is_empty() {
@@ -805,6 +811,19 @@ pub(super) fn scrollable_header(
                 cols,
             ));
         }
+    }
+    // One collapsed row for every plan idea in `.clank/drafts/`; its
+    // page lists them. Absent when there are none.
+    if !snap.agents.is_empty() && !snap.drafts.is_empty() {
+        head_out.push(row_line(
+            &[
+                plain("  ".to_string()),
+                plain(format!("drafts: {}", snap.drafts.len())),
+            ],
+            mode.selected() == at(PanelRow::Drafts),
+            color,
+            cols,
+        ));
     }
 
     head_out
@@ -2094,6 +2113,55 @@ pub(super) fn render_remote_page(
     (out, 0)
 }
 
+/// Every plan idea in `.clank/drafts/`, newest first: its name, its
+/// title and how long ago it changed.
+pub(super) fn render_drafts_list(
+    snap: &StatusSnapshot,
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let color = state_color(snap).sgr();
+    let drafts = &snap.drafts;
+    let mut out = vec![
+        region_rule("drafts", ".clank/drafts/", true, cols),
+        String::new(),
+    ];
+    if drafts.is_empty() {
+        out.push(emit(&[dim("   no drafts".to_string())], "", cols));
+    }
+    // Rows left for the list under the header, above the footer; the
+    // window follows the cursor so the selected draft is always drawn.
+    let room = rows.saturating_sub(out.len() + 1).max(1);
+    let first = sel.saturating_sub(room - 1);
+    for (i, draft) in drafts.iter().enumerate().skip(first).take(room) {
+        let age = draft
+            .modified
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| crate::age::short(crate::age::elapsed(d.as_secs() as i64)))
+            .unwrap_or_default();
+        let mut spans = vec![plain(format!("  {}", draft.name))];
+        if let Some(title) = &draft.title {
+            spans.push(dim(format!(
+                "  {}",
+                super::text::one_line(title, usize::MAX)
+            )));
+        }
+        spans.push(dim(format!("  {age}")));
+        out.push(row_line(&spans, i == sel, &color, cols));
+    }
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ choose · ⏎ open · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
+}
+
 /// A queued plan's priority, on a page with room to say how to change
 /// it. Nudged, or typed outright.
 pub(super) fn render_priority_page(
@@ -3319,6 +3387,7 @@ pub(super) fn render_plan_detail(
         S::Active { repo_paused: false } => ("plan", "active".to_string()),
         S::Finished { .. } => ("plan", "finished".to_string()),
         S::Stashed => ("stash", "stashed".to_string()),
+        S::Draft => ("draft", "not queued".to_string()),
     };
     out.push(region_rule(
         &format!("{kind} · {}", pp.stem),
@@ -3493,6 +3562,16 @@ fn plan_action_row(
             "promote…",
             "make it the active plan: commits the intro, starts the review cycle",
         ),
+        PlanAction::QueueDraft => (
+            key,
+            "queue…",
+            "move it into the queue at the default priority, as `clank queue add` does",
+        ),
+        PlanAction::PromoteDraft => (
+            key,
+            "promote…",
+            "queue it and make it the active plan: commits the intro, starts the review cycle",
+        ),
         other => plan_button_row(other),
     };
     (key, label.to_string(), desc)
@@ -3503,7 +3582,11 @@ fn plan_button_row(a: PlanAction) -> (&'static str, &'static str, &'static str) 
     // it, or it advertises a lie.
     let key = super::input::plan_action_key(a);
     match a {
-        PlanAction::Priority | PlanAction::Unqueue | PlanAction::Promote => {
+        PlanAction::Priority
+        | PlanAction::Unqueue
+        | PlanAction::Promote
+        | PlanAction::QueueDraft
+        | PlanAction::PromoteDraft => {
             unreachable!("named by plan_action_row")
         }
         PlanAction::OpenHtml => (key, "open in browser", "the plan's html page with feedback"),
@@ -3607,6 +3690,8 @@ pub(super) fn render_roster_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::QueueDraft
+        | ConfirmAction::PromoteDraft
         | ConfirmAction::RestorePlan
         | ConfirmAction::DropStashedPlan { .. }
         | ConfirmAction::PurgeArtifacts
@@ -3628,6 +3713,8 @@ pub(super) fn render_roster_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::QueueDraft
+        | ConfirmAction::PromoteDraft
         | ConfirmAction::RestorePlan
         | ConfirmAction::DropStashedPlan { .. }
         | ConfirmAction::PurgeArtifacts
@@ -3773,6 +3860,16 @@ pub(super) fn render_plan_confirm(
              again; the replayed commits are new, so their reviews start over"
                 .to_string(),
         ),
+        ConfirmAction::QueueDraft => (
+            format!("queue `{stem}`?"),
+            format!("moves .clank/drafts/{stem}.md into the queue at the default priority"),
+        ),
+        ConfirmAction::PromoteDraft => (
+            format!("promote draft `{stem}`?"),
+            "queues it, moves it into plans/ and COMMITS the intro — the review cycle starts on \
+             the reviewers' next wake"
+                .to_string(),
+        ),
         ConfirmAction::PromotePlan => (
             format!("promote `{stem}`?"),
             "moves it into plans/ and COMMITS the intro — the review cycle starts on the \
@@ -3831,6 +3928,8 @@ pub(super) fn render_plan_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::QueueDraft
+        | ConfirmAction::PromoteDraft
         | ConfirmAction::RestorePlan => "7",
         _ => "1;41;97", // bold white on red — the scary one
     };
@@ -4420,6 +4519,7 @@ mod tests {
             entry: None,
             body: Some("# my-plan\n\nThe document body rendered inline.\n".into()),
             scroll: 0,
+            drafts_row: None,
         }
     }
 
@@ -7681,6 +7781,138 @@ mod tests {
             !out.iter().any(|l| visible(l).contains("QUEUE")),
             "no empty QUEUE header"
         );
+    }
+
+    fn draft(name: &str, title: Option<&str>, secs: u64) -> crate::cli::queue::Draft {
+        crate::cli::queue::Draft {
+            name: name.into(),
+            path: std::path::PathBuf::from(format!("/r/.clank/drafts/{name}.md")),
+            title: title.map(str::to_string),
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        }
+    }
+
+    /// The drafts collapse to one row under the queue, selectable as
+    /// the panel's last row; with none there is no row.
+    #[test]
+    fn the_drafts_row_sits_under_the_queue_and_only_when_there_are_drafts() {
+        let mut s = two_agent_snap();
+        s.queue = vec![crate::cli::status::QueueItemView {
+            priority: 500,
+            name: "queued-idea".into(),
+            path: std::path::PathBuf::new(),
+        }];
+        let lines = |s: &StatusSnapshot, sel: usize| -> Vec<String> {
+            render_at(s, 40, 80, 0, 0, &PanelView::just(Mode::AgentPanel { sel }))
+                .0
+                .iter()
+                .map(|l| visible(l))
+                .collect()
+        };
+        assert!(!lines(&s, 0).iter().any(|l| l.contains("drafts:")));
+        s.drafts = vec![draft("a", None, 2), draft("b", None, 1)];
+        let texts = lines(&s, 0);
+        let pos = |needle: &str| texts.iter().position(|t| t.contains(needle));
+        let (queued, drafts) = (pos("queued-idea").unwrap(), pos("drafts: 2").unwrap());
+        assert!(queued < drafts, "below the queue");
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("drafts")).count(),
+            1,
+            "one row"
+        );
+        let rows = super::super::input::panel_rows(2, &[], 0, 1, true);
+        let at = rows.iter().position(|r| *r == PanelRow::Drafts).unwrap();
+        let raw = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: at }),
+        )
+        .0;
+        let line = raw
+            .iter()
+            .find(|l| visible(l).contains("drafts: 2"))
+            .unwrap();
+        let unselected = render_at(
+            &s,
+            40,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0;
+        assert_ne!(
+            Some(line),
+            unselected.iter().find(|l| visible(l).contains("drafts: 2")),
+            "the cursor on it is shown"
+        );
+    }
+
+    /// However long the list and short the pane, the selected draft is
+    /// drawn, and drawn selected; moving back up brings the top back.
+    #[test]
+    fn the_drafts_page_keeps_the_selected_draft_in_view() {
+        let mut s = two_agent_snap();
+        s.drafts = (0..25)
+            .map(|i| draft(&format!("idea-{i:02}"), None, 100 - i))
+            .collect();
+        let page = |sel: usize, rows: usize| -> Vec<String> {
+            render_at(
+                &s,
+                rows as u16,
+                80,
+                0,
+                0,
+                &PanelView::just(Mode::DraftsList { sel }),
+            )
+            .0
+        };
+        let shows = |lines: &[String], name: &str| lines.iter().any(|l| visible(l).contains(name));
+        for (sel, rows) in [(18, 12), (24, 12), (2, 12), (10, 4), (0, 4)] {
+            let lines = page(sel, rows);
+            let name = format!("idea-{sel:02}");
+            assert!(shows(&lines, &name), "{name} at {rows} rows: {lines:#?}");
+            assert!(lines.len() <= rows, "fits {rows} rows");
+            let other = page(if sel == 0 { 1 } else { sel - 1 }, rows);
+            assert_ne!(
+                lines.iter().find(|l| visible(l).contains(&name)),
+                other.iter().find(|l| visible(l).contains(&name)),
+                "{name} is drawn selected"
+            );
+        }
+        assert!(!shows(&page(18, 12), "idea-00"), "scrolled past the top");
+        assert!(shows(&page(2, 12), "idea-00"), "and back");
+    }
+
+    /// The drafts page lists each draft in the snapshot's order with its
+    /// title.
+    #[test]
+    fn the_drafts_page_lists_names_and_titles() {
+        let mut s = two_agent_snap();
+        s.drafts = vec![
+            draft("newer", Some("The newer one"), 20),
+            draft("older", None, 10),
+        ];
+        let texts: Vec<String> = render_at(
+            &s,
+            20,
+            80,
+            0,
+            0,
+            &PanelView::just(Mode::DraftsList { sel: 1 }),
+        )
+        .0
+        .iter()
+        .map(|l| visible(l))
+        .collect();
+        let newer = texts
+            .iter()
+            .position(|t| t.contains("newer") && t.contains("The newer one"));
+        let older = texts.iter().position(|t| t.contains("older"));
+        assert!(newer.unwrap() < older.unwrap(), "{texts:#?}");
     }
 
     #[test]

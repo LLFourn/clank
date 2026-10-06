@@ -1913,9 +1913,9 @@
   //
   // The list is navigation and read-only priority. Actions belong to
   // the page, addressed by this exact handle.
-  function paintQueue(queue) {
+  function paintQueue(queue, drafts) {
     const box = $('queue');
-    const sig = JSON.stringify(queue);
+    const sig = JSON.stringify([queue, drafts]);
     if (sig === queueDrawn) return;
     const focused = document.activeElement?.closest('.q')?.dataset.handle;
     queueDrawn = sig;
@@ -1926,6 +1926,8 @@
           + `<span class="pri" aria-label="priority ${esc(String(q.priority))}">${esc(String(q.priority).padStart(3, '0'))}</span>`
           + `</div>`).join('')
       : '';
+    // Drafts collapse to one row, as in the pane; they are not acted on here.
+    if (drafts) box.innerHTML += `<div class="q drafts"><span class="nm">drafts: ${esc(String(drafts))}</span></div>`;
     if (focused) box.querySelector(`.q[data-handle="${CSS.escape(focused)}"] a.nm`)?.focus();
   }
   function reconcileQueuePage(queue) {
@@ -2337,7 +2339,7 @@
       (L.queue.length || L.stash) ? `<div class="line">${L.queue.length ? `${L.queue.length} queued` : ''}${L.queue.length && L.stash ? ', ' : ''}${L.stash ? `${L.stash} stashed` : ''}</div>` : '',
     ].join('');
     paintTeam(facts.agents);
-    paintQueue(L.queue);
+    paintQueue(L.queue, L.drafts || 0);
     paintStash(L.stash_entries || []);
     reconcileQueuePage(L.queue);
     reconcileStashPage(L.stash_entries || []);

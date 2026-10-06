@@ -218,7 +218,11 @@ The TUI is the primary interface once a team is running: agent rows
 with live state (`?` marks an agent whose pane is not open),
 per-agent pages (auto-mode, review tier, swap, reopen a closed pane,
 remove), the plan and its verdicts, queued plans, and github event
-pages. `--watch` gives a live non-fullscreen view; `-j` emits JSON.
+pages. Under the queue, one `drafts: N` row lists `.clank/drafts/`; a draft's
+page reads it and queues it (`e`) or queues and promotes it (`p`), with the
+same checks as `clank queue add` and `clank queue promote`. Unqueue on a queued
+plan's page sends it back there. The remote page shows the same count.
+`--watch` gives a live non-fullscreen view; `-j` emits JSON.
 Status JSON carries `active_plan` and `last_finished` as objects or `null`. A
 finished run carries `duration_secs`, recorded once from its accepted intro to
 finalize using Git author timestamps (clock reversals clamp to zero; squashed

@@ -13,6 +13,23 @@ const clickUnavailableChat = async (page) => {
 
 (async () => {
   try {
+  // ---- drafts collapse to one read-only row under the queue, absent at zero
+  {
+    const { page, errors } = await open();
+    const frame = (drafts) => facts([agent('claude', 'master')], {
+      ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, stash: 0, blocks: [], rows: [], drafts,
+        queue: [{ name: 'queued-idea', priority: 500, handle: '500-queued-idea', page: 'queue/500-queued-idea.html' }] },
+    });
+    await page.evaluate((d) => window.__send('status', d), frame(2));
+    const text = await page.textContent('#queue');
+    ok('the drafts count shows under the queue',
+       text.includes('drafts: 2') && text.indexOf('queued-idea') < text.indexOf('drafts: 2'));
+    ok('the drafts row offers no action', await page.locator('#queue .drafts a, #queue .drafts button').count() === 0);
+    await page.evaluate((d) => window.__send('status', d), frame(0));
+    ok('no drafts, no row', !(await page.textContent('#queue')).includes('drafts'));
+    ok('no page errors (drafts)', errors.length === 0, errors.join('; '));
+  }
+
   // ---- an agent's pending question shows in the header and the picker,
   // to a page that connects after it was asked, and goes when it ends
   {

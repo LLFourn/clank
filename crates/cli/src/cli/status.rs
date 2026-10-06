@@ -59,6 +59,10 @@ pub struct StatusSnapshot {
     /// apart. All absent when nothing is queued.
     #[serde(flatten, with = "queue_wire")]
     pub(crate) queue: Vec<QueueItemView>,
+    /// Plan ideas in `.clank/drafts/`, newest first. Only the panel and
+    /// the remote page's count read them, so the wire omits them.
+    #[serde(skip)]
+    pub(crate) drafts: Vec<crate::cli::queue::Draft>,
     /// The team's master label, when a team resolves (render path:
     /// degrades to None on a teamless repo). The TUI's idle+queue
     /// headline names master as the agent whose turn it is.
@@ -697,6 +701,7 @@ impl StatusSnapshot {
             last_finished,
             blocks,
             queue,
+            drafts: crate::cli::queue::scan_drafts(repo),
             master,
             agents,
             stash,
@@ -1281,7 +1286,7 @@ pub(crate) struct WakeFilter {
 // The `.clank/` workflow-state signal dirs the snapshot depends on —
 // the SHARED allowlist the core watcher wakes on. One source of truth
 // in `repo_watch`, so the reuse fingerprint and the wake rule agree.
-use crate::repo_watch::CLANK_WAKE_DIRS;
+use crate::repo_watch::{CLANK_STATUS_ONLY_DIRS, CLANK_WAKE_DIRS};
 
 /// A cheap fingerprint of everything a [`StatusSnapshot`] is derived
 /// from — the SAME inputs the [`WakeFilter`] wakes on: committed
@@ -1364,7 +1369,7 @@ fn clank_input_fingerprint(repo: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let clank = repo.join(".clank");
     let mut entries: Vec<(PathBuf, Option<std::time::SystemTime>)> = Vec::new();
-    for dir in CLANK_WAKE_DIRS {
+    for dir in CLANK_WAKE_DIRS.iter().chain(CLANK_STATUS_ONLY_DIRS) {
         collect_fingerprint(&clank.join(dir), &mut entries);
     }
     // readdir order isn't stable; sort for a deterministic hash.
@@ -1431,8 +1436,17 @@ impl WakeFilter {
         // dirty/diff from the WORKING TREE only, so it drops both: status
         // runs both watchers on one channel, and dropping here keeps the
         // diff side from double-waking on a gate change the core already
-        // delivered.
-        if path.starts_with(&self.git_dir) || path.starts_with(&self.clank_root) {
+        // delivered. The status-only dirs under `.clank/` are the
+        // exception: no gate reads them, so only this watcher delivers
+        // them.
+        if let Ok(rel) = path.strip_prefix(&self.clank_root) {
+            return rel
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .is_some_and(|head| CLANK_STATUS_ONLY_DIRS.contains(&head));
+        }
+        if path.starts_with(&self.git_dir) {
             return false;
         }
         // A `.gitignore` write changes what's ignored: rebuild the
@@ -2006,6 +2020,9 @@ mod dirty_and_wake_tests {
         assert!(!f.wakes(&p(".clank/cache/repo-state/abc123.7.v10.bin")));
         assert!(!f.wakes(&p(".clank/worktrees/wt1/src/lib.rs")));
         assert!(!f.wakes(&p(".git/HEAD")));
+        // Drafts are the panel's alone: no core watcher delivers them.
+        assert!(f.wakes(&p(".clank/drafts/idea.md")));
+        assert!(f.wakes(&p(".clank/drafts")));
 
         // Top-level working tree: root-gitignored → drop, tracked → wake.
         assert!(!f.wakes(&p("target/debug/build/junk.o")));
@@ -2371,6 +2388,53 @@ mod dirty_and_wake_tests {
             before, after,
             "a new gitignored feedback file must flip the fingerprint"
         );
+    }
+
+    /// Unqueueing a plan makes it a draft in the very next snapshot the
+    /// panel would build, and the refresh that builds it is not skipped.
+    #[tokio::test]
+    async fn an_unqueued_plan_is_a_draft_in_the_next_snapshot() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::create_dir_all(r.join(".clank/queue")).unwrap();
+        std::fs::write(r.join(".clank/queue/500-idea.md"), "# idea\n\nbody\n").unwrap();
+        let before = snapshot(r, None).await.unwrap();
+        assert_eq!(before.queue.len(), 1);
+        assert!(before.drafts.is_empty());
+        let signature = input_signature(r).unwrap();
+        crate::cli::queue::unqueue(r, "idea").unwrap();
+        assert_ne!(signature, input_signature(r).unwrap());
+        let after = snapshot(r, None).await.unwrap();
+        assert!(after.queue.is_empty());
+        assert_eq!(
+            after
+                .drafts
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            ["idea"]
+        );
+    }
+
+    /// A draft written, edited (a new mtime) or removed changes what the
+    /// panel shows, so a refresh must not reuse the snapshot.
+    #[test]
+    fn clank_fingerprint_flips_on_every_draft_change() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        let draft = r.join(".clank/drafts/idea.md");
+        let before = clank_input_fingerprint(r);
+        std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+        std::fs::write(&draft, "# idea\n\nfirst\n").unwrap();
+        let written = clank_input_fingerprint(r);
+        assert_ne!(before, written, "a new draft");
+        let file = std::fs::File::options().write(true).open(&draft).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7))
+            .unwrap();
+        let edited = clank_input_fingerprint(r);
+        assert_ne!(written, edited, "an edited draft");
+        std::fs::remove_file(&draft).unwrap();
+        assert_ne!(edited, clank_input_fingerprint(r), "a removed draft");
     }
 
     #[test]
@@ -2840,6 +2904,7 @@ mod dirty_and_wake_tests {
                 answer: None,
             }],
             queue: Vec::new(),
+            drafts: Vec::new(),
             master: None,
             agents: Vec::new(),
             stash: Vec::new(),
@@ -3011,6 +3076,8 @@ mod dirty_and_wake_tests {
             master,
             agents,
             stash: _,
+            // The panel's and the remote page's; the wire skips them.
+            drafts: _,
             forks,
             pr_reviews,
             ad_hoc,

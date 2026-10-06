@@ -123,6 +123,7 @@ fn panel_row_list(
         &crate::cli::status_tui::render::drawable_waits(snap, cols),
         snap.stash.len(),
         snap.queue.len(),
+        !snap.drafts.is_empty(),
     )
 }
 
@@ -287,6 +288,8 @@ fn apply_confirm(
         ConfirmAction::StashPlan
         | ConfirmAction::UnqueuePlan
         | ConfirmAction::PromotePlan
+        | ConfirmAction::QueueDraft
+        | ConfirmAction::PromoteDraft
         | ConfirmAction::RestorePlan
         | ConfirmAction::DropStashedPlan { .. }
         | ConfirmAction::PurgeArtifacts
@@ -316,6 +319,8 @@ async fn run_plan_confirm(
         }
         ConfirmAction::UnqueuePlan => crate::cli::queue::unqueue(repo, stem).map(|_| ()),
         ConfirmAction::PromotePlan => crate::cli::queue::promote(repo, stem),
+        ConfirmAction::QueueDraft => crate::cli::queue::queue_draft(repo, stem).map(|_| ()),
+        ConfirmAction::PromoteDraft => crate::cli::queue::promote_draft(repo, stem),
         ConfirmAction::RestorePlan => {
             crate::cli::stash::run_pop_inner(Some(repo), Some(stem)).await
         }
@@ -351,6 +356,29 @@ async fn run_plan_confirm(
     }
 }
 
+/// The draft under the drafts list's cursor, by file. The list is
+/// ordered by modification time, so a refresh can move it: this is what
+/// the cursor follows.
+fn selected_draft(mode: Mode, snapshot: &StatusSnapshot) -> Option<std::path::PathBuf> {
+    match mode {
+        Mode::DraftsList { sel } => snapshot.drafts.get(sel).map(|d| d.path.clone()),
+        _ => None,
+    }
+}
+
+/// A draft's page, its document read from its own file; its Back
+/// returns to `row` of the drafts list.
+fn draft_page(draft: &crate::cli::queue::Draft, row: usize) -> PlanPage {
+    PlanPage {
+        body: std::fs::read_to_string(&draft.path).ok(),
+        stem: draft.name.clone(),
+        st: input::PlanPageState::Draft,
+        entry: Some(draft.path.clone()),
+        scroll: 0,
+        drafts_row: Some(row),
+    }
+}
+
 /// A stashed plan's page, its document read from the stash.
 fn stash_page(repo: &std::path::Path, stem: &str) -> PlanPage {
     PlanPage {
@@ -359,22 +387,39 @@ fn stash_page(repo: &std::path::Path, stem: &str) -> PlanPage {
         st: input::PlanPageState::Stashed,
         entry: None,
         scroll: 0,
+        drafts_row: None,
     }
 }
 
-/// What a plan-page confirm's outcome does to the open page. Restoring
-/// moves the plan's source: it is read from the plans now, and a
-/// refresh still reading the stash it left would close the page.
+/// What a plan-page confirm's outcome does to the open page. Restoring,
+/// queueing a draft and promoting one move the plan's source: a refresh
+/// still reading the one it left would close the page.
 fn settle_plan_confirm(
+    repo: &std::path::Path,
     action: ConfirmAction,
     outcome: &anyhow::Result<()>,
     page: &mut Option<PlanPage>,
 ) {
-    if action == ConfirmAction::RestorePlan
-        && outcome.is_ok()
-        && let Some(pp) = page.as_mut()
-    {
-        pp.st = input::PlanPageState::Active { repo_paused: false };
+    let (Ok(()), Some(pp)) = (outcome, page.as_mut()) else {
+        return;
+    };
+    match action {
+        ConfirmAction::RestorePlan | ConfirmAction::PromoteDraft => {
+            pp.st = input::PlanPageState::Active { repo_paused: false };
+            pp.entry = None;
+        }
+        ConfirmAction::QueueDraft => {
+            if let Some(queued) = crate::cli::queue::scan_queue(repo)
+                .into_iter()
+                .find(|e| e.name == pp.stem && e.priority == crate::cli::queue::ADD_PRIORITY)
+            {
+                pp.st = input::PlanPageState::Queued {
+                    priority: queued.priority,
+                };
+                pp.entry = Some(queued.path);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -383,7 +428,8 @@ fn plan_confirm_title(action: ConfirmAction) -> String {
     match action {
         ConfirmAction::StashPlan => "stash push failed".to_string(),
         ConfirmAction::UnqueuePlan => "unqueue failed".to_string(),
-        ConfirmAction::PromotePlan => "promote failed".to_string(),
+        ConfirmAction::PromotePlan | ConfirmAction::PromoteDraft => "promote failed".to_string(),
+        ConfirmAction::QueueDraft => "queue failed".to_string(),
         ConfirmAction::RestorePlan => "stash pop failed".to_string(),
         ConfirmAction::DropStashedPlan { .. } => "stash drop failed".to_string(),
         ConfirmAction::PurgeArtifacts => "purge failed".to_string(),
@@ -694,6 +740,13 @@ async fn plan_page_facts(
                 .any(|s| s.stem == stem)
                 .then_some((input::PlanPageState::Stashed, None));
         }
+        PlanSource::Draft(path) => {
+            return snapshot
+                .drafts
+                .iter()
+                .any(|d| d.path == path)
+                .then(|| (input::PlanPageState::Draft, Some(path.to_path_buf())));
+        }
         PlanSource::Plans => {}
     }
     if !has_plan_page(repo, stem, snapshot) {
@@ -768,12 +821,14 @@ enum PlanSource<'a> {
     Plans,
     Queue(&'a std::path::Path),
     Stash,
+    Draft(&'a std::path::Path),
 }
 
 impl PlanPage {
     fn source(&self) -> PlanSource<'_> {
         match (self.st, self.entry.as_deref()) {
             (input::PlanPageState::Queued { .. }, Some(entry)) => PlanSource::Queue(entry),
+            (input::PlanPageState::Draft, Some(entry)) => PlanSource::Draft(entry),
             (input::PlanPageState::Stashed, _) => PlanSource::Stash,
             _ => PlanSource::Plans,
         }
@@ -1807,8 +1862,9 @@ fn refresh_commit_page(
     }
 }
 
-/// Close the plan page, returning to the commit page `beneath` it, when
-/// it was opened from one, on the row it was left on; else to the log.
+/// Close the plan page, returning to the drafts list row it was opened
+/// from, or the commit page `beneath` it on the row it was left on; else
+/// to the log.
 fn close_plan_page(
     repo: &std::path::Path,
     plan_page: &mut Option<PlanPage>,
@@ -1816,7 +1872,11 @@ fn close_plan_page(
     commit_page: &mut Option<CommitPage>,
     snapshot: &StatusSnapshot,
 ) -> Mode {
-    *plan_page = None;
+    if let Some(row) = plan_page.take().and_then(|pp| pp.drafts_row) {
+        return Mode::DraftsList {
+            sel: row.min(snapshot.drafts.len().saturating_sub(1)),
+        };
+    }
     let Some(mut cp) = beneath.take() else {
         return Mode::LogScroll;
     };
@@ -1861,6 +1921,7 @@ async fn open_plan_page(
         entry: None,
         body: read_plan_markdown(repo, stem),
         scroll: 0,
+        drafts_row: None,
     })
 }
 
@@ -2073,6 +2134,10 @@ pub(crate) struct Ledger {
     /// shows is these entries' length: a number beside the list is a
     /// second thing to keep true (the-queue-is-workable-from-the-phone).
     pub(crate) queue: Vec<Queued>,
+    /// How many plan ideas wait in `.clank/drafts/`: the panel's one
+    /// collapsed row, said the same way here. Nothing acts on them
+    /// remotely.
+    pub(crate) drafts: usize,
     pub(crate) stash: usize,
     pub(crate) stash_entries: Vec<Stashed>,
     pub(crate) blocks: Vec<PendingBlock>,
@@ -2201,6 +2266,7 @@ pub(crate) fn web_facts(
                 }
             })
             .collect(),
+        drafts: snap.drafts.len(),
         stash: snap.stash.len(),
         stash_entries: snap
             .stash
@@ -3525,6 +3591,33 @@ pub(crate) async fn run_tui(
                             }
                             continue;
                         }
+                        Mode::DraftsList { sel } => {
+                            use crate::cli::status_tui::input::DraftsNav;
+                            match crate::cli::status_tui::input::drafts_nav(
+                                sel,
+                                snapshot.drafts.len(),
+                                k,
+                            ) {
+                                DraftsNav::Quit => break 'evloop,
+                                DraftsNav::Back => {
+                                    mode = Mode::AgentPanel {
+                                        sel: row_position(
+                                            &panel_row_list(&snapshot, cols as usize),
+                                            crate::cli::status_tui::input::PanelRow::Drafts,
+                                        ),
+                                    };
+                                }
+                                DraftsNav::Sel(x) => mode = Mode::DraftsList { sel: x },
+                                DraftsNav::Open(i) => {
+                                    if let Some(draft) = snapshot.drafts.get(i) {
+                                        plan_page = Some(draft_page(draft, i));
+                                        mode = Mode::PlanDetail { sel: 0 };
+                                    }
+                                }
+                                DraftsNav::None => {}
+                            }
+                            continue;
+                        }
                         Mode::PriorityPage { value } => {
                             use crate::cli::status_tui::input::PriorityNav;
                             match crate::cli::status_tui::input::priority_page_nav(value, k) {
@@ -3809,6 +3902,7 @@ pub(crate) async fn run_tui(
                                             },
                                             entry: Some(item.path.clone()),
                                             scroll: 0,
+                                            drafts_row: None,
                                         });
                                         mode = Mode::PlanDetail { sel: 0 };
                                     }
@@ -3819,6 +3913,7 @@ pub(crate) async fn run_tui(
                                         mode = Mode::PlanDetail { sel: 0 };
                                     }
                                 }
+                                PanelAction::OpenDrafts => mode = Mode::DraftsList { sel: 0 },
                                 PanelAction::OpenStashHtml(i) => {
                                     if let Some(item) = snapshot.stash.get(i) {
                                         open_in_browser(
@@ -4038,7 +4133,12 @@ pub(crate) async fn run_tui(
                                             plan_page.as_ref().map(|pp| pp.stem.clone())
                                     {
                                         let outcome = run_plan_confirm(action, &repo, &stem).await;
-                                        settle_plan_confirm(action, &outcome, &mut plan_page);
+                                        settle_plan_confirm(
+                                            &repo,
+                                            action,
+                                            &outcome,
+                                            &mut plan_page,
+                                        );
                                         if let Err(e) = outcome {
                                             detail = Some(Overlay::error(
                                                 plan_confirm_title(action),
@@ -4358,6 +4458,16 @@ pub(crate) async fn run_tui(
                                     PlanAction::Promote => {
                                         mode = Mode::Confirm {
                                             action: ConfirmAction::PromotePlan,
+                                        };
+                                    }
+                                    PlanAction::QueueDraft => {
+                                        mode = Mode::Confirm {
+                                            action: ConfirmAction::QueueDraft,
+                                        };
+                                    }
+                                    PlanAction::PromoteDraft => {
+                                        mode = Mode::Confirm {
+                                            action: ConfirmAction::PromoteDraft,
                                         };
                                     }
                                     PlanAction::Stash => {
@@ -4724,6 +4834,7 @@ pub(crate) async fn run_tui(
                 // operator back to the panel mid-choice.
                 let picker_label =
                     candidate_index(mode).and_then(|i| picker.get(i).map(|c| c.label.clone()));
+                let selected_draft = selected_draft(mode, &snapshot);
                 let keep_picker = candidate_index(mode).is_some();
                 // Same identity rule for a panel cursor on a QUEUE row: a
                 // reprioritise renames the queue file, so THIS refresh is
@@ -4822,6 +4933,13 @@ pub(crate) async fn run_tui(
                     // against the refreshed count rather than trusted.
                     Mode::TokenPage { scroll } => Mode::TokenPage { scroll },
                     Mode::PriorityPage { value } => Mode::PriorityPage { value },
+                    Mode::DraftsList { sel } => Mode::DraftsList {
+                        sel: input::rebind_draft_sel(
+                            sel,
+                            selected_draft.as_deref(),
+                            &snapshot.drafts,
+                        ),
+                    },
                     // The candidate is re-located by label the way the
                     // picker's is; a list that changed under the step
                     // must not add a DIFFERENT agent.
@@ -6811,6 +6929,23 @@ pub(crate) mod tests {
         );
     }
 
+    /// The remote page is told how many drafts there are, and nothing
+    /// that would let it act on them.
+    #[test]
+    fn web_facts_count_the_drafts() {
+        let mut s = fixtures::snap(None, vec![]);
+        assert_eq!(web_facts(&s, &Default::default()).ledger.drafts, 0);
+        s.drafts = vec![crate::cli::queue::Draft {
+            name: "idea".into(),
+            path: "/r/.clank/drafts/idea.md".into(),
+            title: Some("An idea".into()),
+            modified: None,
+        }];
+        let ledger = serde_json::to_value(web_facts(&s, &Default::default()).ledger).unwrap();
+        assert_eq!(ledger["drafts"], 1);
+        assert!(!ledger.to_string().contains("An idea"), "{ledger}");
+    }
+
     #[test]
     fn web_facts_carry_only_pending_blocks_with_their_identity() {
         let mut snap = crate::cli::status_tui::fixtures::snap(None, vec![]);
@@ -8230,6 +8365,91 @@ pub(crate) mod tests {
     /// The page's facts come from the source it opened on, never the
     /// other: a queue entry and an active plan may share a stem
     /// (a-queued-plan-has-a-page).
+    /// A draft's page reads its own file, follows it into the queue when
+    /// queued from the page, and its Back returns to the drafts list on
+    /// the row it came from, or the last one left; a draft gone from its
+    /// source closes the page the same way.
+    #[tokio::test]
+    async fn a_draft_page_follows_its_draft() {
+        use crate::cli::status_tui::fixtures::snap;
+        let repo = tempfile::TempDir::new().unwrap();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join(".clank/drafts")).unwrap();
+        for name in ["idea", "other"] {
+            std::fs::write(
+                p.join(format!(".clank/drafts/{name}.md")),
+                format!("# {name}\n\nbody of {name}\n"),
+            )
+            .unwrap();
+        }
+        let mut s = snap(None, vec![]);
+        let refresh = |s: &mut StatusSnapshot| {
+            s.drafts = crate::cli::queue::scan_drafts(p);
+            s.queue = crate::cli::queue::scan_queue(p)
+                .into_iter()
+                .map(|e| crate::cli::status::QueueItemView {
+                    priority: e.priority,
+                    name: e.name,
+                    path: e.path,
+                })
+                .collect();
+        };
+        refresh(&mut s);
+        let row = s.drafts.iter().position(|d| d.name == "idea").unwrap();
+        let mut page = Some(draft_page(&s.drafts[row], row));
+        assert_eq!(
+            selected_draft(Mode::DraftsList { sel: row }, &s),
+            Some(s.drafts[row].path.clone())
+        );
+        assert_eq!(selected_draft(Mode::LogScroll, &s), None);
+        assert!(refetch_plan_page(p, &mut page, &s).await);
+        let open = page.as_ref().unwrap();
+        assert_eq!(open.st, input::PlanPageState::Draft);
+        assert!(open.body.as_deref().unwrap().contains("body of idea"));
+
+        let outcome = run_plan_confirm(ConfirmAction::QueueDraft, p, "idea").await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        settle_plan_confirm(p, ConfirmAction::QueueDraft, &outcome, &mut page);
+        refresh(&mut s);
+        assert!(refetch_plan_page(p, &mut page, &s).await);
+        assert_eq!(
+            page.as_ref().unwrap().st,
+            input::PlanPageState::Queued {
+                priority: crate::cli::queue::ADD_PRIORITY
+            }
+        );
+        assert_eq!(
+            close_plan_page(p, &mut page, &mut None, &mut None, &s),
+            Mode::DraftsList { sel: 0 },
+            "one draft is left"
+        );
+        assert!(page.is_none());
+
+        let mut gone = Some(draft_page(&s.drafts[0], 0));
+        std::fs::remove_file(&s.drafts[0].path).unwrap();
+        refresh(&mut s);
+        assert!(!refetch_plan_page(p, &mut gone, &s).await);
+        assert_eq!(
+            close_plan_page(
+                p,
+                &mut Some(draft_page(
+                    &crate::cli::queue::Draft {
+                        name: "x".into(),
+                        path: p.join("x.md"),
+                        title: None,
+                        modified: None,
+                    },
+                    3
+                )),
+                &mut None,
+                &mut None,
+                &s
+            ),
+            Mode::DraftsList { sel: 0 },
+            "an empty list still takes its Back"
+        );
+    }
+
     #[tokio::test]
     async fn plan_page_facts_reads_the_source_the_page_opened_on() {
         use crate::cli::status_tui::fixtures::{plan_state, snap};
@@ -8365,7 +8585,7 @@ pub(crate) mod tests {
 
         let mut open = Some(page);
         let outcome = run_plan_confirm(ConfirmAction::RestorePlan, p, "foo").await;
-        settle_plan_confirm(ConfirmAction::RestorePlan, &outcome, &mut open);
+        settle_plan_confirm(p, ConfirmAction::RestorePlan, &outcome, &mut open);
         assert!(outcome.is_ok(), "{outcome:?}");
         assert!(p.join(".clank/plans/foo.md").exists(), "restored");
         assert_eq!(
@@ -8624,6 +8844,7 @@ pub(crate) mod tests {
                 entry: Some(path.clone()),
                 body: None,
                 scroll: 0,
+                drafts_row: None,
             });
             assert!(refetch_plan_page(p, &mut page, &s).await);
             let pg = page.unwrap();
@@ -8647,6 +8868,7 @@ pub(crate) mod tests {
             entry: Some(prefixed.clone()),
             body: None,
             scroll: 0,
+            drafts_row: None,
         });
         assert!(!refetch_plan_page(p, &mut page, &s).await);
         assert!(page.is_none());
@@ -8659,6 +8881,7 @@ pub(crate) mod tests {
             entry: Some(prefixed.clone()),
             body: None,
             scroll: 0,
+            drafts_row: None,
         });
         assert!(refetch_plan_page(p, &mut page, &s).await);
         let pg = page.unwrap();
@@ -8683,6 +8906,7 @@ pub(crate) mod tests {
             entry: Some(before.clone()),
             body: None,
             scroll: 0,
+            drafts_row: None,
         };
         set_priority_to(p, &mut page, 510).unwrap();
         let after = p.join(".clank/queue/510-foo.md");
@@ -8705,6 +8929,7 @@ pub(crate) mod tests {
             entry: None,
             body: None,
             scroll: 0,
+            drafts_row: None,
         };
         set_priority_to(p, &mut active, 510).unwrap();
         assert_eq!(
@@ -8724,6 +8949,7 @@ pub(crate) mod tests {
             entry: entry.map(std::path::PathBuf::from),
             body: None,
             scroll: 0,
+            drafts_row: None,
         };
         let queued = input::PlanPageState::Queued { priority: 999 };
         assert_eq!(
@@ -8774,6 +9000,7 @@ pub(crate) mod tests {
             entry: Some(entry),
             body: None,
             scroll: 0,
+            drafts_row: None,
         });
         assert!(refetch_plan_page(p, &mut queued, &s).await);
         let q = queued.unwrap();
@@ -8786,6 +9013,7 @@ pub(crate) mod tests {
             entry: None,
             body: None,
             scroll: 0,
+            drafts_row: None,
         });
         assert!(refetch_plan_page(p, &mut active, &s).await);
         let a = active.unwrap();

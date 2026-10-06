@@ -36,6 +36,10 @@ pub const CLANK_WAKE_DIRS: &[&str] = &[
     "pr-reviews", // pr-reviews/<pr>/ — PrReviewer/PrMaster gate state
 ];
 
+/// Under `.clank/`, what the status panel shows but no gate reads: a
+/// change refreshes the panel and wakes no `clank wait` or monitor.
+pub const CLANK_STATUS_ONLY_DIRS: &[&str] = &["drafts"];
+
 /// Resolve `<git-common-dir>` (the worktree's gitdir for a linked
 /// worktree, `<repo>/.git` for the main one), canonicalized so prefix
 /// checks match the canonical paths the OS watcher delivers (FSEvents

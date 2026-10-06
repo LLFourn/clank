@@ -128,6 +128,7 @@ pub(crate) fn snap(active_plan: Option<PlanWorkState>, queue: Vec<&str>) -> Stat
                 path: std::path::PathBuf::from(format!("/r/.clank/queue/500-{name}.md")),
             })
             .collect(),
+        drafts: Vec::new(),
         master: Some("claude".into()),
         agents: Vec::new(),
         stash: Vec::new(),
