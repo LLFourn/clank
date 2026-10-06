@@ -3502,6 +3502,7 @@ mod tests {
             invocation: "codex".into(),
             session: None,
             waiting_for_you: None,
+            asking: None,
             repeated: None,
 
             attending: None,
@@ -4260,6 +4261,7 @@ mod tests {
                 invocation: "claude".to_string(),
                 session: None,
                 waiting_for_you: None,
+                asking: None,
                 repeated: None,
 
                 attending: attending

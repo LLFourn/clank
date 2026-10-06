@@ -34,7 +34,11 @@ pub fn agents_root(repo: &Path) -> PathBuf {
 
 /// Repo-relative path: `.clank/agents/<label>/config.json`.
 pub fn agent_config_path(repo: &Path, label: &AgentLabel) -> PathBuf {
-    agents_root(repo).join(label.as_str()).join("config.json")
+    config_in(&agents_root(repo).join(label.as_str()))
+}
+
+fn config_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("config.json")
 }
 
 /// Load this agent's config from disk. Returns `Ok(None)` if the
@@ -43,6 +47,11 @@ pub fn agent_config_path(repo: &Path, label: &AgentLabel) -> PathBuf {
 pub fn load_agent_config(repo: &Path, label: &AgentLabel) -> anyhow::Result<Option<AgentConfig>> {
     let path = agent_config_path(repo, label);
     load_json(&path).with_context(|| format!("reading `{}`", path.display()))
+}
+
+/// The session bound to the agent whose directory is `agent_dir`.
+pub(crate) fn binding_in(agent_dir: &Path) -> anyhow::Result<Option<Session>> {
+    Ok(load_json::<AgentConfig>(&config_in(agent_dir))?.and_then(|c| c.session))
 }
 
 /// Whether the current binding still assigns this label to this tool and session.

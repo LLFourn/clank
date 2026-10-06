@@ -488,6 +488,14 @@ agent's session.
 - **Limits:** only the wording changes; every item is still delivered. Grok hands
   work over through its own wait and is not counted.
 
+A Claude agent that asks a question (`AskUserQuestion`) is recorded as asking
+from the moment it asks, with or without a browser attached. `clank status`
+shows `asking you: <agent> → "<header>"`, and the TUI and the remote status
+show the same. While the question is pending, stall notices and failed-turn
+retries hold. The question is over when it is answered, dismissed or cancelled
+in the terminal, when its turn ends or fails, when a newer prompt begins, or
+when its session is no longer the agent's.
+
 ## Extra wake sources
 
 ### Scheduled and recurring events

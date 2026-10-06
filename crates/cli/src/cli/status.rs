@@ -188,6 +188,10 @@ pub(crate) struct AgentAutoRow {
     /// failed and the monitor will not, or can no longer, retry it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_for_you: Option<String>,
+    /// The question the agent is waiting on a person to answer, by its
+    /// header, while one is pending in its bound session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) asking: Option<String>,
     /// How many times in a row the same items have been delivered, once
     /// that reaches the escalation threshold. A count, not a verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,6 +286,13 @@ fn roster_auto_rows(
             .flatten();
         let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
         let session = cfg.as_ref().and_then(|c| c.session.clone());
+        let asking = session.as_ref().and_then(|s| {
+            crate::cli::question_state::asking(
+                &crate::agent_store::agents_root(repo).join(label.as_str()),
+                s.id.as_str(),
+            )
+            .map(|q| q.header)
+        });
         let repeated = crate::cli::wake_repeat::load(
             &crate::agent_store::agents_root(repo).join(label.as_str()),
         )
@@ -304,6 +315,7 @@ fn roster_auto_rows(
             waiting_for_you: crate::cli::recovery::waiting_for_you(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
             ),
+            asking,
             repeated,
         });
     }
@@ -806,6 +818,9 @@ impl StatusSnapshot {
         for row in &self.agents {
             if let Some(why) = &row.waiting_for_you {
                 let _ = writeln!(out, "waiting for you: {} → {why}", row.label);
+            }
+            if let Some(header) = &row.asking {
+                let _ = writeln!(out, "asking you: {} → \"{header}\"", row.label);
             }
             if let Some(n) = row.repeated {
                 let _ = writeln!(
@@ -2567,6 +2582,7 @@ mod dirty_and_wake_tests {
             invocation: "claude".to_string(),
             session: None,
             waiting_for_you: None,
+            asking: None,
             repeated: None,
             attending,
         }
@@ -2653,10 +2669,15 @@ mod dirty_and_wake_tests {
         let mut snap = minimal_snapshot();
         let mut row = agent_row("claude", None);
         row.repeated = Some(6);
+        row.asking = Some("Life monitor".into());
         snap.agents = vec![row];
         let text = snap.to_human();
         assert!(
             text.contains("repeating: claude → same items delivered 6 times"),
+            "{text}"
+        );
+        assert!(
+            text.contains("asking you: claude → \"Life monitor\""),
             "{text}"
         );
         assert!(

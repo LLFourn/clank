@@ -831,17 +831,29 @@ pub(super) fn agent_wait_view(snap: &StatusSnapshot, cols: usize) -> Vec<(bool, 
         .iter()
         .map(|a| {
             let fields = a.attending.as_ref().and_then(|att| att.marker_fields(now));
-            let marker = fields.as_ref().and_then(|f| fit_marker(f, budget));
-            (fields.is_some(), marker)
+            let marker = fields
+                .as_ref()
+                .and_then(|f| fit_marker(f, budget))
+                .or_else(|| {
+                    // A question it is waiting on a person to answer, where no
+                    // wait is being attended.
+                    let asking = format!("asking you — \"{}\"", a.asking.as_deref()?);
+                    (budget > 0).then(|| asking.chars().take(budget).collect())
+                });
+            (fields.is_some() || a.asking.is_some(), marker)
         })
         .collect()
 }
 
+/// The rows the cursor can open: an attended wait's marker, and not a
+/// question's, which has no wait page.
 pub(super) fn drawable_waits(snap: &StatusSnapshot, cols: usize) -> Vec<usize> {
     agent_wait_view(snap, cols)
         .into_iter()
         .enumerate()
-        .filter_map(|(i, (_, marker))| marker.is_some().then_some(i))
+        .filter_map(|(i, (_, marker))| {
+            (marker.is_some() && snap.agents[i].attending.is_some()).then_some(i)
+        })
         .collect()
 }
 
@@ -9363,6 +9375,20 @@ mod tests {
     /// description when there is one, the task id when there is not.
     /// Naming nothing was the bug — a row reading `⌛ 2m` announced a
     /// wait and withheld what it was for.
+    /// An agent waiting on a question shows it beside the agent, as
+    /// blocked, but it is no wait the cursor can open.
+    #[test]
+    fn an_agent_asking_a_question_is_shown_blocked_but_not_openable() {
+        let mut s = two_agent_snap();
+        s.agents[0].asking = Some("Life monitor".into());
+        let view = agent_wait_view(&s, 80);
+        assert_eq!(
+            view[0],
+            (true, Some("asking you — \"Life monitor\"".into()))
+        );
+        assert!(drawable_waits(&s, 80).is_empty());
+    }
+
     #[test]
     fn the_marker_names_its_subject_description_first_then_the_id() {
         let att = |desc: Option<&str>| crate::cli::stop_hook::Attended {

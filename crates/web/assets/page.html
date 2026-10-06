@@ -901,6 +901,7 @@
   const said = (html) => `<span class="said">${html}</span>`;
   function clause(a) {
     if (!a) return '';
+    if (a.asking) return said(`asking you <span class="obj">“${esc(a.asking)}”</span>`);
     if (!a.owes) return said(esc(a.last || 'idle'));
     const o = a.owes;
     return said(`<span class="dot"></span>${esc(o.verb)} <span class="obj">${esc(o.object)}</span>`)
@@ -927,7 +928,7 @@
     // `no agents` is something only a page that HAS heard can say.
     whoName.textContent = shown || (heard && !roster().length ? 'no agents' : '');
     autoTag.hidden = !selection.auto;
-    whoEl.classList.toggle('elsewhere', !selection.auto && roster().some((a) => a.owes && a.label !== shown));
+    whoEl.classList.toggle('elsewhere', !selection.auto && roster().some((a) => (a.owes || a.asking) && a.label !== shown));
     const a = roster().find((x) => x.label === shown);
     doingEl.innerHTML = live !== true
       ? said(live === null ? 'connecting…' : 'reconnecting…')

@@ -2739,6 +2739,11 @@ fn recovery_facts(
         let Ok(cfg) = crate::agent_store::load_agent_config(repo, &author) else {
             continue;
         };
+        let dir = crate::agent_store::agents_root(repo).join(author.as_str());
+        if crate::cli::question_state::path(&dir).exists() {
+            // A question of a session no longer the agent's is over.
+            crate::cli::question_state::observe(&dir, []);
+        }
         let Some(session) = cfg.as_ref().and_then(|c| c.session.clone()) else {
             continue;
         };
@@ -2769,6 +2774,7 @@ fn recovery_facts(
             forget_stale_repeat(repo, &author, &owed, folded_from);
         }
         let attending = obligated && recovery_gate_holds(repo, &author);
+        let asking = crate::cli::question_state::asking(&dir, session.id.as_str()).is_some();
         facts.push(crate::cli::recovery::Facts {
             agent_dir: crate::agent_store::agents_root(repo).join(author.as_str()),
             author,
@@ -2778,6 +2784,7 @@ fn recovery_facts(
             obligated,
             stall_after,
             attending,
+            asking,
         });
     }
     facts
@@ -2853,7 +2860,16 @@ fn owed_items(
 /// A question or block is pending, or the agent provably attends to work.
 fn recovery_gate_holds(repo: &std::path::Path, author: &AgentLabel) -> bool {
     let dir = crate::agent_store::agents_root(repo).join(author.as_str());
-    crate::cli::wait::blocked(repo, author) || crate::cli::stop_hook::attendance_is_live(&dir)
+    let asking = || {
+        crate::agent_store::load_agent_config(repo, author)
+            .ok()
+            .flatten()
+            .and_then(|c| c.session)
+            .is_some_and(|s| crate::cli::question_state::asking(&dir, s.id.as_str()).is_some())
+    };
+    crate::cli::wait::blocked(repo, author)
+        || crate::cli::stop_hook::attendance_is_live(&dir)
+        || asking()
 }
 
 /// A transport's answer, and the attempt it answers.
@@ -4570,6 +4586,40 @@ mod recovery_tests {
             "the configured interval"
         );
         assert!(!alone[0].attending);
+        // A question from a session no longer the agent's is over at the
+        // next fold.
+        let qdir = crate::agent_store::agents_root(repo.path()).join("codex");
+        let bind = |tool, session| {
+            crate::agent_store::bind_session_to_agent(
+                repo.path(),
+                &codex,
+                tool,
+                &clank_core::ids::SessionId::parse(session).unwrap(),
+            )
+            .unwrap()
+        };
+        bind(clank_core::Tool::Claude, "session-zero");
+        crate::cli::question_state::observe(
+            &qdir,
+            [crate::cli::question_state::Observation::Asked {
+                key: crate::cli::question_state::Key {
+                    session: "session-zero".into(),
+                    prompt: "p".into(),
+                    tool_use: "t".into(),
+                },
+                header: "old".into(),
+                input: "h".into(),
+            }],
+        );
+        assert!(facts(&[])[0].asking, "its record is read for what ends it");
+        bind(clank_core::Tool::Codex, "session-one");
+        facts(&[]);
+        assert!(
+            crate::cli::question_state::load(&qdir)
+                .unwrap()
+                .pending
+                .is_empty()
+        );
 
         // A count that still describes the agent survives folds, a standing
         // block included; a change of session or of block clears it.
@@ -4740,6 +4790,38 @@ mod recovery_tests {
 
         crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::Off).unwrap();
         assert_eq!(gate(&[]), Gate::AutoOff);
+
+        // A question pending in the bound session holds recovery, with no
+        // viewer anywhere; its answer releases it.
+        std::fs::remove_file(dir.join("attending")).unwrap();
+        crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::On).unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &codex,
+            clank_core::Tool::Claude,
+            &clank_core::ids::SessionId::parse("session-one").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gate(&[]), Gate::Go);
+        let key = crate::cli::question_state::Key {
+            session: "session-one".into(),
+            prompt: "p1".into(),
+            tool_use: "t1".into(),
+        };
+        crate::cli::question_state::observe(
+            &dir,
+            [crate::cli::question_state::Observation::Asked {
+                key: key.clone(),
+                header: "Which?".into(),
+                input: "h".into(),
+            }],
+        );
+        assert_eq!(gate(&[]), Gate::Hold);
+        crate::cli::question_state::observe(
+            &dir,
+            [crate::cli::question_state::Observation::Result { key }],
+        );
+        assert_eq!(gate(&[]), Gate::Go);
     }
 
     #[test]

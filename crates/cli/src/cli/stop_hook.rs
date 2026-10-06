@@ -372,6 +372,7 @@ async fn compute_outcome_capturing(
     // Read now, before the wait: where in the agent's record this Stop
     // came from, not wherever the record has got to by delivery.
     let boundary = native_boundary(tool, &input);
+    let turn_over = question_evidence(tool, &input, boundary.as_ref());
 
     // Resolve repo: explicit --repo (testing) > hook stdin cwd.
     let repo = match resolve_hook_repo(repo_override, &input) {
@@ -390,6 +391,7 @@ async fn compute_outcome_capturing(
         };
     }
     let agent_dir = crate::agent_store::agents_root(&repo).join(label.as_str());
+    super::question_state::observe(&agent_dir, turn_over);
 
     // ONE EXIT, so what is reported is what the turn actually did.
     // The turn used to record its INTENT before parking, and nothing
@@ -3049,6 +3051,31 @@ impl ReceiptCapture {
     }
 }
 
+/// What this Stop proves about the agent's questions: the turn it ends,
+/// and the prompts its record shows behind that turn. Only Claude asks
+/// them.
+fn question_evidence(
+    tool: Tool,
+    input: &HookInput,
+    boundary: Option<&super::wake_repeat::Boundary>,
+) -> Vec<super::question_state::Observation> {
+    use super::question_state::Observation;
+    let (Tool::Claude, Some(b), Some(transcript)) = (tool, boundary, &input.transcript_path) else {
+        return Vec::new();
+    };
+    let session = input.session_id.as_str().to_string();
+    vec![
+        Observation::TurnOver {
+            session: session.clone(),
+            prompt: b.turn.clone(),
+        },
+        Observation::Behind {
+            session,
+            older: super::question_state::prompts_behind(Path::new(transcript), &b.turn),
+        },
+    ]
+}
+
 /// Where this Stop comes from in the agent's own record, read when the
 /// hook is invoked, before any waiting: what places it among the Stops
 /// already counted.
@@ -3989,6 +4016,43 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A Claude Stop ends its own turn's questions and those of the turns
+    /// behind it; other harnesses ask none.
+    #[test]
+    fn a_stop_proves_which_turns_are_over() {
+        use super::super::question_state::Observation;
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let user = |id: &str| {
+            format!(r#"{{"type":"user","promptId":"{id}","message":{{"content":"go"}}}}"#)
+        };
+        std::fs::write(&transcript, format!("{}\n{}\n", user("p1"), user("p2"))).unwrap();
+        let input = HookInput {
+            session_id: clank_core::SessionId::parse("session-one").unwrap(),
+            cwd: "/".into(),
+            transcript_path: Some(transcript.display().to_string()),
+            stop_hook_active: false,
+            last_assistant_message: None,
+            turn_id: None,
+            background_tasks: Vec::new(),
+        };
+        let boundary = native_boundary(Tool::Claude, &input);
+        assert_eq!(
+            question_evidence(Tool::Claude, &input, boundary.as_ref()),
+            vec![
+                Observation::TurnOver {
+                    session: "session-one".into(),
+                    prompt: "p2".into(),
+                },
+                Observation::Behind {
+                    session: "session-one".into(),
+                    older: vec!["p1".into()]
+                },
+            ]
+        );
+        assert!(question_evidence(Tool::Codex, &input, boundary.as_ref()).is_empty());
     }
 
     /// The monitor's attendance: a marker counts only while its recorded

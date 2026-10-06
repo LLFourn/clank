@@ -150,6 +150,11 @@ impl Snapshot {
         self.turns.back()
     }
 
+    /// The turns' ids, oldest first.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = &str> {
+        self.turns.iter().map(|t| t.id.as_str())
+    }
+
     /// The turns that began after `id`. When `id` is not here, every turn
     /// here began after it: what is read is always a suffix of the record.
     fn after(&self, id: &str) -> Vec<&TurnRec> {
@@ -953,6 +958,10 @@ pub(crate) struct Facts {
     /// A question or block is pending, or attendance is proven: the agent
     /// is not stalled, whatever its record says.
     pub(crate) attending: bool,
+    /// The agent is waiting on a question it asked: its record is read for
+    /// what ends it, whether or not the agent owes anything. A cancelled
+    /// question has no hook and no Stop, only its result in the record.
+    pub(crate) asking: bool,
 }
 
 /// What the monitor must do for an agent.
@@ -1008,6 +1017,9 @@ struct Watched {
     session: String,
     agent_dir: PathBuf,
     auto: bool,
+    /// Whether anything is decided from the record, or it is read only for
+    /// what ends a question.
+    obligated: bool,
     /// Resolved once per binding, not on every fold: resolving a Codex
     /// rollout walks its session directories.
     source: Option<(clank_core::agent_config::Session, Option<Source>)>,
@@ -1116,6 +1128,7 @@ impl Driver {
                     session: session.clone(),
                     agent_dir: f.agent_dir.clone(),
                     auto: f.auto,
+                    obligated: f.obligated,
                     source: None,
                     watch: None,
                     read: None,
@@ -1130,6 +1143,7 @@ impl Driver {
                     stall_held: None,
                 });
             w.auto = f.auto;
+            w.obligated = f.obligated && !f.delivering;
             if w.session != session {
                 acts.extend(decision(
                     &f.author,
@@ -1143,35 +1157,23 @@ impl Driver {
                 w.tool = f.session.tool;
                 w.snap = Snapshot::default();
             }
-            if f.delivering {
-                acts.extend(decision(&f.author, w, now, Some(Gate::Deliverer), None));
+            if !w.obligated {
+                let gate = if f.delivering {
+                    Gate::Deliverer
+                } else {
+                    Gate::ObligationCleared
+                };
+                acts.extend(decision(&f.author, w, now, Some(gate), None));
                 w.stall_policy = None;
                 acts.extend(set_stall(&f.author, w, None, now));
-                disarm(w);
+                if f.asking {
+                    watch_record(w, &f.session, &self.cwd, &self.home);
+                } else {
+                    disarm(w);
+                }
                 continue;
             }
-            if !f.obligated {
-                acts.extend(decision(
-                    &f.author,
-                    w,
-                    now,
-                    Some(Gate::ObligationCleared),
-                    None,
-                ));
-                w.stall_policy = None;
-                acts.extend(set_stall(&f.author, w, None, now));
-                disarm(w);
-                continue;
-            }
-            let rebound = w.source.as_ref().is_none_or(|(s, _)| s != &f.session);
-            if rebound {
-                // A new binding, or a new record for the same session.
-                let source = record_source(&f.agent_dir, &f.session, &self.cwd, &self.home);
-                w.source = Some((f.session.clone(), source));
-            }
-            // Otherwise the watch reports what changes: nothing is looked
-            // at again on a fold.
-            let armed = (rebound || w.watch.is_none()) && ensure(w);
+            let armed = watch_record(w, &f.session, &self.cwd, &self.home);
             if armed {
                 acts.extend(decision(&f.author, w, now, None, None));
             }
@@ -1239,7 +1241,7 @@ impl Driver {
                         }
                     }
                     let armed = ensure(w);
-                    if armed || refresh(w) {
+                    if (armed || refresh(w)) && w.obligated {
                         acts.extend(decision(author, w, now, None, None));
                     }
                     if let Some(s) = w.stall.clone()
@@ -1340,6 +1342,23 @@ impl Driver {
 
 /// Keep the agent's watch on where its record lives, and its reading on
 /// the record that is there now. Whether a record was newly read.
+/// Keep `w`'s record read and watched; whether it was (re)armed. The
+/// watch reports what changes: nothing is looked at again on a fold.
+fn watch_record(
+    w: &mut Watched,
+    session: &clank_core::agent_config::Session,
+    cwd: &Path,
+    home: &Path,
+) -> bool {
+    let rebound = w.source.as_ref().is_none_or(|(s, _)| s != session);
+    if rebound {
+        // A new binding, or a new record for the same session.
+        let source = record_source(&w.agent_dir, session, cwd, home);
+        w.source = Some((session.clone(), source));
+    }
+    (rebound || w.watch.is_none()) && ensure(w)
+}
+
 fn ensure(w: &mut Watched) -> bool {
     let Some((_, Some(source))) = &w.source else {
         disarm(w);
@@ -1364,7 +1383,58 @@ fn arm(w: &mut Watched, path: PathBuf) -> bool {
     };
     w.read = Some(Reading { path, tail, reader });
     w.snap = snap;
+    let seen = w.snap.ids().map(str::to_string).collect();
+    question_evidence(w, seen, Vec::new(), true);
     true
+}
+
+/// What a Claude agent's record says about the questions it asked: the
+/// turns `seen` begin, in the record's order, are behind the newest; the
+/// calls it `returned` are over; and a failed newest turn ends that turn's
+/// questions (a provider error skips Stop). Attributed by the record's own
+/// order and keys, never by the failure, which names no turn. On `arming`,
+/// each question still pending is looked for in the record itself, once.
+fn question_evidence(
+    w: &Watched,
+    seen: Vec<String>,
+    returned: Vec<super::question_state::Key>,
+    arming: bool,
+) {
+    use super::question_state::{Observation, load, observe, recorded_end};
+    if w.tool != Tool::Claude || !super::question_state::path(&w.agent_dir).exists() {
+        return;
+    }
+    let pending: Vec<super::question_state::Key> = load(&w.agent_dir)
+        .map(|s| s.pending.into_iter().map(|q| q.key).collect())
+        .unwrap_or_default();
+    // Only a pending call's result is news: a hook ran before the record
+    // published any call, so every other one is already recorded.
+    let mut evidence: Vec<Observation> = returned
+        .into_iter()
+        .filter(|k| pending.contains(k))
+        .map(|key| Observation::Result { key })
+        .collect();
+    if let Some(latest) = w.snap.latest() {
+        evidence.push(Observation::Behind {
+            session: w.session.clone(),
+            older: seen.into_iter().filter(|id| *id != latest.id).collect(),
+        });
+        if matches!(latest.outcome, Outcome::Failed(_)) {
+            evidence.push(Observation::TurnOver {
+                session: w.session.clone(),
+                prompt: latest.id.clone(),
+            });
+        }
+    }
+    if let (true, Some(read)) = (arming, &w.read) {
+        evidence.extend(
+            pending
+                .iter()
+                .filter(|k| k.session == w.session)
+                .filter_map(|k| recorded_end(&read.path, k)),
+        );
+    }
+    observe(&w.agent_dir, evidence);
 }
 
 fn disarm(w: &mut Watched) {
@@ -1388,11 +1458,22 @@ fn refresh(w: &mut Watched) -> bool {
         w.read = None;
         return arm(w, path);
     }
+    let mut seen: Vec<String> = w.snap.ids().map(str::to_string).collect();
+    let mut returned = Vec::new();
     for line in &polled.lines {
+        if w.tool == Tool::Claude {
+            returned.extend(super::question_state::results_in(&line.text, &w.session));
+        }
         if let Some(fact) = r.reader.read(&line.text) {
+            if let Fact::Started { id, .. } = &fact
+                && !seen.contains(id)
+            {
+                seen.push(id.clone());
+            }
             w.snap.apply(fact);
         }
     }
+    question_evidence(w, seen, returned, false);
     true
 }
 
@@ -2653,6 +2734,7 @@ pub(crate) mod tests {
             obligated,
             stall_after: None,
             attending: false,
+            asking: false,
         }
     }
 
@@ -3074,6 +3156,7 @@ pub(crate) mod tests {
             obligated: true,
             stall_after: None,
             attending: false,
+            asking: false,
         };
         let watch = WatchKey {
             dir: root.clone(),
@@ -3671,6 +3754,7 @@ pub(crate) mod tests {
             obligated: true,
             stall_after: None,
             attending: false,
+            asking: false,
         };
         let acts = d.reconcile(vec![f], 0);
         forward(&watch, &acts);
@@ -3843,6 +3927,207 @@ pub(crate) mod tests {
         );
         let ep = load(dir.path()).unwrap();
         assert_eq!((ep.opened_by.as_str(), ep.state), ("p1", State::Escalated));
+    }
+
+    /// `prompt` of session-one asks a question, the session bound as the
+    /// question hook requires.
+    fn ask(dir: &Path, prompt: &str) {
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({"session": {
+                "id": "session-one", "tool": "claude", "updated_at": "2026-10-05T00:00:00Z",
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        crate::cli::question_state::observe(
+            dir,
+            [crate::cli::question_state::Observation::Asked {
+                key: crate::cli::question_state::Key {
+                    session: "session-one".into(),
+                    prompt: prompt.into(),
+                    tool_use: "t".into(),
+                },
+                header: "Which?".into(),
+                input: "h".into(),
+            }],
+        );
+        assert!(asking(dir), "asked");
+    }
+
+    fn asking(dir: &Path) -> bool {
+        crate::cli::question_state::asking(dir, "session-one").is_some()
+    }
+
+    /// A question whose turn failed on a provider error (no result hook, no
+    /// Stop, the binding unchanged) is over once the record is read, and so
+    /// is one a newer prompt has left behind; one still waiting is not.
+    #[test]
+    fn the_record_ends_questions_its_turns_have_left() {
+        let error = r#"{"type":"assistant","isApiErrorMessage":true,"error":"overloaded"}"#;
+        for (lines, still) in [
+            (vec![user("p1")], true),
+            (vec![user("p1"), error.to_string()], false),
+            (vec![user("p1"), user("p2")], false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("t.jsonl");
+            append(
+                &transcript,
+                &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            ask(dir.path(), "p1");
+            let mut d = driver();
+            d.reconcile(
+                vec![facts(
+                    "claude",
+                    dir.path(),
+                    &transcript,
+                    "session-one",
+                    true,
+                    false,
+                )],
+                0,
+            );
+            assert_eq!(asking(dir.path()), still, "{lines:?}");
+        }
+    }
+
+    /// A question still waiting outlives a restart: no hook is needed to
+    /// keep it, and nothing in the record ends it.
+    #[test]
+    fn a_waiting_question_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        append(
+            &transcript,
+            &[r#"{"type":"user","promptId":"p1","message":{"content":"go"}}"#],
+        );
+        ask(dir.path(), "p1");
+        for _ in 0..2 {
+            let mut d = driver();
+            d.reconcile(
+                vec![facts(
+                    "claude",
+                    dir.path(),
+                    &transcript,
+                    "session-one",
+                    true,
+                    false,
+                )],
+                0,
+            );
+            assert!(asking(dir.path()));
+        }
+    }
+
+    fn user(id: &str) -> String {
+        format!(r#"{{"type":"user","promptId":"{id}","message":{{"content":"go"}}}}"#)
+    }
+
+    /// An idle Claude agent, owing nothing, with a question pending.
+    fn claude_agent(dir: &Path, transcript: &Path) -> Driver {
+        let mut d = driver();
+        let acts = d.reconcile(
+            vec![Facts {
+                asking: true,
+                ..facts("claude", dir, transcript, "session-one", false, false)
+            }],
+            0,
+        );
+        assert!(
+            acts.iter().all(|a| matches!(a, Act::Watch(_))),
+            "nothing is decided for it: {acts:?}"
+        );
+        d
+    }
+
+    /// A restart whose first read starts after the question's prompt, and
+    /// after the Stop hook's stretch too, still finds the newer prompt
+    /// that left it behind.
+    #[test]
+    fn a_restart_ends_a_question_older_than_what_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let filler = format!(r#"{{"type":"system","pad":"{}"}}"#, "x".repeat(1024));
+        append(&transcript, &[&user("p1")]);
+        append(&transcript, &vec![filler.as_str(); 300]);
+        append(&transcript, &[&user("p2")]);
+        ask(dir.path(), "p1");
+        let (_, _, snap) = bootstrap(&transcript, Tool::Claude, "session-one").unwrap();
+        assert_eq!(snap.ids().collect::<Vec<_>>(), vec!["p2"], "p1 is not read");
+        claude_agent(dir.path(), &transcript);
+        assert!(!asking(dir.path()));
+    }
+
+    /// A question's prompt published, then left behind by more turns than
+    /// the snapshot keeps, all within one read, is still behind: the hook
+    /// ran before the record held the prompt, so the read is the first to
+    /// see it.
+    #[test]
+    fn a_long_read_ends_a_question_its_snapshot_never_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        append(&transcript, &[&user("p0")]);
+        ask(dir.path(), "p1");
+        let mut d = claude_agent(dir.path(), &transcript);
+        assert!(asking(dir.path()));
+        let mut later = vec![user("p1")];
+        later.extend((0..SNAPSHOT_TURNS + 2).map(|i| user(&format!("q{i}"))));
+        append(
+            &transcript,
+            &later.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        touched(&mut d, &transcript, 1);
+        assert!(!asking(dir.path()));
+    }
+
+    /// A question cancelled in the terminal has no result hook and no
+    /// Stop, only its result in the record: that ends it, read live or
+    /// found on a restart.
+    #[test]
+    fn a_cancelled_question_ends_on_its_recorded_result() {
+        let rejected = r#"{"type":"user","promptId":"p1","message":{"content":[{"type":"tool_result","tool_use_id":"t","is_error":true}]}}"#;
+        for restart in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("t.jsonl");
+            append(&transcript, &[&user("p1")]);
+            ask(dir.path(), "p1");
+            if restart {
+                append(&transcript, &[rejected]);
+                claude_agent(dir.path(), &transcript);
+            } else {
+                let mut d = claude_agent(dir.path(), &transcript);
+                assert!(asking(dir.path()));
+                append(&transcript, &[rejected]);
+                touched(&mut d, &transcript, 1);
+            }
+            assert!(!asking(dir.path()), "restart: {restart}");
+        }
+    }
+
+    /// An agent read only for its question is never recovered from what
+    /// its record shows: a failed turn it owes nothing for is not acted on.
+    #[test]
+    fn a_record_read_for_a_question_decides_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        append(&transcript, &[&user("p1")]);
+        ask(dir.path(), "p1");
+        let mut d = claude_agent(dir.path(), &transcript);
+        append(
+            &transcript,
+            &[
+                r#"{"type":"assistant","promptId":"p1","isApiErrorMessage":true,"error":"overloaded"}"#,
+            ],
+        );
+        let acts = touched(&mut d, &transcript, 1);
+        assert!(acts.is_empty(), "{acts:?}");
+        assert!(d.due(10_000, |_, _| Gate::Go).is_empty());
+        assert!(
+            !asking(dir.path()),
+            "the failed turn still ends its question"
+        );
     }
 
     const AFTER: u64 = 40 * 60;

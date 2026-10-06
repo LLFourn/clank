@@ -13,6 +13,24 @@ const clickUnavailableChat = async (page) => {
 
 (async () => {
   try {
+  // ---- an agent's pending question shows in the header and the picker,
+  // to a page that connects after it was asked, and goes when it ends
+  {
+    const { page, errors } = await open();
+    const frame = (asking) => facts([{ ...agent('claude', 'master', null, 'reviewed abc'), asking }]);
+    await page.evaluate((d) => window.__send('status', d), frame('Direction <b>'));
+    ok('a late viewer sees what the agent is asking',
+       (await page.textContent('#doing')).includes('asking you “Direction <b>”'));
+    await page.click('#who');
+    ok('the picker says it too',
+       (await page.textContent('.picker .opt[data-key="pin:claude"]')).includes('asking you'));
+    await page.keyboard.press('Escape');
+    await page.evaluate((d) => window.__send('status', d), frame(null));
+    ok('an answered question leaves the header',
+       !(await page.textContent('#doing')).includes('asking') && (await page.textContent('#doing')).includes('reviewed abc'));
+    ok('no page errors (asking)', errors.length === 0, errors.join('; '));
+  }
+
   // ---- blocks can be answered in the page without losing a draft on status refresh
   {
     const { browser, page, errors } = await open();

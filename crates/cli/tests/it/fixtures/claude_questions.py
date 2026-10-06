@@ -38,6 +38,7 @@ root=pathlib.Path(sys.argv[1])
 value=json.load(sys.stdin)
 event=value['hook_event_name']
 (root/(event+'.json')).write_text(json.dumps(value))
+(root/(event+'.transcript')).write_bytes(pathlib.Path(value['transcript_path']).read_bytes())
 if event=='PermissionRequest':
     # Self-held FIFO avoids blocking before publication. This is a local
     # fixture response channel, not the proposed production hook transport.
@@ -118,6 +119,21 @@ def tool_results(messages):
             if block.get("type") == "tool_result" and block.get("tool_use_id") == TOOL_ID]
 
 
+def published(transcript, prompt_id):
+    """What of this question the native record holds: its prompt, its call."""
+    seen = {"prompt": False, "tool_use": False}
+    for line in transcript.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        seen["prompt"] |= record.get("promptId") == prompt_id
+        content = record.get("message", {}).get("content")
+        seen["tool_use"] |= isinstance(content, list) and any(
+            block.get("type") == "tool_use" and block.get("id") == TOOL_ID for block in content)
+    return seen
+
+
 def recorded_results(profile):
     results = []
     for path in (profile / "projects").glob("*/*.jsonl"):
@@ -135,6 +151,7 @@ root = pathlib.Path(sys.argv[1])
 raw = sys.stdin.read()
 value = json.loads(raw)
 (root / (value['hook_event_name'] + '.json')).write_text(json.dumps(value))
+(root / (value['hook_event_name'] + '.transcript')).write_bytes(pathlib.Path(value['transcript_path']).read_bytes())
 if value['hook_event_name'] == 'PermissionRequest':
     (root / 'hook-ready').write_text('clank')
 result = subprocess.run([sys.argv[2], 'question-hook'], input=raw, text=True, capture_output=True)
@@ -218,6 +235,19 @@ def run(binary, scenario, broker=None):
                     assert pre["prompt_id"] == permission["prompt_id"]
                     assert pre["tool_input"] == permission["tool_input"] == QUESTION
                     assert "tool_use_id" not in permission, "Do not invent a PermissionRequest tool id"
+                    # Both hooks run before the native record publishes the
+                    # prompt or the call (2.1.280 holds neither then); the
+                    # call is published while the question still waits, so
+                    # a viewer's transcript card needs no other source.
+                    at_hook = {event: published((root / (event + ".transcript")).read_text(), pre["prompt_id"])
+                               for event in ("PreToolUse", "PermissionRequest")}
+                    print(f"publication at hook: {at_hook}", file=sys.stderr, flush=True)
+                    transcript = Path(pre["transcript_path"])
+                    waited = time.monotonic()
+                    while not published(transcript.read_text(), pre["prompt_id"])["tool_use"]:
+                        assert time.monotonic() - waited < 10, "The pending call was never published"
+                        time.sleep(.02)
+                    assert not recorded_results(profile), "Published only once answered"
                     # The interactive local dialog is visible while PermissionRequest blocks.
                     if broker:
                         print(json.dumps({'ready': True, 'input': pre}), flush=True)

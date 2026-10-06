@@ -681,8 +681,64 @@ struct HookReply {
 
 /// Native command adapter. Missing/stale/unsupported brokers immediately leave
 /// the ordinary terminal flow alone; this command never starts a broker.
+/// Record what this hook says about a bound agent's question, before any
+/// broker is asked, so the question is known with no viewer attached.
+fn record(hook: &Hook, env: &dyn crate::agent_env::Ambient) {
+    use crate::cli::question_state::{Key, Observation, input_hash, observe};
+    let Ok(repo) = crate::cli::resolve_repo(Some(Path::new(&hook.cwd))) else {
+        return;
+    };
+    let Ok(session) = clank_core::ids::SessionId::parse(&hook.session_id) else {
+        return;
+    };
+    let Ok(label) =
+        crate::agent_env::resolve_identity_for_hook_in(&repo, Tool::Claude, &session, env)
+    else {
+        return;
+    };
+    let key = |tool_use: &String| Key {
+        session: hook.session_id.clone(),
+        prompt: hook.prompt_id.clone(),
+        tool_use: tool_use.clone(),
+    };
+    let observation = match (hook.hook_event_name.as_str(), &hook.tool_use_id) {
+        ("PreToolUse", Some(id)) => Observation::Asked {
+            key: key(id),
+            header: header_of(&hook.tool_input),
+            input: input_hash(&hook.tool_input),
+        },
+        ("PostToolUse" | "PostToolUseFailure", Some(id)) => Observation::Result { key: key(id) },
+        // PermissionRequest carries no tool call id and changes nothing
+        // already recorded; anything without an id cannot be keyed.
+        _ => return,
+    };
+    observe(
+        &crate::agent_store::agents_root(&repo).join(label.as_str()),
+        [observation],
+    );
+}
+
+/// One line saying what is asked: the first question's header, or else its
+/// first line.
+fn header_of(input: &Value) -> String {
+    let first = input.pointer("/questions/0");
+    let pick = |key: &str| {
+        first
+            .and_then(|q| q.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| s.lines().next().unwrap_or_default().trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    pick("header")
+        .or_else(|| pick("question"))
+        .unwrap_or_else(|| "a question".into())
+}
+
 pub(crate) async fn run() -> Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
+    if let Ok(hook) = serde_json::from_str::<Hook>(&input) {
+        record(&hook, &crate::agent_env::Process);
+    }
     let result = async {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -794,6 +850,11 @@ mod tests {
             .unwrap();
             let ready: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(ready["ready"], true);
+            let agent_dir =
+                crate::agent_store::agents_root(repo.path()).join("claude-question-agent");
+            let asking =
+                || crate::cli::question_state::asking(&agent_dir, session).map(|q| q.header);
+            assert_eq!(asking(), Some("Direction".into()), "{scenario}: recorded");
             let (_, mut updates) = registry.feed.bridge_connect();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while !registry
@@ -864,6 +925,33 @@ mod tests {
             })
             .await
             .unwrap();
+            if scenario == "cancel" {
+                // No result hook and no Stop: only the record says so.
+                assert!(asking().is_some(), "a cancel runs no hook");
+                let binding: clank_core::agent_config::Session = serde_json::from_value(json!({
+                    "id": session,
+                    "tool": "claude",
+                    "updated_at": "2026-10-06T00:00:00Z",
+                    "transcript": ready["input"]["transcript_path"],
+                }))
+                .unwrap();
+                crate::cli::recovery::Driver::new(repo.path().into(), "/nonexistent-home".into())
+                    .reconcile(
+                        vec![crate::cli::recovery::Facts {
+                            author: AgentLabel::parse("claude-question-agent").unwrap(),
+                            agent_dir: agent_dir.clone(),
+                            session: binding,
+                            auto: true,
+                            delivering: false,
+                            obligated: false,
+                            stall_after: None,
+                            attending: false,
+                            asking: asking().is_some(),
+                        }],
+                        0,
+                    );
+            }
+            assert_eq!(asking(), None, "{scenario}: ended");
             assert_eq!(
                 registry.answer(ask).await.status,
                 409,
@@ -952,6 +1040,86 @@ mod tests {
         h.tool_response = Some(json!({"answers":{"Choose direction":answer}}));
         h
     }
+    fn record_in(hook: &Hook) {
+        record(hook, &crate::agent_env::Stated::default());
+    }
+
+    /// With no broker listening, the hook still records a bound agent's
+    /// question, and its own result ends it. Another session's hooks, and
+    /// a PermissionRequest (no tool call id), change nothing.
+    #[test]
+    fn the_hook_records_a_bound_agents_question_without_a_broker() {
+        use crate::cli::question_state::asking;
+        let (repo, _registry, hook) = fixture();
+        let dir = crate::agent_store::agents_root(repo.path()).join("claude-question-agent");
+        record_in(&hook);
+        assert_eq!(
+            asking(&dir, "claude-fixture").map(|q| q.header),
+            Some("Direction".into())
+        );
+        let mut permission = hook.clone();
+        permission.hook_event_name = "PermissionRequest".into();
+        permission.tool_use_id = None;
+        record_in(&permission);
+        assert!(asking(&dir, "claude-fixture").is_some());
+        let mut foreign = post(&hook, "South");
+        foreign.session_id = "another-session".into();
+        record_in(&foreign);
+        assert!(
+            asking(&dir, "claude-fixture").is_some(),
+            "another session's result"
+        );
+        // An old session of this very agent, named by its environment, is
+        // still not the bound one.
+        let mut stale = hook.clone();
+        stale.session_id = "old-session".into();
+        stale.tool_use_id = Some("tool-old".into());
+        record(
+            &stale,
+            &crate::agent_env::Stated::saying(&[("CLANK_AGENT", "claude-question-agent")]),
+        );
+        assert_eq!(
+            asking(&dir, "old-session"),
+            None,
+            "an unbound session's question"
+        );
+        record_in(&post(&hook, "South"));
+        assert_eq!(asking(&dir, "claude-fixture"), None);
+        record_in(&hook);
+        assert_eq!(
+            asking(&dir, "claude-fixture"),
+            None,
+            "a replayed pre-tool hook"
+        );
+        let mut failing = hook.clone();
+        failing.tool_use_id = Some("tool-two".into());
+        record_in(&failing);
+        failing.hook_event_name = "PostToolUseFailure".into();
+        record_in(&failing);
+        assert_eq!(asking(&dir, "claude-fixture"), None);
+    }
+
+    /// What the hook records is what the remote status frame says, to a
+    /// viewer who connects at any time after: the frame is derived from
+    /// the record, with no broker or viewer present when it was asked.
+    #[tokio::test]
+    async fn the_status_frame_says_a_recorded_question_is_waiting() {
+        let (repo, _registry, hook) = fixture();
+        let frame = || async {
+            let snap = crate::cli::status::snapshot(repo.path(), None)
+                .await
+                .unwrap();
+            crate::cli::web::status_payload(repo.path(), &snap, &Default::default())
+                ["facts"]["agents"][0]["asking"]
+                .clone()
+        };
+        assert_eq!(frame().await, Value::Null);
+        record_in(&hook);
+        assert_eq!(frame().await, json!("Direction"));
+        record_in(&post(&hook, "South"));
+        assert_eq!(frame().await, Value::Null);
+    }
+
     #[tokio::test]
     async fn remote_receipt_and_local_winner_are_native_and_never_replayed_as_plaintext() {
         for local in [false, true] {
