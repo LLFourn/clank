@@ -1887,8 +1887,11 @@ mod json_output_tests {
             }
         ));
         let described = event_row_text(reply);
+        let crate::cli::github::log::ReplyRoute::Message(to) = &op.route else {
+            panic!("a message reply")
+        };
         assert!(
-            described.starts_with(&format!("→ @coordinator ({})", op.route.repo.display())),
+            described.starts_with(&format!("→ @coordinator ({})", to.repo.display())),
             "an outgoing reply names its target and the repo it is in: {described}"
         );
         assert_eq!(event_badge(reply), "✉");
@@ -2948,10 +2951,10 @@ mod event_row_tests {
             delivery_id: "d".into(),
             from: "claude".into(),
             from_repo: from_repo.into(),
-            destination: clank_core::wait::MessageReplyRoute {
+            destination: Some(clank_core::wait::MessageReplyRoute {
                 repo: to_repo.into(),
                 agent: clank_core::ids::AgentLabel::parse(agent).unwrap(),
-            },
+            }),
             original: MemberKey {
                 agent: "claude".into(),
                 source: "messages".into(),

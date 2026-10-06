@@ -804,7 +804,8 @@ pub enum EventsCmd {
     List(EventsListArgs),
     /// Mark events handled so they stop waking you.
     Ack(EventsAckArgs),
-    /// Send a deliberate message reply without acknowledging the original.
+    /// Send a further reply to an event whose backend takes replies, without
+    /// acknowledging it.
     Reply(EventsReplyArgs),
     /// Inspect one event's metadata without reading content.
     Show(EventsShowArgs),

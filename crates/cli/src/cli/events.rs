@@ -14,7 +14,7 @@ use crate::cli::github::log::{EventLog, EventRow};
 use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
 
-mod message_reply;
+mod operation;
 mod read;
 mod reply;
 use reply::ack_with_reply;
@@ -49,7 +49,7 @@ pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
             let selected = resolve(&rows, &a.id)?;
             let repo = super::resolve_repo(a.repo.as_deref())?;
             let text = super::send::body_of(&a.message, a.file.as_deref())?;
-            message_reply::submit(&repo, &dir, selected, &text, a.operation.as_deref(), false)
+            operation::submit(&repo, &dir, selected, &text, a.operation.as_deref(), false).await
         }
     }
 }
@@ -547,23 +547,38 @@ fn metadata_row(rows: &[Sourced], s: &Sourced) -> serde_json::Value {
     if s.row.reply.is_some() {
         fields.insert("reply_accepted".into(), json!(s.row.reply_accepted));
     }
-    if s.row.message_history_pruned {
-        fields.insert("message_history_pruned".into(), json!(true));
+    if s.row.reply_history_pruned {
+        fields.insert("reply_history_pruned".into(), json!(true));
     }
-    if !s.row.message_replies.is_empty() {
+    if !s.row.replies.is_empty() {
         fields.insert(
-            "message_replies".into(),
+            "replies".into(),
             json!(
                 s.row
-                    .message_replies
+                    .replies
                     .iter()
-                    .map(|r| json!({"id":r.operation.id, "route":r.operation.route,
-                "acknowledge":r.operation.acknowledge,"accepted":r.receipt.is_some()}))
+                    .map(
+                        |r| json!({"id":r.operation.id, "route":route_metadata(&r.operation.route),
+                "acknowledge":r.operation.acknowledge,"accepted":r.receipt.is_some()})
+                    )
                     .collect::<Vec<_>>()
             ),
         );
     }
     value
+}
+/// Where a reply went, as discovery may say it: an agent and its repo, or
+/// only that it was the event's own handler, whose argv, cwd and state stay
+/// behind `events read`.
+fn route_metadata(route: &crate::cli::github::log::ReplyRoute) -> serde_json::Value {
+    match route {
+        crate::cli::github::log::ReplyRoute::Message(to) => {
+            serde_json::json!({"repo": to.repo, "agent": to.agent})
+        }
+        crate::cli::github::log::ReplyRoute::Command(_) => {
+            serde_json::json!({"backend": "reply_command"})
+        }
+    }
 }
 fn metadata_description(item: &WaitItem) -> String {
     let clean = |s: &str| crate::cli::status_tui::text::one_line(s, usize::MAX);
@@ -843,13 +858,13 @@ fn render_full(
         )?;
         writeln!(writer, "accepted:  {}", s.row.reply_accepted)?;
     }
-    if s.row.message_history_pruned {
+    if s.row.reply_history_pruned {
         writeln!(
             writer,
             "Reply history: older accepted replies were pruned; retained replies follow"
         )?;
     }
-    for state in &s.row.message_replies {
+    for state in &s.row.replies {
         let op = &state.operation;
         writeln!(
             writer,
@@ -866,12 +881,17 @@ fn render_full(
                 "pending"
             }
         )?;
-        writeln!(
-            writer,
-            "reply to:  {} ({})",
-            op.route.agent,
-            crate::cli::status_tui::text::safe_multiline(&op.route.repo.display().to_string())
-        )?;
+        match &op.route {
+            crate::cli::github::log::ReplyRoute::Message(route) => writeln!(
+                writer,
+                "reply to:  {} ({})",
+                route.agent,
+                crate::cli::status_tui::text::safe_multiline(&route.repo.display().to_string())
+            )?,
+            crate::cli::github::log::ReplyRoute::Command(_) => {
+                writeln!(writer, "reply to:  the event's reply_command")?
+            }
+        }
         writeln!(
             writer,
             "reply:     {}",

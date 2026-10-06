@@ -3151,11 +3151,14 @@ pub(super) fn render_event_detail(
         wrapped_fact(
             &mut body,
             "to",
-            format!(
-                "{} ({})",
-                clean(reply.destination.agent.as_str()),
-                clean(&reply.destination.repo.display().to_string())
-            ),
+            match &reply.destination {
+                Some(to) => format!(
+                    "{} ({})",
+                    clean(to.agent.as_str()),
+                    clean(&to.repo.display().to_string())
+                ),
+                None => format!("the {} backend", clean(&ev.source)),
+            },
         );
         wrapped_fact(&mut body, "operation", clean(&reply.operation_id));
         wrapped_fact(

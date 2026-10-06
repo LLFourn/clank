@@ -1,23 +1,55 @@
-//! Durable message operations and receiver custody. No cross-repo lock or worker.
+//! Durable reply operations, and a message reply's receiver custody. No
+//! cross-repo lock or worker.
 use super::*;
-use clank_core::{ids::AgentLabel, wait::MessageReplyRoute};
+use clank_core::{
+    ids::AgentLabel,
+    wait::{CommandReplyRoute, MessageReplyRoute},
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const DELIVERY_PREFIX: &str = "message-reply/";
+
+/// Where a reply goes, captured before it is sent: another agent's inbox,
+/// or the backend that produced the event. Untagged so a message route
+/// keeps the bytes it had before command replies existed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MessageOperation {
+#[serde(untagged)]
+pub(crate) enum ReplyRoute {
+    Message(MessageReplyRoute),
+    Command(CommandReplyRoute),
+}
+
+/// What proves a reply was taken: the recipient's inbox record, or the
+/// backend's reply_command finishing successfully.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Acceptance {
+    Message(MessageReceipt),
+    Command { accepted_at: u64 },
+}
+
+/// One reply, deliberate or acknowledging, to one retained event. Its input
+/// is immutable: a retry names its `id` and resends exactly this.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplyOperation {
     pub id: String,
     pub repo: PathBuf,
     pub author: AgentLabel,
     pub original_seq: u64,
     pub original_ident: String,
+    /// The original's own identity: a message's handle, a command event's
+    /// producer id.
     pub original_handle: String,
-    pub route: MessageReplyRoute,
+    pub route: ReplyRoute,
     pub text: String,
     pub at: u64,
     pub acknowledge: bool,
+    /// The command source's name, so a reply is still shown under it once
+    /// its original has aged out of the log. None for a message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
-impl MessageOperation {
+impl ReplyOperation {
     pub(crate) fn delivery_id(&self) -> String {
         blake3::hash(
             &serde_json::to_vec(&("message-delivery-v1", &self.repo, &self.author, &self.id))
@@ -54,10 +86,10 @@ pub(crate) struct MessageReceipt {
     pub ident: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct MessageOperationState {
+pub(crate) struct ReplyOperationState {
     pub seq: u64,
-    pub operation: MessageOperation,
-    pub receipt: Option<MessageReceipt>,
+    pub operation: ReplyOperation,
+    pub receipt: Option<Acceptance>,
 }
 fn invalid(text: &str) -> std::io::Error {
     std::io::Error::other(text)
@@ -67,25 +99,24 @@ fn digest(item: &WaitItem) -> String {
         .to_hex()
         .to_string()
 }
-pub(super) fn operations(lines: &[Line]) -> std::io::Result<Vec<MessageOperationState>> {
-    let mut states: BTreeMap<String, MessageOperationState> = BTreeMap::new();
+pub(super) fn operations(lines: &[Line]) -> std::io::Result<Vec<ReplyOperationState>> {
+    let mut states: BTreeMap<String, ReplyOperationState> = BTreeMap::new();
     for line in lines {
         if let Line::Known(record) = line
-            && let Record::MessageOperation {
+            && let Record::ReplyOperation {
                 seq,
                 operation,
                 receipt,
                 ..
             } = record.as_ref()
         {
-            let state =
-                states
-                    .entry(operation.id.clone())
-                    .or_insert_with(|| MessageOperationState {
-                        seq: *seq,
-                        operation: operation.clone(),
-                        receipt: None,
-                    });
+            let state = states
+                .entry(operation.id.clone())
+                .or_insert_with(|| ReplyOperationState {
+                    seq: *seq,
+                    operation: operation.clone(),
+                    receipt: None,
+                });
             if state.seq != *seq
                 || state.operation != *operation
                 || (state.receipt.is_some() && receipt.is_some() && state.receipt != *receipt)
@@ -95,11 +126,9 @@ pub(super) fn operations(lines: &[Line]) -> std::io::Result<Vec<MessageOperation
                 ));
             }
             if let Some(receipt) = receipt {
-                if receipt.id != operation.delivery_id()
-                    || receipt.digest != digest(&operation.item())
-                {
+                if !proves(operation, receipt) {
                     return Err(invalid(
-                        "message acceptance does not match its immutable operation",
+                        "reply acceptance does not match its immutable operation",
                     ));
                 }
                 state.receipt = Some(receipt.clone());
@@ -109,6 +138,24 @@ pub(super) fn operations(lines: &[Line]) -> std::io::Result<Vec<MessageOperation
     let mut out: Vec<_> = states.into_values().collect();
     out.sort_by_key(|s| s.seq);
     Ok(out)
+}
+/// Whether `acceptance` is evidence for `operation`: a message receipt for
+/// exactly its delivery, or a backend's for a command route.
+fn proves(operation: &ReplyOperation, acceptance: &Acceptance) -> bool {
+    match (&operation.route, acceptance) {
+        (ReplyRoute::Message(_), Acceptance::Message(receipt)) => {
+            receipt.id == operation.delivery_id() && receipt.digest == digest(&operation.item())
+        }
+        (ReplyRoute::Command(_), Acceptance::Command { .. }) => true,
+        _ => false,
+    }
+}
+fn handle_of(item: &WaitItem) -> Option<&str> {
+    match item {
+        WaitItem::Message { handle, .. } => Some(handle),
+        WaitItem::CommandEvent { id, .. } => Some(id),
+        _ => None,
+    }
 }
 pub(super) fn operation_acks(lines: &[Line]) -> Vec<(u64, Option<String>)> {
     // Corrupt/conflicting transactions never manufacture handled work. Explicit
@@ -166,26 +213,32 @@ fn receipts(lines: &[Line]) -> std::io::Result<BTreeMap<String, (MessageReceipt,
     Ok(states)
 }
 impl EventLog {
+    fn is_messages(&self) -> bool {
+        self.log_path.file_stem().and_then(|s| s.to_str()) == Some("messages")
+    }
     fn message_lines(&self) -> std::io::Result<Vec<Line>> {
-        if self.log_path.file_stem().and_then(|s| s.to_str()) != Some("messages") {
+        if !self.is_messages() {
             return Err(invalid("message transactions require the messages WAL"));
         }
+        self.operation_lines()
+    }
+    fn operation_lines(&self) -> std::io::Result<Vec<Line>> {
         let text = match std::fs::read_to_string(&self.log_path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        Self::parse(&text).map_err(|_| invalid("message WAL is corrupt; refusing transaction"))
+        Self::parse(&text).map_err(|_| invalid("event WAL is corrupt; refusing transaction"))
     }
-    pub(crate) fn message_operations(&self) -> std::io::Result<Vec<MessageOperationState>> {
+    pub(crate) fn reply_operations(&self) -> std::io::Result<Vec<ReplyOperationState>> {
         let _lock = SidecarLock::acquire(&self.lock_path, false)?;
-        operations(&self.message_lines()?)
+        operations(&self.operation_lines()?)
     }
     /// Read-only lookup before membership validation: an accepted delivery
     /// remains accepted when its recipient is subsequently removed.
     pub(crate) fn message_delivery_receipt(
         &self,
-        operation: &MessageOperation,
+        operation: &ReplyOperation,
     ) -> std::io::Result<Option<MessageReceipt>> {
         let _lock = SidecarLock::acquire(&self.lock_path, false)?;
         let saved = receipts(&self.message_lines()?)?.remove(&operation.delivery_id());
@@ -199,12 +252,12 @@ impl EventLog {
         }
     }
     /// The caller owns the author's dispatch lease and message writer lock.
-    pub(crate) fn begin_message_operation(
+    pub(crate) fn begin_reply_operation(
         &mut self,
-        operation: &MessageOperation,
-    ) -> std::io::Result<MessageOperationState> {
+        operation: &ReplyOperation,
+    ) -> std::io::Result<ReplyOperationState> {
         let _lock = SidecarLock::acquire(&self.lock_path, true)?;
-        let lines = self.message_lines()?;
+        let lines = self.operation_lines()?;
         let states = operations(&lines)?;
         if let Some(state) = states.iter().find(|s| s.operation.id == operation.id) {
             if state.operation != *operation {
@@ -216,16 +269,34 @@ impl EventLog {
         if operation.text.trim().is_empty()
             || operation.id.is_empty()
             || !operation.repo.is_absolute()
-            || !operation.route.repo.is_absolute()
         {
             return Err(invalid(
-                "message operation needs a nonempty ID/body and absolute repositories",
+                "reply operation needs a nonempty ID/body and an absolute repository",
             ));
         }
         let row = self.reply_target(operation.original_seq, &operation.original_ident)?;
-        if !matches!(&row.item, WaitItem::Message { handle, .. } if handle == &operation.original_handle)
-        {
-            return Err(invalid("message operation's original copy changed"));
+        if handle_of(&row.item) != Some(operation.original_handle.as_str()) {
+            return Err(invalid("reply operation's original copy changed"));
+        }
+        let routed = match (&operation.route, &row.item) {
+            (ReplyRoute::Message(route), WaitItem::Message { .. }) => {
+                self.is_messages() && route.repo.is_absolute()
+            }
+            // Only deliberate: a command event's acknowledging reply is its
+            // own transaction, shared by every copy.
+            (
+                ReplyRoute::Command(route),
+                WaitItem::CommandEvent {
+                    reply_route: Some(saved),
+                    ..
+                },
+            ) => route == saved && !operation.acknowledge,
+            _ => false,
+        };
+        if !routed {
+            return Err(invalid(
+                "reply operation's route is not the original's saved route",
+            ));
         }
         if operation.acknowledge && row.acked {
             return Err(invalid(
@@ -246,15 +317,15 @@ impl EventLog {
         let seq = Self::fold(lines)
             .max_seq
             .checked_add(1)
-            .ok_or_else(|| invalid("message sequence namespace exhausted"))?;
-        self.append_durable_unlocked(&Record::MessageOperation {
+            .ok_or_else(|| invalid("event sequence namespace exhausted"))?;
+        self.append_durable_unlocked(&Record::ReplyOperation {
             v: CURRENT_V,
             seq,
             operation: operation.clone(),
             receipt: None,
         })?;
         self.next_seq = seq.checked_add(1);
-        Ok(MessageOperationState {
+        Ok(ReplyOperationState {
             seq,
             operation: operation.clone(),
             receipt: None,
@@ -265,7 +336,7 @@ impl EventLog {
     /// is acceptance: compaction synthesizes its pin before aging the body out.
     pub(crate) fn accept_message_delivery(
         &mut self,
-        operation: &MessageOperation,
+        operation: &ReplyOperation,
     ) -> std::io::Result<MessageReceipt> {
         let _lock = SidecarLock::acquire(&self.lock_path, true)?;
         let lines = self.message_lines()?;
@@ -311,28 +382,29 @@ impl EventLog {
         self.next_seq = seq.checked_add(1);
         Ok(receipt)
     }
-    pub(crate) fn accept_message_operation(
+    pub(crate) fn accept_reply_operation(
         &mut self,
-        state: &MessageOperationState,
-        receipt: &MessageReceipt,
+        state: &ReplyOperationState,
+        receipt: &Acceptance,
     ) -> std::io::Result<()> {
         let _lock = SidecarLock::acquire(&self.lock_path, true)?;
-        let current = operations(&self.message_lines()?)?
+        let current = operations(&self.operation_lines()?)?
             .into_iter()
             .find(|s| s.operation.id == state.operation.id)
-            .ok_or_else(|| invalid("message intent disappeared; refusing acceptance"))?;
+            .ok_or_else(|| invalid("reply intent disappeared; refusing acceptance"))?;
         if current.seq != state.seq
             || current.operation != state.operation
-            || receipt.id != state.operation.delivery_id()
-            || receipt.digest != digest(&state.operation.item())
+            || !proves(&state.operation, receipt)
         {
             return Err(invalid(
-                "message acceptance does not match its immutable intent",
+                "reply acceptance does not match its immutable intent",
             ));
         }
         if let Some(saved) = current.receipt {
-            if saved != *receipt {
-                return Err(invalid("conflicting message acceptance"));
+            // Already accepted: a retry re-syncs it, whatever evidence it
+            // brings. A command backend's acceptance carries only its time.
+            if saved != *receipt && matches!(saved, Acceptance::Message(_)) {
+                return Err(invalid("conflicting reply acceptance"));
             }
             return self.sync_existing_log();
         }
@@ -340,7 +412,7 @@ impl EventLog {
             state.operation.original_seq,
             &state.operation.original_ident,
         )?;
-        self.append_durable_unlocked(&Record::MessageOperation {
+        self.append_durable_unlocked(&Record::ReplyOperation {
             v: CURRENT_V,
             seq: state.seq,
             operation: state.operation.clone(),
@@ -384,7 +456,7 @@ pub(super) fn compact_records(
         .take(DISPLAY_CAP)
         .map(|s| s.operation.id.clone())
         .collect();
-    let keep = |s: &MessageOperationState| {
+    let keep = |s: &ReplyOperationState| {
         s.receipt.is_none()
             || newest.contains(&s.operation.id)
             || (s.operation.acknowledge
@@ -417,7 +489,7 @@ pub(super) fn compact_records(
     let mut records: Vec<_> = states
         .into_iter()
         .filter(keep)
-        .map(|s| Record::MessageOperation {
+        .map(|s| Record::ReplyOperation {
             v: CURRENT_V,
             seq: s.seq,
             operation: s.operation,
@@ -449,6 +521,46 @@ pub(super) fn compact_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message operation as clank wrote it before command replies: its
+    /// untagged route and receipt still read as a message's.
+    #[test]
+    fn an_old_message_operation_reads_as_a_message_reply() {
+        let old = r#"{"t":"message_operation","v":1,"seq":4,"operation":{"id":"op","repo":"/src/a","author":"worker","original_seq":1,"original_ident":"i","original_handle":"h","route":{"repo":"/src/b","agent":"coordinator"},"text":"done","at":9,"acknowledge":true},"receipt":{"id":"d","digest":"g","seq":2,"ident":"j"}}"#;
+        let Record::ReplyOperation {
+            operation, receipt, ..
+        } = serde_json::from_str::<Record>(old).unwrap()
+        else {
+            panic!("an operation record");
+        };
+        assert_eq!(
+            operation.route,
+            ReplyRoute::Message(MessageReplyRoute {
+                repo: "/src/b".into(),
+                agent: AgentLabel::parse("coordinator").unwrap(),
+            })
+        );
+        assert_eq!(
+            receipt,
+            Some(Acceptance::Message(MessageReceipt {
+                id: "d".into(),
+                digest: "g".into(),
+                seq: 2,
+                ident: "j".into(),
+            }))
+        );
+        assert_eq!(
+            serde_json::to_value(Record::ReplyOperation {
+                v: 1,
+                seq: 4,
+                operation,
+                receipt,
+            })
+            .unwrap(),
+            serde_json::from_str::<serde_json::Value>(old).unwrap(),
+            "written back byte-compatible"
+        );
+    }
     fn fixture(
         acknowledge: bool,
     ) -> (
@@ -456,7 +568,7 @@ mod tests {
         tempfile::TempDir,
         EventLog,
         EventLog,
-        MessageOperation,
+        ReplyOperation,
     ) {
         let origin = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
@@ -486,17 +598,18 @@ mod tests {
             )
             .unwrap();
         let row = source.read_rows().unwrap().unwrap().rows.remove(0);
-        let operation = MessageOperation {
+        let operation = ReplyOperation {
             id: "first".into(),
             repo: origin.path().into(),
             author: AgentLabel::parse("worker").unwrap(),
             original_seq: row.seq,
             original_ident: row.ident,
             original_handle: "original".into(),
-            route,
+            route: ReplyRoute::Message(route),
             text: "  Answer β.\nKeep this whitespace.  ".into(),
             at: 42,
             acknowledge,
+            source_name: None,
         };
         let destination = EventLog::open(target.path(), "messages").unwrap();
         (origin, target, source, destination, operation)
@@ -510,22 +623,24 @@ mod tests {
         let (_source_dir, _target_dir, mut source, mut target, mut operation) = fixture(false);
         for n in 0..=DISPLAY_CAP {
             operation.id = format!("history-{n}");
-            let state = source.begin_message_operation(&operation).unwrap();
+            let state = source.begin_reply_operation(&operation).unwrap();
             let receipt = target.accept_message_delivery(&operation).unwrap();
-            source.accept_message_operation(&state, &receipt).unwrap();
+            source
+                .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+                .unwrap();
             target.release_message_receipt(&receipt).unwrap();
         }
         let before = source.read_rows().unwrap().unwrap().rows.remove(0);
-        assert_eq!(before.message_replies.len(), DISPLAY_CAP + 1);
-        assert!(!before.message_history_pruned && !before.acked);
+        assert_eq!(before.replies.len(), DISPLAY_CAP + 1);
+        assert!(!before.reply_history_pruned && !before.acked);
         for _ in 0..2 {
             source.lines = COMPACT_AT;
             source.maybe_compact().unwrap();
             let after = source.read_rows().unwrap().unwrap().rows.remove(0);
-            assert!(after.message_history_pruned && !after.acked);
-            assert_eq!(after.message_replies.len(), DISPLAY_CAP);
+            assert!(after.reply_history_pruned && !after.acked);
+            assert_eq!(after.replies.len(), DISPLAY_CAP);
             assert_eq!(
-                serde_json::to_value(after).unwrap()["message_history_pruned"],
+                serde_json::to_value(after).unwrap()["reply_history_pruned"],
                 true
             );
         }
@@ -534,7 +649,7 @@ mod tests {
     #[test]
     fn acceptance_is_one_source_ack_decision_and_operations_never_become_sender_work() {
         let (_origin, _target, mut source, mut target, op) = fixture(true);
-        let state = source.begin_message_operation(&op).unwrap();
+        let state = source.begin_reply_operation(&op).unwrap();
         assert_eq!(source.load().unhandled.len(), 1);
         assert!(
             source
@@ -550,17 +665,21 @@ mod tests {
             !incoming.item.event_view().unwrap().requires_reply,
             "replies do not inherit obligations"
         );
-        source.accept_message_operation(&state, &receipt).unwrap();
+        source
+            .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+            .unwrap();
         assert!(source.load().unhandled.is_empty());
         assert!(source.read_rows().unwrap().unwrap().rows[0].acked);
-        source.accept_message_operation(&state, &receipt).unwrap();
+        source
+            .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+            .unwrap();
         let mut changed = op.clone();
         changed.text = "different".into();
-        assert!(source.begin_message_operation(&changed).is_err());
+        assert!(source.begin_reply_operation(&changed).is_err());
         target.release_message_receipt(&receipt).unwrap();
         compact(&mut source);
         assert!(source.read_rows().unwrap().unwrap().rows[0].acked);
-        assert_eq!(source.message_operations().unwrap().len(), 1);
+        assert_eq!(source.reply_operations().unwrap().len(), 1);
         assert_eq!(target.read_rows().unwrap().unwrap().rows.len(), 1);
     }
     #[test]
@@ -569,22 +688,24 @@ mod tests {
         for id in ["first", "second"] {
             let mut next = op.clone();
             next.id = id.into();
-            let state = source.begin_message_operation(&next).unwrap();
+            let state = source.begin_reply_operation(&next).unwrap();
             let receipt = target.accept_message_delivery(&next).unwrap();
-            source.accept_message_operation(&state, &receipt).unwrap();
+            source
+                .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+                .unwrap();
             target.release_message_receipt(&receipt).unwrap();
         }
         assert_eq!(target.read_rows().unwrap().unwrap().rows.len(), 2);
-        assert_eq!(source.message_operations().unwrap().len(), 2);
+        assert_eq!(source.reply_operations().unwrap().len(), 2);
         assert!(!source.read_rows().unwrap().unwrap().rows[0].acked);
         assert_eq!(source.load().unhandled.len(), 1);
         compact(&mut source);
-        assert_eq!(source.message_operations().unwrap().len(), 2);
+        assert_eq!(source.reply_operations().unwrap().len(), 2);
     }
     #[test]
     fn receiver_pin_survives_ack_and_body_pruning_until_source_acceptance() {
         let (_origin, target_dir, mut source, mut target, op) = fixture(true);
-        let state = source.begin_message_operation(&op).unwrap();
+        let state = source.begin_reply_operation(&op).unwrap();
         let receipt = target.accept_message_delivery(&op).unwrap();
         target
             .append_checked_ack(receipt.seq, &receipt.ident)
@@ -610,7 +731,9 @@ mod tests {
             restarted.read_rows().unwrap().unwrap().rows.len(),
             DISPLAY_CAP
         );
-        source.accept_message_operation(&state, &receipt).unwrap();
+        source
+            .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+            .unwrap();
         restarted.release_message_receipt(&receipt).unwrap();
         compact(&mut restarted);
         assert!(
@@ -619,8 +742,8 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            source.begin_message_operation(&op).unwrap().receipt,
-            Some(receipt)
+            source.begin_reply_operation(&op).unwrap().receipt,
+            Some(Acceptance::Message(receipt))
         );
     }
     #[test]
@@ -645,7 +768,7 @@ mod tests {
             op.original_seq = row.seq;
             op.original_ident = row.ident;
             op.original_handle = "ordinary".into();
-            source.begin_message_operation(&op).unwrap();
+            source.begin_reply_operation(&op).unwrap();
             let mut restarted = EventLog::open(origin.path(), "messages").unwrap();
             assert_eq!(
                 restarted
@@ -668,10 +791,10 @@ mod tests {
         for point in [DurableSync::File, DurableSync::Directory] {
             let (origin, target_dir, mut source, mut target, op) = fixture(true);
             source.sync_fault.set(Some(point));
-            assert!(source.begin_message_operation(&op).is_err());
+            assert!(source.begin_reply_operation(&op).is_err());
             assert!(target.read_rows().unwrap().unwrap().rows.is_empty());
             let mut source = EventLog::open(origin.path(), "messages").unwrap();
-            let state = source.begin_message_operation(&op).unwrap();
+            let state = source.begin_reply_operation(&op).unwrap();
             target.sync_fault.set(Some(point));
             assert!(target.accept_message_delivery(&op).is_err());
             assert!(!source.read_rows().unwrap().unwrap().rows[0].acked);
@@ -679,9 +802,15 @@ mod tests {
             let receipt = target.accept_message_delivery(&op).unwrap();
             assert_eq!(target.read_rows().unwrap().unwrap().rows.len(), 1);
             source.sync_fault.set(Some(point));
-            assert!(source.accept_message_operation(&state, &receipt).is_err());
+            assert!(
+                source
+                    .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+                    .is_err()
+            );
             let mut source = EventLog::open(origin.path(), "messages").unwrap();
-            source.accept_message_operation(&state, &receipt).unwrap();
+            source
+                .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+                .unwrap();
             assert!(source.read_rows().unwrap().unwrap().rows[0].acked);
             target.sync_fault.set(Some(point));
             assert!(target.release_message_receipt(&receipt).is_err());
@@ -708,9 +837,11 @@ mod tests {
                 item: op.item(),
             })
             .unwrap();
-        let state = source.begin_message_operation(&op).unwrap();
+        let state = source.begin_reply_operation(&op).unwrap();
         let receipt = target.accept_message_delivery(&op).unwrap();
-        source.accept_message_operation(&state, &receipt).unwrap();
+        source
+            .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+            .unwrap();
         compact(&mut source);
         let rows = source.read_rows().unwrap().unwrap().rows;
         assert_eq!(rows.len(), 2);
@@ -733,7 +864,7 @@ mod tests {
     #[test]
     fn torn_transaction_tails_are_repaired_before_recovery_appends() {
         let (_origin, _target, mut source, mut target, op) = fixture(true);
-        let state = source.begin_message_operation(&op).unwrap();
+        let state = source.begin_reply_operation(&op).unwrap();
         let receipt = target.accept_message_delivery(&op).unwrap();
         for log in [&source, &target] {
             std::fs::OpenOptions::new()
@@ -744,7 +875,9 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(target.accept_message_delivery(&op).unwrap(), receipt);
-        source.accept_message_operation(&state, &receipt).unwrap();
+        source
+            .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+            .unwrap();
         target.release_message_receipt(&receipt).unwrap();
         assert!(source.read_rows().unwrap().unwrap().rows[0].acked);
         assert_eq!(target.read_rows().unwrap().unwrap().rows.len(), 1);
@@ -758,7 +891,7 @@ mod tests {
         source
             .append_ack_ident(op.original_seq, &op.original_ident)
             .unwrap();
-        let state = source.begin_message_operation(&op).unwrap();
+        let state = source.begin_reply_operation(&op).unwrap();
         for i in 0..=DISPLAY_CAP {
             source
                 .append_baseline_inbox(Some(&format!("newer-{i}")), None, None, &op.item())
@@ -775,7 +908,9 @@ mod tests {
                 .any(|r| r.ident == op.original_ident)
         );
         let receipt = target.accept_message_delivery(&op).unwrap();
-        source.accept_message_operation(&state, &receipt).unwrap();
+        source
+            .accept_reply_operation(&state, &Acceptance::Message(receipt.clone()))
+            .unwrap();
         compact(&mut source);
         assert!(
             source
@@ -787,8 +922,8 @@ mod tests {
                 .all(|r| r.ident != op.original_ident)
         );
         assert_eq!(
-            source.message_operations().unwrap()[0].receipt,
-            Some(receipt)
+            source.reply_operations().unwrap()[0].receipt,
+            Some(Acceptance::Message(receipt))
         );
     }
 }

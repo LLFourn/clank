@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::cli::github::log::EventLog;
+use crate::cli::github::log::{EventLog, ReplyRoute};
 use clank_core::wait::WaitItem;
 
 /// A copy's IMMUTABLE identity — the COMPLETE copy key
@@ -154,7 +154,9 @@ pub(crate) struct OutgoingReply {
     pub(crate) delivery_id: String,
     pub(crate) from: String,
     pub(crate) from_repo: std::path::PathBuf,
-    pub(crate) destination: clank_core::wait::MessageReplyRoute,
+    /// The agent the reply was sent to; none for a reply to the command
+    /// backend that produced the original, which no agent receives.
+    pub(crate) destination: Option<clank_core::wait::MessageReplyRoute>,
     pub(crate) original: MemberKey,
     pub(crate) original_handle: String,
     pub(crate) acknowledge: bool,
@@ -297,10 +299,12 @@ impl MergedEvent {
         let mut outgoing: Vec<Recipient> = self
             .outgoing
             .iter()
-            .map(|reply| Recipient {
-                agent: reply.destination.agent.as_str().to_string(),
-                repo: (reply.destination.repo != reply.from_repo)
-                    .then(|| reply.destination.repo.clone()),
+            .filter_map(|reply| {
+                let to = reply.destination.as_ref()?;
+                Some(Recipient {
+                    agent: to.agent.as_str().to_string(),
+                    repo: (to.repo != reply.from_repo).then(|| to.repo.clone()),
+                })
             })
             .collect();
         outgoing.sort();
@@ -494,6 +498,17 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                     // which stopped being true the moment command
                     // sources shared this log, turning the belt into a
                     // silent drop (codex 4e47a2a).
+                    // A command reply is shown under its original's source.
+                    let names: std::collections::HashMap<(u64, String), String> = read
+                        .rows
+                        .iter()
+                        .filter_map(|r| match &r.item {
+                            WaitItem::CommandEvent { name, .. } => {
+                                Some(((r.seq, r.ident.clone()), name.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
                     copies.extend(read.rows.into_iter().filter_map(|r| {
                         let v = r.item.event_view()?;
                         // NAMESPACED by backend and by the identity
@@ -564,25 +579,71 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                     // scan and without turning them into sender inbox work.
                     for state in read.outgoing_replies {
                         let op = state.operation;
-                        if op.repo != local_repo
-                            || op.author.as_str() != label
-                            || stem != crate::inbox::MESSAGES_SOURCE
-                        {
+                        let messages = stem == crate::inbox::MESSAGES_SOURCE;
+                        // The operation's own record names its source, so it
+                        // outlives its original; older ones fall back to it.
+                        let source_name = op
+                            .source_name
+                            .clone()
+                            .or_else(|| {
+                                names
+                                    .get(&(op.original_seq, op.original_ident.clone()))
+                                    .cloned()
+                            })
+                            .unwrap_or_else(|| stem.to_string());
+                        let routed = match &op.route {
+                            ReplyRoute::Message(_) => messages,
+                            ReplyRoute::Command(_) => !messages,
+                        };
+                        if op.repo != local_repo || op.author.as_str() != label || !routed {
                             notices.insert(format!(
                                 "{label}/{name}: outgoing reply provenance disagrees — skipped"
                             ));
                             continue;
                         }
-                        let id = op.delivery_id();
-                        let item = op.item();
-                        let alias = delivery_alias(&op.route.repo, op.route.agent.as_str(), &id);
+                        let (id, item, destination, aliases, transport, backend) = match &op.route {
+                            ReplyRoute::Message(route) => {
+                                let id = op.delivery_id();
+                                let alias = delivery_alias(&route.repo, route.agent.as_str(), &id);
+                                (
+                                    id,
+                                    op.item(),
+                                    Some(route.clone()),
+                                    vec![alias],
+                                    crate::cli::github::log::Transport::Message,
+                                    Backend::Message,
+                                )
+                            }
+                            // Custody of the send only: the backend's exit is
+                            // all clank knows, so no recipient and no receipt.
+                            ReplyRoute::Command(_) => (
+                                op.id.clone(),
+                                WaitItem::CommandEvent {
+                                    presentation: None,
+                                    source_cwd: None,
+                                    name: source_name,
+                                    id: op.id.clone(),
+                                    event: "reply".into(),
+                                    content: op.text.clone(),
+                                    at: Some(op.at),
+                                    failure: false,
+                                    requires_reply: false,
+                                    reply_route: None,
+                                    selector: None,
+                                },
+                                None,
+                                Vec::new(),
+                                crate::cli::github::log::Transport::Command,
+                                Backend::Command,
+                            ),
+                        };
                         copies.push(Copy {
                             outgoing: Some(OutgoingReply {
                                 operation_id: op.id,
                                 delivery_id: id.clone(),
                                 from: label.clone(),
                                 from_repo: op.repo,
-                                destination: op.route,
+                                destination,
                                 original: MemberKey {
                                     agent: label.clone(),
                                     source: stem.into(),
@@ -596,11 +657,11 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
                             source: stem.into(),
                             seq: state.seq,
                             ident: id,
-                            transport: crate::cli::github::log::Transport::Message,
+                            transport,
                             display_at: op.at,
-                            backend: Backend::Message,
+                            backend,
                             glyph: None,
-                            aliases: vec![alias],
+                            aliases,
                             item,
                             woken_at: None,
                             acked: false,
@@ -1712,9 +1773,9 @@ pub(crate) mod tests {
         tempfile::TempDir,
         EventLog,
         EventLog,
-        crate::cli::github::log::MessageOperation,
+        crate::cli::github::log::ReplyOperation,
     ) {
-        use crate::cli::github::log::{MessageOperation, Transport};
+        use crate::cli::github::log::{ReplyOperation, Transport};
         use clank_core::{ids::AgentLabel, wait::MessageReplyRoute};
         let repo = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
@@ -1754,28 +1815,151 @@ pub(crate) mod tests {
             )
             .unwrap();
         let parent = source.read_rows().unwrap().unwrap().rows.remove(0);
-        let op = MessageOperation {
+        let op = ReplyOperation {
             id: "first-reply".into(),
             repo: root,
             author: AgentLabel::parse("worker").unwrap(),
             original_seq: parent.seq,
             original_ident: parent.ident,
             original_handle: "parent-handle".into(),
-            route: MessageReplyRoute {
+            route: ReplyRoute::Message(MessageReplyRoute {
                 repo: target,
                 agent: AgentLabel::parse("coordinator").unwrap(),
-            },
+            }),
             text: "  Answer β.\nKeep this whitespace.  ".into(),
             at: 42,
             acknowledge: false,
+            source_name: None,
         };
-        let state = source.begin_message_operation(&op).unwrap();
+        let state = source.begin_reply_operation(&op).unwrap();
         if accepted {
             let receipt = destination.accept_message_delivery(&op).unwrap();
-            source.accept_message_operation(&state, &receipt).unwrap();
+            source
+                .accept_reply_operation(
+                    &state,
+                    &crate::cli::github::log::Acceptance::Message(receipt.clone()),
+                )
+                .unwrap();
             destination.release_message_receipt(&receipt).unwrap();
         }
         (repo, external, source, destination, op)
+    }
+
+    /// A reply a command backend accepted is shown as sent, under the
+    /// source of the event it answers, with no agent named as its
+    /// recipient; a pending one is not shown as sent.
+    #[test]
+    fn a_command_reply_is_sent_to_its_backend_and_no_agent() {
+        use crate::cli::github::log::{Acceptance, ReplyOperation, Transport};
+        let repo = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(repo.path()).unwrap();
+        let mut log = EventLog::open(
+            &crate::agent_store::agents_root(&root).join("worker/events"),
+            "command-questions-0000",
+        )
+        .unwrap();
+        let route = clank_core::wait::CommandReplyRoute {
+            command: vec!["backend".into()],
+            cwd: root.clone(),
+            state_dir: None,
+        };
+        let seq = log
+            .append_inbox(
+                Transport::Command,
+                Some("q"),
+                None,
+                None,
+                &WaitItem::CommandEvent {
+                    presentation: None,
+                    source_cwd: None,
+                    name: "questions".into(),
+                    id: "q1".into(),
+                    event: "questions".into(),
+                    content: "Which?".into(),
+                    at: None,
+                    failure: false,
+                    requires_reply: false,
+                    reply_route: Some(route.clone()),
+                    selector: None,
+                },
+            )
+            .unwrap();
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        let op = |id: &str| ReplyOperation {
+            id: id.into(),
+            repo: root.clone(),
+            author: clank_core::ids::AgentLabel::parse("worker").unwrap(),
+            original_seq: seq,
+            original_ident: ident.clone(),
+            original_handle: "q1".into(),
+            route: ReplyRoute::Command(route.clone()),
+            text: format!("reply {id}"),
+            at: 50,
+            acknowledge: false,
+            source_name: Some("questions".into()),
+        };
+        let accepted = log.begin_reply_operation(&op("sent")).unwrap();
+        log.accept_reply_operation(&accepted, &Acceptance::Command { accepted_at: 51 })
+            .unwrap();
+        log.begin_reply_operation(&op("pending")).unwrap();
+        let snapshot = timeline_snapshot(repo.path());
+        assert!(snapshot.notices.is_empty(), "{:?}", snapshot.notices);
+        let sent: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|e| !e.outgoing.is_empty())
+            .collect();
+        assert_eq!(sent.len(), 1);
+        let reply = sent[0];
+        assert!(reply.outgoing_only());
+        assert_eq!(reply.backend, Backend::Command);
+        assert_eq!(reply.source, "questions");
+        assert_eq!(reply.outgoing[0].operation_id, "sent");
+        assert_eq!(reply.outgoing[0].destination, None);
+        assert!(reply.destination().outgoing.is_empty());
+        assert_eq!(
+            reply.body.as_deref().or(reply.content.as_deref()),
+            Some("reply sent")
+        );
+
+        // The compacted form once the handled original ages out: only the
+        // accepted operation is left, and it is still shown from its own
+        // record. One written before it named its source falls back to the
+        // log's name rather than vanishing.
+        let path = crate::agent_store::agents_root(&root)
+            .join("worker/events/command-questions-0000.jsonl");
+        let accepted: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|v: &serde_json::Value| {
+                v["t"] == "message_operation" && !v["receipt"].is_null()
+            })
+            .collect();
+        for (named, source) in [(true, "questions"), (false, "command-questions-0000")] {
+            let lines: Vec<String> = accepted
+                .iter()
+                .map(|v| {
+                    let mut v = v.clone();
+                    if !named {
+                        v["operation"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("source_name");
+                    }
+                    v.to_string()
+                })
+                .collect();
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            let snapshot = timeline_snapshot(repo.path());
+            assert!(snapshot.notices.is_empty(), "{:?}", snapshot.notices);
+            assert_eq!(snapshot.events.len(), 1, "named: {named}");
+            let reply = &snapshot.events[0];
+            assert!(reply.outgoing_only() && !reply.unhandled);
+            assert_eq!(reply.source, source);
+            assert_eq!(reply.outgoing[0].destination, None);
+            assert!(reply.members.is_empty() && reply.seen_by.is_empty());
+        }
     }
 
     #[test]
@@ -1795,7 +1979,13 @@ pub(crate) mod tests {
         assert!(reply.members.is_empty() && reply.seen_by.is_empty());
         assert_eq!(reply.body.as_deref(), Some(op.text.as_str()));
         assert_eq!(reply.at, op.at);
-        assert_eq!(reply.outgoing[0].destination, op.route);
+        assert_eq!(
+            reply.outgoing[0]
+                .destination
+                .as_ref()
+                .map(|to| ReplyRoute::Message(to.clone())),
+            Some(op.route.clone())
+        );
         assert_eq!(reply.outgoing[0].original_handle, "parent-handle");
         assert_eq!(reply.outgoing[0].original.ident, op.original_ident);
         assert_eq!(
@@ -1853,9 +2043,14 @@ pub(crate) mod tests {
         assert!(snapshot.events[0].outgoing.is_empty());
         for id in ["first-reply", "second-reply"] {
             op.id = id.into();
-            let state = source.begin_message_operation(&op).unwrap();
+            let state = source.begin_reply_operation(&op).unwrap();
             let receipt = target.accept_message_delivery(&op).unwrap();
-            source.accept_message_operation(&state, &receipt).unwrap();
+            source
+                .accept_reply_operation(
+                    &state,
+                    &crate::cli::github::log::Acceptance::Message(receipt.clone()),
+                )
+                .unwrap();
             target.release_message_receipt(&receipt).unwrap();
         }
         let snapshot = timeline_snapshot(repo.path());
@@ -1881,7 +2076,7 @@ pub(crate) mod tests {
     fn accepted_reply_outlives_parent_display_and_pin_cleanup() {
         let (repo, _external, _source, _target, op) = reply_fixture(false, true);
         // Model the compacted form: source acceptance is retained independently
-        // of an original body, not discovered only through row.message_replies.
+        // of an original body, not discovered only through row.replies.
         let path =
             crate::agent_store::agents_root(repo.path()).join("worker/events/messages.jsonl");
         let accepted: Vec<_> = std::fs::read_to_string(&path)

@@ -5184,7 +5184,7 @@ pub(crate) mod tests {
     /// every byte.
     #[test]
     fn foreign_routes_are_told_apart_and_drawn_safely() {
-        use crate::cli::github::log::{EventLog, MessageOperation, Transport};
+        use crate::cli::github::log::{EventLog, ReplyOperation, Transport};
         use crate::cli::github::timeline;
         use clank_core::{ids::AgentLabel, wait::MessageReplyRoute};
         let repo = tempfile::tempdir().unwrap();
@@ -5221,29 +5221,34 @@ pub(crate) mod tests {
             )
             .unwrap();
             let parent = log.read_rows().unwrap().unwrap().rows.remove(i);
-            let op = MessageOperation {
+            let op = ReplyOperation {
                 id: format!("reply-{i}"),
                 repo: root.clone(),
                 author: AgentLabel::parse("worker").unwrap(),
                 original_seq: parent.seq,
                 original_ident: parent.ident,
                 original_handle: format!("handle-{i}"),
-                route: MessageReplyRoute {
+                route: crate::cli::github::log::ReplyRoute::Message(MessageReplyRoute {
                     repo: route.clone(),
                     agent: AgentLabel::parse("codex").unwrap(),
-                },
+                }),
                 text: format!("answer {i}"),
                 at: 100 + i as u64,
                 acknowledge: false,
+                source_name: None,
             };
-            let state = log.begin_message_operation(&op).unwrap();
+            let state = log.begin_reply_operation(&op).unwrap();
             let mut destination = EventLog::open(
                 &crate::agent_store::agents_root(route).join("codex/events"),
                 "messages",
             )
             .unwrap();
             let receipt = destination.accept_message_delivery(&op).unwrap();
-            log.accept_message_operation(&state, &receipt).unwrap();
+            log.accept_reply_operation(
+                &state,
+                &crate::cli::github::log::Acceptance::Message(receipt.clone()),
+            )
+            .unwrap();
             destination.release_message_receipt(&receipt).unwrap();
         }
 
@@ -5256,7 +5261,7 @@ pub(crate) mod tests {
         assert_eq!(sent.len(), 3, "{:?}", snapshot.notices);
         let mut stored: Vec<std::path::PathBuf> = sent
             .iter()
-            .map(|e| e.outgoing[0].destination.repo.clone())
+            .map(|e| e.outgoing[0].destination.as_ref().unwrap().repo.clone())
             .collect();
         stored.sort();
         assert_eq!(stored, routes, "the route itself keeps every byte");

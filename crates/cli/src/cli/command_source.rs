@@ -1981,8 +1981,8 @@ mod producer_tests {
     /// One logged row, with only the fields this decision reads.
     fn row(seq: u64, ident: &str, acked: bool) -> crate::cli::github::log::EventRow {
         crate::cli::github::log::EventRow {
-            message_replies: Vec::new(),
-            message_history_pruned: false,
+            replies: Vec::new(),
+            reply_history_pruned: false,
             interrupt: false,
             interrupt_hint: None,
             interrupt_attempt: None,
@@ -2074,8 +2074,8 @@ mod producer_tests {
     fn a_replayed_github_row_is_stamped_with_the_watchs_prompt() {
         let github = |seq: u64| crate::cli::github::log::EventRow {
             woken_at: None,
-            message_replies: Vec::new(),
-            message_history_pruned: false,
+            replies: Vec::new(),
+            reply_history_pruned: false,
             interrupt: false,
             interrupt_hint: None,
             interrupt_attempt: None,

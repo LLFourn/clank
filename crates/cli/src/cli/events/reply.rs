@@ -10,7 +10,7 @@ use clank_core::wait::WaitItem;
 use super::{Sourced, resolve};
 use crate::cli::github::log::{EventLog, EventReply, EventRow, IngestLease};
 
-const REPLY_BUDGET: Duration = Duration::from_secs(5);
+pub(super) const REPLY_BUDGET: Duration = Duration::from_secs(5);
 
 struct Copy {
     dir: PathBuf,
@@ -34,7 +34,7 @@ pub(super) async fn ack_with_reply(
     }
     let selected = resolve(&rows, &ids[0])?;
     if matches!(selected.row.item, WaitItem::Message { .. }) {
-        return super::message_reply::submit(repo, dir, selected, text, None, true);
+        return super::operation::submit(repo, dir, selected, text, None, true).await;
     }
     let WaitItem::CommandEvent {
         id, reply_route, ..
@@ -50,20 +50,10 @@ pub(super) async fn ack_with_reply(
     let identity =
         serde_json::to_vec(&("clank-reply-v1", &repo, &selected.source, id, reply_route))?;
     let key = blake3::hash(&identity).to_hex().to_string();
-    // One lock/owner record per saved backend, rather than one permanent file
-    // per question. This also bounds simultaneous callbacks to a single backend.
-    let owner_identity =
-        serde_json::to_vec(&("clank-reply-owner-v1", &repo, &selected.source, reply_route))?;
-    let owner_key = blake3::hash(&owner_identity).to_hex().to_string();
-    let _lease = IngestLease::try_acquire(
-        &crate::agent_store::agents_root(&repo),
-        &format!("reply-{owner_key}"),
-    )?
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "a reply to this source is already in progress; retry after that command ends"
-        )
-    })?;
+    let route = reply_route.clone().ok_or_else(|| anyhow::anyhow!(
+        "this event has no saved reply_command; it stays owed (configure reply_command before emitting reply-required events)"
+    ))?;
+    let (_lease, owner_path) = backend_lease(&repo, &selected.source, &route)?;
 
     // Re-read after claiming the lease: a competing ack may have completed
     // while the initial selector was being inspected.
@@ -84,9 +74,6 @@ pub(super) async fn ack_with_reply(
             reply.clone()
         }
         None => {
-            let route = reply_route.clone().ok_or_else(|| anyhow::anyhow!(
-                "this event has no saved reply_command; it stays owed (configure reply_command before emitting reply-required events)"
-            ))?;
             let author = dir
                 .parent()
                 .and_then(|p| p.file_name())
@@ -146,9 +133,7 @@ pub(super) async fn ack_with_reply(
         )?;
     }
     if !copies.iter().any(|copy| copy.row.reply_accepted) {
-        let owner_path =
-            crate::agent_store::agents_root(&repo).join(format!("reply-{owner_key}.owner.json"));
-        deliver_reply(&reply, REPLY_BUDGET, &owner_path)
+        deliver_reply(&reply, true, REPLY_BUDGET, &owner_path)
             .await
             .context(
                 "reply was not confirmed; event stays owed; retry --reply with the same text",
@@ -166,6 +151,31 @@ pub(super) async fn ack_with_reply(
     }
     println!("{}: reply accepted; handled", ids[0]);
     Ok(())
+}
+
+/// The lease that serializes every reply to one saved backend, and the
+/// record of the callback it owns: one per backend, not one per question,
+/// which also bounds simultaneous callbacks to it.
+pub(super) fn backend_lease(
+    repo: &Path,
+    source: &str,
+    route: &clank_core::wait::CommandReplyRoute,
+) -> anyhow::Result<(IngestLease, PathBuf)> {
+    let owner_identity = serde_json::to_vec(&("clank-reply-owner-v1", repo, source, Some(route)))?;
+    let owner_key = blake3::hash(&owner_identity).to_hex().to_string();
+    let lease = IngestLease::try_acquire(
+        &crate::agent_store::agents_root(repo),
+        &format!("reply-{owner_key}"),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "a reply to this source is already in progress; retry after that command ends"
+        )
+    })?;
+    Ok((
+        lease,
+        crate::agent_store::agents_root(repo).join(format!("reply-{owner_key}.owner.json")),
+    ))
 }
 
 fn copies_of(
@@ -204,8 +214,11 @@ fn copies_of(
 
 /// A reply keeps its existing immutable route and five-second budget; the
 /// common executor knows nothing about replies or event acknowledgement.
-async fn deliver_reply(
+/// `acknowledge` tells the backend whether this is the event's one answer or
+/// a further reply; `idempotency_key` tells a retry from another reply.
+pub(super) async fn deliver_reply(
     reply: &EventReply,
+    acknowledge: bool,
     budget: Duration,
     owner_path: &Path,
 ) -> anyhow::Result<()> {
@@ -214,6 +227,7 @@ async fn deliver_reply(
     let encoded = serde_json::to_vec(&serde_json::json!({
         "version": 1, "id": reply.id, "reply": reply.text,
         "author": reply.author, "idempotency_key": reply.idempotency_key,
+        "acknowledge": acknowledge,
     }))?;
     crate::cli::owned_callback::deliver(
         crate::cli::owned_callback::Request {
@@ -392,6 +406,267 @@ mod tests {
         assert_eq!(attempts(repo.path()), 1);
     }
 
+    // Backend that takes every reply it is given, recording each request.
+    const MULTI: &str = r#"
+        cat > "$1"
+        cat "$1" >> "$1.all"
+        printf '\n' >> "$1.all"
+        if [ -f "$2" ]; then printf 'backend unavailable\n' >&2; exit 7; fi
+    "#;
+
+    fn requests(repo: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(repo.join("request.all"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    async fn deliberate(
+        repo: &Path,
+        agent: &str,
+        selector: &str,
+        text: &str,
+        operation: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let dir = directory(repo, agent);
+        let rows = super::super::read_all(&dir)?;
+        let selected = resolve(&rows, selector)?;
+        super::super::operation::submit(repo, &dir, selected, text, operation, false).await
+    }
+
+    fn operations(repo: &Path, agent: &str) -> Vec<crate::cli::github::log::ReplyOperationState> {
+        rows(repo, agent).remove(0).replies
+    }
+
+    /// Each deliberate reply is its own operation, sent once with its own
+    /// key; a retry names one and sends nothing new once it was accepted.
+    /// None of them answers the event, and none touches another copy.
+    #[tokio::test]
+    async fn a_command_event_takes_many_replies_each_its_own_operation() {
+        let repo = tempfile::tempdir().unwrap();
+        let route = route(repo.path(), MULTI);
+        let selector = seed(repo.path(), "alpha", Some(&route), true);
+        seed(repo.path(), "beta", Some(&route), true);
+        deliberate(repo.path(), "alpha", &selector, "progress", None)
+            .await
+            .unwrap();
+        deliberate(repo.path(), "alpha", &selector, "progress", None)
+            .await
+            .unwrap();
+        let sent = requests(repo.path());
+        assert_eq!(sent.len(), 2, "the same text sent twice is two replies");
+        for (request, op) in sent.iter().zip(operations(repo.path(), "alpha")) {
+            assert_eq!(request["id"], ID);
+            assert_eq!(request["reply"], "progress");
+            assert_eq!(request["acknowledge"], false);
+            assert_eq!(request["idempotency_key"], op.operation.id);
+            assert!(op.receipt.is_some());
+            assert_eq!(op.operation.source_name.as_deref(), Some("questions"));
+        }
+        assert_ne!(sent[0]["idempotency_key"], sent[1]["idempotency_key"]);
+        let first = operations(repo.path(), "alpha")[0].operation.id.clone();
+        deliberate(repo.path(), "alpha", &selector, "progress", Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(
+            requests(repo.path()).len(),
+            2,
+            "an accepted retry sends nothing"
+        );
+        for (text, operation) in [("changed", first.as_str()), ("progress", "unknown")] {
+            assert!(
+                deliberate(repo.path(), "alpha", &selector, text, Some(operation))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(requests(repo.path()).len(), 2);
+        let alpha = rows(repo.path(), "alpha").remove(0);
+        assert!(!alpha.acked && alpha.item.event_view().unwrap().requires_reply);
+        assert!(
+            operations(repo.path(), "beta").is_empty(),
+            "another copy's history"
+        );
+
+        // The acknowledging answer keeps its own key and retires every copy;
+        // a further reply after it is delivered and leaves it handled.
+        submit(repo.path(), "alpha", &selector, ANSWER)
+            .await
+            .unwrap();
+        let answer = requests(repo.path()).remove(2);
+        assert_eq!(answer["acknowledge"], true);
+        assert_eq!(
+            answer["idempotency_key"],
+            rows(repo.path(), "alpha")[0]
+                .reply
+                .as_ref()
+                .unwrap()
+                .idempotency_key
+        );
+        deliberate(repo.path(), "beta", &selector, "after", None)
+            .await
+            .unwrap();
+        assert_eq!(requests(repo.path()).len(), 4);
+        for agent in ["alpha", "beta"] {
+            assert!(rows(repo.path(), agent)[0].acked, "{agent}");
+        }
+    }
+
+    /// Discovery (list and show) says a command reply exists, its ID and
+    /// state, and that it went to the event's handler: never its text nor
+    /// the handler's argv, cwd or state, pending or accepted, and it records
+    /// no presentation.
+    #[tokio::test]
+    async fn discovery_names_a_command_reply_without_its_body_or_callback() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut route = route(repo.path(), MULTI);
+        route.command.push("CALLBACK-ONLY-SECRET".into());
+        let selector = seed(repo.path(), "alpha", Some(&route), false);
+        deliberate(repo.path(), "alpha", &selector, "BODY-ONE", None)
+            .await
+            .unwrap();
+        std::fs::write(repo.path().join("fail"), b"fail").unwrap();
+        assert!(
+            deliberate(repo.path(), "alpha", &selector, "BODY-TWO", None)
+                .await
+                .is_err()
+        );
+        let dir = directory(repo.path(), "alpha");
+        let sourced = super::super::read_all(&dir).unwrap();
+        let shown = super::super::metadata_row(&sourced, resolve(&sourced, &selector).unwrap());
+        let text = shown.to_string();
+        for secret in [
+            "CALLBACK-ONLY-SECRET",
+            "BODY-ONE",
+            "BODY-TWO",
+            "original-state",
+        ] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        let replies = shown["replies"].as_array().unwrap();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|r| r["accepted"].clone())
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+        for (reply, op) in replies.iter().zip(operations(repo.path(), "alpha")) {
+            assert_eq!(reply["id"], op.operation.id.as_str());
+            assert_eq!(
+                reply["route"],
+                serde_json::json!({"backend": "reply_command"})
+            );
+        }
+        super::super::show_metadata(sourced, &selector, true).unwrap();
+        assert_eq!(rows(repo.path(), "alpha")[0].woken_at, None);
+    }
+
+    /// A deliberate reply never stands in for the answer a required event
+    /// is owed.
+    #[tokio::test]
+    async fn a_deliberate_reply_does_not_answer_a_required_event() {
+        let repo = tempfile::tempdir().unwrap();
+        let route = route(repo.path(), MULTI);
+        let selector = seed(repo.path(), "alpha", Some(&route), true);
+        deliberate(repo.path(), "alpha", &selector, "progress", None)
+            .await
+            .unwrap();
+        let dir = directory(repo.path(), "alpha");
+        assert!(
+            super::super::ack(&dir, super::super::read_all(&dir).unwrap(), &[selector]).is_err()
+        );
+        assert!(!rows(repo.path(), "alpha")[0].acked);
+    }
+
+    /// A failed delivery leaves the operation pending under an ID the
+    /// caller is told; its retry resends exactly it, with the same key.
+    #[tokio::test]
+    async fn a_failed_reply_stays_pending_and_its_retry_resends_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let route = route(repo.path(), MULTI);
+        let selector = seed(repo.path(), "alpha", Some(&route), false);
+        std::fs::write(repo.path().join("fail"), b"fail").unwrap();
+        let error = deliberate(repo.path(), "alpha", &selector, "progress", None)
+            .await
+            .unwrap_err();
+        let pending = operations(repo.path(), "alpha").remove(0);
+        assert!(pending.receipt.is_none());
+        assert!(format!("{error:#}").contains(&pending.operation.id));
+        let read = || {
+            let dir = directory(repo.path(), "alpha");
+            let mut out = Vec::new();
+            super::super::render_full(
+                &super::super::read_all(&dir).unwrap(),
+                &Default::default(),
+                &selector,
+                true,
+                &mut out,
+            )
+            .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap()["replies"][0].clone()
+        };
+        assert_eq!(read()["operation"]["id"], pending.operation.id.as_str());
+        assert_eq!(read()["receipt"], serde_json::Value::Null, "pending");
+        std::fs::remove_file(repo.path().join("fail")).unwrap();
+        deliberate(
+            repo.path(),
+            "alpha",
+            &selector,
+            "progress",
+            Some(&pending.operation.id),
+        )
+        .await
+        .unwrap();
+        let sent = requests(repo.path());
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1], "the same reply, not a new one");
+        assert!(operations(repo.path(), "alpha")[0].receipt.is_some());
+        assert_eq!(operations(repo.path(), "alpha").len(), 1);
+        assert!(read()["receipt"]["accepted_at"].is_u64(), "accepted");
+    }
+
+    /// A backend that takes no replies refuses, naming why, and records
+    /// nothing.
+    #[tokio::test]
+    async fn a_backend_without_replies_refuses_a_deliberate_reply() {
+        let repo = tempfile::tempdir().unwrap();
+        let selector = seed(repo.path(), "alpha", None, false);
+        let error = deliberate(repo.path(), "alpha", &selector, "progress", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reply_command"), "{error}");
+        assert!(operations(repo.path(), "alpha").is_empty());
+        let dir = directory(repo.path(), "alpha");
+        EventLog::open(&dir, "github")
+            .unwrap()
+            .append_inbox(
+                Transport::Poll,
+                Some("gh"),
+                None,
+                None,
+                &WaitItem::GithubEvent {
+                    presentation: None,
+                    repo: "o/r".into(),
+                    event: "pr_comment".into(),
+                    detail: None,
+                    number: Some(1),
+                    title: None,
+                    actor: None,
+                    url: None,
+                    instructions: None,
+                    content: None,
+                },
+            )
+            .unwrap();
+        let error = deliberate(repo.path(), "alpha", "github@1", "progress", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("takes no replies"), "{error}");
+    }
+
     #[tokio::test]
     async fn nonzero_leaves_immutable_intent_and_retry_uses_original_route_and_key() {
         let repo = tempfile::tempdir().unwrap();
@@ -448,9 +723,14 @@ mod tests {
         std::fs::remove_file(repo.path().join("fail")).unwrap();
         let pending = rows(repo.path(), "alpha").remove(0);
         let intent = pending.reply.unwrap();
-        deliver_reply(&intent, REPLY_BUDGET, &repo.path().join("test.owner.json"))
-            .await
-            .unwrap();
+        deliver_reply(
+            &intent,
+            true,
+            REPLY_BUDGET,
+            &repo.path().join("test.owner.json"),
+        )
+        .await
+        .unwrap();
         let first_answer = std::fs::read(repo.path().join("request.answer")).unwrap();
         assert!(
             !rows(repo.path(), "alpha")[0].acked,
@@ -578,6 +858,7 @@ mod tests {
         let start = std::time::Instant::now();
         let error = deliver_reply(
             &intent,
+            true,
             Duration::from_millis(400),
             &repo.path().join("test.owner.json"),
         )
@@ -686,7 +967,9 @@ mod tests {
             let mut child = child;
             child.wait().await.unwrap()
         });
-        deliver_reply(&intent, REPLY_BUDGET, &path).await.unwrap();
+        deliver_reply(&intent, true, REPLY_BUDGET, &path)
+            .await
+            .unwrap();
         assert!(!reaper.await.unwrap().success());
         assert_eq!(attempts(repo.path()), 1);
         assert!(!path.exists());
@@ -705,7 +988,11 @@ mod tests {
         };
         let path = repo.path().join("test.owner.json");
         std::fs::write(&path, b"unreadable recovery evidence").unwrap();
-        assert!(deliver_reply(&intent, REPLY_BUDGET, &path).await.is_err());
+        assert!(
+            deliver_reply(&intent, true, REPLY_BUDGET, &path)
+                .await
+                .is_err()
+        );
         assert_eq!(attempts(repo.path()), 0);
         assert_eq!(
             std::fs::read(&path).unwrap(),

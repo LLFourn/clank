@@ -47,7 +47,9 @@ mod message;
 mod presentation;
 mod timer;
 pub(crate) use interruption::{Interrupt, InterruptAttempt, InterruptOutcome};
-pub(crate) use message::{MessageOperation, MessageOperationState, MessageReceipt};
+pub(crate) use message::{
+    Acceptance, MessageReceipt, ReplyOperation, ReplyOperationState, ReplyRoute,
+};
 
 #[derive(Debug)]
 pub(crate) enum RecurringTransition {
@@ -171,11 +173,14 @@ enum Record {
         ident: String,
         at: u64,
     },
-    MessageOperation {
+    /// A reply's immutable intent, then the same record with its acceptance.
+    /// The tag predates command replies and stays, so old logs read.
+    #[serde(rename = "message_operation")]
+    ReplyOperation {
         v: u64,
         seq: u64,
-        operation: MessageOperation,
-        receipt: Option<MessageReceipt>,
+        operation: ReplyOperation,
+        receipt: Option<Acceptance>,
     },
     MessageReceipt {
         v: u64,
@@ -301,7 +306,7 @@ impl Record {
     }
     fn version(&self) -> u64 {
         match self {
-            Record::MessageOperation { v, .. }
+            Record::ReplyOperation { v, .. }
             | Record::MessageReceipt { v, .. }
             | Record::MessageHistoryPruned { v, .. } => *v,
             Record::Inbox { v, .. }
@@ -394,7 +399,7 @@ pub(crate) struct InboxEntry {
 /// of whether the original inbox body remains in the display horizon.
 #[derive(Debug)]
 pub(crate) struct ReadRows {
-    pub(crate) outgoing_replies: Vec<MessageOperationState>,
+    pub(crate) outgoing_replies: Vec<ReplyOperationState>,
     pub(crate) rows: Vec<EventRow>,
     pub(crate) foreign: usize,
 }
@@ -406,9 +411,9 @@ pub(crate) struct ReadRows {
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct EventRow {
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) message_replies: Vec<MessageOperationState>,
+    pub(crate) replies: Vec<ReplyOperationState>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) message_history_pruned: bool,
+    pub(crate) reply_history_pruned: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) interrupt: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -949,7 +954,7 @@ impl EventLog {
                     max_seq = max_seq.max(seq);
                     pending_replies.push((seq, ident));
                 }
-                Record::MessageOperation {
+                Record::ReplyOperation {
                     seq,
                     operation,
                     receipt,
@@ -1098,16 +1103,14 @@ impl EventLog {
         if self.is_recurring_key() && !lines_in.is_empty() {
             self.validate_recurring_inspection(&lines_in)?;
         }
-        let mut message_replies: std::collections::BTreeMap<
-            (u64, String),
-            Vec<MessageOperationState>,
-        > = std::collections::BTreeMap::new();
+        let mut operations: std::collections::BTreeMap<(u64, String), Vec<ReplyOperationState>> =
+            std::collections::BTreeMap::new();
         let mut outgoing_replies = Vec::new();
         for state in message::operations(&lines_in)? {
             if state.receipt.is_some() {
                 outgoing_replies.push(state.clone());
             }
-            message_replies
+            operations
                 .entry((
                     state.operation.original_seq,
                     state.operation.original_ident.clone(),
@@ -1126,7 +1129,7 @@ impl EventLog {
             })
             .collect();
         acks.extend(
-            message_replies
+            operations
                 .values()
                 .flatten()
                 .filter(|s| s.operation.acknowledge && s.receipt.is_some())
@@ -1222,8 +1225,8 @@ impl EventLog {
                     std::collections::hash_map::Entry::Vacant(v) => {
                         v.insert(rows.len());
                         rows.push(EventRow {
-                            message_replies: Vec::new(),
-                            message_history_pruned: false,
+                            replies: Vec::new(),
+                            reply_history_pruned: false,
                             interrupt,
                             interrupt_hint,
                             interrupt_attempt: None,
@@ -1271,13 +1274,13 @@ impl EventLog {
                 .any(|(a, i)| ack_covers(*a, i.as_deref(), row.seq, &row.ident));
             row.acked = row.baseline || covered;
             row.woken_at = presentations.remove(&(row.seq, row.ident.clone()));
-            row.message_history_pruned = pruned.contains(&(row.seq, row.ident.clone()));
-            row.message_replies = message_replies
+            row.reply_history_pruned = pruned.contains(&(row.seq, row.ident.clone()));
+            row.replies = operations
                 .remove(&(row.seq, row.ident.clone()))
                 .unwrap_or_default();
             if !row.acked
                 && row
-                    .message_replies
+                    .replies
                     .iter()
                     .any(|s| s.receipt.is_none() && s.operation.acknowledge)
             {
@@ -1905,7 +1908,7 @@ impl EventLog {
                         .entry((seq, ident.clone()))
                         .or_insert(r);
                 }
-                Record::MessageOperation { .. }
+                Record::ReplyOperation { .. }
                 | Record::MessageReceipt { .. }
                 | Record::MessageHistoryPruned { .. } => {}
             }
@@ -2225,6 +2228,90 @@ pub(super) mod tests {
                 state_dir: Some(PathBuf::from("/original/state")),
             },
         }
+    }
+
+    /// A deliberate reply to a command event lives in that source's own WAL:
+    /// pending, it survives compaction and restart and holds its parent;
+    /// it must name the parent's saved route, and never acknowledges.
+    #[test]
+    fn a_command_reply_operation_is_durable_in_its_source_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::open(dir.path(), "command-questions-0000").unwrap();
+        let route = reply_fixture().route;
+        let event = WaitItem::CommandEvent {
+            presentation: None,
+            source_cwd: None,
+            name: "questions".into(),
+            id: "question/雪".into(),
+            event: "questions".into(),
+            content: "Which?".into(),
+            at: None,
+            failure: false,
+            requires_reply: false,
+            reply_route: Some(route.clone()),
+            selector: None,
+        };
+        let seq = log
+            .append_inbox(Transport::Command, Some("q"), None, None, &event)
+            .unwrap();
+        let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
+        let op = ReplyOperation {
+            id: "op-1".into(),
+            repo: dir.path().into(),
+            author: clank_core::ids::AgentLabel::parse("alpha").unwrap(),
+            original_seq: seq,
+            original_ident: ident,
+            original_handle: "question/雪".into(),
+            route: ReplyRoute::Command(route.clone()),
+            text: "progress".into(),
+            at: 7,
+            acknowledge: false,
+            source_name: Some("questions".into()),
+        };
+        let mut moved = route.clone();
+        moved.cwd = PathBuf::from("/elsewhere");
+        for refused in [
+            ReplyOperation {
+                route: ReplyRoute::Command(moved),
+                ..op.clone()
+            },
+            ReplyOperation {
+                acknowledge: true,
+                ..op.clone()
+            },
+            ReplyOperation {
+                route: ReplyRoute::Message(clank_core::wait::MessageReplyRoute {
+                    repo: dir.path().into(),
+                    agent: clank_core::ids::AgentLabel::parse("beta").unwrap(),
+                }),
+                ..op.clone()
+            },
+        ] {
+            assert!(log.begin_reply_operation(&refused).is_err(), "{refused:?}");
+        }
+        let state = log.begin_reply_operation(&op).unwrap();
+        log.append_ack(seq).unwrap();
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let mut restarted = EventLog::open(dir.path(), "command-questions-0000").unwrap();
+        assert!(
+            restarted.load().unhandled.is_empty(),
+            "a reply holds no work"
+        );
+        let row = restarted.read_rows().unwrap().unwrap().rows.remove(0);
+        assert_eq!(row.replies.len(), 1);
+        assert_eq!(row.replies[0].operation, op);
+        assert!(row.replies[0].receipt.is_none());
+        assert_eq!(restarted.begin_reply_operation(&op).unwrap(), state);
+        let accepted = Acceptance::Command { accepted_at: 9 };
+        restarted.accept_reply_operation(&state, &accepted).unwrap();
+        restarted
+            .accept_reply_operation(&state, &Acceptance::Command { accepted_at: 10 })
+            .unwrap();
+        assert_eq!(
+            restarted.reply_operations().unwrap()[0].receipt,
+            Some(accepted)
+        );
     }
 
     #[test]

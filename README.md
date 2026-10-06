@@ -699,8 +699,14 @@ Clank invokes `reply_command` directly with its configured argv, without shell
 interpolation or added arguments. Stdin carries one JSON object, then EOF:
 
 ```json
-{"version":1,"id":"question/42","reply":"Use option B.","author":"codex","idempotency_key":"<opaque stable key>"}
+{"version":1,"id":"question/42","reply":"Use option B.","author":"codex","idempotency_key":"<opaque stable key>","acknowledge":true}
 ```
+
+`acknowledge` is true for the event's one answer (`events ack --reply`) and
+false for each further reply (`events reply`, below). The answer's key is the
+same as it always was; a further reply's key is its operation ID, so a handler
+tells a retry (same key) from another reply (new key). What a further reply
+means is the handler's business.
 
 The original producer ID and answer can contain Unicode, slashes or newlines.
 The handler receives the producer's saved working directory and resolved
@@ -721,6 +727,24 @@ retry explicitly
 with the original answer; different text is refused while that intent exists.
 `clank events read <selector> --json` includes the saved reply and acceptance.
 
+Any event whose backend takes replies — a message, or a command event with a
+saved `reply_command` — also takes any number of further replies:
+
+```sh
+clank events reply command-questions-<hash>@1 -m 'Still working on it.'
+clank events reply command-questions-<hash>@1 --operation <printed-id> -m 'Still working on it.'
+```
+
+`events reply` never answers, completes or reopens the event, before or after
+its acknowledgement; a required event still needs its `--reply` answer. Each
+invocation without `--operation` is a new reply, even with identical text.
+Its intent is stored before it is sent and stays pending if delivery fails or
+is interrupted; retry it with its printed operation ID and the exact text,
+which resends that reply and never a new one, and sends nothing once it was
+accepted. Changed text, or an unknown or pruned operation ID, is refused.
+`events read` and its JSON list an event's replies (`replies`) with their
+operation IDs and pending or accepted state.
+
 Message replies use concrete agent destinations:
 
 ```sh
@@ -740,21 +764,15 @@ reply endpoint.
 
 `events ack --reply` stores one immutable acknowledgement reply. The destination
 must accept it durably before the original is handled. Retry with identical text;
-different text cannot replace that acknowledgement. `events reply` instead sends
-a deliberate reply without completing or reopening the original, including after
-acknowledgement. Each invocation without `--operation` sends a new message, even
-with identical text. To retry an interrupted deliberate reply, reuse its printed
-operation ID and exact text. An unknown or pruned operation ID refuses delivery.
-`events read` and its JSON expose retained reply bodies, endpoints, operation IDs
-and pending/accepted state, so an interrupted command's ID is recoverable.
+different text cannot replace that acknowledgement. `events reply` sends further
+replies as for any replyable event, each as a new message.
 
 Message delivery is deduplicated across the destination/source commit gap. A
 small destination receipt pin survives inbox acknowledgement and body compaction
 until source acceptance is saved; cleanup failures leave acceptance intact and
 can be retried explicitly. Reply commands use a single nonblocking author lease,
 short local writer locks and no idle retry worker or polling. New replies do not
-inherit the original message's reply obligation. Command callbacks retain the
-separate single-answer contract below; `events reply` does not invoke them.
+inherit the original message's reply obligation.
 
 Reply-required messages use a version-2 inbox record that older readers cannot
 treat as plain-ackable work. Install supporting binaries on every custodian before
@@ -767,6 +785,8 @@ repository merges with its recipient's inbox copy; only recipient copies count
 as pending work or ack targets. External replies carry the `→` sent mark
 locally, even if that repository is unavailable, without fetching it or
 claiming the recipient woke or acknowledged.
+A reply a command backend accepted appears as sent under the event's source, with
+no recipient: the handler's exit is all clank knows of it.
 In the TUI, open the reply to read its full body, endpoint, operation ID and
 original-message link. `clank log --json` preserves those fields as structured
 data. Pending reply intents remain visible in event detail and are not shown as
@@ -777,7 +797,8 @@ before its local record can repeat delivery. The backend must persist and
 deduplicate `idempotency_key`, return zero for a previously accepted identical
 submission, and refuse conflicting content for that key. The author, key and
 text remain the same on retry. Copies sharing the same resolved source key,
-producer ID and saved route use one transaction and callback; same-named
+producer ID and saved route use one answer transaction and callback; a further
+reply belongs to the copy it was sent from and acknowledges none; same-named
 sources with different routes remain independent. A recorded acceptance lets
 an interrupted fanout finish retiring other copies without another callback.
 

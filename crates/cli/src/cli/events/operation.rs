@@ -1,13 +1,18 @@
-//! Explicit message dispatch. Each boundary holds only its own repo's writer
-//! lock; one author lease serializes operations without an idle worker.
+//! One reply operation for every backend that takes replies: its intent is
+//! durable before anything is sent, a retry resends exactly it, and only its
+//! transport differs by backend. Each boundary holds only its own repo's
+//! writer lock; a per-author or per-backend lease serializes operations
+//! without an idle worker.
 use super::Sourced;
-use crate::cli::github::log::{IngestLease, MessageOperation};
+use crate::cli::github::log::{
+    Acceptance, EventLog, EventReply, IngestLease, ReplyOperation, ReplyRoute,
+};
 use anyhow::Context;
 use clank_core::{
     ids::AgentLabel,
     wait::{MessageReplyRoute, WaitItem},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn dispatch_lease(repo: &Path, author: &AgentLabel) -> anyhow::Result<IngestLease> {
     crate::cli::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
@@ -52,7 +57,42 @@ fn endpoint(item: &WaitItem) -> anyhow::Result<MessageReplyRoute> {
         _ => anyhow::bail!("this message has no reply endpoint; its sender must supply --reply-to"),
     }
 }
-pub(super) fn submit(
+
+/// How a reply reaches the backend that produced its event.
+enum Transport {
+    /// Another agent's inbox, recorded in the author's messages WAL.
+    Message { handle: String },
+    /// The event's saved reply_command, recorded in its source's WAL.
+    Command {
+        source: String,
+        name: String,
+        producer: String,
+        owner: PathBuf,
+    },
+}
+impl Transport {
+    /// The transaction on the WAL the operation is recorded in.
+    fn record<T>(
+        &self,
+        repo: &Path,
+        author: &AgentLabel,
+        dir: &Path,
+        f: impl FnOnce(&mut EventLog) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        match self {
+            Transport::Message { .. } => crate::inbox::message_transaction(repo, author, f),
+            Transport::Command { source, .. } => f(&mut EventLog::open(dir, source)?),
+        }
+    }
+    fn handle(&self) -> &str {
+        match self {
+            Transport::Message { handle } => handle,
+            Transport::Command { producer, .. } => producer,
+        }
+    }
+}
+
+pub(super) async fn submit(
     repo: &Path,
     dir: &Path,
     selected: &Sourced,
@@ -64,13 +104,6 @@ pub(super) fn submit(
         !text.trim().is_empty(),
         "reply text must not be empty or whitespace-only"
     );
-    anyhow::ensure!(
-        selected.source == crate::inbox::MESSAGES_SOURCE,
-        "message replies require a messages selector"
-    );
-    let WaitItem::Message { handle, .. } = &selected.row.item else {
-        anyhow::bail!("events reply supports messages only; command events use events ack --reply");
-    };
     let repo = dunce::canonicalize(repo)?;
     let author = AgentLabel::parse(
         dir.parent()
@@ -84,9 +117,57 @@ pub(super) fn submit(
             == crate::agent_store::agents_root(&repo)
                 .join(author.as_str())
                 .join("events"),
-        "message author directory does not match the selected repository"
+        "reply author directory does not match the selected repository"
     );
-    let _lease = dispatch_lease(&repo, &author)?;
+    let (transport, saved_route, _lease) = match &selected.row.item {
+        WaitItem::Message { handle, .. } => {
+            anyhow::ensure!(
+                selected.source == crate::inbox::MESSAGES_SOURCE,
+                "message replies require a messages selector"
+            );
+            let lease = dispatch_lease(&repo, &author)?;
+            (
+                Transport::Message {
+                    handle: handle.clone(),
+                },
+                None,
+                lease,
+            )
+        }
+        WaitItem::CommandEvent {
+            id,
+            name,
+            reply_route,
+            ..
+        } => {
+            anyhow::ensure!(
+                !acknowledge,
+                "a command event's acknowledging reply is events ack --reply"
+            );
+            let route = reply_route.clone().ok_or_else(|| {
+                anyhow::anyhow!("this event has no saved reply_command; no reply was sent")
+            })?;
+            anyhow::ensure!(
+                route
+                    .command
+                    .first()
+                    .is_some_and(|program| !program.trim().is_empty()),
+                "the event's saved reply_command is empty; no reply was sent"
+            );
+            let (lease, owner) = super::reply::backend_lease(&repo, &selected.source, &route)?;
+            (
+                Transport::Command {
+                    source: selected.source.clone(),
+                    name: name.clone(),
+                    producer: id.clone(),
+                    owner,
+                },
+                Some(ReplyRoute::Command(route)),
+                lease,
+            )
+        }
+        _ => anyhow::bail!("this event's backend takes no replies"),
+    };
     let id = if acknowledge {
         blake3::hash(&serde_json::to_vec(&(
             "message-ack-v1",
@@ -102,9 +183,9 @@ pub(super) fn submit(
             .map(str::to_string)
             .unwrap_or_else(crate::inbox::mint_id)
     };
-    let state = crate::inbox::message_transaction(&repo, &author, |log| {
+    let state = transport.record(&repo, &author, dir, |log| {
         let saved = log
-            .message_operations()?
+            .reply_operations()?
             .into_iter()
             .find(|s| s.operation.id == id);
         let operation = if let Some(saved) = saved {
@@ -113,7 +194,8 @@ pub(super) fn submit(
                 op.acknowledge == acknowledge
                     && op.original_seq == selected.row.seq
                     && op.original_ident == selected.row.ident
-                    && op.original_handle == *handle
+                    && op.original_handle == transport.handle()
+                    && saved_route.as_ref().is_none_or(|route| *route == op.route)
                     && op.repo == repo
                     && op.author == author
                     && op.text == text,
@@ -125,20 +207,27 @@ pub(super) fn submit(
                 retry.is_none(),
                 "operation is unknown or its retained history was pruned; no reply was sent (omit --operation only to send a new reply)"
             );
-            MessageOperation {
+            ReplyOperation {
                 id: id.clone(),
                 repo: repo.clone(),
                 author: author.clone(),
                 original_seq: selected.row.seq,
                 original_ident: selected.row.ident.clone(),
-                original_handle: handle.clone(),
-                route: endpoint(&selected.row.item)?,
+                original_handle: transport.handle().into(),
+                route: match &saved_route {
+                    Some(route) => route.clone(),
+                    None => ReplyRoute::Message(endpoint(&selected.row.item)?),
+                },
                 text: text.into(),
                 at: crate::cli::github::log::now_epoch(),
                 acknowledge,
+                source_name: match &transport {
+                    Transport::Message { .. } => None,
+                    Transport::Command { name, .. } => Some(name.clone()),
+                },
             }
         };
-        Ok(log.begin_message_operation(&operation)?)
+        Ok(log.begin_reply_operation(&operation)?)
     })?;
     println!("reply operation: {}", state.operation.id);
     let retry_hint = if acknowledge {
@@ -149,66 +238,71 @@ pub(super) fn submit(
             state.operation.id
         )
     };
-    let receipt = if let Some(receipt) = &state.receipt {
+    let acceptance = if let Some(acceptance) = &state.receipt {
         // Re-sync before a visible acceptance suppresses delivery after a
-        // previous uncertain fsync. No endpoint membership check can undo it.
-        crate::inbox::message_transaction(&repo, &author, |log| {
-            Ok(log.accept_message_operation(&state, receipt)?)
+        // previous uncertain fsync. No endpoint check can undo it.
+        transport.record(&repo, &author, dir, |log| {
+            Ok(log.accept_reply_operation(&state, acceptance)?)
         })?;
-        receipt.clone()
+        acceptance.clone()
     } else {
-        let op = &state.operation;
-        let delivered = (|| -> anyhow::Result<_> {
-            anyhow::ensure!(
-                dunce::canonicalize(&op.route.repo)? == op.route.repo,
-                "saved reply repository now resolves elsewhere; refusing retargeting"
-            );
-            crate::inbox::message_transaction(&op.route.repo, &op.route.agent, |log| {
-                if log.message_delivery_receipt(op)?.is_none() {
-                    let root =
-                        crate::git_io::discover_work_dir(&op.route.repo)?.ok_or_else(|| {
-                            anyhow::anyhow!("saved reply repository is no longer a Git repository")
-                        })?;
-                    anyhow::ensure!(
-                        dunce::canonicalize(root)? == op.route.repo,
-                        "saved reply repository no longer names its Git root"
-                    );
-                    crate::cli::send::recipient(
-                        &op.route.repo,
-                        Some(op.route.agent.as_str()),
-                        false,
-                    )?;
+        let delivered = match (&transport, &state.operation.route) {
+            (Transport::Message { .. }, ReplyRoute::Message(route)) => {
+                Acceptance::Message(deliver_message(&state.operation, route).with_context(
+                    || {
+                        format!(
+                            "reply destination has not confirmed acceptance; original stays owed; {retry_hint}"
+                        )
+                    },
+                )?)
+            }
+            (Transport::Command { producer, owner, .. }, ReplyRoute::Command(route)) => {
+                super::reply::deliver_reply(
+                    &EventReply {
+                        id: producer.clone(),
+                        text: state.operation.text.clone(),
+                        author: author.to_string(),
+                        idempotency_key: state.operation.id.clone(),
+                        route: route.clone(),
+                    },
+                    false,
+                    super::reply::REPLY_BUDGET,
+                    owner,
+                )
+                .await
+                .with_context(|| format!("reply was not confirmed; {retry_hint}"))?;
+                Acceptance::Command {
+                    accepted_at: crate::cli::github::log::now_epoch(),
                 }
-                Ok(log.accept_message_delivery(op)?)
+            }
+            _ => anyhow::bail!("this operation's saved route is not its event's backend"),
+        };
+        transport
+            .record(&repo, &author, dir, |log| {
+                Ok(log.accept_reply_operation(&state, &delivered)?)
             })
-        })()
-        .with_context(|| {
-            format!(
-                "reply destination has not confirmed acceptance; original stays owed; {retry_hint}"
-            )
-        })?;
-        crate::inbox::message_transaction(&repo, &author, |log| {
-            Ok(log.accept_message_operation(&state, &delivered)?)
-        })
-        .with_context(|| {
-            format!("destination accepted, but source commit was not confirmed; {retry_hint}")
-        })?;
+            .with_context(|| {
+                format!("destination accepted, but source commit was not confirmed; {retry_hint}")
+            })?;
         delivered
     };
-    // Cleanup is allowed only after source acceptance above. A removed/offline
-    // endpoint cannot turn a completed reply into failure or another delivery.
-    if let Err(error) = (|| -> anyhow::Result<()> {
-        anyhow::ensure!(
-            dunce::canonicalize(&state.operation.route.repo)? == state.operation.route.repo,
-            "saved reply repository resolves elsewhere; cleanup deferred"
-        );
-        crate::inbox::message_transaction(
-            &state.operation.route.repo,
-            &state.operation.route.agent,
-            |log| Ok(log.release_message_receipt(&receipt)?),
-        )
-    })() {
-        eprintln!("clank: reply accepted; receipt-pin cleanup deferred: {error:#}");
+    if let (Acceptance::Message(receipt), ReplyRoute::Message(route)) =
+        (&acceptance, &state.operation.route)
+    {
+        // Cleanup is allowed only after source acceptance above. A
+        // removed/offline endpoint cannot turn a completed reply into failure
+        // or another delivery.
+        if let Err(error) = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                dunce::canonicalize(&route.repo)? == route.repo,
+                "saved reply repository resolves elsewhere; cleanup deferred"
+            );
+            crate::inbox::message_transaction(&route.repo, &route.agent, |log| {
+                Ok(log.release_message_receipt(receipt)?)
+            })
+        })() {
+            eprintln!("clank: reply accepted; receipt-pin cleanup deferred: {error:#}");
+        }
     }
     println!(
         "reply accepted{}",
@@ -219,6 +313,29 @@ pub(super) fn submit(
         }
     );
     Ok(())
+}
+
+fn deliver_message(
+    op: &ReplyOperation,
+    route: &MessageReplyRoute,
+) -> anyhow::Result<crate::cli::github::log::MessageReceipt> {
+    anyhow::ensure!(
+        dunce::canonicalize(&route.repo)? == route.repo,
+        "saved reply repository now resolves elsewhere; refusing retargeting"
+    );
+    crate::inbox::message_transaction(&route.repo, &route.agent, |log| {
+        if log.message_delivery_receipt(op)?.is_none() {
+            let root = crate::git_io::discover_work_dir(&route.repo)?.ok_or_else(|| {
+                anyhow::anyhow!("saved reply repository is no longer a Git repository")
+            })?;
+            anyhow::ensure!(
+                dunce::canonicalize(root)? == route.repo,
+                "saved reply repository no longer names its Git root"
+            );
+            crate::cli::send::recipient(&route.repo, Some(route.agent.as_str()), false)?;
+        }
+        Ok(log.accept_message_delivery(op)?)
+    })
 }
 
 #[cfg(test)]
@@ -313,11 +430,13 @@ mod tests {
             1
         );
         assert_eq!(
-            log(source.path(), "worker").message_operations().unwrap()[0]
+            log(source.path(), "worker").reply_operations().unwrap()[0]
                 .operation
-                .route
-                .repo,
-            dunce::canonicalize(target.path()).unwrap()
+                .route,
+            ReplyRoute::Message(MessageReplyRoute {
+                repo: dunce::canonicalize(target.path()).unwrap(),
+                agent: label("coordinator"),
+            })
         );
         assert!(
             log(source.path(), "worker")
@@ -329,7 +448,7 @@ mod tests {
         );
         reply(source.path(), "same follow-up", None).await.unwrap();
         reply(source.path(), "same follow-up", None).await.unwrap();
-        let operations = log(source.path(), "worker").message_operations().unwrap();
+        let operations = log(source.path(), "worker").reply_operations().unwrap();
         assert_eq!(operations.len(), 3);
         let detail = log(source.path(), "worker")
             .read_rows()
@@ -338,8 +457,8 @@ mod tests {
             .rows
             .remove(0);
         let detail = serde_json::to_value(detail).unwrap();
-        assert_eq!(detail["message_replies"][0]["operation"]["text"], text);
-        assert_eq!(detail["message_replies"].as_array().unwrap().len(), 3);
+        assert_eq!(detail["replies"][0]["operation"]["text"], text);
+        assert_eq!(detail["replies"].as_array().unwrap().len(), 3);
         reply(
             source.path(),
             "same follow-up",
@@ -381,7 +500,7 @@ mod tests {
         )
         .unwrap();
         assert!(reply(source.path(), "progress", None).await.is_err());
-        let operations = log(source.path(), "worker").message_operations().unwrap();
+        let operations = log(source.path(), "worker").reply_operations().unwrap();
         assert_eq!(operations.len(), 1);
         assert!(operations[0].receipt.is_none());
         assert!(
@@ -433,7 +552,7 @@ mod tests {
         .unwrap();
         assert!(ack(source.path(), "done").await.is_err());
         let state = log(source.path(), "worker")
-            .message_operations()
+            .reply_operations()
             .unwrap()
             .remove(0);
         crate::inbox::message_transaction(target.path(), &label("coordinator"), |log| {
@@ -505,7 +624,7 @@ mod tests {
         assert!(reply(human.path(), "progress", None).await.is_err());
         assert!(
             log(human.path(), "worker")
-                .message_operations()
+                .reply_operations()
                 .unwrap()
                 .is_empty()
         );
@@ -524,7 +643,7 @@ mod tests {
         );
         assert!(
             log(source.path(), "worker")
-                .message_operations()
+                .reply_operations()
                 .unwrap()
                 .is_empty()
         );
@@ -614,7 +733,7 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert!(rows[0].acked);
             assert!(!rows[1].acked);
-            assert_eq!(rows[0].message_replies.len(), 1);
+            assert_eq!(rows[0].replies.len(), 1);
         }
     }
     #[test]
