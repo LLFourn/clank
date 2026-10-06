@@ -198,6 +198,23 @@ pub(super) fn render_at(
             cols,
         );
     }
+    if let Mode::SourcePage { sel, lift } = mode
+        && let Some(source) = view.source_page.and_then(|r| r.find(&snap.sources))
+    {
+        let rows_of = super::input::source_rows(
+            restartable(source, &snap.sources_live),
+            &source_events(source, &snap.github_events),
+        );
+        return render_source_page(
+            snap,
+            source,
+            &rows_of,
+            sel,
+            lift,
+            rows as usize,
+            cols as usize,
+        );
+    }
     if let Mode::DraftsList { sel } = mode {
         return render_drafts_list(snap, sel, rows, cols);
     }
@@ -249,6 +266,12 @@ pub(super) fn render_at(
                         cols,
                     );
                 }
+            }
+            ConfirmAction::RestartSource => {
+                if let Some(source) = view.source_page.and_then(|r| r.find(&snap.sources)) {
+                    return render_restart_confirm(source, rows as usize, cols as usize);
+                }
+                return (vec![region_rule("restart", "", true, cols as usize)], 1);
             }
             ConfirmAction::KillAttended => {
                 if let Some((a, att)) = view
@@ -650,6 +673,7 @@ pub(super) fn scrollable_header(
         snap.stash.len(),
         snap.queue.len(),
         !snap.drafts.is_empty(),
+        snap.sources.len(),
     );
     let at = |row: PanelRow| panel.iter().position(|r| *r == row);
     if !snap.agents.is_empty() {
@@ -825,8 +849,279 @@ pub(super) fn scrollable_header(
             cols,
         ));
     }
+    // The configured event sources, one row each with the icon their
+    // events carry and what the monitor says each is doing.
+    if !snap.agents.is_empty() && !snap.sources.is_empty() {
+        head_out.push(region_rule(
+            "sources",
+            "⏎ open",
+            mode.agents_focused(),
+            cols,
+        ));
+        for (i, source) in snap.sources.iter().enumerate() {
+            head_out.push(row_line(
+                &[
+                    plain(format!("  {} {}", source.glyph, source.name)),
+                    dim(format!("  @{}", source.agent)),
+                    dim(format!("  {}", source_state(source, &snap.sources_live))),
+                ],
+                mode.selected() == at(PanelRow::Source(i)),
+                color,
+                cols,
+            ));
+        }
+    }
 
     head_out
+}
+
+/// What the monitor says `source` is doing, in a few words. Without a
+/// running monitor nothing is known, which is said, not taken for stopped.
+pub(super) fn source_state(
+    source: &crate::cli::source_status::ConfiguredSource,
+    live: &crate::cli::source_status::Live,
+) -> String {
+    use crate::cli::event_source::Lifecycle;
+    use crate::cli::github::timeline::Backend;
+    use crate::cli::source_status::Live;
+    let hosted = match live {
+        Live::Unavailable => return "monitor not running".to_string(),
+        Live::Monitor(_) => match live.of(source) {
+            Some(hosted) => hosted,
+            None => return "not hosted".to_string(),
+        },
+    };
+    let now = crate::cli::github::log::now_epoch();
+    let state = match (&hosted.lifecycle, source.backend) {
+        (None, Backend::Command) => "starting".to_string(),
+        (None, _) => "hosted".to_string(),
+        (Some(Lifecycle::Following), _) => "following another host's log".to_string(),
+        (Some(Lifecycle::Settling { why }), _) => format!("settling: {why}"),
+        (Some(Lifecycle::Stopped { why }), _) => format!("stopped: {why}"),
+        (Some(Lifecycle::Running { pid, since }), _) => format!(
+            "running · pid {pid} · {}",
+            crate::age::short(crate::age::elapsed(*since as i64))
+        ),
+        (
+            Some(Lifecycle::BackingOff {
+                until,
+                failures,
+                exit,
+                error,
+            }),
+            _,
+        ) => {
+            let why = match (exit, error) {
+                (_, Some(error)) => format!("did not start: {error}"),
+                (Some(code), None) => format!("exited {code}"),
+                (None, None) => "ended".to_string(),
+            };
+            format!(
+                "{why} · restarting in {}s · {failures} in a row",
+                until.saturating_sub(now)
+            )
+        }
+    };
+    if hosted.accepted != crate::cli::source_status::fingerprint(&source.config) {
+        format!("{state} · an edit was rejected; runs the earlier config")
+    } else {
+        state
+    }
+}
+
+/// Whether a source page offers Restart: a command source the running
+/// monitor hosts.
+pub(super) fn restartable(
+    source: &crate::cli::source_status::ConfiguredSource,
+    live: &crate::cli::source_status::Live,
+) -> bool {
+    source.backend == crate::cli::github::timeline::Backend::Command && live.of(source).is_some()
+}
+
+/// The positions of `source`'s events in `events`, newest first.
+pub(super) fn source_events(
+    source: &crate::cli::source_status::ConfiguredSource,
+    events: &[crate::cli::github::timeline::MergedEvent],
+) -> Vec<usize> {
+    let mut found = crate::cli::source_status::events_of(source, events);
+    found.sort_by_key(|&i| std::cmp::Reverse(events[i].at));
+    found
+}
+
+/// A source's configuration, line by line, as it is configured.
+fn source_config_lines(
+    config: &clank_core::agent_config::WaitEventSource,
+) -> Vec<(String, String)> {
+    use clank_core::agent_config::WaitEventSource;
+    let argv = |v: &[String]| v.join(" ");
+    let mut lines = Vec::new();
+    let (interrupt, hint) = match config {
+        WaitEventSource::Command(c) => {
+            lines.push(("kind".to_string(), "command".to_string()));
+            lines.push(("command".to_string(), argv(&c.command)));
+            if let Some(reply) = &c.reply_command {
+                lines.push(("reply".to_string(), argv(reply)));
+            }
+            if let Some(receipt) = &c.receipt_command {
+                lines.push(("receipt".to_string(), argv(receipt)));
+            }
+            if let Some(glyph) = &c.glyph {
+                lines.push(("glyph".to_string(), glyph.clone()));
+            }
+            (c.interrupt, c.interrupt_message.clone())
+        }
+        WaitEventSource::Timer(t) => {
+            lines.push(("kind".to_string(), "timer".to_string()));
+            lines.push(("due".to_string(), t.due_at.clone()));
+            if let Some(every) = &t.repeat_every {
+                lines.push(("every".to_string(), every.clone()));
+            }
+            if let Some(content) = &t.content {
+                lines.push(("content".to_string(), content.clone()));
+            }
+            (t.interrupt, t.interrupt_message.clone())
+        }
+        WaitEventSource::Github(g) => {
+            lines.push(("kind".to_string(), "github".to_string()));
+            lines.push(("repo".to_string(), g.repo.clone()));
+            let config = serde_json::to_value(g).unwrap_or_default();
+            for (field, label) in [
+                ("events", "events"),
+                ("watch", "watch"),
+                ("prs", "prs"),
+                ("branches", "branches"),
+                ("poll_interval", "poll every"),
+                ("prompt", "prompt"),
+                ("include_own_actions", "own actions"),
+            ] {
+                match config.get(field) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::Array(a)) if a.is_empty() => {}
+                    Some(serde_json::Value::String(s)) => {
+                        lines.push((label.to_string(), s.clone()))
+                    }
+                    Some(other) => lines.push((label.to_string(), other.to_string())),
+                }
+            }
+            (g.interrupt, g.interrupt_message.clone())
+        }
+    };
+    if interrupt {
+        lines.push((
+            "interrupt".to_string(),
+            hint.unwrap_or_else(|| "yes".to_string()),
+        ));
+    }
+    lines
+}
+
+/// A source's page: its configuration and state, read-only, then its
+/// rows — Restart where it applies, and its events newest first. Under
+/// the pinned title the page scrolls as one: its window keeps the
+/// cursor's row drawn, raised `lift` lines when the reader scrolls up to
+/// read the configuration above it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_source_page(
+    snap: &StatusSnapshot,
+    source: &crate::cli::source_status::ConfiguredSource,
+    rows_of: &[super::input::SourceRow],
+    sel: usize,
+    lift: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    use super::input::SourceRow;
+    const LABEL: usize = 11;
+    let color = state_color(snap).sgr();
+    let mut body = vec![String::new()];
+    let mut fact = |key: &str, value: &str| {
+        let width = cols.saturating_sub(LABEL + 2).max(1);
+        for (i, line) in wrap(value, width).into_iter().enumerate() {
+            let label = if i == 0 { key } else { "" };
+            body.push(emit(
+                &[dim(format!("  {label:<LABEL$}")), plain(line)],
+                "",
+                cols,
+            ));
+        }
+    };
+    for (key, value) in source_config_lines(&source.config) {
+        fact(&key, &value);
+    }
+    fact("state", &source_state(source, &snap.sources_live));
+    body.push(String::new());
+    let first_row = body.len();
+    for (i, row) in rows_of.iter().enumerate() {
+        let spans = match row {
+            SourceRow::Restart => vec![
+                plain("  r restart…".to_string()),
+                dim("  stop its process group and start it again".to_string()),
+            ],
+            SourceRow::Event(at) => match snap.github_events.get(*at) {
+                Some(event) => vec![
+                    dim(format!("  {} ", event.delivery().glyph())),
+                    plain(crate::cli::log::event_row_text(event)),
+                ],
+                None => vec![dim("  (gone)".to_string())],
+            },
+        };
+        body.push(row_line(&spans, i == sel, &color, cols));
+    }
+    if !rows_of.iter().any(|r| matches!(r, SourceRow::Event(_))) {
+        body.push(emit(&[dim("  no events yet".to_string())], "", cols));
+    }
+    let room = rows.saturating_sub(2).max(1);
+    let selected = first_row + sel.min(rows_of.len().saturating_sub(1));
+    let offset = (selected + 1).saturating_sub(room).saturating_sub(lift);
+    let mut out = vec![region_rule(
+        &format!("source · {} {}", source.glyph, source.name),
+        &format!("@{}", source.agent),
+        true,
+        cols,
+    )];
+    out.extend(body.into_iter().skip(offset).take(room));
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ choose · ⏎ open · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
+}
+
+/// Whether to restart a source's producer.
+pub(super) fn render_restart_confirm(
+    source: &crate::cli::source_status::ConfiguredSource,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut out = vec![
+        region_rule(
+            &format!("restart · {}", source.name),
+            &format!("@{}", source.agent),
+            true,
+            cols,
+        ),
+        String::new(),
+    ];
+    let body = "Stop its producer's whole process group, children included, and start it \
+                again? Its log, its pending events and its state are kept, and no other \
+                source is touched.";
+    for line in wrap(body, cols.saturating_sub(3).max(1)) {
+        out.push(emit(&[plain(format!("   {line}"))], "", cols));
+    }
+    out.push(String::new());
+    out.push(emit(
+        &[dim("   y restart it   ·   n cancel".to_string())],
+        "",
+        cols,
+    ));
+    let len = out.len();
+    out.truncate(rows);
+    (out, len)
 }
 
 /// Newest-at-top render with no scroll — the common case the layout
@@ -3680,7 +3975,7 @@ pub(super) fn render_roster_confirm(
     let target = match action {
         // Rendered by `render_kill_confirm`, which needs the wait
         // record rather than the roster.
-        ConfirmAction::KillAttended => return (Vec::new(), 0),
+        ConfirmAction::KillAttended | ConfirmAction::RestartSource => return (Vec::new(), 0),
         ConfirmAction::AddCandidate { idx, tier } => picker
             .get(idx)
             .map(|c| format!("{} [{}] as {}", c.label, c.tool, tier_label(tier.into())))
@@ -3706,7 +4001,9 @@ pub(super) fn render_roster_confirm(
         }
     };
     let (title, consequence) = match action {
-        ConfirmAction::KillAttended => unreachable!("returned above"),
+        ConfirmAction::KillAttended | ConfirmAction::RestartSource => {
+            unreachable!("returned above")
+        }
         ConfirmAction::AddCandidate { .. } => (
             format!("add reviewer `{target}`?"),
             "adds this global-library agent to the local roster in .clank/config.json",
@@ -5397,6 +5694,7 @@ mod tests {
                             Mode::AgentPanel { sel: 0 }
                         };
                         let view = PanelView {
+                            source_page: None,
                             mode,
                             plan_page: None,
                             commit_page: None,
@@ -5445,6 +5743,7 @@ mod tests {
 
     fn lift_view(cursor: usize, lift: usize) -> PanelView<'static> {
         PanelView {
+            source_page: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -5646,6 +5945,7 @@ mod tests {
         // rows == 2, UNFOCUSED: today's greedy fit unchanged — bar +
         // first header row, no pressure lift ever engages.
         let unfocused = PanelView {
+            source_page: None,
             mode: Mode::AgentPanel { sel: 0 },
             ..lift_view(0, 0)
         };
@@ -5667,6 +5967,7 @@ mod tests {
         let mut s = two_agent_snap();
         s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
         let view = PanelView {
+            source_page: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -7370,6 +7671,7 @@ mod tests {
             0,
             0,
             &PanelView {
+                source_page: None,
                 plan_page: None,
                 commit_page: None,
                 event_page: None,
@@ -7425,6 +7727,7 @@ mod tests {
             cand("gizmo", "claude", "claude"),
         ];
         let view = PanelView {
+            source_page: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -7530,6 +7833,7 @@ mod tests {
             0,
             0,
             &PanelView {
+                source_page: None,
                 plan_page: None,
                 commit_page: None,
                 event_page: None,
@@ -7826,7 +8130,7 @@ mod tests {
             1,
             "one row"
         );
-        let rows = super::super::input::panel_rows(2, &[], 0, 1, true);
+        let rows = super::super::input::panel_rows(2, &[], 0, 1, true, 0);
         let at = rows.iter().position(|r| *r == PanelRow::Drafts).unwrap();
         let raw = render_at(
             &s,
@@ -7868,6 +8172,247 @@ mod tests {
             .collect();
         assert_eq!(line, "─".repeat(12));
         assert_eq!(age_gutter(&row, 3).1, "");
+    }
+
+    fn source(name: &str) -> crate::cli::source_status::ConfiguredSource {
+        crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse("alpha").unwrap(),
+            &clank_core::agent_config::WaitEventSource::Command(
+                clank_core::agent_config::CommandSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: name.into(),
+                    command: vec!["producer".into(), "--watch".into()],
+                    reply_command: None,
+                    receipt_command: None,
+                    glyph: Some("🛰".into()),
+                },
+            ),
+        )
+    }
+
+    fn account(
+        source: &crate::cli::source_status::ConfiguredSource,
+        accepted: String,
+        lifecycle: Option<crate::cli::event_source::Lifecycle>,
+    ) -> crate::cli::source_status::Live {
+        crate::cli::source_status::Live::Monitor(crate::cli::source_status::Account {
+            monitor: 1,
+            birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+            sources: vec![crate::cli::source_status::Hosted {
+                agent: source.agent.to_string(),
+                key: source.key.clone(),
+                accepted,
+                lifecycle,
+            }],
+        })
+    }
+
+    /// A source's state says what the monitor reports, and says so when
+    /// there is no monitor to ask rather than calling it stopped.
+    #[test]
+    fn a_source_state_is_the_monitors_account_or_its_absence() {
+        use crate::cli::event_source::Lifecycle;
+        use crate::cli::source_status::{Live, fingerprint};
+        let s = source("watch");
+        let ours = fingerprint(&s.config);
+        assert_eq!(source_state(&s, &Live::Unavailable), "monitor not running");
+        let other = source("other");
+        assert_eq!(
+            source_state(&s, &account(&other, ours.clone(), None)),
+            "not hosted"
+        );
+        let running = account(
+            &s,
+            ours.clone(),
+            Some(Lifecycle::Running { pid: 42, since: 0 }),
+        );
+        assert!(source_state(&s, &running).starts_with("running · pid 42"));
+        let backing = account(
+            &s,
+            ours.clone(),
+            Some(Lifecycle::BackingOff {
+                until: 0,
+                failures: 2,
+                exit: Some(3),
+                error: None,
+            }),
+        );
+        assert!(source_state(&s, &backing).starts_with("exited 3 · restarting in 0s · 2 in a row"));
+        let rejected = account(
+            &s,
+            "an earlier config".into(),
+            Some(Lifecycle::Running { pid: 42, since: 0 }),
+        );
+        assert!(
+            source_state(&s, &rejected).ends_with("an edit was rejected; runs the earlier config")
+        );
+        assert!(restartable(&s, &running) && !restartable(&s, &Live::Unavailable));
+    }
+
+    /// The sources sit in the panel with their icon and state, and a
+    /// source's page shows its configuration and keeps the selected
+    /// event drawn however many there are.
+    #[test]
+    fn the_sources_region_and_page_show_the_source() {
+        let mut s = two_agent_snap();
+        s.sources = vec![source("watch")];
+        let texts: Vec<String> = render_at(
+            &s,
+            40,
+            100,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0
+        .iter()
+        .map(|l| visible(l))
+        .collect();
+        let row = texts
+            .iter()
+            .find(|t| t.contains("🛰 watch"))
+            .expect("a source row");
+        assert!(
+            row.contains("@alpha") && row.contains("monitor not running"),
+            "{row}"
+        );
+
+        let ours = s.sources[0].clone();
+        s.github_events = (0..30u64)
+            .map(|i| crate::cli::github::timeline::MergedEvent {
+                outgoing: Vec::new(),
+                recurrence: None,
+                at: 1_000 + i,
+                backend: crate::cli::github::timeline::Backend::Command,
+                glyph: None,
+                source: "watch".into(),
+                kind: "k".into(),
+                failure: false,
+                detail: None,
+                number: None,
+                content: Some(format!("event-{i:02}")),
+                body: None,
+                actor: None,
+                url: None,
+                seen_by: vec!["alpha".into()],
+                unhandled: false,
+                baseline: false,
+                members: vec![crate::cli::github::timeline::MemberRef {
+                    woken_at: None,
+                    key: crate::cli::github::timeline::MemberKey {
+                        agent: "alpha".into(),
+                        source: ours.key.clone(),
+                        seq: i,
+                        ident: String::new(),
+                    },
+                    acked: true,
+                    transport: crate::cli::github::log::Transport::Command,
+                    content: None,
+                }],
+            })
+            .collect();
+        let events = source_events(&ours, &s.github_events);
+        assert_eq!(events.first(), Some(&29), "newest first");
+        let rows_of = super::super::input::source_rows(false, &events);
+        let page = |sel: usize| -> Vec<String> {
+            render_source_page(&s, &s.sources[0], &rows_of, sel, 0, 14, 100)
+                .0
+                .iter()
+                .map(|l| visible(l))
+                .collect()
+        };
+        let top = page(0);
+        assert!(
+            top.iter().any(|t| t.contains("producer --watch")),
+            "{top:#?}"
+        );
+        assert!(top.iter().any(|t| t.contains("monitor not running")));
+        assert!(top.iter().any(|t| t.contains("event-29")));
+        let deep = page(25);
+        assert!(deep.len() <= 14);
+        assert!(
+            deep.iter().any(|t| t.contains("event-04")),
+            "the selected event: {deep:#?}"
+        );
+        assert!(
+            !deep.iter().any(|t| t.contains("event-29")),
+            "scrolled past the newest"
+        );
+        assert!(page(1).iter().any(|t| t.contains("event-29")), "and back");
+    }
+
+    /// In a pane shorter than the configuration, the reader scrolls up
+    /// from the first row to read all of it, from its kind and the start
+    /// of its command, and moving the cursor brings its row back; long
+    /// values wrap rather than being cut.
+    #[test]
+    fn a_short_pane_reads_the_whole_configuration_and_its_rows() {
+        use super::super::input::{Key, SourceNav, source_moved, source_nav};
+        let mut s = two_agent_snap();
+        let source = crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse("alpha").unwrap(),
+            &clank_core::agent_config::WaitEventSource::Command(
+                clank_core::agent_config::CommandSource {
+                    interrupt: true,
+                    interrupt_message: Some("A long interrupt hint that also needs room".into()),
+                    name: "watch".into(),
+                    command: vec![
+                        "BEGIN-OF-COMMAND".into(),
+                        "--a-very-long-argument-".repeat(6),
+                        "TAIL-OF-COMMAND".into(),
+                    ],
+                    reply_command: Some(vec!["reply".into(), "--answer".into()]),
+                    receipt_command: Some(vec!["receipt".into()]),
+                    glyph: Some("🛰".into()),
+                },
+            ),
+        );
+        s.sources = vec![source.clone()];
+        let rows_of = super::super::input::source_rows(true, &[]);
+        let page = |sel: usize, lift: usize| -> Vec<String> {
+            render_source_page(&s, &source, &rows_of, sel, lift, 10, 40)
+                .0
+                .iter()
+                .map(|l| visible(l))
+                .collect()
+        };
+        let shows = |lines: &[String], text: &str| lines.iter().any(|l| l.contains(text));
+        let (mut sel, mut lift) = (0, 0);
+        let opened = page(sel, lift);
+        assert!(opened.len() <= 10);
+        assert!(shows(&opened, "restart"), "the cursor's row: {opened:#?}");
+        assert!(
+            !shows(&opened, "BEGIN-OF-COMMAND"),
+            "the fixture overflows the pane"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..30 {
+            (sel, lift) = source_moved(sel, lift, source_nav(sel, &rows_of, Key::Up)).unwrap();
+            for line in page(sel, lift) {
+                seen.insert(line);
+            }
+        }
+        for text in [
+            "kind",
+            "BEGIN-OF-COMMAND",
+            "TAIL-OF-COMMAND",
+            "reply",
+            "receipt",
+            "interrupt",
+        ] {
+            assert!(seen.iter().any(|l| l.contains(text)), "{text} never shown");
+        }
+        (sel, lift) = source_moved(sel, lift, source_nav(sel, &rows_of, Key::Down)).unwrap();
+        assert!(
+            shows(&page(sel, lift), "restart"),
+            "back to the cursor's row"
+        );
+        assert_eq!(
+            source_nav(0, &rows_of, Key::Top),
+            SourceNav::Lift(usize::MAX)
+        );
+        assert!(shows(&page(0, usize::MAX), "kind"), "top of the page");
     }
 
     /// However long the list and short the pane, the selected draft is
@@ -8092,6 +8637,7 @@ mod tests {
         // Log focused, cursor on the SECOND entry (seq index 1, since
         // two_agent_snap has no ask/in-progress rows).
         let view = PanelView {
+            source_page: None,
             plan_page: None,
             commit_page: None,
             event_page: None,

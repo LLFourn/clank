@@ -222,6 +222,19 @@ pages. Under the queue, one `drafts: N` row lists `.clank/drafts/`; a draft's
 page reads it and queues it (`e`) or queues and promotes it (`p`), with the
 same checks as `clank queue add` and `clank queue promote`. Unqueue on a queued
 plan's page sends it back there. The remote page shows the same count.
+Above the log, a SOURCES region lists each agent's configured command, timer
+and GitHub event sources, with the icon their events carry and what the monitor
+says each is doing: running with its pid, backing off after an exit, following
+another host's log, or not hosted. Without a running monitor it says so rather
+than show a stale pid. Enter opens a source's page:
+- its configuration, read-only;
+- its events alone, newest first, each opening its event page;
+- for a command source, `r` to restart its producer behind a confirm.
+
+A restart is a request to the monitor. It stops only that source's whole
+process group and starts it again, and is refused if the configuration it runs
+has changed since the page showed it. When an edited source configuration was
+rejected, the page says the monitor still runs the earlier one.
 `--watch` gives a live non-fullscreen view; `-j` emits JSON.
 Status JSON carries `active_plan` and `last_finished` as objects or `null`. A
 finished run carries `duration_secs`, recorded once from its accepted intro to

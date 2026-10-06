@@ -65,6 +65,7 @@ pub(crate) mod session_holder;
 pub mod setup;
 pub mod source_group;
 pub(crate) mod source_ids;
+pub(crate) mod source_status;
 pub mod stash;
 pub mod status;
 pub(crate) mod status_tui;

@@ -63,6 +63,13 @@ pub struct StatusSnapshot {
     /// the remote page's count read them, so the wire omits them.
     #[serde(skip)]
     pub(crate) drafts: Vec<crate::cli::queue::Draft>,
+    /// The agents' configured event sources, by agent and name: the
+    /// panel's sources region. The wire omits them.
+    #[serde(skip)]
+    pub(crate) sources: Vec<crate::cli::source_status::ConfiguredSource>,
+    /// What the running monitor says of those sources, if one runs.
+    #[serde(skip)]
+    pub(crate) sources_live: crate::cli::source_status::Live,
     /// The team's master label, when a team resolves (render path:
     /// degrades to None on a teamless repo). The TUI's idle+queue
     /// headline names master as the agent whose turn it is.
@@ -702,6 +709,8 @@ impl StatusSnapshot {
             blocks,
             queue,
             drafts: crate::cli::queue::scan_drafts(repo),
+            sources: crate::cli::source_status::configured(repo),
+            sources_live: crate::cli::source_status::live(repo),
             master,
             agents,
             stash,
@@ -1310,6 +1319,9 @@ pub(crate) struct InputSignature {
     /// Liveness of recorded attended tasks, which can change without
     /// a file write when the task process exits.
     attendances: u64,
+    /// The monitor's account of its sources, which changes outside the
+    /// repo: a producer starting or ending, or the monitor going.
+    sources: u64,
 }
 
 /// Compute the current [`InputSignature`]. One ODB open (HEAD + the
@@ -1323,7 +1335,17 @@ pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
         dirty,
         clank: clank_input_fingerprint(repo),
         attendances: attendance_fingerprint(repo),
+        sources: sources_fingerprint(repo),
     })
+}
+
+/// Hash of the sources account the monitor publishes, as the panel would
+/// read it, including whether its monitor still runs.
+fn sources_fingerprint(repo: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", crate::cli::source_status::live(repo)).hash(&mut h);
+    h.finish()
 }
 
 /// Hash of every agent's reachability verdict.
@@ -2905,6 +2927,8 @@ mod dirty_and_wake_tests {
             }],
             queue: Vec::new(),
             drafts: Vec::new(),
+            sources: Vec::new(),
+            sources_live: crate::cli::source_status::Live::Unavailable,
             master: None,
             agents: Vec::new(),
             stash: Vec::new(),
@@ -3078,6 +3102,8 @@ mod dirty_and_wake_tests {
             stash: _,
             // The panel's and the remote page's; the wire skips them.
             drafts: _,
+            sources: _,
+            sources_live: _,
             forks,
             pr_reviews,
             ad_hoc,

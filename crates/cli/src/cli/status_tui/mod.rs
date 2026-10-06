@@ -124,6 +124,7 @@ fn panel_row_list(
         snap.stash.len(),
         snap.queue.len(),
         !snap.drafts.is_empty(),
+        snap.sources.len(),
     )
 }
 
@@ -265,7 +266,9 @@ fn apply_confirm(
     match action {
         // Executed at the call site, which holds the page identity the
         // post-confirm revalidation needs.
-        ConfirmAction::KillAttended | ConfirmAction::ClearSession { .. } => Ok(()),
+        ConfirmAction::KillAttended
+        | ConfirmAction::ClearSession { .. }
+        | ConfirmAction::RestartSource => Ok(()),
         ConfirmAction::AddCandidate { idx, tier } => {
             if let Some(c) = picker.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
@@ -954,6 +957,80 @@ fn content_needs_refetch(
 /// loop's turn long, and a GitHub round trip must not be added to it.
 /// The generation rides along so a slow answer can be refused if the
 /// page has moved on.
+/// A source page's rows for `source` in this snapshot.
+fn source_rows_in(
+    source: &crate::cli::source_status::ConfiguredSource,
+    snapshot: &StatusSnapshot,
+) -> Vec<input::SourceRow> {
+    input::source_rows(
+        render::restartable(source, &snapshot.sources_live),
+        &render::source_events(source, &snapshot.github_events),
+    )
+}
+
+/// What a source page's cursor is on before a refresh.
+fn selected_source_row(
+    mode: Mode,
+    source: Option<&input::SourceRef>,
+    snapshot: &StatusSnapshot,
+) -> Option<input::SourcePick> {
+    let Mode::SourcePage { sel, .. } = mode else {
+        return None;
+    };
+    let source = source?.find(&snapshot.sources)?;
+    input::source_pick(
+        &source_rows_in(source, snapshot),
+        sel,
+        &snapshot.github_events,
+    )
+}
+
+/// What a confirmed restart asks the monitor: this page's source, as
+/// long as it still runs the configuration the confirm was shown.
+fn restart_request(
+    source: Option<&input::SourceRef>,
+    accepted: Option<String>,
+) -> Option<crate::cli::monitor::Control> {
+    let source = source?;
+    Some(crate::cli::monitor::Control::Restart {
+        author: source.agent.clone(),
+        key: source.key.clone(),
+        accepted: accepted?,
+    })
+}
+
+/// The page of `event`, its content requested.
+fn open_event_page(
+    repo: &std::path::Path,
+    event: &crate::cli::github::timeline::MergedEvent,
+    content_generation: &mut u64,
+    ev_tx: &mpsc::Sender<Ev>,
+) -> Option<EventPage> {
+    let first = event.page_keys().into_iter().next()?;
+    let want = first
+        .member()
+        .and_then(|key| crate::cli::github::timeline::resolve_content_ref(&event.members, key))
+        .cloned();
+    let content = want.map(|target| {
+        *content_generation += 1;
+        spawn_content_fetch(
+            ev_tx,
+            event.source.clone(),
+            target.clone(),
+            *content_generation,
+        );
+        event_content::ContentSlot::requesting(target, *content_generation)
+    });
+    Some(EventPage {
+        target: first,
+        retained: event.page_keys(),
+        event: event.clone(),
+        prompts: event_prompts(repo, event),
+        scroll: 0,
+        content,
+    })
+}
+
 fn spawn_content_fetch(
     ev_tx: &mpsc::Sender<Ev>,
     repo: String,
@@ -2983,6 +3060,12 @@ pub(crate) async fn run_tui(
     // a plan-page Confirm — set and cleared ONLY together with those
     // mode transitions.
     let mut plan_page: Option<PlanPage> = None;
+    // The source page's source (⟺ mode is `SourcePage`), the page an
+    // event page returns to when opened from it, and the configuration
+    // a restart confirm was shown, which the monitor checks it still runs.
+    let mut source_page: Option<input::SourceRef> = None;
+    let mut event_beneath: Option<Mode> = None;
+    let mut restart_accepted: Option<String> = None;
     // The open commit page, and the one a plan page opened from it
     // returns to; see `Mode::CommitPage`.
     let mut commit_page: Option<CommitPage> = None;
@@ -3269,6 +3352,7 @@ pub(crate) async fn run_tui(
             (detail, None) => detail,
         };
         let view = PanelView {
+            source_page: source_page.as_ref(),
             wait_page: wait_page.as_ref(),
             wait_process: wait_process.slot.as_ref(),
             wait_scroll,
@@ -3638,6 +3722,66 @@ pub(crate) async fn run_tui(
                             }
                             continue;
                         }
+                        Mode::SourcePage { sel, lift } => {
+                            use crate::cli::status_tui::input::{SourceNav, SourceRow};
+                            let Some(source) =
+                                source_page.as_ref().and_then(|r| r.find(&snapshot.sources))
+                            else {
+                                source_page = None;
+                                mode = Mode::LogScroll;
+                                continue;
+                            };
+                            let rows_of = source_rows_in(source, &snapshot);
+                            match input::source_nav(sel, &rows_of, k) {
+                                SourceNav::Quit => break 'evloop,
+                                SourceNav::Back => {
+                                    let row = snapshot.sources.iter().position(|s| s == source);
+                                    source_page = None;
+                                    mode = Mode::AgentPanel {
+                                        sel: row
+                                            .map(|i| {
+                                                row_position(
+                                                    &panel_row_list(&snapshot, cols as usize),
+                                                    input::PanelRow::Source(i),
+                                                )
+                                            })
+                                            .unwrap_or(0),
+                                    };
+                                }
+                                nav @ (SourceNav::Sel(_) | SourceNav::Lift(_)) => {
+                                    if let Some((sel, lift)) = input::source_moved(sel, lift, nav) {
+                                        mode = Mode::SourcePage { sel, lift };
+                                    }
+                                }
+                                SourceNav::Act(SourceRow::Restart) => {
+                                    restart_accepted = snapshot
+                                        .sources_live
+                                        .of(source)
+                                        .map(|h| h.accepted.clone());
+                                    mode = Mode::Confirm {
+                                        action: ConfirmAction::RestartSource,
+                                    };
+                                }
+                                SourceNav::Act(SourceRow::Event(at)) => {
+                                    if let Some(page) =
+                                        snapshot.github_events.get(at).and_then(|ev| {
+                                            open_event_page(
+                                                &repo,
+                                                ev,
+                                                &mut content_generation,
+                                                &ev_tx_async,
+                                            )
+                                        })
+                                    {
+                                        event_page = Some(page);
+                                        event_beneath = Some(Mode::SourcePage { sel, lift });
+                                        mode = Mode::EventDetail { sel: 0 };
+                                    }
+                                }
+                                SourceNav::None => {}
+                            }
+                            continue;
+                        }
                         Mode::DraftsList { sel } => {
                             use crate::cli::status_tui::input::DraftsNav;
                             match crate::cli::status_tui::input::drafts_nav(
@@ -3961,6 +4105,12 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PanelAction::OpenDrafts => mode = Mode::DraftsList { sel: 0 },
+                                PanelAction::OpenSource(i) => {
+                                    if let Some(source) = snapshot.sources.get(i) {
+                                        source_page = Some(input::SourceRef::of(source));
+                                        mode = Mode::SourcePage { sel: 0, lift: 0 };
+                                    }
+                                }
                                 PanelAction::OpenStashHtml(i) => {
                                     if let Some(item) = snapshot.stash.get(i) {
                                         open_in_browser(
@@ -4168,6 +4318,30 @@ pub(crate) async fn run_tui(
                                 continue;
                             }
                             if let Some(go) = confirm_decision(action, k) {
+                                if action == ConfirmAction::RestartSource {
+                                    if go
+                                        && let Some(request) = restart_request(
+                                            source_page.as_ref(),
+                                            restart_accepted.take(),
+                                        )
+                                    {
+                                        let repo = repo.clone();
+                                        let answered = tokio::task::spawn_blocking(move || {
+                                            crate::cli::monitor::request(&repo, request)
+                                        })
+                                        .await
+                                        .unwrap_or_else(|e| Err(format!("{e}")));
+                                        if let Err(why) = answered {
+                                            detail = Some(Overlay::error(
+                                                "restart failed".to_string(),
+                                                why,
+                                            ));
+                                        }
+                                        refresh_pending = true;
+                                    }
+                                    mode = Mode::SourcePage { sel: 0, lift: 0 };
+                                    continue;
+                                }
                                 if action.is_plan_page() {
                                     // Plan-page confirms execute the async
                                     // core here (the TUI confirm IS the
@@ -4323,7 +4497,7 @@ pub(crate) async fn run_tui(
                                 }
                                 EventNav::Back => {
                                     event_page = None;
-                                    mode = Mode::LogScroll;
+                                    mode = event_beneath.take().unwrap_or(Mode::LogScroll);
                                 }
                                 // The EFFECT is resolved at the
                                 // tested seam (event_action_effect,
@@ -4382,7 +4556,7 @@ pub(crate) async fn run_tui(
                                     }
                                     EventEffect::Close => {
                                         event_page = None;
-                                        mode = Mode::LogScroll;
+                                        mode = event_beneath.take().unwrap_or(Mode::LogScroll);
                                     }
                                     EventEffect::None => {}
                                 },
@@ -4735,39 +4909,18 @@ pub(crate) async fn run_tui(
                                     ..
                                 })) = seq.get(log.cursor)
                                 {
-                                    if let Some(ev) = snapshot.github_events.get(*event_idx)
-                                        && let Some(first) = ev.page_keys().into_iter().next()
-                                    {
-                                        let want = first
-                                            .member()
-                                            .and_then(|key| {
-                                                crate::cli::github::timeline::resolve_content_ref(
-                                                    &ev.members,
-                                                    key,
-                                                )
-                                            })
-                                            .cloned();
-                                        let slot = want.map(|target| {
-                                            content_generation += 1;
-                                            spawn_content_fetch(
+                                    if let Some(page) =
+                                        snapshot.github_events.get(*event_idx).and_then(|ev| {
+                                            open_event_page(
+                                                &repo,
+                                                ev,
+                                                &mut content_generation,
                                                 &ev_tx_async,
-                                                ev.source.clone(),
-                                                target.clone(),
-                                                content_generation,
-                                            );
-                                            event_content::ContentSlot::requesting(
-                                                target,
-                                                content_generation,
                                             )
-                                        });
-                                        event_page = Some(EventPage {
-                                            target: first,
-                                            retained: ev.page_keys(),
-                                            event: ev.clone(),
-                                            prompts: event_prompts(&repo, ev),
-                                            scroll: 0,
-                                            content: slot,
-                                        });
+                                        })
+                                    {
+                                        event_page = Some(page);
+                                        event_beneath = None;
                                         mode = Mode::EventDetail { sel: 0 };
                                     }
                                     continue;
@@ -4886,6 +5039,7 @@ pub(crate) async fn run_tui(
                 let picker_label =
                     candidate_index(mode).and_then(|i| picker.get(i).map(|c| c.label.clone()));
                 let selected_draft = selected_draft(mode, &snapshot);
+                let selected_source = selected_source_row(mode, source_page.as_ref(), &snapshot);
                 let keep_picker = candidate_index(mode).is_some();
                 // Same identity rule for a panel cursor on a QUEUE row: a
                 // reprioritise renames the queue file, so THIS refresh is
@@ -4907,6 +5061,7 @@ pub(crate) async fn run_tui(
                                 .iter()
                                 .map(|q| q.name.clone())
                                 .collect::<Vec<_>>(),
+                            &snapshot.sources,
                         ))
                     }
                     _ => None,
@@ -5100,6 +5255,7 @@ pub(crate) async fn run_tui(
                                         .iter()
                                         .map(|q| q.name.clone())
                                         .collect::<Vec<_>>(),
+                                    &snapshot.sources,
                                 )
                             })
                             .unwrap_or(sel),
@@ -5209,7 +5365,29 @@ pub(crate) async fn run_tui(
                                 }
                                 Mode::EventDetail { sel: r.sel }
                             }
-                            None => Mode::LogScroll,
+                            None => event_beneath.take().unwrap_or(Mode::LogScroll),
+                        }
+                    }
+                    Mode::SourcePage { sel, lift } => {
+                        match source_page.as_ref().and_then(|r| r.find(&snapshot.sources)) {
+                            Some(source) => Mode::SourcePage {
+                                sel: input::rebind_source_sel(
+                                    selected_source.as_ref(),
+                                    sel,
+                                    &source_rows_in(source, &snapshot),
+                                    &snapshot.github_events,
+                                ),
+                                lift,
+                            },
+                            None => {
+                                source_page = None;
+                                Mode::AgentPanel {
+                                    sel: input::add_row_index(&panel_row_list(
+                                        &snapshot,
+                                        cols as usize,
+                                    )),
+                                }
+                            }
                         }
                     }
                     Mode::CommitPage { sel } => match commit_page.as_mut() {
@@ -8462,6 +8640,99 @@ pub(crate) mod tests {
     /// The page's facts come from the source it opened on, never the
     /// other: a queue entry and an active plan may share a stem
     /// (a-queued-plan-has-a-page).
+    /// Before a refresh the loop takes what the source page's cursor is
+    /// on from that page's own rows; elsewhere there is nothing to keep.
+    #[test]
+    fn the_source_page_cursor_is_taken_from_its_rows() {
+        let mut s = fixtures::snap(None, vec![]);
+        let source = crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse("alpha").unwrap(),
+            &clank_core::agent_config::WaitEventSource::Command(
+                clank_core::agent_config::CommandSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: "watch".into(),
+                    command: vec!["true".into()],
+                    reply_command: None,
+                    receipt_command: None,
+                    glyph: None,
+                },
+            ),
+        );
+        s.sources = vec![source.clone()];
+        let page = input::SourceRef::of(&source);
+        assert_eq!(selected_source_row(Mode::LogScroll, Some(&page), &s), None);
+        assert_eq!(
+            selected_source_row(Mode::SourcePage { sel: 0, lift: 0 }, Some(&page), &s),
+            None,
+            "no rows: no monitor hosts it and it has no events"
+        );
+        assert_eq!(source_rows_in(&source, &s), vec![]);
+        s.github_events = vec![crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
+            recurrence: None,
+            at: 1,
+            backend: crate::cli::github::timeline::Backend::Command,
+            glyph: None,
+            source: "watch".into(),
+            kind: "k".into(),
+            failure: false,
+            detail: None,
+            number: None,
+            content: None,
+            body: None,
+            actor: None,
+            url: None,
+            seen_by: Vec::new(),
+            unhandled: false,
+            baseline: false,
+            members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
+                key: crate::cli::github::timeline::MemberKey {
+                    agent: "alpha".into(),
+                    source: source.key.clone(),
+                    seq: 1,
+                    ident: String::new(),
+                },
+                acked: true,
+                transport: crate::cli::github::log::Transport::Command,
+                content: None,
+            }],
+        }];
+        assert_eq!(
+            selected_source_row(Mode::SourcePage { sel: 0, lift: 0 }, Some(&page), &s),
+            s.github_events[0]
+                .page_keys()
+                .into_iter()
+                .next()
+                .map(input::SourcePick::Event)
+        );
+    }
+
+    /// A restart asks for this page's source with the configuration its
+    /// confirm was shown; without that there is nothing safe to ask.
+    #[test]
+    fn a_restart_asks_for_what_the_confirm_showed() {
+        let source = input::SourceRef {
+            agent: "alpha".into(),
+            key: "command-q".into(),
+        };
+        assert_eq!(
+            restart_request(Some(&source), Some("shown".into())),
+            Some(crate::cli::monitor::Control::Restart {
+                author: "alpha".into(),
+                key: "command-q".into(),
+                accepted: "shown".into(),
+            })
+        );
+        assert_eq!(
+            restart_request(Some(&source), None),
+            None,
+            "nothing hosted was shown"
+        );
+        assert_eq!(restart_request(None, Some("shown".into())), None);
+    }
+
     /// A draft's page reads its own file, follows it into the queue when
     /// queued from the page, and its Back returns to the drafts list on
     /// the row it came from, or the last one left; a draft gone from its

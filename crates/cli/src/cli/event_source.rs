@@ -4,7 +4,7 @@ use clank_core::{AgentLabel, wait::WaitItem};
 use tokio::sync::mpsc::{UnboundedSender, error::SendError};
 
 /// Provenance determines whether a source belongs to an author or one invocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SourceOrigin {
     Config,
     Cli,
@@ -19,39 +19,111 @@ pub(crate) enum Durability {
 
 pub(crate) type Emission = (WaitItem, Durability);
 
+/// Where a command source's producer is in its run, as its host last saw
+/// it. Times are Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Lifecycle {
+    /// Another host holds the source's lease; this one follows its log.
+    Following,
+    /// The previous run's process group has not been confirmed gone, so
+    /// no new run starts.
+    Settling {
+        why: String,
+    },
+    Running {
+        pid: u32,
+        since: u64,
+    },
+    /// Its supervisor ended and will not start it again until the
+    /// monitor next hosts it.
+    Stopped {
+        why: String,
+    },
+    /// Waiting to start it again after it ended or failed to start.
+    BackingOff {
+        until: u64,
+        failures: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+type Report = Arc<dyn Fn(&str, Lifecycle) + Send + Sync>;
+
+/// What a reporting sink tells its host: whose source, its storage key,
+/// the instance of the task that reported, and the state.
+pub(crate) type LifecycleReport = (AgentLabel, String, u64, Lifecycle);
+
 /// Success means the delivery owner's queue already holds the emission.
 /// Metadata transformations run within the send, with no private buffer or task.
+/// A host that publishes its producers' state also hears each source's
+/// [`Lifecycle`] through it, by the source's storage key.
 #[derive(Clone)]
-pub(crate) struct EmissionSink(
-    Arc<dyn Fn(Emission) -> Result<(), SendError<Emission>> + Send + Sync>,
-);
+pub(crate) struct EmissionSink {
+    send: Arc<dyn Fn(Emission) -> Result<(), SendError<Emission>> + Send + Sync>,
+    report: Option<Report>,
+}
 
 impl EmissionSink {
     pub(crate) fn for_author(
         tx: UnboundedSender<(AgentLabel, Emission)>,
         author: AgentLabel,
     ) -> Self {
-        Self(Arc::new(move |emission| {
-            tx.send((author.clone(), emission))
-                .map_err(|e| SendError(e.0.1))
-        }))
+        Self {
+            send: Arc::new(move |emission| {
+                tx.send((author.clone(), emission))
+                    .map_err(|e| SendError(e.0.1))
+            }),
+            report: None,
+        }
+    }
+
+    /// This sink, also telling `tx` each of `author`'s sources' lifecycle,
+    /// as instance `instance` of their tasks: a host replaces a task with a
+    /// new instance, and knows the old one's late reports by its number.
+    pub(crate) fn reporting(
+        mut self,
+        tx: UnboundedSender<LifecycleReport>,
+        author: AgentLabel,
+        instance: u64,
+    ) -> Self {
+        self.report = Some(Arc::new(move |key, state| {
+            let _ = tx.send((author.clone(), key.to_string(), instance, state));
+        }));
+        self
     }
 
     pub(crate) fn map(
         self,
         transform: impl Fn(Emission) -> Emission + Send + Sync + 'static,
     ) -> Self {
-        Self(Arc::new(move |emission| self.send(transform(emission))))
+        let report = self.report.clone();
+        Self {
+            send: Arc::new(move |emission| self.send(transform(emission))),
+            report,
+        }
     }
 
     pub(crate) fn send(&self, emission: Emission) -> Result<(), SendError<Emission>> {
-        (self.0)(emission)
+        (self.send)(emission)
+    }
+
+    pub(crate) fn report(&self, key: &str, state: Lifecycle) {
+        if let Some(report) = &self.report {
+            report(key, state);
+        }
     }
 }
 
 impl From<UnboundedSender<Emission>> for EmissionSink {
     fn from(tx: UnboundedSender<Emission>) -> Self {
-        Self(Arc::new(move |emission| tx.send(emission)))
+        Self {
+            send: Arc::new(move |emission| tx.send(emission)),
+            report: None,
+        }
     }
 }
 

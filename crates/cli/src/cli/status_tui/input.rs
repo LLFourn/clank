@@ -119,6 +119,11 @@ pub(super) enum Mode {
     /// The list of `.clank/drafts/`; `sel` is the cursor over it. Enter
     /// opens a draft's page, whose Back returns here.
     DraftsList { sel: usize },
+    /// An event source's page; `sel` is the cursor over its rows, and
+    /// `lift` how many lines the reader has scrolled above the window that
+    /// keeps that row drawn, to read the configuration. WHICH source
+    /// lives in the loop's `source_page`, set and cleared with this mode.
+    SourcePage { sel: usize, lift: usize },
     /// A commit's page (every-object-in-the-tui-has-a-page); `sel` is
     /// the cursor over its rows. The commit lives in the loop's
     /// `commit_page`, set and cleared with this mode; while a plan page
@@ -408,6 +413,139 @@ pub(super) fn plan_action_key(a: PlanAction) -> &'static str {
         // Reached by `esc`, which the hint carries; it has no letter
         // of its own to advertise.
         Back => "esc",
+    }
+}
+
+/// Which source a source page shows: its owner and its log, never its
+/// display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SourceRef {
+    pub(super) agent: String,
+    pub(super) key: String,
+}
+
+impl SourceRef {
+    pub(super) fn of(source: &crate::cli::source_status::ConfiguredSource) -> Self {
+        Self {
+            agent: source.agent.to_string(),
+            key: source.key.clone(),
+        }
+    }
+
+    pub(super) fn find<'a>(
+        &self,
+        sources: &'a [crate::cli::source_status::ConfiguredSource],
+    ) -> Option<&'a crate::cli::source_status::ConfiguredSource> {
+        sources
+            .iter()
+            .find(|s| s.agent.as_str() == self.agent && s.key == self.key)
+    }
+}
+
+/// A source page's selectable rows, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceRow {
+    /// Restart its producer, for a command source the monitor hosts.
+    Restart,
+    /// One of its events, by position in the snapshot's events.
+    Event(usize),
+}
+
+/// The rows: Restart when it applies, then its events newest first.
+pub(super) fn source_rows(restartable: bool, events_newest_first: &[usize]) -> Vec<SourceRow> {
+    restartable
+        .then_some(SourceRow::Restart)
+        .into_iter()
+        .chain(events_newest_first.iter().map(|i| SourceRow::Event(*i)))
+        .collect()
+}
+
+/// What a source page's cursor is on, by identity: kept across a
+/// refresh, which reorders events as new ones arrive and can take
+/// Restart away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SourcePick {
+    Restart,
+    Event(crate::cli::github::timeline::EventKey),
+}
+
+pub(super) fn source_pick(
+    rows: &[SourceRow],
+    sel: usize,
+    events: &[crate::cli::github::timeline::MergedEvent],
+) -> Option<SourcePick> {
+    match rows.get(sel)? {
+        SourceRow::Restart => Some(SourcePick::Restart),
+        SourceRow::Event(at) => events
+            .get(*at)?
+            .page_keys()
+            .into_iter()
+            .next()
+            .map(SourcePick::Event),
+    }
+}
+
+/// Where the cursor lands after a refresh: on what it was on, or on the
+/// same row, or the last, only when that is gone.
+pub(super) fn rebind_source_sel(
+    pick: Option<&SourcePick>,
+    sel: usize,
+    rows: &[SourceRow],
+    events: &[crate::cli::github::timeline::MergedEvent],
+) -> usize {
+    pick.and_then(|pick| {
+        rows.iter().position(|row| match (row, pick) {
+            (SourceRow::Restart, SourcePick::Restart) => true,
+            (SourceRow::Event(at), SourcePick::Event(key)) => {
+                events.get(*at).is_some_and(|e| e.has_page_key(key))
+            }
+            _ => false,
+        })
+    })
+    .unwrap_or_else(|| sel.min(rows.len().saturating_sub(1)))
+}
+
+/// What a key does on a source page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceNav {
+    /// Move the cursor, bringing its row back into view.
+    Sel(usize),
+    /// Scroll this many lines further up the page.
+    Lift(usize),
+    Act(SourceRow),
+    Back,
+    Quit,
+    None,
+}
+
+/// A source page's cursor and lift after a move or a scroll: a move
+/// brings its row back into view; a scroll goes further up.
+pub(super) fn source_moved(sel: usize, lift: usize, nav: SourceNav) -> Option<(usize, usize)> {
+    match nav {
+        SourceNav::Sel(x) => Some((x, 0)),
+        SourceNav::Lift(n) => Some((sel, lift.saturating_add(n))),
+        _ => None,
+    }
+}
+
+/// How far one page-up scrolls a source page.
+pub(super) const SOURCE_PAGE_STEP: usize = 8;
+
+pub(super) fn source_nav(sel: usize, rows: &[SourceRow], key: Key) -> SourceNav {
+    match key {
+        Key::Quit => SourceNav::Quit,
+        Key::Escape | Key::Left | Key::Focus | Key::Char(b'a') => SourceNav::Back,
+        Key::Up if sel == 0 => SourceNav::Lift(1),
+        Key::Up => SourceNav::Sel(move_selection(sel, rows.len(), false)),
+        Key::Down => SourceNav::Sel(move_selection(sel, rows.len(), true)),
+        Key::PageUp => SourceNav::Lift(SOURCE_PAGE_STEP),
+        Key::Top => SourceNav::Lift(usize::MAX),
+        Key::PageDown | Key::Bottom => SourceNav::Sel(sel),
+        Key::Char(b'r') if rows.contains(&SourceRow::Restart) => SourceNav::Act(SourceRow::Restart),
+        Key::Enter | Key::Right => rows
+            .get(sel)
+            .map_or(SourceNav::None, |r| SourceNav::Act(*r)),
+        _ => SourceNav::None,
     }
 }
 
@@ -877,6 +1015,9 @@ pub(super) enum PanelAnchor {
     Remote,
     Stash(String),
     Queue(String),
+    Drafts,
+    /// A source, by its owner and log.
+    Source(SourceRef),
 }
 
 /// What the cursor is on now, for re-locating after a refresh.
@@ -886,6 +1027,7 @@ pub(super) fn capture_anchor(
     agents: &[crate::cli::status::AgentAutoRow],
     stash_stems: &[String],
     queue_names: &[String],
+    sources: &[crate::cli::source_status::ConfiguredSource],
 ) -> PanelAnchor {
     match rows.get(sel) {
         Some(PanelRow::Agent(i)) => agents
@@ -913,6 +1055,11 @@ pub(super) fn capture_anchor(
             .map(|n| PanelAnchor::Queue(n.clone()))
             .unwrap_or(PanelAnchor::Add),
         Some(PanelRow::Remote) => PanelAnchor::Remote,
+        Some(PanelRow::Drafts) => PanelAnchor::Drafts,
+        Some(PanelRow::Source(i)) => sources
+            .get(*i)
+            .map(|s| PanelAnchor::Source(SourceRef::of(s)))
+            .unwrap_or(PanelAnchor::Add),
         _ => PanelAnchor::Add,
     }
 }
@@ -929,6 +1076,7 @@ pub(super) fn rebind_anchor(
     agents: &[crate::cli::status::AgentAutoRow],
     stash_stems: &[String],
     queue_names: &[String],
+    sources: &[crate::cli::source_status::ConfiguredSource],
 ) -> usize {
     let find = |want: PanelRow| rows.iter().position(|r| *r == want);
     let by_label = |label: &str| agents.iter().position(|a| a.label == label);
@@ -955,6 +1103,11 @@ pub(super) fn rebind_anchor(
             .position(|n| n == name)
             .and_then(|i| find(PanelRow::Queue(i))),
         PanelAnchor::Remote => find(PanelRow::Remote),
+        PanelAnchor::Drafts => find(PanelRow::Drafts),
+        PanelAnchor::Source(source) => sources
+            .iter()
+            .position(|s| SourceRef::of(s) == *source)
+            .and_then(|i| find(PanelRow::Source(i))),
         PanelAnchor::Add => None,
     };
     at.unwrap_or_else(|| add_row_index(rows))
@@ -1413,6 +1566,8 @@ pub(super) enum ConfirmAction {
     QueueDraft,
     /// Queue and promote the open draft page's draft.
     PromoteDraft,
+    /// Ask the monitor to restart the open source page's command source.
+    RestartSource,
     /// `stash pop` the open (stashed) plan page's plan.
     RestorePlan,
     /// `stash drop` the open (stashed) plan page's plan — the one
@@ -2109,6 +2264,8 @@ pub(super) struct PlanPage {
 pub(super) struct PanelView<'a> {
     pub(super) mode: Mode,
     pub(super) plan_page: Option<&'a PlanPage>,
+    /// The source a source page shows.
+    pub(super) source_page: Option<&'a SourceRef>,
     pub(super) commit_page: Option<&'a CommitPage>,
     pub(super) event_page: Option<&'a EventPage>,
     pub(super) wait_page: Option<&'a WaitPage>,
@@ -2156,6 +2313,7 @@ impl<'a> PanelView<'a> {
         Self {
             mode,
             plan_page: None,
+            source_page: None,
             commit_page: None,
             event_page: None,
             wait_page: None,
@@ -2214,6 +2372,8 @@ pub(super) enum PanelAction {
     OpenStashHtml(usize),
     /// Open the drafts list (Enter on the drafts row).
     OpenDrafts,
+    /// Open an event source's page (Enter on its row).
+    OpenSource(usize),
 }
 
 /// Pure key routing for the agent panel. `agents` is the roster; the
@@ -2241,6 +2401,8 @@ pub(super) enum PanelRow {
     Queue(usize),
     /// `drafts: N`, under the queue, when there are any.
     Drafts,
+    /// A configured event source, in the region above the log.
+    Source(usize),
 }
 
 /// Every cursor position in the panel, in screen order. `waits` holds
@@ -2252,8 +2414,10 @@ pub(super) fn panel_rows(
     stash_len: usize,
     queue_len: usize,
     drafts: bool,
+    sources_len: usize,
 ) -> Vec<PanelRow> {
-    let mut out = Vec::with_capacity(agents_len + waits.len() + 3 + stash_len + queue_len);
+    let mut out =
+        Vec::with_capacity(agents_len + waits.len() + 3 + stash_len + queue_len + sources_len);
     for i in 0..agents_len {
         out.push(PanelRow::Agent(i));
         if waits.contains(&i) {
@@ -2267,6 +2431,7 @@ pub(super) fn panel_rows(
     if drafts {
         out.push(PanelRow::Drafts);
     }
+    out.extend((0..sources_len).map(PanelRow::Source));
     out
 }
 
@@ -2304,6 +2469,7 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
             Some(PanelRow::Stash(i)) => PanelAction::OpenStashItem(i),
             Some(PanelRow::Queue(q)) => PanelAction::OpenQueueItem(q),
             Some(PanelRow::Drafts) => PanelAction::OpenDrafts,
+            Some(PanelRow::Source(i)) => PanelAction::OpenSource(i),
             Some(PanelRow::Agent(i)) => PanelAction::OpenDetail(i),
             Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
             Some(PanelRow::Remote) => PanelAction::OpenRemotePage,
@@ -2573,10 +2739,14 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 0,
-                &panel_rows(agents.len(), &[], 0, 0, false),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
                 Key::Char(b'a')
             ),
-            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false), Key::Focus),
+            agent_panel_action(
+                0,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Focus
+            ),
             "panel: `a` and Tab both leave focus"
         );
         let acts = [DetailAction::Back];
@@ -2801,6 +2971,144 @@ mod tests {
         }
     }
 
+    /// Sources sit last in the panel, one row each; Enter opens one. On
+    /// its page `r` restarts only where Restart is offered, and Enter
+    /// acts on the row under the cursor.
+    #[test]
+    fn a_source_row_opens_its_page_and_its_rows_act() {
+        let rows = panel_rows(1, &[], 0, 1, true, 2);
+        assert_eq!(
+            &rows[rows.len() - 3..],
+            [PanelRow::Drafts, PanelRow::Source(0), PanelRow::Source(1)]
+        );
+        assert_eq!(
+            agent_panel_action(rows.len() - 1, &rows, Key::Enter),
+            PanelAction::OpenSource(1)
+        );
+        let with = source_rows(true, &[4, 2]);
+        assert_eq!(
+            with,
+            [SourceRow::Restart, SourceRow::Event(4), SourceRow::Event(2)]
+        );
+        assert_eq!(
+            source_nav(0, &with, Key::Char(b'r')),
+            SourceNav::Act(SourceRow::Restart)
+        );
+        assert_eq!(
+            source_nav(2, &with, Key::Enter),
+            SourceNav::Act(SourceRow::Event(2))
+        );
+        assert_eq!(source_nav(2, &with, Key::Down), SourceNav::Sel(2));
+        let without = source_rows(false, &[4]);
+        assert_eq!(source_nav(0, &without, Key::Char(b'r')), SourceNav::None);
+        assert_eq!(source_nav(0, &[], Key::Enter), SourceNav::None);
+        assert_eq!(source_nav(0, &without, Key::Escape), SourceNav::Back);
+    }
+
+    fn event(seq: u64) -> crate::cli::github::timeline::MergedEvent {
+        crate::cli::github::timeline::MergedEvent {
+            outgoing: Vec::new(),
+            recurrence: None,
+            at: seq,
+            backend: crate::cli::github::timeline::Backend::Command,
+            glyph: None,
+            source: "watch".into(),
+            kind: "k".into(),
+            failure: false,
+            detail: None,
+            number: None,
+            content: None,
+            body: None,
+            actor: None,
+            url: None,
+            seen_by: Vec::new(),
+            unhandled: false,
+            baseline: false,
+            members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
+                key: crate::cli::github::timeline::MemberKey {
+                    agent: "alpha".into(),
+                    source: "command-watch".into(),
+                    seq,
+                    ident: String::new(),
+                },
+                acked: true,
+                transport: crate::cli::github::log::Transport::Command,
+                content: None,
+            }],
+        }
+    }
+
+    /// A refresh keeps a source page's cursor on what it was on: its
+    /// event through a newer one arriving above it, and through Restart
+    /// going away; when that event is gone, the same row or the last.
+    #[test]
+    fn a_source_page_cursor_follows_its_row_through_a_refresh() {
+        let before = [event(1), event(2)];
+        let rows = source_rows(true, &[1, 0]);
+        let pick = source_pick(&rows, 2, &before).unwrap();
+        let after = [event(1), event(2), event(3)];
+        assert_eq!(
+            rebind_source_sel(Some(&pick), 2, &source_rows(true, &[2, 1, 0]), &after),
+            3
+        );
+        assert_eq!(
+            rebind_source_sel(Some(&pick), 2, &source_rows(false, &[2, 1, 0]), &after),
+            2
+        );
+        let restart = source_pick(&rows, 0, &before).unwrap();
+        assert_eq!(
+            rebind_source_sel(Some(&restart), 0, &source_rows(true, &[2, 1, 0]), &after),
+            0
+        );
+        let gone = [event(2)];
+        assert_eq!(
+            rebind_source_sel(Some(&pick), 2, &source_rows(true, &[0]), &gone),
+            1
+        );
+    }
+
+    /// The panel cursor on a source stays on that source, by owner and
+    /// log, through a source added before it; a removed one gives way.
+    #[test]
+    fn a_panel_source_row_keeps_its_cursor_through_a_refresh() {
+        let source = |agent: &str, name: &str| {
+            crate::cli::source_status::ConfiguredSource::of(
+                &clank_core::ids::AgentLabel::parse(agent).unwrap(),
+                &clank_core::agent_config::WaitEventSource::Command(
+                    clank_core::agent_config::CommandSource {
+                        interrupt: false,
+                        interrupt_message: None,
+                        name: name.into(),
+                        command: vec!["true".into()],
+                        reply_command: None,
+                        receipt_command: None,
+                        glyph: None,
+                    },
+                ),
+            )
+        };
+        let before = [source("alpha", "a"), source("beta", "a")];
+        let rows = panel_rows(0, &[], 0, 0, false, 2);
+        let at = rows.iter().position(|r| *r == PanelRow::Source(1)).unwrap();
+        let anchor = capture_anchor(at, &rows, &[], &[], &[], &before);
+        let after = [
+            source("alpha", "a"),
+            source("alpha", "b"),
+            source("beta", "a"),
+        ];
+        let rows_after = panel_rows(0, &[], 0, 0, false, 3);
+        assert_eq!(
+            rows_after[rebind_anchor(&anchor, &rows_after, &[], &[], &[], &after)],
+            PanelRow::Source(2)
+        );
+        assert_eq!(
+            rebind_anchor(&anchor, &rows, &[], &[], &[], &before[..1]),
+            add_row_index(&rows),
+            "removed"
+        );
+    }
+
     /// A refresh keeps the cursor on the draft it was on, through a new
     /// draft above it and a reorder by modification time; only a draft
     /// that is gone gives way to the same row, or the last.
@@ -2836,10 +3144,10 @@ mod tests {
     /// back.
     #[test]
     fn the_drafts_row_opens_a_list_that_opens_a_draft() {
-        let rows = panel_rows(1, &[], 0, 2, true);
+        let rows = panel_rows(1, &[], 0, 2, true, 0);
         assert_eq!(rows.last(), Some(&PanelRow::Drafts));
         assert_eq!(rows[rows.len() - 2], PanelRow::Queue(1));
-        assert!(!panel_rows(1, &[], 0, 2, false).contains(&PanelRow::Drafts));
+        assert!(!panel_rows(1, &[], 0, 2, false, 0).contains(&PanelRow::Drafts));
         let at = rows.len() - 1;
         assert_eq!(
             agent_panel_action(at, &rows, Key::Enter),
@@ -3965,7 +4273,7 @@ mod tests {
     /// rows' offsets for exactly that reason.
     #[test]
     fn a_drawable_wait_is_a_cursor_position_between_its_agent_and_the_next() {
-        let rows = panel_rows(2, &[0], 1, 2, false);
+        let rows = panel_rows(2, &[0], 1, 2, false, 0);
         assert_eq!(
             rows,
             vec![
@@ -3998,7 +4306,7 @@ mod tests {
     #[test]
     fn an_undrawable_wait_is_not_a_cursor_position() {
         assert_eq!(
-            panel_rows(2, &[], 0, 0, false),
+            panel_rows(2, &[], 0, 0, false, 0),
             vec![
                 PanelRow::Agent(0),
                 PanelRow::Agent(1),
@@ -4127,7 +4435,7 @@ mod tests {
     /// rows are adjacent and an off-by-one here opens the wrong page.
     #[test]
     fn enter_on_a_wait_row_opens_the_wait_not_its_agent() {
-        let rows = panel_rows(2, &[1], 0, 0, false);
+        let rows = panel_rows(2, &[1], 0, 0, false, 0);
         // [Agent(0), Agent(1), Wait(1), Add]
         assert_eq!(
             agent_panel_action(1, &rows, Key::Enter),
@@ -4150,7 +4458,7 @@ mod tests {
     /// cursor's — they diverge as soon as a wait sits above.
     #[test]
     fn actions_carry_the_agent_index_not_the_cursor_position() {
-        let rows = panel_rows(3, &[0], 0, 0, false);
+        let rows = panel_rows(3, &[0], 0, 0, false, 0);
         // [Agent(0), Wait(0), Agent(1), Agent(2), Add]
         assert_eq!(
             agent_panel_action(3, &rows, Key::Enter),
@@ -4219,50 +4527,74 @@ mod tests {
         // "+ add" row is index 2 (== agents.len()): Enter AND Space open
         // the picker.
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0, false), Key::Enter),
+            agent_panel_action(
+                2,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Enter
+            ),
             PanelAction::OpenPicker
         );
         assert_eq!(
-            agent_panel_action(2, &panel_rows(agents.len(), &[], 0, 0, false), Key::Space),
+            agent_panel_action(
+                2,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Space
+            ),
             PanelAction::OpenPicker
         );
         // Agent rows: Enter opens the detail page; Space toggles auto.
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false), Key::Enter),
+            agent_panel_action(
+                1,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Enter
+            ),
             PanelAction::OpenDetail(1)
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false), Key::Space),
+            agent_panel_action(
+                1,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Space
+            ),
             PanelAction::ToggleAuto(1)
         );
         // DEL is no longer a panel action (removal lives on the detail page).
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false), Key::Delete),
+            agent_panel_action(
+                1,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Delete
+            ),
             PanelAction::None
         );
         // Navigation: Down within the panel moves; Down at the +add row
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
         // q quits.
         assert_eq!(
-            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false), Key::Down),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Down),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0, false), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Down),
             PanelAction::EnterLog,
             "Down past the remote row, the last, flows into the log"
         );
         assert_eq!(
-            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false), Key::Up),
+            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Up),
             PanelAction::MoveCursor(0),
             "Up at the top stays put"
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false), Key::Focus),
+            agent_panel_action(
+                1,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                Key::Focus
+            ),
             PanelAction::LeaveFocus
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false), Key::Quit),
+            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Quit),
             PanelAction::Quit
         );
     }
@@ -4273,7 +4605,7 @@ mod tests {
     /// the URL, and on no other row means that.
     #[test]
     fn the_remote_row_is_under_the_agents_and_is_the_switch() {
-        let rows = panel_rows(2, &[], 1, 1, false);
+        let rows = panel_rows(2, &[], 1, 1, false, 0);
         assert_eq!(
             rows,
             vec![
@@ -4329,34 +4661,50 @@ mod tests {
         // there, so `o`, `+`, `-` and Space are inert on the row
         // (a-queued-plan-has-a-page).
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], 0, ql, false), Key::Enter),
+            agent_panel_action(
+                4,
+                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                Key::Enter
+            ),
             PanelAction::OpenQueueItem(0)
         );
         for key in [Key::Html, Key::Plus, Key::Minus, Key::Space] {
             assert_eq!(
-                agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql, false), key),
+                agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql, false, 0), key),
                 PanelAction::None,
                 "{key:?} does nothing on a queue row"
             );
         }
         // `o` on an agent row is inert too.
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, ql, false), Key::Html),
+            agent_panel_action(
+                1,
+                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                Key::Html
+            ),
             PanelAction::None
         );
         // Down from the remote row now enters the queue, not the log;
         // Down from the LAST queue row crosses into the log.
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, ql, false), Key::Down),
+            agent_panel_action(
+                3,
+                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                Key::Down
+            ),
             PanelAction::MoveCursor(4)
         );
         assert_eq!(
-            agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql, false), Key::Down),
+            agent_panel_action(
+                5,
+                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                Key::Down
+            ),
             PanelAction::EnterLog
         );
         // With an empty queue, Down from the remote row still enters the log.
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0, false), Key::Down),
+            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Down),
             PanelAction::EnterLog
         );
     }
@@ -4373,26 +4721,46 @@ mod tests {
         // queue row.
         let (sl, ql) = (1, 1);
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql, false), Key::Enter),
+            agent_panel_action(
+                4,
+                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                Key::Enter
+            ),
             PanelAction::OpenStashItem(0)
         );
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql, false), Key::Html),
+            agent_panel_action(
+                4,
+                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                Key::Html
+            ),
             PanelAction::OpenStashHtml(0)
         );
         // The queue row sits AFTER the stash segment.
         assert_eq!(
-            agent_panel_action(5, &panel_rows(agents.len(), &[], sl, ql, false), Key::Enter),
+            agent_panel_action(
+                5,
+                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                Key::Enter
+            ),
             PanelAction::OpenQueueItem(0)
         );
         // +/- are queue-only; inert on a stash row.
         assert_eq!(
-            agent_panel_action(4, &panel_rows(agents.len(), &[], sl, ql, false), Key::Plus),
+            agent_panel_action(
+                4,
+                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                Key::Plus
+            ),
             PanelAction::None
         );
         // Down from the LAST row (the queue row) crosses into the log.
         assert_eq!(
-            agent_panel_action(5, &panel_rows(agents.len(), &[], sl, ql, false), Key::Down),
+            agent_panel_action(
+                5,
+                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                Key::Down
+            ),
             PanelAction::EnterLog
         );
     }
@@ -4435,20 +4803,20 @@ mod tests {
     #[test]
     fn a_replaced_attendance_does_not_inherit_the_wait_cursor() {
         let before = rows_for(&["claude", "codex"], &[1]);
-        let rows = panel_rows(2, &[1], 0, 0, false); // [A0, A1, W1, Add]
-        let anchor = capture_anchor(2, &rows, &before, &[], &[]);
+        let rows = panel_rows(2, &[1], 0, 0, false, 0); // [A0, A1, W1, Add]
+        let anchor = capture_anchor(2, &rows, &before, &[], &[], &[]);
 
         // Same agent, still attending — but a new instance.
         let mut after = rows_for(&["claude", "codex"], &[1]);
         after[1].attending.as_mut().unwrap().at = "2026-08-24T09:00:00Z".to_string();
         assert_eq!(
-            rebind_anchor(&anchor, &rows, &after, &[], &[]),
+            rebind_anchor(&anchor, &rows, &after, &[], &[], &[]),
             1,
             "falls back to its agent, not onto the replacement"
         );
 
         // Unchanged instance keeps the wait row.
-        assert_eq!(rebind_anchor(&anchor, &rows, &before, &[], &[]), 2);
+        assert_eq!(rebind_anchor(&anchor, &rows, &before, &[], &[], &[]), 2);
     }
 
     /// A refresh moves rows. The cursor follows what it was ON, by
@@ -4463,32 +4831,41 @@ mod tests {
         let queue = labels(&["q1", "q2"]);
 
         // No waits: [A0, A1, Add, R, S0, Q0, Q1]
-        let before = panel_rows(2, &[], 1, 2, false);
-        let anchor = capture_anchor(5, &before, &agents, &stash, &queue);
+        let before = panel_rows(2, &[], 1, 2, false, 0);
+        let anchor = capture_anchor(5, &before, &agents, &stash, &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Queue("q1".to_string()));
 
         // A wait appears above everything: [A0, W0, A1, Add, R, S0, Q0, Q1]
-        let after = panel_rows(2, &[0], 1, 2, false);
+        let after = panel_rows(2, &[0], 1, 2, false, 0);
         assert_eq!(
-            rebind_anchor(&anchor, &after, &agents, &stash, &queue),
+            rebind_anchor(&anchor, &after, &agents, &stash, &queue, &[]),
             6,
             "the queue row moved down by the wait; the cursor moved with it"
         );
 
         // The stash row too.
-        let anchor = capture_anchor(4, &before, &agents, &stash, &queue);
+        let anchor = capture_anchor(4, &before, &agents, &stash, &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Stash("s1".to_string()));
-        assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 5);
+        assert_eq!(
+            rebind_anchor(&anchor, &after, &agents, &stash, &queue, &[]),
+            5
+        );
 
         // And the remote row, by its own name.
-        let anchor = capture_anchor(3, &before, &agents, &stash, &queue);
+        let anchor = capture_anchor(3, &before, &agents, &stash, &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Remote);
-        assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 4);
+        assert_eq!(
+            rebind_anchor(&anchor, &after, &agents, &stash, &queue, &[]),
+            4
+        );
 
         // And an agent below the new wait.
-        let anchor = capture_anchor(1, &before, &agents, &stash, &queue);
+        let anchor = capture_anchor(1, &before, &agents, &stash, &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Agent("codex".to_string()));
-        assert_eq!(rebind_anchor(&anchor, &after, &agents, &stash, &queue), 2);
+        assert_eq!(
+            rebind_anchor(&anchor, &after, &agents, &stash, &queue, &[]),
+            2
+        );
     }
 
     /// A queue item that is renamed or re-sorted under the cursor is
@@ -4498,22 +4875,22 @@ mod tests {
     fn a_reordered_queue_item_keeps_the_cursor() {
         let agents = rows_for(&["claude", "codex"], &[]);
         let queue = vec!["a".to_string(), "b".to_string()];
-        let rows = panel_rows(2, &[], 0, 2, false);
-        let anchor = capture_anchor(5, &rows, &agents, &[], &queue);
+        let rows = panel_rows(2, &[], 0, 2, false, 0);
+        let anchor = capture_anchor(5, &rows, &agents, &[], &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Queue("b".to_string()));
 
         let resorted = vec!["b".to_string(), "a".to_string()];
         assert_eq!(
-            rebind_anchor(&anchor, &rows, &agents, &[], &resorted),
+            rebind_anchor(&anchor, &rows, &agents, &[], &resorted, &[]),
             4,
             "follows the item, not the slot"
         );
 
         // Gone entirely → the add row.
         let without = vec!["a".to_string()];
-        let shorter = panel_rows(2, &[], 0, 1, false);
+        let shorter = panel_rows(2, &[], 0, 1, false, 0);
         assert_eq!(
-            rebind_anchor(&anchor, &shorter, &agents, &[], &without),
+            rebind_anchor(&anchor, &shorter, &agents, &[], &without, &[]),
             add_row_index(&shorter)
         );
     }
@@ -4524,8 +4901,8 @@ mod tests {
     #[test]
     fn a_vanished_wait_falls_back_to_its_own_agent() {
         let agents = rows_for(&["claude", "codex"], &[1]);
-        let with = panel_rows(2, &[1], 0, 0, false); // [A0, A1, W1, Add]
-        let anchor = capture_anchor(2, &with, &agents, &[], &[]);
+        let with = panel_rows(2, &[1], 0, 0, false, 0); // [A0, A1, W1, Add]
+        let anchor = capture_anchor(2, &with, &agents, &[], &[], &[]);
         assert_eq!(
             anchor,
             PanelAnchor::Wait {
@@ -4535,19 +4912,19 @@ mod tests {
             }
         );
 
-        let without = panel_rows(2, &[], 0, 0, false); // [A0, A1, Add]
+        let without = panel_rows(2, &[], 0, 0, false, 0); // [A0, A1, Add]
         let no_wait = rows_for(&["claude", "codex"], &[]);
         assert_eq!(
-            rebind_anchor(&anchor, &without, &no_wait, &[], &[]),
+            rebind_anchor(&anchor, &without, &no_wait, &[], &[], &[]),
             1,
             "its agent, not the add row"
         );
 
         // The agent left too → the add row.
         let solo = rows_for(&["claude"], &[]);
-        let rows = panel_rows(1, &[], 0, 0, false);
+        let rows = panel_rows(1, &[], 0, 0, false, 0);
         assert_eq!(
-            rebind_anchor(&anchor, &rows, &solo, &[], &[]),
+            rebind_anchor(&anchor, &rows, &solo, &[], &[], &[]),
             add_row_index(&rows)
         );
     }

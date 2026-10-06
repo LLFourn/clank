@@ -1272,7 +1272,24 @@ pub(crate) fn resolve_wait_event_sources(
     // operator configured (codex 072e459).
     let mut timer_names = std::collections::HashSet::new();
     let mut timer_keys = std::collections::HashSet::new();
+    // One task owns a storage key's log and lease. Two sources resolving
+    // to one key would be two tasks, and a host keyed by it keeps one.
+    let mut producer_keys = std::collections::HashSet::new();
     for (source, origin) in &sources {
+        let produced_into = match source {
+            clank_core::agent_config::WaitEventSource::Command(c) => Some(c.source_key()),
+            clank_core::agent_config::WaitEventSource::Github(g) => {
+                Some(crate::cli::github::supervisor::source_key(g))
+            }
+            clank_core::agent_config::WaitEventSource::Timer(_) => None,
+        };
+        if let Some(key) = produced_into {
+            anyhow::ensure!(
+                producer_keys.insert((*origin, key.clone())),
+                "two `{}` sources share the storage key `{key}`; give one a different name",
+                source_name(source)
+            );
+        }
         match source {
             clank_core::agent_config::WaitEventSource::Timer(timer) => {
                 crate::cli::timer_source::parse(timer)?;
@@ -1424,12 +1441,24 @@ fn spawn_local(
 /// Local waits shut down and join them on return; monitor hosts retain them
 /// until retirement. Aborting a command source retires its producer group.
 pub(crate) struct EventSources {
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Each source's task by the storage key of the log it writes, so a
+    /// host can stop one and leave the rest running.
+    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
 }
 
 impl EventSources {
-    pub(crate) fn into_tasks(mut self) -> Vec<tokio::task::JoinHandle<()>> {
-        std::mem::take(&mut self.tasks)
+    pub(crate) fn into_tasks(
+        mut self,
+    ) -> std::collections::BTreeMap<String, tokio::task::JoinHandle<()>> {
+        let mut tasks = std::collections::BTreeMap::new();
+        for (key, task) in std::mem::take(&mut self.tasks) {
+            // Resolution refuses two sources of one key; were one to get
+            // here, its task is stopped rather than detached.
+            if let Some(overwritten) = tasks.insert(key, task) {
+                overwritten.abort();
+            }
+        }
+        tasks
     }
 
     /// `events_dir` is the agent's github event-WAL home
@@ -1472,48 +1501,58 @@ impl EventSources {
                 // Native deadlines belong to the owner's select loop.
                 WaitEventSource::Timer(_) => {}
                 WaitEventSource::Command(c) => {
-                    tasks.push(tokio::spawn(run_command_source(
-                        c.clone(),
-                        tx.clone(),
-                        events_dir.map(std::path::Path::to_path_buf),
-                        crate::cli::command_source::storage_key(c.source_key(), *origin, scope),
-                    )));
+                    let key =
+                        crate::cli::command_source::storage_key(c.source_key(), *origin, scope);
+                    tasks.push((
+                        key.clone(),
+                        tokio::spawn(run_command_source(
+                            c.clone(),
+                            tx.clone(),
+                            events_dir.map(std::path::Path::to_path_buf),
+                            key,
+                        )),
+                    ));
                 }
                 WaitEventSource::Github(g) => {
-                    tasks.push(tokio::spawn(
-                        crate::cli::github::supervisor::run_github_source(
+                    let key = crate::cli::command_source::storage_key(
+                        crate::cli::github::supervisor::source_key(g),
+                        *origin,
+                        scope,
+                    );
+                    tasks.push((
+                        key.clone(),
+                        tokio::spawn(crate::cli::github::supervisor::run_github_source(
                             g.clone(),
                             tx.clone(),
                             events_dir.map(std::path::Path::to_path_buf),
                             *origin,
-                            crate::cli::command_source::storage_key(
-                                crate::cli::github::supervisor::source_key(g),
-                                *origin,
-                                scope,
-                            ),
-                        ),
+                            key,
+                        )),
                     ));
                 }
             }
         }
         for (pr, slug) in drafts {
-            tasks.push(tokio::spawn(crate::cli::pr_review::run_draft_source(
-                repo.to_path_buf(),
-                slug.clone(),
-                *pr,
-                author.clone(),
-                tx.clone(),
-                crate::cli::pr_review::DRAFT_POLL,
-            )));
+            tasks.push((
+                format!("draft-{pr}-{slug}"),
+                tokio::spawn(crate::cli::pr_review::run_draft_source(
+                    repo.to_path_buf(),
+                    slug.clone(),
+                    *pr,
+                    author.clone(),
+                    tx.clone(),
+                    crate::cli::pr_review::DRAFT_POLL,
+                )),
+            ));
         }
         Self { tasks }
     }
 
     async fn shutdown(mut self) {
-        for task in &self.tasks {
+        for (_, task) in &self.tasks {
             task.abort();
         }
-        for task in self.tasks.drain(..) {
+        for (_, task) in self.tasks.drain(..) {
             let _ = task.await;
         }
     }
@@ -1524,7 +1563,7 @@ impl Drop for EventSources {
         // A lifecycle owner may cancel the wait future itself. Dropping join
         // handles detaches tasks; aborting them preserves process-group cleanup.
         // Normal returns still use shutdown to abort AND join.
-        for task in &self.tasks {
+        for (_, task) in &self.tasks {
             task.abort();
         }
     }
@@ -1641,6 +1680,12 @@ async fn run_command_source_with(
     // arm, not from a line in a log nobody reads.
     if src.command.is_empty() {
         eprintln!("wait: command source `{}` has an empty argv", src.name);
+        tx.report(
+            &key,
+            crate::cli::event_source::Lifecycle::Stopped {
+                why: "its command is empty".to_string(),
+            },
+        );
         return;
     }
     // No events dir (an ad-hoc wait) means no durable dedup: the
@@ -1687,6 +1732,7 @@ async fn run_command_source_with(
             }
             Ok(None) => {
                 if !warned_tail {
+                    tx.report(&key, crate::cli::event_source::Lifecycle::Following);
                     eprintln!(
                         "wait: command source `{}` — another wait is already running this \
                          source for this agent; tailing its event log instead",
@@ -1729,6 +1775,12 @@ async fn run_command_source_with(
                     "wait: command source `{}` cannot take its ingest lease: {e}",
                     src.name
                 );
+                tx.report(
+                    &key,
+                    crate::cli::event_source::Lifecycle::Stopped {
+                        why: format!("cannot take its ingest lease: {e}"),
+                    },
+                );
                 return;
             }
         }
@@ -1765,6 +1817,12 @@ async fn run_leased_command_source(
             eprintln!(
                 "wait: command source `{}` cannot open its log: {e}",
                 src.name
+            );
+            tx.report(
+                &key,
+                crate::cli::event_source::Lifecycle::Stopped {
+                    why: format!("cannot open its log: {e}"),
+                },
             );
             return;
         }
@@ -1897,6 +1955,10 @@ async fn run_leased_command_source(
         // gets its unacked rows while the launch waits.
         if let cs::Retired::Deferred(why) = retire(&store_dir, &key) {
             if !deferral_warned {
+                tx.report(
+                    &key,
+                    crate::cli::event_source::Lifecycle::Settling { why: why.clone() },
+                );
                 eprintln!(
                     "wait: command source `{}` — {why}; not starting another until it is \
                      settled",
@@ -1920,6 +1982,7 @@ async fn run_leased_command_source(
             Some(dir) => cmd.env("CLANK_SOURCE_STATE_DIR", dir),
             None => cmd.env_remove("CLANK_SOURCE_STATE_DIR"),
         };
+        let mut launch_error = None;
         let launched = match source_group::launch(
             &source_group::OWNERS,
             &source_group::Arming::standard(),
@@ -1933,10 +1996,21 @@ async fn run_leased_command_source(
             Ok(launched) => Some(launched),
             Err(e) => {
                 eprintln!("wait: command source `{}` did not start: {e}", src.name);
+                launch_error = Some(format!("{e:#}"));
                 None
             }
         };
+        let mut exit = None;
         if let Some((owned, mut child)) = launched {
+            if let Some(pid) = child.id() {
+                tx.report(
+                    &key,
+                    crate::cli::event_source::Lifecycle::Running {
+                        pid,
+                        since: crate::cli::github::log::now_epoch(),
+                    },
+                );
+            }
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             if let Some(err) = stderr {
@@ -2016,7 +2090,7 @@ async fn run_leased_command_source(
                     }
                 }
             }
-            let _ = child.wait().await;
+            exit = child.wait().await.ok().and_then(|status| status.code());
             // The command's end is not its group's: a descendant it
             // left, and the anchor, are still there.
             if let Err((owned, why)) = owned.retire() {
@@ -2052,7 +2126,17 @@ async fn run_leased_command_source(
                 return;
             }
         }
-        tokio::time::sleep(cs::backoff(failures)).await;
+        let backoff = cs::backoff(failures);
+        tx.report(
+            &key,
+            crate::cli::event_source::Lifecycle::BackingOff {
+                until: crate::cli::github::log::now_epoch() + backoff.as_secs(),
+                failures,
+                exit,
+                error: launch_error,
+            },
+        );
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -3335,7 +3419,7 @@ mod shared_tests {
             );
         }
 
-        for task in tasks {
+        for (_, task) in tasks {
             task.abort();
             let _ = task.await;
         }
@@ -3480,7 +3564,7 @@ mod shared_tests {
              invocation of anybody else's"
         );
 
-        for task in tasks.into_iter().chain(claude_tasks) {
+        for (_, task) in tasks.into_iter().chain(claude_tasks) {
             task.abort();
             let _ = task.await;
         }
@@ -3553,7 +3637,7 @@ mod shared_tests {
             "and so did the second's — neither tailed the other's log, \
              which is what sharing one name-derived key did"
         );
-        for task in tasks {
+        for (_, task) in tasks {
             task.abort();
             let _ = task.await;
         }
@@ -4296,6 +4380,87 @@ mod tests {
         })
         .await
         .expect("cancelling the wait must not leave its command source running");
+    }
+
+    /// A supervisor that cannot take its source's lease says it stopped,
+    /// and why, rather than leave its host believing it starts.
+    #[tokio::test]
+    async fn a_command_source_that_cannot_take_its_lease_reports_it_stopped() {
+        use crate::cli::event_source::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("events");
+        std::fs::write(&not_a_dir, "a file where the events directory should be").unwrap();
+        let src = command_source("blocked", &["true"]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reports, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let author = AgentLabel::parse("alpha").unwrap();
+        let sink = crate::cli::event_source::EmissionSink::for_author(tx, author.clone())
+            .reporting(reports, author, 3);
+        let key = src.source_key();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_command_source(src, sink, Some(not_a_dir), key),
+        )
+        .await
+        .expect("it ends rather than retrying a lease it cannot take");
+        assert!(
+            matches!(heard.try_recv(), Ok((_, _, 3, Lifecycle::Stopped { why })) if why.contains("lease")),
+        );
+    }
+
+    /// A hosted producer's host hears where it is: running, with the
+    /// pid of the command it started, then backing off with how that
+    /// run ended.
+    #[tokio::test]
+    async fn a_command_source_reports_its_lifecycle() {
+        use crate::cli::event_source::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events");
+        let src = command_source(
+            "exits",
+            &[
+                "sh",
+                "-c",
+                "echo $$ > \"$0.pid\"; exit 3",
+                events.to_str().unwrap(),
+            ],
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reports, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let author = AgentLabel::parse("alpha").unwrap();
+        let sink = crate::cli::event_source::EmissionSink::for_author(tx, author.clone())
+            .reporting(reports, author.clone(), 1);
+        let key = src.source_key();
+        let task = tokio::spawn(run_command_source(
+            src,
+            sink,
+            Some(events.clone()),
+            key.clone(),
+        ));
+        let mut states = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some((who, at, instance, state)) = heard.recv().await {
+                assert_eq!(instance, 1);
+                assert_eq!((&who, at.as_str()), (&author, key.as_str()));
+                let backing_off = matches!(state, Lifecycle::BackingOff { .. });
+                states.push(state);
+                if backing_off {
+                    break;
+                }
+            }
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        let pid: u32 = std::fs::read_to_string(format!("{}.pid", events.display()))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            matches!(states.as_slice(), [Lifecycle::Running { pid: p, .. }, Lifecycle::BackingOff { failures: 1, exit: Some(3), error: None, .. }] if *p == pid),
+            "{states:?}"
+        );
     }
 
     /// Run a supervised source until `want` items arrive, then stop

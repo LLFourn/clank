@@ -30,7 +30,9 @@ use clank_core::wait::WaitItem;
 // Version 9 can host the same inbox but cannot promise this control lifecycle;
 // a fresh client must negotiate retirement rather than silently reuse it.
 // 11 admits one automatic Grok wait per bound session and reports refusals.
-pub(crate) const PROTO: u32 = 11;
+// 12 publishes its sources' lifecycle and takes a control request to
+// restart one.
+pub(crate) const PROTO: u32 = 12;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -130,6 +132,22 @@ pub(crate) enum Who {
     /// retry a failed turn and never takes inbox work, so its presence is
     /// not evidence the agent is waiting for any (`recovery.rs`).
     RecoveryHelper { author: String, holder: Holder },
+    /// One request, answered with one note, after which the connection
+    /// closes. Never a reader.
+    Control { request: Control },
+}
+
+/// What a control client asks of the monitor.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub(crate) enum Control {
+    /// Restart one of `author`'s command sources, if what the monitor
+    /// runs for it is still the configuration `accepted` fingerprints.
+    Restart {
+        author: String,
+        key: String,
+        accepted: String,
+    },
 }
 
 /// What a client says on connecting.
@@ -174,6 +192,8 @@ pub(crate) enum Note {
         tag: String,
         wake: String,
     },
+    /// A control request was carried out.
+    Done { what: String },
     /// Proof of life, and nothing else.
     ///
     /// It carried the monitor's fold counter so a client could tell a
@@ -1934,6 +1954,28 @@ const SUBSCRIBE_POLL: Duration = Duration::from_millis(500);
 /// Attaches but never STARTS one. A panel is not a reason to put a
 /// daemon on somebody's machine, and the fallback costs only what it
 /// cost before this existed — its own watcher.
+/// Ask the running monitor to restart one source, and say what it
+/// answered. Never starts a monitor: with none running there is nothing
+/// to restart.
+pub(crate) fn request(repo: &std::path::Path, control: Control) -> Result<String, String> {
+    let mut conn = match attach_by(
+        repo,
+        Who::Control { request: control },
+        ATTACH_BUDGET,
+        connect_within,
+    ) {
+        Attached::Shared(conn) => conn,
+        Attached::Alone(why) => return Err(format!("no monitor is running for this repo ({why})")),
+    };
+    let deadline = std::time::Instant::now() + ATTACH_BUDGET + SETTLE_BUDGET;
+    match conn.note(deadline) {
+        Ok(Note::Done { what }) => Ok(what),
+        Ok(Note::Refused { why }) => Err(why),
+        Ok(other) => Err(format!("the monitor answered {other:?}")),
+        Err(e) => Err(format!("the monitor did not answer: {e}")),
+    }
+}
+
 pub(crate) fn subscribe(repo: &std::path::Path) -> Attached {
     attach_by(repo, Who::Observer, ATTACH_BUDGET, connect_within)
 }
@@ -2232,7 +2274,7 @@ pub(crate) enum Published {
     Untrusted(String),
 }
 
-#[cfg(test)]
+/// What the runtime namespace says about this repo's monitor.
 pub(crate) fn published(repo: &std::path::Path) -> Published {
     let me = unsafe { libc::getuid() };
     published_in(&runtime_dir(me), repo, me)
@@ -2459,9 +2501,27 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // to the retirement: `abort` only asks, and a producer or a
     // handshake live at the cutoff still owns its resources.
     let mut owned = OwnedTasks::default();
-    owned
-        .departing
-        .extend(reconcile_hosting(&repo, &mut hosted, &source_items));
+    // What each hosted command source's producer last reported, published
+    // with the sources for the panels that show them.
+    let (lifecycle_tx, mut lifecycles_in) = tokio::sync::mpsc::unbounded_channel();
+    let mut lifecycles: Lifecycles = Default::default();
+    let mut account = None;
+    let birth = crate::proc_identity::token_for(std::process::id() as i32);
+    owned.departing.extend(reconcile_hosting_reporting(
+        &repo,
+        &mut hosted,
+        &source_items,
+        false,
+        Some(&lifecycle_tx),
+    ));
+    if let Some(birth) = &birth {
+        publish_sources(
+            &repo,
+            sources_account(&hosted, &lifecycles, birth.clone()),
+            &mut account,
+            &clients,
+        );
+    }
 
     for author in roster_authors(&repo) {
         owned.interrupting.notify(&repo, author);
@@ -2552,6 +2612,36 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             Some(greeted) = arrivals.recv() => {
                 let client = match greeted {
                     Greeted::Client(client) => client,
+                    Greeted::Control { request, out, writer } => {
+                        let answered = restart_source(
+                            &repo,
+                            &mut hosted,
+                            &source_items,
+                            &lifecycle_tx,
+                            &mut owned.departing,
+                            &request,
+                        )
+                        .await;
+                        let note = match answered {
+                            Ok(what) => {
+                                let Control::Restart { author, key, .. } = &request;
+                                if let Ok(author) = AgentLabel::parse(author) {
+                                    lifecycles.remove(&(author, key.clone()));
+                                }
+                                if let Some(birth) = &birth {
+                                    publish_sources(&repo, sources_account(&hosted, &lifecycles, birth.clone()), &mut account, &clients);
+                                }
+                                Note::Done { what }
+                            }
+                            Err(why) => Note::Refused { why },
+                        };
+                        if let Ok(line) = serde_json::to_string(&note) {
+                            let _ = out.try_send(format!("{line}\n"));
+                        }
+                        drop(out);
+                        leaving.push(writer);
+                        continue;
+                    }
                     // Already acknowledged on its own connection, so
                     // nothing is owed to the successor here.
                     //
@@ -2639,6 +2729,14 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     leaving.extend(serve_to_cached(&repo, &mut clients, state, Some(&author), &mut pending, &mut timer_backlogs, &hosted));
                 }
             }
+            // A hosted producer moved: started, ended, backing off.
+            Some(report) = lifecycles_in.recv() => {
+                if record_lifecycle(&hosted, &mut lifecycles, report) {
+                    if let Some(birth) = &birth {
+                        publish_sources(&repo, sources_account(&hosted, &lifecycles, birth.clone()), &mut account, &clients);
+                    }
+                }
+            }
             // A cancelled producer finished winding down. Nothing to
             // do but stop owning it — which is the point: this set is
             // what a retirement would otherwise have to wait for, and
@@ -2680,9 +2778,17 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         // `.clank/` is a wake dir, so an edited
                         // `wait_events` takes effect here rather than
                         // on a restart.
-                        owned
-                            .departing
-                            .extend(reconcile_hosting_changed(&repo, &mut hosted, &source_items, timers_changed));
+                        owned.departing.extend(reconcile_hosting_reporting(
+                            &repo,
+                            &mut hosted,
+                            &source_items,
+                            timers_changed,
+                            Some(&lifecycle_tx),
+                        ));
+                        forget_replaced(&hosted, &mut lifecycles);
+                        if let Some(birth) = &birth {
+                            publish_sources(&repo, sources_account(&hosted, &lifecycles, birth.clone()), &mut account, &clients);
+                        }
                         // ONE presentation, carrying the projection,
                         // the durable rows and anything held from
                         // before there was a state to present it
@@ -3066,6 +3172,150 @@ fn watch_the_fold(tick: std::sync::Arc<std::sync::atomic::AtomicU64>, every: Dur
     });
 }
 
+/// The sink `author`'s hosted sources emit into, reporting their
+/// lifecycle when the monitor publishes it.
+fn host_sink(
+    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
+    lifecycle: Option<&LifecycleTx>,
+    author: &AgentLabel,
+    instance: u64,
+) -> crate::cli::event_source::EmissionSink {
+    let sink = crate::cli::event_source::EmissionSink::for_author(into.clone(), author.clone());
+    match lifecycle {
+        Some(tx) => sink.reporting(tx.clone(), author.clone(), instance),
+        None => sink,
+    }
+}
+
+/// Tasks spawned together, as one instance.
+fn hosted_tasks(
+    tasks: std::collections::BTreeMap<String, tokio::task::JoinHandle<()>>,
+    instance: u64,
+) -> std::collections::BTreeMap<String, HostedTask> {
+    tasks
+        .into_iter()
+        .map(|(key, handle)| (key, HostedTask { instance, handle }))
+        .collect()
+}
+
+/// The account of what the monitor hosts, from `hosted` and the last
+/// lifecycle each running source reported.
+fn sources_account(
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    lifecycles: &Lifecycles,
+    birth: crate::proc_identity::ProcToken,
+) -> crate::cli::source_status::Account {
+    use crate::cli::source_status::{ConfiguredSource, Hosted as Entry, fingerprint};
+    let sources = hosted
+        .iter()
+        .flat_map(|(author, host)| {
+            host.spec.iter().map(move |(config, _)| {
+                let key = ConfiguredSource::of(author, config).key;
+                Entry {
+                    agent: author.to_string(),
+                    lifecycle: lifecycles
+                        .get(&(author.clone(), key.clone()))
+                        .filter(|(instance, _)| current(hosted, author, &key, *instance))
+                        .map(|(_, state)| state.clone()),
+                    key,
+                    accepted: fingerprint(config),
+                }
+            })
+        })
+        .collect();
+    crate::cli::source_status::Account {
+        monitor: std::process::id() as i32,
+        birth,
+        sources,
+    }
+}
+
+/// Publish the account when it says something new, and wake the
+/// observers that show it. A rewrite of the same account would refresh
+/// every panel for nothing.
+fn publish_sources(
+    repo: &std::path::Path,
+    account: crate::cli::source_status::Account,
+    last: &mut Option<crate::cli::source_status::Account>,
+    clients: &[Client],
+) {
+    if last.as_ref() == Some(&account) {
+        return;
+    }
+    match crate::cli::source_status::publish(repo, &account) {
+        Ok(()) => {
+            *last = Some(account);
+            for client in clients.iter().filter(|c| c.who == Served::Observer) {
+                send_note(client, &Note::Beat);
+            }
+        }
+        Err(e) => eprintln!("monitor: could not publish its sources: {e}"),
+    }
+}
+
+/// Restart one of an author's command sources for a control client,
+/// if what runs for it is still the configuration the asker was shown.
+/// Only that source's task is stopped: its process group is retired as
+/// the task ends, and the replacement cannot start a run until that
+/// group is gone and its lease free.
+async fn restart_source(
+    repo: &std::path::Path,
+    hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
+    lifecycle: &LifecycleTx,
+    departing: &mut futures_util::stream::FuturesUnordered<tokio::task::JoinHandle<()>>,
+    request: &Control,
+) -> Result<String, String> {
+    use clank_core::agent_config::WaitEventSource;
+    let Control::Restart {
+        author,
+        key,
+        accepted,
+    } = request;
+    let author =
+        AgentLabel::parse(author).map_err(|e| format!("invalid author `{author}`: {e}"))?;
+    let host = hosted
+        .get_mut(&author)
+        .ok_or_else(|| format!("the monitor runs no sources for `{author}`"))?;
+    let config = host
+        .spec
+        .iter()
+        .map(|(config, _)| config)
+        .find(|config| matches!(config, WaitEventSource::Command(c) if c.source_key() == *key))
+        .cloned()
+        .ok_or_else(|| format!("`{author}` has no command source `{key}` running"))?;
+    if crate::cli::source_status::fingerprint(&config) != *accepted {
+        return Err(
+            "what runs for this source changed since it was shown; reopen its page".to_string(),
+        );
+    }
+    let mut old = host
+        .tasks
+        .remove(key)
+        .ok_or_else(|| format!("`{author}`'s `{key}` has no running task"))?
+        .handle;
+    old.abort();
+    if tokio::time::timeout(SETTLE_BUDGET, &mut old).await.is_err() {
+        departing.push(old);
+    }
+    let instance = next_instance();
+    let events_dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    let restarted = crate::cli::wait::EventSources::spawn(
+        &[(config, crate::cli::event_source::SourceOrigin::Config)],
+        Some(&events_dir),
+        repo,
+        &author,
+        &[],
+        None,
+        host_sink(into, Some(lifecycle), &author, instance),
+    )
+    .into_tasks();
+    host.tasks.extend(hosted_tasks(restarted, instance));
+    Ok(format!("restarted `{author}`'s `{key}`"))
+}
+
 /// One author's config sources, running in the monitor.
 struct Hosted {
     /// What they were resolved from, so a config change is noticed by
@@ -3074,8 +3324,15 @@ struct Hosted {
         clank_core::agent_config::WaitEventSource,
         crate::cli::event_source::SourceOrigin,
     )>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Each source's task, by the storage key of the log it writes.
+    tasks: std::collections::BTreeMap<String, HostedTask>,
     timers: Option<crate::cli::timer_source::TimerSet>,
+}
+
+/// One hosted source's task, and which instance of it this is.
+struct HostedTask {
+    instance: u64,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl Hosted {
@@ -3095,10 +3352,13 @@ impl Hosted {
     /// cancelling all production, including passive future deadlines.
     fn stop_producing(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
         self.timers.take();
-        for task in &self.tasks {
-            task.abort();
+        for task in self.tasks.values() {
+            task.handle.abort();
         }
         std::mem::take(&mut self.tasks)
+            .into_values()
+            .map(|task| task.handle)
+            .collect()
     }
 }
 
@@ -3158,6 +3418,69 @@ fn reconcile_hosting_changed(
     into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
     timers_changed: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
+    reconcile_hosting_reporting(repo, hosted, into, timers_changed, None)
+}
+
+/// The channel a hosted source's lifecycle is reported on.
+type LifecycleTx = tokio::sync::mpsc::UnboundedSender<crate::cli::event_source::LifecycleReport>;
+
+/// What each hosted source's producer last reported, with the instance of
+/// the task that reported it.
+type Lifecycles =
+    std::collections::BTreeMap<(AgentLabel, String), (u64, crate::cli::event_source::Lifecycle)>;
+
+/// A fresh instance number for tasks this monitor spawns, so a replaced
+/// task's late reports are known for what they are.
+fn next_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keep a producer's report if it is from the task hosted for its source
+/// now; a replaced task's late word is dropped. Whether it was kept.
+fn record_lifecycle(
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    lifecycles: &mut Lifecycles,
+    (author, key, instance, state): crate::cli::event_source::LifecycleReport,
+) -> bool {
+    if !current(hosted, &author, &key, instance) {
+        return false;
+    }
+    lifecycles.insert((author, key), (instance, state));
+    true
+}
+
+/// Forget what replaced or removed tasks last said: a source's new task
+/// has said nothing yet, and its old one's word is not about it.
+fn forget_replaced(
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    lifecycles: &mut Lifecycles,
+) {
+    lifecycles.retain(|(author, key), (instance, _)| current(hosted, author, key, *instance));
+}
+
+/// Whether `instance` is the task `author` hosts for `key` now.
+fn current(
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    author: &AgentLabel,
+    key: &str,
+    instance: u64,
+) -> bool {
+    hosted
+        .get(author)
+        .and_then(|h| h.tasks.get(key))
+        .is_some_and(|task| task.instance == instance)
+}
+
+/// [`reconcile_hosting_changed`], with each hosted source's lifecycle
+/// reported on `lifecycle`.
+fn reconcile_hosting_reporting(
+    repo: &std::path::Path,
+    hosted: &mut std::collections::BTreeMap<AgentLabel, Hosted>,
+    into: &tokio::sync::mpsc::UnboundedSender<(AgentLabel, crate::cli::event_source::Emission)>,
+    timers_changed: bool,
+    lifecycle: Option<&LifecycleTx>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let retry_timers = |timers: &mut crate::cli::timer_source::TimerSet| {
         if timers_changed {
             timers.refresh();
@@ -3209,7 +3532,8 @@ fn reconcile_hosting_changed(
         let events_dir = crate::agent_store::agents_root(repo)
             .join(author.as_str())
             .join("events");
-        let sink = crate::cli::event_source::EmissionSink::for_author(into.clone(), author.clone());
+        let instance = next_instance();
+        let sink = host_sink(into, lifecycle, author, instance);
         let mut timers =
             match crate::cli::timer_source::TimerSet::new(&spec, &events_dir, None, sink.clone()) {
                 Ok(timers) => timers,
@@ -3248,7 +3572,7 @@ fn reconcile_hosting_changed(
             author.clone(),
             Hosted {
                 spec,
-                tasks,
+                tasks: hosted_tasks(tasks, instance),
                 timers: Some(timers),
             },
         );
@@ -3514,6 +3838,10 @@ fn revoked(err: &anyhow::Error) -> bool {
 fn served_for(repo: &std::path::Path, who: Who) -> Result<Served, Welcome> {
     match who {
         Who::Observer => Ok(Served::Observer),
+        Who::Control { .. } => Err(Welcome::Decline {
+            proto: PROTO,
+            why: "a control request is answered, not served".to_string(),
+        }),
         Who::RecoveryHelper { author, .. } => match served_for(
             repo,
             Who::Agent {
@@ -3545,6 +3873,13 @@ fn served_for(repo: &std::path::Path, who: Who) -> Result<Served, Welcome> {
 #[derive(Debug)]
 enum Greeted {
     Client(Client),
+    /// A control request, for the owner loop to carry out and answer on
+    /// `out` before the connection closes.
+    Control {
+        request: Control,
+        out: tokio::sync::mpsc::Sender<String>,
+        writer: tokio::task::JoinHandle<Wrote>,
+    },
     /// A successor asked, and was told this monitor is retiring. The
     /// answer is already sent; what remains is to do it.
     StandDown,
@@ -3558,6 +3893,7 @@ impl Greeted {
         match self {
             Greeted::Client(c) => c,
             Greeted::StandDown => panic!("a hello was answered as a successor's ask"),
+            Greeted::Control { .. } => panic!("a hello was answered as a control request"),
         }
     }
 }
@@ -3601,6 +3937,34 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         return Ok(Greeted::StandDown);
     }
 
+    if let Greeting::Client(Hello {
+        who: Who::Control { request },
+        ..
+    }) = &greeting
+    {
+        let request = request.clone();
+        io.get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&Welcome::Ok { proto: PROTO })?
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let writer = tokio::spawn(write_to(
+            io.into_inner(),
+            queued,
+            "a control client".to_string(),
+        ));
+        return Ok(Greeted::Control {
+            request,
+            out,
+            writer,
+        });
+    }
+
     // An agent's author is resolved BEFORE admission: welcoming one the
     // roster does not know would register a connection nothing can ever
     // serve. An observer asks for no projection, so there is nothing to
@@ -3615,7 +3979,7 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
                 match hello.who {
                     Who::Agent { holder, .. } => holder,
                     Who::RecoveryHelper { holder, .. } => Some(holder),
-                    Who::Observer => None,
+                    Who::Observer | Who::Control { .. } => None,
                 },
             )
         }),
@@ -3976,6 +4340,25 @@ fn claim_late_arrivals(
             // A second successor, asking for what is already
             // happening. It was acknowledged on its own connection.
             Greeted::StandDown => {}
+            // Told why, and drained with the readers so its writer is
+            // owned to the end rather than detached.
+            Greeted::Control { out, writer, .. } => {
+                let client = Client {
+                    who: Served::Observer,
+                    holder: None,
+                    out,
+                    writer: Some(writer),
+                    shown: Default::default(),
+                };
+                send_note(
+                    &client,
+                    &Note::Refused {
+                        why: "the monitor is standing down".to_string(),
+                    },
+                );
+                clients.push(client);
+                took += 1;
+            }
         }
     }
     took
@@ -5131,7 +5514,14 @@ mod tests {
         let producers = Hosted {
             timers: None,
             spec: Vec::new(),
-            tasks: vec![producer],
+            tasks: [(
+                "producer".to_string(),
+                HostedTask {
+                    instance: 0,
+                    handle: producer,
+                },
+            )]
+            .into(),
         }
         .stop();
 
@@ -5324,7 +5714,14 @@ mod tests {
             Hosted {
                 timers: None,
                 spec: Vec::new(),
-                tasks: vec![producer],
+                tasks: [(
+                    "producer".to_string(),
+                    HostedTask {
+                        instance: 0,
+                        handle: producer,
+                    },
+                )]
+                .into(),
             },
         )]);
 
@@ -5553,7 +5950,14 @@ mod tests {
         let producers = Hosted {
             timers: None,
             spec: Vec::new(),
-            tasks: vec![producer],
+            tasks: [(
+                "producer".to_string(),
+                HostedTask {
+                    instance: 0,
+                    handle: producer,
+                },
+            )]
+            .into(),
         }
         .stop();
 
@@ -5974,7 +6378,14 @@ mod tests {
         let departing = Hosted {
             timers: None,
             spec: Vec::new(),
-            tasks: vec![producer],
+            tasks: [(
+                "producer".to_string(),
+                HostedTask {
+                    instance: 0,
+                    handle: producer,
+                },
+            )]
+            .into(),
         }
         .stop();
 
@@ -8711,6 +9122,19 @@ mod tests {
             ready.await.unwrap();
         }
         let ids: Vec<_> = tasks.iter().map(|task| task.id()).collect();
+        let tasks: std::collections::BTreeMap<String, _> = tasks
+            .into_iter()
+            .enumerate()
+            .map(|(i, handle)| {
+                (
+                    format!("source-{i}"),
+                    HostedTask {
+                        instance: 0,
+                        handle,
+                    },
+                )
+            })
+            .collect();
         let command_key = match &spec[0].0 {
             WaitEventSource::Command(source) => source.source_key(),
             _ => unreachable!(),
@@ -8771,8 +9195,8 @@ mod tests {
             assert_eq!(
                 hosts[&author]
                     .tasks
-                    .iter()
-                    .map(|task| task.id())
+                    .values()
+                    .map(|task| task.handle.id())
                     .collect::<Vec<_>>(),
                 ids
             );
@@ -9554,6 +9978,327 @@ mod tests {
         .unwrap();
     }
 
+    /// The account says, for every hosted source, the configuration the
+    /// monitor accepted and the lifecycle its producer last reported, and
+    /// it is published outside the repo: a producer starting or ending is
+    /// no repo write, so it wakes no wait and no gate.
+    #[tokio::test]
+    async fn the_sources_account_is_what_runs_and_lives_outside_the_repo() {
+        use crate::cli::event_source::{Lifecycle, SourceOrigin};
+        let repo = repo_with_roster();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let config = |name: &str| {
+            clank_core::agent_config::WaitEventSource::Command(
+                clank_core::agent_config::CommandSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: name.into(),
+                    command: vec!["true".into()],
+                    reply_command: None,
+                    receipt_command: None,
+                    glyph: None,
+                },
+            )
+        };
+        let key =
+            |name: &str| crate::cli::source_status::ConfiguredSource::of(&codex, &config(name)).key;
+        let one = key("one");
+        let task = |instance| HostedTask {
+            instance,
+            handle: tokio::spawn(std::future::pending()),
+        };
+        let hosted = std::collections::BTreeMap::from([(
+            codex.clone(),
+            Hosted {
+                spec: vec![
+                    (config("one"), SourceOrigin::Config),
+                    (config("two"), SourceOrigin::Config),
+                ],
+                tasks: [(one.clone(), task(5)), (key("two"), task(6))].into(),
+                timers: None,
+            },
+        )]);
+        // `two`'s report is from the task its current one replaced.
+        let lifecycles = std::collections::BTreeMap::from([
+            (
+                (codex.clone(), one.clone()),
+                (5, Lifecycle::Running { pid: 9, since: 0 }),
+            ),
+            (
+                (codex.clone(), key("two")),
+                (4, Lifecycle::Running { pid: 8, since: 0 }),
+            ),
+        ]);
+        let birth = crate::proc_identity::token_for(std::process::id() as i32).unwrap();
+        let account = sources_account(&hosted, &lifecycles, birth);
+        assert_eq!(account.monitor, std::process::id() as i32);
+        assert_eq!(account.sources.len(), 2);
+        assert_eq!(account.sources[0].key, one);
+        assert_eq!(
+            account.sources[0].accepted,
+            crate::cli::source_status::fingerprint(&config("one"))
+        );
+        assert_eq!(
+            account.sources[0].lifecycle,
+            Some(Lifecycle::Running { pid: 9, since: 0 })
+        );
+        assert_eq!(
+            account.sources[1].lifecycle, None,
+            "a replaced task's report"
+        );
+        for host in hosted.into_values() {
+            for handle in host.stop() {
+                let _ = handle.await;
+            }
+        }
+        let published = crate::cli::source_status::path(repo.path());
+        assert!(
+            !published.starts_with(repo.path()),
+            "{}",
+            published.display()
+        );
+    }
+
+    /// Two sources resolving to one storage key are refused, command or
+    /// github, and an edit that introduces them leaves the last accepted
+    /// host running as it was rather than losing hold of a task.
+    #[tokio::test]
+    async fn sources_sharing_a_storage_key_are_refused_and_the_host_kept() {
+        let repo = repo_with_roster();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |sources: serde_json::Value| {
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({ "wait_events": sources })).unwrap(),
+            )
+            .unwrap()
+        };
+        let command =
+            serde_json::json!({"kind": "command", "name": "watch", "command": ["sleep", "300"]});
+        let github = serde_json::json!({"kind": "github", "repo": "o/r", "events": ["pr_comment"]});
+        for twice in [command.clone(), github] {
+            write(serde_json::json!([twice.clone(), twice]));
+            let refused = hostable(repo.path(), &codex).unwrap_err().to_string();
+            assert!(refused.contains("share the storage key"), "{refused}");
+        }
+        write(serde_json::json!([command.clone()]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = std::collections::BTreeMap::new();
+        let mut departing: Vec<_> = reconcile_hosting(repo.path(), &mut hosted, &tx);
+        let before: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
+        write(serde_json::json!([command.clone(), command]));
+        departing.extend(reconcile_hosting(repo.path(), &mut hosted, &tx));
+        let after: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
+        assert_eq!(before, after, "the accepted host runs on, holding its task");
+        for host in hosted.into_values() {
+            departing.extend(host.stop());
+        }
+        for handle in departing {
+            let _ = handle.await;
+        }
+    }
+
+    /// A source's task replaced under the same key starts with nothing
+    /// said: the old task's state is forgotten and its late reports are
+    /// refused, and what the new one reports, even that it stopped before
+    /// running anything, is what is published.
+    #[tokio::test]
+    async fn a_replaced_task_is_never_spoken_for_by_the_old_one() {
+        use crate::cli::event_source::{Lifecycle, SourceOrigin};
+        let codex = AgentLabel::parse("codex").unwrap();
+        let config = clank_core::agent_config::WaitEventSource::Command(
+            clank_core::agent_config::CommandSource {
+                interrupt: false,
+                interrupt_message: None,
+                name: "watch".into(),
+                command: vec!["true".into()],
+                reply_command: None,
+                receipt_command: None,
+                glyph: None,
+            },
+        );
+        let key = crate::cli::source_status::ConfiguredSource::of(&codex, &config).key;
+        let host = |instance| Hosted {
+            spec: vec![(config.clone(), SourceOrigin::Config)],
+            tasks: [(
+                key.clone(),
+                HostedTask {
+                    instance,
+                    handle: tokio::spawn(std::future::pending()),
+                },
+            )]
+            .into(),
+            timers: None,
+        };
+        let mut hosted = std::collections::BTreeMap::from([(codex.clone(), host(1))]);
+        let mut lifecycles = Lifecycles::default();
+        let running = Lifecycle::Running { pid: 9, since: 0 };
+        assert!(record_lifecycle(
+            &hosted,
+            &mut lifecycles,
+            (codex.clone(), key.clone(), 1, running.clone())
+        ));
+        let old = hosted.insert(codex.clone(), host(2)).unwrap();
+        forget_replaced(&hosted, &mut lifecycles);
+        assert!(lifecycles.is_empty(), "the new task has said nothing");
+        assert!(!record_lifecycle(
+            &hosted,
+            &mut lifecycles,
+            (codex.clone(), key.clone(), 1, running)
+        ));
+        let stopped = Lifecycle::Stopped {
+            why: "cannot take its ingest lease".into(),
+        };
+        assert!(record_lifecycle(
+            &hosted,
+            &mut lifecycles,
+            (codex.clone(), key.clone(), 2, stopped.clone())
+        ));
+        let birth = crate::proc_identity::token_for(std::process::id() as i32).unwrap();
+        assert_eq!(
+            sources_account(&hosted, &lifecycles, birth).sources[0].lifecycle,
+            Some(stopped)
+        );
+        for host in hosted.into_values().chain([old]) {
+            for handle in host.stop() {
+                let _ = handle.await;
+            }
+        }
+    }
+
+    /// A restart stops one source's whole process group, a grandchild
+    /// included, and starts it again, leaving the author's other source
+    /// running as it was; a request for a configuration the monitor no
+    /// longer runs, or a source it does not have, restarts nothing.
+    #[tokio::test]
+    async fn a_restart_is_one_source_whole_and_only_it() {
+        let repo = repo_with_roster();
+        let marks = repo.path().join("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        let mark = |name: &str| marks.join(name).display().to_string();
+        let dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"wait_events": [
+                {"kind": "command", "name": "restartable", "command": [
+                    "sh", "-c", "sleep 300 & echo $! > \"$0.gc\"; echo $$ >> \"$0.runs\"; wait", mark("a")]},
+                {"kind": "command", "name": "sibling", "command": [
+                    "sh", "-c", "echo $$ > \"$0.pid\"; exec sleep 300", mark("b")]},
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex = AgentLabel::parse("codex").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (life, _heard) = tokio::sync::mpsc::unbounded_channel();
+        let mut hosted = std::collections::BTreeMap::new();
+        let mut departing = futures_util::stream::FuturesUnordered::new();
+        departing.extend(reconcile_hosting_reporting(
+            repo.path(),
+            &mut hosted,
+            &tx,
+            false,
+            Some(&life),
+        ));
+        let read = |name: &str| std::fs::read_to_string(mark(name)).unwrap_or_default();
+        let pid = |name: &str| {
+            read(name)
+                .lines()
+                .last()
+                .and_then(|l| l.trim().parse::<i32>().ok())
+        };
+        async fn until(what: impl Fn() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !what() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            what()
+        }
+        assert!(
+            until(|| pid("a.gc").is_some() && pid("b.pid").is_some()).await,
+            "both started"
+        );
+        let grandchild = pid("a.gc").unwrap();
+        let sibling = pid("b.pid").unwrap();
+        let alive = |pid: i32| crate::signal::probe_process(pid) != crate::signal::Probe::Gone;
+        let config = hosted[&codex]
+            .spec
+            .iter()
+            .map(|(c, _)| c.clone())
+            .find(|c| matches!(c, clank_core::agent_config::WaitEventSource::Command(s) if s.name == "restartable"))
+            .unwrap();
+        let clank_core::agent_config::WaitEventSource::Command(command) = &config else {
+            unreachable!()
+        };
+        let key = command.source_key();
+        let ask = |key: &str, accepted: &str| Control::Restart {
+            author: "codex".into(),
+            key: key.into(),
+            accepted: accepted.into(),
+        };
+        for refused in [
+            ask(&key, "an earlier config"),
+            ask("command-nothing-0", "x"),
+        ] {
+            assert!(
+                restart_source(
+                    repo.path(),
+                    &mut hosted,
+                    &tx,
+                    &life,
+                    &mut departing,
+                    &refused
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(alive(grandchild), "a refused restart touches nothing");
+        let accepted = crate::cli::source_status::fingerprint(&config);
+        restart_source(
+            repo.path(),
+            &mut hosted,
+            &tx,
+            &life,
+            &mut departing,
+            &ask(&key, &accepted),
+        )
+        .await
+        .unwrap();
+        assert!(
+            until(|| !alive(grandchild)).await,
+            "the grandchild went with its group"
+        );
+        assert!(
+            until(|| read("a.runs").lines().count() == 2).await,
+            "and it started again"
+        );
+        assert!(
+            hosted[&codex].tasks.contains_key(&key) && hosted[&codex].tasks.len() == 2,
+            "and the monitor holds its new task, to stop or restart again"
+        );
+        assert!(
+            alive(sibling) && pid("b.pid") == Some(sibling),
+            "the sibling ran on"
+        );
+        for host in std::mem::take(&mut hosted).into_values() {
+            departing.extend(host.stop());
+        }
+        while let Some(_) = futures_util::StreamExt::next(&mut departing).await {}
+        assert!(until(|| !alive(sibling)).await);
+    }
+
     #[tokio::test]
     async fn hosted_producers_deliver_with_their_author_and_release_their_leases() {
         use crate::cli::event_source::Durability;
@@ -9684,18 +10429,30 @@ mod tests {
             "an author with no configured source hosts nothing"
         );
         let codex = AgentLabel::parse("codex").unwrap();
-        let first: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        let first: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
         assert_eq!(first.len(), 1, "one source driver, no author forwarder");
 
         // An unrelated fold leaves a healthy producer alone.
         reconcile_hosting(repo.path(), &mut hosted, &tx);
-        let again: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        let again: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
         assert_eq!(first, again, "an unchanged spec must not restart anything");
 
         // An edited `wait_events` takes effect without a restart.
         with_source(repo.path(), "codex", "builds");
         reconcile_hosting(repo.path(), &mut hosted, &tx);
-        let after: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
+        let after: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
         assert_ne!(first, after, "a changed spec restarts that author's set");
 
         // And an author off the roster keeps nothing running.
@@ -9740,14 +10497,30 @@ mod tests {
 
         let codex = AgentLabel::parse("codex").unwrap();
         let claude = AgentLabel::parse("claude").unwrap();
-        let codex_before: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
-        let claude_before: Vec<_> = hosted[&claude].tasks.iter().map(|t| t.id()).collect();
+        let codex_before: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
+        let claude_before: Vec<_> = hosted[&claude]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
 
         with_source(repo.path(), "codex", "releases");
         reconcile_hosting(repo.path(), &mut hosted, &tx);
 
-        let codex_after: Vec<_> = hosted[&codex].tasks.iter().map(|t| t.id()).collect();
-        let claude_after: Vec<_> = hosted[&claude].tasks.iter().map(|t| t.id()).collect();
+        let codex_after: Vec<_> = hosted[&codex]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
+        let claude_after: Vec<_> = hosted[&claude]
+            .tasks
+            .values()
+            .map(|t| t.handle.id())
+            .collect();
         assert_ne!(
             codex_before, codex_after,
             "the edited author's set restarts"
@@ -10142,6 +10915,7 @@ mod tests {
         // a transient is one author's event, like any other.
         let note: Note = serde_json::from_str(other.recv().await.unwrap().trim_end()).unwrap();
         match note {
+            Note::Done { what } => panic!("unexpected control answer: {what}"),
             Note::Refused { why } => panic!("unexpected refusal: {why}"),
             Note::Beat { .. } => {}
             Note::Recover { .. } => panic!("a wait is never sent a recovery"),

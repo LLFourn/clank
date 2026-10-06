@@ -129,6 +129,8 @@ pub(crate) fn snap(active_plan: Option<PlanWorkState>, queue: Vec<&str>) -> Stat
             })
             .collect(),
         drafts: Vec::new(),
+        sources: Vec::new(),
+        sources_live: crate::cli::source_status::Live::Unavailable,
         master: Some("claude".into()),
         agents: Vec::new(),
         stash: Vec::new(),
