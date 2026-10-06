@@ -5962,6 +5962,8 @@ pub(crate) mod tests {
         members: Vec<crate::cli::github::timeline::MemberRef>,
     ) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 1,
@@ -8669,6 +8671,8 @@ pub(crate) mod tests {
         );
         assert_eq!(source_rows_in(&source, &s), vec![]);
         s.github_events = vec![crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 1,

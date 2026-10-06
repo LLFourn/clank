@@ -3507,6 +3507,40 @@ pub(super) fn render_event_detail(
             body.push(emit(&[plain(format!("  {line}"))], "", cols));
         }
     };
+    if !ev.replies.is_empty() || ev.reply_history_pruned {
+        body.push(emit(
+            &[dim("  replies to its backend".to_string())],
+            "",
+            cols,
+        ));
+        if ev.reply_history_pruned {
+            body.push(emit(
+                &[dim(
+                    "  older accepted replies were pruned; these remain".to_string()
+                )],
+                "",
+                cols,
+            ));
+        }
+        for reply in &ev.replies {
+            let about = format!(
+                "{} · @{} · {} · {}",
+                crate::cli::events::age(reply.at),
+                reply.original.agent,
+                if reply.accepted {
+                    "accepted"
+                } else {
+                    "pending"
+                },
+                reply.operation_id,
+            );
+            let safe = crate::cli::status_tui::text::safe_multiline(&about);
+            for row in super::text::wrap_body(&safe, cols.saturating_sub(4).max(1)) {
+                body.push(emit(&[dim(format!("  {row}"))], "", cols));
+            }
+            push_body(&mut body, &reply.text, cols);
+        }
+    }
     for reply in &ev.outgoing {
         wrapped_fact(
             &mut body,
@@ -5425,6 +5459,8 @@ mod tests {
             );
         }
         let voice = [MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 190,
@@ -8281,6 +8317,8 @@ mod tests {
         let ours = s.sources[0].clone();
         s.github_events = (0..30u64)
             .map(|i| crate::cli::github::timeline::MergedEvent {
+                replies: Vec::new(),
+                reply_history_pruned: false,
                 outgoing: Vec::new(),
                 recurrence: None,
                 at: 1_000 + i,
@@ -8413,6 +8451,136 @@ mod tests {
             SourceNav::Lift(usize::MAX)
         );
         assert!(shows(&page(0, usize::MAX), "kind"), "top of the page");
+    }
+
+    /// An event's page lists the replies sent to its backend: whose, when,
+    /// pending or accepted, which operation, and every line of the text.
+    #[test]
+    fn an_event_page_lists_the_replies_to_its_backend() {
+        let key = crate::cli::github::timeline::MemberKey {
+            agent: "alpha".into(),
+            source: "command-voice".into(),
+            seq: 1,
+            ident: String::new(),
+        };
+        let ev = crate::cli::github::timeline::MergedEvent {
+            replies: vec![crate::cli::github::timeline::BackendReply {
+                original: key.clone(),
+                operation_id: "op-7".into(),
+                text: "first line\nSECOND-LINE".into(),
+                at: 1,
+                accepted: false,
+            }],
+            reply_history_pruned: true,
+            outgoing: Vec::new(),
+            recurrence: None,
+            at: 1,
+            backend: crate::cli::github::timeline::Backend::Command,
+            glyph: Some("🎙".into()),
+            source: "voice".into(),
+            kind: "voice".into(),
+            failure: false,
+            detail: None,
+            number: None,
+            content: Some("note".into()),
+            body: None,
+            actor: None,
+            url: None,
+            seen_by: vec!["alpha".into()],
+            unhandled: false,
+            baseline: false,
+            members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
+                key,
+                acked: true,
+                transport: crate::cli::github::log::Transport::Command,
+                content: None,
+            }],
+        };
+        let ep = super::super::input::EventPage {
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+        let (lines, _) = render_event_detail(&ep, &[], 0, 80, 80);
+        let text: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        let has = |s: &str| text.iter().any(|l| l.contains(s));
+        assert!(has("replies to its backend"), "{text:#?}");
+        assert!(has("older accepted replies were pruned"));
+        assert!(has("@alpha") && has("pending") && has("op-7"));
+        assert!(has("first line") && has("SECOND-LINE"));
+    }
+
+    /// A reply's text reaches the page as event content does: terminal
+    /// controls neutralised, its layout kept, every character on some
+    /// row however narrow the pane, and its operation id whole.
+    #[test]
+    fn a_reply_on_an_event_page_is_safe_and_whole() {
+        let key = crate::cli::github::timeline::MemberKey {
+            agent: "alpha".into(),
+            source: "command-voice".into(),
+            seq: 1,
+            ident: String::new(),
+        };
+        let id = "operation-0123456789-abcdefghij-klmnopqrst";
+        let ev = crate::cli::github::timeline::MergedEvent {
+            replies: vec![crate::cli::github::timeline::BackendReply {
+                original: key.clone(),
+                operation_id: id.into(),
+                text: "\u{1b}]2;CLANK-REVIEW-PROBE\u{7}visible\n\t  SECOND  gap".into(),
+                at: 1,
+                accepted: true,
+            }],
+            reply_history_pruned: false,
+            outgoing: Vec::new(),
+            recurrence: None,
+            at: 1,
+            backend: crate::cli::github::timeline::Backend::Command,
+            glyph: None,
+            source: "voice".into(),
+            kind: "voice".into(),
+            failure: false,
+            detail: None,
+            number: None,
+            content: None,
+            body: None,
+            actor: None,
+            url: None,
+            seen_by: vec!["alpha".into()],
+            unhandled: false,
+            baseline: false,
+            members: vec![crate::cli::github::timeline::MemberRef {
+                woken_at: None,
+                key,
+                acked: true,
+                transport: crate::cli::github::log::Transport::Command,
+                content: None,
+            }],
+        };
+        let ep = super::super::input::EventPage {
+            target: ev.members[0].key.clone().into(),
+            retained: ev.page_keys(),
+            event: ev,
+            prompts: Vec::new(),
+            scroll: 0,
+            content: None,
+        };
+        let (lines, _) = render_event_detail(&ep, &[], 0, 200, 30);
+        assert!(
+            lines.iter().all(|l| !l.contains("]2;")),
+            "no raw OSC: {lines:#?}"
+        );
+        let text: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        let joined: String = text.iter().map(|l| l.trim()).collect();
+        assert!(joined.contains(id), "the whole operation: {text:#?}");
+        assert!(
+            text.iter().any(|l| l.contains("SECOND  gap")),
+            "layout kept: {text:#?}"
+        );
+        assert!(text.iter().any(|l| l.contains("visible")));
     }
 
     /// However long the list and short the pane, the selected draft is
@@ -8692,6 +8860,8 @@ mod tests {
         use clank_core::wait::ContentRef;
 
         let ev = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 0,
@@ -8870,6 +9040,8 @@ mod tests {
                     a    b\n\tcol\tcol\nend";
         let cols = 24;
         let mut ev = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 0,
@@ -8964,6 +9136,8 @@ mod tests {
     fn a_body_bearing_event_shows_all_of_it() {
         let text = "# Rebase please\n\nonto master, then run the suite.\n\nThanks.";
         let mut ev = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 0,
@@ -9047,6 +9221,8 @@ mod tests {
     fn a_command_events_content_keeps_its_lines() {
         let page = |content: &str, cols: usize| {
             let ev = crate::cli::github::timeline::MergedEvent {
+                replies: Vec::new(),
+                reply_history_pruned: false,
                 outgoing: Vec::new(),
                 recurrence: None,
                 at: 0,
@@ -9198,6 +9374,8 @@ mod tests {
     #[test]
     fn the_event_page_renders_a_command_event_without_githubs_extras() {
         let ev = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 0,
@@ -9293,6 +9471,8 @@ mod tests {
             content: None,
         };
         let ev = MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 1,
@@ -9867,6 +10047,8 @@ mod tests {
             content: None,
         };
         let event = |members: Vec<MemberRef>| MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             backend: Backend::Github,

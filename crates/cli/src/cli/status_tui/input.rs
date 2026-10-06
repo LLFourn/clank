@@ -3007,6 +3007,8 @@ mod tests {
 
     fn event(seq: u64) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: seq,

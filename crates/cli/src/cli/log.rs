@@ -521,7 +521,26 @@ pub(crate) fn event_row_text(g: &crate::cli::github::timeline::MergedEvent) -> S
     if g.failure {
         out.push_str("  (this SOURCE is broken, not the world)");
     }
+    if let Some(mark) = reply_mark(g) {
+        out.push_str(&format!("  {mark}"));
+    }
     out
+}
+
+/// How an event shows the replies sent to its backend: `↩` and how many
+/// its logs retain, `+` when older ones were pruned, and how many of
+/// them are still pending.
+pub(crate) fn reply_mark(g: &crate::cli::github::timeline::MergedEvent) -> Option<String> {
+    if g.replies.is_empty() && !g.reply_history_pruned {
+        return None;
+    }
+    let pruned = if g.reply_history_pruned { "+" } else { "" };
+    let pending = g.replies.iter().filter(|r| !r.accepted).count();
+    let pending = match pending {
+        0 => String::new(),
+        n => format!(" ({n} pending)"),
+    };
+    Some(format!("↩{}{pruned}{pending}", g.replies.len()))
 }
 
 // ── git helpers ──────────────────────────────────────────────
@@ -1513,6 +1532,15 @@ enum LogJsonRow<'a> {
         seen_by: &'a [String],
         unhandled: bool,
         baseline: bool,
+        /// Replies sent to its backend that its logs retain.
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        replies: &'a [crate::cli::github::timeline::BackendReply],
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        reply_history_pruned: bool,
+        /// For a reply whose event has aged out: its operation, and the
+        /// copy it answered.
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        outgoing: &'a [crate::cli::github::timeline::OutgoingReply],
     },
     #[serde(rename = "timer_event")]
     Timer {
@@ -1610,6 +1638,9 @@ fn json_items<'a>(
                         seen_by: &g.seen_by,
                         unhandled: g.unhandled,
                         baseline: g.baseline,
+                        replies: &g.replies,
+                        reply_history_pruned: g.reply_history_pruned,
+                        outgoing: &g.outgoing,
                     },
                     crate::cli::github::timeline::Backend::Timer => LogJsonRow::Timer {
                         delivery: g.delivery(),
@@ -1990,6 +2021,8 @@ mod json_output_tests {
 
     fn gh(at: u64, key_hint: &str, unhandled: bool) -> crate::cli::github::timeline::MergedEvent {
         crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at,
@@ -2078,6 +2111,8 @@ mod json_output_tests {
         // marker without ANSI in plain output.
         let base = gh(100, "old news", false);
         let base = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             baseline: true,
             ..base
@@ -2434,6 +2469,8 @@ mod json_output_tests {
     #[test]
     fn no_github_hides_github_events_and_keeps_command_ones() {
         let ev = |backend, source: &str| crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 150,
@@ -2483,6 +2520,8 @@ mod json_output_tests {
     #[test]
     fn a_command_events_row_and_json_are_not_dressed_up_as_github() {
         let cmd = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 150,
@@ -2550,6 +2589,63 @@ mod json_output_tests {
         assert_eq!(row["failure"], true, "the flag survives the JSON");
         assert!(row.get("repo").is_none(), "no borrowed repo: {row}");
         assert!(row.get("title").is_none(), "no borrowed title: {row}");
+    }
+
+    /// `log --json` carries what the row's mark says: an event's backend
+    /// replies with their operation, owner and state, and for a reply
+    /// whose event aged out, its operation and the copy it answered.
+    #[test]
+    fn log_json_carries_backend_reply_history() {
+        use crate::cli::github::timeline::{Backend, BackendReply, MemberKey, OutgoingReply};
+        let original = MemberKey {
+            agent: "alpha".into(),
+            source: "command-voice".into(),
+            seq: 3,
+            ident: "i".into(),
+        };
+        let mut with = gh(150, "note", true);
+        with.backend = Backend::Command;
+        with.replies = vec![BackendReply {
+            original: original.clone(),
+            operation_id: "op-1".into(),
+            text: "on it".into(),
+            at: 160,
+            accepted: false,
+        }];
+        with.reply_history_pruned = true;
+        let mut orphan = gh(170, "earlier", false);
+        orphan.backend = Backend::Command;
+        orphan.members = Vec::new();
+        orphan.outgoing = vec![OutgoingReply {
+            operation_id: "op-0".into(),
+            delivery_id: "op-0".into(),
+            from: "alpha".into(),
+            from_repo: "/r".into(),
+            destination: None,
+            original: original.clone(),
+            original_handle: "note-1".into(),
+            acknowledge: false,
+        }];
+        let events: Vec<&LogEvent> = Vec::new();
+        let gh_events = vec![with, orphan];
+        let items = interleave(&events, &gh_events);
+        let json = serde_json::to_value(json_items(&items, &Default::default())).unwrap();
+        let rows = json.as_array().unwrap();
+        let attached = rows
+            .iter()
+            .find(|r| r["replies"].is_array())
+            .expect("{json}");
+        assert_eq!(attached["kind"], "command_event");
+        assert_eq!(attached["replies"][0]["operation_id"], "op-1");
+        assert_eq!(attached["replies"][0]["accepted"], false);
+        assert_eq!(attached["replies"][0]["original"]["agent"], "alpha");
+        assert_eq!(attached["reply_history_pruned"], true);
+        let alone = rows
+            .iter()
+            .find(|r| r["outgoing"].is_array())
+            .expect("{json}");
+        assert_eq!(alone["outgoing"][0]["operation_id"], "op-0");
+        assert_eq!(alone["outgoing"][0]["original"]["seq"], 3);
     }
 
     #[test]
@@ -2819,6 +2915,8 @@ mod tests {
             subject: "[split] wrap up".into(),
         };
         let event = crate::cli::github::timeline::MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 2,
@@ -3155,6 +3253,8 @@ mod event_row_tests {
 
     fn event(backend: Backend, source: &str, kind: &str, seen_by: &[&str]) -> MergedEvent {
         MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: Vec::new(),
             recurrence: None,
             at: 150,

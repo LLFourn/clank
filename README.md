@@ -802,8 +802,13 @@ repository merges with its recipient's inbox copy; only recipient copies count
 as pending work or ack targets. External replies carry the `→` sent mark
 locally, even if that repository is unavailable, without fetching it or
 claiming the recipient woke or acknowledged.
-A reply a command backend accepted appears as sent under the event's source, with
-no recipient: the handler's exit is all clank knows of it.
+A reply to a command backend is part of the event it answers, not a timeline
+entry of its own. The event's row is marked `↩N`, where N counts the replies its
+logs retain, followed by `+` when older accepted ones were pruned and by how many
+are still pending. Its page lists each reply: its agent, when, pending or
+accepted, its operation, and its full text. Once the event itself has aged out
+of the log, an accepted reply stays visible as one entry, "↩ reply to an earlier
+<source> event", with the source's icon.
 In the TUI, open the reply to read its full body, endpoint, operation ID and
 original-message link. `clank log --json` preserves those fields as structured
 data. Pending reply intents remain visible in event detail and are not shown as

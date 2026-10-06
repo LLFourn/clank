@@ -223,6 +223,8 @@ mod tests {
 
     fn event(members: Vec<MemberKey>, outgoing: Vec<MemberKey>) -> MergedEvent {
         MergedEvent {
+            replies: Vec::new(),
+            reply_history_pruned: false,
             outgoing: outgoing
                 .into_iter()
                 .map(|original| OutgoingReply {
