@@ -124,7 +124,7 @@ fn panel_row_list(
         snap.stash.len(),
         snap.queue.len(),
         !snap.drafts.is_empty(),
-        snap.sources.len(),
+        input::source_groups(&snap.sources).len(),
     )
 }
 
@@ -366,6 +366,72 @@ fn selected_draft(mode: Mode, snapshot: &StatusSnapshot) -> Option<std::path::Pa
     match mode {
         Mode::DraftsList { sel } => snapshot.drafts.get(sel).map(|d| d.path.clone()),
         _ => None,
+    }
+}
+
+/// The member under a source row's member list cursor, by its owner and
+/// log, for the cursor to follow across a refresh.
+fn selected_member(
+    mode: Mode,
+    group: Option<&input::GroupRef>,
+    snapshot: &StatusSnapshot,
+) -> Option<input::SourceRef> {
+    match (mode, group) {
+        (Mode::SourceMembers { sel }, Some(group)) => group
+            .members(&snapshot.sources)
+            .get(sel)
+            .map(|s| input::SourceRef::of(s)),
+        _ => None,
+    }
+}
+
+/// What Enter on the panel's source row `row` opens: a source only one
+/// agent configures opens its page; one several do lists them. Each is
+/// `(source_page, source_group, mode)`.
+fn open_source_row(
+    row: usize,
+    sources: &[crate::cli::source_status::ConfiguredSource],
+) -> Option<(Option<input::SourceRef>, Option<input::GroupRef>, Mode)> {
+    let group = input::source_groups(sources).get(row)?.clone();
+    Some(match group.members(sources)[..] {
+        [only] => (
+            Some(input::SourceRef::of(only)),
+            None,
+            Mode::SourcePage { sel: 0, lift: 0 },
+        ),
+        _ => (None, Some(group), Mode::SourceMembers { sel: 0 }),
+    })
+}
+
+/// Where a source's Back lands: its member list when it was opened from
+/// one, else the panel on its row.
+fn source_back(
+    source: &crate::cli::source_status::ConfiguredSource,
+    group: Option<&input::GroupRef>,
+    snapshot: &StatusSnapshot,
+    cols: usize,
+) -> Mode {
+    match group {
+        Some(group) => Mode::SourceMembers {
+            sel: group
+                .members(&snapshot.sources)
+                .iter()
+                .position(|s| *s == source)
+                .unwrap_or(0),
+        },
+        None => source_row_in_panel(&input::GroupRef::of(source), snapshot, cols),
+    }
+}
+
+/// The panel, its cursor on `group`'s row.
+fn source_row_in_panel(group: &input::GroupRef, snapshot: &StatusSnapshot, cols: usize) -> Mode {
+    let rows = panel_row_list(snapshot, cols);
+    Mode::AgentPanel {
+        sel: input::source_groups(&snapshot.sources)
+            .iter()
+            .position(|g| g == group)
+            .map(|i| row_position(&rows, input::PanelRow::Source(i)))
+            .unwrap_or_else(|| input::add_row_index(&rows)),
     }
 }
 
@@ -3163,6 +3229,7 @@ pub(crate) async fn run_tui(
     // event page returns to when opened from it, and the configuration
     // a restart confirm was shown, which the monitor checks it still runs.
     let mut source_page: Option<input::SourceRef> = None;
+    let mut source_group: Option<input::GroupRef> = None;
     let mut event_beneath: Option<Mode> = None;
     let mut restart_accepted: Option<String> = None;
     // The open commit page, and the one a plan page opened from it
@@ -3451,6 +3518,7 @@ pub(crate) async fn run_tui(
         };
         let view = PanelView {
             source_page: source_page.as_ref(),
+            source_group: source_group.as_ref(),
             wait_page: wait_page.as_ref(),
             wait_process: wait_process.slot.as_ref(),
             wait_scroll,
@@ -3807,18 +3875,13 @@ pub(crate) async fn run_tui(
                             match input::source_nav(sel, &rows_of, k) {
                                 SourceNav::Quit => break 'evloop,
                                 SourceNav::Back => {
-                                    let row = snapshot.sources.iter().position(|s| s == source);
+                                    mode = source_back(
+                                        source,
+                                        source_group.as_ref(),
+                                        &snapshot,
+                                        cols as usize,
+                                    );
                                     source_page = None;
-                                    mode = Mode::AgentPanel {
-                                        sel: row
-                                            .map(|i| {
-                                                row_position(
-                                                    &panel_row_list(&snapshot, cols as usize),
-                                                    input::PanelRow::Source(i),
-                                                )
-                                            })
-                                            .unwrap_or(0),
-                                    };
                                 }
                                 nav @ (SourceNav::Sel(_) | SourceNav::Lift(_)) => {
                                     if let Some((sel, lift)) = input::source_moved(sel, lift, nav) {
@@ -3854,15 +3917,37 @@ pub(crate) async fn run_tui(
                             }
                             continue;
                         }
+                        Mode::SourceMembers { sel } => {
+                            use crate::cli::status_tui::input::ListNav;
+                            let Some(group) = source_group.clone() else {
+                                mode = Mode::LogScroll;
+                                continue;
+                            };
+                            let members = group.members(&snapshot.sources);
+                            match input::list_nav(sel, members.len(), k) {
+                                ListNav::Quit => break 'evloop,
+                                ListNav::Back => {
+                                    mode = source_row_in_panel(&group, &snapshot, cols as usize);
+                                    source_group = None;
+                                }
+                                ListNav::Sel(x) => mode = Mode::SourceMembers { sel: x },
+                                ListNav::Open(i) => {
+                                    source_page = members.get(i).map(|s| input::SourceRef::of(s));
+                                    mode = Mode::SourcePage { sel: 0, lift: 0 };
+                                }
+                                ListNav::None => {}
+                            }
+                            continue;
+                        }
                         Mode::DraftsList { sel } => {
-                            use crate::cli::status_tui::input::DraftsNav;
-                            match crate::cli::status_tui::input::drafts_nav(
+                            use crate::cli::status_tui::input::ListNav;
+                            match crate::cli::status_tui::input::list_nav(
                                 sel,
                                 snapshot.drafts.len(),
                                 k,
                             ) {
-                                DraftsNav::Quit => break 'evloop,
-                                DraftsNav::Back => {
+                                ListNav::Quit => break 'evloop,
+                                ListNav::Back => {
                                     mode = Mode::AgentPanel {
                                         sel: row_position(
                                             &panel_row_list(&snapshot, cols as usize),
@@ -3870,14 +3955,14 @@ pub(crate) async fn run_tui(
                                         ),
                                     };
                                 }
-                                DraftsNav::Sel(x) => mode = Mode::DraftsList { sel: x },
-                                DraftsNav::Open(i) => {
+                                ListNav::Sel(x) => mode = Mode::DraftsList { sel: x },
+                                ListNav::Open(i) => {
                                     if let Some(draft) = snapshot.drafts.get(i) {
                                         plan_page = Some(draft_page(draft, i));
                                         mode = Mode::PlanDetail { sel: 0 };
                                     }
                                 }
-                                DraftsNav::None => {}
+                                ListNav::None => {}
                             }
                             continue;
                         }
@@ -4178,9 +4263,12 @@ pub(crate) async fn run_tui(
                                 }
                                 PanelAction::OpenDrafts => mode = Mode::DraftsList { sel: 0 },
                                 PanelAction::OpenSource(i) => {
-                                    if let Some(source) = snapshot.sources.get(i) {
-                                        source_page = Some(input::SourceRef::of(source));
-                                        mode = Mode::SourcePage { sel: 0, lift: 0 };
+                                    if let Some((page, group, opened)) =
+                                        open_source_row(i, &snapshot.sources)
+                                    {
+                                        source_page = page;
+                                        source_group = group;
+                                        mode = opened;
                                     }
                                 }
                                 PanelAction::OpenStashHtml(i) => {
@@ -5111,6 +5199,7 @@ pub(crate) async fn run_tui(
                 let picker_label =
                     candidate_index(mode).and_then(|i| picker.get(i).map(|c| c.label.clone()));
                 let selected_draft = selected_draft(mode, &snapshot);
+                let selected_member = selected_member(mode, source_group.as_ref(), &snapshot);
                 let selected_source = selected_source_row(mode, source_page.as_ref(), &snapshot);
                 let keep_picker = candidate_index(mode).is_some();
                 // Same identity rule for a panel cursor on a QUEUE row: a
@@ -5220,6 +5309,29 @@ pub(crate) async fn run_tui(
                             &snapshot.drafts,
                         ),
                     },
+                    Mode::SourceMembers { sel } => {
+                        let members = source_group
+                            .as_ref()
+                            .map(|g| g.members(&snapshot.sources))
+                            .unwrap_or_default();
+                        if members.is_empty() {
+                            source_group = None;
+                            Mode::AgentPanel {
+                                sel: input::add_row_index(&panel_row_list(
+                                    &snapshot,
+                                    cols as usize,
+                                )),
+                            }
+                        } else {
+                            Mode::SourceMembers {
+                                sel: input::rebind_member_sel(
+                                    sel,
+                                    selected_member.as_ref(),
+                                    &members,
+                                ),
+                            }
+                        }
+                    }
                     // The candidate is re-located by label the way the
                     // picker's is; a list that changed under the step
                     // must not add a DIFFERENT agent.
@@ -5455,6 +5567,7 @@ pub(crate) async fn run_tui(
                             },
                             None => {
                                 source_page = None;
+                                source_group = None;
                                 Mode::AgentPanel {
                                     sel: input::add_row_index(&panel_row_list(
                                         &snapshot,
@@ -8723,6 +8836,7 @@ pub(crate) mod tests {
     fn log_frame(mode: Mode) -> PanelView<'static> {
         PanelView {
             source_page: None,
+            source_group: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -9115,6 +9229,80 @@ pub(crate) mod tests {
         };
         assert_eq!(&opened, sha);
         assert!(shows(&screen, subject));
+    }
+
+    fn command_source(agent: &str, name: &str) -> crate::cli::source_status::ConfiguredSource {
+        crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse(agent).unwrap(),
+            &clank_core::agent_config::WaitEventSource::Command(
+                clank_core::agent_config::CommandSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: name.into(),
+                    command: vec!["true".into()],
+                    reply_command: None,
+                    receipt_command: None,
+                    glyph: None,
+                },
+            ),
+        )
+    }
+
+    /// Enter on a source only one agent configures opens its page; on one
+    /// several do, their list, whose Back returns to the panel's row and
+    /// whose pages' Back returns to the list, on the agent left.
+    #[test]
+    fn a_source_row_opens_its_page_or_its_agents() {
+        let mut s = two_agent_snap();
+        s.sources = vec![
+            command_source("alpha", "signal"),
+            command_source("alpha", "voice"),
+            command_source("beta", "voice"),
+        ];
+        let Some((Some(page), None, Mode::SourcePage { .. })) = open_source_row(0, &s.sources)
+        else {
+            panic!("one agent: its page");
+        };
+        assert_eq!(page, input::SourceRef::of(&s.sources[0]));
+        let Some((None, Some(group), Mode::SourceMembers { sel: 0 })) =
+            open_source_row(1, &s.sources)
+        else {
+            panic!("several: their list");
+        };
+        assert_eq!(group.members(&s.sources).len(), 2);
+        assert_eq!(
+            source_back(&s.sources[2], Some(&group), &s, 80),
+            Mode::SourceMembers { sel: 1 }
+        );
+        let rows = panel_row_list(&s, 80);
+        assert_eq!(
+            source_row_in_panel(&group, &s, 80),
+            Mode::AgentPanel {
+                sel: row_position(&rows, input::PanelRow::Source(1))
+            }
+        );
+        assert_eq!(
+            source_back(&s.sources[0], None, &s, 80),
+            Mode::AgentPanel {
+                sel: row_position(&rows, input::PanelRow::Source(0))
+            }
+        );
+    }
+
+    /// The agent list's cursor follows its agent through a refresh that
+    /// adds one above it.
+    #[test]
+    fn the_source_agent_list_keeps_its_agent_across_a_refresh() {
+        let mut s = two_agent_snap();
+        s.sources = vec![
+            command_source("beta", "voice"),
+            command_source("gamma", "voice"),
+        ];
+        let group = input::GroupRef::of(&s.sources[0]);
+        let held = selected_member(Mode::SourceMembers { sel: 1 }, Some(&group), &s);
+        s.sources.insert(0, command_source("alpha", "voice"));
+        let members = group.members(&s.sources);
+        assert_eq!(input::rebind_member_sel(1, held.as_ref(), &members), 2);
     }
 
     /// The page's facts come from the source it opened on, never the

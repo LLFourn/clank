@@ -215,6 +215,11 @@ pub(super) fn render_at(
             cols as usize,
         );
     }
+    if let Mode::SourceMembers { sel } = mode
+        && let Some(group) = view.source_group
+    {
+        return render_source_members(snap, group, sel, rows, cols);
+    }
     if let Mode::DraftsList { sel } = mode {
         return render_drafts_list(snap, sel, rows, cols);
     }
@@ -673,7 +678,7 @@ pub(super) fn scrollable_header(
         snap.stash.len(),
         snap.queue.len(),
         !snap.drafts.is_empty(),
-        snap.sources.len(),
+        super::input::source_groups(&snap.sources).len(),
     );
     let at = |row: PanelRow| panel.iter().position(|r| *r == row);
     if !snap.agents.is_empty() {
@@ -849,8 +854,8 @@ pub(super) fn scrollable_header(
             cols,
         ));
     }
-    // The configured event sources, one row each with the icon their
-    // events carry and what the monitor says each is doing.
+    // The configured event sources, one row per source with the icon its
+    // events carry, the agents configuring it, and what they are doing.
     if !snap.agents.is_empty() && !snap.sources.is_empty() {
         head_out.push(region_rule(
             "sources",
@@ -858,12 +863,17 @@ pub(super) fn scrollable_header(
             mode.agents_focused(),
             cols,
         ));
-        for (i, source) in snap.sources.iter().enumerate() {
+        for (i, group) in super::input::source_groups(&snap.sources)
+            .iter()
+            .enumerate()
+        {
+            let members = group.members(&snap.sources);
+            let agents: Vec<String> = members.iter().map(|s| format!("@{}", s.agent)).collect();
             head_out.push(row_line(
                 &[
-                    plain(format!("  {} {}", source.glyph, source.name)),
-                    dim(format!("  @{}", source.agent)),
-                    dim(format!("  {}", source_state(source, &snap.sources_live))),
+                    plain(format!("  {} {}", members[0].glyph, group.name)),
+                    dim(format!("  {}", agents.join(","))),
+                    dim(format!("  {}", group_state(&members, &snap.sources_live))),
                 ],
                 mode.selected() == at(PanelRow::Source(i)),
                 color,
@@ -873,6 +883,92 @@ pub(super) fn scrollable_header(
     }
 
     head_out
+}
+
+/// What a source row's agents are doing: the one agent's state in full,
+/// or how many of several are in each.
+pub(super) fn group_state(
+    members: &[&crate::cli::source_status::ConfiguredSource],
+    live: &crate::cli::source_status::Live,
+) -> String {
+    if let [only] = members {
+        return source_state(only, live);
+    }
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for source in members {
+        let word = source_word(source, live);
+        match counts.iter_mut().find(|(w, _)| *w == word) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((word, 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(word, n)| format!("{n} {word}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// [`source_state`] in a word, for counting.
+fn source_word(
+    source: &crate::cli::source_status::ConfiguredSource,
+    live: &crate::cli::source_status::Live,
+) -> &'static str {
+    use crate::cli::event_source::Lifecycle;
+    use crate::cli::source_status::Live;
+    let Live::Monitor(..) = live else {
+        return "monitor not running";
+    };
+    match live.of(source).map(|h| &h.lifecycle) {
+        None => "not hosted",
+        Some(None) => "hosted",
+        Some(Some(Lifecycle::Running { .. })) => "running",
+        Some(Some(Lifecycle::Following)) => "held elsewhere",
+        Some(Some(Lifecycle::Settling { .. })) => "settling",
+        Some(Some(Lifecycle::Stopped { .. })) => "stopped",
+        Some(Some(Lifecycle::BackingOff { .. })) => "restarting",
+    }
+}
+
+/// The agents configuring one source row's source, each with what its
+/// own copy is doing. Enter opens that copy's page.
+pub(super) fn render_source_members(
+    snap: &StatusSnapshot,
+    group: &super::input::GroupRef,
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let color = state_color(snap).sgr();
+    let members = group.members(&snap.sources);
+    let glyph = members.first().map(|s| s.glyph.as_str()).unwrap_or("");
+    let mut out = vec![
+        region_rule("source", &format!("{glyph} {}", group.name), true, cols),
+        String::new(),
+    ];
+    let room = rows.saturating_sub(out.len() + 1).max(1);
+    let first = sel.saturating_sub(room - 1);
+    for (i, source) in members.iter().enumerate().skip(first).take(room) {
+        out.push(row_line(
+            &[
+                plain(format!("  @{}", source.agent)),
+                dim(format!("  {}", source_state(source, &snap.sources_live))),
+            ],
+            i == sel,
+            &color,
+            cols,
+        ));
+    }
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ choose · ⏎ open · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
 }
 
 /// What the monitor says `source` is doing, in a few words. Without a
@@ -886,7 +982,7 @@ pub(super) fn source_state(
     use crate::cli::source_status::Live;
     let hosted = match live {
         Live::Unavailable => return "monitor not running".to_string(),
-        Live::Monitor(_) => match live.of(source) {
+        Live::Monitor(..) => match live.of(source) {
             Some(hosted) => hosted,
             None => return "not hosted".to_string(),
         },
@@ -895,7 +991,10 @@ pub(super) fn source_state(
     let state = match (&hosted.lifecycle, source.backend) {
         (None, Backend::Command) => "starting".to_string(),
         (None, _) => "hosted".to_string(),
-        (Some(Lifecycle::Following), _) => "following another host's log".to_string(),
+        (Some(Lifecycle::Following), _) => match live.producer(source) {
+            Some(pid) => format!("held elsewhere · producer pid {pid}"),
+            None => "held elsewhere · producer unknown".to_string(),
+        },
         (Some(Lifecycle::Settling { why }), _) => format!("settling: {why}"),
         (Some(Lifecycle::Stopped { why }), _) => format!("stopped: {why}"),
         (Some(Lifecycle::Running { pid, since }), _) => format!(
@@ -930,12 +1029,16 @@ pub(super) fn source_state(
 }
 
 /// Whether a source page offers Restart: a command source the running
-/// monitor hosts.
+/// monitor hosts and runs itself. A followed source's producer belongs
+/// to whoever holds its lease, which a restart here would not reach.
 pub(super) fn restartable(
     source: &crate::cli::source_status::ConfiguredSource,
     live: &crate::cli::source_status::Live,
 ) -> bool {
-    source.backend == crate::cli::github::timeline::Backend::Command && live.of(source).is_some()
+    source.backend == crate::cli::github::timeline::Backend::Command
+        && live
+            .of(source)
+            .is_some_and(|h| h.lifecycle != Some(crate::cli::event_source::Lifecycle::Following))
 }
 
 /// The positions of `source`'s events in `events`, newest first.
@@ -5731,6 +5834,7 @@ mod tests {
                         };
                         let view = PanelView {
                             source_page: None,
+                            source_group: None,
                             mode,
                             plan_page: None,
                             commit_page: None,
@@ -5780,6 +5884,7 @@ mod tests {
     fn lift_view(cursor: usize, lift: usize) -> PanelView<'static> {
         PanelView {
             source_page: None,
+            source_group: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -5988,6 +6093,7 @@ mod tests {
         // first header row, no pressure lift ever engages.
         let unfocused = PanelView {
             source_page: None,
+            source_group: None,
             mode: Mode::AgentPanel { sel: 0 },
             ..lift_view(0, 0)
         };
@@ -6010,6 +6116,7 @@ mod tests {
         s.log_rows = (0..12).map(|i| commit_row(&format!("c{i}"))).collect();
         let view = PanelView {
             source_page: None,
+            source_group: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -7714,6 +7821,7 @@ mod tests {
             0,
             &PanelView {
                 source_page: None,
+                source_group: None,
                 plan_page: None,
                 commit_page: None,
                 event_page: None,
@@ -7770,6 +7878,7 @@ mod tests {
         ];
         let view = PanelView {
             source_page: None,
+            source_group: None,
             plan_page: None,
             commit_page: None,
             event_page: None,
@@ -7876,6 +7985,7 @@ mod tests {
             0,
             &PanelView {
                 source_page: None,
+                source_group: None,
                 plan_page: None,
                 commit_page: None,
                 event_page: None,
@@ -8238,16 +8348,19 @@ mod tests {
         accepted: String,
         lifecycle: Option<crate::cli::event_source::Lifecycle>,
     ) -> crate::cli::source_status::Live {
-        crate::cli::source_status::Live::Monitor(crate::cli::source_status::Account {
-            monitor: 1,
-            birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
-            sources: vec![crate::cli::source_status::Hosted {
-                agent: source.agent.to_string(),
-                key: source.key.clone(),
-                accepted,
-                lifecycle,
-            }],
-        })
+        crate::cli::source_status::Live::Monitor(
+            crate::cli::source_status::Account {
+                monitor: 1,
+                birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+                sources: vec![crate::cli::source_status::Hosted {
+                    agent: source.agent.to_string(),
+                    key: source.key.clone(),
+                    accepted,
+                    lifecycle,
+                }],
+            },
+            Default::default(),
+        )
     }
 
     /// A source's state says what the monitor reports, and says so when
@@ -8290,6 +8403,167 @@ mod tests {
             source_state(&s, &rejected).ends_with("an edit was rejected; runs the earlier config")
         );
         assert!(restartable(&s, &running) && !restartable(&s, &Live::Unavailable));
+    }
+
+    fn source_of(agent: &str, name: &str) -> crate::cli::source_status::ConfiguredSource {
+        crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse(agent).unwrap(),
+            &clank_core::agent_config::WaitEventSource::Command(
+                clank_core::agent_config::CommandSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: name.into(),
+                    command: vec!["producer".into()],
+                    reply_command: None,
+                    receipt_command: None,
+                    glyph: Some("🎙".into()),
+                },
+            ),
+        )
+    }
+
+    /// The monitor's account of `hosted`, with `producers` proven for the
+    /// sources it only follows.
+    fn hosting(
+        hosted: &[(
+            &crate::cli::source_status::ConfiguredSource,
+            crate::cli::event_source::Lifecycle,
+        )],
+        producers: &[(&crate::cli::source_status::ConfiguredSource, i32)],
+    ) -> crate::cli::source_status::Live {
+        crate::cli::source_status::Live::Monitor(
+            crate::cli::source_status::Account {
+                monitor: 1,
+                birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+                sources: hosted
+                    .iter()
+                    .map(|(s, lifecycle)| crate::cli::source_status::Hosted {
+                        agent: s.agent.to_string(),
+                        key: s.key.clone(),
+                        accepted: crate::cli::source_status::fingerprint(&s.config),
+                        lifecycle: Some(lifecycle.clone()),
+                    })
+                    .collect(),
+            },
+            producers
+                .iter()
+                .map(|(s, pid)| ((s.agent.to_string(), s.key.clone()), *pid))
+                .collect(),
+        )
+    }
+
+    /// A source another host runs says which process produces it when
+    /// its record proves one, and that nobody knows when it cannot; its
+    /// page offers no restart, which would reach only the follower.
+    #[test]
+    fn a_followed_source_names_its_producer_and_cannot_be_restarted() {
+        use crate::cli::event_source::Lifecycle;
+        let s = source_of("claude", "voice");
+        let proven = hosting(&[(&s, Lifecycle::Following)], &[(&s, 53272)]);
+        assert_eq!(
+            source_state(&s, &proven),
+            "held elsewhere · producer pid 53272"
+        );
+        let unproven = hosting(&[(&s, Lifecycle::Following)], &[]);
+        assert_eq!(
+            source_state(&s, &unproven),
+            "held elsewhere · producer unknown"
+        );
+        assert!(!restartable(&s, &proven));
+        let ran = hosting(&[(&s, Lifecycle::Running { pid: 9, since: 0 })], &[]);
+        assert!(restartable(&s, &ran));
+    }
+
+    /// Agents configuring one source share one panel row naming them all,
+    /// with how many are in each state; its page lists each agent's own.
+    #[test]
+    fn a_source_several_agents_configure_is_one_row_listing_them() {
+        use crate::cli::event_source::Lifecycle;
+        let mut s = two_agent_snap();
+        let voice: Vec<_> = ["assistent", "claude", "codex"]
+            .iter()
+            .map(|a| source_of(a, "voice"))
+            .collect();
+        let signal = source_of("assistent", "signal");
+        s.sources = vec![
+            signal.clone(),
+            voice[0].clone(),
+            voice[1].clone(),
+            voice[2].clone(),
+        ];
+        s.sources_live = hosting(
+            &[
+                (
+                    &voice[0],
+                    Lifecycle::Running {
+                        pid: 47171,
+                        since: 0,
+                    },
+                ),
+                (&voice[1], Lifecycle::Following),
+                (&voice[2], Lifecycle::Following),
+                (
+                    &signal,
+                    Lifecycle::Running {
+                        pid: 47170,
+                        since: 0,
+                    },
+                ),
+            ],
+            &[(&voice[1], 53272)],
+        );
+        let texts: Vec<String> = render_at(
+            &s,
+            40,
+            120,
+            0,
+            0,
+            &PanelView::just(Mode::AgentPanel { sel: 0 }),
+        )
+        .0
+        .iter()
+        .map(|l| visible(l))
+        .collect();
+        let rows: Vec<&String> = texts.iter().filter(|t| t.contains("🎙")).collect();
+        assert_eq!(rows.len(), 2, "{texts:#?}");
+        assert!(
+            rows[0].contains("signal  @assistent  running · pid 47170"),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("voice  @assistent,@claude,@codex  1 running · 2 held elsewhere"),
+            "{}",
+            rows[1]
+        );
+        let group = super::super::input::GroupRef::of(&voice[0]);
+        let page: Vec<String> = render_at(
+            &s,
+            20,
+            120,
+            0,
+            0,
+            &PanelView {
+                source_group: Some(&group),
+                ..PanelView::just(Mode::SourceMembers { sel: 1 })
+            },
+        )
+        .0
+        .iter()
+        .map(|l| visible(l))
+        .collect();
+        let line = |agent: &str| {
+            page.iter()
+                .find(|l| l.contains(agent))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(
+            line("@assistent").contains("running · pid 47171"),
+            "{page:#?}"
+        );
+        assert!(line("@claude").contains("producer pid 53272"), "{page:#?}");
+        assert!(line("@codex").contains("producer unknown"), "{page:#?}");
     }
 
     /// The sources sit in the panel with their icon and state, and a
@@ -8812,6 +9086,7 @@ mod tests {
         // two_agent_snap has no ask/in-progress rows).
         let view = PanelView {
             source_page: None,
+            source_group: None,
             plan_page: None,
             commit_page: None,
             event_page: None,

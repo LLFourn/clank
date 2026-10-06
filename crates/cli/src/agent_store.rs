@@ -292,6 +292,17 @@ pub fn role_from_registered_set(
         .map(|m| m.role.resolved())
 }
 
+/// Every agent this repo's roster names, the master first. Empty when
+/// no roster resolves.
+pub fn roster_labels(repo: &Path) -> Vec<AgentLabel> {
+    let Ok(Some(set)) = try_resolve_via_team(repo) else {
+        return Vec::new();
+    };
+    let mut out = vec![set.master.clone()];
+    out.extend(set.members.iter().map(|m| m.label.clone()));
+    out
+}
+
 pub fn try_resolve_via_team(
     repo: &Path,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {

@@ -1528,6 +1528,22 @@ pub(crate) fn leader_of(record: &Producer) -> Leader {
     }
 }
 
+/// The group producing for the source whose record is in `store_dir`:
+/// the recorded anchor, while this system says it is still the process
+/// recorded. Only reads: it takes no lease and retires nothing. A legacy
+/// record names its process by a rendering nobody can check, so it
+/// proves nothing here.
+pub(crate) fn verified_producer(store_dir: &std::path::Path, key: &str) -> Option<i32> {
+    let body = std::fs::read(producer_path(store_dir, key)).ok()?;
+    match serde_json::from_slice::<Producer>(&body).ok()? {
+        Producer::Anchored { pgid, birth } => {
+            let seen = crate::proc_identity::inspect::inspect(pgid, &birth);
+            (anchored_leader(pgid, seen) == Leader::Same).then_some(pgid)
+        }
+        Producer::Legacy { .. } => None,
+    }
+}
+
 /// Where a source records its producer, beside that source's log.
 pub(crate) fn producer_path(store_dir: &std::path::Path, key: &str) -> std::path::PathBuf {
     store_dir.join(format!("{key}.producer"))

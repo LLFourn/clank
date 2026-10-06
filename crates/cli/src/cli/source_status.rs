@@ -61,23 +61,27 @@ impl ConfiguredSource {
     }
 }
 
-/// Every source the repo's agents configure, by agent and then name.
-/// Messages are always on and need no configuration, so they are not
-/// sources here.
+/// Every external source the roster's agents configure, by name and
+/// then agent. Messages are always on and timers are an agent's own
+/// reminders, so neither is a source here; nor is a config an agent
+/// off the roster left on disk.
 pub(crate) fn configured(repo: &std::path::Path) -> Vec<ConfiguredSource> {
-    let Ok(agents) = crate::agent_store::load_all_agent_configs(repo) else {
-        return Vec::new();
-    };
-    let mut sources: Vec<ConfiguredSource> = agents
+    let mut sources: Vec<ConfiguredSource> = crate::agent_store::roster_labels(repo)
         .iter()
+        .filter_map(|label| {
+            let cfg = crate::agent_store::load_agent_config(repo, label).ok()??;
+            Some((label, cfg))
+        })
         .flat_map(|(label, cfg)| {
             cfg.wait_events
                 .iter()
-                .map(move |s| ConfiguredSource::of(label, s))
+                .filter(|s| !matches!(s, WaitEventSource::Timer(_)))
+                .map(|s| ConfiguredSource::of(label, s))
+                .collect::<Vec<_>>()
         })
         .collect();
     sources.sort_by(|a, b| {
-        (a.agent.as_str(), &a.name, &a.key).cmp(&(b.agent.as_str(), &b.name, &b.key))
+        (&a.name, a.agent.as_str(), &a.key).cmp(&(&b.name, b.agent.as_str(), &b.key))
     });
     sources
 }
@@ -134,8 +138,10 @@ pub(crate) fn publish(repo: &std::path::Path, account: &Account) -> std::io::Res
 /// What is known of the sources' live state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Live {
-    /// The running monitor's own account.
-    Monitor(Account),
+    /// The running monitor's own account, and for each source it only
+    /// follows, the producer group its record proves is running, by
+    /// (agent, key).
+    Monitor(Account, Producers),
     /// No monitor runs for this repo, or the account is not the running
     /// one's: nothing is known, which is not the same as stopped.
     Unavailable,
@@ -151,6 +157,9 @@ pub(crate) fn live(repo: &std::path::Path) -> Live {
     )
 }
 
+/// Verified producers of followed sources, by (agent, key).
+pub(crate) type Producers = std::collections::BTreeMap<(String, String), i32>;
+
 fn live_in(namespace: &std::path::Path, repo: &std::path::Path) -> Live {
     let crate::cli::monitor::Published::Ours(descriptor) =
         crate::cli::monitor::published_in(namespace, repo, unsafe { libc::getuid() })
@@ -164,17 +173,48 @@ fn live_in(namespace: &std::path::Path, repo: &std::path::Path) -> Live {
         Ok(account)
             if account.monitor == descriptor.pid && account.birth.still_holds(account.monitor) =>
         {
-            Live::Monitor(account)
+            let producers = followed_producers(repo, &account);
+            Live::Monitor(account, producers)
         }
         _ => Live::Unavailable,
     }
 }
 
+/// Another host holds a followed source's lease, so its producer is
+/// whatever that source's own record proves, in its author's events.
+fn followed_producers(repo: &std::path::Path, account: &Account) -> Producers {
+    let events = |agent: &str| {
+        crate::agent_store::agents_root(repo)
+            .join(agent)
+            .join("events")
+    };
+    account
+        .sources
+        .iter()
+        .filter(|h| h.lifecycle == Some(crate::cli::event_source::Lifecycle::Following))
+        .filter_map(|h| {
+            let pgid = crate::cli::command_source::verified_producer(&events(&h.agent), &h.key)?;
+            Some(((h.agent.clone(), h.key.clone()), pgid))
+        })
+        .collect()
+}
+
 impl Live {
+    /// The verified producer of `source`, when the monitor only follows
+    /// it.
+    pub(crate) fn producer(&self, source: &ConfiguredSource) -> Option<i32> {
+        match self {
+            Live::Monitor(_, producers) => producers
+                .get(&(source.agent.to_string(), source.key.clone()))
+                .copied(),
+            Live::Unavailable => None,
+        }
+    }
+
     /// What the monitor hosts for `source`, if it hosts it.
     pub(crate) fn of(&self, source: &ConfiguredSource) -> Option<&Hosted> {
         match self {
-            Live::Monitor(p) => p
+            Live::Monitor(p, _) => p
                 .sources
                 .iter()
                 .find(|h| h.agent == source.agent.as_str() && h.key == source.key),
@@ -342,7 +382,7 @@ mod tests {
         write(&account(ours));
         assert_eq!(
             live_in(&namespace, repo.path()),
-            Live::Monitor(account(ours))
+            Live::Monitor(account(ours), Default::default())
         );
         write(&account(ours + 1));
         assert_eq!(
@@ -360,14 +400,40 @@ mod tests {
         );
     }
 
-    /// Every configured kind is listed with its timeline icon, by agent
-    /// and then name; an unreadable roster lists nothing.
+    fn timer(name: &str) -> WaitEventSource {
+        WaitEventSource::Timer(clank_core::agent_config::TimerSource {
+            interrupt: false,
+            interrupt_message: None,
+            name: name.into(),
+            repeat_every: None,
+            due_at: "2026-10-13T00:00:00Z".into(),
+            content: Some("follow up".into()),
+        })
+    }
+
+    /// The roster's external sources, by name and then agent. A timer is
+    /// an agent's own reminder and an agent off the roster runs nothing,
+    /// so neither is listed; with no roster nothing is.
     #[test]
-    fn configured_sources_are_listed_by_agent_then_name() {
+    fn configured_sources_are_the_rosters_external_ones() {
         let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"codex":{"tool":"codex","role":"commit"}}}"#,
+        )
+        .unwrap();
         for (agent, sources) in [
-            ("beta", vec![command("zeta")]),
-            ("alpha", vec![command("questions"), command("answers")]),
+            (
+                "codex",
+                vec![
+                    command("questions"),
+                    command("answers"),
+                    timer("rama-follow-up"),
+                ],
+            ),
+            ("claude", vec![command("questions")]),
+            ("grok", vec![command("voice")]),
         ] {
             crate::agent_store::update_agent_config(
                 repo.path(),
@@ -378,16 +444,97 @@ mod tests {
         }
         let listed: Vec<(String, String)> = configured(repo.path())
             .into_iter()
-            .map(|s| (s.agent.to_string(), s.name))
+            .map(|s| (s.name, s.agent.to_string()))
             .collect();
         assert_eq!(
             listed,
             [
-                ("alpha".to_string(), "answers".to_string()),
-                ("alpha".into(), "questions".into()),
-                ("beta".into(), "zeta".into()),
+                ("answers".to_string(), "codex".to_string()),
+                ("questions".into(), "claude".into()),
+                ("questions".into(), "codex".into()),
             ]
         );
         assert!(configured(&repo.path().join("missing")).is_empty());
+    }
+
+    /// A source the monitor only follows is produced by whatever its own
+    /// record proves is still running, and by nothing a record cannot
+    /// prove: a stale birth, a legacy rendering, no record, a group that
+    /// has ended. A source the monitor runs needs no record read.
+    #[test]
+    fn a_followed_sources_producer_is_what_its_record_proves() {
+        use crate::cli::command_source::{Producer, record_producer};
+        use crate::cli::event_source::Lifecycle;
+        use std::os::unix::process::CommandExt;
+        let repo = tempfile::tempdir().unwrap();
+        let events = |agent: &str| {
+            let dir = crate::agent_store::agents_root(repo.path())
+                .join(agent)
+                .join("events");
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        let birth = crate::proc_identity::token_for(pgid).unwrap();
+        let hosted = |agent: &str, key: &str, lifecycle| Hosted {
+            agent: agent.into(),
+            key: key.into(),
+            accepted: "f".into(),
+            lifecycle: Some(lifecycle),
+        };
+        let anchored = |birth| Producer::Anchored { pgid, birth };
+        record_producer(&events("alpha"), "live", &anchored(birth.clone())).unwrap();
+        record_producer(&events("alpha"), "ran", &anchored(birth.clone())).unwrap();
+        record_producer(
+            &events("alpha"),
+            "stale",
+            &anchored(crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 }),
+        )
+        .unwrap();
+        record_producer(
+            &events("alpha"),
+            "legacy",
+            &Producer::Legacy {
+                pgid,
+                started: "Thu 1 Oct 16:58:08 2026".into(),
+            },
+        )
+        .unwrap();
+        record_producer(&events("beta"), "absent", &anchored(birth)).unwrap();
+        let account = Account {
+            monitor: 1,
+            birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+            sources: vec![
+                hosted("alpha", "live", Lifecycle::Following),
+                hosted(
+                    "alpha",
+                    "ran",
+                    Lifecycle::Running {
+                        pid: pgid as u32,
+                        since: 1,
+                    },
+                ),
+                hosted("alpha", "stale", Lifecycle::Following),
+                hosted("alpha", "legacy", Lifecycle::Following),
+                hosted("alpha", "absent", Lifecycle::Following),
+            ],
+        };
+        let found = followed_producers(repo.path(), &account);
+        assert_eq!(
+            found.into_iter().collect::<Vec<_>>(),
+            [(("alpha".to_string(), "live".to_string()), pgid)],
+            "alpha's absent record is not beta's"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            followed_producers(repo.path(), &account).is_empty(),
+            "ended"
+        );
     }
 }

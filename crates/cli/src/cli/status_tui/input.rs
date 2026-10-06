@@ -119,6 +119,8 @@ pub(super) enum Mode {
     /// The list of `.clank/drafts/`; `sel` is the cursor over it. Enter
     /// opens a draft's page, whose Back returns here.
     DraftsList { sel: usize },
+    /// The agents configuring one source row's source.
+    SourceMembers { sel: usize },
     /// An event source's page; `sel` is the cursor over its rows, and
     /// `lift` how many lines the reader has scrolled above the window that
     /// keeps that row drawn, to read the configuration. WHICH source
@@ -442,6 +444,61 @@ impl SourceRef {
     }
 }
 
+/// A source as the panel lists it: by what it is, every roster agent
+/// configuring one of that name a member of it. Each member is still
+/// its own source, with its own log, lease and producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GroupRef {
+    pub(super) backend: crate::cli::github::timeline::Backend,
+    pub(super) name: String,
+}
+
+impl GroupRef {
+    pub(super) fn of(source: &crate::cli::source_status::ConfiguredSource) -> Self {
+        Self {
+            backend: source.backend,
+            name: source.name.clone(),
+        }
+    }
+
+    pub(super) fn members<'a>(
+        &self,
+        sources: &'a [crate::cli::source_status::ConfiguredSource],
+    ) -> Vec<&'a crate::cli::source_status::ConfiguredSource> {
+        sources
+            .iter()
+            .filter(|s| GroupRef::of(s) == *self)
+            .collect()
+    }
+}
+
+/// The panel's source rows, in the order the sources are listed.
+pub(super) fn source_groups(
+    sources: &[crate::cli::source_status::ConfiguredSource],
+) -> Vec<GroupRef> {
+    let mut out: Vec<GroupRef> = Vec::new();
+    for source in sources {
+        let group = GroupRef::of(source);
+        if !out.contains(&group) {
+            out.push(group);
+        }
+    }
+    out
+}
+
+/// Where a source's member list cursor lands after a refresh: on the
+/// member it was on, wherever it moved; on the same row, or the last,
+/// only when that member is gone.
+pub(super) fn rebind_member_sel(
+    sel: usize,
+    selected: Option<&SourceRef>,
+    members: &[&crate::cli::source_status::ConfiguredSource],
+) -> usize {
+    selected
+        .and_then(|r| members.iter().position(|s| SourceRef::of(s) == *r))
+        .unwrap_or_else(|| sel.min(members.len().saturating_sub(1)))
+}
+
 /// A source page's selectable rows, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SourceRow {
@@ -549,9 +606,9 @@ pub(super) fn source_nav(sel: usize, rows: &[SourceRow], key: Key) -> SourceNav 
     }
 }
 
-/// What a key does on the drafts list.
+/// What a key does on a list page: the drafts, a source's agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DraftsNav {
+pub(super) enum ListNav {
     Sel(usize),
     Open(usize),
     Back,
@@ -572,14 +629,14 @@ pub(super) fn rebind_draft_sel(
         .unwrap_or_else(|| sel.min(drafts.len().saturating_sub(1)))
 }
 
-pub(super) fn drafts_nav(sel: usize, len: usize, key: Key) -> DraftsNav {
+pub(super) fn list_nav(sel: usize, len: usize, key: Key) -> ListNav {
     match key {
-        Key::Quit => DraftsNav::Quit,
-        Key::Escape | Key::Left | Key::Focus | Key::Char(b'a') => DraftsNav::Back,
-        Key::Up => DraftsNav::Sel(move_selection(sel, len, false)),
-        Key::Down => DraftsNav::Sel(move_selection(sel, len, true)),
-        Key::Enter | Key::Right if sel < len => DraftsNav::Open(sel),
-        _ => DraftsNav::None,
+        Key::Quit => ListNav::Quit,
+        Key::Escape | Key::Left | Key::Focus | Key::Char(b'a') => ListNav::Back,
+        Key::Up => ListNav::Sel(move_selection(sel, len, false)),
+        Key::Down => ListNav::Sel(move_selection(sel, len, true)),
+        Key::Enter | Key::Right if sel < len => ListNav::Open(sel),
+        _ => ListNav::None,
     }
 }
 
@@ -1016,8 +1073,8 @@ pub(super) enum PanelAnchor {
     Stash(String),
     Queue(String),
     Drafts,
-    /// A source, by its owner and log.
-    Source(SourceRef),
+    /// A source row, by what the source is.
+    Source(GroupRef),
 }
 
 /// What the cursor is on now, for re-locating after a refresh.
@@ -1056,9 +1113,9 @@ pub(super) fn capture_anchor(
             .unwrap_or(PanelAnchor::Add),
         Some(PanelRow::Remote) => PanelAnchor::Remote,
         Some(PanelRow::Drafts) => PanelAnchor::Drafts,
-        Some(PanelRow::Source(i)) => sources
+        Some(PanelRow::Source(i)) => source_groups(sources)
             .get(*i)
-            .map(|s| PanelAnchor::Source(SourceRef::of(s)))
+            .map(|g| PanelAnchor::Source(g.clone()))
             .unwrap_or(PanelAnchor::Add),
         _ => PanelAnchor::Add,
     }
@@ -1104,9 +1161,9 @@ pub(super) fn rebind_anchor(
             .and_then(|i| find(PanelRow::Queue(i))),
         PanelAnchor::Remote => find(PanelRow::Remote),
         PanelAnchor::Drafts => find(PanelRow::Drafts),
-        PanelAnchor::Source(source) => sources
+        PanelAnchor::Source(group) => source_groups(sources)
             .iter()
-            .position(|s| SourceRef::of(s) == *source)
+            .position(|g| g == group)
             .and_then(|i| find(PanelRow::Source(i))),
         PanelAnchor::Add => None,
     };
@@ -2271,6 +2328,8 @@ pub(super) struct PanelView<'a> {
     pub(super) plan_page: Option<&'a PlanPage>,
     /// The source a source page shows.
     pub(super) source_page: Option<&'a SourceRef>,
+    /// The source row whose agents `Mode::SourceMembers` lists.
+    pub(super) source_group: Option<&'a GroupRef>,
     pub(super) commit_page: Option<&'a CommitPage>,
     pub(super) event_page: Option<&'a EventPage>,
     pub(super) wait_page: Option<&'a WaitPage>,
@@ -2319,6 +2378,7 @@ impl<'a> PanelView<'a> {
             mode,
             plan_page: None,
             source_page: None,
+            source_group: None,
             commit_page: None,
             event_page: None,
             wait_page: None,
@@ -3075,8 +3135,9 @@ mod tests {
         );
     }
 
-    /// The panel cursor on a source stays on that source, by owner and
-    /// log, through a source added before it; a removed one gives way.
+    /// The panel cursor on a source row stays on that row, by what the
+    /// source is, through a row added before it; a removed one gives way.
+    /// Agents configuring the same source share its row.
     #[test]
     fn a_panel_source_row_keeps_its_cursor_through_a_refresh() {
         let source = |agent: &str, name: &str| {
@@ -3095,14 +3156,20 @@ mod tests {
                 ),
             )
         };
-        let before = [source("alpha", "a"), source("beta", "a")];
+        let before = [
+            source("alpha", "a"),
+            source("beta", "a"),
+            source("alpha", "z"),
+        ];
+        assert_eq!(source_groups(&before).len(), 2, "one row for a, one for z");
         let rows = panel_rows(0, &[], 0, 0, false, 2);
         let at = rows.iter().position(|r| *r == PanelRow::Source(1)).unwrap();
         let anchor = capture_anchor(at, &rows, &[], &[], &[], &before);
         let after = [
             source("alpha", "a"),
-            source("alpha", "b"),
             source("beta", "a"),
+            source("alpha", "b"),
+            source("alpha", "z"),
         ];
         let rows_after = panel_rows(0, &[], 0, 0, false, 3);
         assert_eq!(
@@ -3110,7 +3177,7 @@ mod tests {
             PanelRow::Source(2)
         );
         assert_eq!(
-            rebind_anchor(&anchor, &rows, &[], &[], &[], &before[..1]),
+            rebind_anchor(&anchor, &rows, &[], &[], &[], &before[..2]),
             add_row_index(&rows),
             "removed"
         );
@@ -3161,16 +3228,12 @@ mod tests {
             PanelAction::OpenDrafts
         );
         assert_eq!(agent_panel_action(at, &rows, Key::Space), PanelAction::None);
-        assert_eq!(drafts_nav(0, 2, Key::Down), DraftsNav::Sel(1));
-        assert_eq!(drafts_nav(1, 2, Key::Down), DraftsNav::Sel(1));
-        assert_eq!(drafts_nav(1, 2, Key::Enter), DraftsNav::Open(1));
-        assert_eq!(
-            drafts_nav(0, 0, Key::Enter),
-            DraftsNav::None,
-            "nothing to open"
-        );
-        assert_eq!(drafts_nav(0, 2, Key::Escape), DraftsNav::Back);
-        assert_eq!(drafts_nav(0, 2, Key::Quit), DraftsNav::Quit);
+        assert_eq!(list_nav(0, 2, Key::Down), ListNav::Sel(1));
+        assert_eq!(list_nav(1, 2, Key::Down), ListNav::Sel(1));
+        assert_eq!(list_nav(1, 2, Key::Enter), ListNav::Open(1));
+        assert_eq!(list_nav(0, 0, Key::Enter), ListNav::None, "nothing to open");
+        assert_eq!(list_nav(0, 2, Key::Escape), ListNav::Back);
+        assert_eq!(list_nav(0, 2, Key::Quit), ListNav::Quit);
     }
 
     /// `u` and `p` are hotkeys from any row; `p` is purge on a plan

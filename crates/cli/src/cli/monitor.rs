@@ -3388,12 +3388,7 @@ fn hostable(
 /// delivery client again, and the churn that causes is what this plan
 /// exists to end. A monitor's producers live as long as the monitor.
 fn roster_authors(repo: &std::path::Path) -> Vec<AgentLabel> {
-    let Ok(Some(set)) = crate::agent_store::try_resolve_via_team(repo) else {
-        return Vec::new();
-    };
-    let mut out = vec![set.master.clone()];
-    out.extend(set.members.iter().map(|m| m.label.clone()));
-    out
+    crate::agent_store::roster_labels(repo)
 }
 
 /// Bring hosting into line with the roster and its configs.
