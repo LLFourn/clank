@@ -233,6 +233,32 @@ pub(super) fn build_scroll<'a>(
     seq
 }
 
+/// Where a cursor that may have come to rest on a row nothing selects
+/// (a run's end rule) lands: the nearest selectable row the way it was
+/// moving, else the nearest the other way.
+pub(super) fn land(
+    cursor: usize,
+    total: usize,
+    rising: bool,
+    unselectable: impl Fn(usize) -> bool,
+) -> usize {
+    if !unselectable(cursor) {
+        return cursor;
+    }
+    let up = (0..cursor).rev();
+    let down = cursor + 1..total;
+    let found = if rising {
+        up.clone()
+            .find(|&i| !unselectable(i))
+            .or_else(|| down.clone().find(|&i| !unselectable(i)))
+    } else {
+        down.clone()
+            .find(|&i| !unselectable(i))
+            .or_else(|| up.clone().find(|&i| !unselectable(i)))
+    };
+    found.unwrap_or(cursor)
+}
+
 /// The log-side half of continuous navigation: pressing `Up` in the
 /// log returns `Some(panel_row)` when the log is FULLY AT ITS TOP —
 /// cursor on the first entry AND the viewport offset at 0 — (cross back
@@ -324,6 +350,46 @@ mod tests {
     use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap};
     use crate::cli::status_tui::render::block_ask_spans;
     use crate::cli::status_tui::text::display_width;
+
+    /// Enter across a run's end rule: the rule opens nothing, a plan
+    /// banner still opens its plan, and a review under the rule still
+    /// opens the finish it reviews.
+    #[test]
+    fn a_run_end_rule_opens_nothing_and_binds_nothing() {
+        use crate::cli::log::{OnelineRow, RowMarker};
+        let sha = crate::lifecycle::CommitSha::parse(&"f".repeat(40)).unwrap();
+        let rows = [
+            OnelineRow::RunEnd,
+            OnelineRow::Review {
+                verdict: clank_core::vocab::Verdict::Finished,
+                author: "codex".into(),
+                summary: String::new(),
+                at: None,
+            },
+            OnelineRow::Commit {
+                sha: sha.clone(),
+                at: 0,
+                subject: "finish".into(),
+                marker: RowMarker::Finish,
+                stands_for: None,
+            },
+            OnelineRow::Header {
+                plan: Some("p".into()),
+                duration_secs: None,
+                starts_here: true,
+            },
+        ];
+        let seq: Vec<Seg> = rows.iter().map(Seg::Log).collect();
+        assert!(entry_target(&seq, 0).is_none());
+        assert!(matches!(
+            entry_target(&seq, 1),
+            Some(EntryTarget::Commit { sha: s, focus: Some(f) }) if s == sha && f == "codex"
+        ));
+        assert!(matches!(
+            entry_target(&seq, 3),
+            Some(EntryTarget::Plan { .. })
+        ));
+    }
 
     #[test]
     fn log_up_target_crosses_to_panel_only_when_fully_topped() {

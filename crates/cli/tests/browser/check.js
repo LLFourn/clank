@@ -13,6 +13,22 @@ const clickUnavailableChat = async (page) => {
 
 (async () => {
   try {
+  // ---- a finished run's end rule is a textless line in the timeline
+  {
+    const { page, errors } = await open();
+    await page.evaluate((d) => window.__send('status', d), facts([agent('claude', 'master')], {
+      ledger: { plan: null, gate: null, dirty: null, stash: 0, blocks: [], queue: [], rows: [
+        { kind: 'commit', glyph: '~', sha: 'aaaaaaa', text: 'drive by', age: '1m' },
+        { kind: 'run_end', text: '' },
+        { kind: 'commit', glyph: '⚑', sha: 'bbbbbbb', text: 'finish', age: '2m' },
+      ] },
+    }));
+    const rule = page.locator('#rows .row.run_end');
+    ok('the run end draws one line with no text',
+       await rule.count() === 1 && (await rule.textContent()).trim() === '');
+    ok('no page errors (run end)', errors.length === 0, errors.join('; '));
+  }
+
   // ---- drafts collapse to one read-only row under the queue, absent at zero
   {
     const { page, errors } = await open();

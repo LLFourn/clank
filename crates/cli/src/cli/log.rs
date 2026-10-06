@@ -951,6 +951,48 @@ pub(crate) enum OnelineRow {
     /// A timeline-read notice (corrupt/foreign logs) surfaced as a
     /// dim row — the TUI's rendering of the snapshot's notices.
     Notice(String),
+    /// A textless rule above a finished run, where something other than
+    /// the next run follows it: what is above it is outside the run.
+    /// Drawn, never selected.
+    RunEnd,
+}
+
+/// The CLI's rendering of [`OnelineRow::RunEnd`].
+pub(crate) const RUN_END_RULE: &str = "────────────────────────";
+
+/// Insert a [`OnelineRow::RunEnd`] above each finished run, from row
+/// `from` on, decided by the rows as finally interleaved. A finish's own
+/// reviews sit above it and stay inside the run; a banner directly above
+/// them is the next run's and already separates the two; at the top of
+/// the rows nothing follows yet. Rerunning it adds nothing, so a joined
+/// page can be passed over again from its seam.
+pub(crate) fn mark_run_ends(rows: &mut Vec<OnelineRow>, from: usize) {
+    let mut i = from;
+    while i < rows.len() {
+        let finish = matches!(
+            rows[i],
+            OnelineRow::Commit {
+                marker: RowMarker::Finish,
+                ..
+            }
+        );
+        if finish {
+            let mut above = i;
+            while above > 0 && matches!(rows[above - 1], OnelineRow::Review { .. }) {
+                above -= 1;
+            }
+            let ends = above > 0
+                && !matches!(
+                    rows[above - 1],
+                    OnelineRow::Header { .. } | OnelineRow::RunEnd
+                );
+            if ends {
+                rows.insert(above, OnelineRow::RunEnd);
+                i += 1;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Finalize SHAs that stand for their whole plan, mapped to its name.
@@ -1013,6 +1055,7 @@ pub(crate) fn oneline_items_rows(
             }),
         }
     }
+    mark_run_ends(&mut out, 0);
     out
 }
 
@@ -1053,12 +1096,16 @@ pub(crate) fn extend_oneline_rows(rows: &mut Vec<OnelineRow>, mut older: Vec<One
             )
         }) {
             let footer = rows.pop().unwrap();
+            let seam = rows.len();
             rows.append(&mut older);
             rows.push(footer);
+            mark_run_ends(rows, seam);
             return;
         }
     }
+    let seam = rows.len();
     rows.append(&mut older);
+    mark_run_ends(rows, seam);
 }
 
 pub(crate) fn plan_footer_text(plan: Option<&str>, duration_secs: Option<u64>) -> String {
@@ -1222,6 +1269,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 )
             }
             OnelineRow::Notice(n) => format!("({n})"),
+            OnelineRow::RunEnd => RUN_END_RULE.to_string(),
             OnelineRow::PlainCommit {
                 sha, subject, refs, ..
             } => {
@@ -1272,6 +1320,13 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
     for row in rows {
         match row {
             OnelineRow::Notice(message) => println!("{message}"),
+            OnelineRow::RunEnd => {
+                if c {
+                    println!("{DIM}{RUN_END_RULE}{Z}");
+                } else {
+                    println!("{RUN_END_RULE}");
+                }
+            }
             OnelineRow::PlainCommit {
                 sha, subject, refs, ..
             } => {
@@ -2079,6 +2134,188 @@ mod json_output_tests {
             vec!["commit", "gh", "commit", "foo"],
             "one footer for the Git run: {rows:?}"
         );
+    }
+
+    fn run(name: &str, base: u64, intro_at: i64, finish_at: Option<i64>) -> Vec<LogEvent> {
+        use crate::lifecycle::{CommitSha, PlanKey};
+        let key = PlanKey::parse(name).unwrap();
+        let hash = |n: u64| CommitSha::parse(&format!("{n:040x}")).unwrap();
+        let mut events = Vec::new();
+        if let Some(at) = finish_at {
+            events.push(LogEvent::PlanFinalized {
+                plan: key.clone(),
+                sha: hash(base + 2),
+                ts: at,
+                duration_secs: 60,
+                subject: format!("[{name}] finish"),
+            });
+        }
+        events.push(LogEvent::PlanCommit {
+            plan: key.clone(),
+            sha: hash(base + 1),
+            ts: intro_at + 1,
+            touched_plan: false,
+            touched_code: true,
+            subject: format!("[{name}] work"),
+        });
+        events.push(LogEvent::PlanIntro {
+            plan: key,
+            sha: hash(base),
+            ts: intro_at,
+            subject: format!("[{name}] intro"),
+        });
+        events
+    }
+
+    /// The rows' shape, newest first: `-` a run's end rule, `=` a banner,
+    /// `⚑` a finish, `c` another commit, `r` a review, `e` an event.
+    fn shape(rows: &[OnelineRow]) -> String {
+        rows.iter()
+            .map(|r| match r {
+                OnelineRow::RunEnd => '-',
+                OnelineRow::Header { .. } => '=',
+                OnelineRow::Commit {
+                    marker: RowMarker::Finish,
+                    ..
+                } => '⚑',
+                OnelineRow::Commit { .. } | OnelineRow::PlainCommit { .. } => 'c',
+                OnelineRow::Review { .. } => 'r',
+                OnelineRow::Github { .. } | OnelineRow::Notice(_) => 'e',
+            })
+            .collect()
+    }
+
+    fn rows_of(
+        events: &[LogEvent],
+        external: &[crate::cli::github::timeline::MergedEvent],
+        reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+        stands_for: &StandsFor,
+    ) -> Vec<OnelineRow> {
+        let events: Vec<&LogEvent> = events.iter().collect();
+        oneline_items_rows(&interleave(&events, external), reviews, stands_for)
+    }
+
+    /// A finished run is closed by a textless rule when anything but the
+    /// next run follows it, decided from the rows as finally interleaved:
+    /// an ad-hoc commit or an event after it, or an event between it and
+    /// the next run's intro. The finish's own reviews stay inside it.
+    #[test]
+    fn a_finished_run_ends_with_a_rule_unless_the_next_run_follows() {
+        let p = run("p", 10, 100, Some(300));
+        let mut after = vec![adhoc(400, "drive by")];
+        after.extend(p.clone());
+        assert_eq!(
+            shape(&rows_of(
+                &after,
+                &[],
+                &Default::default(),
+                &Default::default()
+            )),
+            "c-⚑cc="
+        );
+
+        let mut next = run("q", 20, 400, None);
+        next.extend(p.clone());
+        assert_eq!(
+            shape(&rows_of(
+                &next,
+                &[],
+                &Default::default(),
+                &Default::default()
+            )),
+            "cc=⚑cc=",
+            "the next banner"
+        );
+        assert_eq!(
+            shape(&rows_of(
+                &next,
+                &[gh(350, "between", false)],
+                &Default::default(),
+                &Default::default()
+            )),
+            "cc=e-⚑cc=",
+            "an event between the finish and the next run"
+        );
+        assert_eq!(
+            shape(&rows_of(&p, &[], &Default::default(), &Default::default())),
+            "⚑cc=",
+            "nothing after it yet"
+        );
+        let active = run("a", 30, 100, None);
+        let mut later = vec![adhoc(400, "drive by")];
+        later.extend(active);
+        assert_eq!(
+            shape(&rows_of(
+                &later,
+                &[],
+                &Default::default(),
+                &Default::default()
+            )),
+            "ccc=",
+            "an active run"
+        );
+
+        let finish = p[0].sha().as_str().to_string();
+        let reviews = [(
+            finish,
+            vec![Review {
+                verdict: Verdict::Finished,
+                author: "codex".into(),
+                summary: "done".into(),
+                body: String::new(),
+                at: Some(310),
+            }],
+        )]
+        .into_iter()
+        .collect();
+        let rows = rows_of(&after, &[], &reviews, &Default::default());
+        assert_eq!(shape(&rows), "c-r⚑cc=", "its review stays inside");
+    }
+
+    /// A finished plan collapsed to its one finalize commit is a run too.
+    #[test]
+    fn a_collapsed_finished_plan_ends_with_a_rule() {
+        let p = run("solo", 10, 100, Some(300));
+        let finish = p[0].clone();
+        let stands_for: StandsFor = [(finish.sha().as_str().to_string(), "solo".to_string())]
+            .into_iter()
+            .collect();
+        let events = vec![adhoc(400, "drive by"), finish];
+        assert_eq!(
+            shape(&rows_of(&events, &[], &Default::default(), &stands_for)),
+            "c-⚑"
+        );
+    }
+
+    /// Joined page by page, the rows have the one rule they have whole:
+    /// a finish at the top of an older page is closed against the page
+    /// above it, and passing over a seam twice adds nothing.
+    #[test]
+    fn a_run_end_survives_the_paging_seam_once() {
+        let mut events = vec![adhoc(400, "drive by")];
+        events.extend(run("p", 10, 100, Some(300)));
+        let whole = rows_of(&events, &[], &Default::default(), &Default::default());
+        let mut paged = rows_of(&events[..1], &[], &Default::default(), &Default::default());
+        extend_oneline_rows(
+            &mut paged,
+            rows_of(&events[1..2], &[], &Default::default(), &Default::default()),
+        );
+        extend_oneline_rows(
+            &mut paged,
+            rows_of(&events[2..], &[], &Default::default(), &Default::default()),
+        );
+        assert_eq!(shape(&paged), shape(&whole));
+        let len = paged.len();
+        mark_run_ends(&mut paged, 0);
+        assert_eq!(paged.len(), len);
+        assert_eq!(
+            paged
+                .iter()
+                .filter(|r| matches!(r, OnelineRow::RunEnd))
+                .count(),
+            1
+        );
+        assert!(oneline_plain_lines(&whole).contains(&RUN_END_RULE.to_string()));
     }
 
     #[test]

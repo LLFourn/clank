@@ -1508,6 +1508,9 @@ struct LogView {
     /// This pass may do the top-up IO. Set by input/data/resize, cleared
     /// after one fill; a tick never sets it.
     fill: bool,
+    /// The cursor last moved up: a rule it comes to rest on is passed
+    /// over in that direction.
+    rising: bool,
 }
 
 impl LogView {
@@ -1519,6 +1522,7 @@ impl LogView {
             next: None,
             complete: false,
             fill: true,
+            rising: false,
         }
     }
 
@@ -1530,32 +1534,50 @@ impl LogView {
     /// Settle the viewport for the paint: clamp the cursor into the
     /// loaded length and DERIVE the offset from it when the log is
     /// focused; otherwise just keep the last page full.
-    fn settle(&mut self, capacity: usize, total: usize, focused: bool) {
+    fn settle(
+        &mut self,
+        capacity: usize,
+        total: usize,
+        focused: bool,
+        unselectable: impl Fn(usize) -> bool,
+    ) {
         if focused {
-            self.cursor = self.cursor.min(total.saturating_sub(1));
+            self.cursor = land(
+                self.cursor.min(total.saturating_sub(1)),
+                total,
+                self.rising,
+                unselectable,
+            );
             self.offset = scroll_to_show(self.cursor, self.offset, capacity, total);
         } else {
             self.offset = self.offset.min(total.saturating_sub(capacity.max(1)));
         }
     }
 
-    fn up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+    // Each move lands at once, before the next key in the same batch or an
+    // Enter can see the cursor: a rule is never a position, however the
+    // keys arrive.
+    fn moved(&mut self, cursor: usize, rising: bool, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.rising = rising;
+        self.cursor = land(cursor, total, rising, rule);
     }
-    fn down(&mut self) {
-        self.cursor += 1;
+    fn up(&mut self, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.moved(self.cursor.saturating_sub(1), true, total, rule);
     }
-    fn page_up(&mut self, page: usize) {
-        self.cursor = self.cursor.saturating_sub(page);
+    fn down(&mut self, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.moved(self.cursor + 1, false, total, rule);
     }
-    fn page_down(&mut self, page: usize) {
-        self.cursor += page;
+    fn page_up(&mut self, page: usize, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.moved(self.cursor.saturating_sub(page), true, total, rule);
     }
-    fn jump_top(&mut self) {
-        self.cursor = 0;
+    fn page_down(&mut self, page: usize, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.moved(self.cursor + page, false, total, rule);
     }
-    fn jump_bottom(&mut self, total: usize) {
-        self.cursor = total.saturating_sub(1);
+    fn jump_top(&mut self, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.moved(0, true, total, rule);
+    }
+    fn jump_bottom(&mut self, total: usize, rule: &dyn Fn(usize) -> bool) {
+        self.moved(total.saturating_sub(1), false, total, rule);
     }
     /// Enter the log at its first entry (crossing in from the panel) —
     /// the one place offset is reset directly, alongside the cursor.
@@ -1563,6 +1585,17 @@ impl LogView {
         self.cursor = 0;
         self.offset = 0;
     }
+}
+
+/// Whether scroll entry `i` is a run's end rule, the log's rows starting
+/// after `head` ask lines.
+fn is_rule(snapshot: &StatusSnapshot, head: usize, i: usize) -> bool {
+    i.checked_sub(head).is_some_and(|i| {
+        matches!(
+            snapshot.log_rows.get(i),
+            Some(crate::cli::log::OnelineRow::RunEnd)
+        )
+    })
 }
 
 /// THE INVARIANT: panel focus ⟹ the log viewport is at its top. The
@@ -2424,7 +2457,7 @@ fn ledger_rows(rows: &[crate::cli::log::OnelineRow]) -> Vec<LedgerRow> {
                 }
                 OnelineRow::Review { .. } => row.page = commit_page.clone(),
                 OnelineRow::Header { .. } => commit_page = None,
-                OnelineRow::Github { .. } | OnelineRow::Notice(_) => {}
+                OnelineRow::Github { .. } | OnelineRow::Notice(_) | OnelineRow::RunEnd => {}
             }
             row
         })
@@ -2528,6 +2561,18 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             verdict_class: None,
             stands_for: None,
             age,
+            page: None,
+        },
+        OnelineRow::RunEnd => LedgerRow {
+            kind: "run_end".into(),
+            glyph: None,
+            sha: None,
+            text: String::new(),
+            author: None,
+            verdict: None,
+            verdict_class: None,
+            stands_for: None,
+            age: None,
             page: None,
         },
         OnelineRow::Notice(n) => LedgerRow {
@@ -3334,7 +3379,9 @@ pub(crate) async fn run_tui(
         .capacity;
         // Derive the viewport from the cursor (focused) or keep the last
         // page full (unfocused) — see [`LogView::settle`].
-        log.settle(capacity, total, log_focused);
+        log.settle(capacity, total, log_focused, |i| {
+            is_rule(&snapshot, head, i)
+        });
         // Rebuild the view with the clamped cursor/offset for the paint.
         let view = PanelView { lift, ..view };
         // `screen_total` is the current screen's virtual content height
@@ -4658,14 +4705,18 @@ pub(crate) async fn run_tui(
                             Key::Up => {
                                 match log_up_target(log.cursor, log.offset, snapshot.agents.len()) {
                                     Some(sel) => mode = Mode::AgentPanel { sel },
-                                    None => log.up(),
+                                    None => log.up(total, &|i| is_rule(&snapshot, head, i)),
                                 }
                             }
-                            Key::Down => log.down(),
-                            Key::PageUp => log.page_up(page),
-                            Key::Space | Key::PageDown => log.page_down(page),
-                            Key::Top => log.jump_top(),
-                            Key::Bottom => log.jump_bottom(total),
+                            Key::Down => log.down(total, &|i| is_rule(&snapshot, head, i)),
+                            Key::PageUp => {
+                                log.page_up(page, total, &|i| is_rule(&snapshot, head, i))
+                            }
+                            Key::Space | Key::PageDown => {
+                                log.page_down(page, total, &|i| is_rule(&snapshot, head, i))
+                            }
+                            Key::Top => log.jump_top(total, &|i| is_rule(&snapshot, head, i)),
+                            Key::Bottom => log.jump_bottom(total, &|i| is_rule(&snapshot, head, i)),
                             // Enter drills into the entry under the cursor:
                             // build the same scroll sequence the cursor indexes
                             // and open the entry's page. A commit/review opens the
@@ -6579,22 +6630,23 @@ pub(crate) mod tests {
 
     #[test]
     fn log_view_cursor_moves_saturate() {
+        let none = |_: usize| false;
         let mut v = LogView::new();
         assert_eq!((v.cursor, v.offset), (0, 0));
-        v.up(); // at top → stays
+        v.up(100, &none); // at top → stays
         assert_eq!(v.cursor, 0);
-        v.page_up(5); // at top → stays
+        v.page_up(5, 100, &none); // at top → stays
         assert_eq!(v.cursor, 0);
-        v.down();
-        v.down();
+        v.down(100, &none);
+        v.down(100, &none);
         assert_eq!(v.cursor, 2);
-        v.page_down(10);
+        v.page_down(10, 100, &none);
         assert_eq!(v.cursor, 12);
-        v.jump_top();
+        v.jump_top(100, &none);
         assert_eq!(v.cursor, 0);
-        v.jump_bottom(20); // last index of 20 entries
+        v.jump_bottom(20, &none); // last index of 20 entries
         assert_eq!(v.cursor, 19);
-        v.jump_bottom(0); // empty timeline pins at 0
+        v.jump_bottom(0, &none); // empty timeline pins at 0
         assert_eq!(v.cursor, 0);
     }
 
@@ -6604,7 +6656,7 @@ pub(crate) mod tests {
         // Focused: cursor below the window pulls the offset down to reveal
         // it (matches scroll_to_show), and a cursor past the end clamps.
         v.cursor = 50;
-        v.settle(10, 20, true);
+        v.settle(10, 20, true, |_| false);
         assert_eq!(v.cursor, 19, "cursor clamped into the loaded length");
         assert_eq!(v.offset, scroll_to_show(19, 0, 10, 20));
         // Unfocused: the cursor is NOT clamped; only the offset is held to
@@ -6612,12 +6664,57 @@ pub(crate) mod tests {
         let mut u = LogView::new();
         u.cursor = 50;
         u.offset = 999;
-        u.settle(10, 20, false);
+        u.settle(10, 20, false, |_| false);
         assert_eq!(u.cursor, 50, "unfocused leaves the cursor alone");
         assert_eq!(u.offset, 10, "offset held to the last full page");
         // enter_first resets both (the one place offset is set directly).
         v.enter_first();
         assert_eq!((v.cursor, v.offset), (0, 0));
+    }
+
+    /// A run's end rule is a line in the log but never a place the cursor
+    /// rests, after every single key: several keys handled before a paint
+    /// select what the same keys one at a time do, and an Enter right
+    /// after a move never finds the cursor on the rule.
+    #[test]
+    fn the_log_cursor_steps_over_a_run_end_rule_on_every_key() {
+        let rule = |i: usize| i == 2;
+        let mut batched = LogView::new();
+        for _ in 0..3 {
+            batched.down(7, &rule);
+            assert!(!rule(batched.cursor), "no key leaves it on the rule");
+        }
+        let mut one_by_one = LogView::new();
+        for _ in 0..3 {
+            one_by_one.down(7, &rule);
+            one_by_one.settle(10, 7, true, rule);
+        }
+        assert_eq!(batched.cursor, one_by_one.cursor);
+        assert_eq!(batched.cursor, 4);
+        let mut v = LogView::new();
+        v.cursor = 1;
+        v.down(7, &rule);
+        assert_eq!(v.cursor, 3, "the Enter that follows opens the finish");
+        v.up(7, &rule);
+        assert_eq!(v.cursor, 1, "up past it");
+        v.cursor = 1;
+        v.page_down(1, 7, &rule);
+        assert_eq!(v.cursor, 3, "a page that ends on it");
+        let mut top = LogView::new();
+        top.jump_top(7, &|i| i == 0);
+        assert_eq!(top.cursor, 1, "nothing above: the other way");
+        top.jump_bottom(7, &|i| i == 6);
+        assert_eq!(top.cursor, 5, "nothing below: the other way");
+        let mut s = fixtures::snap(None, vec![]);
+        s.log_rows = vec![
+            crate::cli::log::OnelineRow::Notice("n".into()),
+            crate::cli::log::OnelineRow::RunEnd,
+        ];
+        assert_eq!(
+            (0..4).map(|i| is_rule(&s, 2, i)).collect::<Vec<_>>(),
+            [false, false, false, true],
+            "after two ask lines"
+        );
     }
 
     #[test]

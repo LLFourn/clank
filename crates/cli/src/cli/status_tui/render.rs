@@ -1031,6 +1031,7 @@ pub(super) fn log_row_spans(
             &crate::cli::log::plan_footer_text(plan.as_deref(), *duration_secs),
             cols,
         ),
+        OnelineRow::RunEnd => vec![dim("─".repeat(cols))],
         // A merged github event in the timeline: cyan `gh` badge, the
         // shared describe line, and the open-work mark while any
         // agent's copy is unhandled (log-timeline-github-events).
@@ -1164,7 +1165,7 @@ pub(super) fn row_age(row: &crate::cli::log::OnelineRow) -> Option<String> {
         OnelineRow::Commit { at, .. } | OnelineRow::PlainCommit { at, .. } => *at,
         OnelineRow::Github { at, .. } => *at as i64,
         OnelineRow::Review { at, .. } => (*at)?,
-        OnelineRow::Header { .. } | OnelineRow::Notice(_) => return None,
+        OnelineRow::Header { .. } | OnelineRow::Notice(_) | OnelineRow::RunEnd => return None,
     };
     Some(elapsed_text(at))
 }
@@ -1184,7 +1185,12 @@ fn age_gutter(row: &crate::cli::log::OnelineRow, width: usize) -> Span {
     // could not be read keeps the column anyway — it is still a row
     // in the list, and stepping out of the column would say more
     // about the missing clock than the blank does.
-    if width == 0 || matches!(row, OnelineRow::Header { .. } | OnelineRow::Notice(_)) {
+    if width == 0
+        || matches!(
+            row,
+            OnelineRow::Header { .. } | OnelineRow::Notice(_) | OnelineRow::RunEnd
+        )
+    {
         return dim(String::new());
     }
     let age = row_age(row).unwrap_or_default();
@@ -7849,6 +7855,19 @@ mod tests {
             unselected.iter().find(|l| visible(l).contains("drafts: 2")),
             "the cursor on it is shown"
         );
+    }
+
+    /// A run's end rule is drawn across the pane, with no age.
+    #[test]
+    fn a_run_end_rule_is_a_plain_line_without_an_age() {
+        let row = crate::cli::log::OnelineRow::RunEnd;
+        assert_eq!(row_age(&row), None);
+        let line: String = log_row_spans(&row, 0, &Default::default(), 12)
+            .iter()
+            .map(|s| s.1.clone())
+            .collect();
+        assert_eq!(line, "─".repeat(12));
+        assert_eq!(age_gutter(&row, 3).1, "");
     }
 
     /// However long the list and short the pane, the selected draft is
