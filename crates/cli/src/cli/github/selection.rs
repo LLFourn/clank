@@ -175,6 +175,41 @@ impl Clause {
         )
     }
 
+    /// What this clause subscribes to, in a reader's words: its events,
+    /// the objects its scope narrows them to, and whether the
+    /// watcher's own actions are admitted where that filter applies.
+    fn describe(&self) -> String {
+        let mut sels: Vec<String> = self.selectors.iter().map(Selector::canonical).collect();
+        sels.sort();
+        sels.dedup();
+        let mut out = sels.join(", ");
+        match &self.scope {
+            Scope::Any => {}
+            Scope::Prs(ns) => {
+                let mut ns = ns.clone();
+                ns.sort_unstable();
+                ns.dedup();
+                let ns: Vec<String> = ns.iter().map(|n| format!("#{n}")).collect();
+                out.push_str(&format!(" on PR {}", ns.join(", ")));
+            }
+            Scope::Branches(bs) => {
+                let mut bs = bs.clone();
+                bs.sort();
+                bs.dedup();
+                out.push_str(&format!(" on branch {}", bs.join(", ")));
+            }
+        }
+        if self.include_own
+            && self
+                .selectors
+                .iter()
+                .any(|s| s.kind.is_filterable_by_actor())
+        {
+            out.push_str(" · incl. own");
+        }
+        out
+    }
+
     fn suppresses_own(&self, ev: &Event<'_>) -> bool {
         ev.is_own && !self.include_own && ev.kind.is_filterable_by_actor()
     }
@@ -343,6 +378,30 @@ impl Selection {
         clauses.sort();
         clauses.dedup();
         clauses.join(";")
+    }
+
+    /// What this watch subscribes to, one clause after another in
+    /// canonical order: a watch written differently but admitting the
+    /// same reads the same. Clauses with one scope and one own-actions
+    /// rule admit exactly the union of their events, so they read as one;
+    /// the flat shape's desugaring would otherwise show as repetition.
+    pub(crate) fn describe(&self) -> String {
+        let mut clauses: Vec<Clause> = Vec::new();
+        for c in &self.clauses {
+            match clauses.iter_mut().find(|m| {
+                m.scope.canonical() == c.scope.canonical() && m.include_own == c.include_own
+            }) {
+                Some(m) => m.selectors.extend(c.selectors.iter().copied()),
+                None => clauses.push(c.clone()),
+            }
+        }
+        clauses.sort_by_key(|c| c.canonical());
+        clauses.dedup_by_key(|c| c.canonical());
+        clauses
+            .iter()
+            .map(|c| c.describe())
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// Whether this event reaches the watch.
@@ -544,6 +603,65 @@ mod tests {
         s.watch = serde_json::from_str(watch).expect("the clauses parse");
         assert_eq!(s.refusal(), None, "{watch}");
         Selection::of(&s)
+    }
+
+    /// What a watch reads as, scope by scope: a flat `prs` narrows its
+    /// PR kinds and never `pr_opened`; a flat `branches` narrows only
+    /// pushes; a nested clause's numbers narrow everything it names,
+    /// opened included; own actions show where the filter applies.
+    #[test]
+    fn a_watch_describes_each_clause_with_its_own_scope() {
+        let mut flat = src(&[PrOpened, PrComment]);
+        flat.prs = vec![530, 522];
+        assert_eq!(
+            Selection::of(&flat).describe(),
+            "pr_comment on PR #522, #530; pr_opened"
+        );
+        let mut pushes = src(&[BranchPush, PrUpdated]);
+        pushes.branches = vec!["main".into()];
+        assert_eq!(
+            Selection::of(&pushes).describe(),
+            "branch_push on branch main; pr_updated"
+        );
+        assert_eq!(
+            nested(r#"[{"pr": {"numbers": [7], "events": ["opened", "comment"]}}]"#).describe(),
+            "pr_comment, pr_opened on PR #7"
+        );
+    }
+
+    /// Admitting the watcher's own actions changes what arrives, so it
+    /// is said, per clause, and only for kinds the filter applies to.
+    #[test]
+    fn a_watch_says_when_it_admits_its_own_actions() {
+        let mut own = src(&[PrComment]);
+        assert_eq!(Selection::of(&own).describe(), "pr_comment");
+        own.include_own_actions = true;
+        assert_eq!(Selection::of(&own).describe(), "pr_comment · incl. own");
+        let mut reviews = src(&[ReviewSubmitted]);
+        reviews.include_own_actions = true;
+        assert_eq!(Selection::of(&reviews).describe(), "review_submitted");
+        assert_eq!(
+            nested(
+                r#"[{"pr": {"events": ["comment"], "include_own_actions": true}},
+                    {"issue": {"events": ["opened"]}}]"#
+            )
+            .describe(),
+            "issue_opened; pr_comment · incl. own"
+        );
+    }
+
+    /// Two flat watches listing the same events in another order are the
+    /// same subscription and read the same, and keep the keys their
+    /// logs already have.
+    #[test]
+    fn a_reordered_flat_watch_reads_the_same_under_its_own_key() {
+        let a = src(&[PrComment, ReviewSubmitted]);
+        let b = src(&[ReviewSubmitted, PrComment]);
+        assert_eq!(Selection::of(&a).describe(), Selection::of(&b).describe());
+        assert_ne!(
+            super::super::supervisor::source_key(&a),
+            super::super::supervisor::source_key(&b)
+        );
     }
 
     fn comment(detail: &str, number: u64, is_own: bool) -> Event<'_> {

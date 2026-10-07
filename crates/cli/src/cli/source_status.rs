@@ -17,6 +17,10 @@ pub(crate) struct ConfiguredSource {
     pub(crate) name: String,
     pub(crate) glyph: String,
     pub(crate) config: WaitEventSource,
+    /// What a github watch subscribes to; a command source has none.
+    pub(crate) subscription: Option<String>,
+    /// How a github watch is configured to be delivered.
+    pub(crate) delivery: Option<String>,
 }
 
 impl ConfiguredSource {
@@ -36,6 +40,13 @@ impl ConfiguredSource {
                 None,
             ),
         };
+        let (subscription, delivery) = match config {
+            WaitEventSource::Github(g) => (
+                Some(crate::cli::github::selection::Selection::of(g).describe()),
+                Some(crate::cli::github::configured_delivery(g)),
+            ),
+            _ => (None, None),
+        };
         Self {
             agent: agent.clone(),
             key,
@@ -43,6 +54,8 @@ impl ConfiguredSource {
             name,
             glyph: crate::cli::log::badge_of(glyph, backend).to_string(),
             config: config.clone(),
+            subscription,
+            delivery,
         }
     }
 

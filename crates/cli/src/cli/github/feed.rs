@@ -883,6 +883,30 @@ pub(crate) async fn poll_once<F: EventFetcher>(
     }
 }
 
+/// The cadence a watch with no `poll_interval` polls at.
+pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How a github watch is configured to be delivered. Configured, not
+/// observed: the server's `X-Poll-Interval` may lengthen the polling,
+/// and a realtime watch keeps polling as its backstop and its fallback.
+pub(crate) fn configured_delivery(src: &clank_core::agent_config::GithubSource) -> String {
+    let poll = match src
+        .poll_interval
+        .as_deref()
+        .map(crate::cli::wait::parse_duration_str)
+    {
+        None | Some(Ok(None)) => {
+            format!("poll every {}s (default)", DEFAULT_POLL_INTERVAL.as_secs())
+        }
+        Some(Ok(Some(d))) => format!("poll every {}s (configured)", d.as_secs()),
+        Some(Err(_)) => "poll interval unreadable".to_string(),
+    };
+    match src.delivery {
+        clank_core::agent_config::Delivery::Poll => poll,
+        clank_core::agent_config::Delivery::Realtime => format!("realtime, {poll} as backstop"),
+    }
+}
+
 /// The effective poll interval: the server's `X-Poll-Interval` is a
 /// FLOOR the client must obey, so take the max of it and the
 /// configured cadence (default 60s).
@@ -890,7 +914,7 @@ pub(crate) fn effective_interval(
     configured: Option<Duration>,
     server_floor: Option<u64>,
 ) -> Duration {
-    let configured = configured.unwrap_or(Duration::from_secs(60));
+    let configured = configured.unwrap_or(DEFAULT_POLL_INTERVAL);
     let server = server_floor
         .map(Duration::from_secs)
         .unwrap_or(Duration::ZERO);
@@ -1428,6 +1452,46 @@ pub(super) mod tests {
         let bt = s.as_btree();
         assert!(bt.contains("b") && bt.contains("c"), "oldest 'a' evicted");
         assert!(!bt.contains("a"));
+    }
+
+    /// A watch's delivery as configured: the default or its own
+    /// interval, and a realtime watch's polling backstop.
+    #[test]
+    fn a_watch_states_its_configured_delivery() {
+        let src = |interval: Option<&str>, delivery| clank_core::agent_config::GithubSource {
+            interrupt: false,
+            interrupt_message: None,
+            repo: "o/r".into(),
+            events: vec![clank_core::agent_config::GithubEventKind::PrComment],
+            watch: Vec::new(),
+            poll_interval: interval.map(String::from),
+            include_own_actions: false,
+            branches: Vec::new(),
+            prs: Vec::new(),
+            prompt: None,
+            delivery,
+        };
+        use clank_core::agent_config::Delivery::{Poll, Realtime};
+        assert_eq!(
+            configured_delivery(&src(None, Poll)),
+            "poll every 60s (default)"
+        );
+        assert_eq!(
+            configured_delivery(&src(Some("0"), Poll)),
+            "poll every 60s (default)"
+        );
+        assert_eq!(
+            configured_delivery(&src(Some("2m"), Poll)),
+            "poll every 120s (configured)"
+        );
+        assert_eq!(
+            configured_delivery(&src(Some("120s"), Realtime)),
+            "realtime, poll every 120s (configured) as backstop"
+        );
+        assert_eq!(
+            configured_delivery(&src(Some("5x"), Poll)),
+            "poll interval unreadable"
+        );
     }
 
     #[test]

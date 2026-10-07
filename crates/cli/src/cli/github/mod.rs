@@ -19,6 +19,7 @@ pub(crate) mod draft;
 /// What an event means and which ones are new: both classifiers, the
 /// poll state machine, and the cursor a watch remembers.
 mod feed;
+pub(crate) use feed::configured_delivery;
 /// The per-agent write-ahead inbox every ingested event lands in
 /// before it is presented.
 pub(crate) mod log;

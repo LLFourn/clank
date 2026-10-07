@@ -868,11 +868,10 @@ pub(super) fn scrollable_header(
             .enumerate()
         {
             let members = group.members(&snap.sources);
-            let agents: Vec<String> = members.iter().map(|s| format!("@{}", s.agent)).collect();
             head_out.push(row_line(
                 &[
                     plain(format!("  {} {}", members[0].glyph, group.name)),
-                    dim(format!("  {}", agents.join(","))),
+                    dim(format!("  {}", row_agents(&members))),
                     dim(format!("  {}", group_state(&members, &snap.sources_live))),
                 ],
                 mode.selected() == at(PanelRow::Source(i)),
@@ -894,19 +893,58 @@ pub(super) fn group_state(
     if let [only] = members {
         return source_state(only, live);
     }
-    let mut counts: Vec<(&'static str, usize)> = Vec::new();
-    for source in members {
-        let word = source_word(source, live);
+    // A watch's state is its configured delivery, which only its whole
+    // text tells apart: two intervals are two states.
+    let github = members
+        .iter()
+        .all(|s| s.backend == crate::cli::github::timeline::Backend::Github);
+    if github {
+        let states: Vec<String> = members.iter().map(|s| source_state(s, live)).collect();
+        return tally(states.iter().map(String::as_str), false);
+    }
+    tally(members.iter().map(|s| source_word(s, live)), true)
+}
+
+/// `n state` per distinct state, in first-seen order; one state shared
+/// by all reads once when `counted` is false.
+fn tally<'a>(states: impl Iterator<Item = &'a str>, counted: bool) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for word in states {
         match counts.iter_mut().find(|(w, _)| *w == word) {
             Some((_, n)) => *n += 1,
             None => counts.push((word, 1)),
         }
+    }
+    if let [(word, _)] = counts[..]
+        && !counted
+    {
+        return word.to_string();
     }
     counts
         .iter()
         .map(|(word, n)| format!("{n} {word}"))
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// Each agent once, with how many of the row's sources are its when
+/// that is more than one.
+fn row_agents(members: &[&crate::cli::source_status::ConfiguredSource]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for source in members {
+        match counts.iter_mut().find(|(a, _)| *a == source.agent.as_str()) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((source.agent.as_str(), 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(agent, n)| match n {
+            1 => format!("@{agent}"),
+            n => format!("@{agent} ×{n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// [`source_state`] in a word, for counting.
@@ -949,15 +987,15 @@ pub(super) fn render_source_members(
     let room = rows.saturating_sub(out.len() + 1).max(1);
     let first = sel.saturating_sub(room - 1);
     for (i, source) in members.iter().enumerate().skip(first).take(room) {
-        out.push(row_line(
-            &[
-                plain(format!("  @{}", source.agent)),
-                dim(format!("  {}", source_state(source, &snap.sources_live))),
-            ],
-            i == sel,
-            &color,
-            cols,
-        ));
+        let mut spans = vec![plain(format!("  @{}", source.agent))];
+        if let Some(subscription) = &source.subscription {
+            spans.push(plain(format!("  {subscription}")));
+        }
+        spans.push(dim(format!(
+            "  {}",
+            source_state(source, &snap.sources_live)
+        )));
+        out.push(row_line(&spans, i == sel, &color, cols));
     }
     while out.len() < rows.saturating_sub(1) {
         out.push(String::new());
@@ -990,6 +1028,7 @@ pub(super) fn source_state(
     let now = crate::cli::github::log::now_epoch();
     let state = match (&hosted.lifecycle, source.backend) {
         (None, Backend::Command) => "starting".to_string(),
+        (None, Backend::Github) => source.delivery.clone().unwrap_or_default(),
         (None, _) => "hosted".to_string(),
         (Some(Lifecycle::Following), _) => match live.producer(source) {
             Some(pid) => format!("held elsewhere · producer pid {pid}"),
@@ -1148,10 +1187,20 @@ pub(super) fn render_source_page(
             ));
         }
     };
+    if let Some(subscription) = &source.subscription {
+        fact("subscribes", subscription);
+        fact("key", &source.key);
+    }
     for (key, value) in source_config_lines(&source.config) {
         fact(&key, &value);
     }
     fact("state", &source_state(source, &snap.sources_live));
+    if source.delivery.is_some() {
+        fact(
+            "",
+            "configured cadence: GitHub's X-Poll-Interval may make it poll less often",
+        );
+    }
     body.push(String::new());
     let first_row = body.len();
     for (i, row) in rows_of.iter().enumerate() {
@@ -8564,6 +8613,163 @@ mod tests {
         );
         assert!(line("@claude").contains("producer pid 53272"), "{page:#?}");
         assert!(line("@codex").contains("producer unknown"), "{page:#?}");
+    }
+
+    fn watch(
+        agent: &str,
+        events: &[clank_core::agent_config::GithubEventKind],
+        interval: Option<&str>,
+    ) -> crate::cli::source_status::ConfiguredSource {
+        crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse(agent).unwrap(),
+            &clank_core::agent_config::WaitEventSource::Github(
+                clank_core::agent_config::GithubSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    repo: "frostsnap/frostsnap".into(),
+                    events: events.to_vec(),
+                    watch: Vec::new(),
+                    poll_interval: interval.map(String::from),
+                    include_own_actions: true,
+                    branches: Vec::new(),
+                    prs: Vec::new(),
+                    prompt: None,
+                    delivery: Default::default(),
+                },
+            ),
+        )
+    }
+
+    fn hosted_watches(
+        sources: &[&crate::cli::source_status::ConfiguredSource],
+    ) -> crate::cli::source_status::Live {
+        crate::cli::source_status::Live::Monitor(
+            crate::cli::source_status::Account {
+                monitor: 1,
+                birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+                sources: sources
+                    .iter()
+                    .map(|s| crate::cli::source_status::Hosted {
+                        agent: s.agent.to_string(),
+                        key: s.key.clone(),
+                        accepted: crate::cli::source_status::fingerprint(&s.config),
+                        lifecycle: None,
+                    })
+                    .collect(),
+            },
+            Default::default(),
+        )
+    }
+
+    fn visible_lines(lines: Vec<String>) -> Vec<String> {
+        lines.iter().map(|l| visible(l)).collect()
+    }
+
+    /// fs-war-room's shape: one agent's three watches on one repo. The
+    /// row names the agent once with its count and their one shared
+    /// delivery; the agent list tells the three apart by what each
+    /// subscribes to; the page leads with the subscription and its key.
+    #[test]
+    fn three_watches_on_one_repo_say_what_each_watches() {
+        use clank_core::agent_config::GithubEventKind::*;
+        let mut s = two_agent_snap();
+        s.sources = vec![
+            watch("claude", &[PrOpened, IssueOpened, PrMerged], Some("120s")),
+            watch("claude", &[PrComment, ReviewSubmitted], Some("120s")),
+            watch("claude", &[PrUpdated], Some("120s")),
+        ];
+        s.sources_live = hosted_watches(&s.sources.iter().collect::<Vec<_>>());
+        let panel = visible_lines(
+            render_at(
+                &s,
+                40,
+                140,
+                0,
+                0,
+                &PanelView::just(Mode::AgentPanel { sel: 0 }),
+            )
+            .0,
+        );
+        let row = panel
+            .iter()
+            .find(|l| l.contains("frostsnap/frostsnap"))
+            .unwrap();
+        assert!(
+            row.contains("@claude ×3  poll every 120s (configured)"),
+            "{row}"
+        );
+        assert!(!row.contains("hosted"), "{row}");
+
+        let group = super::super::input::GroupRef::of(&s.sources[0]);
+        let list = visible_lines(
+            render_at(
+                &s,
+                20,
+                140,
+                0,
+                0,
+                &PanelView {
+                    source_group: Some(&group),
+                    ..PanelView::just(Mode::SourceMembers { sel: 0 })
+                },
+            )
+            .0,
+        );
+        let members: Vec<&String> = list.iter().filter(|l| l.contains("@claude")).collect();
+        assert_eq!(members.len(), 3, "{list:#?}");
+        for want in [
+            "issue_opened, pr_merged, pr_opened · incl. own",
+            "pr_comment, review_submitted · incl. own",
+            "pr_updated · incl. own",
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .any(|l| l.contains(&format!("@claude  {want}  poll every 120s"))),
+                "{want}: {list:#?}"
+            );
+        }
+
+        let page = visible_lines(render_source_page(&s, &s.sources[1], &[], 0, 0, 40, 140).0);
+        let subscribes = page.iter().position(|l| l.contains("subscribes")).unwrap();
+        assert!(page[subscribes].contains("pr_comment, review_submitted"));
+        assert!(
+            page[subscribes + 1].contains(&s.sources[1].key),
+            "{page:#?}"
+        );
+        assert!(
+            page.iter()
+                .any(|l| l.contains("may make it poll less often"))
+        );
+    }
+
+    /// Watches whose deliveries differ are counted, not collapsed; and a
+    /// watch the monitor does not host, or whose edit it rejected, says
+    /// so rather than naming its delivery as if it ran.
+    #[test]
+    fn a_watchs_delivery_never_hides_what_the_monitor_says() {
+        use crate::cli::source_status::Live;
+        use clank_core::agent_config::GithubEventKind::*;
+        let fast = watch("claude", &[PrUpdated], Some("30s"));
+        let slow = watch("claude", &[PrComment], None);
+        let both = hosted_watches(&[&fast, &slow]);
+        assert_eq!(
+            group_state(&[&fast, &slow], &both),
+            "1 poll every 30s (configured) · 1 poll every 60s (default)"
+        );
+        assert_eq!(source_state(&fast, &hosted_watches(&[&slow])), "not hosted");
+        assert_eq!(
+            source_state(&fast, &Live::Unavailable),
+            "monitor not running"
+        );
+        let Live::Monitor(mut account, producers) = hosted_watches(&[&fast]) else {
+            unreachable!()
+        };
+        account.sources[0].accepted = "an earlier config".into();
+        assert_eq!(
+            source_state(&fast, &Live::Monitor(account, producers)),
+            "poll every 30s (configured) · an edit was rejected; runs the earlier config"
+        );
     }
 
     /// The sources sit in the panel with their icon and state, and a
