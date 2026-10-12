@@ -199,6 +199,10 @@ pub(crate) struct AgentAutoRow {
     /// failed and the monitor will not, or can no longer, retry it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) waiting_for_you: Option<String>,
+    /// What clank knows the agent is doing, as its monitor last published
+    /// it, or why that is stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state: Option<crate::cli::agent_state::View>,
     /// The question the agent is waiting on a person to answer, by its
     /// header, while one is pending in its bound session.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,6 +316,8 @@ fn roster_auto_rows(
                 && session.as_ref().is_some_and(|s| s.id.as_str() == r.session)
         })
         .map(|r| r.count);
+        let state =
+            crate::cli::agent_state::view(repo, label, session.as_ref().map(|s| s.id.as_str()));
         rows.push(AgentAutoRow {
             label: label.as_str().to_string(),
             role,
@@ -326,6 +332,7 @@ fn roster_auto_rows(
             waiting_for_you: crate::cli::recovery::waiting_for_you(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
             ),
+            state,
             asking,
             repeated,
         });
@@ -830,7 +837,18 @@ impl StatusSnapshot {
             let _ = writeln!(out, "  {url}");
         }
         for row in &self.agents {
-            if let Some(why) = &row.waiting_for_you {
+            if let Some(state) = &row.state {
+                let _ = writeln!(
+                    out,
+                    "state: {} → {}",
+                    row.label,
+                    state.line(crate::cli::recovery::unix_now())
+                );
+            }
+            // A current state already says why it waits for a person.
+            if let Some(why) = &row.waiting_for_you
+                && row.state.as_ref().is_none_or(|s| s.stale.is_some())
+            {
                 let _ = writeln!(out, "waiting for you: {} → {why}", row.label);
             }
             if let Some(header) = &row.asking {
@@ -2679,6 +2697,7 @@ mod dirty_and_wake_tests {
             invocation: "claude".to_string(),
             session: None,
             waiting_for_you: None,
+            state: None,
             asking: None,
             repeated: None,
             attending,
@@ -2836,6 +2855,52 @@ mod dirty_and_wake_tests {
             "{}",
             snap.to_human()
         );
+    }
+
+    /// Plain status gives each agent's current state with its reasons,
+    /// once: a current state already says why it waits for a person, and
+    /// a stale one says it is stale and leaves the reason to the episode.
+    #[test]
+    fn plain_status_gives_each_agents_state() {
+        use crate::cli::agent_state::{Activity, AgentState, Nudge, Observer, View};
+        let state = |stale| View {
+            state: AgentState {
+                role: "commit".into(),
+                session: "s1".into(),
+                tool: clank_core::Tool::Codex,
+                monitor: Observer {
+                    pid: 1,
+                    birth: None,
+                },
+                activity: Activity::Failed("billing_error".into()),
+                since: 0,
+                suppressors: Vec::new(),
+                nudge: Nudge::WaitingForYou("this kind of failure needs a person".into()),
+                cannot_resume: Some("no evidence".into()),
+            },
+            stale,
+        };
+        let shown = |stale| {
+            let mut snap = minimal_snapshot();
+            let mut row = agent_row("codex", None);
+            row.waiting_for_you = Some("this kind of failure needs a person".into());
+            row.state = Some(state(stale));
+            snap.agents = vec![row];
+            snap.to_human()
+        };
+        let current = shown(None);
+        assert!(
+            current.contains("state: codex → failed (billing_error)"),
+            "{current}"
+        );
+        assert!(current.contains("no evidence"), "{current}");
+        assert_eq!(current.matches("needs a person").count(), 1, "{current}");
+        let stale = shown(Some("its monitor is gone"));
+        assert!(
+            stale.contains("state: codex → stale: its monitor is gone"),
+            "{stale}"
+        );
+        assert!(stale.contains("waiting for you: codex"), "{stale}");
     }
 
     #[test]

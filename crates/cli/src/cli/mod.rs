@@ -10,6 +10,7 @@ use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 
 pub mod agent;
+pub(crate) mod agent_state;
 pub mod as_cmd;
 pub mod attending;
 pub mod auto;
@@ -19,6 +20,7 @@ pub(crate) mod codex_chat;
 pub(crate) mod codex_interrupt;
 pub mod command;
 pub mod command_source;
+pub(crate) mod composer;
 pub mod config;
 pub mod diff;
 pub mod doctor;
@@ -58,6 +60,7 @@ pub(crate) mod question_state;
 pub mod queue;
 pub(crate) mod recovery;
 pub mod rereview;
+pub(crate) mod resume;
 pub mod rewire;
 pub mod rewrite;
 pub mod run;
@@ -132,11 +135,11 @@ pub enum ConfigKey {
     /// bool, default: false. `--no-squash` skips it for one finish.
     #[command(name = "finish.autosquash", alias = "finish_autosquash")]
     FinishAutosquash(ConfigKeyArgs),
-    /// How long an agent may have pending work that nothing is waiting
-    /// for, with no failure in its record, before a person is told.
-    /// duration (30s, 40m, 1h) or `off`, default: 40m.
-    #[command(name = "recovery.stall_after", alias = "recovery_stall_after")]
-    RecoveryStallAfter(ConfigKeyArgs),
+    /// How often to blindly nudge an agent that owes work and whose record
+    /// clank cannot read: at most one send per stuck interval.
+    /// duration (30s, 40m, 1h) or `off`, default: off.
+    #[command(name = "recovery.blind_nudge", alias = "recovery_blind_nudge")]
+    RecoveryBlindNudge(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]

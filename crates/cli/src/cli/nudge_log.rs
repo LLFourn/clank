@@ -21,6 +21,11 @@ pub(crate) enum Trigger {
         attempt: u32,
         of: u32,
     },
+    /// The agent stopped the ordinary way with work owed and no wait to
+    /// take it.
+    Idle { attempt: u32, of: u32 },
+    /// `recovery.blind_nudge`: work owed and a record clank cannot read.
+    Fallback { attempt: u32 },
 }
 
 /// What the attempt's transport could tell. Only `Submitted` means the
@@ -65,6 +70,8 @@ impl Record {
             Trigger::Retry { class, attempt, of } => {
                 format!("{what} · retry {attempt}/{of} after {class}")
             }
+            Trigger::Idle { attempt, of } => format!("{what} · idle {attempt}/{of}"),
+            Trigger::Fallback { .. } => format!("{what} · blind, its record unreadable"),
         }
     }
 }

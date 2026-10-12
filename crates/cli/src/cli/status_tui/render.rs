@@ -733,8 +733,27 @@ pub(super) fn scrollable_header(
             // qualifies: it says how long this agent has owed what it
             // owes, so an idle row has nothing to say and an attending
             // one says it in its own marker below.
+            // What the agent owes is its role's; what it is doing is its
+            // published state's. The spinner claims both, so it is drawn only
+            // while a current state says the agent is working, or no state is
+            // known; otherwise the row says what the agent is doing instead.
+            // Gone: no pane, and no process still running its binding. A
+            // process without a pane is lost, not gone.
+            let gone =
+                view.presence_of(&a.label) == Presence::Missing && !view.lost.contains(&a.label);
+            let not_working = a.state.as_ref().filter(|s| {
+                s.activity()
+                    .is_some_and(|act| *act != crate::cli::agent_state::Activity::Working)
+            });
             if !waiting {
-                if let Some((verb, since)) = verb_for(&a.label) {
+                if gone {
+                    spans.push(dim("  gone".to_string()));
+                } else if let Some(s) = not_working {
+                    spans.push(dim(format!(
+                        "  {}",
+                        s.brief(crate::cli::recovery::unix_now())
+                    )));
+                } else if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
                     spans.extend(since.map(|at| dim(format!(" {}", elapsed_text(at)))));
@@ -3199,6 +3218,21 @@ pub(super) fn render_agent_detail(
             "",
             cols,
         )),
+    }
+    if let Some(state) = &agent.state {
+        let state_label = format!("{LEAD}state     ");
+        let indent = display_width(&state_label);
+        let state = state.line(crate::cli::recovery::unix_now());
+        for (n, line) in wrap(&state, cols.saturating_sub(indent).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = match n {
+                0 => state_label.clone(),
+                _ => " ".repeat(indent),
+            };
+            content.push(emit(&[dim(lead), plain(line)], "", cols));
+        }
     }
 
     // The binding outranks the gaps around the menu: a pane too short
@@ -11110,6 +11144,103 @@ mod tests {
             !render(&teamless, 40, 80).join("\n").contains(SPINNER[0]),
             "panel-less render carries no spinner"
         );
+    }
+
+    fn view_of(
+        activity: crate::cli::agent_state::Activity,
+        stale: Option<&'static str>,
+    ) -> crate::cli::agent_state::View {
+        use crate::cli::agent_state::{AgentState, Nudge, Observer, View};
+        View {
+            state: AgentState {
+                role: "master".into(),
+                session: "s1".into(),
+                tool: clank_core::Tool::Claude,
+                monitor: Observer {
+                    pid: 1,
+                    birth: None,
+                },
+                activity,
+                since: 0,
+                suppressors: Vec::new(),
+                nudge: Nudge::WaitingForYou("resuming this harness is not enabled".into()),
+                cannot_resume: Some("no evidence".into()),
+            },
+            stale,
+        }
+    }
+
+    /// A master owing a plan action is drawn working only while its state
+    /// says it is working, or nothing current is known; a current idle,
+    /// failed or unobserved state is drawn as itself, and a stale one claims
+    /// nothing. With no pane and no process, it is gone.
+    #[test]
+    fn the_agent_row_shows_what_the_agent_is_doing_not_what_it_owes() {
+        use crate::cli::agent_state::Activity;
+        let row = |state: Option<crate::cli::agent_state::View>, view: &PanelView<'_>| {
+            let mut s = two_agent_snap();
+            s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
+            s.agents[0].state = state;
+            visible(line_with(&render_at(&s, 40, 100, 0, 0, view).0, "claude"))
+        };
+        let plain = PanelView::just(Mode::LogScroll);
+        for (state, says) in [
+            (Some(view_of(Activity::Idle, None)), "idle"),
+            (
+                Some(view_of(Activity::Failed("overloaded".into()), None)),
+                "failed (overloaded)",
+            ),
+            (Some(view_of(Activity::Unobserved, None)), "not observed"),
+        ] {
+            let r = row(state, &plain);
+            assert!(r.contains(says) && !r.contains(SPINNER[0]), "{r}");
+            assert!(r.contains("waiting for you"), "{r}");
+        }
+        for state in [
+            Some(view_of(Activity::Working, None)),
+            Some(view_of(Activity::Idle, Some("its monitor is gone"))),
+            None,
+        ] {
+            let r = row(state, &plain);
+            assert!(r.contains(SPINNER[0]) && !r.contains("idle"), "{r}");
+        }
+        let mut paneless = PanelView::just(Mode::LogScroll);
+        paneless.presence = Some(Default::default());
+        let r = row(Some(view_of(Activity::Idle, None)), &paneless);
+        assert!(r.contains("gone"), "{r}");
+        paneless.lost.insert("claude".into());
+        let r = row(Some(view_of(Activity::Idle, None)), &paneless);
+        assert!(
+            !r.contains("gone"),
+            "running without a pane is not gone: {r}"
+        );
+    }
+
+    /// The agent page gives the whole state with its reasons, or says it
+    /// is stale.
+    #[test]
+    fn the_agent_page_gives_the_state_and_its_reasons() {
+        use crate::cli::agent_state::Activity;
+        let mut s = two_agent_snap();
+        s.agents[0].state = Some(view_of(Activity::Idle, None));
+        let page = render_agent_detail(&s.agents[0], None, &[DetailAction::Back], 0, 40, 200)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            page.contains("idle") && page.contains("no evidence"),
+            "{page}"
+        );
+        s.agents[0].state = Some(view_of(Activity::Idle, Some("another session is bound")));
+        let page = render_agent_detail(&s.agents[0], None, &[DetailAction::Back], 0, 40, 200)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains("stale: another session is bound"), "{page}");
     }
 
     /// An attending agent is blocked, not working. The hourglass takes

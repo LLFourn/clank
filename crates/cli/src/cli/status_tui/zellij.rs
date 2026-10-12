@@ -2225,6 +2225,7 @@ mod tests {
                 invocation: "claude".into(),
                 session: None,
                 waiting_for_you: None,
+                state: None,
                 asking: None,
                 repeated: None,
 
@@ -3427,6 +3428,7 @@ mod tests {
                     invocation: "claude".into(),
                     session: None,
                     waiting_for_you: None,
+                    state: None,
                     asking: None,
                     repeated: None,
 
@@ -3441,6 +3443,7 @@ mod tests {
                     invocation: "codex".into(),
                     session: None,
                     waiting_for_you: None,
+                    state: None,
                     asking: None,
                     repeated: None,
 

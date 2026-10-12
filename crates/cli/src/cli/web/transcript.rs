@@ -969,6 +969,9 @@ pub(crate) struct Tail {
     pos: u64,
     partial: Vec<u8>,
     window: u64,
+    /// The file read, by device and inode: a file renamed over the path is
+    /// another record whatever its length.
+    file: (u64, u64),
 }
 
 pub(crate) struct Polled {
@@ -988,8 +991,10 @@ impl Tail {
     /// and the page wants the last few screens, not the history.
     pub(crate) fn open(path: &Path, window: u64) -> std::io::Result<(Self, Vec<TranscriptLine>)> {
         use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
         let mut file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len();
+        let meta = file.metadata()?;
+        let len = meta.len();
         let mut start = len.saturating_sub(window);
         // Expand to the start of the boundary record. A single attachment
         // may exceed the lookback budget; dropping its head loses the whole
@@ -1022,6 +1027,7 @@ impl Tail {
                 pos,
                 partial,
                 window,
+                file: (meta.dev(), meta.ino()),
             },
             lines,
         ))
@@ -1029,9 +1035,11 @@ impl Tail {
 
     pub(crate) fn poll(&mut self) -> std::io::Result<Polled> {
         use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
         let mut file = std::fs::File::open(&self.path)?;
-        let len = file.metadata()?.len();
-        if len < self.pos {
+        let meta = file.metadata()?;
+        let len = meta.len();
+        if len < self.pos || (meta.dev(), meta.ino()) != self.file {
             let (fresh, lines) = Self::open(&self.path, self.window)?;
             *self = fresh;
             return Ok(Polled { lines, reset: true });

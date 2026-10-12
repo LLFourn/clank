@@ -36,21 +36,19 @@ impl Default for Config {
 /// Recovery config, from `.clank/config.json#/recovery`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryConfig {
-    /// Seconds an eligible agent may hold pending work, with no failure in
-    /// its record, before a person is told. `None` is `off`.
-    pub stall_after: Option<u64>,
+    /// Seconds between blind nudges of an agent that owes work and whose
+    /// record cannot be read. `None` is `off`.
+    pub blind_nudge: Option<u64>,
 }
 
 impl Default for RecoveryConfig {
     fn default() -> Self {
-        Self {
-            stall_after: Some(40 * 60),
-        }
+        Self { blind_nudge: None }
     }
 }
 
 /// `off`, or a duration in clank's grammar; `0` is `off` too.
-fn parse_stall_after(raw: &str) -> anyhow::Result<Option<u64>> {
+fn parse_blind_nudge(raw: &str) -> anyhow::Result<Option<u64>> {
     if raw.trim() == "off" {
         return Ok(None);
     }
@@ -131,7 +129,7 @@ struct ConfigFile {
 #[derive(Debug, Default, Deserialize)]
 struct RecoveryFile {
     #[serde(default)]
-    stall_after: Option<String>,
+    blind_nudge: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -478,14 +476,14 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         cfg.finish.autosquash = v;
         present.insert("finish.autosquash".to_string());
     }
-    if let Some(raw) = parsed.recovery.and_then(|r| r.stall_after) {
-        match parse_stall_after(&raw) {
+    if let Some(raw) = parsed.recovery.and_then(|r| r.blind_nudge) {
+        match parse_blind_nudge(&raw) {
             Ok(v) => {
-                cfg.recovery.stall_after = v;
-                present.insert("recovery.stall_after".to_string());
+                cfg.recovery.blind_nudge = v;
+                present.insert("recovery.blind_nudge".to_string());
             }
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "clank config: bad recovery.stall_after; ignoring it");
+                tracing::warn!(path = %path.display(), error = %e, "clank config: bad recovery.blind_nudge; ignoring it");
             }
         }
     }
@@ -554,10 +552,10 @@ pub static KEY_CATALOG: &[KeyDef] = &[
     },
     KeyDef {
         section: "recovery",
-        name: "stall_after",
+        name: "blind_nudge",
         type_desc: "duration|off",
-        default: "40m",
-        help: "Tell a person when an agent has had pending work this long that nothing is waiting for, with no failure in its record; `off` disables only this",
+        default: "off",
+        help: "Nudge an agent that owes work and whose record clank cannot read, at most once per stuck interval, checking again at this interval (doubling, up to 4h) while there is nowhere to send it; `off` leaves such an agent to a person",
     },
 ];
 
@@ -658,9 +656,9 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
             .unwrap_or(false)
             .to_string(),
         "finish.autosquash" => cfg.finish.autosquash.to_string(),
-        "recovery.stall_after" => cfg
+        "recovery.blind_nudge" => cfg
             .recovery
-            .stall_after
+            .blind_nudge
             .map_or_else(|| "off".to_string(), show_duration),
         _ => "unknown key".to_string(),
     }
@@ -685,7 +683,7 @@ fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
         "diff.wait" => Some(&["diff", "wait"]),
         "diff.editor.command" => Some(&["diff", "editor", "command"]),
         "finish.autosquash" => Some(&["finish", "autosquash"]),
-        "recovery.stall_after" => Some(&["recovery", "stall_after"]),
+        "recovery.blind_nudge" => Some(&["recovery", "blind_nudge"]),
         _ => None,
     }
 }
@@ -716,7 +714,7 @@ struct FinishJson {
 #[derive(serde::Serialize)]
 struct RecoveryJson {
     /// Seconds, or `null` for `off`.
-    stall_after: Option<u64>,
+    blind_nudge: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -761,7 +759,7 @@ impl<'a> From<&'a Config> for ConfigJson<'a> {
                 autosquash: cfg.finish.autosquash,
             },
             recovery: RecoveryJson {
-                stall_after: cfg.recovery.stall_after,
+                blind_nudge: cfg.recovery.blind_nudge,
             },
         }
     }
@@ -776,7 +774,7 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::DiffEditorCommand(_) => "diff.editor.command",
         ConfigKey::DiffWait(_) => "diff.wait",
         ConfigKey::FinishAutosquash(_) => "finish.autosquash",
-        ConfigKey::RecoveryStallAfter(_) => "recovery.stall_after",
+        ConfigKey::RecoveryBlindNudge(_) => "recovery.blind_nudge",
     }
 }
 
@@ -789,7 +787,7 @@ fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         | ConfigKey::DiffEditorCommand(a)
         | ConfigKey::DiffWait(a)
         | ConfigKey::FinishAutosquash(a)
-        | ConfigKey::RecoveryStallAfter(a) => a,
+        | ConfigKey::RecoveryBlindNudge(a) => a,
     }
 }
 
@@ -862,7 +860,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 anyhow::bail!("{key} is a bool; value must be true or false");
             }
             if def.type_desc == "duration|off" {
-                parse_stall_after(value).map_err(|e| anyhow::anyhow!("{key}: {e}, or off"))?;
+                parse_blind_nudge(value).map_err(|e| anyhow::anyhow!("{key}: {e}, or off"))?;
             }
             let path = key_to_json_path(key).expect("key_name always returns a catalog key");
             // `--global` writes the user-scope config; otherwise the repo's.
@@ -1588,7 +1586,7 @@ mod tests {
                     "autosquash": cfg.finish.autosquash,
                 },
                 "recovery": {
-                    "stall_after": 2400,
+                    "blind_nudge": null,
                 }
             })
         );
@@ -1682,31 +1680,31 @@ mod tests {
         assert_eq!(kv.source, ValueSource::Repo);
     }
 
-    /// `recovery.stall_after`: 40 minutes unless set, a duration or `off`
-    /// when it is, and a value it cannot read leaves the default standing.
+    /// `recovery.blind_nudge`: off unless set, a duration or `off` when it
+    /// is, and a value it cannot read leaves the default standing.
     #[test]
-    fn recovery_stall_after_reads_a_duration_or_off() {
+    fn recovery_blind_nudge_reads_a_duration_or_off() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(load_isolated(tmp.path()).recovery.stall_after, Some(2400));
+        assert_eq!(load_isolated(tmp.path()).recovery.blind_nudge, None);
         for (raw, want, shown) in [
             ("90m", Some(5400), "90m"),
             ("1h", Some(3600), "1h"),
             ("45s", Some(45), "45s"),
             ("off", None, "off"),
             ("0", None, "off"),
-            ("soon", Some(2400), "40m"),
+            ("soon", None, "off"),
         ] {
             write(
                 &tmp.path().join(".clank/config.json"),
-                &format!(r#"{{"recovery":{{"stall_after":"{raw}"}}}}"#),
+                &format!(r#"{{"recovery":{{"blind_nudge":"{raw}"}}}}"#),
             );
             let cfg = load_isolated(tmp.path());
-            assert_eq!(cfg.recovery.stall_after, want, "{raw}");
-            assert_eq!(get_value(&cfg, "recovery.stall_after"), shown, "{raw}");
+            assert_eq!(cfg.recovery.blind_nudge, want, "{raw}");
+            assert_eq!(get_value(&cfg, "recovery.blind_nudge"), shown, "{raw}");
         }
         set_repo_key(
             tmp.path(),
-            &["recovery", "stall_after"],
+            &["recovery", "blind_nudge"],
             "off",
             "duration|off",
         )
@@ -1714,7 +1712,7 @@ mod tests {
         let kvs = resolve_key_values_with_home(tmp.path(), None);
         let kv = kvs
             .iter()
-            .find(|kv| kv.key == "recovery.stall_after")
+            .find(|kv| kv.key == "recovery.blind_nudge")
             .unwrap();
         assert_eq!((kv.value.as_str(), kv.source), ("off", ValueSource::Repo));
     }

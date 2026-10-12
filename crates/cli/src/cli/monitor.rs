@@ -2528,6 +2528,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     }
     // Agents whose turn failed with nothing left to wake them.
     let (recovery_answers, mut answered) = tokio::sync::mpsc::unbounded_channel::<RecoveryAnswer>();
+    let (typed_sends, mut prepared_sends) = tokio::sync::mpsc::unbounded_channel::<Prepared>();
     let mut recovery = crate::cli::recovery::Driver::new(
         repo.as_ref().clone(),
         std::env::var_os("HOME")
@@ -2555,11 +2556,14 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 let acts = recovery.due(crate::cli::recovery::unix_now(), |author, session| {
                     recovery_gate(&repo, &clients, author, session)
                 });
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+                act_on_recovery(&repo, &clients, acts, &recovery_answers, &typed_sends, &records, &mut owned);
+            }
+            Some(p) = prepared_sends.recv() => {
+                send_typed(&repo, &clients, &hosted, &mut recovery, p, &recovery_answers, &mut owned);
             }
             Some((author, attempt, answer)) = answered.recv() => {
                 let acts = recovery.answer(&author, &attempt, answer, crate::cli::recovery::unix_now());
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+                act_on_recovery(&repo, &clients, acts, &recovery_answers, &typed_sends, &records, &mut owned);
             }
             Some(event) = changed_records.recv() => {
                 let mut events = std::collections::BTreeSet::from([event]);
@@ -2571,7 +2575,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 for event in events {
                     acts.extend(recovery.changed(event, now));
                 }
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+                act_on_recovery(&repo, &clients, acts, &recovery_answers, &typed_sends, &records, &mut owned);
             }
             _ = crate::cli::timer_source::deadline(timer_deadline) => {
                 for host in hosted.values_mut() {
@@ -2801,7 +2805,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             now,
                         );
                         acts.extend(recovery.replies(now));
-                        act_on_recovery(&repo, &clients, acts, &recovery_answers, &records, &mut owned);
+                        act_on_recovery(&repo, &clients, acts, &recovery_answers, &typed_sends, &records, &mut owned);
                         folded_state = Some(state);
                     }
                     // The counter stays where it is, so the
@@ -2838,9 +2842,9 @@ fn recovery_facts(
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let stall_after = crate::cli::config::load_with_home(repo, home.as_deref())
+    let blind_nudge = crate::cli::config::load_with_home(repo, home.as_deref())
         .recovery
-        .stall_after;
+        .blind_nudge;
     let mut facts = Vec::new();
     for author in roster_authors(repo) {
         let Ok(cfg) = crate::agent_store::load_agent_config(repo, &author) else {
@@ -2882,19 +2886,36 @@ fn recovery_facts(
         }
         let attending = obligated && recovery_gate_holds(repo, &author);
         let asking = crate::cli::question_state::asking(&dir, session.id.as_str()).is_some();
+        let role = crate::agent_store::resolve_role(repo, &author)
+            .map(|r| r.to_string())
+            .unwrap_or_default();
         facts.push(crate::cli::recovery::Facts {
             agent_dir: crate::agent_store::agents_root(repo).join(author.as_str()),
+            work: identities(&owed),
             author,
             session,
             auto,
             delivering,
             obligated,
-            stall_after,
+            role,
+            blind_nudge,
             attending,
             asking,
         });
     }
     facts
+}
+
+/// Each item's stable identity, as a delivery names it: never its
+/// rendering, age or repeat count.
+fn identities(owed: &[WaitItem]) -> Vec<String> {
+    owed.iter()
+        .filter_map(|item| {
+            let json = serde_json::to_value(crate::cli::wait::render_json(item)).ok()?;
+            serde_json::from_value::<crate::cli::stop_hook::WaitItem>(json).ok()
+        })
+        .map(|item| item.identity())
+        .collect()
 }
 
 /// Clear a recorded repeat that no longer describes the agent, so status
@@ -2906,14 +2927,7 @@ fn forget_stale_repeat(
     read_at: u128,
 ) {
     let dir = crate::agent_store::agents_root(repo).join(author.as_str());
-    let owed: Vec<String> = owed
-        .iter()
-        .filter_map(|item| {
-            let json = serde_json::to_value(crate::cli::wait::render_json(item)).ok()?;
-            serde_json::from_value::<crate::cli::stop_hook::WaitItem>(json).ok()
-        })
-        .map(|item| item.identity())
-        .collect();
+    let owed = identities(owed);
     let bound = || {
         crate::agent_store::load_agent_config(repo, author)
             .ok()
@@ -3026,12 +3040,117 @@ fn recovery_gate(
     }
 }
 
+/// A typed send's pane and screen, read off the loop, for the loop's last
+/// look before anything is written.
+#[derive(Debug)]
+struct Prepared {
+    author: AgentLabel,
+    attempt: crate::cli::recovery::AttemptRef,
+    tool: clank_core::Tool,
+    session: String,
+    pane: String,
+    screen: Option<String>,
+    text: String,
+    /// The repo folded afresh for this send, so its last look can derive
+    /// the agent's work from disk as it is then.
+    state: Option<crate::repo_state::RepoState>,
+}
+
+/// Type a prepared send into its pane, submit-only, if the last look
+/// allows it; otherwise nothing is written and the attempt is answered
+/// as never sent.
+#[allow(clippy::too_many_arguments)]
+fn send_typed(
+    repo: &std::path::Path,
+    clients: &[Client],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    recovery: &mut crate::cli::recovery::Driver,
+    p: Prepared,
+    answers: &tokio::sync::mpsc::UnboundedSender<RecoveryAnswer>,
+    owned: &mut OwnedTasks,
+) {
+    use crate::cli::open_zellij::PaneWrite;
+    use crate::cli::recovery::Answer;
+    if !may_type(repo, clients, hosted, recovery, &p) {
+        let _ = answers.send((p.author, p.attempt, Answer::Unavailable));
+        return;
+    }
+    let answers = answers.clone();
+    owned.departing.push(tokio::spawn(async move {
+        let answer =
+            match crate::cli::open_zellij::submit_async(&p.session, &p.pane, p.tool, &p.text).await
+            {
+                Ok(()) => Answer::Submitted { started: None },
+                Err(PaneWrite::NotStarted(_)) => Answer::Unavailable,
+                Err(PaneWrite::Unknown(_)) => Answer::Indeterminate,
+            };
+        let _ = answers.send((p.author, p.attempt, answer));
+    }));
+}
+
+/// The last look before typing, made on the loop that owns the live
+/// state, so a change already on disk vetoes the send whether or not a
+/// fold has seen it: the same gate a deadline asks (binding, deliverer,
+/// auto mode, a question, block or attendance), the input read as empty,
+/// and then the driver's own view, given the role on the roster and the
+/// work derived from the repo as freshly folded for this send, with the
+/// record read afresh nearest the write. Not atomic: what changes after
+/// it is the race the capability evidence must accept.
+fn may_type(
+    repo: &std::path::Path,
+    clients: &[Client],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    recovery: &mut crate::cli::recovery::Driver,
+    p: &Prepared,
+) -> bool {
+    if recovery_gate(repo, clients, &p.author, &p.attempt.session) != crate::cli::recovery::Gate::Go
+        || p.screen
+            .as_deref()
+            .map(|s| crate::cli::composer::composer(p.tool, s))
+            != Some(crate::cli::composer::Composer::Empty)
+    {
+        return false;
+    }
+    let (Ok(role), Some(state)) = (
+        crate::agent_store::resolve_role(repo, &p.author),
+        p.state.as_ref(),
+    ) else {
+        return false;
+    };
+    let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
+    let head = crate::git_io::head_commit_at(repo, state);
+    // Read afresh, never the loop's cached backlog: a recurring occurrence
+    // acknowledged since its last invalidation is still in that cache.
+    let backlog = crate::cli::timer_source::Backlog::new(
+        crate::agent_store::agents_root(repo)
+            .join(p.author.as_str())
+            .join("events"),
+        Default::default(),
+    )
+    .inspection();
+    let owed = owed_items(
+        repo,
+        state,
+        &p.author,
+        hosted,
+        &mut [(p.author.clone(), backlog)].into_iter().collect(),
+        &reviews,
+        head.as_ref(),
+    );
+    let live = crate::cli::recovery::Live {
+        role: role.to_string(),
+        work: identities(&owed),
+    };
+    recovery.may_send(&p.author, &p.attempt, &live)
+}
+
 /// Carry out what recovery decided.
 fn act_on_recovery(
     repo: &std::path::Path,
     clients: &[Client],
     acts: Vec<crate::cli::recovery::Act>,
     answers: &tokio::sync::mpsc::UnboundedSender<RecoveryAnswer>,
+    prepared: &tokio::sync::mpsc::UnboundedSender<Prepared>,
     records: &crate::cli::recovery::RecordWatch,
     owned: &mut OwnedTasks,
 ) {
@@ -3040,16 +3159,12 @@ fn act_on_recovery(
         match act {
             Act::Watch(path) => records.watch(path),
             Act::Unwatch(path) => records.unwatch(path),
-            Act::Notice { author, key, text } => {
-                if let Err(e) = write_recovery_notice(repo, &author, &key, &text) {
-                    eprintln!("monitor: could not record `{author}`'s recovery notice: {e}");
-                }
-            }
             Act::Dispatch {
                 author,
                 attempt,
                 transport: Transport::Helper,
                 tag,
+                text,
                 ..
             } => {
                 let helper = clients.iter().find(|c| {
@@ -3064,7 +3179,7 @@ fn act_on_recovery(
                         &Note::Recover {
                             opened_by: attempt.opened_by.clone(),
                             n: attempt.n,
-                            wake: crate::cli::recovery::wake_text(&tag),
+                            wake: text,
                             tag,
                         },
                     )
@@ -3076,18 +3191,52 @@ fn act_on_recovery(
             Act::Dispatch {
                 author,
                 attempt,
+                transport: Transport::Typed,
+                text,
+                ..
+            } => {
+                let repo = repo.to_path_buf();
+                let answers = answers.clone();
+                let prepared = prepared.clone();
+                owned.departing.push(tokio::spawn(async move {
+                    match crate::cli::pane_target::discover(repo.clone(), author.clone()).await {
+                        Ok((found, tool)) => {
+                            let screen = crate::cli::open_zellij::dump_pane_screen(
+                                &found.session,
+                                &found.pane,
+                            )
+                            .await;
+                            let state = folded(&repo).await.ok();
+                            let _ = prepared.send(Prepared {
+                                author,
+                                attempt,
+                                tool,
+                                session: found.session,
+                                pane: found.pane,
+                                screen,
+                                text,
+                                state,
+                            });
+                        }
+                        Err(_) => {
+                            let _ = answers.send((author, attempt, Answer::Unavailable));
+                        }
+                    }
+                }));
+            }
+            Act::Dispatch {
+                author,
+                attempt,
                 transport: Transport::CodexStart,
-                tag,
                 target,
+                text,
+                ..
             } => {
                 let repo = repo.to_path_buf();
                 let answers = answers.clone();
                 owned.departing.push(tokio::spawn(async move {
                     let answer = crate::cli::codex_interrupt::start_if_failed(
-                        &repo,
-                        &author,
-                        &target,
-                        &crate::cli::recovery::wake_text(&tag),
+                        &repo, &author, &target, &text,
                     )
                     .await;
                     let _ = answers.send((author, attempt, answer));
@@ -3095,47 +3244,6 @@ fn act_on_recovery(
             }
         }
     }
-}
-
-/// Tell the agent's timeline why its pending work is waiting, as a row
-/// that is already handled: a notice for a person, not work for the
-/// agent, and written once per episode.
-fn write_recovery_notice(
-    repo: &std::path::Path,
-    author: &AgentLabel,
-    key: &str,
-    text: &str,
-) -> std::io::Result<()> {
-    let dir = crate::agent_store::agents_root(repo)
-        .join(author.as_str())
-        .join("events");
-    std::fs::create_dir_all(&dir)?;
-    let mut log = crate::cli::github::log::EventLog::open(&dir, "clank-recovery")?;
-    let seq = log.append_inbox(
-        crate::cli::github::log::Transport::Command,
-        Some(key),
-        None,
-        Some(crate::cli::recovery::unix_now()),
-        &WaitItem::CommandEvent {
-            presentation: None,
-            source_cwd: None,
-            name: "recovery".into(),
-            id: key.into(),
-            event: "recovery".into(),
-            content: text.into(),
-            at: None,
-            failure: false,
-            requires_reply: false,
-            reply_route: None,
-            selector: None,
-        },
-    )?;
-    let ident = log
-        .read_rows()?
-        .and_then(|read| read.rows.into_iter().find(|row| row.seq == seq))
-        .map(|row| row.ident)
-        .ok_or_else(|| std::io::Error::other("the notice was not found after it was written"))?;
-    log.append_checked_ack(seq, &ident)
 }
 
 /// Watch the fold from a thread of its own, and stand down if it stops.
@@ -4727,7 +4835,336 @@ mod recovery_tests {
             transport: Transport::Helper,
             tag: "tag-1".into(),
             target: "t1".into(),
+            text: crate::cli::recovery::wake_text("tag-1"),
         }
+    }
+
+    const STARTED: &str = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"T"}}"#;
+    const DONE: &str =
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"T","error":null}}"#;
+    /// Codex's empty input on its band, between blank band rows, above its
+    /// footer.
+    const CODEX_EMPTY: &str = "• done\n\n\u{1b}[48;5;236m   \u{1b}[49m\n\u{1b}[48;5;236m›    \u{1b}[49m\n\u{1b}[48;5;236m   \u{1b}[49m\n\u{1b}[m  ? for shortcuts";
+
+    fn append(path: &std::path::Path, line: &str) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    /// A repo whose codex master is bound, auto, idle and owing work (an
+    /// event in its inbox), its first nudge claimed by the driver: what a
+    /// typed send's last look is made against.
+    struct Claimed {
+        repo: tempfile::TempDir,
+        codex: AgentLabel,
+        record: std::path::PathBuf,
+        driver: crate::cli::recovery::Driver,
+        attempt: AttemptRef,
+        /// The owed event, by its row.
+        owed: (u64, String),
+    }
+
+    impl Claimed {
+        fn new() -> Self {
+            use crate::cli::github::log::{EventLog, Transport as Wal};
+            crate::cli::recovery::tests::enable(clank_core::Tool::Codex, Some(Transport::Typed));
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+            std::fs::write(
+                repo.path().join(".clank/config.json"),
+                r#"{"agents":{"codex":{"tool":"codex","role":"master"}}}"#,
+            )
+            .unwrap();
+            let codex = AgentLabel::parse("codex").unwrap();
+            let timer = clank_core::agent_config::TimerSource {
+                interrupt: false,
+                interrupt_message: None,
+                name: "check".into(),
+                repeat_every: None,
+                due_at: "1970-01-01T00:01:40Z".into(),
+                content: Some("scheduled work".into()),
+            };
+            crate::agent_store::update_agent_config(repo.path(), &codex, |c| {
+                c.auto_mode = Some(clank_core::AutoMode::On);
+                c.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
+                    timer.clone(),
+                )];
+            })
+            .unwrap();
+            crate::agent_store::bind_session_to_agent(
+                repo.path(),
+                &codex,
+                clank_core::Tool::Codex,
+                &clank_core::ids::SessionId::parse("session-one").unwrap(),
+            )
+            .unwrap();
+            let events = crate::agent_store::agents_root(repo.path()).join("codex/events");
+            std::fs::create_dir_all(&events).unwrap();
+            let mut log = EventLog::open(&events, &timer.source_key(None)).unwrap();
+            let seq = log
+                .append_inbox(
+                    Wal::Timer,
+                    Some("timer/100"),
+                    None,
+                    Some(100),
+                    &WaitItem::TimerEvent {
+                        presentation: None,
+                        name: "check".into(),
+                        recurrence: None,
+                        id: "timer/100".into(),
+                        due_at: 100,
+                        content: "scheduled work".into(),
+                        selector: None,
+                    },
+                )
+                .unwrap();
+            let ident = log
+                .read_rows()
+                .unwrap()
+                .and_then(|read| read.rows.into_iter().find(|row| row.seq == seq))
+                .unwrap()
+                .ident;
+            let record = repo.path().join("rollout.jsonl");
+            append(&record, &STARTED.replace("\"T\"", "\"t1\""));
+            append(&record, &DONE.replace("\"T\"", "\"t1\""));
+            let mut driver = crate::cli::recovery::Driver::new(
+                repo.path().to_path_buf(),
+                std::path::PathBuf::from("/nonexistent-home"),
+            );
+            let mut claimed = Claimed {
+                repo,
+                codex,
+                record,
+                driver: crate::cli::recovery::Driver::new("/".into(), "/".into()),
+                attempt: attempt(),
+                owed: (seq, ident),
+            };
+            driver.reconcile(vec![claimed.facts()], 0);
+            let acts = driver.due(10_000, |_, _| Gate::Go);
+            let [Act::Dispatch { attempt, .. }] = acts.as_slice() else {
+                panic!("{acts:?}");
+            };
+            claimed.attempt = attempt.clone();
+            claimed.driver = driver;
+            claimed
+        }
+
+        fn facts(&self) -> crate::cli::recovery::Facts {
+            crate::cli::recovery::Facts {
+                author: self.codex.clone(),
+                agent_dir: crate::agent_store::agents_root(self.repo.path()).join("codex"),
+                session: serde_json::from_value(serde_json::json!({
+                    "id": "session-one",
+                    "tool": "codex",
+                    "updated_at": "2026-10-05T00:00:00Z",
+                    "transcript": self.record,
+                }))
+                .unwrap(),
+                auto: true,
+                delivering: false,
+                obligated: true,
+                role: "master".into(),
+                work: vec!["the timer".into()],
+                blind_nudge: None,
+                attending: false,
+                asking: false,
+            }
+        }
+
+        /// The send as prepared off the loop, the repo folded as it is now.
+        async fn prepared(&self, screen: Option<&str>) -> Prepared {
+            Prepared {
+                author: self.codex.clone(),
+                attempt: self.attempt.clone(),
+                tool: clank_core::Tool::Codex,
+                session: "zellij".into(),
+                pane: "1".into(),
+                screen: screen.map(str::to_string),
+                text: "check your pending work".into(),
+                state: folded(self.repo.path()).await.ok(),
+            }
+        }
+
+        async fn may_type(&mut self, clients: &[Client], screen: Option<&str>) -> bool {
+            let p = self.prepared(screen).await;
+            may_type(
+                self.repo.path(),
+                clients,
+                &Default::default(),
+                &mut self.driver,
+                &p,
+            )
+        }
+    }
+
+    /// The last look before typing is made from the live state on the loop
+    /// and the repo as it is on disk: every change already made by then,
+    /// folded or not, vetoes the send. What changes after it is the
+    /// acknowledged race.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn any_change_before_the_last_look_vetoes_a_typed_send() {
+        assert!(Claimed::new().may_type(&[], Some(CODEX_EMPTY)).await);
+        for change in [
+            "draft",
+            "no screen",
+            "newer turn",
+            "auto off",
+            "deliverer",
+            "rebound",
+            "block",
+            "off the roster",
+            "role on disk",
+            "work done on disk",
+            "work cleared at a fold",
+        ] {
+            let mut c = Claimed::new();
+            let mut clients = Vec::new();
+            let mut screen = Some(CODEX_EMPTY.to_string());
+            match change {
+                "draft" => screen = Some(CODEX_EMPTY.replace("›    ", "› half")),
+                "no screen" => screen = None,
+                "newer turn" => append(&c.record, &STARTED.replace("\"T\"", "\"t2\"")),
+                "auto off" => {
+                    crate::agent_store::update_agent_config(c.repo.path(), &c.codex, |cfg| {
+                        cfg.auto_mode = Some(clank_core::AutoMode::Off);
+                    })
+                    .unwrap();
+                }
+                "deliverer" => clients.push(
+                    client(
+                        Served::Agent {
+                            author: c.codex.clone(),
+                        },
+                        "session-one",
+                    )
+                    .0,
+                ),
+                "rebound" => {
+                    crate::agent_store::bind_session_to_agent(
+                        c.repo.path(),
+                        &c.codex,
+                        clank_core::Tool::Codex,
+                        &clank_core::ids::SessionId::parse("session-two").unwrap(),
+                    )
+                    .unwrap();
+                }
+                "block" => {
+                    let blocks =
+                        crate::agent_store::agents_root(c.repo.path()).join("codex/blocks");
+                    std::fs::create_dir_all(&blocks).unwrap();
+                    std::fs::write(blocks.join("which.md"), "Which way?").unwrap();
+                }
+                "off the roster" => std::fs::write(
+                    c.repo.path().join(".clank/config.json"),
+                    r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
+                )
+                .unwrap(),
+                "role on disk" => std::fs::write(
+                    c.repo.path().join(".clank/config.json"),
+                    r#"{"agents":{"codex":{"tool":"codex","role":"commit"},"claude":{"tool":"claude","role":"master"}}}"#,
+                )
+                .unwrap(),
+                "work done on disk" => {
+                    let events = crate::agent_store::agents_root(c.repo.path()).join("codex/events");
+                    let key = clank_core::agent_config::TimerSource {
+                        interrupt: false,
+                        interrupt_message: None,
+                        name: "check".into(),
+                        repeat_every: None,
+                        due_at: "1970-01-01T00:01:40Z".into(),
+                        content: Some("scheduled work".into()),
+                    }
+                    .source_key(None);
+                    let mut log = crate::cli::github::log::EventLog::open(&events, &key).unwrap();
+                    log.append_checked_ack(c.owed.0, &c.owed.1).unwrap();
+                }
+                _ => {
+                    let f = crate::cli::recovery::Facts {
+                        obligated: false,
+                        ..c.facts()
+                    };
+                    c.driver.reconcile(vec![f], 10_001);
+                }
+            }
+            assert!(!c.may_type(&clients, screen.as_deref()).await, "{change}");
+        }
+    }
+
+    /// A vetoed send writes nothing and is answered as never sent: here
+    /// drafts already in the input at the last look, on the prompt row or
+    /// under blank rows of the input.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_draft_in_the_input_is_never_written_over() {
+        let band = |l: &str| format!("\u{1b}[48;5;236m{l}   \u{1b}[49m");
+        let screen = |rows: &[&str]| {
+            let rows: Vec<String> = [""]
+                .iter()
+                .chain(rows)
+                .chain(&[""])
+                .map(|l| band(l))
+                .collect();
+            format!("• done\n\n{}\n\u{1b}[m  ? for shortcuts", rows.join("\n"))
+        };
+        for draft in [
+            screen(&["› half"]),
+            screen(&["› ", "", "  unfinished draft"]),
+            screen(&["› ", "  draft", ""]),
+        ] {
+            let mut c = Claimed::new();
+            let (tx, mut answers) = tokio::sync::mpsc::unbounded_channel();
+            let mut owned = OwnedTasks::default();
+            let p = c.prepared(Some(&draft)).await;
+            send_typed(
+                c.repo.path(),
+                &[],
+                &Default::default(),
+                &mut c.driver,
+                p,
+                &tx,
+                &mut owned,
+            );
+            assert!(
+                owned.departing.is_empty(),
+                "no write was started: {draft:?}"
+            );
+            assert_eq!(answers.try_recv().unwrap().2, Answer::Unavailable);
+        }
+    }
+
+    /// A recurring occurrence acknowledged on disk is no longer owed at the
+    /// last look, though the monitor's own backlog would still list it
+    /// until its next invalidation: the look reads the backlog afresh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acknowledged_recurring_occurrence_is_not_owed_at_the_last_look() {
+        use crate::cli::github::log::EventLog;
+        let mut c = Claimed::new();
+        let events = crate::agent_store::agents_root(c.repo.path()).join("codex/events");
+        let mut timer = clank_core::agent_config::TimerSource {
+            interrupt: false,
+            interrupt_message: None,
+            name: "check".into(),
+            repeat_every: None,
+            due_at: "1970-01-01T00:01:40Z".into(),
+            content: Some("scheduled work".into()),
+        };
+        EventLog::open(&events, &timer.source_key(None))
+            .unwrap()
+            .append_checked_ack(c.owed.0, &c.owed.1)
+            .unwrap();
+        timer.name = "recurring".into();
+        timer.repeat_every = Some("60s".into());
+        let r = crate::cli::timer_source::recurrence::Recurrence::parse(&timer, None).unwrap();
+        let mut log = EventLog::open(&events, &r.source_key()).unwrap();
+        log.accept_recurring(&r, "recurring work", 100).unwrap();
+        let row = log.read_rows().unwrap().unwrap().rows[0].clone();
+        assert!(c.may_type(&[], Some(CODEX_EMPTY)).await, "owed");
+        log.append_checked_ack(row.seq, &row.ident).unwrap();
+        assert!(!c.may_type(&[], Some(CODEX_EMPTY)).await, "acknowledged");
     }
 
     fn records() -> crate::cli::recovery::RecordWatch {
@@ -4767,6 +5204,7 @@ mod recovery_tests {
             &clients,
             vec![dispatch(&author)],
             &tx,
+            &tokio::sync::mpsc::unbounded_channel().0,
             &records(),
             &mut owned,
         );
@@ -4796,6 +5234,7 @@ mod recovery_tests {
             &[],
             vec![dispatch(&author)],
             &tx,
+            &tokio::sync::mpsc::unbounded_channel().0,
             &records(),
             &mut owned,
         );
@@ -4853,37 +5292,6 @@ mod recovery_tests {
         let note: Note = serde_json::from_str(stale_rx.try_recv().unwrap().trim_end()).unwrap();
         assert!(matches!(note, Note::Refused { .. }), "{note:?}");
         assert!(clients.is_empty());
-    }
-
-    /// A notice is a row a person sees in the timeline, already handled:
-    /// it tells, and owes the agent nothing.
-    #[tokio::test]
-    async fn a_notice_is_a_handled_timeline_row() {
-        let repo = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("codex").unwrap();
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let mut owned = OwnedTasks::default();
-        act_on_recovery(
-            repo.path(),
-            &[],
-            vec![Act::Notice {
-                author: author.clone(),
-                key: "session-one:t1".into(),
-                text: "codex's turn failed (server_overloaded)".into(),
-            }],
-            &tx,
-            &records(),
-            &mut owned,
-        );
-        let snapshot = crate::cli::github::timeline::timeline_snapshot(repo.path());
-        assert_eq!(snapshot.events.len(), 1, "{:?}", snapshot.notices);
-        let event = &snapshot.events[0];
-        assert_eq!(
-            event.content.as_deref(),
-            Some("codex's turn failed (server_overloaded)")
-        );
-        assert!(!event.unhandled, "a notice is not work");
-        assert_eq!(event.seen_by, vec!["codex".to_string()]);
     }
 
     /// Obligation is what a newly arriving waiter would be handed, a
@@ -4959,11 +5367,7 @@ mod recovery_tests {
             "an agent with no bound session is not considered"
         );
         assert!(alone[0].obligated && !alone[0].delivering, "{alone:?}");
-        assert_eq!(
-            alone[0].stall_after,
-            Some(40 * 60),
-            "the configured interval"
-        );
+        assert_eq!(alone[0].blind_nudge, None, "off unless configured");
         assert!(!alone[0].attending);
         // A question from a session no longer the agent's is over at the
         // next fold.
@@ -5081,7 +5485,7 @@ mod recovery_tests {
         .unwrap();
         assert!(
             facts(&[])[0].attending,
-            "proven attendance ends stall eligibility"
+            "proven attendance holds recovery back"
         );
         std::fs::remove_file(&marker).unwrap();
 

@@ -1664,7 +1664,7 @@ pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<Subscri
 // Terminal transport and provider key knowledge live in one module.
 #[cfg(test)]
 use super::pane_input::{codex_submit_argv, say_argvs, stop_argv};
-pub(crate) use super::pane_input::{say_to_pane_for_tool, stop_pane};
+pub(crate) use super::pane_input::{stop_pane, submit_async};
 
 /// Execute one typed terminal-input action. Provider policy belongs to pane_input;
 /// this remains the sole module that starts Zellij subprocesses.
@@ -1683,6 +1683,26 @@ pub(crate) fn write_pane_action(session: &str, pane: &str, argv: &[String]) -> a
     Ok(())
 }
 
+/// `pane`'s screen in `session`, its colours kept, or `None` when zellij
+/// does not answer within its budget.
+pub(crate) async fn dump_pane_screen(session: &str, pane: &str) -> Option<String> {
+    let argv = [
+        "zellij",
+        "--session",
+        session,
+        "action",
+        "dump-screen",
+        "--pane-id",
+        pane,
+        "--ansi",
+    ]
+    .map(str::to_string);
+    let out = run_open_query(&argv, std::time::Duration::from_secs(3))
+        .await
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
 /// Event-loop-safe input with bounded I/O. A timeout is an uncertain mutation,
 /// not evidence that the server ignored the bytes: callers must not resend it.
 pub(crate) async fn write_pane_action_async(
@@ -1690,20 +1710,49 @@ pub(crate) async fn write_pane_action_async(
     pane: &str,
     argv: &[String],
 ) -> anyhow::Result<()> {
+    write_pane_action_classified(session, pane, argv)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Why a terminal write did not complete, as what it may have done.
+#[derive(Debug)]
+pub(crate) enum PaneWrite {
+    /// The transport never ran: nothing was written.
+    NotStarted(String),
+    /// It ran, and may have written some or all of it.
+    Unknown(String),
+}
+
+impl std::fmt::Display for PaneWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaneWrite::NotStarted(e) | PaneWrite::Unknown(e) => f.write_str(e),
+        }
+    }
+}
+
+/// [`write_pane_action_async`], saying whether a failure wrote nothing.
+pub(crate) async fn write_pane_action_classified(
+    session: &str,
+    pane: &str,
+    argv: &[String],
+) -> Result<(), PaneWrite> {
     let mut command = tokio::process::Command::new("zellij");
     command.args(["--session", session]).args(argv);
-    let status = run_pane_write(&mut command, std::time::Duration::from_secs(3)).await?;
-    anyhow::ensure!(
-        status.success(),
-        "zellij refused terminal input for {pane}: {status}"
-    );
-    Ok(())
+    run_pane_write(&mut command, std::time::Duration::from_secs(3))
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            PaneWrite::Unknown(e) => PaneWrite::Unknown(format!("terminal input for {pane}: {e}")),
+            not_started => not_started,
+        })
 }
 
 async fn run_pane_write(
     command: &mut tokio::process::Command,
     budget: std::time::Duration,
-) -> anyhow::Result<std::process::ExitStatus> {
+) -> Result<std::process::ExitStatus, PaneWrite> {
     use tokio::io::AsyncReadExt;
     command
         .stdin(std::process::Stdio::null())
@@ -1713,7 +1762,7 @@ async fn run_pane_write(
         .kill_on_drop(true);
     let mut child = command
         .spawn()
-        .context("starting terminal input transport")?;
+        .map_err(|e| PaneWrite::NotStarted(format!("starting terminal input transport: {e}")))?;
     let mut group = super::wait::GroupKill::over(child.id());
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
@@ -1742,18 +1791,18 @@ async fn run_pane_write(
     }
     match result {
         Ok(Ok(status)) if status.success() => Ok(status),
-        Ok(Ok(status)) => anyhow::bail!(
+        Ok(Ok(status)) => Err(PaneWrite::Unknown(format!(
             "terminal input transport exited {status}; stderr: {}",
             tail.into_string()
-        ),
-        Ok(Err(error)) => anyhow::bail!(
+        ))),
+        Ok(Err(error)) => Err(PaneWrite::Unknown(format!(
             "terminal input transport failed: {error}; acceptance is unknown; stderr: {}",
             tail.into_string()
-        ),
-        Err(_) => anyhow::bail!(
+        ))),
+        Err(_) => Err(PaneWrite::Unknown(format!(
             "terminal input transport timed out after {budget:?}; acceptance is unknown; stderr: {}",
             tail.into_string()
-        ),
+        ))),
     }
 }
 

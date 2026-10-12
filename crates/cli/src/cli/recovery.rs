@@ -150,6 +150,12 @@ impl Snapshot {
         self.turns.back()
     }
 
+    /// Whether [`Self::latest`] is the record's latest turn: not when the
+    /// record was entered mid-turn.
+    pub(crate) fn anchored(&self) -> bool {
+        !self.unanchored
+    }
+
     /// The turns' ids, oldest first.
     pub(crate) fn ids(&self) -> impl Iterator<Item = &str> {
         self.turns.iter().map(|t| t.id.as_str())
@@ -178,6 +184,9 @@ pub(crate) struct RecordReader {
     /// The bound session, for a record that interleaves several.
     session: String,
     current: Option<String>,
+    /// The current turn has ended: Claude closes a failed turn with the
+    /// same marker as a finished one, and the first end is the true one.
+    ended: bool,
 }
 
 impl RecordReader {
@@ -186,6 +195,7 @@ impl RecordReader {
             tool,
             session: session.to_string(),
             current: None,
+            ended: false,
         }
     }
 
@@ -197,8 +207,16 @@ impl RecordReader {
             Tool::Grok => grok(&v),
             Tool::OpenCode => observed(&v, &self.session),
         }?;
-        if let Fact::Started { id, .. } = &fact {
-            self.current = Some(id.clone());
+        match &fact {
+            Fact::Started { id, .. } => {
+                self.current = Some(id.clone());
+                self.ended = false;
+            }
+            Fact::Ended { id: None, .. } if self.ended && self.tool == Tool::Claude => {
+                return None;
+            }
+            Fact::Ended { .. } => self.ended = true,
+            Fact::NativeRetry => self.ended = false,
         }
         Some(fact)
     }
@@ -236,13 +254,29 @@ fn codex(v: &serde_json::Value) -> Option<Fact> {
 }
 
 /// Claude's transcript. A new turn is a user record whose `promptId` has
-/// changed; a tool result shares its turn's id. A failure names no turn.
+/// changed; a tool result shares its turn's id. A failure, a person's
+/// interrupt and the `turn_duration` written as any turn closes name no
+/// turn.
 fn claude(v: &serde_json::Value, current: Option<&str>) -> Option<Fact> {
     match v.get("type")?.as_str()? {
+        "system" if string(v, "subtype").as_deref() == Some("turn_duration") => Some(Fact::Ended {
+            id: None,
+            outcome: Outcome::Completed,
+        }),
         "user" => {
             let id = string(v, "promptId")?;
             if Some(id.as_str()) == current {
-                return None;
+                let interrupted = v
+                    .get("message")?
+                    .get("content")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b.get("text")?.as_str())
+                    .any(|t| t.starts_with("[Request interrupted by user"));
+                return interrupted.then_some(Fact::Ended {
+                    id: None,
+                    outcome: Outcome::Interrupted,
+                });
             }
             let text = match v.get("message")?.get("content")? {
                 serde_json::Value::String(s) => Some(s.clone()),
@@ -442,6 +476,9 @@ pub(crate) enum Transport {
     /// A recovery helper parked on the monitor, which hands the wake to the
     /// harness and answers through [`reply_path`].
     Helper,
+    /// The wake typed into the agent's pane and submitted, with no
+    /// interrupt, after a last look at its input line.
+    Typed,
 }
 
 impl Transport {
@@ -449,23 +486,24 @@ impl Transport {
         match self {
             Transport::CodexStart => "codex-start",
             Transport::Helper => "helper",
+            Transport::Typed => "typed",
         }
     }
 }
 
-/// The transport clank may use for `tool`, if any.
-///
-/// Empty until each harness's live capability check passes: whether a
-/// start on a busy session queues or cancels is unknown for every harness,
-/// and recovery must never cancel a turn. An agent with no transport is
-/// told about its failure and waits for a person.
-pub(crate) fn transport_for(tool: Tool) -> Option<Transport> {
+/// The transport clank may use for `tool`, or why it may not: the harness's
+/// resume capability ([`crate::cli::resume`]), which committed evidence for
+/// its installed version must enable. Recovery never cancels a turn, so a
+/// harness with none waits for a person.
+pub(crate) fn transport_for(tool: Tool) -> Result<Transport, &'static str> {
     #[cfg(test)]
     if let Some(t) = tests::enabled(tool) {
-        return t;
+        return t.ok_or(crate::cli::resume::NO_EVIDENCE);
     }
-    let _ = tool;
-    None
+    match crate::cli::resume::resume_for(tool)? {
+        crate::cli::resume::Resume::TypedSubmit => Ok(Transport::Typed),
+        crate::cli::resume::Resume::Plugin => Ok(Transport::Helper),
+    }
 }
 
 /// Every turn clank has asked for in an episode.
@@ -534,6 +572,29 @@ pub(crate) struct Episode {
     /// Deadlines at which the record could not be read.
     #[serde(default)]
     pub(crate) unobserved: u32,
+    #[serde(default)]
+    pub(crate) kind: Kind,
+    /// A fallback's interval, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) every: Option<u64>,
+    /// The roster role it was opened under: its attempts are that role's,
+    /// and another role's fold or restart ends it.
+    #[serde(default)]
+    pub(crate) role: String,
+}
+
+/// What opened an episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Kind {
+    /// A turn that ended on a provider error.
+    #[default]
+    Failed,
+    /// A turn that ended the ordinary way with work still owed, and no
+    /// wait to take it.
+    Idle,
+    /// `recovery.blind_nudge`: work owed, and a record that cannot be read.
+    Fallback,
 }
 
 impl Episode {
@@ -602,7 +663,15 @@ pub(crate) enum Answer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Effect {
     Dispatch { n: u32, tag: String, target: String },
-    Notice(String),
+}
+
+/// `recovery.blind_nudge` for an agent whose record cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fallback {
+    /// The stuck interval: the agent's owed work, by its items' stable
+    /// identities. Different work is a different interval.
+    pub(crate) identity: String,
+    pub(crate) every: u64,
 }
 
 /// What a decision needs besides the episode and the snapshot.
@@ -611,15 +680,22 @@ pub(crate) struct Ctx<'a> {
     pub(crate) session: &'a str,
     pub(crate) tool: Tool,
     pub(crate) transport: Option<Transport>,
-    /// Why `transport` is `None`, for the agent's notice.
+    /// Why `transport` is `None`, for the agent's status.
     pub(crate) no_transport: &'static str,
     /// What the monitor found when it checked, where it checked.
     pub(crate) gate: Option<Gate>,
+    /// The agent owes work and has no wait to take it.
+    pub(crate) obligated: bool,
+    /// Its record is being read.
+    pub(crate) readable: bool,
+    pub(crate) fallback: Option<Fallback>,
+    /// The agent's roster role.
+    pub(crate) role: &'a str,
+    /// The highest attempt number ever issued to this agent, in any
+    /// episode or interval: a claim continues past it, so no two attempts,
+    /// their answers, tags or history share an identity.
+    pub(crate) issued: u32,
 }
-
-/// Why an agent with no transport is left to a person.
-pub(crate) const NOT_ENABLED: &str = "automatic retry is not enabled for this harness";
-pub(crate) const AUTO_OFF: &str = "auto mode is off";
 
 /// How long a claimed attempt has for its transport to answer.
 pub(crate) const ANSWER_WITHIN: u64 = 60;
@@ -629,6 +705,16 @@ pub(crate) const CONFIRM_WITHIN: u64 = 120;
 /// many absent transports it tolerates.
 const RETRY_LOOK: u64 = 60;
 const UNAVAILABLE_LIMIT: usize = 3;
+/// The waits before an idle agent's nudges: a minute for its state to
+/// settle and two more, then fifteen after a nudged turn that took nothing
+/// up.
+const IDLE_WAITS: &[u64] = &[180, 900];
+pub(crate) const IDLE: &str = "idle";
+pub(crate) const FALLBACK: &str = "fallback";
+/// A blind nudge's checks that found nothing to send to, and the longest
+/// it waits between them.
+const FALLBACK_CHECKS: usize = 5;
+const FALLBACK_CEILING: u64 = 4 * 3600;
 
 /// The episode the agent's current state calls for.
 ///
@@ -648,39 +734,69 @@ pub(crate) fn decide(
         // same failed turn is stuck again later, it is a new episode.
         return (None, Vec::new());
     }
-    let before = prev.clone();
-    let mut ep = prev.filter(|e| e.session == ctx.session);
+    // An episode is its session's and its role's: another role owes other
+    // work, so what was armed for the old one is over, however late the
+    // change is seen.
+    let mut ep = prev
+        .filter(|e| e.session == ctx.session && e.role == ctx.role)
+        .filter(|e| e.kind != Kind::Fallback || fallback_stands(e, ctx));
 
-    if let Some(e) = ep.as_mut().filter(|e| e.live()) {
+    if let Some(e) = ep.as_mut().filter(|e| e.live() && e.kind != Kind::Fallback) {
         follow(e, snap, ctx);
     }
-    if ep.as_ref().is_none_or(|e| !e.live())
-        && let Some(latest) = snap.latest()
-        && let Outcome::Failed(class) = &latest.outcome
-        && !latest.retrying
-        && ep.as_ref().is_none_or(|closed| !closed.owns(&latest.id))
+    let free = |ep: &Option<Episode>, id: &str| {
+        ep.as_ref()
+            .is_none_or(|e| !e.live() && e.kind != Kind::Fallback && !e.owns(id))
+    };
+    if let Some(latest) = snap.latest().filter(|t| !t.retrying)
+        && free(&ep, &latest.id)
     {
-        ep = Some(opened(latest.id.clone(), class.clone(), ctx));
+        match &latest.outcome {
+            Outcome::Failed(class) => {
+                ep = Some(opened(Kind::Failed, latest.id.clone(), class.clone(), ctx))
+            }
+            Outcome::Completed if ctx.obligated && snap.anchored() => {
+                ep = Some(opened(Kind::Idle, latest.id.clone(), IDLE.into(), ctx))
+            }
+            _ => {}
+        }
+    }
+    if ep
+        .as_ref()
+        .is_none_or(|e| !e.live() && e.kind != Kind::Fallback)
+        && ctx.obligated
+        && !ctx.readable
+        && let Some(f) = &ctx.fallback
+    {
+        ep = Some(Episode {
+            kind: Kind::Fallback,
+            every: Some(f.every),
+            next_at: Some(ctx.now + f.every),
+            ..blank(f.identity.clone(), String::new(), FALLBACK.into(), ctx)
+        });
     }
 
     let mut effects = Vec::new();
-    if let Some(e) = ep.as_mut().filter(|e| e.live())
-        && let Some(fx) = due(e, snap, ctx)
-    {
-        effects.push(fx);
+    if let Some(e) = ep.as_mut().filter(|e| e.live()) {
+        match (ctx.gate, e.state, e.next_at) {
+            // Held: no deadline, so nothing looks again until a fold says
+            // the hold is over.
+            (Some(Gate::Hold | Gate::AutoOff), State::Waiting, _) => e.next_at = None,
+            (_, State::Waiting, None) => e.next_at = Some(ctx.now + RETRY_LOOK),
+            _ => effects.extend(due(e, snap, ctx)),
+        }
     }
-    effects.extend(notice(before.as_ref(), ep.as_ref()).map(Effect::Notice));
     (ep, effects)
 }
 
-/// What a person is told by the move from `prev` to `next`: the notice of
-/// an episode that has just escalated, and nothing for one already told.
-fn notice(prev: Option<&Episode>, next: Option<&Episode>) -> Option<String> {
-    let next = next.filter(|e| e.state == State::Escalated)?;
-    let told = prev.is_some_and(|p| {
-        p.state == State::Escalated && p.session == next.session && p.opened_by == next.opened_by
-    });
-    (!told).then(|| next.notice.clone()).flatten()
+/// Whether a fallback episode still describes the agent: its record still
+/// unreadable and its work the same. Otherwise it is over, and forgotten.
+fn fallback_stands(e: &Episode, ctx: &Ctx) -> bool {
+    !ctx.readable
+        && ctx
+            .fallback
+            .as_ref()
+            .is_some_and(|f| f.identity == e.opened_by)
 }
 
 impl Episode {
@@ -693,36 +809,81 @@ impl Episode {
                 .iter()
                 .any(|a| a.started.as_deref() == Some(id))
     }
+
+    /// The wait before the next attempt, or why there is none. A failure
+    /// keeps its class's budget; an idle episode has its own, and a nudged
+    /// turn that fails spends from both, so switching refunds nothing.
+    fn next_wait(&self) -> Result<u64, &'static str> {
+        let spent = self.spent();
+        let budget = match self.class.as_str() {
+            IDLE => IDLE_WAITS,
+            class => retries(class),
+        };
+        if budget.is_empty() {
+            return Err("this kind of failure needs a person");
+        }
+        let idle_left = self.kind != Kind::Idle || spent < IDLE_WAITS.len();
+        match budget.get(spent) {
+            Some(wait) if idle_left => Ok(*wait),
+            _ if self.kind == Kind::Idle => Err("nudging did not get it going"),
+            _ => Err("retrying did not recover it"),
+        }
+    }
+
+    /// The outcome a turn must have to be what this episode is about.
+    fn targets(&self, outcome: &Outcome) -> bool {
+        match self.class.as_str() {
+            IDLE => *outcome == Outcome::Completed,
+            _ => matches!(outcome, Outcome::Failed(_)),
+        }
+    }
 }
 
-fn opened(id: String, class: String, ctx: &Ctx) -> Episode {
-    let mut e = Episode {
+fn blank(opened_by: String, turn: String, class: String, ctx: &Ctx) -> Episode {
+    Episode {
         session: ctx.session.to_string(),
-        opened_by: id.clone(),
-        failed_turn: id,
-        class: class.clone(),
+        opened_by,
+        failed_turn: turn,
+        class,
         attempts: Vec::new(),
         next_at: None,
         state: State::Waiting,
         notice: None,
         unobserved: 0,
+        kind: Kind::Failed,
+        every: None,
+        role: ctx.role.to_string(),
+    }
+}
+
+fn opened(kind: Kind, id: String, class: String, ctx: &Ctx) -> Episode {
+    let mut e = Episode {
+        kind,
+        ..blank(id.clone(), id, class, ctx)
     };
-    if ctx.transport.is_none() {
+    // An idle agent is given its settle period first, transport or not: a
+    // turn's end is read moments before the Stop hook parks it.
+    if kind == Kind::Failed && ctx.transport.is_none() {
         escalate(&mut e, ctx, ctx.no_transport);
         return e;
     }
-    match retries(&class).first() {
-        None => escalate(&mut e, ctx, "this kind of failure needs a person"),
-        Some(wait) => e.next_at = Some(ctx.now + wait),
+    match e.next_wait() {
+        Err(why) => escalate(&mut e, ctx, why),
+        Ok(wait) => e.next_at = Some(ctx.now + wait),
     }
     e
 }
 
 fn escalate(e: &mut Episode, ctx: &Ctx, why: &str) {
+    let tool = ctx.tool.as_str();
+    let what = match e.kind {
+        Kind::Failed => format!("{tool}'s turn failed ({})", e.class),
+        Kind::Idle if e.class == IDLE => format!("{tool} is idle with pending work"),
+        Kind::Idle => format!("{tool}'s nudged turn failed ({})", e.class),
+        Kind::Fallback => format!("{tool} has pending work and its record cannot be read"),
+    };
     e.notice = Some(format!(
-        "{}'s turn failed ({}) and {why}; its pending work is waiting for you",
-        ctx.tool.as_str(),
-        e.class
+        "{what} and {why}; its pending work is waiting for you"
     ));
     e.state = State::Escalated;
     e.next_at = None;
@@ -732,7 +893,7 @@ fn escalate(e: &mut Episode, ctx: &Ctx, why: &str) {
 fn follow(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) {
     if snap
         .find(&e.failed_turn)
-        .is_some_and(|t| matches!(t.outcome, Outcome::Completed | Outcome::Interrupted))
+        .is_some_and(|t| !e.targets(&t.outcome) && t.outcome != Outcome::Running)
     {
         // The harness's own retry finished it, or somebody stopped it.
         close(e);
@@ -781,32 +942,32 @@ fn follow(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) {
         .filter(|a| a.disposition == Disposition::Started)
         .and_then(|a| a.started.as_deref())
         .and_then(|id| snap.find(id))
+        // Already this episode's target: decided when it ended.
+        .filter(|t| t.id != e.failed_turn)
     else {
         return;
     };
-    match (&turn.outcome, e.state) {
-        (Outcome::Running, _) => {}
-        (Outcome::Completed | Outcome::Interrupted, _) => close(e),
-        (Outcome::Failed(class), State::Running) => {
-            e.failed_turn = turn.id.clone();
-            e.class = class.clone();
-            let budget = retries(class);
-            match budget.get(e.spent()) {
-                _ if ctx.transport.is_none() => escalate(e, ctx, ctx.no_transport),
-                Some(wait) => {
-                    e.state = State::Waiting;
-                    e.next_at = Some(ctx.now + wait);
-                }
-                None if budget.is_empty() => {
-                    escalate(e, ctx, "this kind of failure needs a person")
-                }
-                None => escalate(e, ctx, "retrying did not recover it"),
-            }
-        }
+    let next = match (&turn.outcome, e.state) {
+        (Outcome::Running, _) => return,
+        // A nudged turn that ended and left the work owed, with no wait to
+        // take it: still idle, on the same budget.
+        (Outcome::Completed, State::Running) if e.kind == Kind::Idle => IDLE.to_string(),
+        (Outcome::Completed | Outcome::Interrupted, _) => return close(e),
+        (Outcome::Failed(class), State::Running) => class.clone(),
         // Already decided: waiting for the next attempt, or latched for a
         // person, whom a late failure of the uncertain attempt changes
         // nothing for.
-        (Outcome::Failed(_), _) => {}
+        (Outcome::Failed(_), _) => return,
+    };
+    e.failed_turn = turn.id.clone();
+    e.class = next;
+    match e.next_wait() {
+        _ if ctx.transport.is_none() => escalate(e, ctx, ctx.no_transport),
+        Ok(wait) => {
+            e.state = State::Waiting;
+            e.next_at = Some(ctx.now + wait);
+        }
+        Err(why) => escalate(e, ctx, why),
     }
 }
 
@@ -821,7 +982,11 @@ impl Attempt {
             Disposition::Unavailable | Disposition::Refused
         ) && (self.started.as_deref() == Some(turn.id.as_str())
             || self.tag == turn.id
-            || turn.text.as_deref().is_some_and(|t| t.contains(&self.tag)))
+            // Delimited, so attempt 1's tag is not read in attempt 12's.
+            || turn
+                .text
+                .as_deref()
+                .is_some_and(|t| t.contains(&format!("({})", self.tag))))
     }
 }
 
@@ -836,6 +1001,19 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
         return None;
     }
     match e.state {
+        State::Waiting if e.kind == Kind::Fallback => {
+            // Its record is unreadable by definition, so that is no reason
+            // to wait; anything else the gate says is.
+            if !matches!(ctx.gate, Some(Gate::Go | Gate::Unobserved)) {
+                e.next_at = Some(ctx.now + fallback_wait(e));
+                return None;
+            }
+            let Some(transport) = ctx.transport else {
+                escalate(e, ctx, ctx.no_transport);
+                return None;
+            };
+            Some(claim(e, transport, ctx))
+        }
         State::Waiting => {
             if ctx.gate == Some(Gate::Unobserved) {
                 e.unobserved += 1;
@@ -854,31 +1032,15 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
                 escalate(e, ctx, ctx.no_transport);
                 return None;
             };
-            let current = snap.latest().is_some_and(|t| {
-                t.id == e.failed_turn && matches!(t.outcome, Outcome::Failed(_)) && !t.retrying
-            });
+            let current = snap.anchored()
+                && snap
+                    .latest()
+                    .is_some_and(|t| t.id == e.failed_turn && e.targets(&t.outcome) && !t.retrying);
             if !current {
                 e.next_at = Some(ctx.now + RETRY_LOOK);
                 return None;
             }
-            let n = e.attempts.iter().map(|a| a.n).max().unwrap_or(0) + 1;
-            let tag = format!("clank-recovery-{}-{n}", e.opened_by);
-            e.attempts.push(Attempt {
-                n,
-                claimed_at: ctx.now,
-                transport: transport.name().into(),
-                target: e.failed_turn.clone(),
-                tag: tag.clone(),
-                started: None,
-                disposition: Disposition::Claimed,
-            });
-            e.state = State::Dispatched;
-            e.next_at = Some(ctx.now + ANSWER_WITHIN);
-            Some(Effect::Dispatch {
-                n,
-                tag,
-                target: e.failed_turn.clone(),
-            })
+            Some(claim(e, transport, ctx))
         }
         State::Dispatched => {
             let why = match e.attempts.last_mut() {
@@ -895,52 +1057,103 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
     }
 }
 
+/// Claim the next attempt, durably before anything is sent.
+fn claim(e: &mut Episode, transport: Transport, ctx: &Ctx) -> Effect {
+    let n = e
+        .attempts
+        .iter()
+        .map(|a| a.n)
+        .chain([ctx.issued])
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let tag = format!("clank-recovery-{}-{n}", e.opened_by);
+    e.attempts.push(Attempt {
+        n,
+        claimed_at: ctx.now,
+        transport: transport.name().into(),
+        target: e.failed_turn.clone(),
+        tag: tag.clone(),
+        started: None,
+        disposition: Disposition::Claimed,
+    });
+    e.state = State::Dispatched;
+    e.next_at = Some(ctx.now + ANSWER_WITHIN);
+    Effect::Dispatch {
+        n,
+        tag,
+        target: e.failed_turn.clone(),
+    }
+}
+
+/// A blind nudge's wait before its next check: its interval, doubled for
+/// each check that found nothing to send to, up to four hours.
+fn fallback_wait(e: &Episode) -> u64 {
+    e.every
+        .unwrap_or(RETRY_LOOK)
+        .saturating_mul(1 << e.unavailable().min(16))
+        .min(FALLBACK_CEILING)
+}
+
 /// A transport's answer, applied only to the attempt it was given.
-pub(crate) fn answered(
-    mut e: Episode,
-    n: u32,
-    answer: Answer,
-    ctx: &Ctx,
-) -> (Episode, Vec<Effect>) {
+pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Episode {
     let current = e.state == State::Dispatched
         && e.attempts
             .last()
             .is_some_and(|a| a.n == n && a.disposition == Disposition::Claimed);
     if !current {
-        return (e, Vec::new());
+        return e;
     }
     let a = e.attempts.last_mut().expect("checked");
     match answer {
+        Answer::Submitted { started } if e.kind == Kind::Fallback => {
+            // With its record unreadable nothing can confirm it, so it is
+            // never sent again in this interval.
+            a.disposition = Disposition::Submitted;
+            a.started = started;
+            escalate(
+                &mut e,
+                ctx,
+                "a blind nudge was sent that clank cannot see the outcome of",
+            );
+        }
         Answer::Submitted { started } => {
             a.disposition = Disposition::Submitted;
             a.started = started;
             e.next_at = Some(a.claimed_at + CONFIRM_WITHIN);
-            (e, Vec::new())
         }
         Answer::Refused => {
             a.disposition = Disposition::Refused;
             close(&mut e);
-            (e, Vec::new())
+        }
+        Answer::Unavailable if e.kind == Kind::Fallback => {
+            a.disposition = Disposition::Unavailable;
+            if e.unavailable() >= FALLBACK_CHECKS {
+                escalate(
+                    &mut e,
+                    ctx,
+                    "a blind nudge never found it ready to take one",
+                );
+            } else {
+                e.state = State::Waiting;
+                e.next_at = Some(ctx.now + fallback_wait(&e));
+            }
         }
         Answer::Unavailable => {
             a.disposition = Disposition::Unavailable;
             if e.unavailable() >= UNAVAILABLE_LIMIT {
                 escalate(&mut e, ctx, "its recovery transport never answered");
-                let text = e.notice.clone().expect("escalated");
-                (e, vec![Effect::Notice(text)])
             } else {
                 e.state = State::Waiting;
                 e.next_at = Some(ctx.now + RETRY_LOOK);
-                (e, Vec::new())
             }
         }
         Answer::Indeterminate => {
             a.disposition = Disposition::Indeterminate;
             escalate(&mut e, ctx, "a retry may or may not have reached it");
-            let text = e.notice.clone().expect("escalated");
-            (e, vec![Effect::Notice(text)])
         }
     }
+    e
 }
 
 /// What the monitor knows about one roster agent at a fold.
@@ -954,8 +1167,12 @@ pub(crate) struct Facts {
     pub(crate) delivering: bool,
     /// A newly arriving waiter would be handed work.
     pub(crate) obligated: bool,
-    /// `recovery.stall_after`, in seconds; `None` is `off`.
-    pub(crate) stall_after: Option<u64>,
+    /// Its roster role.
+    pub(crate) role: String,
+    /// The stable identities of the work it owes.
+    pub(crate) work: Vec<String>,
+    /// `recovery.blind_nudge`, in seconds; `None` is `off`.
+    pub(crate) blind_nudge: Option<u64>,
     /// A question or block is pending, or attendance is proven: the agent
     /// is not stalled, whatever its record says.
     pub(crate) attending: bool,
@@ -975,11 +1192,7 @@ pub(crate) enum Act {
         transport: Transport,
         tag: String,
         target: String,
-    },
-    Notice {
-        author: clank_core::ids::AgentLabel,
-        /// Identifies the episode, so a notice is written once.
-        key: String,
+        /// What it submits.
         text: String,
     },
 
@@ -1039,17 +1252,14 @@ struct Watched {
     /// Answers that arrived during a hold, or whose decision could not be
     /// stored, applied in order by the next decision that is.
     answers: Vec<(AttemptRef, Answer)>,
-    /// The stall as last observed and decided, which a storage hold does
-    /// not hold back.
-    stall: Option<Stall>,
-    /// The stall as last stored: what its notice and status are told from.
-    stall_saved: Option<Stall>,
-    /// The stall interval while the agent is eligible for one, `None` while
-    /// it is not: what a stall decision is rebuilt from, whenever it is made.
-    stall_policy: Option<u64>,
-    /// The stall could not be stored: it is decided again at this time, by
-    /// the deadline path, and by nothing before it.
-    stall_held: Option<u64>,
+    role: String,
+    attending: bool,
+    asking: bool,
+    delivering: bool,
+    fallback: Option<Fallback>,
+    /// The activity last published, and since when.
+    activity: Option<(crate::cli::agent_state::Activity, u64)>,
+    published: Option<crate::cli::agent_state::AgentState>,
 }
 
 struct Reading {
@@ -1079,6 +1289,8 @@ pub(crate) struct Driver {
     /// agent's place on the roster, and the monitor itself.
     pending:
         std::collections::BTreeMap<(clank_core::ids::AgentLabel, AttemptRef), (PathBuf, Pending)>,
+    /// This monitor, as each published state names it.
+    observer: crate::cli::agent_state::Observer,
 }
 
 /// What an attempt's history record needs, as it was when dispatched, and
@@ -1088,6 +1300,12 @@ pub(crate) struct Pending {
     pub(crate) attempt: AttemptRef,
     pub(crate) at: u64,
     pub(crate) class: String,
+    #[serde(default)]
+    pub(crate) kind: Kind,
+    /// Its place in its own episode's budget: one for the first attempt
+    /// after any reset, whatever its number.
+    #[serde(default)]
+    pub(crate) ordinal: u32,
     /// [`Transport::name`].
     pub(crate) transport: String,
     pub(crate) text: String,
@@ -1106,13 +1324,31 @@ impl Pending {
                 "recovery:{}:{}:{}",
                 self.attempt.session, self.attempt.opened_by, self.attempt.n
             ),
-            trigger: crate::cli::nudge_log::Trigger::Retry {
-                class: self.class.clone(),
-                attempt: self.attempt.n,
-                of: retries(&self.class).len() as u32,
+            trigger: match (self.kind, self.class.as_str()) {
+                (Kind::Fallback, _) => crate::cli::nudge_log::Trigger::Fallback {
+                    attempt: self.place(),
+                },
+                (_, IDLE) => crate::cli::nudge_log::Trigger::Idle {
+                    attempt: self.place(),
+                    of: IDLE_WAITS.len() as u32,
+                },
+                (_, class) => crate::cli::nudge_log::Trigger::Retry {
+                    class: class.to_string(),
+                    attempt: self.place(),
+                    of: retries(class).len() as u32,
+                },
             },
             text: self.text.clone(),
             outcome,
+        }
+    }
+
+    /// Its place in its budget, for a pending attempt saved before places
+    /// were: its number, which was its place until a reset.
+    fn place(&self) -> u32 {
+        match self.ordinal {
+            0 => self.attempt.n,
+            n => n,
         }
     }
 
@@ -1159,6 +1395,7 @@ impl Driver {
             cwd,
             home,
             pending: Default::default(),
+            observer: crate::cli::agent_state::Observer::me(),
         }
     }
 
@@ -1169,7 +1406,7 @@ impl Driver {
                 author,
                 attempt,
                 transport,
-                tag,
+                text,
                 ..
             } = act
             else {
@@ -1178,18 +1415,27 @@ impl Driver {
             let Some(w) = self.agents.get(author) else {
                 continue;
             };
-            let class = w
+            let (class, kind, ordinal) = w
                 .episode
                 .as_ref()
                 .filter(|e| e.opened_by == attempt.opened_by)
-                .map(|e| e.class.clone())
+                .map(|e| {
+                    // A fallback sends at most once; its place is its check.
+                    let place = match e.kind {
+                        Kind::Fallback => e.attempts.len(),
+                        _ => e.spent(),
+                    };
+                    (e.class.clone(), e.kind, place as u32)
+                })
                 .unwrap_or_default();
             let pending = Pending {
                 attempt: attempt.clone(),
                 at: now,
                 class,
+                kind,
+                ordinal,
                 transport: transport.name().into(),
-                text: wake_text(tag),
+                text: text.clone(),
                 due: now + ANSWER_WITHIN,
             };
             self.pending.insert(
@@ -1322,9 +1568,8 @@ impl Driver {
                         .and_then(|e| e.next_at)
                         .map(|at| at.max(held))
                 };
-                [episode, w.stall_due()]
+                episode
             })
-            .flatten()
             .chain(self.pending.values().map(|(_, p)| p.due))
             .min()
     }
@@ -1368,13 +1613,24 @@ impl Driver {
                     held_until: None,
                     owed: false,
                     answers: Vec::new(),
-                    stall: load_stall(&f.agent_dir),
-                    stall_saved: load_stall(&f.agent_dir),
-                    stall_policy: None,
-                    stall_held: None,
+                    role: String::new(),
+                    attending: false,
+                    asking: false,
+                    delivering: false,
+                    fallback: None,
+                    activity: None,
+                    published: crate::cli::agent_state::load(&f.agent_dir),
                 });
             w.auto = f.auto;
             w.obligated = f.obligated && !f.delivering;
+            w.role = f.role.clone();
+            w.attending = f.attending;
+            w.asking = f.asking;
+            w.delivering = f.delivering;
+            w.fallback = f.blind_nudge.map(|every| Fallback {
+                identity: fallback_identity(&f.work),
+                every,
+            });
             if w.session != session {
                 acts.extend(decision(
                     &f.author,
@@ -1387,6 +1643,7 @@ impl Driver {
                 w.session = session;
                 w.tool = f.session.tool;
                 w.snap = Snapshot::default();
+                w.activity = None;
             }
             if !w.obligated {
                 let gate = if f.delivering {
@@ -1395,8 +1652,6 @@ impl Driver {
                     Gate::ObligationCleared
                 };
                 acts.extend(decision(&f.author, w, now, Some(gate), None));
-                w.stall_policy = None;
-                acts.extend(set_stall(&f.author, w, None, now));
                 if f.asking {
                     watch_record(w, &f.session, &self.cwd, &self.home);
                 } else {
@@ -1404,16 +1659,15 @@ impl Driver {
                 }
                 continue;
             }
-            let armed = watch_record(w, &f.session, &self.cwd, &self.home);
-            if armed {
-                acts.extend(decision(&f.author, w, now, None, None));
-            }
-            w.stall_policy = f.stall_after.filter(|_| f.auto && !f.attending);
-            let stall = stall_wanted(w, now, armed);
-            acts.extend(set_stall(&f.author, w, stall, now));
+            watch_record(w, &f.session, &self.cwd, &self.home);
+            // Decided on every fold: only a fold says whether the agent is
+            // still eligible, so only a fold can take away, or give back,
+            // its permission to be sent anything.
+            acts.extend(decision(&f.author, w, now, suppressed(w), None));
         }
         self.lost.clear();
         acts.extend(self.sync_watches());
+        self.publish(now);
         self.accounted(acts, now)
     }
 
@@ -1471,24 +1725,17 @@ impl Driver {
                             *source = again;
                         }
                     }
+                    let was = w.read.is_some();
                     let armed = ensure(w);
-                    if (armed || refresh(w)) && w.obligated {
-                        acts.extend(decision(author, w, now, None, None));
-                    }
-                    if let Some(s) = w.stall.clone()
-                        && (armed || s.state == StallState::Quiet || s.told())
-                        && record_mark(w) != s.mark
-                        && !w.told_latched()
-                    {
-                        // The record moved after a stop, or is another
-                        // record: counted from here.
-                        let again = Stall::waiting(&s.session, now, s.after, record_mark(w));
-                        acts.extend(set_stall(author, w, Some(again), now));
+                    let lost = !armed && !refresh(w) && was && w.read.is_none();
+                    if (armed || lost || w.read.is_some()) && w.obligated {
+                        acts.extend(decision(author, w, now, suppressed(w), None));
                     }
                 }
             }
         }
         acts.extend(self.sync_watches());
+        self.publish(now);
         self.accounted(acts, now)
     }
 
@@ -1512,27 +1759,30 @@ impl Driver {
                 .is_some_and(|at| at <= now)
                 || w.owed;
             let due = due && w.held_until.is_none_or(|at| at <= now);
-            let stalled = w.stall_due().is_some_and(|at| at <= now);
-            if !due && !stalled {
+            if !due {
                 continue;
             }
             let fresh = refresh(w);
             let mut g = gate(author, &w.session);
-            if stalled {
-                acts.extend(stall_expired(author, w, now, g));
-            }
-            if !due {
-                continue;
-            }
             if g == Gate::AutoOff {
                 w.auto = false;
-                g = Gate::Go;
             }
             if g == Gate::Go && !fresh {
                 g = Gate::Unobserved;
             }
+            // A decision owed across a hold is made from the agent as the
+            // folds since have left it, not only as the gate sees it now.
+            if !w.obligated {
+                g = match w.delivering {
+                    true => Gate::Deliverer,
+                    false => Gate::ObligationCleared,
+                };
+            } else if let (Gate::Go | Gate::Unobserved, Some(held)) = (g, suppressed(w)) {
+                g = held;
+            }
             acts.extend(decision(author, w, now, Some(g), None));
         }
+        self.publish(now);
         self.accounted(acts, now)
     }
 
@@ -1549,7 +1799,81 @@ impl Driver {
         if let Some(w) = self.agents.get_mut(author) {
             acts.extend(decision(author, w, now, None, Some((attempt, answer))));
         }
+        self.publish(now);
         self.accounted(acts, now)
+    }
+
+    /// Whether `attempt` may still be sent to `author` now: still this
+    /// agent's claimed attempt, on its binding and unsuppressed; the role
+    /// and work derived `live`, from disk at the send, still the ones it was
+    /// claimed under; and, the record read afresh, its target still the
+    /// latest, ended turn. A fallback's record must still be unreadable,
+    /// and its live work still the interval's.
+    pub(crate) fn may_send(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        attempt: &AttemptRef,
+        live: &Live,
+    ) -> bool {
+        let Some(w) = self.agents.get_mut(author) else {
+            return false;
+        };
+        let Some(e) = w.episode.clone() else {
+            return false;
+        };
+        let claimed = e.session == attempt.session
+            && e.opened_by == attempt.opened_by
+            && e.state == State::Dispatched
+            && e.attempts
+                .last()
+                .is_some_and(|a| a.n == attempt.n && a.disposition == Disposition::Claimed);
+        if !claimed
+            || w.session != attempt.session
+            || !w.obligated
+            || suppressed(w).is_some()
+            || live.role != e.role
+            || w.role != e.role
+            || live.work.is_empty()
+        {
+            return false;
+        }
+        if e.kind == Kind::Fallback {
+            return w.read.is_none()
+                && w.fallback.is_some()
+                && fallback_identity(&live.work) == e.opened_by;
+        }
+        refresh(w)
+            && w.snap.anchored()
+            && w.snap
+                .latest()
+                .is_some_and(|t| t.id == e.failed_turn && e.targets(&t.outcome) && !t.retrying)
+    }
+
+    /// Publish each agent's state that changed in meaning.
+    fn publish(&mut self, now: u64) {
+        for w in self.agents.values_mut() {
+            let activity = activity(w);
+            let since = match &w.activity {
+                Some((a, since)) if *a == activity => *since,
+                _ => now,
+            };
+            w.activity = Some((activity.clone(), since));
+            let state = crate::cli::agent_state::AgentState {
+                role: w.role.clone(),
+                session: w.session.clone(),
+                tool: w.tool,
+                monitor: self.observer.clone(),
+                activity,
+                since,
+                suppressors: suppressors(w),
+                nudge: nudge(w.episode.as_ref()),
+                cannot_resume: transport_for(w.tool).err().map(str::to_string),
+            };
+            if w.published.as_ref() != Some(&state) {
+                crate::cli::agent_state::store(&w.agent_dir, &state);
+                w.published = Some(state);
+            }
+        }
     }
 
     /// Answers helpers left beside their agents, and beside any agent that
@@ -1585,6 +1909,7 @@ impl Driver {
         for (author, attempt, answer) in &answered {
             self.settle(author, attempt, |p| p.outcome(answer), now);
         }
+        self.publish(now);
         self.accounted(acts, now)
     }
 }
@@ -1698,6 +2023,9 @@ fn refresh(w: &mut Watched) -> bool {
         return false;
     };
     let Ok(polled) = r.tail.poll() else {
+        // What was read no longer describes a record that can be read.
+        w.read = None;
+        w.snap = Snapshot::default();
         return false;
     };
     if polled.reset {
@@ -1737,14 +2065,26 @@ fn decision(
     gate: Option<Gate>,
     answer: Option<(&AttemptRef, Answer)>,
 ) -> Vec<Act> {
-    let transport = if w.auto { transport_for(w.tool) } else { None };
+    let (transport, no_transport) = match transport_for(w.tool) {
+        Ok(t) => (Some(t), ""),
+        Err(why) => (None, why),
+    };
+    let gate = match gate {
+        None if !w.auto => Some(Gate::AutoOff),
+        g => g,
+    };
     let ctx = Ctx {
         now,
         session: &w.session,
         tool: w.tool,
         transport,
-        no_transport: if w.auto { NOT_ENABLED } else { AUTO_OFF },
+        no_transport,
         gate,
+        obligated: w.obligated,
+        readable: w.read.is_some(),
+        fallback: w.fallback.clone(),
+        role: &w.role,
+        issued: 0,
     };
     w.answers
         .extend(answer.map(|(a, answer)| (a.clone(), answer)));
@@ -1753,25 +2093,50 @@ fn decision(
         w.owed = true;
         return Vec::new();
     }
+    // Read only past the hold, and after any answer is kept: a fault here
+    // holds new claims, never the results of claims already made.
+    let issued = match load_issued(&w.agent_dir) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "monitor: could not read `{author}`'s issued attempts, so nothing was done: {e}"
+            );
+            w.held_until = Some(now + RETRY_LOOK);
+            w.owed = true;
+            return Vec::new();
+        }
+    };
+    let ctx = Ctx { issued, ..ctx };
     let prev = w.episode.clone();
     let mut ep = prev.clone();
-    let mut effects = Vec::new();
     for (attempt, answer) in w.answers.clone() {
         ep = match ep {
             Some(e) if e.session == attempt.session && e.opened_by == attempt.opened_by => {
-                let (e, fx) = answered(e, attempt.n, answer, &ctx);
-                effects.extend(fx);
-                Some(e)
+                Some(answered(e, attempt.n, answer, &ctx))
             }
             other => other,
         };
     }
     // An answer may name a turn the record has already shown.
-    let (next, fx) = decide(ep, &w.snap, &ctx);
-    effects.extend(fx);
-    if next != prev
-        && let Err(e) = store(&w.agent_dir, next.as_ref())
-    {
+    let (next, effects) = decide(ep, &w.snap, &ctx);
+    let high = next
+        .iter()
+        .flat_map(|e| &e.attempts)
+        .map(|a| a.n)
+        .max()
+        .unwrap_or(0);
+    // The number is claimed before the episode that uses it, and neither
+    // is acted on until both are stored: an attempt's identity must
+    // outlive its episode, which a reset may forget.
+    let stored = match high > issued {
+        true => store_issued(&w.agent_dir, high),
+        false => Ok(()),
+    }
+    .and_then(|()| match next != prev {
+        true => store(&w.agent_dir, next.as_ref()),
+        false => Ok(()),
+    });
+    if let Err(e) = stored {
         eprintln!("monitor: could not record `{author}`'s recovery, so nothing was done: {e}");
         w.held_until = Some(now + RETRY_LOOK);
         w.owed = true;
@@ -1780,28 +2145,13 @@ fn decision(
     w.held_until = None;
     w.owed = false;
     w.answers.clear();
-    if next == prev {
-        return Vec::new();
-    }
-    // Told from where the stored state was to where it is now, never from
-    // a step on the way: an escalation the record has since overtaken was
-    // never stored, and is never told.
-    let told = notice(prev.as_ref(), next.as_ref());
     w.episode = next;
-    let ep = w.episode.as_ref();
-    let mut acts: Vec<Act> = told
-        .zip(ep)
-        .map(|(text, e)| Act::Notice {
-            author: author.clone(),
-            key: format!("{}:{}", e.session, e.opened_by),
-            text,
-        })
+    let Some(e) = w.episode.as_ref() else {
+        return Vec::new();
+    };
+    effects
         .into_iter()
-        .collect();
-    acts.extend(effects.into_iter().filter_map(|effect| match effect {
-        Effect::Notice(_) => None,
-        Effect::Dispatch { n, tag, target } => {
-            let e = ep.expect("a dispatch has an episode");
+        .filter_map(|Effect::Dispatch { n, tag, target }| {
             transport.map(|transport| Act::Dispatch {
                 author: author.clone(),
                 attempt: AttemptRef {
@@ -1810,303 +2160,133 @@ fn decision(
                     n,
                 },
                 transport,
+                text: match e.kind {
+                    Kind::Failed => wake_text(&tag),
+                    Kind::Idle | Kind::Fallback => nudge_text(&tag),
+                },
                 tag,
                 target,
             })
-        }
-    }));
-    acts
+        })
+        .collect()
 }
 
-/// The fallback for an eligible agent whose record shows no failure: told
-/// once, after `after` seconds in which its record has not moved. Notice
-/// only; it never starts or stops a turn.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Stall {
-    pub(crate) session: String,
-    /// When the record was last seen to move, or eligibility began.
-    pub(crate) since: u64,
-    pub(crate) after: u64,
-    /// The record as it was at `since`; `None` when there was none to read.
-    pub(crate) mark: Option<Mark>,
-    pub(crate) state: StallState,
+/// What is true of an agent at a send, derived from disk then rather than
+/// from the last fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Live {
+    pub(crate) role: String,
+    /// The stable identities of the work it owes.
+    pub(crate) work: Vec<String>,
 }
 
-/// Which record, and how far it had got: any difference is progress, an
-/// append or a slow tool's output as much as a replaced file of the same
-/// size.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Mark {
-    pub(crate) path: PathBuf,
-    pub(crate) ino: u64,
-    pub(crate) len: u64,
-    pub(crate) modified_ns: Option<u128>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub(crate) enum StallState {
-    Waiting,
-    /// The latest turn was stopped, or failed and is failed-turn recovery's.
-    /// Nothing until the record moves.
-    Quiet,
-    /// Latched until the agent stops being eligible.
-    Told {
-        notice: String,
-    },
-}
-
-impl Stall {
-    fn waiting(session: &str, now: u64, after: u64, mark: Option<Mark>) -> Self {
-        Stall {
-            session: session.to_string(),
-            since: now,
-            after,
-            mark,
-            state: StallState::Waiting,
-        }
-    }
-
-    fn told(&self) -> bool {
-        matches!(self.state, StallState::Told { .. })
-    }
-
-    fn same_interval(&self, other: &Stall) -> bool {
-        self.session == other.session && self.since == other.since
-    }
-}
-
-impl Watched {
-    /// The latch: a told stall that is stored for this same interval. One
-    /// not yet stored is only a candidate, which the record or eligibility
-    /// may still overtake.
-    fn told_latched(&self) -> bool {
-        match (&self.stall, &self.stall_saved) {
-            (Some(s), Some(saved)) => s.told() && saved.told() && s.same_interval(saved),
-            _ => false,
-        }
-    }
-
-    /// When the stall must be looked at: its deadline, or the end of a
-    /// storage hold that left a decision owed.
-    fn stall_due(&self) -> Option<u64> {
-        if let Some(held) = self.stall_held {
-            return Some(held);
-        }
-        self.stall
-            .as_ref()
-            .filter(|s| s.state == StallState::Waiting)
-            .map(|s| s.since + s.after)
-    }
-}
-
-/// The agent's record as it is now, the measure of its progress whatever
-/// the record says: a slow tool's output counts.
-fn record_mark(w: &Watched) -> Option<Mark> {
-    use std::os::unix::fs::MetadataExt;
-    let path = match (&w.read, &w.source) {
-        (Some(r), _) => &r.path,
-        (None, Some((_, Some(Source::At(path))))) => path,
-        _ => return None,
-    };
-    let m = std::fs::metadata(path).ok()?;
-    Some(Mark {
-        path: path.clone(),
-        ino: m.ino(),
-        len: m.len(),
-        modified_ns: m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos()),
-    })
-}
-
-/// The stall the agent should have now, from its current eligibility: kept
-/// across folds and restarts, begun afresh when it was not eligible before
-/// or its record is another one.
-fn stall_wanted(w: &Watched, now: u64, armed: bool) -> Option<Stall> {
-    let after = w.stall_policy?;
-    let mark = record_mark(w);
-    Some(match w.stall.clone() {
-        Some(s) if s.session == w.session && (!armed || w.told_latched() || mark == s.mark) => {
-            Stall { after, ..s }
-        }
-        _ => Stall::waiting(&w.session, now, after, mark),
-    })
-}
-
-/// A stall's deadline, or the end of a hold that left its decision owed:
-/// rebuilt from the agent's current eligibility, and at a deadline, a person
-/// is told unless the record moved, the latest turn was stopped or failed,
-/// or the agent is not eligible just now.
-fn stall_expired(
-    author: &clank_core::ids::AgentLabel,
-    w: &mut Watched,
-    now: u64,
-    gate: Gate,
-) -> Vec<Act> {
-    let latched = w.told_latched();
-    let next = match stall_wanted(w, now, false) {
-        Some(s) if s.state == StallState::Waiting && s.since + s.after <= now => {
-            stall_at_deadline(author, w, s, now, gate)
-        }
-        // A told stall a hold kept from being stored is decided again, at
-        // its deadline, from the record and the agent as they are now.
-        Some(s) if s.told() && !latched => stall_at_deadline(
-            author,
-            w,
-            Stall {
-                state: StallState::Waiting,
-                ..s
-            },
-            now,
-            gate,
-        ),
-        other => other,
-    };
-    set_stall(author, w, next, now)
-}
-
-fn stall_at_deadline(
-    author: &clank_core::ids::AgentLabel,
-    w: &Watched,
-    s: Stall,
-    now: u64,
-    gate: Gate,
-) -> Option<Stall> {
-    let mark = record_mark(w);
-    match gate {
-        Gate::Deliverer | Gate::SessionChanged | Gate::ObligationCleared | Gate::AutoOff => None,
-        // Not eligible just now: counted again from here.
-        Gate::Hold => Some(Stall::waiting(&s.session, now, s.after, mark)),
-        Gate::Go | Gate::Unobserved => stall_verdict(author, w, s, now, mark),
-    }
-}
-
-/// Whether the eligible agent's interval `s` has stalled, from its record
-/// and policy as they are now: re-armed if the record moved, still waiting
-/// if its current interval has not passed, quiet if the latest turn was
-/// stopped or failed, and told only otherwise. The one rule every told
-/// stall is made by, wherever it is decided or stored.
-fn stall_verdict(
-    author: &clank_core::ids::AgentLabel,
-    w: &Watched,
-    s: Stall,
-    now: u64,
-    mark: Option<Mark>,
-) -> Option<Stall> {
-    let after = w.stall_policy?;
-    if mark != s.mark {
-        return Some(Stall::waiting(&s.session, now, after, mark));
-    }
-    if s.since + after > now {
-        return Some(Stall {
-            after,
-            state: StallState::Waiting,
-            ..s
-        });
-    }
-    let latest = w.snap.latest().map(|t| &t.outcome);
-    let failing =
-        matches!(latest, Some(Outcome::Failed(_))) || w.episode.as_ref().is_some_and(|e| e.live());
-    let state = if failing || matches!(latest, Some(Outcome::Interrupted)) {
-        StallState::Quiet
+/// What holds the agent's nudges back just now, as the last fold saw it:
+/// manual mode, or a question, block or attendance.
+fn suppressed(w: &Watched) -> Option<Gate> {
+    if !w.auto {
+        Some(Gate::AutoOff)
+    } else if w.attending || w.asking {
+        Some(Gate::Hold)
     } else {
-        StallState::Told {
-            notice: format!(
-                "{author} has had pending work for {} and is not waiting for it",
-                crate::cli::config::show_duration(after)
-            ),
+        None
+    }
+}
+
+/// What the agent is doing, by what its record shows.
+fn activity(w: &Watched) -> crate::cli::agent_state::Activity {
+    use crate::cli::agent_state::Activity;
+    if w.asking {
+        return Activity::Asking;
+    }
+    if w.read.is_none() {
+        if !w.obligated {
+            return Activity::Unobserved;
         }
-    };
-    Some(Stall { after, state, ..s })
-}
-
-/// Make `next` the agent's stall, and store it unless storage is held.
-/// What is observed during a hold is kept, not dropped: the hold delays
-/// only the write, and the write at its end is of the latest state.
-fn set_stall(
-    author: &clank_core::ids::AgentLabel,
-    w: &mut Watched,
-    next: Option<Stall>,
-    now: u64,
-) -> Vec<Act> {
-    w.stall = next;
-    save_stall(author, w, now)
-}
-
-/// Store the stall if it differs from what is stored, telling a person if
-/// the stored stall has just become told: the notice follows the stored
-/// transition, never a state that was overtaken before it could be saved.
-fn save_stall(author: &clank_core::ids::AgentLabel, w: &mut Watched, now: u64) -> Vec<Act> {
-    if w.stall_held.is_some_and(|at| at > now) {
-        return Vec::new();
+        return Activity::Unknown(
+            match &w.source {
+                Some((_, Some(Source::At(_)))) => "its record could not be read",
+                Some((_, Some(_))) => "its record has not appeared yet",
+                _ => "no record was found for its session",
+            }
+            .into(),
+        );
     }
-    if let Some(s) = w.stall.clone()
-        && s.told()
-        && !w.told_latched()
-    {
-        // A notice not yet stored is still a candidate: whichever path
-        // stores it, it is first judged by the record as it is now. An
-        // unchanged mark means an unchanged record, so the turns already
-        // read still stand.
-        w.stall = stall_verdict(author, w, s, now, record_mark(w));
-    }
-    if w.stall == w.stall_saved {
-        // Nothing owed: whatever hold there was is over.
-        w.stall_held = None;
-        return Vec::new();
-    }
-    if let Err(e) = store_stall(&w.agent_dir, w.stall.as_ref()) {
-        eprintln!("monitor: could not record `{author}`'s stall, so nothing was done: {e}");
-        w.stall_held = Some(now + RETRY_LOOK);
-        return Vec::new();
-    }
-    w.stall_held = None;
-    let previous = std::mem::replace(&mut w.stall_saved, w.stall.clone());
-    let told_before = |s: &Stall| {
-        previous
-            .as_ref()
-            .is_some_and(|p| p.told() && p.same_interval(s))
-    };
-    match &w.stall {
-        Some(
-            s @ Stall {
-                state: StallState::Told { notice },
-                ..
-            },
-        ) if !told_before(s) => vec![Act::Notice {
-            author: author.clone(),
-            key: format!("{}:stall:{}", s.session, s.since),
-            text: notice.clone(),
-        }],
-        _ => Vec::new(),
-    }
-}
-
-pub(crate) fn stall_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("stall.json")
-}
-
-pub(crate) fn load_stall(agent_dir: &Path) -> Option<Stall> {
-    let raw = std::fs::read_to_string(stall_path(agent_dir)).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn store_stall(agent_dir: &Path, stall: Option<&Stall>) -> std::io::Result<()> {
-    let path = stall_path(agent_dir);
-    match stall {
-        None => match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+    match w.snap.latest().filter(|_| w.snap.anchored()) {
+        None => Activity::Unknown("its record shows no turn yet".into()),
+        Some(t) => match &t.outcome {
+            Outcome::Running => Activity::Working,
+            Outcome::Completed => Activity::Idle,
+            Outcome::Failed(class) => Activity::Failed(class.clone()),
+            Outcome::Interrupted => Activity::Interrupted,
         },
-        Some(stall) => {
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(stall)?)?;
-            std::fs::rename(&tmp, &path)
+    }
+}
+
+fn suppressors(w: &Watched) -> Vec<crate::cli::agent_state::Suppressor> {
+    use crate::cli::agent_state::Suppressor;
+    [
+        (w.attending, Suppressor::Attending),
+        (w.delivering, Suppressor::Delivering),
+        (
+            w.snap.latest().is_some_and(|t| t.retrying),
+            Suppressor::NativeRetry,
+        ),
+        (!w.auto, Suppressor::AutoOff),
+    ]
+    .into_iter()
+    .filter_map(|(on, s)| on.then_some(s))
+    .collect()
+}
+
+fn nudge(ep: Option<&Episode>) -> crate::cli::agent_state::Nudge {
+    use crate::cli::agent_state::Nudge;
+    match ep {
+        Some(e) => match e.state {
+            State::Waiting => e.next_at.map_or(Nudge::Nothing, Nudge::At),
+            State::Dispatched | State::Running => Nudge::InFlight,
+            State::Escalated => Nudge::WaitingForYou(e.notice.clone().unwrap_or_default()),
+            State::Closed => Nudge::Nothing,
+        },
+        None => Nudge::Nothing,
+    }
+}
+
+/// One stable name for `work`, whatever order it was listed in: FNV-1a,
+/// so the same work names the same interval across builds and restarts.
+fn fallback_identity(work: &[String]) -> String {
+    let mut sorted: Vec<&String> = work.iter().collect();
+    sorted.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for item in sorted {
+        for b in item.bytes().chain([0]) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
         }
     }
+    format!("fallback-{h:016x}")
+}
+
+/// The highest attempt number issued to the agent: control state, not
+/// history, and never forgotten with an episode.
+fn issued_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("recovery-issued.json")
+}
+
+/// The highest attempt number issued, zero when none ever was. A file
+/// that is there but cannot be read is an error, never zero.
+fn load_issued(agent_dir: &Path) -> std::io::Result<u32> {
+    match std::fs::read(issued_path(agent_dir)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+fn store_issued(agent_dir: &Path, n: u32) -> std::io::Result<()> {
+    let path = issued_path(agent_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&n)?)?;
+    std::fs::rename(&tmp, &path)
 }
 
 pub(crate) fn episode_path(agent_dir: &Path) -> PathBuf {
@@ -2125,10 +2305,6 @@ pub(crate) fn waiting_for_you(agent_dir: &Path) -> Option<String> {
     load(agent_dir)
         .filter(|ep| ep.state == State::Escalated)
         .and_then(|ep| ep.notice)
-        .or_else(|| match load_stall(agent_dir)?.state {
-            StallState::Told { notice } => Some(notice),
-            _ => None,
-        })
 }
 
 pub(crate) fn load(agent_dir: &Path) -> Option<Episode> {
@@ -2224,6 +2400,15 @@ pub(crate) fn wake_text(tag: &str) -> String {
     format!(
         "Your previous turn failed on a provider error. Clank is retrying \
          ({tag}): check your pending work with `clank status` and carry on."
+    )
+}
+
+/// What an idle or blind nudge submits: a hint to look at pending work,
+/// never the work itself, carrying the attempt's tag.
+pub(crate) fn nudge_text(tag: &str) -> String {
+    format!(
+        "Clank sees you stopped with pending work ({tag}): check it with \
+         `clank status` and carry on."
     )
 }
 
@@ -2420,9 +2605,21 @@ pub(crate) mod tests {
             session: "s1",
             tool: Tool::OpenCode,
             transport,
-            no_transport: NOT_ENABLED,
+            no_transport: crate::cli::resume::NO_EVIDENCE,
             gate,
+            obligated: false,
+            readable: true,
+            fallback: None,
+            role: "",
+            issued: 0,
         }
+    }
+
+    /// Why the episode left the agent to a person, once it has.
+    fn told(ep: &Option<Episode>) -> Option<&str> {
+        ep.as_ref()
+            .filter(|e| e.state == State::Escalated)
+            .and_then(|e| e.notice.as_deref())
     }
 
     fn started(id: &str) -> Fact {
@@ -2461,16 +2658,14 @@ pub(crate) mod tests {
     }
 
     fn submitted(e: Episode, n: u32, started: Option<&str>, now: u64) -> Episode {
-        let (e, fx) = answered(
+        answered(
             e,
             n,
             Answer::Submitted {
                 started: started.map(str::to_string),
             },
             &ctx(now, HELPER, None),
-        );
-        assert!(acting(&fx).is_empty());
-        e
+        )
     }
 
     #[test]
@@ -2548,10 +2743,9 @@ pub(crate) mod tests {
         s.apply(started("a1"));
         s.apply(failed("a1", "authentication_failed"));
         let (ep, fx) = decide(Some(ep), &s, &ctx(62, HELPER, None));
-        let ep = ep.unwrap();
-        assert_eq!(ep.state, State::Escalated);
-        assert_eq!(ep.class, "authentication_failed");
-        assert!(matches!(fx.as_slice(), [Effect::Notice(t)] if t.contains("needs a person")));
+        assert!(fx.is_empty());
+        assert!(told(&ep).is_some_and(|t| t.contains("needs a person")));
+        assert_eq!(ep.unwrap().class, "authentication_failed");
     }
 
     /// A batch that holds a failure and a person's next turn decides once,
@@ -2582,11 +2776,11 @@ pub(crate) mod tests {
         let ep = submitted(ep, 1, Some("a1"), 61);
         s.apply(started("a1"));
         s.apply(failed("a1", "max_output_tokens"));
-        let (ep, fx) = decide(Some(ep), &s, &ctx(62, HELPER, None));
-        assert!(matches!(fx.as_slice(), [Effect::Notice(t)] if t.contains("did not recover")));
+        let (ep, _) = decide(Some(ep), &s, &ctx(62, HELPER, None));
+        assert!(told(&ep).is_some_and(|t| t.contains("did not recover")));
         s.apply(failed("a1", "max_output_tokens"));
         let (ep, fx) = decide(ep, &s, &ctx(63, HELPER, GO));
-        assert!(fx.is_empty(), "told once: {fx:?}");
+        assert!(fx.is_empty(), "{fx:?}");
         assert_eq!(ep.as_ref().unwrap().state, State::Escalated);
 
         s.apply(started("p1"));
@@ -2598,12 +2792,9 @@ pub(crate) mod tests {
             "a person's turn is the reset"
         );
         s.apply(failed("p1", "server_error"));
-        let (ep, fx) = decide(ep, &s, &ctx(90, None, None));
-        assert_eq!(ep.unwrap().opened_by, "p1");
-        assert!(
-            matches!(acting(&fx).as_slice(), [Effect::Notice(_)]),
-            "a new failure is told"
-        );
+        let (ep, _) = decide(ep, &s, &ctx(90, None, None));
+        assert_eq!(ep.as_ref().unwrap().opened_by, "p1");
+        assert!(told(&ep).is_some(), "a new failure is told");
     }
 
     /// A person's turn that fails in the same batch that ended the last
@@ -2611,16 +2802,13 @@ pub(crate) mod tests {
     #[test]
     fn a_new_failure_read_with_the_reset_is_told() {
         let mut s = snap([started("t1"), failed("t1", "billing_error")]);
-        let (ep, fx) = decide(None, &s, &ctx(0, None, None));
-        assert_eq!(fx.len(), 1);
+        let (ep, _) = decide(None, &s, &ctx(0, None, None));
+        assert!(told(&ep).is_some());
         s.apply(started("p1"));
         s.apply(failed("p1", "billing_error"));
-        let (ep, fx) = decide(ep, &s, &ctx(10, None, None));
-        assert_eq!(ep.unwrap().opened_by, "p1");
-        assert!(
-            matches!(acting(&fx).as_slice(), [Effect::Notice(_)]),
-            "{fx:?}"
-        );
+        let (ep, _) = decide(ep, &s, &ctx(10, None, None));
+        assert_eq!(ep.as_ref().unwrap().opened_by, "p1");
+        assert!(told(&ep).is_some());
     }
 
     #[test]
@@ -2632,8 +2820,8 @@ pub(crate) mod tests {
     #[test]
     fn without_a_transport_a_failure_is_told_once_and_left_to_a_person() {
         let s = snap([started("t1"), failed("t1", "server_overloaded")]);
-        let (ep, fx) = decide(None, &s, &ctx(0, None, None));
-        assert!(matches!(fx.as_slice(), [Effect::Notice(t)] if t.contains("not enabled")));
+        let (ep, _) = decide(None, &s, &ctx(0, None, None));
+        assert!(told(&ep).is_some_and(|t| t.contains("not enabled")));
         let (ep, fx) = decide(ep, &s, &ctx(5, None, GO));
         assert!(acting(&fx).is_empty());
         assert_eq!(ep.unwrap().state, State::Escalated);
@@ -2642,8 +2830,8 @@ pub(crate) mod tests {
     #[test]
     fn a_fatal_class_escalates_without_an_attempt() {
         let s = snap([started("t1"), failed("t1", "authentication_failed")]);
-        let (ep, fx) = decide(None, &s, &ctx(0, HELPER, None));
-        assert!(matches!(acting(&fx).as_slice(), [Effect::Notice(_)]));
+        let (ep, _) = decide(None, &s, &ctx(0, HELPER, None));
+        assert!(told(&ep).is_some());
         assert!(ep.unwrap().attempts.is_empty());
     }
 
@@ -2658,10 +2846,8 @@ pub(crate) mod tests {
         let (ep, fx) = decide(ep, &s, &ctx(60 + ANSWER_WITHIN - 1, HELPER, GO));
         assert!(acting(&fx).is_empty());
         let (ep, fx) = decide(ep, &s, &ctx(60 + ANSWER_WITHIN, HELPER, GO));
-        assert!(
-            matches!(acting(&fx).as_slice(), [Effect::Notice(_)]),
-            "{fx:?}"
-        );
+        assert!(fx.is_empty(), "{fx:?}");
+        assert!(told(&ep).is_some());
         let ep = ep.unwrap();
         assert_eq!(ep.state, State::Escalated);
         assert_eq!(ep.attempts[0].disposition, Disposition::Indeterminate);
@@ -2674,10 +2860,10 @@ pub(crate) mod tests {
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
         let ep = submitted(ep, 1, None, 61);
         assert_eq!(ep.next_at, Some(60 + CONFIRM_WITHIN));
-        let (_, fx) = decide(Some(ep), &s, &ctx(60 + CONFIRM_WITHIN, HELPER, GO));
+        let (ep, _) = decide(Some(ep), &s, &ctx(60 + CONFIRM_WITHIN, HELPER, GO));
         assert!(
-            matches!(fx.as_slice(), [Effect::Notice(t)] if t.contains("never seen")),
-            "{fx:?}"
+            told(&ep).is_some_and(|t| t.contains("never seen")),
+            "{ep:?}"
         );
     }
 
@@ -2730,7 +2916,13 @@ pub(crate) mod tests {
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let (ep, fx) = decide(ep, &s, &ctx(60, HELPER, Some(Gate::Hold)));
         assert!(acting(&fx).is_empty());
-        assert_eq!(ep.as_ref().unwrap().next_at, Some(60 + RETRY_LOOK));
+        assert_eq!(ep.as_ref().unwrap().next_at, None, "held: nothing polls");
+        let (resumed, _) = decide(ep.clone(), &s, &ctx(90, HELPER, None));
+        assert_eq!(
+            resumed.unwrap().next_at,
+            Some(90 + RETRY_LOOK),
+            "a fold with no hold gives the deadline back"
+        );
         for end in [
             Gate::Deliverer,
             Gate::SessionChanged,
@@ -2749,8 +2941,7 @@ pub(crate) mod tests {
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
-        let (ep, fx) = answered(ep, 1, Answer::Refused, &ctx(61, HELPER, None));
-        assert!(acting(&fx).is_empty());
+        let ep = answered(ep, 1, Answer::Refused, &ctx(61, HELPER, None));
         assert_eq!(ep.state, State::Closed);
         let (ep, fx) = decide(Some(ep), &s, &ctx(5000, HELPER, GO));
         assert!(acting(&fx).is_empty());
@@ -2762,8 +2953,8 @@ pub(crate) mod tests {
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
-        let (ep, fx) = answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None));
-        assert!(matches!(acting(&fx).as_slice(), [Effect::Notice(_)]));
+        let ep = answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None));
+        assert_eq!(ep.state, State::Escalated);
         let (_, fx) = decide(Some(ep), &s, &ctx(5000, HELPER, GO));
         assert!(acting(&fx).is_empty());
     }
@@ -2779,7 +2970,7 @@ pub(crate) mod tests {
         };
         type Uncertain = fn(Episode) -> Episode;
         let answered_indeterminate: Uncertain =
-            |ep| answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None)).0;
+            |ep| answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None));
         let named_unconfirmed: Uncertain = |ep| {
             let ep = submitted(ep, 1, Some("clank-recovery-t1-1"), 61);
             let s = snap([started("t1"), failed("t1", "server_error")]);
@@ -2845,7 +3036,7 @@ pub(crate) mod tests {
         let mut s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
-        let ep = answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None)).0;
+        let ep = answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None));
         s.apply(started("x9"));
         s.apply(failed("x9", "server_error"));
         let (after, fx) = decide(Some(ep.clone()), &s, &ctx(70, HELPER, GO));
@@ -2864,8 +3055,8 @@ pub(crate) mod tests {
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
-        let (after, fx) = answered(ep.clone(), 2, Answer::Indeterminate, &ctx(61, HELPER, None));
-        assert_eq!((after, fx), (ep, Vec::new()));
+        let after = answered(ep.clone(), 2, Answer::Indeterminate, &ctx(61, HELPER, None));
+        assert_eq!(after, ep);
     }
 
     #[test]
@@ -2873,13 +3064,10 @@ pub(crate) mod tests {
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let mut ep = decide(None, &s, &ctx(0, HELPER, None)).0.unwrap();
         let mut now = 60;
-        let mut notices = 0;
         for _ in 0..UNAVAILABLE_LIMIT {
             ep = decide(Some(ep), &s, &ctx(now, HELPER, GO)).0.unwrap();
             let n = ep.attempts.last().unwrap().n;
-            let (next, fx) = answered(ep, n, Answer::Unavailable, &ctx(now, HELPER, None));
-            notices += fx.iter().filter(|f| matches!(f, Effect::Notice(_))).count();
-            ep = next;
+            ep = answered(ep, n, Answer::Unavailable, &ctx(now, HELPER, None));
             now += RETRY_LOOK;
         }
         assert_eq!(
@@ -2888,7 +3076,6 @@ pub(crate) mod tests {
             "no budget was spent on a transport that was not there"
         );
         assert_eq!(ep.state, State::Escalated);
-        assert_eq!(notices, 1);
     }
 
     #[test]
@@ -3002,7 +3189,9 @@ pub(crate) mod tests {
             auto: true,
             delivering,
             obligated,
-            stall_after: None,
+            role: "master".into(),
+            work: vec!["continue plan=p".into()],
+            blind_nudge: None,
             attending: false,
             asking: false,
         }
@@ -3065,15 +3254,6 @@ pub(crate) mod tests {
         Driver::new(PathBuf::from("/"), PathBuf::from("/nonexistent-home"))
     }
 
-    fn notices(acts: &[Act]) -> Vec<&str> {
-        acts.iter()
-            .filter_map(|a| match a {
-                Act::Notice { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The nudge history recorded in `dir`.
     fn nudged(dir: &Path) -> Vec<crate::cli::nudge_log::Record> {
         crate::cli::nudge_log::read(dir)
@@ -3091,7 +3271,7 @@ pub(crate) mod tests {
     }
 
     /// The incident: a failed Codex turn in the record, an obligated agent
-    /// with nothing waiting, and no transport enabled. One notice, latched,
+    /// with nothing waiting, and no transport enabled. Left to a person, latched,
     /// until a person's turn appears in the same record.
     #[test]
     fn a_recorded_failure_with_no_transport_is_told_once_and_a_person_ends_it() {
@@ -3111,9 +3291,9 @@ pub(crate) mod tests {
 
         let acts = d.reconcile(f(), 100);
         assert!(acts.contains(&Act::Watch(watch_of(&rollout))), "{acts:?}");
-        let told = notices(&acts);
         assert!(
-            matches!(told.as_slice(), [t] if t.contains("server_overloaded") && t.contains("not enabled")),
+            waiting_for_you(dir.path())
+                .is_some_and(|t| t.contains("server_overloaded") && t.contains("not enabled")),
             "{acts:?}"
         );
         assert_eq!(load(dir.path()).unwrap().state, State::Escalated);
@@ -3215,7 +3395,7 @@ pub(crate) mod tests {
             (Gate::Hold, Some(State::Waiting)),
             (Gate::Deliverer, None),
             (Gate::SessionChanged, None),
-            (Gate::AutoOff, Some(State::Escalated)),
+            (Gate::AutoOff, Some(State::Waiting)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let rollout = dir.path().join("rollout.jsonl");
@@ -3237,9 +3417,7 @@ pub(crate) mod tests {
             });
             assert!(dispatches(&acts).is_empty(), "{gate:?}");
             assert_eq!(load(dir.path()).map(|e| e.state), after, "{gate:?}");
-            if gate == Gate::AutoOff {
-                assert!(notices(&acts)[0].contains(AUTO_OFF));
-            }
+            assert_eq!(d.next_due(), None, "{gate:?}: nothing polls");
         }
     }
 
@@ -3295,7 +3473,7 @@ pub(crate) mod tests {
         }
         let mut d = driver();
         let acts = d.reconcile(f(), 500);
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
         let ep = load(dir.path()).unwrap();
         assert_eq!(ep.state, State::Escalated);
         assert_eq!(ep.attempts[0].disposition, Disposition::Indeterminate);
@@ -3437,7 +3615,9 @@ pub(crate) mod tests {
             auto: true,
             delivering: false,
             obligated: true,
-            stall_after: None,
+            role: "master".into(),
+            work: vec!["continue plan=p".into()],
+            blind_nudge: None,
             attending: false,
             asking: false,
         };
@@ -3466,7 +3646,7 @@ pub(crate) mod tests {
         let rollout = day.join("rollout-2026-10-06T00-00-01-session-one.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
         let acts = d.changed(changed(&rollout), 3);
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(home.path()).is_some(), "{acts:?}");
         assert!(acts.contains(&Act::Unwatch(watch)), "{acts:?}");
         assert!(acts.contains(&Act::Watch(watch_of(&rollout))), "{acts:?}");
     }
@@ -3490,7 +3670,8 @@ pub(crate) mod tests {
         assert_eq!(d.reconcile(f(), 0), [Act::Watch(watch_of(&rollout))]);
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
         assert!(d.reconcile(f(), 1).is_empty());
-        assert_eq!(notices(&touched(&mut d, &rollout, 2)).len(), 1);
+        touched(&mut d, &rollout, 2);
+        assert!(waiting_for_you(dir.path()).is_some());
     }
 
     /// The same session's record moving to another file is followed.
@@ -3502,18 +3683,16 @@ pub(crate) mod tests {
         append(&first, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
         append(&second, &[&line(STARTED, "t2"), &line(FAILED, "t2")]);
         let mut d = driver();
-        assert!(
-            notices(&d.reconcile(
-                vec![codex_facts(dir.path(), &first, "session-one", true, false)],
-                0
-            ))
-            .is_empty()
+        d.reconcile(
+            vec![codex_facts(dir.path(), &first, "session-one", true, false)],
+            0,
         );
+        assert_eq!(waiting_for_you(dir.path()), None);
         let acts = d.reconcile(
             vec![codex_facts(dir.path(), &second, "session-one", true, false)],
             1,
         );
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
     }
 
     /// Armed in the middle of a turn whose start is further back than the
@@ -3551,7 +3730,7 @@ pub(crate) mod tests {
         assert_eq!(acts, [Act::Watch(watch_of(&events))]);
         append(&events, &[r#"{"type":"turn_ended","outcome":"error"}"#]);
         let acts = touched(&mut d, &events, 5);
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
     }
 
     /// A deadline whose record cannot be read dispatches nothing from what
@@ -3576,16 +3755,15 @@ pub(crate) mod tests {
         );
         std::fs::remove_file(&rollout).unwrap();
         let mut now = 60;
-        let mut told = Vec::new();
         for _ in 0..UNAVAILABLE_LIMIT {
             let acts = d.due(now, |_, _| Gate::Go);
             assert!(dispatches(&acts).is_empty(), "{acts:?}");
-            told.extend(notices(&acts).into_iter().map(str::to_string));
             now += RETRY_LOOK;
         }
         assert!(
-            matches!(told.as_slice(), [t] if t.contains("could not be read")),
-            "{told:?}"
+            waiting_for_you(dir.path()).is_some_and(|t| t.contains("could not be read")),
+            "{:?}",
+            waiting_for_you(dir.path())
         );
         assert_eq!(load(dir.path()).unwrap().state, State::Escalated);
     }
@@ -3646,7 +3824,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn with_auto_mode_off_a_failure_is_only_told() {
+    fn with_auto_mode_off_a_failure_waits_with_no_deadline() {
         enable(Tool::Codex, Some(Transport::CodexStart));
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
@@ -3655,11 +3833,29 @@ pub(crate) mod tests {
         let mut f = codex_facts(dir.path(), &rollout, "session-one", true, false);
         f.auto = false;
         let acts = d.reconcile(vec![f], 0);
-        assert!(
-            matches!(notices(&acts).as_slice(), [t] if t.contains(AUTO_OFF)),
-            "{acts:?}"
-        );
+        assert!(dispatches(&acts).is_empty(), "{acts:?}");
         assert_eq!(d.next_due(), None, "nothing is scheduled");
+        assert!(
+            crate::cli::agent_state::load(dir.path())
+                .unwrap()
+                .suppressors
+                .contains(&crate::cli::agent_state::Suppressor::AutoOff)
+        );
+        d.reconcile(
+            vec![codex_facts(
+                dir.path(),
+                &rollout,
+                "session-one",
+                true,
+                false,
+            )],
+            10,
+        );
+        assert_eq!(
+            d.next_due(),
+            Some(10 + RETRY_LOOK),
+            "auto back on resumes it"
+        );
     }
 
     /// A record replaced under the reader is read again from scratch, not
@@ -3670,7 +3866,7 @@ pub(crate) mod tests {
         let rollout = dir.path().join("rollout.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
         let mut d = driver();
-        let acts = d.reconcile(
+        d.reconcile(
             vec![codex_facts(
                 dir.path(),
                 &rollout,
@@ -3680,7 +3876,7 @@ pub(crate) mod tests {
             )],
             0,
         );
-        assert_eq!(notices(&acts).len(), 1);
+        assert!(waiting_for_you(dir.path()).is_some());
         std::fs::write(&rollout, format!("{}\n", line(STARTED, "t9"))).unwrap();
         touched(&mut d, &rollout, 10);
         assert_eq!(load(dir.path()).unwrap().state, State::Closed);
@@ -3741,7 +3937,7 @@ pub(crate) mod tests {
         );
         observe(dir.path(), &serde_json::json!({"session":"session-one","turn":"failed","id":"m1","class":"billing_error"})).unwrap();
         let acts = touched(&mut d, &record, 2);
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
     }
 
     #[test]
@@ -3993,9 +4189,8 @@ pub(crate) mod tests {
         );
         assert_eq!(fake.installs(), 2);
         let acts = d.changed(setup, 4);
-        assert_eq!(
-            notices(&acts).len(),
-            1,
+        assert!(
+            waiting_for_you(&dir.path().join("first")).is_some(),
             "what changed meanwhile is read: {acts:?}"
         );
 
@@ -4035,7 +4230,9 @@ pub(crate) mod tests {
             auto: true,
             delivering: false,
             obligated: true,
-            stall_after: None,
+            role: "master".into(),
+            work: vec!["continue plan=p".into()],
+            blind_nudge: None,
             attending: false,
             asking: false,
         };
@@ -4043,7 +4240,7 @@ pub(crate) mod tests {
         forward(&watch, &acts);
         let setup = next_event(&mut rx).await;
         let acts = d.changed(setup, 1);
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(home.path()).is_some(), "{acts:?}");
         assert!(acts.contains(&Act::Watch(watch_of(&rollout))), "{acts:?}");
     }
 
@@ -4495,10 +4692,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// A notice that could not be stored is not lost: its decision is owed,
-    /// with a deadline of its own, and is made once storage works.
+    /// An escalation that could not be stored is not lost: its decision is
+    /// owed, with a deadline of its own, and is made once storage works.
     #[test]
-    fn a_notice_that_could_not_be_stored_is_retried_after_the_hold() {
+    fn an_escalation_that_could_not_be_stored_is_made_after_the_hold() {
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
@@ -4514,25 +4711,16 @@ pub(crate) mod tests {
             )],
             0,
         );
-        assert!(notices(&acts).is_empty());
+        assert_eq!(waiting_for_you(dir.path()), None, "{acts:?}");
         assert_eq!(d.next_due(), Some(RETRY_LOOK));
         std::fs::remove_dir(&blocked).unwrap();
         let acts = d.due(RETRY_LOOK, |_, _| Gate::Go);
-        assert_eq!(notices(&acts).len(), 1, "{acts:?}");
+        assert!(waiting_for_you(dir.path()).is_some(), "{acts:?}");
         assert_eq!(d.next_due(), None);
         assert!(
             d.due(RETRY_LOOK * 2, |_, _| Gate::Go).is_empty(),
             "told once"
         );
-    }
-
-    fn notices_with_keys(acts: &[Act]) -> Vec<(&str, &str)> {
-        acts.iter()
-            .filter_map(|a| match a {
-                Act::Notice { key, text, .. } => Some((key.as_str(), text.as_str())),
-                _ => None,
-            })
-            .collect()
     }
 
     /// An uncertain answer held across a storage failure, overtaken by the
@@ -4566,15 +4754,18 @@ pub(crate) mod tests {
 
         std::fs::remove_dir(&blocked).unwrap();
         let acts = d.due(61 + RETRY_LOOK, |_, _| Gate::Go);
-        assert_eq!(notices_with_keys(&acts), [], "{acts:?}");
+        assert_eq!(waiting_for_you(dir.path()), None, "{acts:?}");
         let ep = load(dir.path()).unwrap();
-        assert_eq!(ep.state, State::Closed);
-        assert_eq!(ep.attempts[0].disposition, Disposition::Indeterminate);
+        assert_eq!(
+            (ep.kind, ep.opened_by.as_str(), ep.state),
+            (Kind::Idle, "t2", State::Waiting),
+            "the finished turn is a new, idle, interval"
+        );
     }
 
     /// A held answer for one episode, then a person's turn that fails
-    /// differently: the stored episode and its notice are the new
-    /// failure's, under its own key, and the old one is told nothing.
+    /// differently: the stored episode and its reason are the new
+    /// failure's, and the old escalation is never stored.
     #[test]
     fn a_held_answer_overtaken_by_a_new_failure_tells_only_the_new_one() {
         enable(Tool::Codex, Some(Transport::Helper));
@@ -4604,9 +4795,8 @@ pub(crate) mod tests {
 
         std::fs::remove_dir(&blocked).unwrap();
         let acts = d.due(61 + RETRY_LOOK, |_, _| Gate::Go);
-        let told = notices_with_keys(&acts);
         assert!(
-            matches!(told.as_slice(), [("session-one:p1", text)] if text.contains("billing_error")),
+            waiting_for_you(dir.path()).is_some_and(|t| t.contains("billing_error")),
             "{acts:?}"
         );
         let ep = load(dir.path()).unwrap();
@@ -4814,585 +5004,988 @@ pub(crate) mod tests {
         );
     }
 
-    const AFTER: u64 = 40 * 60;
+    const DURATION: &str = r#"{"type":"system","subtype":"turn_duration","durationMs":5}"#;
+    const INTERRUPTED: &str = r#"{"type":"user","promptId":"P","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#;
 
-    fn stalling(dir: &Path, record: &Path) -> Facts {
+    /// Claude closes every turn with `turn_duration`, a failed one too, and
+    /// a person's interrupt is a user record of the same turn: the first end
+    /// read is the turn's.
+    #[test]
+    fn claude_turns_end_on_their_first_recorded_end() {
+        let read = |lines: &[&str]| {
+            let mut r = RecordReader::new(Tool::Claude, "s1");
+            let mut s = Snapshot::default();
+            for l in lines {
+                if let Some(f) = r.read(l) {
+                    s.apply(f);
+                }
+            }
+            s.latest().map(|t| t.outcome.clone())
+        };
+        let go = user("P");
+        let error = r#"{"type":"assistant","isApiErrorMessage":true,"error":"overloaded"}"#;
+        assert_eq!(read(&[&go, DURATION]), Some(Outcome::Completed));
+        assert_eq!(
+            read(&[&go, error, DURATION]),
+            Some(Outcome::Failed("overloaded".into()))
+        );
+        assert_eq!(
+            read(&[&go, INTERRUPTED, DURATION]),
+            Some(Outcome::Interrupted)
+        );
+        assert_eq!(read(&[&go]), Some(Outcome::Running));
+    }
+
+    /// `ctx` for an agent that owes work and has no wait to take it.
+    fn owing(now: u64, transport: Option<Transport>, gate: Option<Gate>) -> Ctx<'static> {
+        Ctx {
+            obligated: true,
+            ..ctx(now, transport, gate)
+        }
+    }
+
+    fn done(id: &str) -> Fact {
+        ended(id, Outcome::Completed)
+    }
+
+    /// An agent whose turn ended the ordinary way while it owes work is
+    /// nudged after its settle period, and only then: not when it owes
+    /// nothing, not after a stopped turn, and not while the harness retries.
+    #[test]
+    fn an_idle_agent_owing_work_is_nudged_after_it_settles() {
+        let s = snap([started("t1"), done("t1")]);
+        let (ep, fx) = decide(None, &s, &owing(0, HELPER, None));
+        assert!(fx.is_empty());
+        let ep = ep.unwrap();
+        assert_eq!(
+            (ep.kind, ep.state, ep.next_at),
+            (Kind::Idle, State::Waiting, Some(IDLE_WAITS[0]))
+        );
+        let (_, fx) = decide(Some(ep.clone()), &s, &owing(IDLE_WAITS[0] - 1, HELPER, GO));
+        assert!(fx.is_empty(), "not before it settles");
+        let (ep, fx) = decide(Some(ep), &s, &owing(IDLE_WAITS[0], HELPER, GO));
+        assert!(
+            matches!(fx.as_slice(), [Effect::Dispatch { n: 1, target, .. }] if target == "t1"),
+            "{fx:?}"
+        );
+        assert_eq!(ep.unwrap().state, State::Dispatched);
+
+        assert_eq!(
+            decide(None, &s, &ctx(0, HELPER, None)),
+            (None, Vec::new()),
+            "owes nothing"
+        );
+        let stopped = snap([started("t1"), ended("t1", Outcome::Interrupted)]);
+        assert_eq!(
+            decide(None, &stopped, &owing(0, HELPER, None)),
+            (None, Vec::new())
+        );
+        let mut retrying = snap([started("t1"), done("t1")]);
+        retrying.apply(Fact::NativeRetry);
+        assert_eq!(
+            decide(None, &retrying, &owing(0, HELPER, None)),
+            (None, Vec::new())
+        );
+    }
+
+    /// Each suppressor the gate reports holds an idle nudge back, and a
+    /// person's turn ends the episode.
+    #[test]
+    fn suppressors_hold_an_idle_nudge_and_a_new_turn_ends_it() {
+        let s = snap([started("t1"), done("t1")]);
+        let ep = decide(None, &s, &owing(0, HELPER, None)).0;
+        for gate in [Gate::Hold, Gate::Unobserved] {
+            let (ep, fx) = decide(ep.clone(), &s, &owing(IDLE_WAITS[0], HELPER, Some(gate)));
+            assert!(fx.is_empty(), "{gate:?}");
+            assert_eq!(ep.unwrap().state, State::Waiting, "{gate:?}");
+        }
+        for gone in [Gate::Deliverer, Gate::AutoOff] {
+            let (_, fx) = decide(ep.clone(), &s, &owing(IDLE_WAITS[0], HELPER, Some(gone)));
+            assert!(fx.is_empty(), "{gone:?}");
+        }
+        let mut s = s;
+        s.apply(started("p1"));
+        let (ep, fx) = decide(ep, &s, &owing(IDLE_WAITS[0], HELPER, GO));
+        assert!(fx.is_empty());
+        assert_eq!(ep.unwrap().state, State::Closed, "a person took it back");
+    }
+
+    /// Without a resume capability an idle agent is never nudged: after its
+    /// settle period it is left to a person, with the reason.
+    #[test]
+    fn without_a_capability_an_idle_agent_is_only_explained() {
+        let s = snap([started("t1"), done("t1")]);
+        let ep = decide(None, &s, &owing(0, None, None)).0;
+        assert_eq!(told(&ep), None, "not before it settles");
+        let (ep, fx) = decide(ep, &s, &owing(IDLE_WAITS[0], None, GO));
+        assert!(fx.is_empty());
+        assert!(
+            told(&ep).is_some_and(|t| t.contains("idle") && t.contains("not enabled")),
+            "{ep:?}"
+        );
+    }
+
+    /// Dispatch an idle episode's next attempt, have it start as `id`, and
+    /// read it ending with `end`.
+    fn nudge_round(
+        ep: Episode,
+        s: &mut Snapshot,
+        now: u64,
+        id: &str,
+        end: Fact,
+    ) -> Option<Episode> {
+        let (ep, fx) = decide(Some(ep), s, &owing(now, HELPER, GO));
+        let Some(Effect::Dispatch { n, .. }) = fx.first() else {
+            panic!("no dispatch at {now}: {ep:?}");
+        };
+        let ep = submitted(ep.unwrap(), *n, Some(id), now);
+        s.apply(started(id));
+        s.apply(end);
+        decide(Some(ep), s, &owing(now + 1, HELPER, None)).0
+    }
+
+    /// A nudged turn that ends with the work still owed is idle again, on
+    /// the same budget: two nudges, then a person.
+    #[test]
+    fn an_idle_episode_has_two_nudges_then_a_person() {
+        let mut s = snap([started("t1"), done("t1")]);
+        let ep = decide(None, &s, &owing(0, HELPER, None)).0.unwrap();
+        let ep = nudge_round(ep, &mut s, IDLE_WAITS[0], "a1", done("a1")).unwrap();
+        assert_eq!(
+            (ep.state, ep.failed_turn.as_str(), ep.next_at),
+            (
+                State::Waiting,
+                "a1",
+                Some(IDLE_WAITS[0] + 1 + IDLE_WAITS[1])
+            )
+        );
+        let at = ep.next_at.unwrap();
+        let ep = nudge_round(ep, &mut s, at, "a2", done("a2"));
+        assert!(
+            told(&ep).is_some_and(|t| t.contains("did not get it going")),
+            "{ep:?}"
+        );
+        assert_eq!(ep.unwrap().spent(), 2);
+    }
+
+    /// A nudged turn that fails on a provider error stays in its episode:
+    /// what was spent stays spent, so the smaller budget left decides.
+    #[test]
+    fn a_nudged_turn_that_fails_spends_from_the_same_budget() {
+        let mut s = snap([started("t1"), done("t1")]);
+        let ep = decide(None, &s, &owing(0, HELPER, None)).0.unwrap();
+        let ep = nudge_round(
+            ep,
+            &mut s,
+            IDLE_WAITS[0],
+            "a1",
+            failed("a1", "server_error"),
+        )
+        .unwrap();
+        assert_eq!(
+            (ep.kind, ep.opened_by.as_str(), ep.class.as_str(), ep.state),
+            (Kind::Idle, "t1", "server_error", State::Waiting)
+        );
+        assert_eq!(
+            ep.next_at,
+            Some(IDLE_WAITS[0] + 1 + retries("server_error")[1])
+        );
+        let at = ep.next_at.unwrap();
+        let ep = nudge_round(ep, &mut s, at, "a2", failed("a2", "server_error"));
+        assert!(
+            told(&ep).is_some(),
+            "server_error has a third retry, but the idle budget is spent: {ep:?}"
+        );
+
+        let mut s = snap([started("t1"), done("t1")]);
+        let ep = decide(None, &s, &owing(0, HELPER, None)).0.unwrap();
+        let ep = nudge_round(
+            ep,
+            &mut s,
+            IDLE_WAITS[0],
+            "a1",
+            failed("a1", "billing_error"),
+        );
+        assert!(
+            told(&ep).is_some_and(|t| t.contains("needs a person")),
+            "{ep:?}"
+        );
+    }
+
+    /// A failure is its own episode, never an idle nudge, whatever its
+    /// class; and with one live, the idle path opens nothing beside it.
+    #[test]
+    fn a_failure_never_becomes_an_idle_nudge() {
+        let s = snap([started("t1"), failed("t1", "authentication_failed")]);
+        let ep = decide(None, &s, &owing(0, HELPER, None)).0.unwrap();
+        assert_eq!((ep.kind, ep.state), (Kind::Failed, State::Escalated));
+        let (ep, fx) = decide(Some(ep), &s, &owing(10_000, HELPER, GO));
+        assert!(fx.is_empty());
+        assert_eq!(ep.unwrap().kind, Kind::Failed);
+    }
+
+    /// One attempt in flight per agent: while one is out, a deadline adds
+    /// none, whatever else the record shows.
+    #[test]
+    fn one_attempt_is_in_flight_at_a_time() {
+        let s = snap([started("t1"), done("t1")]);
+        let ep = decide(None, &s, &owing(0, HELPER, None)).0;
+        let (ep, fx) = decide(ep, &s, &owing(IDLE_WAITS[0], HELPER, GO));
+        assert_eq!(fx.len(), 1);
+        for now in [IDLE_WAITS[0] + 1, IDLE_WAITS[0] + ANSWER_WITHIN - 1] {
+            let (_, fx) = decide(ep.clone(), &s, &owing(now, HELPER, GO));
+            assert!(fx.is_empty(), "{now}");
+        }
+    }
+
+    fn blind(identity: &str) -> Ctx<'static> {
+        Ctx {
+            readable: false,
+            fallback: Some(Fallback {
+                identity: identity.into(),
+                every: 600,
+            }),
+            ..owing(0, HELPER, None)
+        }
+    }
+
+    fn at(now: u64, gate: Option<Gate>, ctx: Ctx<'static>) -> Ctx<'static> {
+        Ctx { now, gate, ..ctx }
+    }
+
+    /// An unreadable record is status-only unless `blind_nudge` is set.
+    #[test]
+    fn unknown_is_never_nudged_without_the_opt_in() {
+        let none = Snapshot::default();
+        let unreadable = Ctx {
+            readable: false,
+            ..owing(0, HELPER, None)
+        };
+        assert_eq!(decide(None, &none, &unreadable), (None, Vec::new()));
+        let ep = decide(None, &none, &blind("w1")).0.unwrap();
+        assert_eq!((ep.kind, ep.next_at), (Kind::Fallback, Some(600)));
+    }
+
+    /// A blind nudge whose checks find nowhere to send waits its interval,
+    /// doubling, and stops after its cap; one that is sent latches, and is
+    /// never sent again in that interval.
+    #[test]
+    fn a_blind_nudge_is_bounded_and_sends_at_most_once() {
+        let none = Snapshot::default();
+        let mut ep = decide(None, &none, &blind("w1")).0.unwrap();
+        let mut waits = Vec::new();
+        for _ in 0..FALLBACK_CHECKS {
+            let now = ep.next_at.unwrap();
+            let (next, fx) = decide(
+                Some(ep),
+                &none,
+                &at(now, Some(Gate::Unobserved), blind("w1")),
+            );
+            let [Effect::Dispatch { n, .. }] = fx.as_slice() else {
+                panic!("{fx:?}");
+            };
+            ep = answered(
+                next.unwrap(),
+                *n,
+                Answer::Unavailable,
+                &at(now, None, blind("w1")),
+            );
+            waits.push(ep.next_at.map(|t| t - now));
+        }
+        assert_eq!(
+            waits,
+            [Some(1200), Some(2400), Some(4800), Some(9600), None],
+            "doubling, then a person"
+        );
+        assert!(told(&Some(ep.clone())).is_some());
+
+        let ep = decide(None, &none, &blind("w1")).0.unwrap();
+        let (ep, fx) = decide(Some(ep), &none, &at(600, GO, blind("w1")));
+        assert_eq!(fx.len(), 1);
+        let ep = answered(
+            ep.unwrap(),
+            1,
+            Answer::Submitted { started: None },
+            &at(601, None, blind("w1")),
+        );
+        assert_eq!(ep.state, State::Escalated, "latched");
+        let (ep, fx) = decide(Some(ep), &none, &at(100_000, GO, blind("w1")));
+        assert!(fx.is_empty(), "never sent again");
+        assert_eq!(ep.as_ref().unwrap().attempts.len(), 1);
+
+        let (ep, _) = decide(ep, &none, &blind("w2"));
+        let ep = ep.unwrap();
+        assert_eq!(
+            (ep.opened_by.as_str(), ep.state, ep.attempts.len()),
+            ("w2", State::Waiting, 0),
+            "other work is another interval"
+        );
+        let readable = Ctx {
+            readable: true,
+            ..blind("w2")
+        };
+        assert_eq!(
+            decide(Some(ep), &none, &readable).0,
+            None,
+            "a readable record ends it"
+        );
+    }
+
+    /// The same work names the same interval in any order; other work, or
+    /// none, names another.
+    #[test]
+    fn a_fallback_interval_is_named_by_its_work() {
+        let a = fallback_identity(&["x".into(), "y".into()]);
+        assert_eq!(a, fallback_identity(&["y".into(), "x".into()]));
+        assert_ne!(a, fallback_identity(&["x".into()]));
+        assert_ne!(a, fallback_identity(&["xy".into()]));
+    }
+
+    /// Claim an idle Codex agent's first nudge, with a typed transport.
+    fn claimed_codex() -> (tempfile::TempDir, PathBuf, Driver, AttemptRef) {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let (dir, record, mut d) = idle_codex();
+        let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        let attempt = dispatches(&acts)[0].0.clone();
+        (dir, record, d, attempt)
+    }
+
+    fn live(role: &str) -> Live {
+        Live {
+            role: role.into(),
+            work: vec!["continue plan=p".into()],
+        }
+    }
+
+    /// Whether a claimed attempt may still be sent is decided again from
+    /// what the driver knows then: each change since the claim vetoes it.
+    #[test]
+    fn a_claimed_send_is_vetoed_by_any_change_since_the_claim() {
+        let (_dir, _record, mut d, attempt) = claimed_codex();
+        assert!(d.may_send(
+            &label(),
+            &attempt,
+            &Live {
+                role: "master".into(),
+                work: vec!["continue plan=p".into()],
+            }
+        ));
+        for change in [
+            "newer turn",
+            "auto off",
+            "attending",
+            "asking",
+            "work cleared",
+            "deliverer",
+            "session",
+            "role",
+        ] {
+            let (dir, record, mut d, attempt) = claimed_codex();
+            let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
+            match change {
+                "newer turn" => append(&record, &[&line(STARTED, "t2")]),
+                "auto off" => f.auto = false,
+                "attending" => f.attending = true,
+                "asking" => f.asking = true,
+                "work cleared" => f.obligated = false,
+                "deliverer" => f.delivering = true,
+                "session" => f = codex_facts(dir.path(), &record, "session-two", true, false),
+                _ => f.role = "commit".into(),
+            }
+            d.reconcile(vec![f], IDLE_WAITS[0] + 1);
+            assert!(
+                !d.may_send(
+                    &label(),
+                    &attempt,
+                    &Live {
+                        role: "master".into(),
+                        work: vec!["continue plan=p".into()],
+                    }
+                ),
+                "{change}"
+            );
+        }
+        let (_dir, _record, mut d, attempt) = claimed_codex();
+        let other = AttemptRef {
+            n: attempt.n + 1,
+            ..attempt.clone()
+        };
+        assert!(
+            !d.may_send(&label(), &other, &live("master")),
+            "only the claimed attempt"
+        );
+        let (_dir, _record, mut d, attempt) = claimed_codex();
+        assert!(
+            !d.may_send(&label(), &attempt, &live("commit")),
+            "a role changed on disk"
+        );
+        let done = Live {
+            work: Vec::new(),
+            ..live("master")
+        };
+        assert!(!d.may_send(&label(), &attempt, &done), "work done on disk");
+    }
+
+    /// `split-backup-formal`: a Claude master stopped with work owed and
+    /// nothing waiting for it. With its capability, it is nudged once after
+    /// the settle period, by a typed submit naming the attempt, and the
+    /// nudge is in its history as an idle one.
+    #[test]
+    fn a_stopped_master_owing_work_is_nudged_once() {
+        use crate::cli::nudge_log::{Outcome as Said, Trigger};
+        enable(Tool::Claude, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        append(&transcript, &[&user("p1"), DURATION]);
+        let mut d = driver();
+        let f = || {
+            vec![facts(
+                "claude",
+                dir.path(),
+                &transcript,
+                "session-one",
+                true,
+                false,
+            )]
+        };
+        let acts = d.reconcile(f(), 0);
+        assert!(dispatches(&acts).is_empty(), "{acts:?}");
+        assert_eq!(d.next_due(), Some(IDLE_WAITS[0]));
+        let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        let [
+            Act::Dispatch {
+                attempt,
+                transport,
+                text,
+                tag,
+                ..
+            },
+        ] = acts.as_slice()
+        else {
+            panic!("{acts:?}");
+        };
+        assert_eq!(*transport, Transport::Typed);
+        assert_eq!(text, &nudge_text(tag));
+        let attempt = attempt.clone();
+        d.answer(
+            &label(),
+            &attempt,
+            Answer::Submitted { started: None },
+            IDLE_WAITS[0] + 1,
+        );
+        assert!(matches!(
+            &nudged(dir.path())[..],
+            [r] if r.outcome == Said::Submitted && r.trigger == Trigger::Idle { attempt: 1, of: 2 }
+        ));
+        append(&transcript, &[&prompt("p2", &nudge_text(tag))]);
+        touched(&mut d, &transcript, IDLE_WAITS[0] + 2);
+        assert!(
+            d.due(IDLE_WAITS[0] + 10_000, |_, _| Gate::Go)
+                .iter()
+                .all(|a| !matches!(a, Act::Dispatch { .. })),
+            "nudged once: its turn is running"
+        );
+        assert_eq!(load(dir.path()).unwrap().state, State::Running);
+    }
+
+    /// The published state: an agent owing nothing is unobserved, never
+    /// idle, and has no deadline, no watch and no pane read; one owing work
+    /// is read and shown idle, with what holds a nudge back.
+    #[test]
+    fn the_published_state_never_calls_an_unobserved_agent_idle() {
+        use crate::cli::agent_state::{Activity, Nudge, Suppressor, load as published};
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        let mut d = driver();
+        let acts = d.reconcile(
+            vec![codex_facts(
+                dir.path(),
+                &rollout,
+                "session-one",
+                false,
+                true,
+            )],
+            0,
+        );
+        assert!(acts.is_empty(), "no watch: {acts:?}");
+        assert_eq!(d.next_due(), None);
+        let s = published(dir.path()).unwrap();
+        assert_eq!(s.activity, Activity::Unobserved);
+        assert_eq!(s.suppressors, [Suppressor::Delivering]);
+        assert_eq!(
+            (s.session.as_str(), s.role.as_str()),
+            ("session-one", "master")
+        );
+
+        d.reconcile(
+            vec![codex_facts(
+                dir.path(),
+                &rollout,
+                "session-one",
+                true,
+                false,
+            )],
+            5,
+        );
+        let s = published(dir.path()).unwrap();
+        assert_eq!(
+            (s.activity, s.since),
+            (Activity::Idle, 5),
+            "read before deciding"
+        );
+        assert_eq!(s.nudge, Nudge::At(5 + IDLE_WAITS[0]));
+        assert!(s.cannot_resume.is_some(), "no capability evidence");
+
+        let mut off = codex_facts(dir.path(), &rollout, "session-one", true, false);
+        off.auto = false;
+        d.reconcile(vec![off], 6);
+        let s = published(dir.path()).unwrap();
+        assert_eq!(
+            (s.activity, s.since),
+            (Activity::Idle, 5),
+            "since is semantic"
+        );
+        assert!(s.suppressors.contains(&Suppressor::AutoOff));
+    }
+
+    /// The opt-in reaches the driver: an agent owing work whose record
+    /// cannot be found is unknown, with no deadline, unless `blind_nudge`
+    /// is set, and then its interval is the configured one.
+    #[test]
+    fn only_the_configured_fallback_schedules_an_unreadable_agent() {
+        use crate::cli::agent_state::{Activity, load as published};
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-written.jsonl");
+        let mut d = driver();
+        d.reconcile(
+            vec![codex_facts(
+                dir.path(),
+                &missing,
+                "session-one",
+                true,
+                false,
+            )],
+            0,
+        );
+        assert_eq!(d.next_due(), None);
+        assert_eq!(load(dir.path()), None);
+        assert!(matches!(
+            published(dir.path()).unwrap().activity,
+            Activity::Unknown(_)
+        ));
+
+        let mut f = codex_facts(dir.path(), &missing, "session-one", true, false);
+        f.blind_nudge = Some(600);
+        d.reconcile(vec![f], 10);
+        assert_eq!(d.next_due(), Some(610));
+        assert_eq!(load(dir.path()).unwrap().kind, Kind::Fallback);
+    }
+
+    fn idle_codex() -> (tempfile::TempDir, PathBuf, Driver) {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.jsonl");
+        append(&record, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+        let mut d = driver();
+        d.reconcile(
+            vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+            0,
+        );
+        assert_eq!(d.next_due(), Some(IDLE_WAITS[0]));
+        (dir, record, d)
+    }
+
+    /// Manual mode, and a question, block or attendance, each take the
+    /// nudge's deadline away at the fold that sees them, not at the deadline.
+    #[test]
+    fn a_suppressor_takes_the_deadline_away_at_once() {
+        for how in ["auto off", "attending", "asking"] {
+            let (dir, record, mut d) = idle_codex();
+            let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
+            match how {
+                "auto off" => f.auto = false,
+                "attending" => f.attending = true,
+                _ => f.asking = true,
+            }
+            d.reconcile(vec![f], 1);
+            assert_eq!(d.next_due(), None, "{how}");
+            assert_eq!(load(dir.path()).unwrap().state, State::Waiting, "{how}");
+        }
+    }
+
+    /// A role change is other work: the old role's nudge is forgotten.
+    #[test]
+    fn a_role_change_forgets_the_old_roles_nudge() {
+        let (dir, record, mut d) = idle_codex();
+        let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
+        f.role = "commit".into();
+        d.reconcile(vec![f], 1);
+        let ep = load(dir.path()).unwrap();
+        assert_eq!(
+            (ep.opened_by.as_str(), ep.next_at),
+            ("t1", Some(1 + IDLE_WAITS[0])),
+            "a fresh interval for the new role"
+        );
+    }
+
+    /// A record that cannot be read any more is no longer evidence: the
+    /// state says unknown rather than what it last said.
+    #[test]
+    fn a_failed_read_invalidates_what_was_read() {
+        use crate::cli::agent_state::{Activity, load as published};
+        let (dir, record, mut d) = idle_codex();
+        assert_eq!(published(dir.path()).unwrap().activity, Activity::Idle);
+        std::fs::remove_file(&record).unwrap();
+        touched(&mut d, &record, 1);
+        assert!(
+            matches!(
+                published(dir.path()).unwrap().activity,
+                Activity::Unknown(_)
+            ),
+            "{:?}",
+            published(dir.path())
+        );
+    }
+
+    /// A record renamed over the old one is another record, even at the
+    /// same length: it is read afresh.
+    #[test]
+    fn an_equal_length_replacement_is_read_afresh() {
+        use crate::cli::agent_state::{Activity, load as published};
+        let (dir, record, mut d) = idle_codex();
+        let len = std::fs::metadata(&record).unwrap().len() as usize;
+        let mut bytes = format!("{}\n", line(STARTED, "t2")).into_bytes();
+        bytes.resize(len, b' ');
+        let other = dir.path().join("replacement.jsonl");
+        std::fs::write(&other, bytes).unwrap();
+        std::fs::rename(&other, &record).unwrap();
+        touched(&mut d, &record, 1);
+        assert_eq!(published(dir.path()).unwrap().activity, Activity::Working);
+    }
+
+    /// A new binding's state is its own: its age starts when it was bound.
+    #[test]
+    fn a_new_binding_starts_its_own_age() {
+        use crate::cli::agent_state::load as published;
+        let (dir, record, mut d) = idle_codex();
+        d.reconcile(
+            vec![codex_facts(dir.path(), &record, "session-two", true, false)],
+            100,
+        );
+        assert_eq!(published(dir.path()).unwrap().since, 100);
+    }
+
+    /// Reset the claimed agent's interval with a role change, and claim
+    /// the new interval's first attempt.
+    fn reclaimed(d: &mut Driver, dir: &Path, record: &Path, now: u64) -> AttemptRef {
+        let mut f = codex_facts(dir, record, "session-one", true, false);
+        f.role = "commit".into();
+        f.work = vec!["review other work".into()];
+        d.reconcile(vec![f], now);
+        let acts = d.due(now + IDLE_WAITS[0], |_, _| Gate::Go);
+        dispatches(&acts)[0].0.clone()
+    }
+
+    /// An attempt's identity is never reused, though a role change resets
+    /// the budget on the same turn: each interval's attempts are their own
+    /// history rows.
+    #[test]
+    fn a_reset_interval_never_reuses_an_attempts_identity() {
+        let (dir, record, mut d, first) = claimed_codex();
+        d.answer(&label(), &first, Answer::Submitted { started: None }, 181);
+        let second = reclaimed(&mut d, dir.path(), &record, 200);
+        assert_ne!(first, second);
+        d.answer(&label(), &second, Answer::Submitted { started: None }, 400);
+        assert_eq!(nudged(dir.path()).len(), 2);
+    }
+
+    /// An old interval's answer, or its turn, is not the new interval's:
+    /// it settles only its own history, and leaves the new claim claimed.
+    #[test]
+    fn an_old_intervals_answer_or_turn_is_not_the_new_ones() {
+        let (dir, record, mut d, old) = claimed_codex();
+        let new = reclaimed(&mut d, dir.path(), &record, 181);
+        d.answer(&label(), &old, Answer::Submitted { started: None }, 400);
+        let ep = load(dir.path()).unwrap();
+        assert_eq!(
+            ep.attempts.last().unwrap().disposition,
+            Disposition::Claimed
+        );
+        assert_eq!(nudged(dir.path()).len(), 1, "the old attempt's own row");
+
+        let old_attempt = Attempt {
+            n: old.n,
+            claimed_at: 0,
+            transport: "typed".into(),
+            target: "t1".into(),
+            tag: format!("clank-recovery-t1-{}", old.n),
+            started: None,
+            disposition: Disposition::Submitted,
+        };
+        let new_turn = TurnRec {
+            id: "x".into(),
+            text: Some(nudge_text(&format!("clank-recovery-t1-{}", new.n))),
+            outcome: Outcome::Running,
+            retrying: false,
+        };
+        assert!(!old_attempt.made(&new_turn));
+        let twelfth = TurnRec {
+            text: Some(nudge_text("clank-recovery-t1-12")),
+            ..new_turn
+        };
+        assert!(
+            !Attempt {
+                n: 1,
+                tag: "clank-recovery-t1-1".into(),
+                ..old_attempt
+            }
+            .made(&twelfth)
+        );
+    }
+
+    /// The identity holds across a restart: after the episode is forgotten
+    /// (its work cleared), a new driver continues past what was issued, by
+    /// the history and by a claim still pending.
+    #[test]
+    fn a_restart_never_reuses_an_attempts_identity() {
+        let (dir, record, mut d, first) = claimed_codex();
+        d.answer(&label(), &first, Answer::Submitted { started: None }, 181);
+        let cleared = |d: &mut Driver, now| {
+            d.reconcile(
+                vec![codex_facts(
+                    dir.path(),
+                    &record,
+                    "session-one",
+                    false,
+                    false,
+                )],
+                now,
+            );
+            assert_eq!(load(dir.path()), None, "forgotten");
+        };
+        let claim = |d: &mut Driver, now| {
+            d.reconcile(
+                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+                now,
+            );
+            let acts = d.due(now + IDLE_WAITS[0], |_, _| Gate::Go);
+            dispatches(&acts)[0].0.clone()
+        };
+        cleared(&mut d, 190);
+        drop(d);
+        let mut d = driver();
+        let second = claim(&mut d, 200);
+        assert!(second.n > first.n, "{first:?} {second:?}");
+        cleared(&mut d, 400);
+        drop(d);
+        let mut d = driver();
+        let third = claim(&mut d, 500);
+        assert!(
+            third.n > second.n,
+            "a pending claim counts too: {second:?} {third:?}"
+        );
+    }
+
+    /// An attempt's identity is control state: a history that cannot be
+    /// written changes nothing about the numbers issued after a reset.
+    #[test]
+    fn an_unwritable_history_never_recycles_an_identity() {
+        let (dir, record, mut d, first) = claimed_codex();
+        std::fs::create_dir(crate::cli::nudge_log::path(dir.path())).unwrap();
+        d.answer(&label(), &first, Answer::Submitted { started: None }, 181);
+        let second = reclaimed(&mut d, dir.path(), &record, 200);
+        assert!(second.n > first.n, "{first:?} {second:?}");
+    }
+
+    /// A reset interval's first attempt is the first of its own budget in
+    /// the history, whatever number it was issued.
+    #[test]
+    fn history_counts_each_interval_from_its_own_budget() {
+        use crate::cli::nudge_log::Trigger;
+        let (dir, record, mut d, first) = claimed_codex();
+        d.answer(&label(), &first, Answer::Submitted { started: None }, 181);
+        let second = reclaimed(&mut d, dir.path(), &record, 200);
+        d.answer(&label(), &second, Answer::Submitted { started: None }, 400);
+        let rows = nudged(dir.path());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].trigger, Trigger::Idle { attempt: 1, of: 2 });
+        assert_ne!(rows[0].attempt, rows[1].attempt);
+    }
+
+    /// An issued number that cannot be read is not zero: nothing is
+    /// claimed until it can be.
+    #[test]
+    fn an_unreadable_issued_number_claims_nothing() {
+        enable(Tool::Codex, Some(Transport::Typed));
+        let (dir, _record, mut d) = idle_codex();
+        std::fs::write(issued_path(dir.path()), "not a number").unwrap();
+        let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        assert!(dispatches(&acts).is_empty(), "{acts:?}");
+        std::fs::write(issued_path(dir.path()), "7").unwrap();
+        let acts = d.due(IDLE_WAITS[0] + RETRY_LOOK, |_, _| Gate::Go);
+        assert_eq!(dispatches(&acts)[0].0.n, 8);
+    }
+
+    /// A fault reading the issued number holds new claims, never what is
+    /// already known: an answer that arrives during it is kept, and applied
+    /// once the number can be read.
+    #[test]
+    fn an_issued_number_fault_keeps_answers() {
+        for answer in [Answer::Submitted { started: None }, Answer::Indeterminate] {
+            let (dir, _record, mut d, attempt) = claimed_codex();
+            std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+            d.answer(&label(), &attempt, answer.clone(), 181);
+            std::fs::write(issued_path(dir.path()), attempt.n.to_string()).unwrap();
+            d.due(181 + RETRY_LOOK, |_, _| Gate::Go);
+            let want = match answer {
+                Answer::Submitted { .. } => Disposition::Submitted,
+                _ => Disposition::Indeterminate,
+            };
+            assert_eq!(
+                load(dir.path())
+                    .unwrap()
+                    .attempts
+                    .last()
+                    .unwrap()
+                    .disposition,
+                want,
+                "{answer:?}"
+            );
+        }
+    }
+
+    /// A hold is one deadline: folds and record events inside it neither
+    /// read the broken number again nor move the hold.
+    #[test]
+    fn folds_inside_a_hold_do_not_move_it() {
+        let (dir, record, mut d, _) = claimed_codex();
+        std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+        let f = || vec![codex_facts(dir.path(), &record, "session-one", true, false)];
+        d.reconcile(f(), 181);
+        let until = d.agents.get(&label()).unwrap().held_until;
+        assert_eq!(until, Some(181 + RETRY_LOOK));
+        d.reconcile(f(), 182);
+        touched(&mut d, &record, 183);
+        assert_eq!(d.agents.get(&label()).unwrap().held_until, until);
+    }
+
+    /// What changed during a hold is what its end decides from: work
+    /// cleared during it forgets the episode; a suppressor holds it with no
+    /// deadline.
+    #[test]
+    fn a_holds_end_decides_from_what_changed_during_it() {
+        for change in ["work cleared", "auto off"] {
+            enable(Tool::Codex, Some(Transport::Typed));
+            let (dir, record, mut d) = idle_codex();
+            std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+            let mut f = codex_facts(dir.path(), &record, "session-one", true, false);
+            d.reconcile(vec![f.clone()], 1);
+            match change {
+                "work cleared" => f.obligated = false,
+                _ => f.auto = false,
+            }
+            d.reconcile(vec![f], 2);
+            std::fs::write(issued_path(dir.path()), "0").unwrap();
+            let acts = d.due(1 + RETRY_LOOK, |_, _| Gate::Go);
+            assert!(dispatches(&acts).is_empty(), "{change}: {acts:?}");
+            match change {
+                "work cleared" => assert_eq!(load(dir.path()), None, "{change}"),
+                _ => assert_eq!(d.next_due(), None, "{change}"),
+            }
+        }
+    }
+
+    /// A blind nudge's history counts its checks, those that found nowhere
+    /// to send included: its cap is on checks.
+    #[test]
+    fn fallback_history_counts_its_checks() {
+        use crate::cli::nudge_log::Trigger;
+        enable(Tool::Codex, Some(Transport::Typed));
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jsonl");
+        let mut f = codex_facts(dir.path(), &missing, "session-one", true, false);
+        f.blind_nudge = Some(600);
+        let mut d = driver();
+        d.reconcile(vec![f], 0);
+        for now in [600, 1801] {
+            let acts = d.due(now, |_, _| Gate::Go);
+            let attempt = dispatches(&acts)[0].0.clone();
+            d.answer(&label(), &attempt, Answer::Unavailable, now + 1);
+        }
+        let rows = nudged(dir.path());
+        assert_eq!(
+            rows.iter().map(|r| r.trigger.clone()).collect::<Vec<_>>(),
+            [
+                Trigger::Fallback { attempt: 1 },
+                Trigger::Fallback { attempt: 2 }
+            ]
+        );
+    }
+
+    /// The facts of the claimed agent after its role became `commit`, with
+    /// that role's own work.
+    fn as_reviewer(dir: &Path, record: &Path) -> Facts {
         Facts {
-            stall_after: Some(AFTER),
+            role: "commit".into(),
+            work: vec!["the new role's review".into()],
             ..codex_facts(dir, record, "session-one", true, false)
         }
     }
 
-    /// A rollout whose latest turn finished, and an agent still owing work.
-    fn quiet_agent() -> (tempfile::TempDir, PathBuf, Driver) {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
-        let mut d = driver();
-        assert!(
-            d.reconcile(vec![stalling(dir.path(), &rollout)], 0)
-                .iter()
-                .all(|a| matches!(a, Act::Watch(_)))
-        );
-        (dir, rollout, d)
-    }
-
-    const NOW_GO: fn(&clank_core::ids::AgentLabel, &str) -> Gate = |_, _| Gate::Go;
-
-    /// Pending work, nothing waiting for it, and a record that has not
-    /// moved: one notice at the configured interval, kept for status, and
-    /// nothing more until eligibility resets.
-    #[test]
-    fn a_stalled_agent_is_told_once() {
-        let (dir, _, mut d) = quiet_agent();
-        assert_eq!(d.next_due(), Some(AFTER), "one deadline, nothing else");
-        assert!(d.due(AFTER - 1, NOW_GO).is_empty());
-        let acts = d.due(AFTER, NOW_GO);
-        assert_eq!(
-            notices_with_keys(&acts),
-            [(
-                "session-one:stall:0",
-                "agent has had pending work for 40m and is not waiting for it"
-            )]
-        );
-        assert_eq!(
-            waiting_for_you(dir.path()).as_deref(),
-            Some("agent has had pending work for 40m and is not waiting for it")
-        );
-        assert_eq!(d.next_due(), None);
-        assert!(d.due(AFTER * 3, NOW_GO).is_empty());
-    }
-
-    /// A slow tool writes to the record without any turn ending: the
-    /// deadline is re-armed from the last movement, not told.
-    #[test]
-    fn a_record_that_moved_before_the_deadline_is_not_stalled() {
-        let (_dir, rollout, mut d) = quiet_agent();
-        append(
-            &rollout,
-            &[r#"{"type":"response_item","payload":{"type":"function_call_output"}}"#],
-        );
-        assert!(notices(&d.due(AFTER, NOW_GO)).is_empty());
-        assert_eq!(
-            d.next_due(),
-            Some(AFTER * 2),
-            "counted from the movement it found"
-        );
-        assert_eq!(notices(&d.due(AFTER * 2, NOW_GO)).len(), 1);
-    }
-
-    /// A person stopped the latest turn: nothing is told, and nothing
-    /// waits, until the record moves again.
-    #[test]
-    fn a_stopped_turn_is_not_a_stall_until_the_record_moves() {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        let aborted = r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T","reason":"interrupted"}}"#;
-        append(&rollout, &[&line(STARTED, "t1"), &line(aborted, "t1")]);
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        assert!(d.due(AFTER, NOW_GO).is_empty());
-        assert_eq!(d.next_due(), None, "nothing waits on a stopped turn");
-        append(&rollout, &[&line(STARTED, "t2")]);
-        touched(&mut d, &rollout, AFTER + 5);
-        assert_eq!(d.next_due(), Some(AFTER + 5 + AFTER));
-    }
-
-    /// A failure the record shows is failed-turn recovery's: it is told
-    /// once, by that, and never again as a stall.
-    #[test]
-    fn a_recorded_failure_is_left_to_failed_turn_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
-        let mut d = driver();
-        let acts = d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        assert!(matches!(notices(&acts).as_slice(), [t] if t.contains("server_overloaded")));
-        assert!(notices(&d.due(AFTER, NOW_GO)).is_empty());
-        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
-    }
-
-    /// A deliverer, the end of the obligation or of auto mode means no
-    /// deadline at all; attendance or a block at the deadline counts it
-    /// again from there. Each just before the deadline cancels it.
-    #[test]
-    fn eligibility_ending_before_the_deadline_cancels_it() {
-        for end in ["deliverer", "obligation", "auto"] {
-            let (dir, rollout, mut d) = quiet_agent();
-            let mut f = stalling(dir.path(), &rollout);
-            match end {
-                "deliverer" => f.delivering = true,
-                "obligation" => f.obligated = false,
-                _ => f.auto = false,
-            }
-            d.reconcile(vec![f], AFTER - 1);
-            assert_eq!(load_stall(dir.path()), None, "{end}");
-            assert!(d.due(AFTER, NOW_GO).is_empty(), "{end}");
-            assert_eq!(d.next_due(), None, "{end}");
-        }
-        let (_dir, _, mut d) = quiet_agent();
-        assert!(d.due(AFTER, |_, _| Gate::Hold).is_empty());
-        assert_eq!(d.next_due(), Some(AFTER * 2), "attending: counted again");
-        for gone in [Gate::Deliverer, Gate::SessionChanged, Gate::AutoOff] {
-            let (dir, _, mut d) = quiet_agent();
-            assert!(d.due(AFTER, |_, _| gone).is_empty(), "{gone:?}");
-            assert_eq!(load_stall(dir.path()), None, "{gone:?}");
+    fn reviewer_live() -> Live {
+        Live {
+            role: "commit".into(),
+            work: vec!["the new role's review".into()],
         }
     }
 
-    /// `off` disables only this: no deadline, while a recorded failure is
-    /// still told.
+    /// A role change seen during a hold, whether the issued number or the
+    /// episode cannot be stored, fences the old role's claim at once, and
+    /// is applied when the hold ends: the old interval retired, the new
+    /// role's armed afresh, and numbers still never reused.
     #[test]
-    fn off_disables_the_stall_and_nothing_else() {
-        let (dir, rollout, mut d) = quiet_agent();
-        let f = || Facts {
-            stall_after: None,
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(vec![f()], 1);
-        assert_eq!((d.next_due(), load_stall(dir.path())), (None, None));
-        append(&rollout, &[&line(STARTED, "t2"), &line(FAILED, "t2")]);
-        assert_eq!(notices(&touched(&mut d, &rollout, 2)).len(), 1);
-    }
-
-    /// A monitor restarted before the deadline keeps it, one restarted
-    /// after it fires it once, and one restarted after the notice does not
-    /// tell again.
-    #[test]
-    fn a_restart_keeps_the_deadline_and_never_tells_twice() {
-        let (dir, rollout, d) = quiet_agent();
-        drop(d);
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 100);
-        assert_eq!(
-            d.next_due(),
-            Some(AFTER),
-            "the deadline it had, not a new one"
-        );
-        drop(d);
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], AFTER + 100);
-        assert_eq!(notices(&d.due(AFTER + 100, NOW_GO)).len(), 1);
-        drop(d);
-        let mut d = driver();
-        let acts = d.reconcile(vec![stalling(dir.path(), &rollout)], AFTER + 200);
-        assert!(notices(&acts).is_empty());
-        assert!(d.due(AFTER * 5, NOW_GO).is_empty());
-    }
-
-    /// A record clank cannot find, or cannot make sense of, is no reason
-    /// to stay quiet: that is what this fallback is for.
-    #[test]
-    fn a_missing_or_unreadable_record_is_still_told() {
-        for record in ["missing", "garbage"] {
-            let dir = tempfile::tempdir().unwrap();
-            let rollout = dir.path().join("rollout.jsonl");
-            if record == "garbage" {
-                append(&rollout, &["not json", "{\"type\":\"something else\"}"]);
-            }
-            let mut d = driver();
-            d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-            assert_eq!(notices(&d.due(AFTER, NOW_GO)).len(), 1, "{record}");
-        }
-    }
-
-    /// A notice that could not be stored is held, not retried in a loop,
-    /// and told once storage works.
-    #[test]
-    fn a_stall_that_could_not_be_stored_is_told_after_the_hold() {
-        let (dir, _, mut d) = quiet_agent();
-        let blocked = stall_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        assert!(d.due(AFTER, NOW_GO).is_empty());
-        assert_eq!(d.next_due(), Some(AFTER + RETRY_LOOK));
-        assert!(d.due(AFTER + 1, NOW_GO).is_empty());
-        std::fs::remove_dir(&blocked).unwrap();
-        assert_eq!(notices(&d.due(AFTER + RETRY_LOOK, NOW_GO)).len(), 1);
-    }
-
-    /// A failure whose recovery already ended (here, its retry was
-    /// refused) is still the failed-turn plan's: the stall stays quiet.
-    #[test]
-    fn a_failure_whose_recovery_ended_is_still_not_a_stall() {
-        enable(Tool::Codex, Some(Transport::Helper));
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        let attempt = dispatches(&d.due(60, NOW_GO))[0].0.clone();
-        d.answer(&label(), &attempt, Answer::Refused, 61);
-        assert_eq!(load(dir.path()).unwrap().state, State::Closed);
-        assert!(notices(&d.due(AFTER, NOW_GO)).is_empty());
-        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
-    }
-
-    /// During a storage hold a fold writes nothing either: the stall a
-    /// deliverer ends is let go when the hold does.
-    #[test]
-    fn a_stall_hold_covers_folds_too() {
-        let (dir, rollout, mut d) = quiet_agent();
-        let blocked = stall_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        d.due(AFTER, NOW_GO);
-        let held = d.next_due();
-        let delivering = || Facts {
-            delivering: true,
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(vec![delivering()], AFTER + 1);
-        assert_eq!(d.next_due(), held, "nothing was written");
-        assert!(load_stall(dir.path()).is_some());
-        std::fs::remove_dir(&blocked).unwrap();
-        d.reconcile(vec![delivering()], AFTER + RETRY_LOOK);
-        assert_eq!(load_stall(dir.path()), None);
-    }
-
-    /// A stall that could not be stored, whether its first arming, a
-    /// clear, or a policy that changed during the hold, is decided again
-    /// from the agent as it is when the hold ends, and a disk that keeps
-    /// failing moves the hold on rather than leaving it due.
-    #[test]
-    fn a_stall_decision_owed_across_a_hold_is_rebuilt_from_now() {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
-        let blocked = stall_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        assert_eq!(d.next_due(), Some(RETRY_LOOK), "first arming owed");
-        d.due(RETRY_LOOK, NOW_GO);
-        assert_eq!(
-            d.next_due(),
-            Some(RETRY_LOOK * 2),
-            "still failing: moved on"
-        );
-        std::fs::remove_dir(&blocked).unwrap();
-        d.due(RETRY_LOOK * 2, NOW_GO);
-        let armed = load_stall(dir.path()).unwrap();
-        assert_eq!(
-            (armed.state, armed.since),
-            (StallState::Waiting, 0),
-            "counted from when it became eligible, not from the save"
-        );
-        assert_eq!(d.next_due(), Some(AFTER));
-
-        // A clear that fails, then `off` during the hold.
-        std::fs::remove_file(stall_path(dir.path())).unwrap();
-        std::fs::create_dir(stall_path(dir.path())).unwrap();
-        let off = || Facts {
-            stall_after: None,
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(
-            vec![Facts {
-                delivering: true,
-                ..stalling(dir.path(), &rollout)
-            }],
-            1000,
-        );
-        assert_eq!(d.next_due(), Some(1000 + RETRY_LOOK));
-        d.reconcile(vec![off()], 1001);
-        std::fs::remove_dir(stall_path(dir.path())).unwrap();
-        assert!(d.due(1000 + RETRY_LOOK, NOW_GO).is_empty());
-        assert_eq!(
-            (d.next_due(), load_stall(dir.path())),
-            (None, None),
-            "off, as it is now"
-        );
-    }
-
-    fn stop(turn: &str) -> String {
-        line(
-            r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"T","reason":"interrupted"}}"#,
-            turn,
-        )
-    }
-
-    /// A record replaced by another of the same size, or a session whose
-    /// record moved to another path, is progress: a quiet stall counts
-    /// again from there.
-    #[test]
-    fn a_replaced_record_of_the_same_size_is_progress() {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &stop("t1")]);
-        let size = std::fs::metadata(&rollout).unwrap().len() as usize;
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        d.due(AFTER, NOW_GO);
-        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
-
-        let running = format!("{}\n", line(STARTED, "t2"));
-        let pad = size - running.len() - 1;
-        let filler = format!(r#"{{"pad":"{}"}}"#, "x".repeat(pad - 10));
-        let replacement = format!("{running}{filler}\n");
-        assert_eq!(replacement.len(), size);
-        let tmp = dir.path().join("rollout.new");
-        std::fs::write(&tmp, replacement).unwrap();
-        std::fs::rename(&tmp, &rollout).unwrap();
-        touched(&mut d, &rollout, AFTER + 10);
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!((s.state, s.since), (StallState::Waiting, AFTER + 10));
-
-        let moved = dir.path().join("moved.jsonl");
-        append(&moved, &[&line(STARTED, "t3"), &stop("t3")]);
-        d.due(AFTER * 2 + 10, NOW_GO);
-        d.reconcile(vec![stalling(dir.path(), &moved)], AFTER * 3);
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!(
-            (s.state, s.since),
-            (StallState::Waiting, AFTER * 3),
-            "another record"
-        );
-    }
-
-    /// A question, block or proven attendance ends eligibility like
-    /// anything else: no deadline while it lasts, a told notice let go, and
-    /// a fresh interval, and a fresh notice, once it is over.
-    #[test]
-    fn attending_ends_the_stall_and_resuming_starts_it_afresh() {
-        let (dir, rollout, mut d) = quiet_agent();
-        let attending = |on: bool| Facts {
-            attending: on,
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(vec![attending(true)], AFTER - 10);
-        assert_eq!((d.next_due(), load_stall(dir.path())), (None, None));
-        d.reconcile(vec![attending(false)], AFTER - 5);
-        assert_eq!(d.next_due(), Some(AFTER - 5 + AFTER), "a fresh interval");
-        let told = d.due(AFTER * 2 - 5, NOW_GO);
-        assert_eq!(notices(&told).len(), 1);
-
-        d.reconcile(vec![attending(true)], AFTER * 3);
-        assert_eq!(waiting_for_you(dir.path()), None, "the notice is let go");
-        d.reconcile(vec![attending(false)], AFTER * 4);
-        let again = d.due(AFTER * 5, NOW_GO);
-        assert_eq!(
-            notices_with_keys(&again).first().map(|(k, _)| *k),
-            Some(format!("session-one:stall:{}", AFTER * 4).as_str())
-        );
-    }
-
-    /// An owed decision that turns out to change nothing still ends the
-    /// hold: an arming that failed, then `off`, leaves nothing due.
-    #[test]
-    fn an_owed_stall_that_needs_nothing_leaves_nothing_due() {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
-        let blocked = stall_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        let off = Facts {
-            stall_after: None,
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(vec![off], 1);
-        d.due(RETRY_LOOK, NOW_GO);
-        assert_eq!(d.next_due(), None);
-    }
-
-    fn stopped_agent() -> (tempfile::TempDir, PathBuf, Driver) {
-        let dir = tempfile::tempdir().unwrap();
-        let rollout = dir.path().join("rollout.jsonl");
-        append(&rollout, &[&line(STARTED, "t1"), &stop("t1")]);
-        let mut d = driver();
-        d.reconcile(vec![stalling(dir.path(), &rollout)], 0);
-        d.due(AFTER, NOW_GO);
-        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
-        (dir, rollout, d)
-    }
-
-    /// A quiet stall's record moves while storage is held: the re-arm is
-    /// kept, and saved, counted from the movement, when the hold ends.
-    #[test]
-    fn a_rearm_observed_during_a_hold_is_saved_after_it() {
-        let (dir, rollout, mut d) = stopped_agent();
-        let blocked = stall_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        append(&rollout, &[&line(STARTED, "t2")]);
-        touched(&mut d, &rollout, AFTER + 1);
-        assert_eq!(load_stall(dir.path()).unwrap().state, StallState::Quiet);
-        std::fs::remove_dir(&blocked).unwrap();
-        assert!(d.due(AFTER + 1 + RETRY_LOOK, NOW_GO).is_empty());
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!((s.state, s.since), (StallState::Waiting, AFTER + 1));
-        assert_eq!(d.next_due(), Some(AFTER + 1 + AFTER));
-        assert_eq!(notices(&d.due(AFTER + 1 + AFTER, NOW_GO)).len(), 1);
-    }
-
-    /// A newer decision during the hold supersedes the pending re-arm: a
-    /// deliverer arriving leaves nothing stored and nothing due.
-    #[test]
-    fn a_newer_decision_supersedes_one_pending_in_a_hold() {
-        let (dir, rollout, mut d) = stopped_agent();
-        let blocked = stall_path(dir.path()).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        append(&rollout, &[&line(STARTED, "t2")]);
-        touched(&mut d, &rollout, AFTER + 1);
-        let delivering = Facts {
-            delivering: true,
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(vec![delivering], AFTER + 2);
-        std::fs::remove_dir(&blocked).unwrap();
-        assert!(d.due(AFTER + 1 + RETRY_LOOK, NOW_GO).is_empty());
-        assert_eq!((load_stall(dir.path()), d.next_due()), (None, None));
-    }
-
-    /// Told, then not eligible and eligible again, all while storage is
-    /// held: the latch is let go and a fresh interval counted from when it
-    /// became eligible, with no notice until that interval passes.
-    #[test]
-    fn an_eligibility_reset_during_a_hold_is_kept() {
-        use std::os::unix::fs::PermissionsExt;
-        let (dir, rollout, mut d) = quiet_agent();
-        assert_eq!(notices(&d.due(AFTER, NOW_GO)).len(), 1);
-        let attending = |on: bool| Facts {
-            attending: on,
-            ..stalling(dir.path(), &rollout)
-        };
-        let perms = |mode| {
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
-        };
-        perms(0o555);
-        d.reconcile(vec![attending(true)], 2500);
-        d.reconcile(vec![attending(false)], 2501);
-        perms(0o755);
-        assert!(
-            load_stall(dir.path()).unwrap().told(),
-            "nothing written yet"
-        );
-        assert!(d.due(2500 + RETRY_LOOK, NOW_GO).is_empty());
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!((s.state, s.since), (StallState::Waiting, 2501));
-        assert_eq!(waiting_for_you(dir.path()), None);
-        let again = d.due(2501 + AFTER, NOW_GO);
-        assert_eq!(
-            notices_with_keys(&again).first().map(|(k, _)| *k),
-            Some("session-one:stall:2501")
-        );
-    }
-
-    fn block(dir: &Path) -> PathBuf {
-        let blocked = stall_path(dir).with_extension("json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
-        blocked
-    }
-
-    /// A notice that could not be stored is only a candidate: progress
-    /// seen before it could be stored overtakes it, and nobody is told.
-    #[test]
-    fn an_unstored_notice_overtaken_by_progress_is_never_told() {
-        let (dir, rollout, mut d) = quiet_agent();
-        let blocked = block(dir.path());
-        assert!(d.due(AFTER, NOW_GO).is_empty());
-        append(&rollout, &[&line(STARTED, "t2")]);
-        assert!(notices(&touched(&mut d, &rollout, AFTER + 1)).is_empty());
-        std::fs::remove_dir(&blocked).unwrap();
-        let acts = d.due(AFTER + RETRY_LOOK, NOW_GO);
-        assert_eq!(notices_with_keys(&acts), [], "{acts:?}");
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!((s.state, s.since), (StallState::Waiting, AFTER + 1));
-    }
-
-    /// An unstored notice is decided again at the hold's end by the
-    /// deadline's own gate: a deliverer, a new binding or auto mode off
-    /// cancels it before any fold.
-    #[test]
-    fn an_unstored_notice_is_cancelled_by_the_gate_at_the_holds_end() {
-        for gone in [Gate::Deliverer, Gate::SessionChanged, Gate::AutoOff] {
-            let (dir, _, mut d) = quiet_agent();
-            let blocked = block(dir.path());
-            assert!(d.due(AFTER, NOW_GO).is_empty());
-            std::fs::remove_dir(&blocked).unwrap();
+    fn a_role_change_during_a_hold_fences_the_claim_and_is_applied_after() {
+        for hold in ["issued number", "episode storage"] {
+            let (dir, record, mut d, old) = claimed_codex();
+            let repair = match hold {
+                "issued number" => {
+                    std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+                    None
+                }
+                _ => Some(block_storage(dir.path())),
+            };
+            d.reconcile(vec![as_reviewer(dir.path(), &record)], 182);
             assert!(
-                d.due(AFTER + RETRY_LOOK, |_, _| gone).is_empty(),
-                "{gone:?}"
+                d.agents.get(&label()).unwrap().held_until.is_some(),
+                "{hold}: held"
             );
-            assert_eq!(load_stall(dir.path()), None, "{gone:?}");
+            assert!(!d.may_send(&label(), &old, &reviewer_live()), "{hold}");
+            match repair {
+                None => std::fs::write(issued_path(dir.path()), old.n.to_string()).unwrap(),
+                Some(blocked) => std::fs::remove_dir(blocked).unwrap(),
+            }
+            d.due(182 + RETRY_LOOK, |_, _| Gate::Go);
+            let ep = load(dir.path()).unwrap();
+            assert_eq!(
+                (ep.role.as_str(), ep.state, ep.attempts.len()),
+                ("commit", State::Waiting, 0),
+                "{hold}: the new role's interval"
+            );
+            let acts = d.due(ep.next_at.unwrap(), |_, _| Gate::Go);
+            let new = dispatches(&acts)[0].0.clone();
+            assert!(new.n > old.n, "{hold}: {old:?} {new:?}");
         }
     }
 
-    /// A later interval's notice is told though the stored one before it
-    /// was told too: the latch is per interval.
+    /// A restarted driver never adopts another role's claim: the episode
+    /// carries the role it was opened under.
     #[test]
-    fn each_interval_is_told_once() {
-        use std::os::unix::fs::PermissionsExt;
-        let (dir, rollout, mut d) = quiet_agent();
-        assert_eq!(notices(&d.due(AFTER, NOW_GO)).len(), 1);
-        let attending = |on: bool| Facts {
-            attending: on,
-            ..stalling(dir.path(), &rollout)
-        };
-        let perms = |mode| {
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
-        };
-        perms(0o555);
-        d.reconcile(vec![attending(true)], 2500);
-        d.reconcile(vec![attending(false)], 2501);
-        assert!(d.due(2501 + AFTER, NOW_GO).is_empty(), "held");
-        perms(0o755);
-        let acts = d.due(2501 + AFTER + RETRY_LOOK, NOW_GO);
-        assert_eq!(
-            notices_with_keys(&acts)
-                .iter()
-                .map(|(k, _)| *k)
-                .collect::<Vec<_>>(),
-            ["session-one:stall:2501"]
-        );
-        let s = load_stall(dir.path()).unwrap();
-        assert!(s.told() && s.since == 2501);
-    }
-
-    /// A fold that reaches an unstored notice before its deadline path,
-    /// with progress in the record whose event never came, stores the
-    /// progress, not the notice.
-    #[test]
-    fn a_fold_judges_an_unstored_notice_by_the_record() {
-        let (dir, rollout, mut d) = quiet_agent();
-        let blocked = block(dir.path());
-        assert!(d.due(AFTER, NOW_GO).is_empty());
-        append(&rollout, &[&line(STARTED, "t2")]);
-        std::fs::remove_dir(&blocked).unwrap();
-        let acts = d.reconcile(vec![stalling(dir.path(), &rollout)], AFTER + RETRY_LOOK);
-        assert_eq!(notices_with_keys(&acts), [], "{acts:?}");
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!(
-            (s.state, s.since),
-            (StallState::Waiting, AFTER + RETRY_LOOK)
-        );
-        assert_eq!(d.next_due(), Some(AFTER + RETRY_LOOK + AFTER));
-    }
-
-    /// An interval lengthened while its notice was held is not told before
-    /// its new deadline, and is told, once, at it.
-    #[test]
-    fn a_lengthened_interval_is_not_told_early() {
-        let (dir, rollout, mut d) = quiet_agent();
-        let blocked = block(dir.path());
-        assert!(d.due(AFTER, NOW_GO).is_empty());
-        let longer = AFTER + 1200;
-        let f = || Facts {
-            stall_after: Some(longer),
-            ..stalling(dir.path(), &rollout)
-        };
-        d.reconcile(vec![f()], AFTER + 1);
-        std::fs::remove_dir(&blocked).unwrap();
-        assert!(notices(&d.due(AFTER + RETRY_LOOK, NOW_GO)).is_empty());
-        let s = load_stall(dir.path()).unwrap();
-        assert_eq!(
-            (s.state, s.since, s.after),
-            (StallState::Waiting, 0, longer)
-        );
-        assert_eq!(d.next_due(), Some(longer));
-        let acts = d.due(longer, NOW_GO);
-        assert!(
-            matches!(notices(&acts).as_slice(), [t] if t.contains("for 1h")),
-            "{acts:?}"
-        );
+    fn a_restart_never_adopts_another_roles_claim() {
+        let (dir, record, d, old) = claimed_codex();
+        drop(d);
+        let mut d = driver();
+        d.reconcile(vec![as_reviewer(dir.path(), &record)], 181);
+        assert!(!d.may_send(&label(), &old, &reviewer_live()));
+        assert_eq!(load(dir.path()).unwrap().role, "commit");
     }
 }

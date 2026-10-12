@@ -146,7 +146,7 @@ async fn run_recovery(args: StopHookArgs) -> anyhow::Result<()> {
     if let Some(line) = observation(&args, tool, &session) {
         crate::cli::recovery::observe(&agent_dir, &line)?;
         let helper = crate::cli::recovery::transport_for(tool)
-            == Some(crate::cli::recovery::Transport::Helper);
+            == Ok(crate::cli::recovery::Transport::Helper);
         println!(
             "{}",
             serde_json::json!({"recovery": if helper { "helper" } else { "notice" }})

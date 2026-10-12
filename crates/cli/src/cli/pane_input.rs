@@ -175,6 +175,52 @@ where
     .await
 }
 
+/// Type `text` into `pane` and submit it the way `tool` expects, and
+/// nothing else: never an interrupt key. Bounded; a failure says whether
+/// nothing was written or some of it may have been.
+pub(crate) async fn submit_async(
+    session: &str,
+    pane: &str,
+    tool: clank_core::Tool,
+    text: &str,
+) -> Result<(), super::open_zellij::PaneWrite> {
+    submit_with(pane, tool, text, |argv| async move {
+        super::open_zellij::write_pane_action_classified(session, pane, &argv).await
+    })
+    .await
+}
+
+/// [`submit_async`] with the terminal write supplied, so the keys it sends
+/// can be recorded.
+async fn submit_with<W, F>(
+    pane: &str,
+    tool: clank_core::Tool,
+    text: &str,
+    write: W,
+) -> Result<(), super::open_zellij::PaneWrite>
+where
+    W: Fn(Vec<String>) -> F,
+    F: std::future::Future<Output = Result<(), super::open_zellij::PaneWrite>>,
+{
+    use super::open_zellij::PaneWrite;
+    let Some(argvs) = say_argvs(pane, text) else {
+        return Err(PaneWrite::NotStarted("there was nothing to say".into()));
+    };
+    for (index, mut argv) in argvs.into_iter().enumerate() {
+        if index == 1 && tool == clank_core::Tool::Codex {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            argv = codex_submit_argv(pane);
+        }
+        match write(argv).await {
+            Ok(()) => {}
+            // Only before anything was written is a failure a no-send.
+            Err(PaneWrite::NotStarted(e)) if index == 0 => return Err(PaneWrite::NotStarted(e)),
+            Err(e) => return Err(PaneWrite::Unknown(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
 /// A fresh prompt is the handoff across native cancellation hooks. User content
 /// stays in its durable inbox: `hint` only names the pending events to read.
 /// Role is deliberately resolved by Clank when the target reads, never captured
@@ -456,6 +502,57 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("message was not confirmed"), "{said}");
+    }
+
+    /// A submit-only send writes the message and its submit, and no
+    /// interrupt key, for every typed harness.
+    #[tokio::test(start_paused = true)]
+    async fn a_submit_only_send_writes_no_interrupt() {
+        use clank_core::Tool;
+        for (tool, submit) in [
+            (Tool::Claude, "13"),
+            (Tool::Codex, "27 91 49 51 59 49 58 49 117"),
+        ] {
+            let written = RefCell::new(Vec::<Vec<String>>::new());
+            submit_with("7", tool, "hello", |argv| {
+                written.borrow_mut().push(argv);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+            let written = written.into_inner();
+            assert_eq!(written.len(), 2, "{tool:?}: {written:?}");
+            assert_eq!(written[0][1], "write-chars", "{tool:?}");
+            assert_eq!(written[1][4..].join(" "), submit, "{tool:?}");
+        }
+    }
+
+    /// A send that never started wrote nothing; one that failed after
+    /// anything was written may have typed it.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_submit_says_whether_anything_was_written() {
+        use super::super::open_zellij::PaneWrite;
+        let first = submit_with("7", clank_core::Tool::Claude, "hello", |_| async {
+            Err(PaneWrite::NotStarted("no zellij".into()))
+        })
+        .await;
+        assert!(matches!(first, Err(PaneWrite::NotStarted(_))));
+        let calls = RefCell::new(0);
+        let second = submit_with("7", clank_core::Tool::Claude, "hello", |_| {
+            *calls.borrow_mut() += 1;
+            let n = *calls.borrow();
+            async move {
+                match n {
+                    1 => Ok(()),
+                    _ => Err(PaneWrite::NotStarted("gone".into())),
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(second, Err(PaneWrite::Unknown(_))),
+            "the text was typed"
+        );
     }
 
     #[tokio::test]

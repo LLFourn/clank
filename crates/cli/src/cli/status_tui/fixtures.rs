@@ -24,6 +24,7 @@ pub(crate) fn agent_row(
         invocation: "claude".to_string(),
         session: None,
         waiting_for_you: None,
+        state: None,
         asking: None,
         repeated: None,
 
@@ -165,6 +166,7 @@ pub(crate) fn with_agents(
             invocation: "claude".to_string(),
             session: None,
             waiting_for_you: None,
+            state: None,
             asking: None,
             repeated: None,
 
