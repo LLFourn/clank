@@ -46,13 +46,12 @@ fn reply_route(
     let path = explicit.or(cwd.as_deref()).ok_or_else(|| {
         anyhow::anyhow!("cannot resolve the invoking repository; use --reply-repo")
     })?;
-    let root = crate::git_io::discover_work_dir(path)?.ok_or_else(|| {
+    let repo = crate::cli::resolve_cwd_repo(path).map_err(|_| {
         anyhow::anyhow!(
             "reply destination is not a Git repository: {}",
             path.display()
         )
     })?;
-    let repo = resolve_repo(Some(&root))?;
     let agent = recipient(&repo, Some(label), false)?;
     Ok(Some(clank_core::wait::MessageReplyRoute { repo, agent }))
 }

@@ -188,7 +188,7 @@ pub(super) fn automatic_grok(
     let cwd = env
         .cwd()
         .ok_or_else(|| anyhow::anyhow!("Grok wait has no working directory"))?;
-    let bound_repo = resolve_repo(Some(&cwd))?;
+    let bound_repo = crate::cli::resolve_cwd_repo(&cwd)?;
     let author = crate::agent_env::resolve_identity_for_hook_in(
         &bound_repo,
         clank_core::Tool::Grok,

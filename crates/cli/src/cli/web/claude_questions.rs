@@ -133,7 +133,7 @@ impl Registry {
         {
             return None;
         }
-        let repo = crate::cli::resolve_repo(Some(Path::new(&h.cwd))).ok()?;
+        let repo = crate::cli::resolve_cwd_repo(Path::new(&h.cwd)).ok()?;
         if dunce::canonicalize(repo).ok()? != dunce::canonicalize(&self.repo).ok()? {
             return None;
         }
@@ -685,7 +685,7 @@ struct HookReply {
 /// broker is asked, so the question is known with no viewer attached.
 fn record(hook: &Hook, env: &dyn crate::agent_env::Ambient) {
     use crate::cli::question_state::{Key, Observation, input_hash, observe};
-    let Ok(repo) = crate::cli::resolve_repo(Some(Path::new(&hook.cwd))) else {
+    let Ok(repo) = crate::cli::resolve_cwd_repo(Path::new(&hook.cwd)) else {
         return;
     };
     let Ok(session) = clank_core::ids::SessionId::parse(&hook.session_id) else {
@@ -743,7 +743,7 @@ pub(crate) async fn run() -> Result<()> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let hook: Hook = serde_json::from_str(&input)?;
-        let repo = crate::cli::resolve_repo(Some(Path::new(&hook.cwd)))?;
+        let repo = crate::cli::resolve_cwd_repo(Path::new(&hook.cwd))?;
         let path = crate::cli::monitor::runtime_path(&repo, "claude-questions.sock");
         let meta = std::fs::symlink_metadata(&path)?;
         ensure!(

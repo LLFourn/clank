@@ -177,6 +177,47 @@ fn automatic_wait_accepts_same_repo_and_rejects_other_repo_or_stale_session() {
     args.repo = Some(other);
     assert!(super::super::wait::automatic_grok(&args, &env).is_err());
     args.repo = None;
+    let nested = repo.join("docs/deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    let in_subdir = Stated::saying(&[
+        ("CLANK_AGENT", "grok"),
+        ("GROK_SESSION_ID", session.as_str()),
+    ])
+    .at(&repo, &nested);
+    let found = super::super::wait::automatic_grok(&args, &in_subdir).unwrap();
+    assert_eq!(
+        found.map(|(r, ..)| r),
+        Some(repo.clone()),
+        "from a subdirectory"
+    );
     crate::agent_store::release_binding(&repo, &label, &session).unwrap();
     assert!(super::super::wait::automatic_grok(&args, &env).is_err());
+}
+
+/// A native Grok session working in a subdirectory of its repo is that
+/// repo's: the hook resolves and validates its cwd by the worktree that
+/// holds it, an explicit `--repo` stays exact, and a repo that does not
+/// hold the session's cwd is still refused.
+#[test]
+fn a_session_in_a_subdirectory_is_its_repos() {
+    let (_temp, repo, label, session, env) = fixture();
+    let nested = repo.join("docs/split-backup/formal");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(hook_repo(None, &nested).unwrap(), repo);
+    assert_eq!(hook_repo(Some(&nested), &nested).unwrap(), nested);
+    handle(
+        &input(&nested, &session, "session_start", json!([])),
+        &repo,
+        &env,
+    )
+    .unwrap();
+    assert!(binding_matches(&repo, &label, Tool::Grok, session.as_str()));
+    let stop = input(&nested, &session, "stop", json!([]));
+    assert_eq!(handle(&stop, &repo, &env).unwrap(), Some(ARM));
+
+    let (_other, elsewhere, ..) = fixture();
+    assert!(
+        handle(&stop, &elsewhere, &env).is_err(),
+        "not the repo holding its cwd"
+    );
 }

@@ -52,7 +52,7 @@ fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<&'stat
         return Ok(None);
     }
     ensure!(
-        super::resolve_repo(Some(&input.cwd))? == repo,
+        super::resolve_cwd_repo(&input.cwd)? == repo,
         "native Grok cwd does not match the Clank repository"
     );
     let label = resolve_identity_for_hook_in(repo, Tool::Grok, &input.session_id, env)?;
@@ -102,6 +102,15 @@ fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<&'stat
     Ok(Some(ARM))
 }
 
+/// The repo a hook acts for: `--repo` exactly, else the worktree holding
+/// the session's cwd.
+fn hook_repo(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+    match explicit {
+        Some(p) => super::resolve_repo(Some(p)),
+        None => super::resolve_cwd_repo(cwd),
+    }
+}
+
 pub(super) fn hook(args: super::StopHookArgs) -> Result<()> {
     let result = (|| -> Result<Option<&'static str>> {
         let mut bytes = Vec::new();
@@ -114,7 +123,7 @@ pub(super) fn hook(args: super::StopHookArgs) -> Result<()> {
         );
         let input: Input =
             serde_json::from_slice(&bytes).context("unsupported native Grok hook payload")?;
-        let repo = super::resolve_repo(args.repo.as_deref().or(Some(&input.cwd)))?;
+        let repo = hook_repo(args.repo.as_deref(), &input.cwd)?;
         if !repo.join(".clank").is_dir() {
             return Ok(None);
         }

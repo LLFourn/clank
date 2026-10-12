@@ -2009,17 +2009,24 @@ pub struct PurgeArgs {
 /// through `dunce::canonicalize` so macOS `/var → /private/var`
 /// symlinks don't yield divergent identities.
 pub(crate) fn resolve_repo(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let raw = if let Some(p) = explicit {
-        p.to_path_buf()
-    } else {
-        let cwd = std::env::current_dir()?;
-        crate::git_io::discover_work_dir(&cwd)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no --repo given and the working directory is not inside a git repository"
-            )
-        })?
-    };
-    Ok(dunce::canonicalize(&raw)?)
+    match explicit {
+        Some(p) => Ok(dunce::canonicalize(p)?),
+        None => resolve_cwd_repo(&std::env::current_dir()?),
+    }
+}
+
+/// The repository a working directory belongs to: the git work tree
+/// containing it, canonicalized. For a cwd the caller did not choose (a
+/// hook payload's, a session's, the process's), which is where discovery
+/// starts; an explicit `--repo` is exact and goes through
+/// [`resolve_repo`]. A linked worktree is its own repository here.
+pub(crate) fn resolve_cwd_repo(cwd: &Path) -> anyhow::Result<PathBuf> {
+    // Discovery walks up the path as spelled, so a symlink placed in
+    // another checkout would find that checkout instead.
+    let real = dunce::canonicalize(cwd)?;
+    let root = crate::git_io::discover_work_dir(&real)?
+        .ok_or_else(|| anyhow::anyhow!("`{}` is not inside a git repository", cwd.display()))?;
+    Ok(dunce::canonicalize(&root)?)
 }
 
 /// Derive the repo basename — the segment Clank uses to address

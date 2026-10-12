@@ -92,7 +92,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use super::{StopHookArgs, resolve_repo};
+use super::{StopHookArgs, resolve_cwd_repo, resolve_repo};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
@@ -912,9 +912,7 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
     };
     // Match Stop's explicit repository override while preserving the
     // session's execution cwd for its peek/callback subprocesses.
-    let Ok(repo) =
-        crate::cli::resolve_repo(Some(args.repo.as_deref().unwrap_or(Path::new(&input.cwd))))
-    else {
+    let Ok(repo) = session_start_repo(args.repo.as_deref(), &input.cwd) else {
         return Ok(());
     };
     let tool: Tool = args.tool.into();
@@ -2206,6 +2204,15 @@ fn read_hook_stdin() -> Result<HookInput, String> {
     serde_json::from_str(&buf).map_err(|e| format!("hook: parsing stdin JSON: {e}"))
 }
 
+/// The repo a SessionStart binds in: `--repo` exactly, else the worktree
+/// holding the session's cwd.
+fn session_start_repo(repo_override: Option<&Path>, cwd: &str) -> anyhow::Result<PathBuf> {
+    match repo_override {
+        Some(p) => resolve_repo(Some(p)),
+        None => resolve_cwd_repo(Path::new(cwd)),
+    }
+}
+
 fn resolve_hook_repo(repo_override: Option<&Path>, input: &HookInput) -> Result<PathBuf, String> {
     if let Some(p) = repo_override {
         return resolve_repo(Some(p)).map_err(|e| format!("hook: --repo {p:?} invalid: {e:#}"));
@@ -2213,8 +2220,7 @@ fn resolve_hook_repo(repo_override: Option<&Path>, input: &HookInput) -> Result<
     // Default: hook stdin's cwd. The agent is sitting at this
     // directory when it ends a turn — that IS the repo we want
     // to project against.
-    let cwd = Path::new(&input.cwd);
-    resolve_repo(Some(cwd)).map_err(|e| {
+    resolve_cwd_repo(Path::new(&input.cwd)).map_err(|e| {
         format!(
             "hook: cwd `{}` from hook stdin is not inside a git repo: {e:#}",
             input.cwd
@@ -7113,14 +7119,27 @@ mod tests {
     async fn proven_run_marker_outcome(
         async_loop: bool,
     ) -> (HookOutcome, tempfile::TempDir, PathBuf) {
-        use crate::cli::teams_config::{AgentDescription, RosterRole};
         let dir = init_repo();
-        let repo = dir.path();
         let sess = if async_loop {
             "sess-run-async"
         } else {
             "sess-run-sync"
         };
+        let (out, agent_dir) =
+            run_marker_outcome_at(dir.path(), Some(dir.path()), "/tmp", sess, async_loop).await;
+        (out, dir, agent_dir)
+    }
+
+    /// The run-marker turn for `claude` bound in `repo`, the hook's payload
+    /// saying `cwd`, with `repo_override` as `--repo`.
+    async fn run_marker_outcome_at(
+        repo: &Path,
+        repo_override: Option<&Path>,
+        cwd: &str,
+        sess: &str,
+        async_loop: bool,
+    ) -> (HookOutcome, PathBuf) {
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
         let label = bind(repo, "claude", sess);
         crate::agent_store::set_auto_mode(repo, &label, AutoMode::On).unwrap();
         crate::cli::agent::add_repo_roster_agent(
@@ -7147,7 +7166,7 @@ mod tests {
         .unwrap();
         let input: HookInput = serde_json::from_value(serde_json::json!({
             "session_id": sess,
-            "cwd": "/tmp",
+            "cwd": cwd,
             "stop_hook_active": false,
             "background_tasks": [
                 {"id": "bq9run", "command": "clank run --desc \"cargo build\" -- cargo build"}
@@ -7156,14 +7175,80 @@ mod tests {
         .unwrap();
         let out = compute_outcome_with(
             Tool::Claude,
-            Some(repo),
+            repo_override,
             input,
             async_loop,
             std::time::Instant::now(),
             &stated(),
         )
         .await;
-        (out, dir, agent_dir)
+        (out, agent_dir)
+    }
+
+    /// A linked worktree under `<main>/.clank/worktrees/wt`, as clank
+    /// makes them, and a directory nested inside it.
+    fn linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let main = init_repo();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(main.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        git(&["commit", "--quiet", "--allow-empty", "-m", "init"]);
+        let wt = main.path().join(".clank/worktrees/wt");
+        git(&["worktree", "add", "--quiet", wt.to_str().unwrap()]);
+        let nested = wt.join("docs/split-backup/formal");
+        std::fs::create_dir_all(&nested).unwrap();
+        (main, dunce::canonicalize(&wt).unwrap(), nested)
+    }
+
+    /// A Stop from inside a linked worktree's subdirectory decides for that
+    /// worktree's agent: the payload's cwd is where discovery starts, its
+    /// containing worktree is the repo, and neither the main checkout nor
+    /// the hook process's own cwd is consulted. A symlinked spelling is
+    /// the same worktree; `--repo` naming the subdirectory stays exact.
+    #[tokio::test]
+    async fn a_stop_from_a_worktree_subdirectory_decides_for_that_worktree() {
+        let (main, wt, nested) = linked_worktree();
+        let (out, _) =
+            run_marker_outcome_at(&wt, None, nested.to_str().unwrap(), "sess-nested", true).await;
+        assert!(matches!(out, HookOutcome::Continue { .. }), "{out:?}");
+
+        let link = main.path().join("formal-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        assert_eq!(resolve_cwd_repo(&link).unwrap(), wt);
+        assert_eq!(
+            resolve_cwd_repo(&nested).unwrap(),
+            wt,
+            "not the main checkout"
+        );
+
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-nested",
+            "cwd": nested.to_str().unwrap(),
+            "stop_hook_active": false,
+        }))
+        .unwrap();
+        assert_eq!(
+            session_start_repo(None, nested.to_str().unwrap()).unwrap(),
+            wt,
+            "SessionStart binds in the worktree holding its cwd"
+        );
+        assert_eq!(
+            session_start_repo(Some(&nested), nested.to_str().unwrap()).unwrap(),
+            dunce::canonicalize(&nested).unwrap()
+        );
+        assert_eq!(
+            resolve_hook_repo(Some(&nested), &input).unwrap(),
+            dunce::canonicalize(&nested).unwrap(),
+            "an explicit --repo is exact, not discovered from"
+        );
     }
 
     #[tokio::test]
