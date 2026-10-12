@@ -57,7 +57,6 @@ mod scroll;
 use scroll::*;
 
 mod zellij;
-use zellij::TabIndicator;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -3191,9 +3190,6 @@ pub(crate) async fn run_tui(
         }
     });
 
-    // When inside zellij: mirror the bar's lamp emoji into the tab name,
-    // and each agent's status glyph onto its own pane name.
-    let mut tab = TabIndicator::new();
     // Probe the input signature BEFORE the first build so any change
     // racing the build re-builds next wake (under-gate, never over-gate).
     let mut last_sig = crate::cli::status::input_signature(&repo).ok();
@@ -3207,6 +3203,7 @@ pub(crate) async fn run_tui(
     // Roster→pane convergence is the worker's job; this is a channel
     // send, not zellij work (tui-reconcile-off-loop).
     reconcile_worker.observe(&snapshot);
+    reconcile_worker.update_glyphs(&snapshot);
     // The log viewport — cursor, derived offset, and the on-demand fetch
     // window. Older history is appended in fixed-size pages from `next`;
     // already loaded commits are not reread merely because the cursor moved.
@@ -5675,9 +5672,6 @@ pub(crate) async fn run_tui(
                     // the snapshot is its.
                     Mode::RemotePage { sel } => Mode::RemotePage { sel },
                 };
-                if let Some(tab) = tab.as_mut() {
-                    tab.update(&bar_emoji(&snapshot));
-                }
                 // Retitles are the worker's: derive pure glyph data
                 // here, send, never touch zellij on the loop
                 // (tui-reconcile-off-loop).

@@ -4,8 +4,8 @@
 //! status glyph onto its own pane name. The module IS the namespace —
 //! the raw `zellij action …` ops are `zellij::rename_tab` etc. (no
 //! `zellij_` stutter); the pure parsers are unit-tested without
-//! spawning zellij; [`TabIndicator`] / [`PaneStatus`] own the dedup +
-//! restore lifecycle.
+//! spawning zellij; [`TabMirror`] / [`PaneStatus`] own the tab's and
+//! the panes' lifecycles.
 
 use super::derive::agent_status_emoji;
 use super::input::Presence;
@@ -67,88 +67,117 @@ fn lost_bound_labels(
         .collect()
 }
 
-/// The current zellij tab's `(stable id, name)`, or `None` outside
-/// zellij or if the query fails. Parses `zellij action
-/// current-tab-info` (`id: N` / `name: X` lines).
-fn current_tab() -> Option<(String, String)> {
-    parse_current_tab_info(&crate::cli::open_zellij::current_tab_info()?)
+/// The zellij tab operations the tab mirror needs, injected so its
+/// lifecycle is testable without a zellij.
+pub(super) trait TabIo {
+    /// This session's tabs by stable id, with their names.
+    fn tabs(&mut self) -> Option<Vec<(u32, String)>>;
+    /// Whether zellij accepted the rename.
+    fn rename(&mut self, id: u32, name: &str) -> bool;
 }
 
-/// Parse `zellij action current-tab-info` into `(id, name)`. The
-/// output is ONE FIELD PER LINE — verified live against zellij 0.44.3
-/// (`od -c`): `name: <name>\nid: <n>\nposition: …`. Order-independent
-/// (scans all lines); `None` if either field is absent (don't rename
-/// a tab we can't identify). Pure, so the format is unit-tested
-/// without spawning zellij (codex 3cc72aa).
-fn parse_current_tab_info(stdout: &str) -> Option<(String, String)> {
-    let mut id = None;
-    let mut name = None;
-    for line in stdout.lines() {
-        if let Some(v) = line.strip_prefix("id:") {
-            id = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("name:") {
-            name = Some(v.trim().to_string());
+struct ZellijTabIo;
+
+/// No tabs at all: what the pane-only tests run against.
+#[cfg(test)]
+struct NoTabs;
+
+#[cfg(test)]
+impl TabIo for NoTabs {
+    fn tabs(&mut self) -> Option<Vec<(u32, String)>> {
+        None
+    }
+    fn rename(&mut self, _: u32, _: &str) -> bool {
+        false
+    }
+}
+
+impl TabIo for ZellijTabIo {
+    fn tabs(&mut self) -> Option<Vec<(u32, String)>> {
+        crate::cli::open_zellij::list_tabs()
+    }
+    fn rename(&mut self, id: u32, name: &str) -> bool {
+        crate::cli::open_zellij::rename_tab(id, name)
+    }
+}
+
+/// Mirrors the bar's glyph into the name of the tab holding this TUI
+/// (tui-tab-mirror-bar-emoji), owned by the worker so it is looked at
+/// on every batch, not only when the repo changes.
+///
+/// The tab is the one holding the TUI's own pane, proved from a pane
+/// listing; never the active tab, which is the user's. Its actual name,
+/// read by id, decides each rename, so a rename that failed, or one
+/// something else undid, is put right on the next batch.
+pub(super) struct TabMirror {
+    /// The TUI's own pane (`terminal_<id>`); `None` disables the mirror.
+    caller: Option<String>,
+    /// The owned tab's id and its name without a leading glyph, once
+    /// proved. Never replaced.
+    owned: Option<(u32, String)>,
+    wanted: Option<String>,
+    /// Some rename was accepted, so exit owes the base name back.
+    renamed: bool,
+}
+
+impl TabMirror {
+    pub(super) fn new(caller: Option<String>) -> Self {
+        Self {
+            caller,
+            owned: None,
+            wanted: None,
+            renamed: false,
         }
     }
-    Some((id?, name?))
-}
 
-fn rename_tab(id: &str, name: &str) {
-    crate::cli::open_zellij::rename_tab(id, name)
-}
-
-/// Mirrors the bar's emoji into the zellij tab name
-/// (tui-tab-mirror-bar-emoji). Captures the tab id + its base name
-/// (sans any stale leading glyph) ONCE; renames only on an emoji
-/// CHANGE; restores the base name on drop (covers a normal/unwound
-/// exit — a signal-killed exit leaves the last glyph, re-synced by the
-/// next TUI launch). `None` (no-op) outside zellij. Lifecycle is the
-/// pane's: this lives only as long as the `clank tui` process, so
-/// there's no separate watcher to leak.
-pub(super) struct TabIndicator<R = fn(&str, &str)>
-where
-    R: FnMut(&str, &str),
-{
-    id: String,
-    base: String,
-    last: Option<String>,
-    /// The rename operation, INJECTED so the lifecycle — capture once,
-    /// rename only on change, restore on drop — is testable without a
-    /// zellij (zellij-is-the-workspace). Production passes the
-    /// spawner's `rename_tab`.
-    rename: R,
-}
-
-impl TabIndicator {
-    pub(super) fn new() -> Option<Self> {
-        Self::with_io(current_tab(), rename_tab as fn(&str, &str))
-    }
-}
-
-impl<R: FnMut(&str, &str)> TabIndicator<R> {
-    fn with_io(tab: Option<(String, String)>, rename: R) -> Option<Self> {
-        let (id, name) = tab?;
-        Some(Self {
-            id,
-            base: strip_leading_emoji(&name),
-            last: None,
-            rename,
-        })
+    pub(super) fn want(&mut self, glyph: &str) {
+        if !glyph.is_empty() {
+            self.wanted = Some(glyph.to_string());
+        }
     }
 
-    pub(super) fn update(&mut self, emoji: &str) {
-        if emoji.is_empty() || self.last.as_deref() == Some(emoji) {
+    /// Bring the owned tab's name to the wanted glyph. `owner` is the
+    /// caller's tab as the batch's pane listing names it.
+    pub(super) fn reconcile(
+        &mut self,
+        owner: impl FnOnce(&str) -> Option<u32>,
+        io: &mut impl TabIo,
+    ) {
+        let Some(caller) = self.caller.as_deref() else {
             return;
+        };
+        let mut tabs = None;
+        if self.owned.is_none() {
+            let Some(id) = owner(caller) else { return };
+            let Some(listed) = io.tabs() else { return };
+            let Some((_, name)) = listed.iter().find(|(t, _)| *t == id) else {
+                return;
+            };
+            self.owned = Some((id, strip_leading_emoji(name)));
+            tabs = Some(listed);
         }
-        (self.rename)(&self.id, &format!("{emoji} {}", self.base));
-        self.last = Some(emoji.to_string());
+        let (Some((id, base)), Some(glyph)) = (&self.owned, &self.wanted) else {
+            return;
+        };
+        let Some(tabs) = tabs.or_else(|| io.tabs()) else {
+            return;
+        };
+        let want = format!("{glyph} {base}");
+        match tabs.iter().find(|(t, _)| t == id) {
+            Some((_, name)) if *name != want => {
+                if io.rename(*id, &want) {
+                    self.renamed = true;
+                }
+            }
+            _ => {}
+        }
     }
-}
 
-impl<R: FnMut(&str, &str)> Drop for TabIndicator<R> {
-    fn drop(&mut self) {
-        if self.last.is_some() {
-            (self.rename)(&self.id, &self.base);
+    /// Put the owned tab's base name back, if a rename was ever
+    /// accepted. The worker's last act, after its final batch.
+    pub(super) fn restore(&mut self, io: &mut impl TabIo) {
+        if let (true, Some((id, base))) = (self.renamed, &self.owned) {
+            io.rename(*id, base);
         }
     }
 }
@@ -171,6 +200,8 @@ pub(super) struct StatusGlyphs {
     /// by another, and wrong after a stale swap re-applied
     /// (placement-is-a-layout-applied-not-panes-shuffled).
     titles: std::collections::BTreeMap<String, String>,
+    /// The bar's glyph, which the tab's name carries.
+    tab: String,
 }
 
 impl StatusGlyphs {
@@ -187,7 +218,10 @@ impl StatusGlyphs {
                 )
             })
             .collect();
-        Self { titles }
+        Self {
+            titles,
+            tab: super::render::bar_emoji(snap),
+        }
     }
 }
 
@@ -501,6 +535,10 @@ pub(super) trait PaneIo {
     /// Bound agents with no pane but a process still holding their
     /// session. Read only; this never starts or reconnects an agent.
     fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String>;
+    /// The tab holding the terminal pane `caller`, as `snap` names it.
+    fn tab_of(&mut self, _snap: &Self::Snap, _caller: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// The real zellij-backed [`PaneIo`].
@@ -553,6 +591,9 @@ impl PaneIo for ZellijPaneIo<'_> {
     }
     fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
         crate::cli::open_zellij::reviewers_are_stacked(snap, self.repo, reviewers)
+    }
+    fn tab_of(&mut self, snap: &Self::Snap, caller: &str) -> Option<u32> {
+        crate::cli::open_zellij::owned_tab(snap, caller)
     }
     fn compose(&mut self, master: &str, reviewers: &[String], snap: &Self::Snap) -> Option<String> {
         let tab = crate::cli::open_zellij::repo_tab_id(snap, self.repo)?;
@@ -989,6 +1030,9 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
         self.inner.lost_labels(snap)
     }
+    fn tab_of(&mut self, snap: &Self::Snap, caller: &str) -> Option<u32> {
+        self.inner.tab_of(snap, caller)
+    }
 }
 
 /// A message to the reconciliation worker. Roster views and glyph data
@@ -1050,15 +1094,17 @@ struct WorkerState {
     /// The last roster view handled — cached (pane, label, role) rows
     /// are only trustworthy while the roster TARGET is unchanged.
     last_roster: Option<RosterView>,
+    tab: TabMirror,
 }
 
 impl WorkerState {
-    fn new() -> Self {
+    fn new(caller: Option<String>) -> Self {
         Self {
             reconciler: PaneReconciler::new(),
             panes: PaneStatus::new(),
             lost: Default::default(),
             last_roster: None,
+            tab: TabMirror::new(caller),
         }
     }
 
@@ -1071,11 +1117,25 @@ impl WorkerState {
     /// refresh retitles, and presence rides on that listing — the
     /// plan's "a refresh batch probes too"; codex on e310988 and
     /// 44e937e).
+    #[cfg(test)]
     fn handle(
         &mut self,
         batch: WorkerBatch,
         io: &mut impl PaneIo,
         rename: impl FnMut(&str, &str),
+    ) -> Vec<Report> {
+        self.handle_with(batch, io, rename, &mut NoTabs)
+    }
+
+    /// [`Self::handle`] with the tab's zellij operations. The tab is
+    /// reconciled on every batch that lists, the periodic probe
+    /// included, so a stale name is found without the repo changing.
+    fn handle_with(
+        &mut self,
+        batch: WorkerBatch,
+        io: &mut impl PaneIo,
+        rename: impl FnMut(&str, &str),
+        tabs: &mut impl TabIo,
     ) -> Vec<Report> {
         let WorkerBatch {
             roster,
@@ -1111,8 +1171,12 @@ impl WorkerState {
         let listed = probe || glyphs.is_some();
         let listing = if listed { io.snapshot() } else { None };
         if let Some(g) = glyphs {
+            self.tab.want(&g.tab);
             let rows = listing.as_ref().map(|snap| io.title_rows(snap));
             self.panes.update_with(&g, rows, rename);
+        }
+        if let Some(snap) = &listing {
+            self.tab.reconcile(|caller| io.tab_of(snap, caller), tabs);
         }
         if listed {
             reports.push(Report::Presence(
@@ -1177,30 +1241,37 @@ impl ReconcileWorker {
         let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
         let mut worker = Self::in_session(report_rx);
         let join = std::thread::spawn(move || {
-            let mut state = WorkerState::new();
+            let mut state = WorkerState::new(crate::cli::open_zellij::caller_pane_id());
+            let mut tabs = ZellijTabIo;
             let io = ZellijPaneIo { repo: &repo };
             let seen = std::cell::Cell::new(None);
             let mut io = Observed {
                 inner: io,
                 seen: &seen,
             };
-            worker_loop(&rx, PRESENCE_PERIOD, |batch| {
-                seen.set(None);
-                let reports = state.handle(batch, &mut io, rename_pane);
-                // Only a batch that actually listed has anything to
-                // say about reach; a cached batch keeps the loop's
-                // last value.
-                if let Some(reach) = seen.get() {
-                    let _ = report_tx.send(Report::Reach(reach));
-                }
-                let wake_loop = !reports.is_empty();
-                for report in reports {
-                    let _ = report_tx.send(report);
-                }
-                if wake_loop {
-                    wake();
-                }
-            });
+            serve(
+                &rx,
+                PRESENCE_PERIOD,
+                &mut state,
+                &mut io,
+                &mut tabs,
+                rename_pane,
+                |reports| {
+                    // Only a batch that actually listed has anything to
+                    // say about reach; a cached batch keeps the loop's
+                    // last value.
+                    if let Some(reach) = seen.take() {
+                        let _ = report_tx.send(Report::Reach(reach));
+                    }
+                    let wake_loop = !reports.is_empty();
+                    for report in reports {
+                        let _ = report_tx.send(report);
+                    }
+                    if wake_loop {
+                        wake();
+                    }
+                },
+            );
         });
         worker.tx = Some(tx);
         worker.join = Some(join);
@@ -1323,6 +1394,24 @@ impl Drop for ReconcileWorker {
     }
 }
 
+/// The worker's life: every batch until the channel closes, then the
+/// tab's base name back, so nothing pending can rename after it.
+#[allow(clippy::too_many_arguments)]
+fn serve<I: PaneIo>(
+    rx: &std::sync::mpsc::Receiver<WorkerMsg>,
+    period: std::time::Duration,
+    state: &mut WorkerState,
+    io: &mut I,
+    tabs: &mut impl TabIo,
+    mut rename: impl FnMut(&str, &str),
+    mut reports: impl FnMut(Vec<Report>),
+) {
+    worker_loop(rx, period, |batch| {
+        reports(state.handle_with(batch, io, &mut rename, tabs))
+    });
+    state.tab.restore(tabs);
+}
+
 /// The worker's receive loop, generic over the batch handler so the
 /// coalescing contract is testable without zellij
 /// (tui-reconcile-off-loop): messages QUEUED before a batch starts
@@ -1398,63 +1487,6 @@ mod tests {
         );
     }
 
-    // ── zellij-is-the-workspace: the tab indicator, fake-backed ──
-
-    /// Rename only on CHANGE, and put the base name back on drop.
-    /// Every rename is a zellij subprocess, so a redundant one per
-    /// frame is a cost, and a missing restore leaves a stale glyph
-    /// in the tab name after the TUI exits.
-    #[test]
-    fn tab_indicator_renames_on_change_only_and_restores_on_drop() {
-        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
-        {
-            let mut tab = TabIndicator::with_io(
-                Some(("3".to_string(), "👀 clank".to_string())),
-                |id: &str, name: &str| renames.borrow_mut().push((id.into(), name.into())),
-            )
-            .expect("a tab to indicate");
-            tab.update("");
-            assert!(renames.borrow().is_empty(), "an empty glyph is a no-op");
-            tab.update("💤");
-            tab.update("💤");
-            tab.update("💤");
-            assert_eq!(
-                renames.borrow().as_slice(),
-                &[("3".to_string(), "💤 clank".to_string())],
-                "three identical updates are one rename"
-            );
-            tab.update("👀");
-            assert_eq!(renames.borrow().len(), 2, "a change renames again");
-        }
-        // The stale leading glyph in the captured name was stripped:
-        // the restore writes the BASE, never the glyph we found.
-        assert_eq!(
-            renames.borrow().last().unwrap(),
-            &("3".to_string(), "clank".to_string()),
-            "drop restores the base name"
-        );
-    }
-
-    /// Never touched → nothing to restore, so drop is silent.
-    #[test]
-    fn tab_indicator_untouched_restores_nothing() {
-        let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
-        {
-            let _tab = TabIndicator::with_io(
-                Some(("3".to_string(), "clank".to_string())),
-                |id: &str, name: &str| renames.borrow_mut().push((id.into(), name.into())),
-            );
-        }
-        assert!(renames.borrow().is_empty(), "no update, no restore");
-    }
-
-    /// Outside zellij there is no tab and no indicator: the rename
-    /// closure is never even constructed into anything.
-    #[test]
-    fn tab_indicator_is_none_without_a_tab() {
-        assert!(TabIndicator::with_io(None, |_: &str, _: &str| {}).is_none());
-    }
-
     // ── zellij-is-the-workspace: reachability ──────────────────
 
     /// Outside a session the worker never spawns and reach is fixed:
@@ -1513,7 +1545,7 @@ mod tests {
             Some(live(&[("claude", true)])),
         ]);
         let mut io = Observed { inner, seen: &seen };
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let view = view(&["claude"], Some("claude"));
 
         // First batch: not converged, so the reconciler lists once.
@@ -1559,7 +1591,7 @@ mod tests {
         let seen = std::cell::Cell::new(None);
         let inner = FakeIo::new(vec![None]);
         let mut io = Observed { inner, seen: &seen };
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         state.handle(
             wb(Some(view(&["claude"], Some("claude"))), None, Vec::new()),
             &mut io,
@@ -1717,6 +1749,10 @@ mod tests {
         home: Option<std::path::PathBuf>,
         orientation: crate::cli::open_zellij::Orientation,
         compose_fails: bool,
+        /// The tab each listing names for the caller's pane; once these
+        /// run out, `owner`.
+        owners: std::collections::VecDeque<Option<u32>>,
+        owner: Option<u32>,
     }
 
     /// The repo every fake composes for. Composition needs a path
@@ -1750,6 +1786,8 @@ mod tests {
                 home: None,
                 orientation: crate::cli::open_zellij::Orientation::Landscape,
                 compose_fails: false,
+                owners: std::collections::VecDeque::new(),
+                owner: None,
             }
         }
 
@@ -1841,6 +1879,221 @@ mod tests {
         fn lost_labels(&mut self, _snap: &Self::Snap) -> std::collections::BTreeSet<String> {
             self.lost.clone()
         }
+        fn tab_of(&mut self, _snap: &Self::Snap, caller: &str) -> Option<u32> {
+            assert_eq!(caller, "terminal_5", "only the TUI's own pane is looked up");
+            self.owners.pop_front().unwrap_or(self.owner)
+        }
+    }
+
+    /// A session's tabs. Each rename is logged; scripted outcomes say
+    /// whether zellij accepts it and whether an accepted one applies.
+    struct FakeTabs {
+        tabs: std::collections::BTreeMap<u32, String>,
+        listings: std::collections::VecDeque<bool>,
+        accepts: std::collections::VecDeque<bool>,
+        applies: std::collections::VecDeque<bool>,
+        renames: Vec<(u32, String)>,
+    }
+
+    impl FakeTabs {
+        /// The TUI's tab 1 and the user's tab 2.
+        fn two() -> Self {
+            Self {
+                tabs: [(1, "anxiety-attack".to_string()), (2, "other".to_string())].into(),
+                listings: Default::default(),
+                accepts: Default::default(),
+                applies: Default::default(),
+                renames: Vec::new(),
+            }
+        }
+
+        fn name(&self, id: u32) -> &str {
+            &self.tabs[&id]
+        }
+    }
+
+    impl TabIo for FakeTabs {
+        fn tabs(&mut self) -> Option<Vec<(u32, String)>> {
+            self.listings
+                .pop_front()
+                .unwrap_or(true)
+                .then(|| self.tabs.iter().map(|(i, n)| (*i, n.clone())).collect())
+        }
+        fn rename(&mut self, id: u32, name: &str) -> bool {
+            self.renames.push((id, name.to_string()));
+            let accepted = self.accepts.pop_front().unwrap_or(true);
+            if accepted && self.applies.pop_front().unwrap_or(true) {
+                self.tabs.insert(id, name.to_string());
+            }
+            accepted
+        }
+    }
+
+    fn mirror() -> TabMirror {
+        let mut m = TabMirror::new(Some("terminal_5".to_string()));
+        m.want("🔨");
+        m
+    }
+
+    /// The tab holding the TUI's pane is the one named, even with the
+    /// user on another tab from the first look; that other tab is never
+    /// touched, then or when the mirror restores on exit.
+    #[test]
+    fn the_mirror_names_only_the_tab_holding_its_pane() {
+        let mut tabs = FakeTabs::two();
+        let mut m = mirror();
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "🔨 anxiety-attack");
+        m.restore(&mut tabs);
+        assert_eq!(tabs.name(1), "anxiety-attack");
+        assert!(
+            tabs.renames.iter().all(|(id, _)| *id == 1),
+            "{:?}",
+            tabs.renames
+        );
+        assert_eq!(tabs.name(2), "other");
+    }
+
+    /// A rename zellij refused, or accepted without applying, is tried
+    /// again with nothing new wanted; a name something else changed is
+    /// put back; a right name is left alone.
+    #[test]
+    fn the_mirror_converges_on_the_tabs_actual_name() {
+        let mut tabs = FakeTabs::two();
+        tabs.accepts = [false].into();
+        tabs.applies = [false].into();
+        let mut m = mirror();
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "anxiety-attack", "refused");
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "anxiety-attack", "accepted, not applied");
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "🔨 anxiety-attack");
+        let before = tabs.renames.len();
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.renames.len(), before, "already right");
+        tabs.tabs.insert(1, "renamed by hand".to_string());
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "🔨 anxiety-attack");
+    }
+
+    /// An unanswered or empty-handed look is unknown: nothing is renamed
+    /// and nothing is recorded, and a later good look converges.
+    #[test]
+    fn the_mirror_does_nothing_on_what_it_cannot_see() {
+        let mut tabs = FakeTabs::two();
+        tabs.listings = [false, true, false].into();
+        let mut m = mirror();
+        m.reconcile(|_| None, &mut tabs);
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert!(tabs.renames.is_empty(), "no owner, then no listing");
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "🔨 anxiety-attack", "owned and named");
+        tabs.tabs.insert(1, "drifted".to_string());
+        let before = tabs.renames.len();
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.renames.len(), before, "the listing failed");
+        m.reconcile(|_| Some(1), &mut tabs);
+        assert_eq!(tabs.name(1), "🔨 anxiety-attack");
+
+        let mut unlisted = FakeTabs::two();
+        let mut m = mirror();
+        m.reconcile(|_| Some(9), &mut unlisted);
+        assert!(
+            unlisted.renames.is_empty(),
+            "an owner the tab listing lacks"
+        );
+        m.reconcile(|_| Some(1), &mut unlisted);
+        assert_eq!(unlisted.name(1), "🔨 anxiety-attack", "proved later");
+
+        let mut tabs = FakeTabs::two();
+        let mut nobody = TabMirror::new(None);
+        nobody.want("🔨");
+        nobody.reconcile(|_| Some(1), &mut tabs);
+        nobody.restore(&mut tabs);
+        assert!(tabs.renames.is_empty(), "no pane of its own, no mirror");
+    }
+
+    /// Once its tab is gone the mirror names no other, however the
+    /// listings go on to answer.
+    #[test]
+    fn a_vanished_tab_is_never_replaced() {
+        let mut tabs = FakeTabs::two();
+        let mut m = mirror();
+        m.reconcile(|_| Some(1), &mut tabs);
+        tabs.tabs.remove(&1);
+        let before = tabs.renames.len();
+        m.reconcile(|_| Some(2), &mut tabs);
+        m.restore(&mut tabs);
+        assert_eq!(tabs.renames.len(), before + 1, "only the restore, by id");
+        assert_eq!(tabs.renames.last().unwrap().0, 1);
+        assert_eq!(tabs.name(2), "other");
+    }
+
+    /// Exit restores only a tab a rename ever reached.
+    #[test]
+    fn exit_restores_only_after_an_accepted_rename() {
+        let mut tabs = FakeTabs::two();
+        tabs.accepts = [false, false].into();
+        let mut m = mirror();
+        m.reconcile(|_| Some(1), &mut tabs);
+        m.reconcile(|_| Some(1), &mut tabs);
+        m.restore(&mut tabs);
+        assert_eq!(tabs.renames.len(), 2, "two refused renames, no restore");
+    }
+
+    /// Through the worker: the first glyphs reach the tab, a refused
+    /// rename is retried by the periodic probe alone, and the worker's
+    /// last act, after the final queued batch, is the restore.
+    #[test]
+    fn the_worker_keeps_the_tab_right_between_refreshes() {
+        let mut state = WorkerState::new(Some("terminal_5".to_string()));
+        let mut io = FakeIo::new(vec![Some(Vec::new()); 3]);
+        io.owner = Some(1);
+        let mut tabs = FakeTabs::two();
+        tabs.accepts = [false].into();
+        let mut first = glyphs(&[]);
+        first.tab = "🔨".to_string();
+        state.handle_with(
+            wb(None, Some(first), Vec::new()),
+            &mut io,
+            |_, _| {},
+            &mut tabs,
+        );
+        assert_eq!(tabs.name(1), "anxiety-attack", "refused");
+        let probe = WorkerBatch {
+            probe: true,
+            ..Default::default()
+        };
+        state.handle_with(probe, &mut io, |_, _| {}, &mut tabs);
+        assert_eq!(tabs.name(1), "🔨 anxiety-attack", "the probe retried it");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut later = glyphs(&[]);
+        later.tab = "💤".to_string();
+        tx.send(WorkerMsg::Glyphs(later)).unwrap();
+        drop(tx);
+        serve(
+            &rx,
+            std::time::Duration::from_secs(60),
+            &mut state,
+            &mut io,
+            &mut tabs,
+            |_, _| {},
+            |_| {},
+        );
+        let tail: Vec<&str> = tabs
+            .renames
+            .iter()
+            .rev()
+            .take(2)
+            .map(|(_, n)| n.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            ["anxiety-attack", "💤 anxiety-attack"],
+            "the pending batch, then the restore"
+        );
     }
 
     /// Every pane command in the layout, parsed rather than grepped,
@@ -1905,6 +2158,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            tab: String::new(),
         }
     }
 
@@ -1918,7 +2172,7 @@ mod tests {
         master: &str,
         live_now: Vec<(String, bool)>,
     ) -> WorkerState {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let mut io = FakeIo::new(vec![Some(live_now)]);
         state.handle(
             wb(Some(view(labels, Some(master))), None, Vec::new()),
@@ -2642,7 +2896,7 @@ mod tests {
     /// the panes' old titles.
     #[test]
     fn retitles_after_a_reconcile_follow_the_roster() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let before = live(&[("claude", true), ("codex", false)]);
         let after = live(&[("claude", false), ("codex", true)]);
         let mut io =
@@ -2680,7 +2934,7 @@ mod tests {
     /// to stamp from (codex afb6d43).
     #[test]
     fn failed_re_list_after_an_acting_reconcile_renames_nothing() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let before = live(&[("claude", true), ("codex", false)]);
         let after = live(&[("claude", false), ("codex", true)]);
         // Reconcile lists once; the retitle listing (the batch's second
@@ -2707,7 +2961,7 @@ mod tests {
     /// TUI already converged the tab and this reconcile is a no-op.
     #[test]
     fn roster_change_invalidates_even_when_another_tui_already_converged() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let both = live(&[("claude", true), ("codex", false)]);
         let renames = std::cell::RefCell::new(Vec::<(String, String)>::new());
         let first = roster_snap(&[("claude", true), ("codex", false)]);
@@ -2747,7 +3001,7 @@ mod tests {
     /// one listing.
     #[test]
     fn a_retitle_that_must_list_and_a_probe_share_one_listing() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let both = live(&[("claude", true), ("codex", false)]);
         let mut io = FakeIo::new(vec![Some(both)]);
         let reports = state.handle(
@@ -2786,7 +3040,7 @@ mod tests {
 
     #[test]
     fn a_probe_request_and_a_refresh_each_list_once_and_a_bare_reopen_does_not() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
         let reports = state.handle(
             WorkerBatch {
@@ -2830,7 +3084,7 @@ mod tests {
 
     #[test]
     fn presence_is_live_panes_only() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let mut io = FakeIo::new(vec![Some(live(&[
             ("claude", true),
             ("r1", false),
@@ -2865,7 +3119,7 @@ mod tests {
 
     #[test]
     fn a_probe_reports_lost_processes_without_changing_panes() {
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let mut io = FakeIo::new(vec![Some(Vec::new()), Some(Vec::new())]);
         io.lost.insert("codex".to_string());
         let batch = || WorkerBatch {
@@ -2895,7 +3149,7 @@ mod tests {
         use clank_core::vocab::AutoMode;
         let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
         let mut w = ReconcileWorker::in_session(report_rx);
-        let mut state = WorkerState::new();
+        let mut state = WorkerState::new(None);
         let probe = || WorkerBatch {
             probe: true,
             ..Default::default()
@@ -3091,25 +3345,6 @@ mod tests {
             &[(Some(view(&["b"], None)), Some(vec!["new".to_string()]))],
             "one batch, newest of each kind"
         );
-    }
-
-    #[test]
-    fn parse_current_tab_info_matches_zellij_044_output() {
-        // The EXACT bytes from `zellij action current-tab-info` on
-        // zellij 0.44.3 (verified via `od -c`): one field per line.
-        let out = "name: clank\nid: 0\nposition: 0\n";
-        assert_eq!(
-            parse_current_tab_info(out),
-            Some(("0".to_string(), "clank".to_string()))
-        );
-        // Order-independent.
-        let reordered = "id: 3\nname: my tab\n";
-        assert_eq!(
-            parse_current_tab_info(reordered),
-            Some(("3".to_string(), "my tab".to_string()))
-        );
-        // Missing id (or name) → None: never rename an unidentified tab.
-        assert_eq!(parse_current_tab_info("position: 0\n"), None);
     }
 
     #[test]

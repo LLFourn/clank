@@ -1399,7 +1399,7 @@ pub(crate) struct ZellijPane {
     /// Which tab the pane lives in — `list-panes --json` spans ALL tabs,
     /// so this scopes a relocation to the caller's active tab.
     #[serde(default)]
-    tab_id: u32,
+    tab_id: Option<u32>,
     /// Focused WITHIN its tab. Every tab reports one, so this alone
     /// cannot name the user's focus — paired with [`active_tab_id`] it
     /// can. Default false when absent, which costs a focus restore
@@ -1429,6 +1429,13 @@ pub(crate) struct ZellijPane {
 }
 
 impl ZellijPane {
+    /// The tab this pane lives in, `0` when the listing did not say.
+    /// Ownership must not use this: an absent tab is unknown, not tab 0
+    /// (see [`owned_tab`]).
+    fn tab(&self) -> u32 {
+        self.tab_id.unwrap_or(0)
+    }
+
     /// The pane-id string zellij's `focus-pane-id` / `close-pane
     /// --pane-id` accept (`terminal_<id>` / `plugin_<id>`).
     pub(crate) fn pane_id(&self) -> String {
@@ -1769,7 +1776,7 @@ pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String
         .map(|(p, l)| {
             let biggest_in_tab = mine
                 .iter()
-                .filter(|(o, _)| o.tab_id == p.tab_id && o.id != p.id)
+                .filter(|(o, _)| o.tab() == p.tab() && o.id != p.id)
                 .all(|(o, _)| area(o) < area(p));
             (l.to_string(), biggest_in_tab && area(p) > 0)
         })
@@ -1813,7 +1820,7 @@ pub(crate) fn repo_tab_id(panes: &[ZellijPane], repo: &Path) -> Option<u32> {
                 .iter()
                 .find(|p| agent_pane_label(p, &repo_str).is_some())
         })
-        .map(|p| p.tab_id)
+        .map(|p| p.tab())
 }
 
 /// The tab's orientation: its SHAPE decides, the same rule
@@ -1860,7 +1867,7 @@ pub(crate) fn open_agent_pane(repo: &Path, label: &str, panes: &[ZellijPane]) ->
     let tab = repo_tab_id(panes, repo);
     let in_tab = panes
         .iter()
-        .find(|p| Some(p.tab_id) == tab && !p.is_plugin)
+        .find(|p| Some(p.tab()) == tab && !p.is_plugin)
         .map(ZellijPane::pane_id)
         .or_else(caller_pane_id);
     if let Some(id) = &in_tab {
@@ -1928,7 +1935,7 @@ fn focused_pane_in(panes: &[ZellijPane], tab: Option<u32>) -> Option<String> {
     let tab = tab?;
     panes
         .iter()
-        .find(|p| p.is_focused && p.tab_id == tab)
+        .find(|p| p.is_focused && p.tab() == tab)
         .map(ZellijPane::pane_id)
 }
 
@@ -1946,13 +1953,13 @@ fn parse_active_tab_id(text: &str) -> Option<u32> {
 
 /// Two panes in the same column span of the same tab.
 fn same_column(a: &ZellijPane, b: &ZellijPane) -> bool {
-    a.tab_id == b.tab_id && a.pane_x == b.pane_x && a.pane_columns == b.pane_columns
+    a.tab() == b.tab() && a.pane_x == b.pane_x && a.pane_columns == b.pane_columns
 }
 
 /// Full placement identity. `tab_id` FIRST: identical coordinates in
 /// two different tabs are two panes, not one stack.
 fn pane_geom(p: &ZellijPane) -> (u32, u16, u16, u16, u16) {
-    (p.tab_id, p.pane_x, p.pane_y, p.pane_columns, p.pane_rows)
+    (p.tab(), p.pane_x, p.pane_y, p.pane_columns, p.pane_rows)
 }
 
 /// Whether two panes are members of the SAME zellij stack.
@@ -2301,31 +2308,58 @@ fn new_pane_argv(label: &str, repo: &str) -> Vec<String> {
 // spawner. Every `zellij` process now starts from THIS file, so the
 // ownership gate can name one owner (zellij-is-the-workspace).
 
-/// The current tab's `(stable id, name)`, or `None` outside zellij or
-/// if the query fails. Raw `current-tab-info` text is parsed by the
-/// caller, which keeps the parser pure and testable without a spawn.
-pub(crate) fn current_tab_info() -> Option<String> {
-    if !in_session() {
-        return None;
-    }
-    let out = std::process::Command::new("zellij")
-        .args(["action", "current-tab-info"])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-pub(crate) fn rename_tab(id: &str, name: &str) {
+/// Whether zellij accepted the rename. Accepted is not applied: a
+/// caller that needs the name reads it back.
+pub(crate) fn rename_tab(id: u32, name: &str) -> bool {
     // `.output()` (NOT `.status()`): capture + discard the child's
     // stdout/stderr so a rename error never bleeds onto the alt-screen
     // the TUI owns. The loop is event-driven, so an inherited error
     // line would PERSIST until the next watcher event, not flicker
     // (ruthless 9c38523).
-    let _ = std::process::Command::new("zellij")
-        .args(["action", "rename-tab-by-id", id, name])
-        .output();
+    std::process::Command::new("zellij")
+        .args(["action", "rename-tab-by-id", &id.to_string(), name])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// This session's tabs by stable id, with their names; `None` when the
+/// listing fails or does not parse.
+pub(crate) fn list_tabs() -> Option<Vec<(u32, String)>> {
+    let out = std::process::Command::new("zellij")
+        .args(["action", "list-tabs", "--json"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| parse_tabs(&out.stdout))
+        .flatten()
+}
+
+/// `list-tabs --json`, each tab's id and name. A tab without an id
+/// fails the whole parse: a tab nobody can name by id is not one to
+/// rename.
+pub(crate) fn parse_tabs(json: &[u8]) -> Option<Vec<(u32, String)>> {
+    #[derive(serde::Deserialize)]
+    struct Tab {
+        tab_id: u32,
+        name: String,
+    }
+    let tabs: Vec<Tab> = serde_json::from_slice(json).ok()?;
+    Some(tabs.into_iter().map(|t| (t.tab_id, t.name)).collect())
+}
+
+/// The tab holding the terminal pane `caller` (`terminal_<id>`): exactly
+/// one such pane in the listing, which names its tab. An absent tab is
+/// unknown, never tab 0, and a duplicate pane id is ambiguous.
+pub(crate) fn owned_tab(panes: &[ZellijPane], caller: &str) -> Option<u32> {
+    let mut found = panes
+        .iter()
+        .filter(|p| !p.is_plugin && p.pane_id() == caller);
+    let one = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    one.tab_id
 }
 
 pub(crate) fn rename_pane(id: &str, name: &str) {
@@ -2427,7 +2461,7 @@ fn list_agent_panes() -> Option<Vec<ZellijPane>> {
 fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
     let mut cols = 0u16;
     let mut rows = 0u16;
-    for p in panes.iter().filter(|p| p.tab_id == tab_id) {
+    for p in panes.iter().filter(|p| p.tab() == tab_id) {
         cols = cols.max(p.pane_x.saturating_add(p.pane_columns));
         rows = rows.max(p.pane_y.saturating_add(p.pane_rows));
     }
@@ -3462,6 +3496,38 @@ ttys004   zellij attach clank-foo
         );
     }
 
+    /// The caller's tab is the one its own terminal pane is listed in:
+    /// a plugin sharing the number is not it, a listing that does not
+    /// say which tab is not tab 0, and two panes claiming the id prove
+    /// nothing.
+    #[test]
+    fn the_owned_tab_is_where_the_callers_pane_is_listed() {
+        let panes = |json: &str| serde_json::from_str::<Vec<ZellijPane>>(json).unwrap();
+        let listed = panes(
+            r#"[{"id":5,"is_plugin":true,"tab_id":2},
+                {"id":5,"tab_id":1},
+                {"id":6,"tab_id":2,"is_focused":true}]"#,
+        );
+        assert_eq!(owned_tab(&listed, "terminal_5"), Some(1));
+        assert_eq!(owned_tab(&listed, "terminal_7"), None, "not listed");
+        let untold = panes(r#"[{"id":5}]"#);
+        assert_eq!(owned_tab(&untold, "terminal_5"), None, "no tab named");
+        let twice = panes(r#"[{"id":5,"tab_id":1},{"id":5,"tab_id":2}]"#);
+        assert_eq!(owned_tab(&twice, "terminal_5"), None, "ambiguous");
+    }
+
+    /// A tab listing names each tab by id; one without an id is not a
+    /// listing to act on.
+    #[test]
+    fn a_tab_listing_needs_every_tabs_id() {
+        assert_eq!(
+            parse_tabs(br#"[{"tab_id":1,"name":"clank","active":false},{"tab_id":4,"name":"x"}]"#),
+            Some(vec![(1, "clank".to_string()), (4, "x".to_string())])
+        );
+        assert_eq!(parse_tabs(br#"[{"name":"clank"}]"#), None);
+        assert_eq!(parse_tabs(b"not json"), None);
+    }
+
     #[test]
     fn active_tab_id_is_read_from_current_tab_info() {
         // Real shape: `name:` / `id:` / `position:` lines. `id` is the
@@ -3530,7 +3596,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: tab,
+            tab_id: Some(tab),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3576,7 +3642,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: 1,
+            tab_id: Some(1),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3606,7 +3672,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: 1,
+            tab_id: Some(1),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3653,7 +3719,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: tab,
+            tab_id: Some(tab),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3684,7 +3750,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: tab,
+            tab_id: Some(tab),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3713,7 +3779,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: 1,
+            tab_id: Some(1),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3749,7 +3815,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: 0,
+            tab_id: Some(0),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3792,7 +3858,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
-            tab_id: 0,
+            tab_id: Some(0),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
@@ -3845,7 +3911,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin,
             terminal_command: cmd.map(str::to_string),
-            tab_id: 0,
+            tab_id: Some(0),
             is_focused: false,
             exited: false,
             tab_name: String::new(),
