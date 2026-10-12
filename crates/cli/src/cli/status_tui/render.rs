@@ -220,6 +220,9 @@ pub(super) fn render_at(
     {
         return render_source_members(snap, group, sel, rows, cols);
     }
+    if let Mode::TimersList { sel } = mode {
+        return render_timers_list(snap, sel, rows, cols);
+    }
     if let Mode::DraftsList { sel } = mode {
         return render_drafts_list(snap, sel, rows, cols);
     }
@@ -679,6 +682,7 @@ pub(super) fn scrollable_header(
         snap.queue.len(),
         !snap.drafts.is_empty(),
         super::input::source_groups(&snap.sources).len(),
+        !super::input::active_timers(&snap.sources).is_empty(),
     );
     let at = |row: PanelRow| panel.iter().position(|r| *r == row);
     if !snap.agents.is_empty() {
@@ -879,9 +883,130 @@ pub(super) fn scrollable_header(
                 cols,
             ));
         }
+        let timers = super::input::active_timers(&snap.sources);
+        if !timers.is_empty() {
+            head_out.push(row_line(
+                &[
+                    plain("  ⏰ timers".to_string()),
+                    dim(format!("  {}", row_agents(&timers))),
+                    dim(format!("  {}", timers_summary(&timers, crate::age::now()))),
+                ],
+                mode.selected() == at(PanelRow::Timers),
+                color,
+                cols,
+            ));
+        }
     }
 
     head_out
+}
+
+/// A timer's state in words at `now`: when it fires, or since when it
+/// has been owed, or why it has no time.
+pub(super) fn timer_words(
+    source: &crate::cli::source_status::ConfiguredSource,
+    now: i64,
+) -> String {
+    use crate::cli::timer_source::TimerState;
+    let recurring = matches!(
+        &source.config,
+        clank_core::agent_config::WaitEventSource::Timer(t) if t.repeat_every.is_some()
+    );
+    match &source.timer {
+        Some(TimerState::Due(at)) if *at as i64 > now => {
+            format!("in {}", crate::age::short(*at as i64 - now))
+        }
+        Some(TimerState::Due(at)) => {
+            let since = crate::age::short(now - *at as i64);
+            match recurring {
+                true => format!("catch-up owed since {since}"),
+                false => format!("owed since {since}"),
+            }
+        }
+        Some(TimerState::AwaitingAck) => "awaiting ack".to_string(),
+        Some(TimerState::Unknown(why)) => format!("unknown: {why}"),
+        Some(TimerState::Fired) | None => String::new(),
+    }
+}
+
+/// The timers row's summary at `now`: how many are owed, when the next
+/// one fires, and how many have no time to give.
+fn timers_summary(timers: &[&crate::cli::source_status::ConfiguredSource], now: i64) -> String {
+    use crate::cli::timer_source::TimerState;
+    let due = |s: &&crate::cli::source_status::ConfiguredSource| match s.timer {
+        Some(TimerState::Due(at)) => Some(at as i64),
+        _ => None,
+    };
+    let owed = timers
+        .iter()
+        .filter_map(due)
+        .filter(|at| *at <= now)
+        .count();
+    let next = timers.iter().filter_map(due).filter(|at| *at > now).min();
+    let count = |want: fn(&TimerState) -> bool| {
+        timers
+            .iter()
+            .filter(|s| s.timer.as_ref().is_some_and(want))
+            .count()
+    };
+    let awaiting = count(|s| matches!(s, TimerState::AwaitingAck));
+    let unknown = count(|s| matches!(s, TimerState::Unknown(_)));
+    let mut parts = Vec::new();
+    if owed > 0 {
+        parts.push(format!("{owed} owed"));
+    }
+    if let Some(at) = next {
+        parts.push(format!("next in {}", crate::age::short(at - now)));
+    }
+    if awaiting > 0 {
+        parts.push(format!("{awaiting} awaiting ack"));
+    }
+    if unknown > 0 {
+        parts.push(format!("{unknown} unknown"));
+    }
+    parts.join(" · ")
+}
+
+/// The active timers, each with its agent, state and recurrence. Enter
+/// opens a timer's page.
+pub(super) fn render_timers_list(
+    snap: &StatusSnapshot,
+    sel: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let color = state_color(snap).sgr();
+    let timers = super::input::active_timers(&snap.sources);
+    let now = crate::age::now();
+    let mut out = vec![region_rule("timers", "active", true, cols), String::new()];
+    if timers.is_empty() {
+        out.push(emit(&[dim("   no active timers".to_string())], "", cols));
+    }
+    let room = rows.saturating_sub(out.len() + 1).max(1);
+    let first = sel.saturating_sub(room - 1);
+    for (i, timer) in timers.iter().enumerate().skip(first).take(room) {
+        let mut spans = vec![
+            plain(format!("  {}", timer.name)),
+            dim(format!("  @{}", timer.agent)),
+            plain(format!("  {}", timer_words(timer, now))),
+        ];
+        if let clank_core::agent_config::WaitEventSource::Timer(t) = &timer.config
+            && let Some(every) = &t.repeat_every
+        {
+            spans.push(dim(format!("  every {every}")));
+        }
+        out.push(row_line(&spans, i == sel, &color, cols));
+    }
+    while out.len() < rows.saturating_sub(1) {
+        out.push(String::new());
+    }
+    out.truncate(rows.saturating_sub(1));
+    out.push(emit(
+        &[dim("  ↑↓ choose · ⏎ open · esc back".to_string())],
+        "",
+        cols,
+    ));
+    (out, 0)
 }
 
 /// What a source row's agents are doing: the one agent's state in full,
@@ -1194,7 +1319,10 @@ pub(super) fn render_source_page(
     for (key, value) in source_config_lines(&source.config) {
         fact(&key, &value);
     }
-    fact("state", &source_state(source, &snap.sources_live));
+    match source.timer {
+        Some(_) => fact("state", &timer_words(source, crate::age::now())),
+        None => fact("state", &source_state(source, &snap.sources_live)),
+    }
     if source.delivery.is_some() {
         fact(
             "",
@@ -8331,7 +8459,7 @@ mod tests {
             1,
             "one row"
         );
-        let rows = super::super::input::panel_rows(2, &[], 0, 1, true, 0);
+        let rows = super::super::input::panel_rows(2, &[], 0, 1, true, 0, false);
         let at = rows.iter().position(|r| *r == PanelRow::Drafts).unwrap();
         let raw = render_at(
             &s,
@@ -8741,6 +8869,166 @@ mod tests {
             page.iter()
                 .any(|l| l.contains("may make it poll less often"))
         );
+    }
+
+    fn timer_of(
+        agent: &str,
+        name: &str,
+        every: Option<&str>,
+        state: crate::cli::timer_source::TimerState,
+    ) -> crate::cli::source_status::ConfiguredSource {
+        let mut source = crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse(agent).unwrap(),
+            &clank_core::agent_config::WaitEventSource::Timer(
+                clank_core::agent_config::TimerSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: name.into(),
+                    repeat_every: every.map(String::from),
+                    due_at: "2026-01-01T08:00:00Z".into(),
+                    content: Some(format!("{name} content")),
+                },
+            ),
+        );
+        source.timer = Some(state);
+        source
+    }
+
+    /// Active timers, each in a state with its own wording: one owed,
+    /// one scheduled, one awaiting an ack, one unreadable; past and
+    /// future far enough that the frame's clock cannot flip them.
+    fn four_timers() -> Vec<crate::cli::source_status::ConfiguredSource> {
+        use crate::cli::timer_source::TimerState::*;
+        vec![
+            timer_of("assistent", "rama-follow-up", None, Due(32_503_680_000)),
+            timer_of("assistent", "tax-bas", None, Due(1_000)),
+            timer_of("assistent", "daily-review", Some("24h"), AwaitingAck),
+            timer_of(
+                "assistent",
+                "broken",
+                None,
+                Unknown("corrupt timer WAL".into()),
+            ),
+        ]
+    }
+
+    /// The timers are one row under the producers, naming their agent once
+    /// with a count and saying what is owed, what is next, and what has no
+    /// time to give; they are no producer row of their own.
+    #[test]
+    fn the_active_timers_are_one_row_under_the_sources() {
+        let mut s = two_agent_snap();
+        s.sources = four_timers();
+        s.sources.insert(0, source_of("assistent", "voice"));
+        let panel = visible_lines(
+            render_at(
+                &s,
+                40,
+                160,
+                0,
+                0,
+                &PanelView::just(Mode::AgentPanel { sel: 0 }),
+            )
+            .0,
+        );
+        let row = panel.iter().find(|l| l.contains("⏰ timers")).unwrap();
+        assert!(
+            row.contains("@assistent ×4  1 owed · next in ")
+                && row.ends_with("· 1 awaiting ack · 1 unknown"),
+            "{row}"
+        );
+        assert!(
+            !panel.iter().any(|l| l.contains("rama-follow-up")),
+            "{panel:#?}"
+        );
+        let voice = panel.iter().position(|l| l.contains("voice")).unwrap();
+        let timers = panel.iter().position(|l| l.contains("⏰ timers")).unwrap();
+        assert!(voice < timers, "under the producers");
+
+        s.sources.retain(|t| t.timer.is_none());
+        let panel = visible_lines(
+            render_at(
+                &s,
+                40,
+                160,
+                0,
+                0,
+                &PanelView::just(Mode::AgentPanel { sel: 0 }),
+            )
+            .0,
+        );
+        assert!(
+            !panel.iter().any(|l| l.contains("⏰")),
+            "none active, no row"
+        );
+    }
+
+    /// The list puts the unreadable timer first, then by due time (the
+    /// owed before the scheduled), then those awaiting an ack; and a
+    /// timer's page shows its state and content, with no restart.
+    #[test]
+    fn the_timer_list_and_a_timers_page() {
+        let mut s = two_agent_snap();
+        s.sources = four_timers();
+        let list = visible_lines(
+            render_at(
+                &s,
+                20,
+                160,
+                0,
+                0,
+                &PanelView::just(Mode::TimersList { sel: 0 }),
+            )
+            .0,
+        );
+        let order: Vec<&str> = list
+            .iter()
+            .filter_map(|l| {
+                ["broken", "tax-bas", "rama-follow-up", "daily-review"]
+                    .into_iter()
+                    .find(|n| l.contains(n))
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["broken", "tax-bas", "rama-follow-up", "daily-review"]
+        );
+        let line = |name: &str| list.iter().find(|l| l.contains(name)).unwrap();
+        assert!(
+            line("tax-bas").contains("@assistent  owed since"),
+            "{list:#?}"
+        );
+        assert!(line("rama-follow-up").contains("  in "), "{list:#?}");
+        assert!(line("daily-review").contains("awaiting ack  every 24h"));
+        assert!(line("broken").contains("unknown: corrupt timer WAL"));
+
+        let tax = s.sources[1].clone();
+        assert!(!restartable(&tax, &s.sources_live));
+        let page = visible_lines(render_source_page(&s, &tax, &[], 0, 0, 30, 140).0);
+        assert!(
+            page.iter()
+                .any(|l| l.contains("state") && l.contains("owed since"))
+        );
+        assert!(page.iter().any(|l| l.contains("tax-bas content")));
+        assert!(!page.iter().any(|l| l.contains("restart")));
+    }
+
+    /// A due time passing turns `in …` into owed, by the frame's clock
+    /// alone; a recurring timer's is a catch-up.
+    #[test]
+    fn a_due_time_passing_turns_scheduled_into_owed() {
+        use crate::cli::timer_source::TimerState::Due;
+        let once = timer_of("a", "once", None, Due(1_000));
+        assert_eq!(timer_words(&once, 900), "in 1m");
+        assert_eq!(timer_words(&once, 1_120), "owed since 2m");
+        let every = timer_of("a", "every", Some("1h"), Due(1_000));
+        assert_eq!(timer_words(&every, 1_120), "catch-up owed since 2m");
+        assert_eq!(
+            timers_summary(&[&once, &every], 900),
+            "next in 1m",
+            "two due at once, neither owed yet"
+        );
+        assert_eq!(timers_summary(&[&once, &every], 1_120), "2 owed");
     }
 
     /// Watches whose deliveries differ are counted, not collapsed; and a

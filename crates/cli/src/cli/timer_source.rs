@@ -67,6 +67,76 @@ pub(crate) fn parse(source: &TimerSource) -> anyhow::Result<u64> {
     Ok(due)
 }
 
+/// What a configured timer's durable evidence says about it. Times are
+/// absolute, so whether a due time has passed is the reader's clock to
+/// judge, not this snapshot's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TimerState {
+    /// Its next occurrence is due at this time and not yet accepted:
+    /// in the future it is scheduled, in the past it is owed.
+    Due(u64),
+    /// A one-off whose occurrence is durably accepted.
+    Fired,
+    /// A recurring timer's occurrence awaits its ack; no next deadline is
+    /// armed until it is acked.
+    AwaitingAck,
+    /// The evidence cannot be read, or contradicts itself.
+    Unknown(String),
+}
+
+/// The state of `source`, configured in the events directory `dir`, from
+/// the evidence the scheduler itself reads: the one-off's exact
+/// occurrence id in its WAL or its `Seen` index, or the recurring WAL's
+/// strict fold. Reads only: no lease, no lock, no file or directory made,
+/// nothing repaired or compacted. A missing log is no evidence, which
+/// means nothing accepted; an unreadable one is unknown.
+pub(crate) fn inspect(dir: &Path, source: &TimerSource) -> TimerState {
+    match inspected(dir, source) {
+        Ok(state) => state,
+        Err(why) => TimerState::Unknown(why.to_string()),
+    }
+}
+
+fn inspected(dir: &Path, source: &TimerSource) -> anyhow::Result<TimerState> {
+    let wal = |key: &str| -> anyhow::Result<String> {
+        match std::fs::read_to_string(dir.join(format!("{key}.jsonl"))) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e.into()),
+        }
+    };
+    if source.repeat_every.is_some() {
+        let r = recurrence::Recurrence::parse(source, None)?;
+        let (covered, pending) =
+            super::github::log::recurring_progress(&wal(&r.source_key())?, &r)?;
+        if pending {
+            return Ok(TimerState::AwaitingAck);
+        }
+        return Ok(TimerState::Due(r.next_due(covered)?));
+    }
+    let due = parse(source)?;
+    let key = source.source_key(None);
+    let id = format!("timer/{due}");
+    if EventLog::retained_timer_ids_in(&wal(&key)?)?.contains(&id) {
+        return Ok(TimerState::Fired);
+    }
+    Ok(match Seen::at(dir, &key).known(&id) {
+        Known::Yes => TimerState::Fired,
+        Known::No => TimerState::Due(due),
+        Known::Damaged(why) => TimerState::Unknown(why),
+    })
+}
+
+/// The storage key the scheduler gives a configured timer: a recurring
+/// timer's log is its generation's, not its name's.
+pub(crate) fn config_key(source: &TimerSource) -> String {
+    match source.repeat_every {
+        Some(_) => recurrence::Recurrence::parse(source, None)
+            .map_or_else(|_| source.source_key(None), |r| r.source_key()),
+        None => source.source_key(None),
+    }
+}
+
 struct Entry {
     source: TimerSource,
     key: String,
@@ -675,6 +745,140 @@ mod tests {
         );
         assert!(!dir.path().join(format!("{key}.seen")).exists());
         assert!(timers.next_deadline().is_none());
+        assert_eq!(
+            inspect(dir.path(), &recurring_source("compact")),
+            TimerState::AwaitingAck,
+            "the compacted WAL still proves the occurrence it awaits"
+        );
+        let row = rows(dir.path(), &key)
+            .into_iter()
+            .find(|row| !row.acked)
+            .unwrap();
+        EventLog::open(dir.path(), &key)
+            .unwrap()
+            .ack_recurring_at(row.seq, &row.ident, r.due_at(completed).unwrap())
+            .unwrap();
+        assert_eq!(
+            inspect(dir.path(), &recurring_source("compact")),
+            TimerState::Due(r.due_at(completed + 1).unwrap()),
+            "compacted coverage carries through to the next slot"
+        );
+    }
+
+    /// Every path under `dir` with its bytes, to prove an inspection
+    /// wrote nothing.
+    fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(at) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&at) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    out.insert(path.clone(), Vec::new());
+                    stack.push(path);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    /// Inspect, asserting it touched nothing.
+    fn looked(dir: &Path, source: &TimerSource) -> TimerState {
+        let before = tree(dir);
+        let state = inspect(dir, source);
+        assert_eq!(tree(dir), before, "inspection wrote nothing");
+        state
+    }
+
+    /// A one-off is due, scheduled or owed, until its exact occurrence is
+    /// durably accepted, and fired from then on whatever the clock says.
+    /// No log at all, or an acceptance that failed, is not evidence.
+    #[tokio::test]
+    async fn a_one_off_is_owed_until_its_occurrence_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("events");
+        let timer = source("rama", 100);
+        assert_eq!(looked(&dir, &timer), TimerState::Due(100));
+        assert!(!dir.exists(), "no events directory was made");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = timer.source_key(None);
+        let held = IngestLease::try_acquire(&dir, &key).unwrap().unwrap();
+        let (mut timers, _rx) = set(&dir, vec![timer.clone()]);
+        timers.due_at(150, Instant::now());
+        assert_eq!(
+            looked(&dir, &timer),
+            TimerState::Due(100),
+            "acceptance failed"
+        );
+        drop(held);
+        timers.retry();
+        assert_eq!(looked(&dir, &timer), TimerState::Fired);
+
+        let seen = dir.join(format!("{key}.seen"));
+        let index = tree(&seen);
+        std::fs::remove_dir_all(&seen).unwrap();
+        assert_eq!(
+            looked(&dir, &timer),
+            TimerState::Fired,
+            "the WAL proves it across the crash gap before its Seen write"
+        );
+        for (path, bytes) in &index {
+            if !bytes.is_empty() {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+
+        std::fs::remove_file(dir.join(format!("{key}.jsonl"))).unwrap();
+        assert_eq!(
+            looked(&dir, &timer),
+            TimerState::Fired,
+            "the Seen tier proves it after the WAL is gone"
+        );
+        let entry = std::fs::read_dir(&seen)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&entry, "something else").unwrap();
+        assert!(
+            matches!(looked(&dir, &timer), TimerState::Unknown(_)),
+            "damaged Seen"
+        );
+    }
+
+    /// A recurring timer owes a catch-up for uncovered past slots, awaits
+    /// its ack once one is accepted, and is next due after the ack; a WAL
+    /// that cannot be read is unknown.
+    #[tokio::test]
+    async fn a_recurring_timer_states_what_its_wal_proves() {
+        let dir = tempfile::tempdir().unwrap();
+        let timer = recurring_source("review");
+        let r = recurrence::Recurrence::parse(&timer, None).unwrap();
+        let key = r.source_key();
+        assert_eq!(
+            looked(dir.path(), &timer),
+            TimerState::Due(100),
+            "slot 0 owed"
+        );
+        let (mut timers, _rx) = set(dir.path(), vec![timer.clone()]);
+        timers.due_at(125, Instant::now());
+        assert_eq!(looked(dir.path(), &timer), TimerState::AwaitingAck);
+        let row = rows(dir.path(), &key).remove(0);
+        EventLog::open(dir.path(), &key)
+            .unwrap()
+            .ack_recurring_at(row.seq, &row.ident, 126)
+            .unwrap();
+        assert_eq!(looked(dir.path(), &timer), TimerState::Due(130));
+        std::fs::write(dir.path().join(format!("{key}.jsonl")), "garbage\nmore\n").unwrap();
+        assert!(matches!(looked(dir.path(), &timer), TimerState::Unknown(_)));
     }
 
     #[test]

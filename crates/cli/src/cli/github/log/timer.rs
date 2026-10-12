@@ -305,6 +305,19 @@ fn fold(lines: &[Line], r: &Recurrence) -> std::io::Result<State> {
     Ok(state)
 }
 
+/// What a recurring timer's WAL text proves: the slots it covers, and
+/// whether an occurrence still awaits its ack. The scheduler's own
+/// strict fold, for an inspector that locks and writes nothing.
+pub(crate) fn recurring_progress(
+    text: &str,
+    r: &Recurrence,
+) -> std::io::Result<(Option<u64>, bool)> {
+    let lines =
+        EventLog::parse(text).map_err(|_| invalid("corrupt recurring WAL; repair required"))?;
+    let state = fold(&lines, r)?;
+    Ok((state.covered, state.pending.is_some()))
+}
+
 impl EventLog {
     /// Recovery publication syncs accepted evidence, including removed schedules.
     /// Inspection stays read-only. Caller never generates an occurrence here.

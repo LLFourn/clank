@@ -121,6 +121,8 @@ pub(super) enum Mode {
     DraftsList { sel: usize },
     /// The agents configuring one source row's source.
     SourceMembers { sel: usize },
+    /// The active timers, in [`active_timers`] order.
+    TimersList { sel: usize },
     /// An event source's page; `sel` is the cursor over its rows, and
     /// `lift` how many lines the reader has scrolled above the window that
     /// keeps that row drawn, to read the configuration. WHICH source
@@ -472,12 +474,13 @@ impl GroupRef {
     }
 }
 
-/// The panel's source rows, in the order the sources are listed.
+/// The panel's source rows, in the order the sources are listed. Timers
+/// have their one row of their own.
 pub(super) fn source_groups(
     sources: &[crate::cli::source_status::ConfiguredSource],
 ) -> Vec<GroupRef> {
     let mut out: Vec<GroupRef> = Vec::new();
-    for source in sources {
+    for source in sources.iter().filter(|s| s.timer.is_none()) {
         let group = GroupRef::of(source);
         if !out.contains(&group) {
             out.push(group);
@@ -486,10 +489,31 @@ pub(super) fn source_groups(
     out
 }
 
-/// Where a source's member list cursor lands after a refresh: on the
-/// member it was on, wherever it moved; on the same row, or the last,
-/// only when that member is gone.
-pub(super) fn rebind_member_sel(
+/// The active timers as their list shows them: unreadable ones first,
+/// then by when they are due (owed ones, being past, before scheduled
+/// ones), then those awaiting an ack. The order is the clock's to judge
+/// only through each timer's own absolute time, so a due time passing
+/// moves nothing.
+pub(super) fn active_timers(
+    sources: &[crate::cli::source_status::ConfiguredSource],
+) -> Vec<&crate::cli::source_status::ConfiguredSource> {
+    use crate::cli::timer_source::TimerState;
+    let rank = |s: &crate::cli::source_status::ConfiguredSource| match &s.timer {
+        Some(TimerState::Unknown(_)) => (0, 0),
+        Some(TimerState::Due(at)) => (1, *at),
+        _ => (2, 0),
+    };
+    let mut timers: Vec<_> = sources.iter().filter(|s| s.timer.is_some()).collect();
+    timers.sort_by(|a, b| {
+        (rank(a), &a.name, a.agent.as_str()).cmp(&(rank(b), &b.name, b.agent.as_str()))
+    });
+    timers
+}
+
+/// Where a list of sources' cursor lands after a refresh: on the source
+/// it was on, wherever it moved; on the same row, or the last, only when
+/// that source is gone.
+pub(super) fn rebind_list_sel(
     sel: usize,
     selected: Option<&SourceRef>,
     members: &[&crate::cli::source_status::ConfiguredSource],
@@ -1075,6 +1099,7 @@ pub(super) enum PanelAnchor {
     Drafts,
     /// A source row, by what the source is.
     Source(GroupRef),
+    Timers,
 }
 
 /// What the cursor is on now, for re-locating after a refresh.
@@ -1113,6 +1138,7 @@ pub(super) fn capture_anchor(
             .unwrap_or(PanelAnchor::Add),
         Some(PanelRow::Remote) => PanelAnchor::Remote,
         Some(PanelRow::Drafts) => PanelAnchor::Drafts,
+        Some(PanelRow::Timers) => PanelAnchor::Timers,
         Some(PanelRow::Source(i)) => source_groups(sources)
             .get(*i)
             .map(|g| PanelAnchor::Source(g.clone()))
@@ -1161,6 +1187,7 @@ pub(super) fn rebind_anchor(
             .and_then(|i| find(PanelRow::Queue(i))),
         PanelAnchor::Remote => find(PanelRow::Remote),
         PanelAnchor::Drafts => find(PanelRow::Drafts),
+        PanelAnchor::Timers => find(PanelRow::Timers),
         PanelAnchor::Source(group) => source_groups(sources)
             .iter()
             .position(|g| g == group)
@@ -2439,6 +2466,7 @@ pub(super) enum PanelAction {
     OpenDrafts,
     /// Open an event source's page (Enter on its row).
     OpenSource(usize),
+    OpenTimers,
 }
 
 /// Pure key routing for the agent panel. `agents` is the roster; the
@@ -2468,6 +2496,8 @@ pub(super) enum PanelRow {
     Drafts,
     /// A configured event source, in the region above the log.
     Source(usize),
+    /// `⏰ timers`, under the sources, while any timer is active.
+    Timers,
 }
 
 /// Every cursor position in the panel, in screen order. `waits` holds
@@ -2480,6 +2510,7 @@ pub(super) fn panel_rows(
     queue_len: usize,
     drafts: bool,
     sources_len: usize,
+    timers: bool,
 ) -> Vec<PanelRow> {
     let mut out =
         Vec::with_capacity(agents_len + waits.len() + 3 + stash_len + queue_len + sources_len);
@@ -2497,6 +2528,9 @@ pub(super) fn panel_rows(
         out.push(PanelRow::Drafts);
     }
     out.extend((0..sources_len).map(PanelRow::Source));
+    if timers {
+        out.push(PanelRow::Timers);
+    }
     out
 }
 
@@ -2535,6 +2569,7 @@ pub(super) fn agent_panel_action(sel: usize, rows: &[PanelRow], key: Key) -> Pan
             Some(PanelRow::Queue(q)) => PanelAction::OpenQueueItem(q),
             Some(PanelRow::Drafts) => PanelAction::OpenDrafts,
             Some(PanelRow::Source(i)) => PanelAction::OpenSource(i),
+            Some(PanelRow::Timers) => PanelAction::OpenTimers,
             Some(PanelRow::Agent(i)) => PanelAction::OpenDetail(i),
             Some(PanelRow::Wait(i)) => PanelAction::OpenWait(i),
             Some(PanelRow::Remote) => PanelAction::OpenRemotePage,
@@ -2804,12 +2839,12 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 0,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Char(b'a')
             ),
             agent_panel_action(
                 0,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Focus
             ),
             "panel: `a` and Tab both leave focus"
@@ -3041,7 +3076,7 @@ mod tests {
     /// acts on the row under the cursor.
     #[test]
     fn a_source_row_opens_its_page_and_its_rows_act() {
-        let rows = panel_rows(1, &[], 0, 1, true, 2);
+        let rows = panel_rows(1, &[], 0, 1, true, 2, false);
         assert_eq!(
             &rows[rows.len() - 3..],
             [PanelRow::Drafts, PanelRow::Source(0), PanelRow::Source(1)]
@@ -3162,7 +3197,7 @@ mod tests {
             source("alpha", "z"),
         ];
         assert_eq!(source_groups(&before).len(), 2, "one row for a, one for z");
-        let rows = panel_rows(0, &[], 0, 0, false, 2);
+        let rows = panel_rows(0, &[], 0, 0, false, 2, false);
         let at = rows.iter().position(|r| *r == PanelRow::Source(1)).unwrap();
         let anchor = capture_anchor(at, &rows, &[], &[], &[], &before);
         let after = [
@@ -3171,7 +3206,7 @@ mod tests {
             source("alpha", "b"),
             source("alpha", "z"),
         ];
-        let rows_after = panel_rows(0, &[], 0, 0, false, 3);
+        let rows_after = panel_rows(0, &[], 0, 0, false, 3, false);
         assert_eq!(
             rows_after[rebind_anchor(&anchor, &rows_after, &[], &[], &[], &after)],
             PanelRow::Source(2)
@@ -3218,10 +3253,10 @@ mod tests {
     /// back.
     #[test]
     fn the_drafts_row_opens_a_list_that_opens_a_draft() {
-        let rows = panel_rows(1, &[], 0, 2, true, 0);
+        let rows = panel_rows(1, &[], 0, 2, true, 0, false);
         assert_eq!(rows.last(), Some(&PanelRow::Drafts));
         assert_eq!(rows[rows.len() - 2], PanelRow::Queue(1));
-        assert!(!panel_rows(1, &[], 0, 2, false, 0).contains(&PanelRow::Drafts));
+        assert!(!panel_rows(1, &[], 0, 2, false, 0, false).contains(&PanelRow::Drafts));
         let at = rows.len() - 1;
         assert_eq!(
             agent_panel_action(at, &rows, Key::Enter),
@@ -4343,7 +4378,7 @@ mod tests {
     /// rows' offsets for exactly that reason.
     #[test]
     fn a_drawable_wait_is_a_cursor_position_between_its_agent_and_the_next() {
-        let rows = panel_rows(2, &[0], 1, 2, false, 0);
+        let rows = panel_rows(2, &[0], 1, 2, false, 0, false);
         assert_eq!(
             rows,
             vec![
@@ -4376,7 +4411,7 @@ mod tests {
     #[test]
     fn an_undrawable_wait_is_not_a_cursor_position() {
         assert_eq!(
-            panel_rows(2, &[], 0, 0, false, 0),
+            panel_rows(2, &[], 0, 0, false, 0, false),
             vec![
                 PanelRow::Agent(0),
                 PanelRow::Agent(1),
@@ -4505,7 +4540,7 @@ mod tests {
     /// rows are adjacent and an off-by-one here opens the wrong page.
     #[test]
     fn enter_on_a_wait_row_opens_the_wait_not_its_agent() {
-        let rows = panel_rows(2, &[1], 0, 0, false, 0);
+        let rows = panel_rows(2, &[1], 0, 0, false, 0, false);
         // [Agent(0), Agent(1), Wait(1), Add]
         assert_eq!(
             agent_panel_action(1, &rows, Key::Enter),
@@ -4528,7 +4563,7 @@ mod tests {
     /// cursor's — they diverge as soon as a wait sits above.
     #[test]
     fn actions_carry_the_agent_index_not_the_cursor_position() {
-        let rows = panel_rows(3, &[0], 0, 0, false, 0);
+        let rows = panel_rows(3, &[0], 0, 0, false, 0, false);
         // [Agent(0), Wait(0), Agent(1), Agent(2), Add]
         assert_eq!(
             agent_panel_action(3, &rows, Key::Enter),
@@ -4599,7 +4634,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 2,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Enter
             ),
             PanelAction::OpenPicker
@@ -4607,7 +4642,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 2,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Space
             ),
             PanelAction::OpenPicker
@@ -4616,7 +4651,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 1,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Enter
             ),
             PanelAction::OpenDetail(1)
@@ -4624,7 +4659,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 1,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Space
             ),
             PanelAction::ToggleAuto(1)
@@ -4633,7 +4668,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 1,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Delete
             ),
             PanelAction::None
@@ -4642,29 +4677,45 @@ mod tests {
         // (index 2 == agents.len()) crosses into the log; Tab/Esc leave;
         // q quits.
         assert_eq!(
-            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Down),
+            agent_panel_action(
+                0,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
+                Key::Down
+            ),
             PanelAction::MoveCursor(1)
         );
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Down),
+            agent_panel_action(
+                3,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
+                Key::Down
+            ),
             PanelAction::EnterLog,
             "Down past the remote row, the last, flows into the log"
         );
         assert_eq!(
-            agent_panel_action(0, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Up),
+            agent_panel_action(
+                0,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
+                Key::Up
+            ),
             PanelAction::MoveCursor(0),
             "Up at the top stays put"
         );
         assert_eq!(
             agent_panel_action(
                 1,
-                &panel_rows(agents.len(), &[], 0, 0, false, 0),
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
                 Key::Focus
             ),
             PanelAction::LeaveFocus
         );
         assert_eq!(
-            agent_panel_action(1, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Quit),
+            agent_panel_action(
+                1,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
+                Key::Quit
+            ),
             PanelAction::Quit
         );
     }
@@ -4675,7 +4726,7 @@ mod tests {
     /// the URL, and on no other row means that.
     #[test]
     fn the_remote_row_is_under_the_agents_and_is_the_switch() {
-        let rows = panel_rows(2, &[], 1, 1, false, 0);
+        let rows = panel_rows(2, &[], 1, 1, false, 0, false);
         assert_eq!(
             rows,
             vec![
@@ -4733,14 +4784,18 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 4,
-                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                &panel_rows(agents.len(), &[], 0, ql, false, 0, false),
                 Key::Enter
             ),
             PanelAction::OpenQueueItem(0)
         );
         for key in [Key::Html, Key::Plus, Key::Minus, Key::Space] {
             assert_eq!(
-                agent_panel_action(5, &panel_rows(agents.len(), &[], 0, ql, false, 0), key),
+                agent_panel_action(
+                    5,
+                    &panel_rows(agents.len(), &[], 0, ql, false, 0, false),
+                    key
+                ),
                 PanelAction::None,
                 "{key:?} does nothing on a queue row"
             );
@@ -4749,7 +4804,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 1,
-                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                &panel_rows(agents.len(), &[], 0, ql, false, 0, false),
                 Key::Html
             ),
             PanelAction::None
@@ -4759,7 +4814,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 3,
-                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                &panel_rows(agents.len(), &[], 0, ql, false, 0, false),
                 Key::Down
             ),
             PanelAction::MoveCursor(4)
@@ -4767,14 +4822,18 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 5,
-                &panel_rows(agents.len(), &[], 0, ql, false, 0),
+                &panel_rows(agents.len(), &[], 0, ql, false, 0, false),
                 Key::Down
             ),
             PanelAction::EnterLog
         );
         // With an empty queue, Down from the remote row still enters the log.
         assert_eq!(
-            agent_panel_action(3, &panel_rows(agents.len(), &[], 0, 0, false, 0), Key::Down),
+            agent_panel_action(
+                3,
+                &panel_rows(agents.len(), &[], 0, 0, false, 0, false),
+                Key::Down
+            ),
             PanelAction::EnterLog
         );
     }
@@ -4793,7 +4852,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 4,
-                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                &panel_rows(agents.len(), &[], sl, ql, false, 0, false),
                 Key::Enter
             ),
             PanelAction::OpenStashItem(0)
@@ -4801,7 +4860,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 4,
-                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                &panel_rows(agents.len(), &[], sl, ql, false, 0, false),
                 Key::Html
             ),
             PanelAction::OpenStashHtml(0)
@@ -4810,7 +4869,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 5,
-                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                &panel_rows(agents.len(), &[], sl, ql, false, 0, false),
                 Key::Enter
             ),
             PanelAction::OpenQueueItem(0)
@@ -4819,7 +4878,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 4,
-                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                &panel_rows(agents.len(), &[], sl, ql, false, 0, false),
                 Key::Plus
             ),
             PanelAction::None
@@ -4828,7 +4887,7 @@ mod tests {
         assert_eq!(
             agent_panel_action(
                 5,
-                &panel_rows(agents.len(), &[], sl, ql, false, 0),
+                &panel_rows(agents.len(), &[], sl, ql, false, 0, false),
                 Key::Down
             ),
             PanelAction::EnterLog
@@ -4873,7 +4932,7 @@ mod tests {
     #[test]
     fn a_replaced_attendance_does_not_inherit_the_wait_cursor() {
         let before = rows_for(&["claude", "codex"], &[1]);
-        let rows = panel_rows(2, &[1], 0, 0, false, 0); // [A0, A1, W1, Add]
+        let rows = panel_rows(2, &[1], 0, 0, false, 0, false); // [A0, A1, W1, Add]
         let anchor = capture_anchor(2, &rows, &before, &[], &[], &[]);
 
         // Same agent, still attending — but a new instance.
@@ -4901,12 +4960,12 @@ mod tests {
         let queue = labels(&["q1", "q2"]);
 
         // No waits: [A0, A1, Add, R, S0, Q0, Q1]
-        let before = panel_rows(2, &[], 1, 2, false, 0);
+        let before = panel_rows(2, &[], 1, 2, false, 0, false);
         let anchor = capture_anchor(5, &before, &agents, &stash, &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Queue("q1".to_string()));
 
         // A wait appears above everything: [A0, W0, A1, Add, R, S0, Q0, Q1]
-        let after = panel_rows(2, &[0], 1, 2, false, 0);
+        let after = panel_rows(2, &[0], 1, 2, false, 0, false);
         assert_eq!(
             rebind_anchor(&anchor, &after, &agents, &stash, &queue, &[]),
             6,
@@ -4945,7 +5004,7 @@ mod tests {
     fn a_reordered_queue_item_keeps_the_cursor() {
         let agents = rows_for(&["claude", "codex"], &[]);
         let queue = vec!["a".to_string(), "b".to_string()];
-        let rows = panel_rows(2, &[], 0, 2, false, 0);
+        let rows = panel_rows(2, &[], 0, 2, false, 0, false);
         let anchor = capture_anchor(5, &rows, &agents, &[], &queue, &[]);
         assert_eq!(anchor, PanelAnchor::Queue("b".to_string()));
 
@@ -4958,7 +5017,7 @@ mod tests {
 
         // Gone entirely → the add row.
         let without = vec!["a".to_string()];
-        let shorter = panel_rows(2, &[], 0, 1, false, 0);
+        let shorter = panel_rows(2, &[], 0, 1, false, 0, false);
         assert_eq!(
             rebind_anchor(&anchor, &shorter, &agents, &[], &without, &[]),
             add_row_index(&shorter)
@@ -4971,7 +5030,7 @@ mod tests {
     #[test]
     fn a_vanished_wait_falls_back_to_its_own_agent() {
         let agents = rows_for(&["claude", "codex"], &[1]);
-        let with = panel_rows(2, &[1], 0, 0, false, 0); // [A0, A1, W1, Add]
+        let with = panel_rows(2, &[1], 0, 0, false, 0, false); // [A0, A1, W1, Add]
         let anchor = capture_anchor(2, &with, &agents, &[], &[], &[]);
         assert_eq!(
             anchor,
@@ -4982,7 +5041,7 @@ mod tests {
             }
         );
 
-        let without = panel_rows(2, &[], 0, 0, false, 0); // [A0, A1, Add]
+        let without = panel_rows(2, &[], 0, 0, false, 0, false); // [A0, A1, Add]
         let no_wait = rows_for(&["claude", "codex"], &[]);
         assert_eq!(
             rebind_anchor(&anchor, &without, &no_wait, &[], &[], &[]),
@@ -4992,7 +5051,7 @@ mod tests {
 
         // The agent left too → the add row.
         let solo = rows_for(&["claude"], &[]);
-        let rows = panel_rows(1, &[], 0, 0, false, 0);
+        let rows = panel_rows(1, &[], 0, 0, false, 0, false);
         assert_eq!(
             rebind_anchor(&anchor, &rows, &solo, &[], &[], &[]),
             add_row_index(&rows)

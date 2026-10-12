@@ -50,6 +50,7 @@ pub(crate) use interruption::{Interrupt, InterruptAttempt, InterruptOutcome};
 pub(crate) use message::{
     Acceptance, MessageReceipt, ReplyOperation, ReplyOperationState, ReplyRoute,
 };
+pub(crate) use timer::recurring_progress;
 
 #[derive(Debug)]
 pub(crate) enum RecurringTransition {
@@ -1042,7 +1043,13 @@ impl EventLog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let lines = Self::parse(&text)
+        Self::retained_timer_ids_in(&text)
+    }
+
+    /// [`Self::retained_timer_ids`] of a WAL's text, for an inspector
+    /// that must take no lock and open nothing for writing.
+    pub(crate) fn retained_timer_ids_in(text: &str) -> std::io::Result<Vec<String>> {
+        let lines = Self::parse(text)
             .map_err(|_| std::io::Error::other("corrupt timer WAL; repair required"))?;
         let mut ids = std::collections::BTreeSet::new();
         for line in lines {

@@ -124,6 +124,7 @@ fn panel_row_list(
         snap.queue.len(),
         !snap.drafts.is_empty(),
         input::source_groups(&snap.sources).len(),
+        !input::active_timers(&snap.sources).is_empty(),
     )
 }
 
@@ -368,6 +369,33 @@ fn selected_draft(mode: Mode, snapshot: &StatusSnapshot) -> Option<std::path::Pa
     }
 }
 
+/// How long until the soonest active timer comes due, so an idle pane
+/// shows it owed when that happens, with nothing on disk changing. A
+/// second past the due time, so the paint lands after it.
+fn until_next_due(snapshot: &StatusSnapshot, now: i64) -> Option<Duration> {
+    snapshot
+        .sources
+        .iter()
+        .filter_map(|s| match s.timer {
+            Some(crate::cli::timer_source::TimerState::Due(at)) => Some(at as i64),
+            _ => None,
+        })
+        .filter(|at| *at > now)
+        .min()
+        .map(|at| Duration::from_secs((at - now) as u64 + 1))
+}
+
+/// The timer under the timers list's cursor, by its owner and log, for
+/// the cursor to follow across a refresh that reorders the list.
+fn selected_timer(mode: Mode, snapshot: &StatusSnapshot) -> Option<input::SourceRef> {
+    match mode {
+        Mode::TimersList { sel } => input::active_timers(&snapshot.sources)
+            .get(sel)
+            .map(|s| input::SourceRef::of(s)),
+        _ => None,
+    }
+}
+
 /// The member under a source row's member list cursor, by its owner and
 /// log, for the cursor to follow across a refresh.
 fn selected_member(
@@ -410,6 +438,14 @@ fn source_back(
     snapshot: &StatusSnapshot,
     cols: usize,
 ) -> Mode {
+    if source.timer.is_some() {
+        return Mode::TimersList {
+            sel: input::active_timers(&snapshot.sources)
+                .iter()
+                .position(|s| *s == source)
+                .unwrap_or(0),
+        };
+    }
     match group {
         Some(group) => Mode::SourceMembers {
             sel: group
@@ -3639,6 +3675,10 @@ pub(crate) async fn run_tui(
             Some(at) => wait.min(at.saturating_duration_since(std::time::Instant::now())),
             None => wait,
         };
+        let wait = match until_next_due(&snapshot, crate::age::now()) {
+            Some(due) => wait.min(due),
+            None => wait,
+        };
 
         match ev_rx.recv_timeout(wait) {
             // Drain the whole queued burst in ONE pass: keystrokes apply
@@ -3919,6 +3959,27 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 SourceNav::None => {}
+                            }
+                            continue;
+                        }
+                        Mode::TimersList { sel } => {
+                            use crate::cli::status_tui::input::ListNav;
+                            let timers = input::active_timers(&snapshot.sources);
+                            match input::list_nav(sel, timers.len(), k) {
+                                ListNav::Quit => break 'evloop,
+                                ListNav::Back => {
+                                    let rows = panel_row_list(&snapshot, cols as usize);
+                                    mode = Mode::AgentPanel {
+                                        sel: row_position(&rows, input::PanelRow::Timers),
+                                    };
+                                }
+                                ListNav::Sel(x) => mode = Mode::TimersList { sel: x },
+                                ListNav::Open(i) => {
+                                    source_page = timers.get(i).map(|s| input::SourceRef::of(s));
+                                    source_group = None;
+                                    mode = Mode::SourcePage { sel: 0, lift: 0 };
+                                }
+                                ListNav::None => {}
                             }
                             continue;
                         }
@@ -4267,6 +4328,7 @@ pub(crate) async fn run_tui(
                                     }
                                 }
                                 PanelAction::OpenDrafts => mode = Mode::DraftsList { sel: 0 },
+                                PanelAction::OpenTimers => mode = Mode::TimersList { sel: 0 },
                                 PanelAction::OpenSource(i) => {
                                     if let Some((page, group, opened)) =
                                         open_source_row(i, &snapshot.sources)
@@ -5203,6 +5265,7 @@ pub(crate) async fn run_tui(
                     candidate_index(mode).and_then(|i| picker.get(i).map(|c| c.label.clone()));
                 let selected_draft = selected_draft(mode, &snapshot);
                 let selected_member = selected_member(mode, source_group.as_ref(), &snapshot);
+                let selected_timer = selected_timer(mode, &snapshot);
                 let selected_source = selected_source_row(mode, source_page.as_ref(), &snapshot);
                 let keep_picker = candidate_index(mode).is_some();
                 // Same identity rule for a panel cursor on a QUEUE row: a
@@ -5312,6 +5375,21 @@ pub(crate) async fn run_tui(
                             &snapshot.drafts,
                         ),
                     },
+                    Mode::TimersList { sel } => {
+                        let timers = input::active_timers(&snapshot.sources);
+                        if timers.is_empty() {
+                            Mode::AgentPanel {
+                                sel: input::add_row_index(&panel_row_list(
+                                    &snapshot,
+                                    cols as usize,
+                                )),
+                            }
+                        } else {
+                            Mode::TimersList {
+                                sel: input::rebind_list_sel(sel, selected_timer.as_ref(), &timers),
+                            }
+                        }
+                    }
                     Mode::SourceMembers { sel } => {
                         let members = source_group
                             .as_ref()
@@ -5327,7 +5405,7 @@ pub(crate) async fn run_tui(
                             }
                         } else {
                             Mode::SourceMembers {
-                                sel: input::rebind_member_sel(
+                                sel: input::rebind_list_sel(
                                     sel,
                                     selected_member.as_ref(),
                                     &members,
@@ -9248,6 +9326,85 @@ pub(crate) mod tests {
         )
     }
 
+    fn timer_source(
+        name: &str,
+        state: crate::cli::timer_source::TimerState,
+    ) -> crate::cli::source_status::ConfiguredSource {
+        let mut source = crate::cli::source_status::ConfiguredSource::of(
+            &clank_core::ids::AgentLabel::parse("assistent").unwrap(),
+            &clank_core::agent_config::WaitEventSource::Timer(
+                clank_core::agent_config::TimerSource {
+                    interrupt: false,
+                    interrupt_message: None,
+                    name: name.into(),
+                    repeat_every: None,
+                    due_at: "2026-01-01T08:00:00Z".into(),
+                    content: None,
+                },
+            ),
+        );
+        source.timer = Some(state);
+        source
+    }
+
+    /// Enter on the timers row lists them; a timer's page goes Back to the
+    /// list on that timer, and the list goes Back to the timers row.
+    #[test]
+    fn a_timers_page_returns_to_the_timer_and_the_list_to_its_row() {
+        use crate::cli::status_tui::input::{PanelAction, PanelRow, agent_panel_action};
+        use crate::cli::timer_source::TimerState::Due;
+        let mut s = two_agent_snap();
+        s.sources = vec![
+            command_source("alpha", "voice"),
+            timer_source("later", Due(2_000)),
+            timer_source("sooner", Due(1_000)),
+        ];
+        let rows = panel_row_list(&s, 80);
+        let at = row_position(&rows, PanelRow::Timers);
+        assert_eq!(rows.last(), Some(&PanelRow::Timers), "under the sources");
+        assert_eq!(
+            agent_panel_action(at, &rows, crate::cli::status_tui::input::Key::Enter),
+            PanelAction::OpenTimers
+        );
+        let later = s.sources[1].clone();
+        assert_eq!(
+            source_back(&later, None, &s, 80),
+            Mode::TimersList { sel: 1 },
+            "after the sooner one"
+        );
+        assert_eq!(rows[at], PanelRow::Timers);
+    }
+
+    /// The list's cursor follows its timer when a refresh reorders the
+    /// list: a timer due earlier arrives above it.
+    #[test]
+    fn the_timer_list_keeps_its_timer_across_a_refresh() {
+        use crate::cli::timer_source::TimerState::Due;
+        let mut s = two_agent_snap();
+        s.sources = vec![timer_source("a", Due(2_000)), timer_source("b", Due(3_000))];
+        let held = selected_timer(Mode::TimersList { sel: 1 }, &s);
+        s.sources.push(timer_source("c", Due(1_000)));
+        let timers = input::active_timers(&s.sources);
+        assert_eq!(input::rebind_list_sel(1, held.as_ref(), &timers), 2);
+    }
+
+    /// An idle pane wakes when the soonest scheduled timer comes due, and
+    /// not for one already owed or with no time.
+    #[test]
+    fn an_idle_pane_wakes_when_a_timer_comes_due() {
+        use crate::cli::timer_source::TimerState::{AwaitingAck, Due};
+        let mut s = two_agent_snap();
+        s.sources = vec![
+            timer_source("owed", Due(500)),
+            timer_source("next", Due(1_100)),
+            timer_source("later", Due(5_000)),
+            timer_source("acking", AwaitingAck),
+        ];
+        assert_eq!(until_next_due(&s, 1_000), Some(Duration::from_secs(101)));
+        s.sources.truncate(1);
+        assert_eq!(until_next_due(&s, 1_000), None);
+    }
+
     /// Enter on a source only one agent configures opens its page; on one
     /// several do, their list, whose Back returns to the panel's row and
     /// whose pages' Back returns to the list, on the agent left.
@@ -9302,7 +9459,7 @@ pub(crate) mod tests {
         let held = selected_member(Mode::SourceMembers { sel: 1 }, Some(&group), &s);
         s.sources.insert(0, command_source("alpha", "voice"));
         let members = group.members(&s.sources);
-        assert_eq!(input::rebind_member_sel(1, held.as_ref(), &members), 2);
+        assert_eq!(input::rebind_list_sel(1, held.as_ref(), &members), 2);
     }
 
     /// The page's facts come from the source it opened on, never the

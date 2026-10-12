@@ -21,6 +21,8 @@ pub(crate) struct ConfiguredSource {
     pub(crate) subscription: Option<String>,
     /// How a github watch is configured to be delivered.
     pub(crate) delivery: Option<String>,
+    /// A timer's state, from its durable evidence; set by [`configured`].
+    pub(crate) timer: Option<crate::cli::timer_source::TimerState>,
 }
 
 impl ConfiguredSource {
@@ -32,7 +34,12 @@ impl ConfiguredSource {
                 c.name.clone(),
                 c.glyph.as_deref(),
             ),
-            WaitEventSource::Timer(t) => (Backend::Timer, t.source_key(None), t.name.clone(), None),
+            WaitEventSource::Timer(t) => (
+                Backend::Timer,
+                crate::cli::timer_source::config_key(t),
+                t.name.clone(),
+                None,
+            ),
             WaitEventSource::Github(g) => (
                 Backend::Github,
                 crate::cli::github::supervisor::source_key(g),
@@ -56,6 +63,7 @@ impl ConfiguredSource {
             config: config.clone(),
             subscription,
             delivery,
+            timer: None,
         }
     }
 
@@ -74,10 +82,10 @@ impl ConfiguredSource {
     }
 }
 
-/// Every external source the roster's agents configure, by name and
-/// then agent. Messages are always on and timers are an agent's own
-/// reminders, so neither is a source here; nor is a config an agent
-/// off the roster left on disk.
+/// Every source the roster's agents configure, by name and then agent:
+/// the external ones, and each timer that has not yet fired, with its
+/// state. Messages are always on, so they are not sources here; nor is a
+/// config an agent off the roster left on disk.
 pub(crate) fn configured(repo: &std::path::Path) -> Vec<ConfiguredSource> {
     let mut sources: Vec<ConfiguredSource> = crate::agent_store::roster_labels(repo)
         .iter()
@@ -88,8 +96,20 @@ pub(crate) fn configured(repo: &std::path::Path) -> Vec<ConfiguredSource> {
         .flat_map(|(label, cfg)| {
             cfg.wait_events
                 .iter()
-                .filter(|s| !matches!(s, WaitEventSource::Timer(_)))
-                .map(|s| ConfiguredSource::of(label, s))
+                .filter_map(|s| {
+                    let mut source = ConfiguredSource::of(label, s);
+                    if let WaitEventSource::Timer(t) = s {
+                        let events = crate::agent_store::agents_root(repo)
+                            .join(label.as_str())
+                            .join("events");
+                        let state = crate::cli::timer_source::inspect(&events, t);
+                        if state == crate::cli::timer_source::TimerState::Fired {
+                            return None;
+                        }
+                        source.timer = Some(state);
+                    }
+                    Some(source)
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -413,20 +433,20 @@ mod tests {
         );
     }
 
-    fn timer(name: &str) -> WaitEventSource {
+    fn timer(name: &str, due_at: &str, every: Option<&str>) -> WaitEventSource {
         WaitEventSource::Timer(clank_core::agent_config::TimerSource {
             interrupt: false,
             interrupt_message: None,
             name: name.into(),
-            repeat_every: None,
-            due_at: "2026-10-13T00:00:00Z".into(),
+            repeat_every: every.map(String::from),
+            due_at: due_at.into(),
             content: Some("follow up".into()),
         })
     }
 
-    /// The roster's external sources, by name and then agent. A timer is
-    /// an agent's own reminder and an agent off the roster runs nothing,
-    /// so neither is listed; with no roster nothing is.
+    /// The roster's sources, by name and then agent; an agent off the
+    /// roster runs nothing, so it lists nothing, and with no roster
+    /// nothing is listed.
     #[test]
     fn configured_sources_are_the_rosters_external_ones() {
         let repo = tempfile::tempdir().unwrap();
@@ -437,14 +457,7 @@ mod tests {
         )
         .unwrap();
         for (agent, sources) in [
-            (
-                "codex",
-                vec![
-                    command("questions"),
-                    command("answers"),
-                    timer("rama-follow-up"),
-                ],
-            ),
+            ("codex", vec![command("questions"), command("answers")]),
             ("claude", vec![command("questions")]),
             ("grok", vec![command("voice")]),
         ] {
@@ -468,6 +481,73 @@ mod tests {
             ]
         );
         assert!(configured(&repo.path().join("missing")).is_empty());
+    }
+
+    /// life's shape: recurring reviews and future reminders are listed,
+    /// with their state, under the scheduler's own storage keys; a past
+    /// reminder is listed while it is owed and gone once the scheduler
+    /// has accepted it.
+    #[tokio::test]
+    async fn a_timer_is_listed_until_its_occurrence_is_accepted() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"assistent":{"tool":"codex","role":"master"}}}"#,
+        )
+        .unwrap();
+        let assistent = AgentLabel::parse("assistent").unwrap();
+        let timers = vec![
+            timer("btc-eth-daily-review", "2026-01-01T08:00:00Z", Some("24h")),
+            timer("daily-inbox-review", "2026-01-01T09:00:00Z", Some("24h")),
+            timer("rama-follow-up", "2999-01-01T00:00:00Z", None),
+            timer("virus-meeting", "2999-02-01T00:00:00Z", None),
+            timer("tax-bas", "2026-01-02T00:00:00Z", None),
+            timer("garbled", "not a time", None),
+        ];
+        crate::agent_store::update_agent_config(repo.path(), &assistent, |cfg| {
+            cfg.wait_events = timers.clone()
+        })
+        .unwrap();
+        let names = |repo: &std::path::Path| -> Vec<String> {
+            configured(repo).into_iter().map(|s| s.name).collect()
+        };
+        assert!(names(repo.path()).contains(&"tax-bas".to_string()), "owed");
+
+        let events = crate::agent_store::agents_root(repo.path())
+            .join("assistent")
+            .join("events");
+        let past = [(
+            timers[4].clone(),
+            crate::cli::event_source::SourceOrigin::Config,
+        )];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut set =
+            crate::cli::timer_source::TimerSet::new(&past, &events, None, tx.into()).unwrap();
+        set.arm();
+        assert_eq!(
+            names(repo.path()),
+            [
+                "btc-eth-daily-review",
+                "daily-inbox-review",
+                "garbled",
+                "rama-follow-up",
+                "virus-meeting"
+            ],
+            "an unreadable timer is listed, not hidden"
+        );
+        let sources = configured(repo.path());
+        assert!(sources.iter().all(|s| s.timer.is_some()));
+        let WaitEventSource::Timer(t) = &sources[0].config else {
+            unreachable!()
+        };
+        assert_eq!(
+            sources[0].key,
+            crate::cli::timer_source::recurrence::Recurrence::parse(t, None)
+                .unwrap()
+                .source_key(),
+            "a recurring timer's log is its generation's"
+        );
     }
 
     /// A source the monitor only follows is produced by whatever its own

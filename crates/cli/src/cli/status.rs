@@ -1340,11 +1340,17 @@ pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
 }
 
 /// Hash of the sources account the monitor publishes, as the panel would
-/// read it, including whether its monitor still runs.
+/// read it, including whether its monitor still runs, and of each
+/// active timer's state, which changes when its evidence does.
 fn sources_fingerprint(repo: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{:?}", crate::cli::source_status::live(repo)).hash(&mut h);
+    for source in crate::cli::source_status::configured(repo) {
+        if let Some(state) = &source.timer {
+            (source.agent.as_str(), &source.key, format!("{state:?}")).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
