@@ -126,12 +126,12 @@ pub(crate) fn stop_pane(
 /// blind retry could send a second interrupt into a cancellation already
 /// under way, which for Grok escalates toward quit. A submission that was
 /// not confirmed may already be partly typed.
-pub async fn interrupt_and_submit_async(
+pub(crate) async fn interrupt_and_submit_async(
     session: &str,
     pane: &str,
     tool: clank_core::Tool,
     text: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), Unconfirmed> {
     interrupt_and_submit_with(pane, tool, text, |argv| async move {
         super::open_zellij::write_pane_action_async(session, pane, &argv).await
     })
@@ -150,7 +150,7 @@ async fn interrupt_and_submit_with<W, F>(
     tool: clank_core::Tool,
     text: &str,
     write: W,
-) -> anyhow::Result<()>
+) -> Result<(), Unconfirmed>
 where
     W: Fn(Vec<String>) -> F,
     F: std::future::Future<Output = anyhow::Result<()>>,
@@ -185,7 +185,7 @@ pub(crate) async fn wake_for_events_async(
     tool: clank_core::Tool,
     hint: &str,
 ) -> anyhow::Result<()> {
-    interrupt_and_submit_async(session, pane, tool, hint).await
+    Ok(interrupt_and_submit_async(session, pane, tool, hint).await?)
 }
 
 /// The order, separated from the terminal so it can be asserted.
@@ -196,22 +196,52 @@ async fn interrupt_then_submit<I, S>(
     interrupt: impl FnOnce() -> I,
     submit: impl FnOnce() -> S,
     empty: bool,
-) -> anyhow::Result<()>
+) -> Result<(), Unconfirmed>
 where
     I: std::future::Future<Output = anyhow::Result<()>>,
     S: std::future::Future<Output = anyhow::Result<()>>,
 {
-    use anyhow::Context;
-    anyhow::ensure!(!empty, "an empty nudge must not interrupt the agent");
-    interrupt().await.context(
-        "the interrupt key's delivery was not confirmed, so no message was submitted; it may \
-         still have interrupted the turn, so do not repeat it blindly — a second interrupt \
-         during a cancellation can escalate (for Grok, toward quit)",
-    )?;
-    submit().await.context(
-        "the interrupt was delivered, but the message was not confirmed (some input may already have been typed); do not resend it automatically",
-    )
+    if empty {
+        return Err(Unconfirmed::Empty);
+    }
+    interrupt().await.map_err(Unconfirmed::Interrupt)?;
+    submit().await.map_err(Unconfirmed::Submit)
 }
+
+/// Why an interrupt-then-submit did not complete, as what the caller may
+/// conclude about the terminal.
+#[derive(Debug)]
+pub(crate) enum Unconfirmed {
+    /// Nothing was sent: there was no message.
+    Empty,
+    /// The interrupt's delivery was not confirmed. No message was
+    /// submitted, but the turn may have been interrupted.
+    Interrupt(anyhow::Error),
+    /// The interrupt was delivered and the message was not confirmed; some
+    /// of it may have been typed.
+    Submit(anyhow::Error),
+}
+
+impl std::fmt::Display for Unconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unconfirmed::Empty => write!(f, "an empty nudge must not interrupt the agent"),
+            Unconfirmed::Interrupt(e) => write!(
+                f,
+                "the interrupt key's delivery was not confirmed, so no message was submitted; \
+                 it may still have interrupted the turn, so do not repeat it blindly — a second \
+                 interrupt during a cancellation can escalate (for Grok, toward quit): {e:#}"
+            ),
+            Unconfirmed::Submit(e) => write!(
+                f,
+                "the interrupt was delivered, but the message was not confirmed (some input may \
+                 already have been typed); do not resend it automatically: {e:#}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Unconfirmed {}
 
 /// Type `text` into `pane` and submit it the way `tool` expects.
 ///

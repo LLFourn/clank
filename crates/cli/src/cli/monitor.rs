@@ -2534,6 +2534,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .unwrap_or_default(),
     );
+    recovery.discover_pending(&crate::agent_store::agents_root(&repo));
     let (record_changes, mut changed_records) = tokio::sync::mpsc::unbounded_channel();
     let records = crate::cli::recovery::RecordWatch::spawn(record_changes);
     loop {

@@ -444,6 +444,16 @@ pub(crate) struct TimelineSnapshot {
     pub(crate) events: Vec<MergedEvent>,
     /// Sorted + deduplicated.
     pub(crate) notices: Vec<String>,
+    /// Every agent's nudge history, oldest first: history beside the
+    /// events, never one of them.
+    pub(crate) nudges: Vec<Nudge>,
+}
+
+/// One nudge attempt, and the agent it was for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Nudge {
+    pub(crate) agent: String,
+    pub(crate) record: crate::cli::nudge_log::Record,
 }
 
 /// One agent's copy of one event, pre-merge. `(agent, source, seq)`
@@ -561,8 +571,17 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
     let Ok(agents) = std::fs::read_dir(&agents_root) else {
         return TimelineSnapshot::default();
     };
+    let mut nudges: Vec<Nudge> = Vec::new();
     for agent in agents.flatten() {
         let label = agent.file_name().to_string_lossy().into_owned();
+        nudges.extend(
+            crate::cli::nudge_log::read(&agent.path())
+                .into_iter()
+                .map(|record| Nudge {
+                    agent: label.clone(),
+                    record,
+                }),
+        );
         // Source key -> glyph, from this agent's CURRENT config. The
         // glyph is presentation config, never stored in the WAL, so
         // it is joined here exactly as a watch's prompt is
@@ -799,9 +818,11 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
             }
         }
     }
+    nudges.sort_by(|a, b| (a.record.at, &a.agent).cmp(&(b.record.at, &b.agent)));
     TimelineSnapshot {
         events: merge(copies),
         notices: notices.into_iter().collect(),
+        nudges,
     }
 }
 
@@ -1001,6 +1022,30 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// An agent's nudge history is read beside its events and is never
+    /// one of them: nothing there can be delivered or acked.
+    #[test]
+    fn nudges_are_read_beside_the_events_never_as_them() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+        std::fs::create_dir_all(dir.join("events")).unwrap();
+        crate::cli::nudge_log::append(
+            &dir,
+            &crate::cli::nudge_log::Record {
+                at: 7,
+                attempt: "manual:1:2".into(),
+                trigger: crate::cli::nudge_log::Trigger::Manual,
+                text: "carry on".into(),
+                outcome: crate::cli::nudge_log::Outcome::Submitted,
+            },
+        )
+        .unwrap();
+        let snap = super::timeline_snapshot(repo.path());
+        assert!(snap.events.is_empty(), "{:?}", snap.events);
+        assert_eq!(snap.nudges.len(), 1);
+        assert_eq!(snap.nudges[0].agent, "claude");
+    }
 
     use clank_core::wait::ContentRef;
 

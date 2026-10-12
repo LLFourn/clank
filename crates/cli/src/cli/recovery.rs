@@ -927,11 +927,12 @@ pub(crate) fn answered(
             if e.unavailable() >= UNAVAILABLE_LIMIT {
                 escalate(&mut e, ctx, "its recovery transport never answered");
                 let text = e.notice.clone().expect("escalated");
-                return (e, vec![Effect::Notice(text)]);
+                (e, vec![Effect::Notice(text)])
+            } else {
+                e.state = State::Waiting;
+                e.next_at = Some(ctx.now + RETRY_LOOK);
+                (e, Vec::new())
             }
-            e.state = State::Waiting;
-            e.next_at = Some(ctx.now + RETRY_LOOK);
-            (e, Vec::new())
         }
         Answer::Indeterminate => {
             a.disposition = Disposition::Indeterminate;
@@ -981,6 +982,7 @@ pub(crate) enum Act {
         key: String,
         text: String,
     },
+
     /// Watch, or stop watching, where a record lives.
     Watch(WatchKey),
     Unwatch(WatchKey),
@@ -1004,7 +1006,7 @@ pub(crate) enum RecordEvent {
 }
 
 /// Which attempt an answer is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AttemptRef {
     pub(crate) session: String,
     pub(crate) opened_by: String,
@@ -1071,6 +1073,81 @@ pub(crate) struct Driver {
     lost: std::collections::BTreeSet<WatchKey>,
     cwd: PathBuf,
     home: PathBuf,
+    /// Each dispatched attempt not yet settled in its agent's nudge
+    /// history, and where that agent keeps its pending file. Captured at
+    /// dispatch and saved beside the agent, so it outlives the episode, the
+    /// agent's place on the roster, and the monitor itself.
+    pending:
+        std::collections::BTreeMap<(clank_core::ids::AgentLabel, AttemptRef), (PathBuf, Pending)>,
+}
+
+/// What an attempt's history record needs, as it was when dispatched, and
+/// when it is settled as unanswered if nothing answers first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Pending {
+    pub(crate) attempt: AttemptRef,
+    pub(crate) at: u64,
+    pub(crate) class: String,
+    /// [`Transport::name`].
+    pub(crate) transport: String,
+    pub(crate) text: String,
+    pub(crate) due: u64,
+}
+
+impl Pending {
+    fn record(
+        &self,
+        at: u64,
+        outcome: crate::cli::nudge_log::Outcome,
+    ) -> crate::cli::nudge_log::Record {
+        crate::cli::nudge_log::Record {
+            at,
+            attempt: format!(
+                "recovery:{}:{}:{}",
+                self.attempt.session, self.attempt.opened_by, self.attempt.n
+            ),
+            trigger: crate::cli::nudge_log::Trigger::Retry {
+                class: self.class.clone(),
+                attempt: self.attempt.n,
+                of: retries(&self.class).len() as u32,
+            },
+            text: self.text.clone(),
+            outcome,
+        }
+    }
+
+    /// What `answer` lets the history claim. A helper's `Submitted` is its
+    /// report before the exit that wakes the harness; only Codex's
+    /// `turn/start` answers for the transport itself.
+    fn outcome(&self, answer: &Answer) -> crate::cli::nudge_log::Outcome {
+        use crate::cli::nudge_log::Outcome;
+        match answer {
+            Answer::Submitted { .. } if self.transport == Transport::Helper.name() => {
+                Outcome::Reported
+            }
+            Answer::Submitted { .. } => Outcome::Submitted,
+            Answer::Refused => Outcome::Refused {
+                reason: "the agent was no longer idle at the failed turn".into(),
+            },
+            Answer::Unavailable => Outcome::Refused {
+                reason: format!("no {} was there to try", self.transport),
+            },
+            Answer::Indeterminate => Outcome::Indeterminate {
+                reason: "it may have reached the harness".into(),
+            },
+        }
+    }
+}
+
+fn pending_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("nudge-pending.json")
+}
+
+fn load_pending(agent_dir: &Path) -> Vec<Pending> {
+    std::fs::read(pending_path(agent_dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 impl Driver {
@@ -1081,6 +1158,152 @@ impl Driver {
             lost: Default::default(),
             cwd,
             home,
+            pending: Default::default(),
+        }
+    }
+
+    /// Remember each dispatch in `acts` as pending history.
+    fn accounted(&mut self, acts: Vec<Act>, now: u64) -> Vec<Act> {
+        for act in &acts {
+            let Act::Dispatch {
+                author,
+                attempt,
+                transport,
+                tag,
+                ..
+            } = act
+            else {
+                continue;
+            };
+            let Some(w) = self.agents.get(author) else {
+                continue;
+            };
+            let class = w
+                .episode
+                .as_ref()
+                .filter(|e| e.opened_by == attempt.opened_by)
+                .map(|e| e.class.clone())
+                .unwrap_or_default();
+            let pending = Pending {
+                attempt: attempt.clone(),
+                at: now,
+                class,
+                transport: transport.name().into(),
+                text: wake_text(tag),
+                due: now + ANSWER_WITHIN,
+            };
+            self.pending.insert(
+                (author.clone(), attempt.clone()),
+                (w.agent_dir.clone(), pending),
+            );
+            self.save_pending(author);
+        }
+        acts
+    }
+
+    /// Settle `attempt`'s history with `outcome`, once: whatever the episode
+    /// has since become, and whether or not recovery still acts on it. The
+    /// row is appended before the attempt stops being pending, so a stop
+    /// between the two leaves it to settle again, and the journal keeps
+    /// one row per attempt. A failed append loses the row, never a retry.
+    fn settle(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        attempt: &AttemptRef,
+        outcome: impl FnOnce(&Pending) -> crate::cli::nudge_log::Outcome,
+        now: u64,
+    ) {
+        self.settle_with(author, attempt, outcome, now, |dir, record| {
+            if let Err(e) = crate::cli::nudge_log::append(dir, record) {
+                eprintln!("monitor: could not record `{author}`'s nudge: {e}");
+            }
+        });
+    }
+
+    /// [`Self::settle`] with the append supplied.
+    fn settle_with(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        attempt: &AttemptRef,
+        outcome: impl FnOnce(&Pending) -> crate::cli::nudge_log::Outcome,
+        now: u64,
+        append: impl FnOnce(&Path, &crate::cli::nudge_log::Record),
+    ) {
+        let key = (author.clone(), attempt.clone());
+        let Some((dir, pending)) = self.pending.get(&key) else {
+            return;
+        };
+        append(dir, &pending.record(now, outcome(pending)));
+        let (dir, _) = self.pending.remove(&key).expect("present");
+        self.save_pending_in(author, &dir);
+    }
+
+    /// Every attempt saved as pending in the repo's agent directories,
+    /// found once when the monitor starts: an attempt outlives its agent's
+    /// place on the roster as well as the monitor that sent it.
+    pub(crate) fn discover_pending(&mut self, agents_root: &Path) {
+        let Ok(entries) = std::fs::read_dir(agents_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(author) =
+                clank_core::ids::AgentLabel::parse(&entry.file_name().to_string_lossy())
+            else {
+                continue;
+            };
+            let dir = entry.path();
+            for p in load_pending(&dir) {
+                self.pending
+                    .entry((author.clone(), p.attempt.clone()))
+                    .or_insert((dir.clone(), p));
+            }
+        }
+    }
+
+    fn save_pending(&self, author: &clank_core::ids::AgentLabel) {
+        if let Some(w) = self.agents.get(author) {
+            self.save_pending_in(author, &w.agent_dir);
+        }
+    }
+
+    /// Write `author`'s pending attempts into `dir`, or remove the file when
+    /// none is left. Best effort: a lost file loses history, never a retry.
+    fn save_pending_in(&self, author: &clank_core::ids::AgentLabel, dir: &Path) {
+        let mine: Vec<&Pending> = self
+            .pending
+            .iter()
+            .filter(|((a, _), _)| a == author)
+            .map(|(_, (_, p))| p)
+            .collect();
+        let path = pending_path(dir);
+        if mine.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        if let Ok(bytes) = serde_json::to_vec(&mine) {
+            let tmp = path.with_extension("json.tmp");
+            let _ = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        }
+    }
+
+    /// Settle every pending attempt whose answer never came by its deadline,
+    /// whatever has become of its agent's recovery or roster place.
+    fn settle_expired(&mut self, now: u64) {
+        let expired: Vec<(clank_core::ids::AgentLabel, AttemptRef)> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, p))| p.due <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (author, attempt) in expired {
+            self.settle(
+                &author,
+                &attempt,
+                |_| crate::cli::nudge_log::Outcome::Indeterminate {
+                    reason: "no answer came".into(),
+                },
+                now,
+            );
         }
     }
 
@@ -1102,6 +1325,7 @@ impl Driver {
                 [episode, w.stall_due()]
             })
             .flatten()
+            .chain(self.pending.values().map(|(_, p)| p.due))
             .min()
     }
 
@@ -1119,6 +1343,13 @@ impl Driver {
             self.agents.remove(&author);
         }
         for f in facts {
+            if !self.agents.contains_key(&f.author) {
+                for p in load_pending(&f.agent_dir) {
+                    self.pending
+                        .entry((f.author.clone(), p.attempt.clone()))
+                        .or_insert((f.agent_dir.clone(), p));
+                }
+            }
             let session = f.session.id.as_str().to_string();
             let w = self
                 .agents
@@ -1183,7 +1414,7 @@ impl Driver {
         }
         self.lost.clear();
         acts.extend(self.sync_watches());
-        acts
+        self.accounted(acts, now)
     }
 
     /// Install the watches agents need and release the rest. One watch per
@@ -1258,7 +1489,7 @@ impl Driver {
             }
         }
         acts.extend(self.sync_watches());
-        acts
+        self.accounted(acts, now)
     }
 
     /// Fire every deadline that has passed, after reading the record and
@@ -1268,7 +1499,10 @@ impl Driver {
         now: u64,
         gate: impl Fn(&clank_core::ids::AgentLabel, &str) -> Gate,
     ) -> Vec<Act> {
-        let mut acts = Vec::new();
+        // An answer already on disk is the attempt's evidence: read it
+        // before concluding that none came.
+        let mut acts = self.replies(now);
+        self.settle_expired(now);
         for (author, w) in self.agents.iter_mut() {
             let due = w
                 .episode
@@ -1299,7 +1533,7 @@ impl Driver {
             }
             acts.extend(decision(author, w, now, Some(g), None));
         }
-        acts
+        self.accounted(acts, now)
     }
 
     /// A transport's answer, applied only to the attempt it was for.
@@ -1310,24 +1544,36 @@ impl Driver {
         answer: Answer,
         now: u64,
     ) -> Vec<Act> {
-        match self.agents.get_mut(author) {
-            Some(w) => decision(author, w, now, None, Some((attempt, answer))),
-            None => Vec::new(),
+        self.settle(author, attempt, |p| p.outcome(&answer), now);
+        let mut acts = Vec::new();
+        if let Some(w) = self.agents.get_mut(author) {
+            acts.extend(decision(author, w, now, None, Some((attempt, answer))));
         }
+        self.accounted(acts, now)
     }
 
-    /// Answers helpers left beside their agents.
+    /// Answers helpers left beside their agents, and beside any agent that
+    /// still has an attempt pending though it is no longer on the roster.
     pub(crate) fn replies(&mut self, now: u64) -> Vec<Act> {
         let mut acts = Vec::new();
+        let mut answered = Vec::new();
+        let away: std::collections::BTreeMap<clank_core::ids::AgentLabel, PathBuf> = self
+            .pending
+            .iter()
+            .filter(|((author, _), _)| !self.agents.contains_key(author))
+            .map(|((author, _), (dir, _))| (author.clone(), dir.clone()))
+            .collect();
+        for (author, dir) in away {
+            if let Some(reply) = take_reply(&dir) {
+                answered.push((author, reply.attempt(), reply.answer()));
+            }
+        }
         for (author, w) in self.agents.iter_mut() {
             let Some(reply) = take_reply(&w.agent_dir) else {
                 continue;
             };
-            let attempt = AttemptRef {
-                session: reply.session.clone(),
-                opened_by: reply.opened_by.clone(),
-                n: reply.n,
-            };
+            let attempt = reply.attempt();
+            answered.push((author.clone(), attempt.clone(), reply.answer()));
             acts.extend(decision(
                 author,
                 w,
@@ -1336,7 +1582,10 @@ impl Driver {
                 Some((&attempt, reply.answer())),
             ));
         }
-        acts
+        for (author, attempt, answer) in &answered {
+            self.settle(author, attempt, |p| p.outcome(answer), now);
+        }
+        self.accounted(acts, now)
     }
 }
 
@@ -1923,6 +2172,15 @@ pub(crate) enum ReplyAnswer {
 }
 
 impl Reply {
+    /// The attempt this reply answers.
+    pub(crate) fn attempt(&self) -> AttemptRef {
+        AttemptRef {
+            session: self.session.clone(),
+            opened_by: self.opened_by.clone(),
+            n: self.n,
+        }
+    }
+
     pub(crate) fn answer(&self) -> Answer {
         match self.answer {
             ReplyAnswer::Submitted => Answer::Submitted {
@@ -2196,6 +2454,12 @@ pub(crate) mod tests {
     const HELPER: Option<Transport> = Some(Transport::Helper);
     const GO: Option<Gate> = Some(Gate::Go);
 
+    /// What a decision does besides marking an attempt unanswered for the
+    /// nudge history.
+    fn acting(fx: &[Effect]) -> Vec<&Effect> {
+        fx.iter().filter(|_| true).collect()
+    }
+
     fn submitted(e: Episode, n: u32, started: Option<&str>, now: u64) -> Episode {
         let (e, fx) = answered(
             e,
@@ -2205,7 +2469,7 @@ pub(crate) mod tests {
             },
             &ctx(now, HELPER, None),
         );
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         e
     }
 
@@ -2231,7 +2495,7 @@ pub(crate) mod tests {
     fn a_failed_retry_is_the_next_attempts_target() {
         let mut s = snap([started("t1"), failed("t1", "server_error")]);
         let (ep, fx) = decide(None, &s, &ctx(0, HELPER, None));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         let ep = ep.unwrap();
         assert_eq!((ep.state, ep.next_at), (State::Waiting, Some(60)));
 
@@ -2252,7 +2516,7 @@ pub(crate) mod tests {
 
         s.apply(failed("a1", "server_error"));
         let (ep, fx) = decide(ep, &s, &ctx(70, HELPER, None));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         let ep = ep.unwrap();
         assert_eq!(ep.state, State::Waiting);
         assert_eq!(
@@ -2305,7 +2569,7 @@ pub(crate) mod tests {
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         s.apply(started("8"));
         let (ep, fx) = decide(ep, &s, &ctx(300, HELPER, GO));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(ep.unwrap().state, State::Closed);
     }
 
@@ -2327,7 +2591,7 @@ pub(crate) mod tests {
 
         s.apply(started("p1"));
         let (ep, fx) = decide(ep, &s, &ctx(80, None, None));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(
             ep.as_ref().unwrap().state,
             State::Closed,
@@ -2337,7 +2601,7 @@ pub(crate) mod tests {
         let (ep, fx) = decide(ep, &s, &ctx(90, None, None));
         assert_eq!(ep.unwrap().opened_by, "p1");
         assert!(
-            matches!(fx.as_slice(), [Effect::Notice(_)]),
+            matches!(acting(&fx).as_slice(), [Effect::Notice(_)]),
             "a new failure is told"
         );
     }
@@ -2353,7 +2617,10 @@ pub(crate) mod tests {
         s.apply(failed("p1", "billing_error"));
         let (ep, fx) = decide(ep, &s, &ctx(10, None, None));
         assert_eq!(ep.unwrap().opened_by, "p1");
-        assert!(matches!(fx.as_slice(), [Effect::Notice(_)]), "{fx:?}");
+        assert!(
+            matches!(acting(&fx).as_slice(), [Effect::Notice(_)]),
+            "{fx:?}"
+        );
     }
 
     #[test]
@@ -2368,7 +2635,7 @@ pub(crate) mod tests {
         let (ep, fx) = decide(None, &s, &ctx(0, None, None));
         assert!(matches!(fx.as_slice(), [Effect::Notice(t)] if t.contains("not enabled")));
         let (ep, fx) = decide(ep, &s, &ctx(5, None, GO));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(ep.unwrap().state, State::Escalated);
     }
 
@@ -2376,7 +2643,7 @@ pub(crate) mod tests {
     fn a_fatal_class_escalates_without_an_attempt() {
         let s = snap([started("t1"), failed("t1", "authentication_failed")]);
         let (ep, fx) = decide(None, &s, &ctx(0, HELPER, None));
-        assert!(matches!(fx.as_slice(), [Effect::Notice(_)]));
+        assert!(matches!(acting(&fx).as_slice(), [Effect::Notice(_)]));
         assert!(ep.unwrap().attempts.is_empty());
     }
 
@@ -2389,9 +2656,12 @@ pub(crate) mod tests {
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0;
         assert_eq!(ep.as_ref().unwrap().next_at, Some(60 + ANSWER_WITHIN));
         let (ep, fx) = decide(ep, &s, &ctx(60 + ANSWER_WITHIN - 1, HELPER, GO));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         let (ep, fx) = decide(ep, &s, &ctx(60 + ANSWER_WITHIN, HELPER, GO));
-        assert!(matches!(fx.as_slice(), [Effect::Notice(_)]), "{fx:?}");
+        assert!(
+            matches!(acting(&fx).as_slice(), [Effect::Notice(_)]),
+            "{fx:?}"
+        );
         let ep = ep.unwrap();
         assert_eq!(ep.state, State::Escalated);
         assert_eq!(ep.attempts[0].disposition, Disposition::Indeterminate);
@@ -2450,7 +2720,7 @@ pub(crate) mod tests {
         assert_eq!(ep.as_ref().unwrap().next_at, Some(60 + RETRY_LOOK));
         s.apply(ended("t1", Outcome::Completed));
         let (ep, fx) = decide(ep, &s, &ctx(61, HELPER, None));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(ep.unwrap().state, State::Closed);
     }
 
@@ -2459,7 +2729,7 @@ pub(crate) mod tests {
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let (ep, fx) = decide(ep, &s, &ctx(60, HELPER, Some(Gate::Hold)));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(ep.as_ref().unwrap().next_at, Some(60 + RETRY_LOOK));
         for end in [
             Gate::Deliverer,
@@ -2480,10 +2750,10 @@ pub(crate) mod tests {
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
         let (ep, fx) = answered(ep, 1, Answer::Refused, &ctx(61, HELPER, None));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(ep.state, State::Closed);
         let (ep, fx) = decide(Some(ep), &s, &ctx(5000, HELPER, GO));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
         assert_eq!(ep.unwrap().state, State::Closed);
     }
 
@@ -2493,9 +2763,9 @@ pub(crate) mod tests {
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
         let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
         let (ep, fx) = answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None));
-        assert!(matches!(fx.as_slice(), [Effect::Notice(_)]));
+        assert!(matches!(acting(&fx).as_slice(), [Effect::Notice(_)]));
         let (_, fx) = decide(Some(ep), &s, &ctx(5000, HELPER, GO));
-        assert!(fx.is_empty());
+        assert!(acting(&fx).is_empty());
     }
 
     /// After an attempt's outcome became uncertain and escalated, its turn
@@ -2804,6 +3074,11 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// The nudge history recorded in `dir`.
+    fn nudged(dir: &Path) -> Vec<crate::cli::nudge_log::Record> {
+        crate::cli::nudge_log::read(dir)
+    }
+
     fn dispatches(acts: &[Act]) -> Vec<(&AttemptRef, &str)> {
         acts.iter()
             .filter_map(|a| match a {
@@ -3024,10 +3299,18 @@ pub(crate) mod tests {
         let ep = load(dir.path()).unwrap();
         assert_eq!(ep.state, State::Escalated);
         assert_eq!(ep.attempts[0].disposition, Disposition::Indeterminate);
+        let acts = d.due(10_000, |_, _| Gate::Go);
+        assert!(dispatches(&acts).is_empty(), "never dispatched again");
         assert!(
-            d.due(10_000, |_, _| Gate::Go).is_empty(),
-            "never dispatched again"
+            matches!(&nudged(dir.path())[..], [r] if matches!(r.outcome,
+                crate::cli::nudge_log::Outcome::Indeterminate { .. })),
+            "the attempt it knew of is history, once: {acts:?}"
         );
+        assert!(
+            !pending_path(dir.path()).exists(),
+            "and nothing is left pending"
+        );
+        assert_eq!(d.next_due(), None);
     }
 
     /// What happened while no monitor ran is read in order on the next
@@ -3770,6 +4053,404 @@ pub(crate) mod tests {
         blocked
     }
 
+    /// An agent of `tool` whose turn failed, armed with `transport`, and
+    /// the attempt recovery dispatched for it at 60.
+    fn dispatched_attempt(
+        tool: Tool,
+        transport: Transport,
+        first: &[&str],
+    ) -> (Driver, tempfile::TempDir, PathBuf, AttemptRef, String) {
+        enable(tool, Some(transport));
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.jsonl");
+        append(&record, first);
+        let mut d = driver();
+        let name = match tool {
+            Tool::Claude => "claude",
+            _ => "codex",
+        };
+        d.reconcile(
+            vec![facts(name, dir.path(), &record, "session-one", true, false)],
+            0,
+        );
+        let acts = d.due(60, |_, _| Gate::Go);
+        let (attempt, tag) = acts
+            .iter()
+            .find_map(|a| match a {
+                Act::Dispatch { attempt, tag, .. } => Some((attempt.clone(), tag.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{acts:?}"));
+        (d, dir, record, attempt, tag)
+    }
+
+    fn claude_failed() -> [&'static str; 2] {
+        [
+            r#"{"type":"user","promptId":"t1","message":{"content":"go"}}"#,
+            r#"{"type":"assistant","isApiErrorMessage":true,"error":"overloaded"}"#,
+        ]
+    }
+
+    fn prompt(id: &str, text: &str) -> String {
+        serde_json::json!({"type": "user", "promptId": id, "message": {"content": text}})
+            .to_string()
+    }
+
+    /// An attempt's answer is its history, once, whatever recovery has
+    /// become since. Here the helper's retry was seen starting in the
+    /// transcript, so recovery had moved on, before the helper's reply was
+    /// read. Its submission is recorded as the helper's report, and nothing
+    /// is retried for it.
+    #[test]
+    fn an_answer_is_history_whatever_recovery_has_become() {
+        use crate::cli::nudge_log::{Outcome, Trigger};
+        let (mut d, dir, record, attempt, tag) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        append(&record, &[&prompt("p9", &wake_text(&tag))]);
+        touched(&mut d, &record, 62);
+        assert_ne!(load(dir.path()).unwrap().state, State::Dispatched);
+        let acts = d.answer(&label(), &attempt, Answer::Submitted { started: None }, 63);
+        let recorded = nudged(dir.path());
+        assert_eq!(recorded.len(), 1, "{acts:?}");
+        assert_eq!(recorded[0].outcome, Outcome::Reported);
+        assert_eq!(
+            recorded[0].trigger,
+            Trigger::Retry {
+                class: "overloaded".into(),
+                attempt: 1,
+                of: retries("overloaded").len() as u32
+            }
+        );
+        assert_eq!(recorded[0].text, wake_text(&tag));
+        assert!(dispatches(&acts).is_empty(), "nothing is retried");
+        d.answer(&label(), &attempt, Answer::Submitted { started: None }, 64);
+        assert_eq!(nudged(dir.path()).len(), 1, "once");
+
+        let (mut d, codex, _record, attempt, _) = dispatched_attempt(
+            Tool::Codex,
+            Transport::CodexStart,
+            &[&line(STARTED, "t1"), &line(FAILED, "t1")],
+        );
+        d.answer(&label(), &attempt, Answer::Submitted { started: None }, 61);
+        assert_eq!(
+            nudged(codex.path())[0].outcome,
+            Outcome::Submitted,
+            "Codex's own answer"
+        );
+    }
+
+    /// An answer that arrives after a different failure replaced the
+    /// episode keeps its own attempt's failure and text.
+    #[test]
+    fn a_replaced_episode_leaves_its_attempt_its_own_history() {
+        let (mut d, dir, record, attempt, tag) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        append(
+            &record,
+            &[
+                &prompt("p9", &wake_text(&tag)),
+                &prompt("p10", "something else"),
+                r#"{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit"}"#,
+            ],
+        );
+        touched(&mut d, &record, 62);
+        assert_eq!(load(dir.path()).unwrap().class, "rate_limit");
+        let acts = d.answer(&label(), &attempt, Answer::Indeterminate, 63);
+        let recorded = nudged(dir.path());
+        assert_eq!(recorded.len(), 1, "{acts:?}");
+        assert!(matches!(
+            &recorded[0].trigger,
+            crate::cli::nudge_log::Trigger::Retry { class, .. } if class == "overloaded"
+        ));
+        assert_eq!(recorded[0].text, wake_text(&tag));
+    }
+
+    /// An attempt whose retry was seen starting, then finishing, with no
+    /// answer ever coming, is settled as uncertain at its own deadline,
+    /// though recovery has nothing left due; then nothing is pending.
+    #[test]
+    fn a_started_attempt_no_one_answered_is_settled_at_its_own_deadline() {
+        let (mut d, dir, record, _, tag) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        append(&record, &[&prompt("p9", &wake_text(&tag))]);
+        touched(&mut d, &record, 62);
+        assert_ne!(load(dir.path()).unwrap().state, State::Dispatched);
+        assert_eq!(d.next_due(), Some(60 + ANSWER_WITHIN), "its own deadline");
+        let acts = d.due(60 + ANSWER_WITHIN, |_, _| Gate::Go);
+        let recorded = nudged(dir.path());
+        assert_eq!(recorded.len(), 1, "{acts:?}");
+        assert_eq!(recorded[0].text, wake_text(&tag));
+        assert!(dispatches(&acts).is_empty());
+        assert!(!pending_path(dir.path()).exists());
+        assert_eq!(d.next_due(), None, "nothing idles on a deadline");
+    }
+
+    /// An agent taken off the roster mid-attempt still has its attempt
+    /// settled, in its own directory, at the attempt's deadline.
+    #[test]
+    fn an_agent_off_the_roster_still_has_its_attempt_settled() {
+        let (mut d, dir, _, attempt, _) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        assert!(pending_path(dir.path()).exists());
+        d.reconcile(Vec::new(), 61);
+        let acts = d.due(60 + ANSWER_WITHIN, |_, _| Gate::Go);
+        assert!(acts.is_empty(), "{acts:?}");
+        assert!(matches!(&nudged(dir.path())[..], [record]
+                if record.attempt.ends_with(&format!(":{}", attempt.n))),);
+        assert!(!pending_path(dir.path()).exists());
+        assert_eq!(d.next_due(), None);
+    }
+
+    /// A monitor that restarts before the deadline reloads the attempt, and
+    /// a helper's reply that survived the restart is recorded as that
+    /// attempt's report, with its original failure and text.
+    #[test]
+    fn a_restart_keeps_the_attempt_for_a_reply_that_survived_it() {
+        let (d, dir, record, attempt, tag) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        drop(d);
+        write_reply(
+            dir.path(),
+            &Reply {
+                session: attempt.session.clone(),
+                opened_by: attempt.opened_by.clone(),
+                n: attempt.n,
+                answer: ReplyAnswer::Submitted,
+                started: None,
+            },
+        )
+        .unwrap();
+        let mut d = driver();
+        d.reconcile(
+            vec![facts(
+                "claude",
+                dir.path(),
+                &record,
+                "session-one",
+                true,
+                false,
+            )],
+            70,
+        );
+        let acts = d.replies(71);
+        let recorded = nudged(dir.path());
+        assert_eq!(recorded.len(), 1, "{acts:?}");
+        assert_eq!(
+            recorded[0].outcome,
+            crate::cli::nudge_log::Outcome::Reported
+        );
+        assert_eq!(recorded[0].text, wake_text(&tag));
+        assert!(matches!(&recorded[0].trigger,
+            crate::cli::nudge_log::Trigger::Retry { class, .. } if class == "overloaded"));
+        assert!(dispatches(&acts).is_empty());
+        assert!(!pending_path(dir.path()).exists());
+    }
+
+    /// An agent taken off the roster before the monitor restarted: its
+    /// saved attempt is found when the monitor starts, by the agent's own
+    /// directory, and settled at its deadline there.
+    #[test]
+    fn a_restart_finds_an_attempt_whose_agent_left_the_roster() {
+        let (d, dir, _, attempt, tag) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        drop(d);
+        let root = tempfile::tempdir().unwrap();
+        let away = root.path().join(label().as_str());
+        std::fs::create_dir_all(&away).unwrap();
+        std::fs::copy(pending_path(dir.path()), pending_path(&away)).unwrap();
+        let mut d = driver();
+        d.discover_pending(root.path());
+        assert_eq!(d.next_due(), Some(60 + ANSWER_WITHIN));
+        let acts = d.due(60 + ANSWER_WITHIN, |_, _| Gate::Go);
+        assert!(dispatches(&acts).is_empty(), "nothing is sent again");
+        assert!(
+            matches!(&nudged(&away)[..], [r] if r.text == wake_text(&tag)
+                && r.attempt.ends_with(&format!(":{}", attempt.n))),
+            "{:?}",
+            nudged(&away)
+        );
+        assert!(!pending_path(&away).exists());
+        assert_eq!(d.next_due(), None);
+    }
+
+    /// A helper's reply for an agent no longer on the roster is still read,
+    /// from the directory its attempt is pending in, as that attempt's
+    /// report.
+    #[test]
+    fn a_reply_for_an_agent_off_the_roster_is_its_attempts_report() {
+        let (mut d, dir, _, attempt, _) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        d.reconcile(Vec::new(), 61);
+        write_reply(
+            dir.path(),
+            &Reply {
+                session: attempt.session.clone(),
+                opened_by: attempt.opened_by.clone(),
+                n: attempt.n,
+                answer: ReplyAnswer::Submitted,
+                started: None,
+            },
+        )
+        .unwrap();
+        let acts = d.replies(62);
+        assert!(dispatches(&acts).is_empty());
+        assert!(matches!(
+            &nudged(dir.path())[..],
+            [r] if r.outcome == crate::cli::nudge_log::Outcome::Reported
+        ));
+        assert!(!pending_path(dir.path()).exists());
+    }
+
+    /// The row is in the journal before the attempt stops being pending,
+    /// so nothing else has to write it; and a stop between the two, which
+    /// leaves both, settles again on the next start as one row.
+    #[test]
+    fn an_attempt_stops_being_pending_only_after_its_row_is_written() {
+        let (mut d, dir, _, attempt, _) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        let saved = std::fs::read(pending_path(dir.path())).unwrap();
+        d.answer(&label(), &attempt, Answer::Submitted { started: None }, 61);
+        assert_eq!(nudged(dir.path()).len(), 1, "written by the answer itself");
+        assert!(!pending_path(dir.path()).exists());
+
+        let root = tempfile::tempdir().unwrap();
+        let away = root.path().join(label().as_str());
+        std::fs::create_dir_all(&away).unwrap();
+        std::fs::copy(
+            crate::cli::nudge_log::path(dir.path()),
+            crate::cli::nudge_log::path(&away),
+        )
+        .unwrap();
+        std::fs::write(pending_path(&away), saved.clone()).unwrap();
+        let mut d = driver();
+        d.discover_pending(root.path());
+        d.due(60 + ANSWER_WITHIN, |_, _| Gate::Go);
+        assert_eq!(nudged(&away).len(), 1, "one row for the attempt");
+
+        let (mut d, dir, _, attempt, _) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            d.settle_with(
+                &label(),
+                &attempt,
+                |_| crate::cli::nudge_log::Outcome::Submitted,
+                61,
+                |_, _| panic!("the process stops while writing the row"),
+            )
+        }));
+        assert!(stopped.is_err());
+        assert!(
+            pending_path(dir.path()).exists(),
+            "still pending, for the next start to settle"
+        );
+        assert!(!pending_path(&away).exists());
+    }
+
+    /// A monitor that restarts past an attempt's deadline reads any reply
+    /// that survived before deciding none came, in either order the timer
+    /// and the reply pass may run, for an agent on the roster or off it:
+    /// the reply's own outcome is recorded, once. With no reply, the
+    /// attempt is settled as unanswered. Nothing is sent again, and nothing
+    /// is left pending.
+    #[test]
+    fn an_overdue_restart_reads_the_reply_before_deciding_none_came() {
+        use crate::cli::nudge_log::Outcome;
+        for on_roster in [true, false] {
+            for timer_first in [true, false] {
+                for reply in [
+                    Some(ReplyAnswer::Submitted),
+                    Some(ReplyAnswer::Refused),
+                    Some(ReplyAnswer::Indeterminate),
+                    None,
+                ] {
+                    let (d, dir, record, attempt, _) =
+                        dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+                    drop(d);
+                    let root = tempfile::tempdir().unwrap();
+                    let agent = root.path().join(label().as_str());
+                    std::fs::create_dir_all(&agent).unwrap();
+                    std::fs::copy(pending_path(dir.path()), pending_path(&agent)).unwrap();
+                    if let Some(answer) = reply {
+                        write_reply(
+                            &agent,
+                            &Reply {
+                                session: attempt.session.clone(),
+                                opened_by: attempt.opened_by.clone(),
+                                n: attempt.n,
+                                answer,
+                                started: None,
+                            },
+                        )
+                        .unwrap();
+                    }
+                    let mut d = driver();
+                    d.discover_pending(root.path());
+                    let facts = match on_roster {
+                        true => vec![facts("claude", &agent, &record, "session-one", true, false)],
+                        false => Vec::new(),
+                    };
+                    d.reconcile(facts, 500);
+                    let mut acts = Vec::new();
+                    if timer_first {
+                        acts.extend(d.due(500, |_, _| Gate::Go));
+                        acts.extend(d.replies(500));
+                    } else {
+                        acts.extend(d.replies(500));
+                        acts.extend(d.due(500, |_, _| Gate::Go));
+                    }
+                    let case = format!("roster {on_roster} timer first {timer_first} {reply:?}");
+                    let recorded = nudged(&agent);
+                    assert_eq!(recorded.len(), 1, "{case}: {recorded:?}");
+                    let want_unanswered = matches!(&recorded[0].outcome,
+                        Outcome::Indeterminate { reason } if reason == "no answer came");
+                    match reply {
+                        Some(ReplyAnswer::Submitted) => {
+                            assert_eq!(recorded[0].outcome, Outcome::Reported, "{case}")
+                        }
+                        Some(ReplyAnswer::Refused) => assert!(
+                            matches!(recorded[0].outcome, Outcome::Refused { .. }),
+                            "{case}"
+                        ),
+                        Some(ReplyAnswer::Indeterminate) => assert!(
+                            matches!(&recorded[0].outcome, Outcome::Indeterminate { reason }
+                                if reason != "no answer came"),
+                            "{case}"
+                        ),
+                        None => assert!(want_unanswered, "{case}"),
+                    }
+                    assert!(dispatches(&acts).is_empty(), "{case}: nothing sent again");
+                    assert!(!pending_path(&agent).exists(), "{case}");
+                    assert!(!reply_path(&agent).exists(), "{case}: the reply was read");
+                }
+            }
+        }
+    }
+
+    /// An attempt nothing ever answered is history when its deadline
+    /// passes, as uncertain; an answer after that adds nothing. An attempt
+    /// that was answered gains no second row when its start is not seen.
+    #[test]
+    fn an_unanswered_attempt_is_uncertain_history_once() {
+        let (mut d, dir, _rollout, attempt, _) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        let acts = d.due(60 + ANSWER_WITHIN, |_, _| Gate::Go);
+        let recorded = nudged(dir.path());
+        assert_eq!(recorded.len(), 1, "{acts:?}");
+        assert!(matches!(
+            &recorded[0].outcome,
+            crate::cli::nudge_log::Outcome::Indeterminate { reason } if reason == "no answer came"
+        ));
+        d.answer(&label(), &attempt, Answer::Submitted { started: None }, 200);
+        assert_eq!(nudged(dir.path()).len(), 1, "a late answer adds nothing");
+
+        let (mut d, dir, _rollout, attempt, _) =
+            dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
+        d.answer(&label(), &attempt, Answer::Submitted { started: None }, 61);
+        assert_eq!(nudged(dir.path()).len(), 1);
+        d.due(61 + CONFIRM_WITHIN, |_, _| Gate::Go);
+        assert_eq!(nudged(dir.path()).len(), 1, "no second row");
+    }
+
     /// While storage is held, nothing tries to write: not a record event,
     /// not an answer. What they brought is kept for the decision at the
     /// hold's end.
@@ -3793,9 +4474,12 @@ pub(crate) mod tests {
         let acts = d.due(60, |_, _| Gate::Go);
         let attempt = dispatches(&acts)[0].0.clone();
         let blocked = block_storage(dir.path());
-        assert!(
-            d.answer(&label(), &attempt, Answer::Submitted { started: None }, 61)
-                .is_empty()
+        let acts = d.answer(&label(), &attempt, Answer::Submitted { started: None }, 61);
+        assert!(acts.is_empty(), "{acts:?}");
+        assert_eq!(
+            nudged(dir.path()).len(),
+            1,
+            "the history is kept through the hold"
         );
         let held = d.next_due();
         assert_eq!(held, Some(61 + RETRY_LOOK));

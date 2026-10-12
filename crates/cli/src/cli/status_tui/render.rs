@@ -1642,6 +1642,11 @@ pub(super) fn log_row_spans(
             spans
         }
         OnelineRow::Notice(n) => vec![dim(format!("({n})"))],
+        OnelineRow::Nudge { agent, summary, .. } => vec![
+            dim(format!("{} ", crate::cli::log::NUDGE_GLYPH)),
+            plain(format!("@{agent} ")),
+            dim(summary.clone()),
+        ],
         OnelineRow::PlainCommit {
             sha, subject, refs, ..
         } => {
@@ -1738,7 +1743,7 @@ pub(super) fn row_age(row: &crate::cli::log::OnelineRow) -> Option<String> {
     use crate::cli::log::OnelineRow;
     let at = match row {
         OnelineRow::Commit { at, .. } | OnelineRow::PlainCommit { at, .. } => *at,
-        OnelineRow::Github { at, .. } => *at as i64,
+        OnelineRow::Github { at, .. } | OnelineRow::Nudge { at, .. } => *at as i64,
         OnelineRow::Review { at, .. } => (*at)?,
         OnelineRow::Header { .. } | OnelineRow::Notice(_) | OnelineRow::RunEnd => return None,
     };
@@ -4741,6 +4746,30 @@ pub(super) fn render_info_doc(
             lines.push(emit(&[plain(format!("  {line}"))], "", cols));
         }
     }
+    let total = lines.len();
+    let off = offset.min(total.saturating_sub(1));
+    (lines.into_iter().skip(off).take(rows).collect(), total)
+}
+
+/// A [`super::OverlayData::Typed`] page: the summary as prose, then the
+/// text as it was typed, its indentation, spacing and blank lines kept.
+pub(super) fn render_typed_doc(
+    title: &str,
+    summary: &str,
+    text: &str,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let mut lines: Vec<String> = vec![
+        region_rule(title, "y copy · esc back", true, cols),
+        String::new(),
+    ];
+    for line in wrap(summary, cols.saturating_sub(2).max(1)) {
+        lines.push(emit(&[dim(format!("  {line}"))], "", cols));
+    }
+    lines.push(String::new());
+    push_body(&mut lines, text, cols);
     let total = lines.len();
     let off = offset.min(total.saturating_sub(1));
     (lines.into_iter().skip(off).take(rows).collect(), total)
@@ -8487,6 +8516,63 @@ mod tests {
             Some(line),
             unselected.iter().find(|l| visible(l).contains("drafts: 2")),
             "the cursor on it is shown"
+        );
+    }
+
+    /// A nudge row is its glyph, its agent and what happened, with an age
+    /// and no delivery mark: it is history, not work.
+    #[test]
+    fn a_nudge_row_is_history_with_no_delivery_mark() {
+        let row = crate::cli::log::OnelineRow::Nudge {
+            agent: "claude".into(),
+            at: 100,
+            attempt: "manual:1:2".into(),
+            summary: "nudged · by hand".into(),
+            text: "carry on".into(),
+        };
+        let line: String = log_row_spans(&row, 0, &Default::default(), 80)
+            .iter()
+            .map(|s| s.1.clone())
+            .collect();
+        assert_eq!(line, "↻ @claude nudged · by hand");
+        assert!(row_age(&row).is_some());
+        let detail = super::super::nudge_detail(&row).unwrap();
+        assert!(matches!(
+            detail.data,
+            super::super::OverlayData::Typed { .. }
+        ));
+    }
+
+    /// A nudge's page shows the text as it was typed: indentation, repeated
+    /// spaces, tabs to their stop and blank lines kept, control characters
+    /// made safe, at any width.
+    #[test]
+    fn a_nudge_page_keeps_the_texts_layout() {
+        let text = "    indented  text\n\n\tcode\u{1b}[2J";
+        let page = |cols: usize| -> Vec<String> {
+            render_typed_doc("nudge · @claude", "nudged · by hand", text, 0, 40, cols)
+                .0
+                .iter()
+                .map(|l| visible_untrimmed(l))
+                .collect()
+        };
+        let wide = page(80);
+        assert!(
+            wide.iter().any(|l| l == "      indented  text"),
+            "{wide:#?}"
+        );
+        assert!(
+            wide.iter().any(|l| l == "      code"),
+            "a tab to its stop: {wide:#?}"
+        );
+        let at = wide.iter().position(|l| l.contains("indented")).unwrap();
+        assert_eq!(wide[at + 1], "", "the blank line");
+        assert!(!wide.iter().any(|l| l.contains('\u{1b}')), "{wide:#?}");
+        assert!(wide.iter().any(|l| l.contains("nudged · by hand")));
+        let narrow = page(14);
+        assert!(
+            narrow.iter().any(|l| l.starts_with("      indent")),
+            "the indentation survives a wrap: {narrow:#?}"
         );
     }
 

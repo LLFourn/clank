@@ -10,31 +10,170 @@
 //!
 //! So this shares nothing with the machinery it exists to bypass. It
 //! reads no hook, no inbox, no session binding and no wait — only the
-//! live pane listing — and it writes nothing to disk.
+//! live pane listing. Its one write is the agent's nudge history, made
+//! after the attempt's outcome is fixed and unable to change it.
 
 use super::{NudgeArgs, resolve_repo};
+use crate::cli::nudge_log::{Outcome, Record, Trigger};
 use crate::cli::open_zellij;
+use crate::cli::pane_input::Unconfirmed;
 
 pub async fn run(args: NudgeArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let to = crate::cli::send::recipient(&repo, args.to.as_deref(), args.master)?;
     let body = crate::cli::send::body_of(&args.message, args.file.as_deref())?;
-
-    open_zellij::require_zellij()?;
-    let (found, tool) = super::pane_target::discover(repo.clone(), to.clone()).await?;
-    crate::cli::pane_input::interrupt_and_submit_async(&found.session, &found.pane, tool, &body)
-        .await?;
-    println!(
-        "nudged `{to}` in {} (session {}, pane {})",
-        repo.display(),
-        found.session,
-        found.pane
-    );
+    let agent_dir = crate::agent_store::agents_root(&repo).join(to.as_str());
+    let where_ = nudge_with(&agent_dir, &body, attempt(&repo, &to, &body))
+        .await
+        .map_err(|failed| match failed {
+            Failed::Refused(e) => e,
+            Failed::Unconfirmed(e) => e.into(),
+        })?;
+    println!("nudged `{to}` in {} ({where_})", repo.display());
     Ok(())
+}
+
+/// Run `attempt`, then add it to the history. The record comes after the
+/// attempt's outcome is fixed and cannot change it.
+async fn nudge_with(
+    agent_dir: &std::path::Path,
+    body: &str,
+    attempt: impl std::future::Future<Output = Result<String, Failed>>,
+) -> Result<String, Failed> {
+    let tried = attempt.await;
+    record(agent_dir, body, &tried);
+    tried
+}
+
+/// Why a nudge did not complete.
+enum Failed {
+    /// Nothing reached the terminal: no zellij, no pane, no provenance.
+    Refused(anyhow::Error),
+    Unconfirmed(Unconfirmed),
+}
+
+/// The nudge itself; on success, where it went.
+async fn attempt(
+    repo: &std::path::Path,
+    to: &crate::lifecycle::AgentLabel,
+    body: &str,
+) -> Result<String, Failed> {
+    open_zellij::require_zellij().map_err(Failed::Refused)?;
+    let (found, tool) = super::pane_target::discover(repo.to_path_buf(), to.clone())
+        .await
+        .map_err(Failed::Refused)?;
+    crate::cli::pane_input::interrupt_and_submit_async(&found.session, &found.pane, tool, body)
+        .await
+        .map_err(Failed::Unconfirmed)?;
+    Ok(format!("session {}, pane {}", found.session, found.pane))
+}
+
+/// What the attempt's result lets the history say.
+fn outcome<T>(tried: &Result<T, Failed>) -> Outcome {
+    match tried {
+        Ok(_) => Outcome::Submitted,
+        Err(Failed::Refused(e)) => Outcome::Refused {
+            reason: format!("{e:#}"),
+        },
+        Err(Failed::Unconfirmed(Unconfirmed::Empty)) => Outcome::Refused {
+            reason: "the message is empty".into(),
+        },
+        Err(Failed::Unconfirmed(Unconfirmed::Interrupt(_))) => Outcome::Indeterminate {
+            reason: "the interrupt was not confirmed".into(),
+        },
+        Err(Failed::Unconfirmed(Unconfirmed::Submit(_))) => Outcome::Indeterminate {
+            reason: "the message was not confirmed".into(),
+        },
+    }
+}
+
+/// Add the attempt to `agent_dir`'s nudge history. Its failure is
+/// ignored: the nudge has already happened, or not, either way.
+fn record<T>(agent_dir: &std::path::Path, body: &str, tried: &Result<T, Failed>) {
+    let _ = crate::cli::nudge_log::append(
+        agent_dir,
+        &Record {
+            at: crate::cli::recovery::unix_now(),
+            attempt: crate::cli::nudge_log::manual_attempt(),
+            trigger: Trigger::Manual,
+            text: body.to_string(),
+            outcome: outcome(tried),
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The history is written after the attempt, says what its result was,
+    /// and cannot change that result, even when it cannot be written.
+    #[tokio::test]
+    async fn a_nudge_is_recorded_after_its_attempt_and_unchanged_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::cli::nudge_log::path(dir.path());
+        let tried = nudge_with(dir.path(), "carry on", async {
+            assert!(
+                !journal.exists(),
+                "nothing is recorded before the attempt ends"
+            );
+            Ok("pane 7".to_string())
+        })
+        .await;
+        assert_eq!(tried.ok().as_deref(), Some("pane 7"));
+        let records = crate::cli::nudge_log::read(dir.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Submitted);
+        assert_eq!(records[0].text, "carry on");
+
+        let unwritable = dir.path().join("not-a-dir");
+        std::fs::write(&unwritable, "").unwrap();
+        let tried = nudge_with(&unwritable, "x", async {
+            Err(Failed::Unconfirmed(Unconfirmed::Submit(anyhow::anyhow!(
+                "Enter refused"
+            ))))
+        })
+        .await;
+        assert!(matches!(
+            tried,
+            Err(Failed::Unconfirmed(Unconfirmed::Submit(_)))
+        ));
+    }
+
+    /// Each way a nudge can end is recorded as what it can claim: a
+    /// refusal before the terminal, an unconfirmed interrupt or message as
+    /// possibly delivered, and only success as submitted.
+    #[test]
+    fn each_result_is_recorded_as_what_it_can_claim() {
+        let of = |r: Result<(), Failed>| outcome(&r);
+        assert_eq!(of(Ok(())), Outcome::Submitted);
+        assert!(matches!(
+            of(Err(Failed::Refused(anyhow::anyhow!("no pane")))),
+            Outcome::Refused { reason } if reason == "no pane"
+        ));
+        assert!(matches!(
+            of(Err(Failed::Unconfirmed(Unconfirmed::Empty))),
+            Outcome::Refused { .. }
+        ));
+        for unconfirmed in [
+            Unconfirmed::Interrupt(anyhow::anyhow!("timeout")),
+            Unconfirmed::Submit(anyhow::anyhow!("timeout")),
+        ] {
+            assert!(matches!(
+                of(Err(Failed::Unconfirmed(unconfirmed))),
+                Outcome::Indeterminate { .. }
+            ));
+        }
+    }
+
+    /// Two nudges are two attempts, even sent at once with the same text.
+    #[tokio::test]
+    async fn two_nudges_are_two_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            let _ = nudge_with(dir.path(), "same", async { Ok(String::new()) }).await;
+        }
+        assert_eq!(crate::cli::nudge_log::read(dir.path()).len(), 2);
+    }
     use super::*;
     use crate::cli::open_zellij::{SessionPane, SessionScan};
     use crate::cli::pane_target::{Found, locate};

@@ -1871,6 +1871,29 @@ fn log_up_crossing(log: &LogView, snapshot: &StatusSnapshot, cols: usize) -> Opt
     })
 }
 
+/// A nudge row's page: what happened and the text that was submitted,
+/// to read; it has nothing to act on.
+fn nudge_detail(row: &crate::cli::log::OnelineRow) -> Option<Overlay> {
+    let crate::cli::log::OnelineRow::Nudge {
+        agent,
+        summary,
+        text,
+        ..
+    } = row
+    else {
+        return None;
+    };
+    Some(Overlay {
+        data: OverlayData::Typed {
+            title: format!("nudge · @{agent}"),
+            summary: summary.clone(),
+            text: text.clone(),
+        },
+        offset: 0,
+        copied: None,
+    })
+}
+
 /// Whether scroll entry `i` is a run's end rule, the log's rows starting
 /// after `head` ask lines.
 fn is_rule(snapshot: &StatusSnapshot, head: usize, i: usize) -> bool {
@@ -1924,6 +1947,13 @@ enum OverlayData {
     /// document that scrolls is the shape that always fits, and `y`
     /// copies the command out of it (one-menu-not-five).
     Info { title: String, body: String },
+    /// Text that was typed into a terminal, kept as it was laid out,
+    /// under one line saying what became of it.
+    Typed {
+        title: String,
+        summary: String,
+        text: String,
+    },
     /// A link to follow from another device, with its QR
     /// (the-tui-mints-the-way-in).
     Link {
@@ -1957,6 +1987,7 @@ fn copyable(data: &OverlayData) -> Option<&str> {
         // An invocation is a command line to paste somewhere else,
         // which is the same need the failure overlay had.
         OverlayData::Info { body, .. } => Some(body),
+        OverlayData::Typed { text, .. } => Some(text),
         _ => None,
     }
 }
@@ -2742,7 +2773,10 @@ fn ledger_rows(rows: &[crate::cli::log::OnelineRow]) -> Vec<LedgerRow> {
                 }
                 OnelineRow::Review { .. } => row.page = commit_page.clone(),
                 OnelineRow::Header { .. } => commit_page = None,
-                OnelineRow::Github { .. } | OnelineRow::Notice(_) | OnelineRow::RunEnd => {}
+                OnelineRow::Github { .. }
+                | OnelineRow::Notice(_)
+                | OnelineRow::RunEnd
+                | OnelineRow::Nudge { .. } => {}
             }
             row
         })
@@ -2866,6 +2900,18 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
             sha: None,
             text: n.clone(),
             author: None,
+            verdict: None,
+            verdict_class: None,
+            stands_for: None,
+            age,
+            page: None,
+        },
+        OnelineRow::Nudge { agent, summary, .. } => LedgerRow {
+            kind: "nudge".into(),
+            glyph: Some(crate::cli::log::NUDGE_GLYPH.into()),
+            sha: None,
+            text: summary.clone(),
+            author: Some(agent.clone()),
             verdict: None,
             verdict_class: None,
             stands_for: None,
@@ -3370,6 +3416,18 @@ pub(crate) async fn run_tui(
                 OverlayData::Info { title, body } => {
                     render_info_doc(title, body, overlay.offset, rows as usize, cols as usize)
                 }
+                OverlayData::Typed {
+                    title,
+                    summary,
+                    text,
+                } => render_typed_doc(
+                    title,
+                    summary,
+                    text,
+                    overlay.offset,
+                    rows as usize,
+                    cols as usize,
+                ),
                 OverlayData::Error { title, message } => render_error_doc(
                     title,
                     message,
@@ -5124,6 +5182,13 @@ pub(crate) async fn run_tui(
                             // in-progress / ad-hoc rows resolve to None.
                             Key::Enter => {
                                 let seq = build_scroll(&snapshot, &ask_lines);
+                                if let Some(Seg::Log(
+                                    row @ crate::cli::log::OnelineRow::Nudge { .. },
+                                )) = seq.get(log.cursor)
+                                {
+                                    detail = nudge_detail(row);
+                                    continue;
+                                }
                                 // A github row opens the EVENT PAGE
                                 // (tui-github-event-page): target =
                                 // the component's first member (full

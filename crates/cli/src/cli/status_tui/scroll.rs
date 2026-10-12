@@ -252,6 +252,8 @@ pub(super) enum EntryId {
     /// Any shared key is the same event: a merge can gain members.
     Event(Vec<crate::cli::github::timeline::EventKey>),
     Notice(String),
+    /// A nudge, by its attempt.
+    Nudge(String),
 }
 
 /// A selected entry, held across a refresh: which entry, and which of
@@ -325,6 +327,7 @@ fn identify(
             EntryId::Event(snap.github_events.get(*event_idx)?.page_keys())
         }
         OnelineRow::Notice(text) => EntryId::Notice(text.clone()),
+        OnelineRow::Nudge { attempt, .. } => EntryId::Nudge(attempt.clone()),
         OnelineRow::RunEnd => return None,
     })
 }

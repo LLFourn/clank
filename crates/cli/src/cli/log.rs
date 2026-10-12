@@ -123,17 +123,21 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     // discard the whole snapshot, which was the same thing while
     // github was the only backend and silently hid every command
     // source the moment one wasn't (codex db5821e).
-    let gh_events: Vec<crate::cli::github::timeline::MergedEvent> = if plan_filter.is_some() {
-        Vec::new()
+    let (gh_events, nudges) = if plan_filter.is_some() {
+        (Vec::new(), Vec::new())
     } else {
         let snap = crate::cli::github::timeline::timeline_snapshot(&repo);
         for n in &snap.notices {
             eprintln!("log: {n}");
         }
-        timeline_events_for(snap.events, args.no_github)
+        (
+            timeline_events_for(snap.events, args.no_github),
+            snap.nudges,
+        )
     };
 
-    if filtered.is_empty() && history.plain.is_empty() && gh_events.is_empty() {
+    if filtered.is_empty() && history.plain.is_empty() && gh_events.is_empty() && nudges.is_empty()
+    {
         println!("no log events");
         return Ok(());
     }
@@ -145,7 +149,7 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     } else {
         &[]
     };
-    let items = interleave_with_plain(&filtered, plain, &gh_events);
+    let items = interleave_with_plain(&filtered, plain, &gh_events, &nudges);
 
     let reviewable_shas: Vec<CommitSha> = filtered
         .iter()
@@ -305,6 +309,7 @@ pub(crate) enum TimelineItem<'a> {
     Repo(&'a LogEvent),
     Plain(&'a PlainCommit),
     Github(usize, &'a crate::cli::github::timeline::MergedEvent),
+    Nudge(&'a crate::cli::github::timeline::Nudge),
 }
 
 /// Two-pointer newest-first merge preserving each list's own order.
@@ -318,13 +323,16 @@ pub(crate) fn interleave<'a>(
     events: &[&'a LogEvent],
     gh: &'a [crate::cli::github::timeline::MergedEvent],
 ) -> Vec<TimelineItem<'a>> {
-    interleave_with_plain(events, &[], gh)
+    interleave_with_plain(events, &[], gh, &[])
 }
 
+/// [`interleave`] with the plain commits and each agent's nudge history,
+/// which sits among the events by time under the same floor.
 pub(crate) fn interleave_with_plain<'a>(
     events: &[&'a LogEvent],
     plain: &'a [PlainCommit],
     gh: &'a [crate::cli::github::timeline::MergedEvent],
+    nudges: &'a [crate::cli::github::timeline::Nudge],
 ) -> Vec<TimelineItem<'a>> {
     let floor = plain
         .last()
@@ -334,46 +342,48 @@ pub(crate) fn interleave_with_plain<'a>(
     // by enumerate BEFORE the floor filter and the reversal, so the
     // displayed row and the event it opens share identity (codex
     // d7f4d40: a derived-list position inverted the mapping).
-    let mut gh_desc: Vec<(usize, &crate::cli::github::timeline::MergedEvent)> = gh
+    let after_floor = |t: i64| floor.is_none_or(|f| t >= f);
+    let at = |t: u64| i64::try_from(t).unwrap_or(i64::MAX);
+    let mut external: Vec<(i64, TimelineItem<'a>)> = gh
         .iter()
         .enumerate()
-        .filter(|(_, g)| {
-            let t = i64::try_from(g.at).unwrap_or(i64::MAX);
-            floor.is_none_or(|f| t >= f)
-        })
+        .map(|(i, g)| (at(g.at), TimelineItem::Github(i, g)))
+        .chain(
+            nudges
+                .iter()
+                .map(|n| (at(n.record.at), TimelineItem::Nudge(n))),
+        )
+        .filter(|(t, _)| after_floor(*t))
         .collect();
-    gh_desc.reverse();
+    // Newest first; a stable sort keeps each list's own order on a tie.
+    external.reverse();
+    external.sort_by(|a, b| b.0.cmp(&a.0));
     let mut history: Vec<TimelineItem<'a>> = events
         .iter()
         .map(|event| TimelineItem::Repo(*event))
         .collect();
     history.extend(plain.iter().map(TimelineItem::Plain));
-    let mut out = Vec::with_capacity(history.len() + gh_desc.len());
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < history.len() || j < gh_desc.len() {
-        let history_ts = |item: &TimelineItem<'_>| match item {
-            TimelineItem::Repo(event) => event.ts(),
-            TimelineItem::Plain(commit) => commit.meta.author_ts,
-            TimelineItem::Github(_, event) => i64::try_from(event.at).unwrap_or(i64::MAX),
-        };
-        let take_gh = match (history.get(i), gh_desc.get(j)) {
-            (Some(item), Some((_, g))) => {
-                i64::try_from(g.at).unwrap_or(i64::MAX) >= history_ts(item)
-            }
+    let history_ts = |item: &TimelineItem<'_>| match item {
+        TimelineItem::Repo(event) => event.ts(),
+        TimelineItem::Plain(commit) => commit.meta.author_ts,
+        TimelineItem::Github(_, event) => at(event.at),
+        TimelineItem::Nudge(n) => at(n.record.at),
+    };
+    let mut out = Vec::with_capacity(history.len() + external.len());
+    let mut history = history.into_iter().peekable();
+    let mut external = external.into_iter().peekable();
+    loop {
+        let take_external = match (history.peek(), external.peek()) {
+            (Some(item), Some((t, _))) => *t >= history_ts(item),
             (None, Some(_)) => true,
-            _ => false,
+            (_, None) => false,
         };
-        if take_gh {
-            let (orig_idx, g) = gh_desc[j];
-            out.push(TimelineItem::Github(orig_idx, g));
-            j += 1;
+        if take_external {
+            out.push(external.next().expect("peeked").1);
+        } else if let Some(item) = history.next() {
+            out.push(item);
         } else {
-            out.push(match history[i] {
-                TimelineItem::Repo(event) => TimelineItem::Repo(event),
-                TimelineItem::Plain(commit) => TimelineItem::Plain(commit),
-                TimelineItem::Github(_, _) => unreachable!("history contains no github rows"),
-            });
-            i += 1;
+            break;
         }
     }
     out
@@ -686,6 +696,23 @@ fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyho
                     println!("    {line}");
                 }
             }
+            TimelineItem::Nudge(n) => {
+                print_human_events(&chunk, repo, &reviews, c, &mut started)?;
+                chunk.clear();
+                if started {
+                    println!();
+                }
+                started = true;
+                let line = format!("{NUDGE_GLYPH} @{} {}", n.agent, n.record.summary());
+                if c {
+                    println!("{C}{line}{Z}");
+                } else {
+                    println!("{line}");
+                }
+                for text in n.record.text.lines() {
+                    println!("    {text}");
+                }
+            }
             TimelineItem::Github(_, g) => {
                 print_human_events(&chunk, repo, &reviews, c, &mut started)?;
                 chunk.clear();
@@ -974,7 +1001,19 @@ pub(crate) enum OnelineRow {
     /// the next run follows it: what is above it is outside the run.
     /// Drawn, never selected.
     RunEnd,
+    /// An attempt to push work into an agent's terminal: history, never
+    /// work, so it carries no delivery state.
+    Nudge {
+        agent: String,
+        at: u64,
+        attempt: String,
+        summary: String,
+        text: String,
+    },
 }
+
+/// The mark of a nudge row: an attempt to push work into a terminal.
+pub(crate) const NUDGE_GLYPH: &str = "↻";
 
 /// The CLI's rendering of [`OnelineRow::RunEnd`].
 pub(crate) const RUN_END_RULE: &str = "────────────────────────";
@@ -1061,6 +1100,13 @@ pub(crate) fn oneline_items_rows(
                 at: commit.meta.author_ts,
                 subject: commit.meta.subject.clone(),
                 refs: commit.refs.clone(),
+            }),
+            TimelineItem::Nudge(n) => out.push(OnelineRow::Nudge {
+                agent: n.agent.clone(),
+                at: n.record.at,
+                attempt: n.record.attempt.clone(),
+                summary: n.record.summary(),
+                text: n.record.text.clone(),
             }),
             TimelineItem::Github(idx, g) => out.push(OnelineRow::Github {
                 delivery: g.delivery(),
@@ -1288,6 +1334,9 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 )
             }
             OnelineRow::Notice(n) => format!("({n})"),
+            OnelineRow::Nudge { agent, summary, .. } => {
+                format!("{NUDGE_GLYPH} @{agent} {summary}")
+            }
             OnelineRow::RunEnd => RUN_END_RULE.to_string(),
             OnelineRow::PlainCommit {
                 sha, subject, refs, ..
@@ -1339,6 +1388,13 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
     for row in rows {
         match row {
             OnelineRow::Notice(message) => println!("{message}"),
+            OnelineRow::Nudge { agent, summary, .. } => {
+                if c {
+                    println!("{C}{NUDGE_GLYPH} @{agent}{Z} {summary}");
+                } else {
+                    println!("{NUDGE_GLYPH} @{agent} {summary}");
+                }
+            }
             OnelineRow::RunEnd => {
                 if c {
                     println!("{DIM}{RUN_END_RULE}{Z}");
@@ -1482,6 +1538,15 @@ enum LogJsonRow<'a> {
         subject: &'a str,
         refs: &'a [String],
     },
+    #[serde(rename = "nudge")]
+    Nudge {
+        agent: &'a str,
+        ts: i64,
+        attempt: &'a str,
+        trigger: &'a crate::cli::nudge_log::Trigger,
+        outcome: &'a crate::cli::nudge_log::Outcome,
+        text: &'a str,
+    },
     #[serde(rename = "review")]
     Review {
         sha: &'a str,
@@ -1597,6 +1662,18 @@ fn json_items<'a>(
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
+            TimelineItem::Nudge(n) => {
+                out.extend(json_rows(&chunk, reviews));
+                chunk.clear();
+                out.push(LogJsonRow::Nudge {
+                    agent: &n.agent,
+                    ts: i64::try_from(n.record.at).unwrap_or(i64::MAX),
+                    attempt: &n.record.attempt,
+                    trigger: &n.record.trigger,
+                    outcome: &n.record.outcome,
+                    text: &n.record.text,
+                });
+            }
             TimelineItem::Plain(commit) => {
                 out.extend(json_rows(&chunk, reviews));
                 chunk.clear();
@@ -2053,6 +2130,67 @@ mod json_output_tests {
         }
     }
 
+    fn nudge(agent: &str, at: u64, attempt: &str) -> crate::cli::github::timeline::Nudge {
+        crate::cli::github::timeline::Nudge {
+            agent: agent.into(),
+            record: crate::cli::nudge_log::Record {
+                at,
+                attempt: attempt.into(),
+                trigger: crate::cli::nudge_log::Trigger::Manual,
+                text: "carry on".into(),
+                outcome: crate::cli::nudge_log::Outcome::Submitted,
+            },
+        }
+    }
+
+    /// Nudges sit among the commits and events by time, under the same
+    /// floor, and render as history: their glyph, no delivery mark, and
+    /// a JSON row of their own kind.
+    #[test]
+    fn nudges_interleave_by_time_as_history() {
+        let e_new = adhoc(200, "new");
+        let e_old = adhoc(100, "old");
+        let events: Vec<&LogEvent> = vec![&e_new, &e_old];
+        let gh_events = vec![gh(160, "between", false)];
+        let nudges = vec![
+            nudge("claude", 50, "too-old"),
+            nudge("claude", 150, "n1"),
+            nudge("codex", 300, "n2"),
+        ];
+        let items = interleave_with_plain(&events, &[], &gh_events, &nudges);
+        let shape: Vec<String> = items
+            .iter()
+            .map(|i| match i {
+                TimelineItem::Github(_, g) => g.content.clone().unwrap(),
+                TimelineItem::Repo(LogEvent::AdHoc { subject, .. }) => subject.clone(),
+                TimelineItem::Nudge(n) => n.record.attempt.clone(),
+                _ => "?".into(),
+            })
+            .collect();
+        assert_eq!(shape, ["n2", "new", "between", "n1", "old"]);
+        let rows = oneline_items_rows(&items, &Default::default(), &Default::default());
+        let lines = oneline_plain_lines(&rows);
+        assert!(
+            lines.contains(&"↻ @codex nudged · by hand".to_string()),
+            "{lines:?}"
+        );
+        let nudge_lines: Vec<&String> = lines.iter().filter(|l| l.contains("nudged")).collect();
+        assert_eq!(nudge_lines.len(), 2);
+        assert!(
+            nudge_lines.iter().all(|l| l.starts_with("↻ @")),
+            "no delivery mark: {lines:?}"
+        );
+        let json = serde_json::to_value(json_items(&items, &Default::default())).unwrap();
+        assert!(
+            json.as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["kind"] == "nudge"
+                    && row["agent"] == "codex"
+                    && row["outcome"]["kind"] == "submitted")
+        );
+    }
+
     #[test]
     fn interleave_orders_by_time_and_respects_the_range_floor() {
         // Commits at ts 100 and 200 (newest first); gh events at 250
@@ -2216,6 +2354,7 @@ mod json_output_tests {
                 OnelineRow::Commit { .. } | OnelineRow::PlainCommit { .. } => 'c',
                 OnelineRow::Review { .. } => 'r',
                 OnelineRow::Github { .. } | OnelineRow::Notice(_) => 'e',
+                OnelineRow::Nudge { .. } => 'n',
             })
             .collect()
     }

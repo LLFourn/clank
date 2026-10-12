@@ -1241,7 +1241,12 @@ async fn log_rows_page(
     } else {
         crate::cli::github::timeline::TimelineSnapshot::default()
     };
-    let items = crate::cli::log::interleave_with_plain(&newest_first, &history.plain, &snap.events);
+    let items = crate::cli::log::interleave_with_plain(
+        &newest_first,
+        &history.plain,
+        &snap.events,
+        &snap.nudges,
+    );
     let mut rows: Vec<crate::cli::log::OnelineRow> = snap
         .notices
         .iter()
@@ -2124,7 +2129,7 @@ mod dirty_and_wake_tests {
         assert_eq!(head_row.meta.sha, head);
         assert!(head_row.refs.iter().any(|name| name == "main"));
 
-        let items = crate::cli::log::interleave_with_plain(&[], &history.plain, &[]);
+        let items = crate::cli::log::interleave_with_plain(&[], &history.plain, &[], &[]);
         let rows =
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         assert_eq!(rows.len(), 3);
@@ -2172,7 +2177,7 @@ mod dirty_and_wake_tests {
         );
 
         let folded: Vec<&clank_core::repo_state::LogEvent> = history.folded.iter().rev().collect();
-        let items = crate::cli::log::interleave_with_plain(&folded, &history.plain, &[]);
+        let items = crate::cli::log::interleave_with_plain(&folded, &history.plain, &[], &[]);
         let rows =
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         let actual: Vec<_> = rows

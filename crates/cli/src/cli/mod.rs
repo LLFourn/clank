@@ -42,6 +42,7 @@ pub mod log;
 pub(crate) mod message;
 pub mod monitor;
 pub mod nudge;
+pub(crate) mod nudge_log;
 pub mod open;
 pub mod open_zellij;
 mod owned_callback;
