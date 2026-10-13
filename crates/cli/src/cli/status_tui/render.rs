@@ -11164,6 +11164,7 @@ mod tests {
                 since: 0,
                 suppressors: Vec::new(),
                 nudge: Nudge::WaitingForYou("resuming this harness is not enabled".into()),
+                resumes: None,
                 cannot_resume: Some("no evidence".into()),
             },
             stale,

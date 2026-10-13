@@ -22,7 +22,10 @@ pub(crate) struct AgentState {
     pub(crate) since: u64,
     pub(crate) suppressors: Vec<Suppressor>,
     pub(crate) nudge: Nudge,
-    /// Why clank cannot resume this agent itself, when it cannot.
+    /// How clank resumes this agent, and on what grounds, when it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resumes: Option<String>,
+    /// Why clank cannot nudge this agent itself, when it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cannot_resume: Option<String>,
 }
@@ -221,8 +224,11 @@ pub(crate) fn line(state: &AgentState, now: u64) -> String {
     if let Nudge::WaitingForYou(why) = &state.nudge {
         out.push_str(&format!(" · {why}"));
     }
+    if let Some(how) = &state.resumes {
+        out.push_str(&format!(" · resumed: {how}"));
+    }
     if let Some(why) = &state.cannot_resume {
-        out.push_str(&format!(" · not resumed: {why}"));
+        out.push_str(&format!(" · not nudged: {why}"));
     }
     out
 }
@@ -244,6 +250,7 @@ mod tests {
             since: 100,
             suppressors: Vec::new(),
             nudge: Nudge::Nothing,
+            resumes: None,
             cannot_resume: None,
         }
     }

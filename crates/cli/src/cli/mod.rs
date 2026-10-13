@@ -35,6 +35,7 @@ pub mod github;
 pub(crate) mod grok_hook;
 pub(crate) mod grok_launch;
 pub(crate) mod grok_setup;
+pub(crate) mod harness_identity;
 pub mod html;
 pub mod html_highlight;
 pub mod init;

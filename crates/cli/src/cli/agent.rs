@@ -382,14 +382,38 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         crate::cli::fork::take_fork_spec(&repo, &label)?;
     }
 
-    if let Err(error) = super::pane_target::record(&repo, &label, launch_tool, &composed.program) {
+    let workdir = matches!(launch_tool, Tool::Grok | Tool::Claude).then_some(repo.as_path());
+    let path = composed
+        .env_overrides
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    let cwd = match workdir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let launch = super::harness_identity::at_launch(
+        launch_tool,
+        &composed.program,
+        &cwd,
+        path.as_deref(),
+        |cmd| launch_context(cmd, &composed, workdir),
+    );
+    if let Err(error) = super::pane_target::record(
+        &repo,
+        &label,
+        launch_tool,
+        &composed.program,
+        launch.version,
+    ) {
         eprintln!("clank: launch provenance unavailable for interruption: {error:#}");
     }
+    // The file whose version was recorded is the file run.
+    if let Some(exe) = launch.exe {
+        composed.program = exe.to_string_lossy().into_owned();
+    }
 
-    exec_composed(
-        composed,
-        matches!(launch_tool, Tool::Grok | Tool::Claude).then_some(repo.as_path()),
-    )
+    exec_composed(composed, workdir)
 }
 
 /// The `--repo` this process was GIVEN, not the resolved path: the
@@ -1059,17 +1083,23 @@ fn scrub_inherited_identity(cmd: &mut std::process::Command) {
 }
 
 #[cfg(unix)]
-fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(&c.program);
+/// The directory and environment a launch runs in: shared by its exec and
+/// by the version asked of it just before.
+fn launch_context(cmd: &mut std::process::Command, c: &ComposedLaunch, repo: Option<&Path>) {
     if let Some(repo) = repo {
         cmd.current_dir(repo);
     }
-    cmd.args(&c.args);
-    scrub_inherited_identity(&mut cmd);
+    scrub_inherited_identity(cmd);
     for (k, v) in &c.env_overrides {
         cmd.env(k, v);
     }
+}
+
+fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&c.program);
+    cmd.args(&c.args);
+    launch_context(&mut cmd, &c, repo);
     // `exec` replaces the current process; the only return
     // value is the io::Error if exec itself fails (e.g.
     // command-not-found, permissions).

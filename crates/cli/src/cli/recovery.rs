@@ -491,18 +491,46 @@ impl Transport {
     }
 }
 
-/// The transport clank may use for `tool`, or why it may not: the harness's
-/// resume capability ([`crate::cli::resume`]), which committed evidence for
-/// its installed version must enable. Recovery never cancels a turn, so a
-/// harness with none waits for a person.
-pub(crate) fn transport_for(tool: Tool) -> Result<Transport, &'static str> {
+/// What recovery means to do: nudge an agent that stopped with work owed,
+/// or retry a turn that failed on a provider error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Nudge,
+    Retry,
+}
+
+impl Episode {
+    fn action(&self) -> Action {
+        match (self.kind, self.class.as_str()) {
+            (Kind::Fallback, _) | (_, IDLE) => Action::Nudge,
+            _ => Action::Retry,
+        }
+    }
+}
+
+/// The transport clank may use to `action` a `tool` running at `version`,
+/// or why it may not. A nudge needs the harness's resume capability
+/// ([`crate::cli::resume`]), which committed evidence for that version
+/// must enable. A retry may use it too, and a Codex retry otherwise takes
+/// Codex's own `turn/start`, which starts a turn only on the exact failed
+/// turn and never interrupts. Recovery never cancels a turn, so an agent
+/// with neither waits for a person.
+pub(crate) fn transport_for(
+    tool: Tool,
+    action: Action,
+    version: Option<&str>,
+) -> Result<Transport, &'static str> {
     #[cfg(test)]
     if let Some(t) = tests::enabled(tool) {
         return t.ok_or(crate::cli::resume::NO_EVIDENCE);
     }
-    match crate::cli::resume::resume_for(tool)? {
-        crate::cli::resume::Resume::TypedSubmit => Ok(Transport::Typed),
-        crate::cli::resume::Resume::Plugin => Ok(Transport::Helper),
+    match crate::cli::resume::resume_for(tool, version) {
+        Ok(grant) => Ok(match grant.resume {
+            crate::cli::resume::Resume::TypedSubmit => Transport::Typed,
+            crate::cli::resume::Resume::Plugin => Transport::Helper,
+        }),
+        Err(_) if tool == Tool::Codex && action == Action::Retry => Ok(Transport::CodexStart),
+        Err(why) => Err(why),
     }
 }
 
@@ -581,6 +609,27 @@ pub(crate) struct Episode {
     /// and another role's fold or restart ends it.
     #[serde(default)]
     pub(crate) role: String,
+    /// The launch it was opened under: a new one, even of the same session,
+    /// ends it, whenever and however that is seen. Absent from an episode
+    /// stored before launches were told apart, which keeps it as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bound: Option<Bound>,
+}
+
+/// One launch of an agent: its session, and when it was bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Bound {
+    pub(crate) session: String,
+    pub(crate) at: String,
+}
+
+impl Bound {
+    pub(crate) fn of(session: &clank_core::agent_config::Session) -> Self {
+        Bound {
+            session: session.id.as_str().to_string(),
+            at: session.updated_at.clone(),
+        }
+    }
 }
 
 /// What opened an episode.
@@ -679,9 +728,10 @@ pub(crate) struct Ctx<'a> {
     pub(crate) now: u64,
     pub(crate) session: &'a str,
     pub(crate) tool: Tool,
-    pub(crate) transport: Option<Transport>,
-    /// Why `transport` is `None`, for the agent's status.
-    pub(crate) no_transport: &'static str,
+    /// How a nudge reaches the agent, or why it cannot.
+    pub(crate) nudge: Result<Transport, &'static str>,
+    /// How a retry reaches it, or why it cannot.
+    pub(crate) retry: Result<Transport, &'static str>,
     /// What the monitor found when it checked, where it checked.
     pub(crate) gate: Option<Gate>,
     /// The agent owes work and has no wait to take it.
@@ -691,10 +741,30 @@ pub(crate) struct Ctx<'a> {
     pub(crate) fallback: Option<Fallback>,
     /// The agent's roster role.
     pub(crate) role: &'a str,
+    /// Its running harness is still being identified.
+    pub(crate) identifying: bool,
+    /// The launch the agent is bound to.
+    pub(crate) bound: Option<Bound>,
     /// The highest attempt number ever issued to this agent, in any
     /// episode or interval: a claim continues past it, so no two attempts,
     /// their answers, tags or history share an identity.
     pub(crate) issued: u32,
+}
+
+impl Ctx<'_> {
+    /// How `e`'s next attempt reaches the agent, or why it cannot.
+    fn transport(&self, e: &Episode) -> Result<Transport, &'static str> {
+        match e.action() {
+            Action::Nudge => self.nudge,
+            Action::Retry => self.retry,
+        }
+    }
+
+    /// Whether `e` is refused only for want of a version that is on its
+    /// way: a hold until it arrives, never a refusal.
+    fn awaiting(&self, e: &Episode) -> bool {
+        self.identifying && self.transport(e) == Err(crate::cli::resume::NO_VERSION)
+    }
 }
 
 /// How long a claimed attempt has for its transport to answer.
@@ -739,6 +809,7 @@ pub(crate) fn decide(
     // change is seen.
     let mut ep = prev
         .filter(|e| e.session == ctx.session && e.role == ctx.role)
+        .filter(|e| e.bound.is_none() || e.bound == ctx.bound)
         .filter(|e| e.kind != Kind::Fallback || fallback_stands(e, ctx));
 
     if let Some(e) = ep.as_mut().filter(|e| e.live() && e.kind != Kind::Fallback) {
@@ -782,6 +853,13 @@ pub(crate) fn decide(
             // Held: no deadline, so nothing looks again until a fold says
             // the hold is over.
             (Some(Gate::Hold | Gate::AutoOff), State::Waiting, _) => e.next_at = None,
+            // Its harness's version is on its way: nothing is decided for
+            // want of it, and its arrival decides again.
+            (_, State::Waiting, at) if ctx.awaiting(e) => {
+                if at.is_some_and(|at| at <= ctx.now) {
+                    e.next_at = None;
+                }
+            }
             (_, State::Waiting, None) => e.next_at = Some(ctx.now + RETRY_LOOK),
             _ => effects.extend(due(e, snap, ctx)),
         }
@@ -853,6 +931,7 @@ fn blank(opened_by: String, turn: String, class: String, ctx: &Ctx) -> Episode {
         kind: Kind::Failed,
         every: None,
         role: ctx.role.to_string(),
+        bound: ctx.bound.clone(),
     }
 }
 
@@ -863,8 +942,8 @@ fn opened(kind: Kind, id: String, class: String, ctx: &Ctx) -> Episode {
     };
     // An idle agent is given its settle period first, transport or not: a
     // turn's end is read moments before the Stop hook parks it.
-    if kind == Kind::Failed && ctx.transport.is_none() {
-        escalate(&mut e, ctx, ctx.no_transport);
+    if let (Kind::Failed, Err(why), false) = (kind, ctx.transport(&e), ctx.awaiting(&e)) {
+        escalate(&mut e, ctx, why);
         return e;
     }
     match e.next_wait() {
@@ -962,7 +1041,10 @@ fn follow(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) {
     e.failed_turn = turn.id.clone();
     e.class = next;
     match e.next_wait() {
-        _ if ctx.transport.is_none() => escalate(e, ctx, ctx.no_transport),
+        _ if ctx.transport(e).is_err() && !ctx.awaiting(e) => {
+            let why = ctx.transport(e).expect_err("checked");
+            escalate(e, ctx, why)
+        }
         Ok(wait) => {
             e.state = State::Waiting;
             e.next_at = Some(ctx.now + wait);
@@ -1008,8 +1090,7 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
                 e.next_at = Some(ctx.now + fallback_wait(e));
                 return None;
             }
-            let Some(transport) = ctx.transport else {
-                escalate(e, ctx, ctx.no_transport);
+            let Ok(transport) = ctx.transport(e).map_err(|why| escalate(e, ctx, why)) else {
                 return None;
             };
             Some(claim(e, transport, ctx))
@@ -1028,8 +1109,7 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
                 e.next_at = Some(ctx.now + RETRY_LOOK);
                 return None;
             }
-            let Some(transport) = ctx.transport else {
-                escalate(e, ctx, ctx.no_transport);
+            let Ok(transport) = ctx.transport(e).map_err(|why| escalate(e, ctx, why)) else {
                 return None;
             };
             let current = snap.anchored()
@@ -1260,6 +1340,12 @@ struct Watched {
     /// The activity last published, and since when.
     activity: Option<(crate::cli::agent_state::Activity, u64)>,
     published: Option<crate::cli::agent_state::AgentState>,
+    /// The harness it is running, as far as it has been identified, for
+    /// `binding`.
+    running: Identity,
+    /// The binding `running` was identified for: a new one, even of the
+    /// same session, is a new launch to identify.
+    binding: Option<clank_core::agent_config::Session>,
 }
 
 struct Reading {
@@ -1620,10 +1706,20 @@ impl Driver {
                     fallback: None,
                     activity: None,
                     published: crate::cli::agent_state::load(&f.agent_dir),
+                    running: Identity::Unasked,
+                    binding: None,
                 });
             w.auto = f.auto;
             w.obligated = f.obligated && !f.delivering;
             w.role = f.role.clone();
+            let process_ended = match &w.running {
+                Identity::Known(r) => !r.process.birth.still_holds(r.process.pid),
+                _ => false,
+            };
+            if w.binding.as_ref() != Some(&f.session) || process_ended {
+                w.binding = Some(f.session.clone());
+                w.running = Identity::Unasked;
+            }
             w.attending = f.attending;
             w.asking = f.asking;
             w.delivering = f.delivering;
@@ -1833,20 +1929,80 @@ impl Driver {
             || suppressed(w).is_some()
             || live.role != e.role
             || w.role != e.role
+            || e.bound.as_ref().is_some_and(|b| {
+                w.binding.as_ref().map(Bound::of).as_ref() != Some(b)
+                    || live.bound.as_ref() != Some(b)
+            })
             || live.work.is_empty()
         {
             return false;
         }
-        if e.kind == Kind::Fallback {
-            return w.read.is_none()
-                && w.fallback.is_some()
-                && fallback_identity(&live.work) == e.opened_by;
+        let current = match e.kind {
+            Kind::Fallback => {
+                w.read.is_none()
+                    && w.fallback.is_some()
+                    && fallback_identity(&live.work) == e.opened_by
+            }
+            _ => {
+                refresh(w)
+                    && w.snap.anchored()
+                    && w.snap.latest().is_some_and(|t| {
+                        t.id == e.failed_turn && e.targets(&t.outcome) && !t.retrying
+                    })
+            }
+        };
+        current && still_permitted(w, &e, live)
+    }
+
+    /// The agents whose running harness has not been asked for, marked as
+    /// being asked: each is identified once per binding and process, off
+    /// the loop.
+    pub(crate) fn unidentified(
+        &mut self,
+    ) -> Vec<(
+        clank_core::ids::AgentLabel,
+        clank_core::agent_config::Session,
+    )> {
+        self.agents
+            .iter_mut()
+            .filter(|(_, w)| {
+                w.running == Identity::Unasked
+                    && w.obligated
+                    && matches!(w.tool, Tool::Claude | Tool::Codex)
+            })
+            .filter_map(|(author, w)| {
+                w.running = Identity::Pending;
+                Some((author.clone(), w.binding.clone()?))
+            })
+            .collect()
+    }
+
+    /// What identifying `author`'s running harness found, for the
+    /// `binding` it was asked for: dropped if the agent has been bound
+    /// again since, even to the same session.
+    pub(crate) fn identified(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        binding: &clank_core::agent_config::Session,
+        found: Result<crate::cli::harness_identity::Running, String>,
+        now: u64,
+    ) -> Vec<Act> {
+        let mut acts = Vec::new();
+        if let Some(w) = self
+            .agents
+            .get_mut(author)
+            .filter(|w| w.binding.as_ref() == Some(binding) && w.running == Identity::Pending)
+        {
+            w.running = match found {
+                Ok(running) => Identity::Known(running),
+                Err(why) => Identity::Unknown(why),
+            };
+            if w.obligated {
+                acts.extend(decision(author, w, now, suppressed(w), None));
+            }
         }
-        refresh(w)
-            && w.snap.anchored()
-            && w.snap
-                .latest()
-                .is_some_and(|t| t.id == e.failed_turn && e.targets(&t.outcome) && !t.retrying)
+        self.publish(now);
+        self.accounted(acts, now)
     }
 
     /// Publish each agent's state that changed in meaning.
@@ -1867,7 +2023,17 @@ impl Driver {
                 since,
                 suppressors: suppressors(w),
                 nudge: nudge(w.episode.as_ref()),
-                cannot_resume: transport_for(w.tool).err().map(str::to_string),
+                resumes: resumes(w.tool, w.running.version()),
+                cannot_resume: match (
+                    &w.running,
+                    transport_for(w.tool, Action::Nudge, w.running.version()),
+                ) {
+                    (_, Ok(_)) => None,
+                    (Identity::Unknown(why), Err(_)) => Some(format!(
+                        "its running version could not be established: {why}"
+                    )),
+                    (_, Err(why)) => Some(why.to_string()),
+                },
             };
             if w.published.as_ref() != Some(&state) {
                 crate::cli::agent_state::store(&w.agent_dir, &state);
@@ -2065,10 +2231,11 @@ fn decision(
     gate: Option<Gate>,
     answer: Option<(&AttemptRef, Answer)>,
 ) -> Vec<Act> {
-    let (transport, no_transport) = match transport_for(w.tool) {
-        Ok(t) => (Some(t), ""),
-        Err(why) => (None, why),
-    };
+    let version = w.running.version();
+    let (nudge, retry) = (
+        transport_for(w.tool, Action::Nudge, version),
+        transport_for(w.tool, Action::Retry, version),
+    );
     let gate = match gate {
         None if !w.auto => Some(Gate::AutoOff),
         g => g,
@@ -2077,13 +2244,16 @@ fn decision(
         now,
         session: &w.session,
         tool: w.tool,
-        transport,
-        no_transport,
+        nudge,
+        retry,
         gate,
         obligated: w.obligated,
         readable: w.read.is_some(),
         fallback: w.fallback.clone(),
         role: &w.role,
+        identifying: matches!(w.running, Identity::Unasked | Identity::Pending)
+            && matches!(w.tool, Tool::Claude | Tool::Codex),
+        bound: w.binding.as_ref().map(Bound::of),
         issued: 0,
     };
     w.answers
@@ -2152,7 +2322,7 @@ fn decision(
     effects
         .into_iter()
         .filter_map(|Effect::Dispatch { n, tag, target }| {
-            transport.map(|transport| Act::Dispatch {
+            ctx.transport(e).ok().map(|transport| Act::Dispatch {
                 author: author.clone(),
                 attempt: AttemptRef {
                     session: e.session.clone(),
@@ -2160,15 +2330,59 @@ fn decision(
                     n,
                 },
                 transport,
-                text: match e.kind {
-                    Kind::Failed => wake_text(&tag),
-                    Kind::Idle | Kind::Fallback => nudge_text(&tag),
+                text: match e.action() {
+                    Action::Retry => wake_text(&tag),
+                    Action::Nudge => nudge_text(&tag),
                 },
                 tag,
                 target,
             })
         })
         .collect()
+}
+
+/// Whether `e`'s claimed attempt may still go by the transport it was
+/// claimed with, judged by the harness running now: an obsolete claim is
+/// refused, never sent another way. A typed send must also be typing into
+/// that same, still living, process.
+fn still_permitted(w: &Watched, e: &Episode, live: &Live) -> bool {
+    let Some(claimed) = e.attempts.last() else {
+        return false;
+    };
+    let now = transport_for(w.tool, e.action(), w.running.version());
+    if now != Ok(live.transport) || live.transport.name() != claimed.transport {
+        return false;
+    }
+    if claimed.transport != Transport::Typed.name() {
+        return true;
+    }
+    match (&w.running, &live.process) {
+        (Identity::Known(running), Some(process)) => {
+            running.process == *process && process.birth.still_holds(process.pid)
+        }
+        _ => false,
+    }
+}
+
+/// What clank knows of the harness an agent is running: its version is the
+/// only one a capability is judged by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Identity {
+    Unasked,
+    Pending,
+    Known(crate::cli::harness_identity::Running),
+    /// It could not be established, and why. Not asked again for this
+    /// binding.
+    Unknown(String),
+}
+
+impl Identity {
+    fn version(&self) -> Option<&str> {
+        match self {
+            Identity::Known(r) => Some(&r.version),
+            _ => None,
+        }
+    }
 }
 
 /// What is true of an agent at a send, derived from disk then rather than
@@ -2178,6 +2392,27 @@ pub(crate) struct Live {
     pub(crate) role: String,
     /// The stable identities of the work it owes.
     pub(crate) work: Vec<String>,
+    /// The launch the agent's config binds it to, read at the send.
+    pub(crate) bound: Option<Bound>,
+    /// The transport asking to send.
+    pub(crate) transport: Transport,
+    /// The provider process a typed send found in the pane it will type
+    /// into.
+    pub(crate) process: Option<crate::cli::pane_target::Process>,
+}
+
+/// How the agent is resumed, and on what grounds: by observation of its
+/// version, by the later-versions policy, or, for a Codex retry only, by
+/// its own `turn/start`.
+fn resumes(tool: Tool, version: Option<&str>) -> Option<String> {
+    match crate::cli::resume::resume_for(tool, version) {
+        Ok(grant) => Some(match grant.policy_beyond {
+            None => format!("observed to queue at {}", version.unwrap_or_default()),
+            Some(from) => format!("allowed by policy beyond observed {from}"),
+        }),
+        Err(_) => (transport_for(tool, Action::Retry, version) == Ok(Transport::CodexStart))
+            .then(|| "retries only, by Codex's own turn/start".to_string()),
+    }
 }
 
 /// What holds the agent's nudges back just now, as the last fold saw it:
@@ -2604,13 +2839,15 @@ pub(crate) mod tests {
             now,
             session: "s1",
             tool: Tool::OpenCode,
-            transport,
-            no_transport: crate::cli::resume::NO_EVIDENCE,
+            nudge: transport.ok_or(crate::cli::resume::NO_EVIDENCE),
+            retry: transport.ok_or(crate::cli::resume::NO_EVIDENCE),
             gate,
             obligated: false,
             readable: true,
             fallback: None,
             role: "",
+            identifying: false,
+            bound: None,
             issued: 0,
         }
     }
@@ -3275,6 +3512,8 @@ pub(crate) mod tests {
     /// until a person's turn appears in the same record.
     #[test]
     fn a_recorded_failure_with_no_transport_is_told_once_and_a_person_ends_it() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
@@ -3599,6 +3838,8 @@ pub(crate) mod tests {
     /// watch on its sessions root by its name, with no scan.
     #[test]
     fn a_rollout_created_after_arming_is_found_by_its_watch() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
@@ -3655,6 +3896,8 @@ pub(crate) mod tests {
     /// says so.
     #[test]
     fn a_record_is_read_on_its_watch_not_on_a_fold() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
         let mut d = driver();
@@ -3677,6 +3920,8 @@ pub(crate) mod tests {
     /// The same session's record moving to another file is followed.
     #[test]
     fn a_new_record_for_the_same_session_is_read() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.jsonl");
         let second = dir.path().join("second.jsonl");
@@ -3862,6 +4107,8 @@ pub(crate) mod tests {
     /// appended to what it said before.
     #[test]
     fn a_replaced_record_is_read_afresh() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
@@ -4145,6 +4392,8 @@ pub(crate) mod tests {
     /// backend that keeps failing is not retried in a loop.
     #[tokio::test]
     async fn a_lost_watch_is_installed_again_once_for_all_who_share_it() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let dir = tempfile::tempdir().unwrap();
         let (one, two) = (dir.path().join("one.jsonl"), dir.path().join("two.jsonl"));
         append(&one, &[&line(STARTED, "a")]);
@@ -4205,6 +4454,8 @@ pub(crate) mod tests {
     /// still being watched for is found when that watch comes up.
     #[tokio::test]
     async fn a_rollout_written_while_its_watch_was_set_up_is_found() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".codex/sessions");
         std::fs::create_dir_all(&root).unwrap();
@@ -4696,6 +4947,8 @@ pub(crate) mod tests {
     /// owed, with a deadline of its own, and is made once storage works.
     #[test]
     fn an_escalation_that_could_not_be_stored_is_made_after_the_hold() {
+        // Escalation, which needs no transport, is how this reads the record.
+        enable(Tool::Codex, None);
         let dir = tempfile::tempdir().unwrap();
         let rollout = dir.path().join("rollout.jsonl");
         append(&rollout, &[&line(STARTED, "t1"), &line(FAILED, "t1")]);
@@ -5341,10 +5594,34 @@ pub(crate) mod tests {
         assert_ne!(a, fallback_identity(&["xy".into()]));
     }
 
+    /// This test process, as an agent's provider process launched at
+    /// `version`.
+    fn launched(version: &str) -> crate::cli::pane_target::Process {
+        let pid = std::process::id() as i32;
+        crate::cli::pane_target::Process {
+            pid,
+            birth: crate::proc_identity::token_for(pid).unwrap(),
+            harness: Ok(version.into()),
+        }
+    }
+
+    fn me() -> crate::cli::pane_target::Process {
+        launched("0.161.0")
+    }
+
+    fn running(version: &str) -> crate::cli::harness_identity::Running {
+        crate::cli::harness_identity::Running {
+            process: launched(version),
+            version: version.into(),
+        }
+    }
+
     /// Claim an idle Codex agent's first nudge, with a typed transport.
+
     fn claimed_codex() -> (tempfile::TempDir, PathBuf, Driver, AttemptRef) {
         enable(Tool::Codex, Some(Transport::Typed));
         let (dir, record, mut d) = idle_codex();
+        identify(&mut d, Ok(running("0.161.0")), 1);
         let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
         let attempt = dispatches(&acts)[0].0.clone();
         (dir, record, d, attempt)
@@ -5354,6 +5631,9 @@ pub(crate) mod tests {
         Live {
             role: role.into(),
             work: vec!["continue plan=p".into()],
+            bound: Some(first_launch()),
+            transport: Transport::Typed,
+            process: Some(me()),
         }
     }
 
@@ -5362,14 +5642,7 @@ pub(crate) mod tests {
     #[test]
     fn a_claimed_send_is_vetoed_by_any_change_since_the_claim() {
         let (_dir, _record, mut d, attempt) = claimed_codex();
-        assert!(d.may_send(
-            &label(),
-            &attempt,
-            &Live {
-                role: "master".into(),
-                work: vec!["continue plan=p".into()],
-            }
-        ));
+        assert!(d.may_send(&label(), &attempt, &live("master")));
         for change in [
             "newer turn",
             "auto off",
@@ -5393,17 +5666,7 @@ pub(crate) mod tests {
                 _ => f.role = "commit".into(),
             }
             d.reconcile(vec![f], IDLE_WAITS[0] + 1);
-            assert!(
-                !d.may_send(
-                    &label(),
-                    &attempt,
-                    &Live {
-                        role: "master".into(),
-                        work: vec!["continue plan=p".into()],
-                    }
-                ),
-                "{change}"
-            );
+            assert!(!d.may_send(&label(), &attempt, &live("master")), "{change}");
         }
         let (_dir, _record, mut d, attempt) = claimed_codex();
         let other = AttemptRef {
@@ -5936,6 +6199,9 @@ pub(crate) mod tests {
         Live {
             role: "commit".into(),
             work: vec!["the new role's review".into()],
+            bound: Some(first_launch()),
+            transport: Transport::Typed,
+            process: Some(me()),
         }
     }
 
@@ -5987,5 +6253,511 @@ pub(crate) mod tests {
         d.reconcile(vec![as_reviewer(dir.path(), &record)], 181);
         assert!(!d.may_send(&label(), &old, &reviewer_live()));
         assert_eq!(load(dir.path()).unwrap().role, "commit");
+    }
+
+    /// The production selector, by the committed evidence: a nudge only
+    /// ever types, under evidence for the agent's version; a Codex retry
+    /// types where that evidence allows, and otherwise takes Codex's own
+    /// `turn/start`.
+    #[test]
+    fn the_production_selector_chooses_per_action() {
+        use Action::{Nudge, Retry};
+        let at = |tool, action, version| transport_for(tool, action, version);
+        assert_eq!(
+            at(Tool::Claude, Nudge, Some("2.1.280")),
+            Ok(Transport::Typed)
+        );
+        assert_eq!(at(Tool::Claude, Retry, Some("2.4.0")), Ok(Transport::Typed));
+        assert_eq!(
+            at(Tool::Claude, Nudge, Some("2.1.279")),
+            Err(crate::cli::resume::NO_EVIDENCE)
+        );
+        assert!(at(Tool::Claude, Retry, None).is_err());
+        assert_eq!(
+            at(Tool::Codex, Nudge, Some("0.161.0")),
+            Ok(Transport::Typed)
+        );
+        assert_eq!(
+            at(Tool::Codex, Retry, Some("0.161.0")),
+            Ok(Transport::Typed)
+        );
+        assert!(at(Tool::Codex, Nudge, Some("0.159.3")).is_err());
+        assert_eq!(
+            at(Tool::Codex, Retry, Some("0.159.3")),
+            Ok(Transport::CodexStart)
+        );
+        assert_eq!(at(Tool::Codex, Retry, None), Ok(Transport::CodexStart));
+        assert!(at(Tool::OpenCode, Retry, Some("1.0.0")).is_err());
+    }
+
+    fn claude_line(line: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+        v["version"] = "2.1.280".into();
+        v.to_string()
+    }
+
+    /// With the committed evidence and nothing enabled by hand, a Claude
+    /// agent that stopped owing work is nudged once its running harness is
+    /// identified at an observed version, by a typed submit of the hint,
+    /// and its state says on what grounds.
+    #[test]
+    fn an_idle_claude_is_nudged_by_the_committed_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        append(
+            &transcript,
+            &[&claude_line(&user("p1")), &claude_line(DURATION)],
+        );
+        let mut d = driver();
+        let f = facts(
+            "claude",
+            dir.path(),
+            &transcript,
+            "session-one",
+            true,
+            false,
+        );
+        d.reconcile(vec![f], 0);
+        identify(&mut d, Ok(running("2.1.280")), 1);
+        assert!(d.unidentified().is_empty(), "asked once");
+        let state = crate::cli::agent_state::load(dir.path()).unwrap();
+        assert_eq!(state.cannot_resume, None);
+        assert_eq!(
+            state.resumes.as_deref(),
+            Some("observed to queue at 2.1.280")
+        );
+        let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        let [
+            Act::Dispatch {
+                transport,
+                text,
+                tag,
+                ..
+            },
+        ] = acts.as_slice()
+        else {
+            panic!("{acts:?}");
+        };
+        assert_eq!(
+            (*transport, text.clone()),
+            (Transport::Typed, nudge_text(tag))
+        );
+    }
+
+    fn rollout(dir: &Path, version: &str, last: &str) -> PathBuf {
+        let record = dir.join("rollout.jsonl");
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": "session-one", "cli_version": version},
+        });
+        append(
+            &record,
+            &[&meta.to_string(), &line(STARTED, "t1"), &line(last, "t1")],
+        );
+        record
+    }
+
+    /// A Codex turn that failed at capacity is retried with no hand
+    /// enabling: by typed submit when the running harness is at an observed
+    /// version, and otherwise, including when it cannot be identified, by
+    /// its own `turn/start`.
+    #[test]
+    fn a_codex_capacity_failure_is_retried_by_the_committed_evidence() {
+        for (found, want) in [
+            (Ok(running("0.161.0")), Transport::Typed),
+            (Ok(running("0.159.3")), Transport::CodexStart),
+            (Err("no launch record".to_string()), Transport::CodexStart),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = rollout(dir.path(), "0.161.0", FAILED);
+            let mut d = driver();
+            d.reconcile(
+                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+                0,
+            );
+            identify(&mut d, found.clone(), 1);
+            let acts = d.due(retries("server_overloaded")[0], |_, _| Gate::Go);
+            let [
+                Act::Dispatch {
+                    transport,
+                    text,
+                    tag,
+                    ..
+                },
+            ] = acts.as_slice()
+            else {
+                panic!("{found:?}: {acts:?}");
+            };
+            assert_eq!(
+                (*transport, text.clone()),
+                (want, wake_text(tag)),
+                "{found:?}"
+            );
+        }
+    }
+
+    /// A record's version is history, not authority: a Codex session begun
+    /// on an observed version, now running an older or unidentified one, is
+    /// not nudged by typing, and says why.
+    #[test]
+    fn a_record_version_never_enables_typing() {
+        for (found, why) in [
+            (
+                Ok(running("0.159.3")),
+                crate::cli::resume::NO_EVIDENCE.to_string(),
+            ),
+            (
+                Err("no launch record".to_string()),
+                "its running version could not be established: no launch record".to_string(),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = rollout(dir.path(), "0.161.0", DONE);
+            let mut d = driver();
+            d.reconcile(
+                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+                0,
+            );
+            identify(&mut d, found, 1);
+            let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+            assert!(dispatches(&acts).is_empty(), "{acts:?}");
+            let state = crate::cli::agent_state::load(dir.path()).unwrap();
+            assert_eq!(state.cannot_resume.as_deref(), Some(why.as_str()));
+        }
+    }
+
+    /// A claim is sent only by the transport it was claimed with, as the
+    /// harness running now still permits: one whose harness is identified
+    /// again at an unsupported version, or whose process is no longer the
+    /// one identified, is refused, and not sent another way.
+    #[test]
+    fn an_obsolete_claim_is_refused() {
+        let claim = || {
+            let dir = tempfile::tempdir().unwrap();
+            let record = rollout(dir.path(), "0.161.0", DONE);
+            let mut d = driver();
+            d.reconcile(
+                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+                0,
+            );
+            identify(&mut d, Ok(running("0.161.0")), 1);
+            let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+            let attempt = dispatches(&acts)[0].0.clone();
+            (dir, d, attempt)
+        };
+        let (dir, mut d, attempt) = claim();
+        assert!(d.may_send(&label(), &attempt, &live("master")));
+        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
+        identify(&mut d, Ok(running("0.159.3")), IDLE_WAITS[0] + 2);
+        assert!(
+            !d.may_send(&label(), &attempt, &live("master")),
+            "relaunched older"
+        );
+
+        let (dir, mut d, attempt) = claim();
+        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
+        identify(&mut d, Err("gone".into()), IDLE_WAITS[0] + 2);
+        assert!(
+            !d.may_send(&label(), &attempt, &live("master")),
+            "relaunched unidentified"
+        );
+
+        let (_dir, mut d, attempt) = claim();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let pid = ended.id() as i32;
+        let birth = crate::proc_identity::token_for(pid);
+        ended.wait().unwrap();
+        let elsewhere = Live {
+            process: birth.map(|birth| crate::cli::pane_target::Process {
+                pid,
+                birth,
+                harness: Ok("0.161.0".into()),
+            }),
+            ..live("master")
+        };
+        assert!(
+            !d.may_send(&label(), &attempt, &elsewhere),
+            "another process"
+        );
+        let unseen = Live {
+            process: None,
+            ..live("master")
+        };
+        assert!(!d.may_send(&label(), &attempt, &unseen), "no process seen");
+    }
+
+    /// The launch the test facts bind an agent to.
+    fn first_launch() -> Bound {
+        Bound {
+            session: "session-one".into(),
+            at: "2026-10-05T00:00:00Z".into(),
+        }
+    }
+
+    /// Answer the driver's one pending identification with `found`.
+    fn identify(
+        d: &mut Driver,
+        found: Result<crate::cli::harness_identity::Running, String>,
+        now: u64,
+    ) {
+        let asks = d.unidentified();
+        let [(author, binding)] = asks.as_slice() else {
+            panic!("{asks:?}");
+        };
+        d.identified(author, binding, found, now);
+    }
+
+    /// The idle Codex agent in `dir`, bound again to the same session by a
+    /// new launch.
+    fn relaunched(d: &mut Driver, dir: &Path, now: u64) {
+        let record = ["record.jsonl", "rollout.jsonl"]
+            .map(|name| dir.join(name))
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap();
+        let mut f = codex_facts(dir, &record, "session-one", true, false);
+        let mut session = serde_json::to_value(&f.session).unwrap();
+        session["updated_at"] = format!("2026-10-06T00:00:{:02}Z", now % 60).into();
+        f.session = serde_json::from_value(session).unwrap();
+        d.reconcile(vec![f], now);
+    }
+
+    /// An identification is for the binding it was asked for: a new launch
+    /// of the same session is asked again, whatever was known or not known
+    /// of the old one, and the old one's late answer is dropped.
+    #[test]
+    fn a_relaunch_is_identified_again() {
+        for first in [Ok(running("0.161.0")), Err("no launch record".to_string())] {
+            let (dir, _record, mut d) = idle_codex();
+            identify(&mut d, first.clone(), 1);
+            assert!(d.unidentified().is_empty(), "{first:?}: asked once");
+            relaunched(&mut d, dir.path(), 2);
+            let asks = d.unidentified();
+            assert_eq!(asks.len(), 1, "{first:?}: the new launch is asked about");
+            let (author, new) = asks[0].clone();
+            let mut old = new.clone();
+            old.updated_at = "2026-10-05T00:00:00Z".parse().unwrap();
+            let resumes = || crate::cli::agent_state::load(dir.path()).unwrap().resumes;
+            d.identified(&author, &old, Ok(running("9.9.9")), 3);
+            assert!(
+                !resumes().unwrap_or_default().contains("9.9.9"),
+                "{first:?}: the old launch's answer is dropped"
+            );
+            d.identified(&author, &new, Ok(running("0.161.0")), 4);
+            assert_eq!(resumes().as_deref(), Some("observed to queue at 0.161.0"));
+        }
+    }
+
+    /// An identified process that has ended is asked about again.
+    #[test]
+    fn an_ended_process_is_identified_again() {
+        let (dir, record, mut d) = idle_codex();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let pid = ended.id() as i32;
+        let birth = crate::proc_identity::token_for(pid).unwrap();
+        ended.wait().unwrap();
+        let gone = crate::cli::harness_identity::Running {
+            process: crate::cli::pane_target::Process {
+                pid,
+                birth,
+                harness: Ok("0.161.0".into()),
+            },
+            version: "0.161.0".into(),
+        };
+        identify(&mut d, Ok(gone), 1);
+        d.reconcile(
+            vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+            2,
+        );
+        assert_eq!(d.unidentified().len(), 1);
+    }
+
+    /// A Claude turn that failed while its harness was still being
+    /// identified waits for the answer rather than escalating, and is
+    /// retried once it comes: a pending identity is a hold, not a refusal.
+    #[test]
+    fn a_failure_waits_for_its_harness_to_be_identified() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let failed = claude_failed();
+        append(
+            &transcript,
+            &[&claude_line(failed[0]), &claude_line(failed[1])],
+        );
+        let mut d = driver();
+        let f = || {
+            vec![facts(
+                "claude",
+                dir.path(),
+                &transcript,
+                "session-one",
+                true,
+                false,
+            )]
+        };
+        d.reconcile(f(), 0);
+        assert_eq!(
+            waiting_for_you(dir.path()),
+            None,
+            "not escalated while asking"
+        );
+        let wait = retries("overloaded")[0];
+        let acts = d.due(wait, |_, _| Gate::Go);
+        assert!(dispatches(&acts).is_empty(), "not before the answer");
+        assert_eq!(
+            waiting_for_you(dir.path()),
+            None,
+            "nor escalated at its deadline"
+        );
+        assert_eq!(d.next_due(), None, "and nothing looks again until it comes");
+        identify(&mut d, Ok(running("2.1.280")), 1);
+        let at = d.next_due().unwrap();
+        let acts = d.due(at, |_, _| Gate::Go);
+        assert!(
+            matches!(
+                &acts[..],
+                [Act::Dispatch {
+                    transport: Transport::Typed,
+                    ..
+                }]
+            ),
+            "{acts:?}"
+        );
+    }
+
+    /// A supported relaunch of the same session recovers an agent its old
+    /// launch left waiting for a person: the new binding retires the old
+    /// episode, and the new launch is nudged on a fresh budget, its attempt
+    /// numbers past the old one's, and the old launch's claim refused.
+    #[test]
+    fn a_supported_relaunch_recovers_an_unsupported_launchs_agent() {
+        let (dir, _record, mut d) = idle_codex();
+        identify(&mut d, Err("no launch record".into()), 1);
+        d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        assert!(
+            waiting_for_you(dir.path()).is_some(),
+            "the old launch escalated"
+        );
+        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
+        assert_eq!(
+            waiting_for_you(dir.path()),
+            None,
+            "the old escalation is retired"
+        );
+        identify(&mut d, Ok(running("0.161.0")), IDLE_WAITS[0] + 2);
+        let at = d.next_due().unwrap();
+        let acts = d.due(at, |_, _| Gate::Go);
+        let new = dispatches(&acts)[0].0.clone();
+        assert_eq!(waiting_for_you(dir.path()), None);
+
+        let (dir, _record, mut d, old) = claimed_codex();
+        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
+        assert!(
+            !d.may_send(&label(), &old, &live("master")),
+            "the old launch's claim"
+        );
+        assert!(new.n >= 1 && old.n >= 1);
+    }
+
+    /// A restart keeps an episode of the same launch, budget and deadline
+    /// as they were; one whose launch was replaced while no driver ran is
+    /// retired, and the new launch is decided afresh.
+    #[test]
+    fn a_restart_tells_the_same_launch_from_a_replacement() {
+        let (dir, record, mut d) = idle_codex();
+        identify(&mut d, Err("no launch record".into()), 1);
+        d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        let escalated = load(dir.path()).unwrap();
+        assert_eq!(escalated.state, State::Escalated);
+        drop(d);
+
+        let mut d = driver();
+        d.reconcile(
+            vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+            IDLE_WAITS[0] + 1,
+        );
+        assert_eq!(
+            load(dir.path()),
+            Some(escalated),
+            "the same launch, as it was"
+        );
+        drop(d);
+
+        let mut d = driver();
+        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 2);
+        assert_eq!(waiting_for_you(dir.path()), None, "replaced while offline");
+        identify(&mut d, Ok(running("0.161.0")), IDLE_WAITS[0] + 3);
+        let at = d.next_due().unwrap();
+        assert_eq!(dispatches(&d.due(at, |_, _| Gate::Go)).len(), 1);
+    }
+
+    /// A relaunch during a hold, of the issued number or of the episode's
+    /// storage, fences the old launch's claim at once and is applied when
+    /// the hold ends.
+    #[test]
+    fn a_relaunch_during_a_hold_fences_the_claim_and_is_applied_after() {
+        for hold in ["issued number", "episode storage"] {
+            let (dir, _record, mut d, old) = claimed_codex();
+            let repair = match hold {
+                "issued number" => {
+                    std::fs::write(issued_path(dir.path()), "corrupt").unwrap();
+                    None
+                }
+                _ => Some(block_storage(dir.path())),
+            };
+            relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
+            identify(&mut d, Ok(running("0.161.0")), IDLE_WAITS[0] + 1);
+            assert!(!d.may_send(&label(), &old, &live("master")), "{hold}");
+            match repair {
+                None => std::fs::write(issued_path(dir.path()), old.n.to_string()).unwrap(),
+                Some(blocked) => std::fs::remove_dir(blocked).unwrap(),
+            }
+            d.due(IDLE_WAITS[0] + 1 + RETRY_LOOK, |_, _| Gate::Go);
+            let ep = load(dir.path()).unwrap();
+            assert_ne!(
+                ep.bound,
+                Some(first_launch()),
+                "{hold}: the new launch's episode"
+            );
+            assert!(ep.attempts.is_empty(), "{hold}");
+        }
+    }
+
+    /// A claim's launch, as the agent's config states it at the send, must
+    /// still be the claim's: a relaunch already on disk refuses it before
+    /// any fold has seen it.
+    #[test]
+    fn a_relaunch_on_disk_refuses_the_old_claim() {
+        let (_dir, _record, mut d, attempt) = claimed_codex();
+        let elsewhere = Live {
+            bound: Some(Bound {
+                at: "2026-10-06T00:00:00Z".into(),
+                ..first_launch()
+            }),
+            ..live("master")
+        };
+        assert!(!d.may_send(&label(), &attempt, &elsewhere));
+    }
+
+    /// An episode stored before launches were told apart is kept as it
+    /// is, its spent attempts and latches with it: no new budget for want
+    /// of a field.
+    #[test]
+    fn a_legacy_episode_keeps_its_budget() {
+        let (dir, record, mut d, _) = claimed_codex();
+        let mut ep = load(dir.path()).unwrap();
+        ep.bound = None;
+        store(dir.path(), Some(&ep)).unwrap();
+        drop(d);
+        d = driver();
+        d.reconcile(
+            vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+            IDLE_WAITS[0] + 1,
+        );
+        let after = load(dir.path()).unwrap();
+        assert_eq!(
+            (after.opened_by, after.attempts),
+            (ep.opened_by, ep.attempts)
+        );
     }
 }

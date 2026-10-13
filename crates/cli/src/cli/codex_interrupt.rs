@@ -191,8 +191,9 @@ async fn preflight<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Start one recovery turn on a bound Codex thread whose latest turn is
-/// `failed_turn`, failed. Anything else — a newer turn, a running one, a
-/// binding that moved — is refused, and nothing is ever interrupted.
+/// `failed_turn`, failed, once `authorize` (the owning monitor's last look,
+/// asked only then) allows it. A newer or running turn is refused, a veto
+/// sends nothing, and nothing is ever interrupted.
 ///
 /// A failure before `turn/start` is sent leaves nothing done
 /// (`Unavailable`); a failure after it may not have (`Indeterminate`).
@@ -201,6 +202,7 @@ pub(crate) async fn start_if_failed(
     label: &AgentLabel,
     failed_turn: &str,
     wake: &str,
+    authorize: impl std::future::Future<Output = bool>,
 ) -> crate::cli::recovery::Answer {
     use crate::cli::recovery::Answer;
     let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
@@ -217,13 +219,7 @@ pub(crate) async fn start_if_failed(
         return Answer::Unavailable;
     };
     let mut rpc = Rpc { socket, next_id: 1 };
-    start_after(&mut rpc, repo, &thread, failed_turn, wake, || {
-        super::event_interrupt::blocking(|| {
-            crate::agent_store::resolve_role(repo, label).is_ok()
-                && crate::agent_store::binding_matches(repo, label, Tool::Codex, &thread)
-        })
-    })
-    .await
+    start_after(&mut rpc, repo, &thread, failed_turn, wake, authorize).await
 }
 
 /// How long a recovery start may take before anything is sent, and after.
@@ -238,7 +234,7 @@ async fn start_after<S: AsyncRead + AsyncWrite + Unpin>(
     thread: &str,
     failed_turn: &str,
     wake: &str,
-    still_bound: impl Fn() -> bool,
+    authorize: impl std::future::Future<Output = bool>,
 ) -> crate::cli::recovery::Answer {
     use crate::cli::recovery::Answer;
     let Ok(Ok(latest)) = tokio::time::timeout(BEFORE_SENDING, preflight(rpc, repo, thread)).await
@@ -249,8 +245,11 @@ async fn start_after<S: AsyncRead + AsyncWrite + Unpin>(
         turn.get("id").and_then(Value::as_str) == Some(failed_turn)
             && turn.get("status").and_then(Value::as_str) == Some("failed")
     });
-    if !failed_is_latest || !still_bound() {
+    if !failed_is_latest {
         return Answer::Refused;
+    }
+    if !authorize.await {
+        return Answer::Unavailable;
     }
     let start = rpc.call(
         "turn/start",
@@ -427,7 +426,7 @@ mod tests {
                 "thread",
                 "old",
                 "retry wake",
-                || true
+                async { true }
             ),
             async {
                 preflight(&mut server, repo.path(), "failed").await;
@@ -456,6 +455,10 @@ mod tests {
             ("other", "failed", true),
             ("old", "failed", false),
         ] {
+            let want = match bound {
+                true => Answer::Refused,
+                false => Answer::Unavailable,
+            };
             let repo = tempfile::tempdir().unwrap();
             let (mut client, mut server) = pair().await;
             let (answer, ()) = tokio::join!(
@@ -465,15 +468,11 @@ mod tests {
                     "thread",
                     failed_turn,
                     "wake",
-                    || bound
+                    async move { bound }
                 ),
                 preflight(&mut server, repo.path(), status)
             );
-            assert_eq!(
-                answer,
-                Answer::Refused,
-                "{failed_turn} {status} bound={bound}"
-            );
+            assert_eq!(answer, want, "{failed_turn} {status} bound={bound}");
             drop(client);
             assert_silent(&mut server).await;
         }
@@ -486,7 +485,9 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let (mut client, mut server) = pair().await;
         let (answer, ()) = tokio::join!(
-            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            start_after(&mut client, repo.path(), "thread", "old", "wake", async {
+                true
+            }),
             async {
                 preflight(&mut server, repo.path(), "failed").await;
                 let Message::Text(text) = server.next().await.unwrap().unwrap() else {
@@ -508,7 +509,9 @@ mod tests {
 
         let (mut client, mut server) = pair().await;
         let (answer, ()) = tokio::join!(
-            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            start_after(&mut client, repo.path(), "thread", "old", "wake", async {
+                true
+            }),
             async {
                 request(&mut server, "initialize", json!({})).await;
                 request(&mut server, "initialized", Value::Null).await;
@@ -531,7 +534,9 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let (mut client, mut server) = pair().await;
         let (answer, _server) = tokio::join!(
-            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            start_after(&mut client, repo.path(), "thread", "old", "wake", async {
+                true
+            }),
             async {
                 let _ = server.next().await;
                 server
@@ -541,7 +546,9 @@ mod tests {
 
         let (mut client, mut server) = pair().await;
         let (answer, _server) = tokio::join!(
-            start_after(&mut client, repo.path(), "thread", "old", "wake", || true),
+            start_after(&mut client, repo.path(), "thread", "old", "wake", async {
+                true
+            }),
             async {
                 preflight(&mut server, repo.path(), "failed").await;
                 let _ = server.next().await;

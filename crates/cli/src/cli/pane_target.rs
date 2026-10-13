@@ -109,6 +109,10 @@ struct Launch {
     program: String,
     pid: i32,
     birth: ProcToken,
+    /// The version of the file exec'd, asked of it just before, or why
+    /// there is none. Absent from a record written before clank asked.
+    #[serde(default)]
+    harness: Option<Result<String, String>>,
 }
 
 fn path(repo: &Path, label: &AgentLabel, session: &str, pane: &str) -> PathBuf {
@@ -131,6 +135,7 @@ pub(crate) fn record(
     label: &AgentLabel,
     tool: Tool,
     program: &str,
+    harness: Result<String, String>,
 ) -> anyhow::Result<()> {
     let (Some(session), Some(pane)) = (
         super::open_zellij::current_session(),
@@ -153,6 +158,7 @@ pub(crate) fn record(
             program: program.into(),
             pid,
             birth,
+            harness: Some(harness),
         },
     )
 }
@@ -173,12 +179,43 @@ fn publish(destination: &Path, launch: &Launch) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The provider process a verified launch record names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Process {
+    pub(crate) pid: i32,
+    pub(crate) birth: ProcToken,
+    /// The harness version it was launched at, or why it has none.
+    pub(crate) harness: Result<String, String>,
+}
+
+/// [`discover`], with the provider process its launch record names.
+pub(crate) async fn discover_process(
+    repo: PathBuf,
+    label: AgentLabel,
+) -> anyhow::Result<(Found, Tool, Process)> {
+    let scan = open_zellij::panes_in_all_sessions_async(SCAN_DEADLINE).await;
+    super::event_interrupt::blocking(move || {
+        let found = locate(&scan, &repo, &label)?;
+        let (tool, process) = resolve_process(&repo, &label, &found.session, &found.pane)?;
+        Ok((found, tool, process))
+    })
+}
+
 pub(crate) fn resolve(
     repo: &Path,
     label: &AgentLabel,
     session: &str,
     pane: &str,
 ) -> anyhow::Result<Tool> {
+    resolve_process(repo, label, session, pane).map(|(tool, _)| tool)
+}
+
+fn resolve_process(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &str,
+    pane: &str,
+) -> anyhow::Result<(Tool, Process)> {
     let root = super::monitor::runtime_dir(unsafe { libc::getuid() });
     ensure!(
         matches!(
@@ -189,7 +226,21 @@ pub(crate) fn resolve(
     );
     let launch = read(&path(repo, label, session, pane))?;
     let observation = inspect::inspect(launch.pid, &launch.birth);
-    verify(&launch, session, pane, observation)
+    let tool = verify(&launch, session, pane, observation)?;
+    Ok((
+        tool,
+        Process {
+            pid: launch.pid,
+            birth: launch.birth,
+            harness: launch.harness.unwrap_or_else(|| {
+                Err(
+                    "it was launched before clank recorded its harness's version; \
+                     restart it through clank"
+                        .into(),
+                )
+            }),
+        },
+    ))
 }
 
 fn read(destination: &Path) -> anyhow::Result<Launch> {
@@ -271,6 +322,7 @@ mod tests {
             program: "/opt/bin/grok".into(),
             pid: 123,
             birth: ProcToken::MacStart { sec: 1, usec: 2 },
+            harness: None,
         }
     }
     fn observed(program: &str) -> Inspection {

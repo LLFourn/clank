@@ -2876,6 +2876,7 @@ mod dirty_and_wake_tests {
                 since: 0,
                 suppressors: Vec::new(),
                 nudge: Nudge::WaitingForYou("this kind of failure needs a person".into()),
+                resumes: None,
                 cannot_resume: Some("no evidence".into()),
             },
             stale,

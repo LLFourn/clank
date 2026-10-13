@@ -39,6 +39,15 @@ pub(crate) fn codex_submit_argv(pane: &str) -> Vec<String> {
     .collect()
 }
 
+/// Tab: Codex submits it at once when idle, and queues it behind a running
+/// turn.
+pub(crate) fn codex_queue_argv(pane: &str) -> Vec<String> {
+    ["action", "write", "-p", pane, "9"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Use Ctrl+C for Grok, matching the installed harness and observed behavior.
 /// Other harnesses use Escape. Select the key from the pane's tool,
 /// never from an inherited environment variable in the web server.
@@ -208,8 +217,11 @@ where
     };
     for (index, mut argv) in argvs.into_iter().enumerate() {
         if index == 1 && tool == clank_core::Tool::Codex {
+            // Past Codex's paste window, so the key is a key: Tab, which
+            // Codex queues behind a running turn, where Enter would steer
+            // into it (`resume::EVIDENCE`).
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            argv = codex_submit_argv(pane);
+            argv = codex_queue_argv(pane);
         }
         match write(argv).await {
             Ok(()) => {}
@@ -504,15 +516,12 @@ mod tests {
         assert!(!said.contains("message was not confirmed"), "{said}");
     }
 
-    /// A submit-only send writes the message and its submit, and no
-    /// interrupt key, for every typed harness.
+    /// A submit-only send writes the message and the key its harness
+    /// queues on, and no interrupt key: Codex's Tab, never its Enter.
     #[tokio::test(start_paused = true)]
     async fn a_submit_only_send_writes_no_interrupt() {
         use clank_core::Tool;
-        for (tool, submit) in [
-            (Tool::Claude, "13"),
-            (Tool::Codex, "27 91 49 51 59 49 58 49 117"),
-        ] {
+        for (tool, submit) in [(Tool::Claude, "13"), (Tool::Codex, "9")] {
             let written = RefCell::new(Vec::<Vec<String>>::new());
             submit_with("7", tool, "hello", |argv| {
                 written.borrow_mut().push(argv);
