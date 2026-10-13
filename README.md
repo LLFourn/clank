@@ -162,6 +162,12 @@ the session was opened. The layout also hands Alt+arrows to the
 agents — codex edits its last message on Alt+Up — so in a clank
 session focus moves on Alt+h/j/k/l, in every mode.
 
+If the repo is already open in any zellij session on the machine,
+`clank open` says where instead (the session, the tab, and how to get
+there from where you are) and opens nothing. A tab or session that only
+shares the repo's name is not it: the repo opens beside it, under a name
+of its own.
+
 (`clank agent start <label>` launches ONE agent — resuming its session
 if it has one, or starting a fresh one if it doesn't. `clank open` is
 what brings up the whole team.)
@@ -1081,6 +1087,11 @@ see the tab. Clank does not create tabs after an unanswered lookup. Session/tab
 lookups run during the explicit open operation, with a three-second limit each;
 inside-session `open --all` shares one tab query. `--print` previews a layout
 without querying the server (outside Zellij it previews a fresh session).
+
+**`clank open` says sessions did not answer:** before opening, it checks every
+Zellij session on the machine for the repo, and a session that did not answer in
+time may hold it, so nothing was opened. Retry, or close the unresponsive
+session.
 
 `clank fork create` may open the fork automatically inside Zellij before a later
 explicit `clank open --fork …`. If automatic opening fails, the error states the
