@@ -776,6 +776,15 @@ mod tests {
 
     /// A legacy monitor's answer, byte for byte: only the obsolete one
     /// asks it to go; a refusal for another repo does not.
+    /// What a proto-12 monitor of the repo answers this build's client,
+    /// byte for byte in its words.
+    fn obsolete_from_12() -> String {
+        format!(
+            "{{\"t\":\"decline\",\"proto\":12,\"why\":\"this monitor speaks proto 12, the client speaks {}\"}}\n",
+            super::super::monitor::PROTO
+        )
+    }
+
     #[test]
     fn only_the_exact_obsolete_answer_counts_as_asked() {
         let dir = tempfile::tempdir().unwrap();
@@ -789,9 +798,10 @@ mod tests {
                     .unwrap();
                 let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let answer = if hello["repo"] == "/w/real" {
-                    "{\"t\":\"decline\",\"proto\":12,\"why\":\"this monitor speaks proto 12, the client speaks 13\"}\n"
+                    obsolete_from_12()
                 } else {
                     "{\"t\":\"decline\",\"proto\":12,\"why\":\"this monitor serves /w/real, the client asked for /w/stale\"}\n"
+                        .to_string()
                 };
                 (&stream).write_all(answer.as_bytes()).unwrap();
             }
@@ -921,7 +931,16 @@ mod tests {
             Successor::Unestablished { spawned: true, .. }
         ));
         assert_eq!(created.load(Ordering::SeqCst), 1, "creation was not told");
-        let _serving = serving(repo.path(), "{\"t\":\"ok\",\"proto\":13}\n");
+        let _serving = serving(
+            repo.path(),
+            Box::leak(
+                format!(
+                    "{{\"t\":\"ok\",\"proto\":{}}}\n",
+                    super::super::monitor::PROTO
+                )
+                .into_boxed_str(),
+            ),
+        );
         assert_eq!(
             start_with(
                 repo.path(),

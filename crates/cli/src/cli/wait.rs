@@ -1146,6 +1146,15 @@ async fn shared_wait_within_on_idle(
                     crate::cli::monitor::Note::Refused { why } => {
                         anyhow::bail!("monitor refused wait: {why}")
                     }
+                    // Terminal: a newer wait of this session holds the
+                    // repo's delivery now. Watching locally instead would
+                    // deliver the same work a second time.
+                    crate::cli::monitor::Note::Superseded => {
+                        return Err(WaitSuperseded(
+                            "a newer wait of this session was admitted by the monitor".into(),
+                        )
+                        .into());
+                    }
                     crate::cli::monitor::Note::Beat => idle(),
                     _ => {}
                 }
@@ -3848,6 +3857,39 @@ mod shared_tests {
 
     /// A monitor that stops speaking sends the wait back to watching
     /// for itself, rather than leaving it listening forever.
+    /// A wait told it is superseded ends as superseded: it does not go
+    /// on to watch for itself, which would deliver the newer wait's work
+    /// a second time.
+    #[tokio::test]
+    async fn a_superseded_wait_ends_without_watching_for_itself() {
+        use std::io::Write;
+        let repo = tempfile::tempdir().unwrap();
+        let (mine, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        mine.set_nonblocking(true).unwrap();
+        writeln!(
+            theirs,
+            "{}",
+            serde_json::to_string(&crate::cli::monitor::Note::Superseded).unwrap()
+        )
+        .unwrap();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            shared_wait_within(
+                Conn::over(mine),
+                repo.path(),
+                &AgentLabel::parse("claude").unwrap(),
+                &WaitBinding(None, WaitPolicy::Manual),
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("a superseded wait ends at once");
+        let Err(e) = ended else {
+            panic!("a superseded wait went on: {ended:?}")
+        };
+        assert!(e.is::<WaitSuperseded>(), "{e:#}");
+    }
+
     #[tokio::test]
     async fn silence_ends_the_sharing() {
         let repo = tempfile::tempdir().unwrap();

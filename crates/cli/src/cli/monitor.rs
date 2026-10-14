@@ -32,7 +32,7 @@ use clank_core::wait::WaitItem;
 // 11 admits one automatic Grok wait per bound session and reports refusals.
 // 12 publishes its sources' lifecycle and takes a control request to
 // restart one.
-pub(crate) const PROTO: u32 = 13;
+pub(crate) const PROTO: u32 = 14;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -176,6 +176,9 @@ pub(crate) enum Note {
     /// A lifecycle or admission refusal. It must never fall back to a local
     /// watcher, which would bypass the monitor's ownership decision.
     Refused { why: String },
+    /// A newer wait of the same agent session was admitted, and this one
+    /// is retired: it ends silently, without watching for itself.
+    Superseded,
     /// What this client's author is owed. Empty is never sent; a client
     /// blocks until it has something, as a park does today.
     Items {
@@ -2633,6 +2636,9 @@ struct Client {
     /// `None` only in the tests that read a queue directly and have no
     /// socket for anyone to write to.
     writer: Option<tokio::task::JoinHandle<Wrote>>,
+    /// The writer's last frame, written after everything queued once
+    /// the queue closes, so a full queue cannot drop it.
+    farewell: Option<tokio::sync::oneshot::Sender<String>>,
     /// What THIS client has been handed from its author's source logs.
     ///
     /// Per client, not per monitor: the monitor outlives every client,
@@ -4668,6 +4674,18 @@ fn admit_into(
         }
         return leaving;
     }
+    // One parked wait per agent session: the one admitted last. The
+    // harness never cancels a Claude or Codex hook's background wait, so
+    // the older ones are left parked, and each would wake the agent with
+    // the same work. Grok's automatic wait is a task Grok manages, so its
+    // duplicate is refused above instead, keeping the connected one.
+    let (older, kept): (Vec<Client>, Vec<Client>) = std::mem::take(clients)
+        .into_iter()
+        .partition(|old| same_wait(old, &client));
+    *clients = kept;
+    for old in older {
+        leaving.extend(supersede(old));
+    }
     let mut arriving = vec![client];
     if let Some(state) = state {
         // The REAL buffer: a transient retained while its author had
@@ -5131,13 +5149,21 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         tracing::debug!(%author, "monitor agent wait admitted");
     }
     let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
-    let writer = tokio::spawn(write_to(io.into_inner(), queued, who.name()));
+    let (farewell, last) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn(write_to_within(
+        io.into_inner(),
+        queued,
+        Some(last),
+        who.name(),
+        WRITE_BUDGET,
+    ));
     Ok(Greeted::Client(Client {
         who,
         holder,
         out,
         writer: Some(writer),
         shown: Default::default(),
+        farewell: Some(farewell),
     }))
 }
 
@@ -5182,7 +5208,7 @@ async fn write_to(
     queued: tokio::sync::mpsc::Receiver<String>,
     author: String,
 ) -> Wrote {
-    write_to_within(socket, queued, author, WRITE_BUDGET).await
+    write_to_within(socket, queued, None, author, WRITE_BUDGET).await
 }
 
 /// [`write_to`] with the budget supplied, so giving up is testable
@@ -5190,6 +5216,7 @@ async fn write_to(
 async fn write_to_within(
     mut socket: tokio::net::UnixStream,
     mut queued: tokio::sync::mpsc::Receiver<String>,
+    mut farewell: Option<tokio::sync::oneshot::Receiver<String>>,
     author: String,
     budget: Duration,
 ) -> Wrote {
@@ -5198,7 +5225,15 @@ async fn write_to_within(
     loop {
         let mut unexpected = [0u8; 1];
         let line = tokio::select! {
-            line = queued.recv() => match line { Some(line) => line, None => return Wrote::Drained },
+            line = queued.recv() => match line {
+                Some(line) => line,
+                // Closed: the last frame, if one was left, after all
+                // that was queued before it.
+                None => match farewell.take().and_then(|mut last| last.try_recv().ok()) {
+                    Some(line) => line,
+                    None => return Wrote::Drained,
+                },
+            },
             _ = socket.read(&mut unexpected) => return Wrote::Failed,
         };
         match tokio::time::timeout(budget, socket.write_all(line.as_bytes())).await {
@@ -5534,6 +5569,7 @@ fn claim_late_arrivals(
                     out,
                     writer: Some(writer),
                     shown: Default::default(),
+                    farewell: None,
                 };
                 send_note(
                     &client,
@@ -5859,6 +5895,27 @@ fn serve_to_cached(
 /// ticks behind, and a closed one means its writer task has already
 /// given up — both are retirement. A frame that will not serialise is
 /// this process's fault rather than the client's, so it costs nothing.
+/// Whether `old` is the same agent session's wait as `new`: both an
+/// agent's, for one author, with one and the same holder.
+fn same_wait(old: &Client, new: &Client) -> bool {
+    matches!(
+        (&old.who, &new.who),
+        (Served::Agent { author: a }, Served::Agent { author: b }) if a == b
+    ) && old.holder.is_some()
+        && old.holder == new.holder
+}
+
+/// Retire `client` because a newer wait of its session was admitted: its
+/// writer sends what was queued, then `Superseded`, then ends.
+fn supersede(client: Client) -> Option<tokio::task::JoinHandle<Wrote>> {
+    if let (Some(farewell), Ok(line)) = (client.farewell, serde_json::to_string(&Note::Superseded))
+    {
+        let _ = farewell.send(format!("{line}\n"));
+    }
+    drop(client.out);
+    client.writer
+}
+
 fn send_note(client: &Client, note: &Note) -> bool {
     let Ok(line) = serde_json::to_string(note) else {
         return true;
@@ -5896,6 +5953,7 @@ mod recovery_tests {
                     session: session.into(),
                 }),
                 shown: Default::default(),
+                farewell: None,
             },
             queued,
         )
@@ -6912,6 +6970,7 @@ mod tests {
             writer: Some(writer),
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
 
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -6977,6 +7036,7 @@ mod tests {
                 writer: Some(writer),
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             }
         };
 
@@ -7032,6 +7092,7 @@ mod tests {
                 writer: Some(writer),
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             }
         };
 
@@ -7203,6 +7264,7 @@ mod tests {
                 writer: Some(writer),
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             }))
             .unwrap();
         // And a second successor, which is answered on its own
@@ -7314,6 +7376,7 @@ mod tests {
             writer: Some(writer),
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
 
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -7445,6 +7508,7 @@ mod tests {
                 writer: Some(writer),
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             }))
             .unwrap();
 
@@ -10812,6 +10876,7 @@ mod tests {
                 out,
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             };
             let mut clients = Vec::new();
             let state = crate::repo_state::RepoState::empty(repo.path().to_owned());
@@ -10917,6 +10982,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         };
         let (one, mut first) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
         let (two, mut second) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
@@ -11216,6 +11282,7 @@ mod tests {
                 out,
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             });
             peers.push(theirs);
         }
@@ -11239,6 +11306,7 @@ mod tests {
         let task = tokio::spawn(write_to_within(
             mine,
             queued,
+            None,
             "codex".to_string(),
             Duration::from_millis(80),
         ));
@@ -11268,6 +11336,7 @@ mod tests {
         let task = tokio::spawn(write_to_within(
             mine,
             queued,
+            None,
             "codex".to_string(),
             // Long on purpose: only an ERROR can end this, not the
             // budget.
@@ -12187,6 +12256,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         let present = |clients: &mut Vec<Client>| {
@@ -12218,6 +12288,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         };
         clients.push(fresh(out));
         present(&mut clients);
@@ -12306,6 +12377,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         serve_to(
@@ -12368,6 +12440,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         serve_to(
@@ -12446,6 +12519,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         serve_to(repo.path(), &mut clients, &state, None, &mut pending);
@@ -12499,6 +12573,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         serve_to(repo.path(), &mut clients, &state, None, &mut pending);
@@ -12516,6 +12591,7 @@ mod tests {
             Note::Refused { why } => panic!("unexpected refusal: {why}"),
             Note::Beat { .. } => {}
             Note::Recover { .. } => panic!("a wait is never sent a recovery"),
+            Note::Superseded => panic!("nothing superseded this wait"),
             Note::Items { items, .. } => assert!(
                 !items.contains(&held),
                 "another author's transient must not be delivered here: {items:?}"
@@ -12571,6 +12647,7 @@ mod tests {
                 out,
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             },
             Some(&state),
             &mut pending,
@@ -12624,6 +12701,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let mut pending = Vec::new();
 
@@ -12677,6 +12755,7 @@ mod tests {
                 out,
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             },
             Some(&state),
             &mut pending,
@@ -12759,6 +12838,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
@@ -12845,6 +12925,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         };
         let mut clients = vec![agent("codex", a), agent("claude", b)];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
@@ -12898,6 +12979,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
 
         // More arrivals than a queue is deep, none of them drained.
@@ -12919,6 +13001,7 @@ mod tests {
                     out,
                     holder: None,
                     shown: Default::default(),
+                    farewell: None,
                 },
                 Some(&state),
                 &mut Vec::new(),
@@ -12958,6 +13041,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         };
         let mut clients = vec![
             agent("codex", mine),
@@ -12968,6 +13052,7 @@ mod tests {
                 out: watching,
                 holder: None,
                 shown: Default::default(),
+                farewell: None,
             },
         ];
 
@@ -13017,6 +13102,7 @@ mod tests {
             out,
             holder: None,
             shown: Default::default(),
+            farewell: None,
         }];
         // A repo with work to do: a queued plan is something an AGENT
         // would be handed, so an observer seeing a Beat here is the
@@ -14037,7 +14123,230 @@ mod build_tests {
         );
         assert!(matches!(
             greeting_of(&hello, repo.path()),
-            Greeting::Decline(Welcome::Decline { proto: 13, .. })
+            Greeting::Decline(Welcome::Decline { proto: PROTO, .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod superseding_tests {
+    use super::*;
+
+    const ROSTER: &str = r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#;
+
+    fn repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".clank")).unwrap();
+        std::fs::write(d.path().join(".clank/config.json"), ROSTER).unwrap();
+        d
+    }
+
+    fn claude() -> AgentLabel {
+        AgentLabel::parse("claude").unwrap()
+    }
+
+    fn bind(repo: &std::path::Path, session: &str) {
+        crate::agent_store::bind_session_to_agent(
+            repo,
+            &claude(),
+            clank_core::Tool::Claude,
+            &clank_core::SessionId::parse(session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn holder(session: &str) -> Option<Holder> {
+        Some(Holder {
+            tool: clank_core::Tool::Claude,
+            session: session.into(),
+        })
+    }
+
+    /// A parked agent client with a queue the test reads, and the slot
+    /// its farewell lands in.
+    fn parked(
+        who: Served,
+        holder: Option<Holder>,
+    ) -> (
+        Client,
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let (farewell, last) = tokio::sync::oneshot::channel();
+        (
+            Client {
+                who,
+                holder,
+                out,
+                writer: None,
+                shown: Default::default(),
+                farewell: Some(farewell),
+            },
+            queued,
+            last,
+        )
+    }
+
+    fn agent() -> Served {
+        Served::Agent { author: claude() }
+    }
+
+    fn admit(repo: &std::path::Path, clients: &mut Vec<Client>, client: Client) {
+        let _ = admit_into(
+            repo,
+            clients,
+            client,
+            None,
+            &mut Vec::new(),
+            &Default::default(),
+        );
+    }
+
+    /// The wait admitted last is the session's: the older one is told it
+    /// is superseded and dropped, so only the newer is ever served.
+    #[tokio::test]
+    async fn a_newer_wait_of_the_same_session_supersedes_the_older() {
+        let repo = repo();
+        bind(repo.path(), "session-a1");
+        let mut clients = Vec::new();
+        let (older, mut older_queue, older_farewell) = parked(agent(), holder("session-a1"));
+        admit(repo.path(), &mut clients, older);
+        let (newer, _queue, _farewell) = parked(agent(), holder("session-a1"));
+        admit(repo.path(), &mut clients, newer);
+
+        assert_eq!(clients.len(), 1);
+        let line = older_farewell.await.expect("the older wait was told");
+        assert_eq!(
+            serde_json::from_str::<Note>(line.trim_end()).unwrap(),
+            Note::Superseded
+        );
+        assert!(older_queue.recv().await.is_none(), "its queue is closed");
+    }
+
+    /// Only the same agent session's wait is replaced: observers,
+    /// helpers, holderless clients, other sessions and other authors are
+    /// not.
+    #[test]
+    fn only_the_same_agent_session_is_the_same_wait() {
+        let new = parked(agent(), holder("s1")).0;
+        let same = |who, holder| same_wait(&parked(who, holder).0, &new);
+        assert!(same(agent(), holder("s1")));
+        assert!(!same(agent(), holder("s2")));
+        assert!(!same(agent(), None));
+        assert!(!same(Served::Observer, holder("s1")));
+        assert!(!same(Served::Helper { author: claude() }, holder("s1")));
+        assert!(!same(
+            Served::Agent {
+                author: AgentLabel::parse("codex").unwrap()
+            },
+            holder("s1")
+        ));
+        let holderless = parked(agent(), None).0;
+        assert!(!same_wait(&parked(agent(), None).0, &holderless));
+    }
+
+    /// A newcomer the admission rules refuse displaces nothing.
+    #[tokio::test]
+    async fn a_refused_newcomer_displaces_nothing() {
+        let repo = repo();
+        bind(repo.path(), "session-a1");
+        let mut clients = Vec::new();
+        let (older, _queue, mut older_farewell) = parked(agent(), holder("session-a1"));
+        admit(repo.path(), &mut clients, older);
+        bind(repo.path(), "session-b2");
+        let (stale, _q, _f) = parked(agent(), holder("session-a1"));
+        admit(repo.path(), &mut clients, stale);
+        assert_eq!(clients.len(), 1);
+        assert!(
+            older_farewell.try_recv().is_err(),
+            "the older was superseded by a refusal"
+        );
+    }
+
+    /// The farewell is written after whatever was queued, by the same
+    /// writer, so a full queue cannot drop it.
+    #[tokio::test]
+    async fn the_farewell_survives_a_full_queue() {
+        use tokio::io::AsyncBufReadExt;
+        let (ours, theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let (farewell, last) = tokio::sync::oneshot::channel();
+        let beat = format!("{}\n", serde_json::to_string(&Note::Beat).unwrap());
+        for _ in 0..CLIENT_QUEUE {
+            out.try_send(beat.clone()).unwrap();
+        }
+        assert!(out.try_send(beat.clone()).is_err(), "the queue is full");
+        let writer = tokio::spawn(write_to_within(
+            ours,
+            queued,
+            Some(last),
+            "claude".into(),
+            Duration::from_secs(2),
+        ));
+        let client = Client {
+            who: agent(),
+            holder: holder("s1"),
+            out,
+            writer: Some(writer),
+            shown: Default::default(),
+            farewell: Some(farewell),
+        };
+        let writer = supersede(client).unwrap();
+        let mut lines = tokio::io::BufReader::new(theirs).lines();
+        let mut got = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            got.push(serde_json::from_str::<Note>(&line).unwrap());
+        }
+        let mut want = vec![Note::Beat; CLIENT_QUEUE];
+        want.push(Note::Superseded);
+        assert_eq!(got, want);
+        assert_eq!(writer.await.unwrap(), Wrote::Drained);
+    }
+
+    /// A delivery already dispatched is not retracted: the served wait
+    /// has left the parked set, so a later admission of its session
+    /// supersedes nothing and is owed work by the normal rules.
+    #[tokio::test]
+    async fn a_dispatched_delivery_stands() {
+        let repo = repo();
+        bind(repo.path(), "session-a1");
+        std::fs::create_dir_all(repo.path().join(".clank/queue")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/queue/500-next.md"),
+            "# next\n\nsomething to promote\n",
+        )
+        .unwrap();
+        let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
+        let mut clients = Vec::new();
+        let (first, mut first_queue, mut first_farewell) = parked(agent(), holder("session-a1"));
+        let _ = admit_into(
+            repo.path(),
+            &mut clients,
+            first,
+            Some(&state),
+            &mut Vec::new(),
+            &Default::default(),
+        );
+        let served: Note =
+            serde_json::from_str(first_queue.recv().await.unwrap().trim_end()).unwrap();
+        assert!(matches!(served, Note::Items { .. }), "{served:?}");
+
+        let (second, mut second_queue, _f) = parked(agent(), holder("session-a1"));
+        let _ = admit_into(
+            repo.path(),
+            &mut clients,
+            second,
+            Some(&state),
+            &mut Vec::new(),
+            &Default::default(),
+        );
+        assert!(
+            first_farewell.try_recv().is_err(),
+            "a dispatched wait was superseded after the fact"
+        );
+        let owed: Note =
+            serde_json::from_str(second_queue.recv().await.unwrap().trim_end()).unwrap();
+        assert!(matches!(owed, Note::Items { .. }), "{owed:?}");
     }
 }
