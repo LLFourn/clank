@@ -76,6 +76,49 @@ pub(crate) struct Swept {
     pub(crate) socket: PathBuf,
     pub(crate) repo: Option<PathBuf>,
     pub(crate) outcome: Outcome,
+    /// How its old monitor was ended, when it was asked to go.
+    pub(crate) retired: Option<Retirement>,
+}
+
+/// How an asked old monitor was ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retirement {
+    /// It exited after TERM.
+    Exited,
+    /// It ignored TERM for [`TERM_GRACE`], and was killed.
+    Killed,
+    /// It was already gone, so nothing was sent.
+    Gone,
+    /// Still running at the deadline, or not confirmed gone by then.
+    StillRunning,
+    /// Its process could not be looked at, so nothing was sent.
+    Unverified,
+}
+
+/// How long an old monitor is given to exit on TERM before KILL: longer
+/// than a lease-loss drain (`monitor::DRAIN_GRACE`, 10 s) that TERM may
+/// join, so a cooperative drain is not mistaken for a wedged one. A KILL
+/// still cuts off whatever producer work is left; it proves nothing was
+/// drained.
+pub(crate) const TERM_GRACE: Duration = Duration::from_secs(12);
+
+/// A monitor process as the upgrade verified it: the repo it serves, and
+/// the birth that is the only proof a later look at its pid is still it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Verified {
+    pub(crate) repo: PathBuf,
+    pub(crate) birth: crate::proc_identity::ProcToken,
+}
+
+/// What one look at an asked monitor's pid found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Still {
+    /// The verified process, by its birth.
+    Ours,
+    /// Exited: nothing there, or another process with another birth.
+    Gone,
+    /// The look established nothing.
+    Unknown,
 }
 
 /// Everything the command did.
@@ -90,10 +133,11 @@ pub(crate) struct Report {
     pub(crate) successors: Vec<(PathBuf, Successor)>,
 }
 
-type RepoOf = Box<dyn Fn(i32) -> Result<PathBuf, String> + Send + Sync>;
+type RepoOf = Box<dyn Fn(i32) -> Result<Verified, String> + Send + Sync>;
 type Probe = Box<dyn Fn(&Path, &Path, Instant) -> Outcome + Send + Sync>;
 /// Start a successor for a repo before the deadline, calling the third
 /// argument the moment a monitor process has been created.
+type Retire = Box<dyn Fn(i32, &Verified, Instant) -> Retirement + Send + Sync>;
 type Start = Box<dyn Fn(&Path, Instant, &(dyn Fn() + Sync)) -> Successor + Send + Sync>;
 
 /// The effects the migration has on the world, so the whole operation is
@@ -105,6 +149,8 @@ pub(crate) struct Effects {
     pub(crate) probe: Probe,
     /// Start a successor for a repo, before the deadline.
     pub(crate) start: Start,
+    /// End the old monitor process `pid` of a repo, before the deadline.
+    pub(crate) retire: Retire,
 }
 
 type Namespaces = Vec<(PathBuf, Result<(), String>)>;
@@ -163,11 +209,25 @@ fn discover(dirs: &[PathBuf], me: u32, deadline: Instant) -> (Namespaces, Vec<(P
     (namespaces, found)
 }
 
+/// One repo's successor, across the endpoints that may start it.
+#[derive(Debug, Clone, Default)]
+struct Claim {
+    /// The endpoint starting it now.
+    starting: Option<usize>,
+    /// The endpoint that last started it.
+    last: Option<usize>,
+    /// Another endpoint's monitor went while a start was running.
+    retry: bool,
+    /// A successor was created or attached.
+    established: bool,
+}
+
 /// How far one endpoint's operation got.
 #[derive(Debug, Clone, Default)]
 struct Progress {
     repo: Option<PathBuf>,
     outcome: Option<Outcome>,
+    retired: Option<Retirement>,
     successor: Option<Starting>,
 }
 
@@ -206,18 +266,17 @@ pub(crate) fn drive(
 
     let progress: Arc<Vec<Mutex<Progress>>> =
         Arc::new(found.iter().map(|_| Mutex::default()).collect());
-    // Which endpoint's operation starts each repo's successor: the first
-    // to hear that repo's monitor say it is obsolete.
-    let claimed: Arc<Mutex<std::collections::BTreeMap<PathBuf, usize>>> = Arc::default();
+    let claims: Arc<Mutex<std::collections::BTreeMap<PathBuf, Claim>>> = Arc::default();
     let (ended, ends) = std::sync::mpsc::channel::<()>();
     let operate = {
-        let (progress, effects, claimed) = (progress.clone(), effects.clone(), claimed.clone());
+        let (progress, effects, claims) = (progress.clone(), effects.clone(), claims.clone());
         move |at: usize, socket: PathBuf, pid: i32| {
             let note = |f: &dyn Fn(&mut Progress)| f(&mut progress[at].lock().unwrap());
-            let repo = match (effects.repo_of)(pid) {
-                Ok(repo) => repo,
+            let verified = match (effects.repo_of)(pid) {
+                Ok(verified) => verified,
                 Err(why) => return note(&|p| p.outcome = Some(Outcome::Skipped(why.clone()))),
             };
+            let repo = verified.repo.clone();
             note(&|p| p.repo = Some(repo.clone()));
             if Instant::now() >= deadline {
                 return;
@@ -227,17 +286,56 @@ pub(crate) fn drive(
             if outcome != Outcome::Asked || Instant::now() >= deadline {
                 return;
             }
-            {
-                let mut claimed = claimed.lock().unwrap();
-                if claimed.contains_key(&repo) {
+            // Every asked monitor is ended, a duplicate as much as the one
+            // published, so none is left holding a source.
+            let retired = (effects.retire)(pid, &verified, deadline);
+            note(&|p| p.retired = Some(retired));
+            if !matches!(
+                retired,
+                Retirement::Exited | Retirement::Killed | Retirement::Gone
+            ) {
+                return;
+            }
+            loop {
+                {
+                    let mut claims = claims.lock().unwrap();
+                    let claim = claims.entry(repo.clone()).or_default();
+                    if claim.established {
+                        return;
+                    }
+                    // Another endpoint is starting it now: if that start
+                    // creates nothing, it is tried again, this endpoint's
+                    // monitor being gone too.
+                    if claim.starting.is_some() {
+                        claim.retry = true;
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    claim.starting = Some(at);
+                    claim.last = Some(at);
+                    claim.retry = false;
+                }
+                note(&|p| p.successor = Some(Starting::Begun));
+                let created = || note(&|p| p.successor = Some(Starting::Created));
+                let started = (effects.start)(&repo, deadline, &created);
+                note(&|p| p.successor = Some(Starting::Ended(started.clone())));
+                let mut claims = claims.lock().unwrap();
+                let claim = claims.entry(repo.clone()).or_default();
+                claim.starting = None;
+                let uncreated = matches!(
+                    started,
+                    Successor::Unestablished { spawned: false, .. } | Successor::TimedOut
+                );
+                if !uncreated {
+                    claim.established = true;
                     return;
                 }
-                claimed.insert(repo.clone(), at);
+                if !claim.retry {
+                    return;
+                }
             }
-            note(&|p| p.successor = Some(Starting::Begun));
-            let created = || note(&|p| p.successor = Some(Starting::Created));
-            let started = (effects.start)(&repo, deadline, &created);
-            note(&|p| p.successor = Some(Starting::Ended(started.clone())));
         }
     };
     let operate = Arc::new(operate);
@@ -266,7 +364,7 @@ pub(crate) fn drive(
     }
 
     let progress: Vec<Progress> = progress.iter().map(|p| p.lock().unwrap().clone()).collect();
-    let claimed = claimed.lock().unwrap().clone();
+    let claims = claims.lock().unwrap().clone();
     let swept: Vec<Swept> = found
         .iter()
         .zip(&progress)
@@ -274,6 +372,7 @@ pub(crate) fn drive(
             socket: socket.clone(),
             repo: p.repo.clone(),
             outcome: p.outcome.clone().unwrap_or(Outcome::TimedOut),
+            retired: p.retired,
         })
         .collect();
     let mut asked: Vec<PathBuf> = swept
@@ -286,7 +385,8 @@ pub(crate) fn drive(
     let successors = asked
         .into_iter()
         .map(|repo| {
-            let successor = match claimed.get(&repo).map(|at| &progress[*at].successor) {
+            let claimant = claims.get(&repo).and_then(|c| c.starting.or(c.last));
+            let successor = match claimant.map(|at| &progress[at].successor) {
                 Some(Some(Starting::Ended(successor))) => successor.clone(),
                 Some(Some(Starting::Created)) => Successor::InFlight {
                     spawned: Created::Yes,
@@ -294,6 +394,19 @@ pub(crate) fn drive(
                 Some(Some(Starting::Begun)) | Some(None) => Successor::InFlight {
                     spawned: Created::Unknown,
                 },
+                None if swept.iter().any(|s| {
+                    s.repo.as_ref() == Some(&repo)
+                        && matches!(
+                            s.retired,
+                            Some(Retirement::StillRunning | Retirement::Unverified)
+                        )
+                }) =>
+                {
+                    Successor::Unestablished {
+                        spawned: false,
+                        why: "an old monitor of it was not confirmed gone".into(),
+                    }
+                }
                 None => Successor::TimedOut,
             };
             (repo, successor)
@@ -332,7 +445,7 @@ fn probe(socket: &Path, repo: &Path, deadline: Instant) -> Outcome {
 /// The repo a monitor process serves: a process this uid may signal,
 /// identified by its birth across the read, whose command line is
 /// `clank monitor start --repo <path>`.
-fn repo_of_monitor(pid: i32, me: u32) -> Result<PathBuf, String> {
+fn repo_of_monitor(pid: i32, me: u32) -> Result<Verified, String> {
     use crate::proc_identity::inspect::{Inspection, inspect};
     let token = crate::proc_identity::token_for(pid)
         .ok_or(format!("process {pid} has no birth to check"))?;
@@ -349,7 +462,8 @@ fn repo_of_monitor(pid: i32, me: u32) -> Result<PathBuf, String> {
     let argv = details
         .argv
         .map_err(|_| format!("process {pid}'s command line could not be read"))?;
-    repo_in_argv(&argv).ok_or(format!("process {pid} is not a clank monitor"))
+    let repo = repo_in_argv(&argv).ok_or(format!("process {pid} is not a clank monitor"))?;
+    Ok(Verified { repo, birth: token })
 }
 
 /// The repo in a `clank monitor start --repo <path>` command line, and
@@ -364,6 +478,93 @@ fn repo_in_argv(argv: &[std::ffi::OsString]) -> Option<PathBuf> {
 }
 
 type Spawn = fn(&Path) -> std::io::Result<Box<dyn super::monitor::Started>>;
+
+/// End the verified old monitor `pid`: TERM, then KILL if it has not
+/// exited within [`TERM_GRACE`], each sent only while the pid still has
+/// the birth it was verified with, and never past the deadline.
+fn retire(pid: i32, verified: &Verified, deadline: Instant) -> Retirement {
+    retire_with(
+        || {
+            observe_with(
+                || crate::proc_identity::token_for(pid),
+                || crate::signal::probe_process(pid),
+                &verified.birth,
+            )
+        },
+        |sig| {
+            if let Some(pid) = crate::signal::Pid::new(pid) {
+                crate::signal::signal_process(pid, sig);
+            }
+        },
+        TERM_GRACE,
+        deadline,
+    )
+}
+
+/// One look at a pid against the `birth` it was verified with. Another
+/// birth there means ours exited and the pid was reused; nothing there
+/// means it exited; a look that establishes neither proves nothing.
+fn observe_with(
+    token: impl Fn() -> Option<crate::proc_identity::ProcToken>,
+    probe: impl Fn() -> crate::signal::Probe,
+    birth: &crate::proc_identity::ProcToken,
+) -> Still {
+    match token() {
+        Some(now) if &now == birth => Still::Ours,
+        Some(_) => Still::Gone,
+        None if probe() == crate::signal::Probe::Gone => Still::Gone,
+        None => Still::Unknown,
+    }
+}
+
+/// [`retire`] with the look and the signal supplied, so no test sends a
+/// real one. The deadline is checked after every look and immediately
+/// before each signal, so no signal is sent past it.
+fn retire_with(
+    observe: impl Fn() -> Still,
+    signal: impl Fn(libc::c_int),
+    grace: Duration,
+    deadline: Instant,
+) -> Retirement {
+    let gone_by = |by: Instant| {
+        loop {
+            if observe() == Still::Gone {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= by {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50).min(by - now));
+        }
+    };
+    match observe() {
+        Still::Gone => return Retirement::Gone,
+        Still::Unknown => return Retirement::Unverified,
+        Still::Ours => {}
+    }
+    if Instant::now() >= deadline {
+        return Retirement::StillRunning;
+    }
+    signal(libc::SIGTERM);
+    if gone_by((Instant::now() + grace).min(deadline)) {
+        return Retirement::Exited;
+    }
+    match observe() {
+        Still::Gone => return Retirement::Exited,
+        Still::Unknown => return Retirement::StillRunning,
+        Still::Ours => {}
+    }
+    if Instant::now() >= deadline {
+        return Retirement::StillRunning;
+    }
+    signal(libc::SIGKILL);
+    if gone_by(deadline) {
+        Retirement::Killed
+    } else {
+        Retirement::StillRunning
+    }
+}
 
 /// Start `repo`'s monitor through the ordinary attach-or-spawn, inside
 /// the one deadline the command holds, and say what it established.
@@ -453,6 +654,7 @@ pub async fn run() -> anyhow::Result<()> {
             repo_of: Box::new(move |pid| repo_of_monitor(pid, me)),
             probe: Box::new(probe),
             start: Box::new(start),
+            retire: Box::new(retire),
         },
         Instant::now() + WITHIN,
     )
@@ -472,7 +674,14 @@ pub async fn run() -> anyhow::Result<()> {
             .as_ref()
             .map(|r| r.display().to_string())
             .unwrap_or_else(|| "?".into());
-        println!("{} ({repo}): {:?}", s.socket.display(), s.outcome);
+        match s.retired {
+            Some(retired) => println!(
+                "{} ({repo}): {:?}, {retired:?}",
+                s.socket.display(),
+                s.outcome
+            ),
+            None => println!("{} ({repo}): {:?}", s.socket.display(), s.outcome),
+        }
     }
     for (repo, successor) in &report.successors {
         println!("{}: {successor:?}", repo.display());
@@ -512,6 +721,20 @@ mod tests {
         (home, dir, listeners)
     }
 
+    fn birth(n: i32) -> crate::proc_identity::ProcToken {
+        crate::proc_identity::ProcToken::MacStart {
+            sec: n as u64,
+            usec: 0,
+        }
+    }
+
+    fn verified(repo: PathBuf, pid: i32) -> Verified {
+        Verified {
+            repo,
+            birth: birth(pid),
+        }
+    }
+
     fn repo_for(pid: i32) -> PathBuf {
         PathBuf::from(format!("/w/{pid}"))
     }
@@ -530,12 +753,13 @@ mod tests {
         started: Started,
     ) -> Effects {
         Effects {
-            repo_of: Box::new(|pid| Ok(repo_for(pid))),
+            repo_of: Box::new(|pid| Ok(verified(repo_for(pid), pid))),
             probe: Box::new(probe),
             start: Box::new(move |repo, _, _| {
                 started.lock().unwrap().push(repo.to_path_buf());
                 Successor::Spawned
             }),
+            retire: Box::new(|_, _, _| Retirement::Exited),
         }
     }
 
@@ -661,7 +885,7 @@ mod tests {
         );
         effects.repo_of = Box::new(|pid| {
             std::thread::sleep(Duration::from_millis(75));
-            Ok(repo_for(pid))
+            Ok(verified(repo_for(pid), pid))
         });
         let report = drive(&[dir], me(), std::sync::Arc::new(effects), started + within);
         assert_eq!(most.load(Ordering::SeqCst), AT_ONCE);
@@ -690,7 +914,7 @@ mod tests {
         );
         effects.repo_of = Box::new(|pid| {
             std::thread::sleep(Duration::from_millis(500));
-            Ok(repo_for(pid))
+            Ok(verified(repo_for(pid), pid))
         });
         let started = Instant::now();
         let within = Duration::from_millis(30);
@@ -1008,9 +1232,9 @@ mod tests {
         effects.repo_of = Box::new(|pid| match pid {
             2 => {
                 std::thread::sleep(Duration::from_millis(500));
-                Ok(repo_for(2))
+                Ok(verified(repo_for(2), 2))
             }
-            _ => Ok(repo_for(1)),
+            n => Ok(verified(repo_for(1), n)),
         });
         let report = drive(
             &[dir],
@@ -1058,5 +1282,326 @@ mod tests {
                 vec![(repo_for(1), Successor::InFlight { spawned: want })]
             );
         }
+    }
+
+    /// A fake old monitor for `retire_with`: alive until `exits_on`
+    /// arrives, recording every signal.
+    struct Old {
+        alive: std::sync::atomic::AtomicBool,
+        sent: std::sync::Mutex<Vec<libc::c_int>>,
+    }
+
+    impl Old {
+        fn new(alive: bool) -> Self {
+            Old {
+                alive: std::sync::atomic::AtomicBool::new(alive),
+                sent: Default::default(),
+            }
+        }
+
+        fn retire(
+            &self,
+            exits_on: Option<libc::c_int>,
+            grace: Duration,
+            within: Duration,
+        ) -> Retirement {
+            retire_with(
+                || {
+                    if self.alive.load(Ordering::SeqCst) {
+                        Still::Ours
+                    } else {
+                        Still::Gone
+                    }
+                },
+                |sig| {
+                    self.sent.lock().unwrap().push(sig);
+                    if Some(sig) == exits_on {
+                        self.alive.store(false, Ordering::SeqCst);
+                    }
+                },
+                grace,
+                Instant::now() + within,
+            )
+        }
+
+        fn sent(&self) -> Vec<libc::c_int> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    /// TERM first; KILL only for one that outlives its grace and is
+    /// still the same process; nothing at all for one already gone; and
+    /// never past the deadline.
+    #[test]
+    fn an_old_monitor_is_termed_then_killed_on_a_timeout() {
+        let grace = Duration::from_millis(100);
+        let within = Duration::from_secs(2);
+
+        let exits = Old::new(true);
+        assert_eq!(
+            exits.retire(Some(libc::SIGTERM), grace, within),
+            Retirement::Exited
+        );
+        assert_eq!(exits.sent(), vec![libc::SIGTERM]);
+
+        let stubborn = Old::new(true);
+        let started = Instant::now();
+        assert_eq!(
+            stubborn.retire(Some(libc::SIGKILL), grace, within),
+            Retirement::Killed
+        );
+        assert_eq!(stubborn.sent(), vec![libc::SIGTERM, libc::SIGKILL]);
+        assert!(started.elapsed() >= grace, "killed before its grace");
+
+        let gone = Old::new(false);
+        assert_eq!(gone.retire(None, grace, within), Retirement::Gone);
+        assert!(gone.sent().is_empty());
+
+        let unkillable = Old::new(true);
+        let started = Instant::now();
+        let short = Duration::from_millis(300);
+        assert_eq!(
+            unkillable.retire(None, grace, short),
+            Retirement::StillRunning
+        );
+        assert!(
+            started.elapsed() < short + Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let deadline_first = Old::new(true);
+        assert_eq!(
+            deadline_first.retire(None, Duration::from_secs(5), Duration::from_millis(100)),
+            Retirement::StillRunning
+        );
+        assert_eq!(
+            deadline_first.sent(),
+            vec![libc::SIGTERM],
+            "a KILL past the deadline"
+        );
+    }
+
+    /// A pid reused after TERM by another monitor of the same repo has
+    /// another birth, so it is not the monitor that was asked, and is not
+    /// sent KILL: the look compares the birth verified at the start.
+    #[test]
+    fn a_pid_reused_by_another_monitor_is_not_killed() {
+        let termed = std::sync::atomic::AtomicBool::new(false);
+        let sent = std::sync::Mutex::new(Vec::new());
+        let out = retire_with(
+            || {
+                observe_with(
+                    || {
+                        Some(if termed.load(Ordering::SeqCst) {
+                            birth(2)
+                        } else {
+                            birth(1)
+                        })
+                    },
+                    || crate::signal::Probe::Ours,
+                    &birth(1),
+                )
+            },
+            |sig| {
+                sent.lock().unwrap().push(sig);
+                termed.store(true, Ordering::SeqCst);
+            },
+            Duration::from_millis(50),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(out, Retirement::Exited);
+        assert_eq!(*sent.lock().unwrap(), vec![libc::SIGTERM]);
+        assert_eq!(
+            observe_with(|| None, || crate::signal::Probe::Unknown(1), &birth(1)),
+            Still::Unknown,
+            "an unreadable process is not gone"
+        );
+        assert_eq!(
+            observe_with(|| None, || crate::signal::Probe::Gone, &birth(1)),
+            Still::Gone
+        );
+    }
+
+    /// No signal past the deadline: not at entry, not after a look that
+    /// itself ran past it, not before KILL; and a process that can no
+    /// longer be looked at is never reported as having exited.
+    #[test]
+    fn no_signal_is_sent_past_the_deadline() {
+        let sends = |observe: &dyn Fn() -> Still, grace, within| {
+            let sent = std::sync::Mutex::new(Vec::new());
+            let out = retire_with(
+                observe,
+                |sig| sent.lock().unwrap().push(sig),
+                grace,
+                Instant::now() + within,
+            );
+            (out, sent.into_inner().unwrap())
+        };
+        let ours = || Still::Ours;
+        let (out, sent) = sends(&ours, Duration::from_secs(1), Duration::ZERO);
+        assert_eq!(
+            (out, sent),
+            (Retirement::StillRunning, vec![]),
+            "expired at entry"
+        );
+
+        let slow = || {
+            std::thread::sleep(Duration::from_millis(40));
+            Still::Ours
+        };
+        let (_, sent) = sends(&slow, Duration::from_secs(1), Duration::from_millis(5));
+        assert!(
+            sent.is_empty(),
+            "TERM after a look that ran past the deadline: {sent:?}"
+        );
+
+        let looks = AtomicUsize::new(0);
+        let late_before_kill = || {
+            if looks.fetch_add(1, Ordering::SeqCst) >= 2 {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Still::Ours
+        };
+        let (_, sent) = sends(
+            &late_before_kill,
+            Duration::from_millis(30),
+            Duration::from_millis(150),
+        );
+        assert_eq!(
+            sent,
+            vec![libc::SIGTERM],
+            "KILL after a look that ran past the deadline"
+        );
+
+        let looked = AtomicUsize::new(0);
+        let unreadable = || {
+            if looked.fetch_add(1, Ordering::SeqCst) == 0 {
+                Still::Ours
+            } else {
+                Still::Unknown
+            }
+        };
+        let (out, _) = sends(
+            &unreadable,
+            Duration::from_millis(50),
+            Duration::from_millis(300),
+        );
+        assert_ne!(
+            out,
+            Retirement::Exited,
+            "an unreadable process counted as gone"
+        );
+    }
+
+    /// Two old monitors of one repo: the first to go starts the successor
+    /// while the other still holds the repo, and creates nothing; when the
+    /// other goes, the start is tried again and succeeds.
+    #[test]
+    fn a_start_that_created_nothing_is_retried_when_a_duplicate_goes() {
+        let (_home, dir, _listeners) = namespace([1, 2]);
+        let second_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let starts = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut effects = effects_of(|_, _, _| Outcome::Asked, Default::default());
+        effects.repo_of = Box::new(|pid| Ok(verified(repo_for(1), pid)));
+        let gone = second_gone.clone();
+        effects.retire = Box::new(move |pid, _, _| {
+            if pid == 2 {
+                std::thread::sleep(Duration::from_millis(300));
+                gone.store(true, Ordering::SeqCst);
+            }
+            Retirement::Exited
+        });
+        let (gone, count) = (second_gone.clone(), starts.clone());
+        effects.start = Box::new(move |_, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            if gone.load(Ordering::SeqCst) {
+                Successor::Spawned
+            } else {
+                std::thread::sleep(Duration::from_millis(400));
+                Successor::Unestablished {
+                    spawned: false,
+                    why: "the other old monitor still holds the repo".into(),
+                }
+            }
+        });
+        let report = drive(
+            &[dir],
+            me(),
+            std::sync::Arc::new(effects),
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(report.successors, vec![(repo_for(1), Successor::Spawned)]);
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// Through the driver: every asked monitor is ended, duplicates
+    /// included, with one successor per repo; current and newer ones are
+    /// neither signalled nor restarted; one still running at the deadline
+    /// gets no successor.
+    #[test]
+    fn the_driver_ends_every_asked_monitor_and_starts_one_successor() {
+        let (_home, dir, _listeners) = namespace([1, 2, 3, 4, 5]);
+        let started = Started::default();
+        let retired = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut effects = effects_of(
+            |socket, _, _| match pid_of(socket) {
+                1 | 2 | 5 => Outcome::Asked,
+                3 => Outcome::Current,
+                _ => Outcome::Newer,
+            },
+            started.clone(),
+        );
+        effects.repo_of = Box::new(|pid| {
+            Ok(verified(
+                match pid {
+                    1 | 2 => repo_for(1),
+                    n => repo_for(n),
+                },
+                pid,
+            ))
+        });
+        let into = retired.clone();
+        effects.retire = Box::new(move |pid, _, _| {
+            into.lock().unwrap().push(pid);
+            if pid == 5 {
+                Retirement::StillRunning
+            } else {
+                Retirement::Exited
+            }
+        });
+        let report = drive(
+            &[dir],
+            me(),
+            std::sync::Arc::new(effects),
+            Instant::now() + Duration::from_secs(5),
+        );
+        let mut ended = retired.lock().unwrap().clone();
+        ended.sort();
+        assert_eq!(ended, vec![1, 2, 5], "every asked monitor, and no other");
+        assert_eq!(*started.lock().unwrap(), vec![repo_for(1)], "one successor");
+        assert!(
+            report
+                .successors
+                .contains(&(repo_for(1), Successor::Spawned))
+        );
+        assert!(
+            report
+                .successors
+                .iter()
+                .any(|(repo, s)| *repo == repo_for(5)
+                    && matches!(s, Successor::Unestablished { spawned: false, .. }))
+        );
+        let of = |pid: i32| {
+            report
+                .swept
+                .iter()
+                .find(|s| pid_of(&s.socket) == pid)
+                .unwrap()
+                .retired
+        };
+        assert_eq!(of(3), None);
+        assert_eq!(of(4), None);
+        assert_eq!(of(5), Some(Retirement::StillRunning));
     }
 }
