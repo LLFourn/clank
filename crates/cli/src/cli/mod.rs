@@ -44,6 +44,7 @@ pub mod js_guard;
 pub mod log;
 pub(crate) mod message;
 pub mod monitor;
+pub mod monitor_upgrade;
 pub mod nudge;
 pub(crate) mod nudge_log;
 pub mod open;
@@ -734,6 +735,9 @@ pub struct MonitorArgs {
 pub enum MonitorCmd {
     /// Watch this repo once, for every waiter.
     Start(MonitorStartArgs),
+    /// Ask every reachable monitor older than this build to stand down,
+    /// and start this build's in their repos. Run once after installing.
+    Upgrade,
 }
 
 #[derive(Args, Debug)]
@@ -741,6 +745,13 @@ pub struct MonitorStartArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// The path clank is installed at, as the spawning client knows it.
+    /// Defaults to this process's own invocation.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub installed_at: Option<PathBuf>,
+    /// Where `--installed-at` came from: override, invocation or fallback.
+    #[arg(long, value_name = "SOURCE", hide = true, requires = "installed_at")]
+    pub installed_from: Option<String>,
 }
 
 /// `clank nudge`, addressed exactly like `clank send` so the escape

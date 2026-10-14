@@ -3184,6 +3184,7 @@ mod shared_tests {
                 pid: 4242,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: socket.to_string_lossy().to_string(),
+                build: None,
             },
         )
         .unwrap();
@@ -3788,6 +3789,7 @@ mod shared_tests {
                 pid: 4343,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: socket.to_string_lossy().to_string(),
+                build: None,
             },
         )
         .unwrap();

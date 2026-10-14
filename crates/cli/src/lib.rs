@@ -10,6 +10,7 @@ pub mod session_probe;
 pub mod age;
 pub mod agent_env;
 pub mod agent_store;
+pub mod build_stamp;
 pub mod feedback_scan;
 pub mod fs_plan_state_lookup;
 pub mod git_io;

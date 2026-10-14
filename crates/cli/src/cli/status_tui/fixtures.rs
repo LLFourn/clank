@@ -111,6 +111,7 @@ pub(crate) fn reviewer_missing(label: &str) -> WaitingOn {
 
 pub(crate) fn snap(active_plan: Option<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
     StatusSnapshot {
+        monitor: None,
         forks: Vec::new(),
         repo_path: "/r".into(),
         basename: "r".into(),

@@ -397,6 +397,7 @@ mod tests {
                 pid: ours,
                 repo: repo.path().display().to_string(),
                 socket: "/nowhere.sock".into(),
+                build: None,
             },
         )
         .unwrap();

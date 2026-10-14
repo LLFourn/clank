@@ -60,6 +60,13 @@ pub fn token_for(pid: i32) -> Option<ProcToken> {
     read_token_for(pid).ok()
 }
 
+/// The user `pid` runs as, as the kernel reports it, or `None` when it
+/// cannot be read. Unchecked against the process's birth: a caller that
+/// needs this to be the process it means brackets it with tokens.
+pub fn uid_of(pid: i32) -> Option<u32> {
+    (pid > 0).then(|| platform::uid_of(pid).ok()).flatten()
+}
+
 fn read_token_for(pid: i32) -> std::io::Result<ProcToken> {
     if pid <= 0 {
         return Err(std::io::ErrorKind::InvalidInput.into());
@@ -107,6 +114,10 @@ mod platform {
         Ok(info)
     }
 
+    pub(super) fn uid_of(pid: i32) -> std::io::Result<u32> {
+        Ok(bsd_info(pid)?.pbi_uid)
+    }
+
     pub(super) fn read_token_for(pid: i32) -> std::io::Result<ProcToken> {
         let info = bsd_info(pid)?;
         Ok(ProcToken::MacStart {
@@ -139,6 +150,11 @@ mod platform {
 mod platform {
     use super::ProcToken;
 
+    pub(super) fn uid_of(pid: i32) -> std::io::Result<u32> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(format!("/proc/{pid}"))?.uid())
+    }
+
     pub(super) fn read_token_for(pid: i32) -> std::io::Result<ProcToken> {
         let stat = super::linux::read_stat(pid)?;
         let bytes = super::linux::read_bounded(
@@ -165,6 +181,10 @@ mod platform {
     /// No supported source: everything that consults a token treats
     /// `None` as "cannot identify", which refuses rather than guesses.
     pub(super) fn read_token_for(_pid: i32) -> std::io::Result<ProcToken> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn uid_of(_pid: i32) -> std::io::Result<u32> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }

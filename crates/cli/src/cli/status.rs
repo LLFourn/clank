@@ -33,6 +33,10 @@ pub struct StatusSnapshot {
     /// Where this was read. `--repo` means the reader need not be
     /// standing in it, and the pane says it too (codex on 772b84f).
     pub(crate) repo_path: PathBuf,
+    /// The serving monitor's build, and whether it is still the installed
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) monitor: Option<String>,
     #[serde(rename = "repo_basename")]
     pub(crate) basename: String,
     pub(crate) branch: Option<String>,
@@ -706,6 +710,7 @@ impl StatusSnapshot {
         Ok(Self {
             forks,
             repo_path: repo.to_path_buf(),
+            monitor: crate::cli::monitor::build_line(repo),
             basename: basename.to_string(),
             branch,
             head_sha,
@@ -760,6 +765,9 @@ impl StatusSnapshot {
         }
         if let Some(s) = &self.head_sha {
             let _ = writeln!(out, "head:   {s}");
+        }
+        if let Some(monitor) = &self.monitor {
+            let _ = writeln!(out, "monitor: {monitor}");
         }
         for warning in &self.warnings {
             let _ = writeln!(
@@ -2982,6 +2990,7 @@ mod dirty_and_wake_tests {
         StatusSnapshot {
             forks: Vec::new(),
             repo_path: PathBuf::from("/repo"),
+            monitor: None,
             basename: "repo".to_string(),
             branch: Some("main".to_string()),
             head_sha: Some("abcd123".to_string()),
@@ -3190,6 +3199,9 @@ mod dirty_and_wake_tests {
             // than here: `--repo` means the reader need not be
             // standing in it (codex on 772b84f).
             repo_path: _,
+            // Read from the runtime namespace, not the repo: shown when a
+            // monitor is published, and absent from a fixture without one.
+            monitor: _,
             // The LOG and the paging that walks it: rows, the fold
             // boundary, the cursor, what a finalize stands for, the
             // branch decorations, and the github events index-aligned

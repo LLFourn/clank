@@ -32,7 +32,7 @@ use clank_core::wait::WaitItem;
 // 11 admits one automatic Grok wait per bound session and reports refusals.
 // 12 publishes its sources' lifecycle and takes a control request to
 // restart one.
-pub(crate) const PROTO: u32 = 12;
+pub(crate) const PROTO: u32 = 13;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -304,6 +304,20 @@ pub(crate) struct Descriptor {
     /// since moved is recognised rather than trusted.
     pub(crate) repo: String,
     pub(crate) socket: String,
+    /// The build serving, fixed for the monitor's life. What it has since
+    /// seen of the installation is in its own observation record, never
+    /// here: this file is routing, and a stale monitor's late write must
+    /// not be able to change where clients connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) build: Option<DescribedBuild>,
+}
+
+/// A monitor's build, as its descriptor names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DescribedBuild {
+    pub(crate) running: String,
+    pub(crate) installed_at: String,
+    pub(crate) source: crate::build_stamp::Source,
 }
 
 /// Whether a monitor serving `theirs` may answer a client from `ours`.
@@ -791,6 +805,13 @@ pub(crate) enum OpeningWho {
 /// claimed an unknown author could not reach this decision; that was
 /// true only of the equal-version path, which is not the path that
 /// matters.
+/// What a monitor says when a newer client tells it it is obsolete. The
+/// same words since proto 3, so a client can tell this answer from an
+/// older monitor's other refusals byte for byte.
+pub(crate) fn obsolete_why(ours: u32, theirs: u32) -> String {
+    format!("this monitor speaks proto {ours}, the client speaks {theirs}")
+}
+
 pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
     let decline = |why: String| Greeting::Decline(Welcome::Decline { proto: PROTO, why });
     let Ok(open) = serde_json::from_str::<Opening>(line) else {
@@ -813,10 +834,7 @@ pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
         return match &open.who {
             OpeningWho::Observer => Greeting::Obsolete(Welcome::Decline {
                 proto: PROTO,
-                why: format!(
-                    "this monitor speaks proto {PROTO}, the client speaks {}",
-                    open.proto
-                ),
+                why: obsolete_why(PROTO, open.proto),
             }),
             OpeningWho::Agent { author } => match AgentLabel::parse(author)
                 .ok()
@@ -824,10 +842,7 @@ pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
             {
                 Some(_) => Greeting::Obsolete(Welcome::Decline {
                     proto: PROTO,
-                    why: format!(
-                        "this monitor speaks proto {PROTO}, the client speaks {}",
-                        open.proto
-                    ),
+                    why: obsolete_why(PROTO, open.proto),
                 }),
                 // On this repo's socket, for this repo, but not one of
                 // its agents. Refused, and this monitor stays.
@@ -866,10 +881,10 @@ pub(crate) const BEAT_GRACE: Duration = Duration::from_secs(20);
 /// is not listening by then costs nothing: this wait watches locally
 /// and the process — which outlives every client — is there for the
 /// next one.
-const SPAWN_SETTLE: Duration = Duration::from_millis(600);
+pub(crate) const SPAWN_SETTLE: Duration = Duration::from_millis(600);
 
 /// How many times a client tries to attach before watching for itself.
-const SHARE_ATTEMPTS: u32 = 4;
+pub(crate) const SHARE_ATTEMPTS: u32 = 4;
 
 /// A client's end of the connection.
 ///
@@ -963,7 +978,7 @@ fn expired() -> std::io::Error {
 /// option with `EINVAL` once the peer has closed both directions, which
 /// is exactly when a note the monitor already delivered is sitting in
 /// the receive buffer waiting to be read.
-fn connect_within(
+pub(crate) fn connect_within(
     path: &std::path::Path,
     deadline: std::time::Instant,
 ) -> std::io::Result<std::os::unix::net::UnixStream> {
@@ -1272,17 +1287,20 @@ fn read_frame(
 pub(crate) enum Seen {
     /// Compatible, and attached.
     Shared(Conn),
-    /// A monitor that should KEEP the repo: newer than us, or it
-    /// refused this client on its merits. Starting one would add a
-    /// monitor that cannot own anything.
+    /// A monitor that should KEEP the repo: it refused this client on
+    /// its merits. Starting one would add a monitor that cannot own
+    /// anything.
     Theirs(String),
+    /// A newer monitor, which keeps the repo for the same reason.
+    Newer(String),
     /// Nothing usable is published. Starting one is the answer.
     Vacant(String),
     /// An older peer answered, and has now been greeted by a newer
     /// client. Retirement is UNCONFIRMED: proto 3 and 4 cannot
-    /// self-exit, and the wire does not distinguish a refusal from
-    /// retirement progress. The lease is what settles it.
-    OlderPeer(String),
+    /// self-exit, and the lease is what settles it. `obsolete` is
+    /// whether its answer was, exactly, the one it gives when told it is
+    /// obsolete, rather than one of its other refusals.
+    OlderPeer { why: String, obsolete: bool },
     /// Nothing was established. Not evidence of anything, and never a
     /// reason to fork.
     Unproven(String),
@@ -1292,9 +1310,11 @@ impl From<Seen> for Attached {
     fn from(seen: Seen) -> Self {
         match seen {
             Seen::Shared(conn) => Attached::Shared(conn),
-            Seen::Theirs(why) | Seen::Vacant(why) | Seen::OlderPeer(why) | Seen::Unproven(why) => {
-                Attached::Alone(why)
-            }
+            Seen::Theirs(why)
+            | Seen::Newer(why)
+            | Seen::Vacant(why)
+            | Seen::OlderPeer { why, .. }
+            | Seen::Unproven(why) => Attached::Alone(why),
         }
     }
 }
@@ -1375,7 +1395,7 @@ pub(crate) fn look_at_in(
     // c4b5899). The repo still gates — a descriptor outlives the repo
     // it describes — and the VERSION is settled by the handshake,
     // where both ends can act on it.
-    let (socket, hint) = match published_in(namespace, repo, unsafe { libc::getuid() }) {
+    let socket = match published_in(namespace, repo, unsafe { libc::getuid() }) {
         Published::Nothing => {
             return Seen::Vacant(format!("no monitor published for {}", repo.display()));
         }
@@ -1398,11 +1418,10 @@ pub(crate) fn look_at_in(
                 repo.display()
             ));
         }
-        Published::Ours(d) => (d.socket, PROTO),
+        Published::Ours(d) => d.socket,
         Published::Other {
-            proto,
-            socket: Some(s),
-        } => (s, proto),
+            socket: Some(s), ..
+        } => s,
         Published::Other {
             proto,
             socket: None,
@@ -1415,13 +1434,22 @@ pub(crate) fn look_at_in(
             ));
         }
     };
-    let d = Descriptor {
-        proto: hint,
-        pid: 0,
-        repo: repo.to_string_lossy().to_string(),
-        socket,
-    };
-    let stream = match connect(std::path::Path::new(&d.socket), deadline) {
+    greet_at(&socket, repo, who, deadline, connect)
+}
+
+/// Greet the monitor listening at `socket` on behalf of `who` in `repo`,
+/// and classify its answer.
+pub(crate) fn greet_at(
+    socket: &str,
+    repo: &std::path::Path,
+    who: Who,
+    deadline: std::time::Instant,
+    connect: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream>,
+) -> Seen {
+    let stream = match connect(std::path::Path::new(socket), deadline) {
         Ok(s) => s,
         // A descriptor outlives its monitor: a refused connection is
         // the ordinary way a dead one is noticed, and a connect that
@@ -1429,7 +1457,7 @@ pub(crate) fn look_at_in(
         // A descriptor outlives its monitor, so a refused connection
         // is the ordinary way a dead one is noticed — and then nothing
         // holds the repo.
-        Err(e) => return Seen::Vacant(format!("cannot reach {}: {e}", d.socket)),
+        Err(e) => return Seen::Vacant(format!("cannot reach {}: {e}", socket)),
     };
 
     let hello = Hello {
@@ -1444,13 +1472,13 @@ pub(crate) fn look_at_in(
 
     let mut conn = Conn::over_reader(std::io::BufReader::new(stream));
     if let Err(e) = write_frame(conn.io.get_ref(), format!("{line}\n").as_bytes(), deadline) {
-        return Seen::Unproven(format!("cannot greet {}: {e}", d.socket));
+        return Seen::Unproven(format!("cannot greet {}: {e}", socket));
     }
 
     let answer = match read_frame(&mut conn.io, &mut conn.partial, deadline) {
         Ok(answer) => answer,
         Err(e) => {
-            return Seen::Unproven(format!("the handshake with {} failed: {e}", d.socket));
+            return Seen::Unproven(format!("the handshake with {} failed: {e}", socket));
         }
     };
     // Version before body here too: the descriptor said what the
@@ -1465,7 +1493,7 @@ pub(crate) fn look_at_in(
             // Newer, and it keeps the repo. We are the stale client
             // and go it alone; starting one would only add a monitor
             // that cannot own anything.
-            return Seen::Theirs(why);
+            return Seen::Newer(why);
         }
         // Older. The REPLY still has to be one we understand before it
         // means anything: a bare `{"proto":4}`, an unknown body, or an
@@ -1479,7 +1507,13 @@ pub(crate) fn look_at_in(
         // established is an older peer that has now been greeted; the
         // LEASE is what says whether it left.
         return match serde_json::from_str::<Welcome>(answer.trim_end()) {
-            Ok(Welcome::Decline { .. }) => Seen::OlderPeer(why),
+            Ok(Welcome::Decline {
+                proto,
+                why: answered,
+            }) => Seen::OlderPeer {
+                why,
+                obsolete: answered == obsolete_why(proto, PROTO),
+            },
             _ => Seen::Unproven(format!(
                 "a proto {theirs} monitor answered something this build cannot read"
             )),
@@ -1862,13 +1896,52 @@ pub(crate) async fn attach_or_spawn_by(
     // to free, start, attach. The retries used to take a fresh budget
     // each, so the count was the bound rather than any deadline.
     let by = std::time::Instant::now() + settle + budget;
-    let mut why = match look_at(repo, who.clone(), budget, connect) {
+    attach_or_spawn_until(
+        repo,
+        who,
+        by,
+        budget,
+        settle / limit,
+        limit,
+        spawn,
+        connect,
+        took_it,
+    )
+    .await
+}
+
+/// [`attach_or_spawn_by`] under a deadline the caller already holds: the
+/// first handshake gets at most `first` of what is left of it, and every
+/// later step only what is left when it starts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attach_or_spawn_until(
+    repo: &std::path::Path,
+    who: Who,
+    by: std::time::Instant,
+    first: Duration,
+    step: Duration,
+    limit: u32,
+    spawn: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn Started>>,
+    connect: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream>
+    + Copy,
+    took_it: impl Fn(&std::path::Path) -> bool,
+) -> Attached {
+    let left = by.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return Attached::Alone("the handoff ran out of time before it began".into());
+    }
+    let mut why = match look_at(repo, who.clone(), first.min(left), connect) {
         Seen::Shared(conn) => return Attached::Shared(conn),
         // A monitor that should keep the repo. Starting one would add
         // a monitor that cannot own anything, and doing it on every
         // park is the cost this classification exists to remove.
-        Seen::Theirs(why) | Seen::Unproven(why) => return Attached::Alone(why),
-        Seen::Vacant(why) | Seen::OlderPeer(why) => why,
+        Seen::Theirs(why) | Seen::Newer(why) | Seen::Unproven(why) => {
+            return Attached::Alone(why);
+        }
+        Seen::Vacant(why) | Seen::OlderPeer { why, .. } => why,
     };
 
     // The repo is ours when its LEASE frees, and nothing sooner says
@@ -1907,12 +1980,14 @@ pub(crate) async fn attach_or_spawn_by(
     if !left.is_zero() {
         match look_at(repo, who.clone(), left, connect) {
             Seen::Shared(conn) => return Attached::Shared(conn),
-            Seen::Theirs(next) | Seen::Unproven(next) => return Attached::Alone(next),
-            Seen::Vacant(next) | Seen::OlderPeer(next) => why = next,
+            Seen::Theirs(next) | Seen::Newer(next) | Seen::Unproven(next) => {
+                return Attached::Alone(next);
+            }
+            Seen::Vacant(next) | Seen::OlderPeer { why: next, .. } => why = next,
         }
     }
 
-    match wait_for_ownership_by(repo, by, settle / limit, took_it).await {
+    match wait_for_ownership_by(repo, by, step, took_it).await {
         Ownership::Ready => {}
         // Still held when time ran out. This client does its own work;
         // a monitor that cannot own the repo helps nobody.
@@ -1945,7 +2020,7 @@ pub(crate) async fn attach_or_spawn_by(
         if left.is_zero() {
             break;
         }
-        tokio::time::sleep((settle / limit).min(left)).await;
+        tokio::time::sleep(step.min(left)).await;
         attempts += 1;
         // What is LEFT of the one deadline, never a fresh budget: an
         // attempt entering its handshake just before `by` could
@@ -1957,8 +2032,10 @@ pub(crate) async fn attach_or_spawn_by(
         }
         match look_at(repo, who.clone(), left, connect) {
             Seen::Shared(conn) => return Attached::Shared(conn),
-            Seen::Theirs(next) | Seen::Unproven(next) => return Attached::Alone(next),
-            Seen::Vacant(next) | Seen::OlderPeer(next) => why = next,
+            Seen::Theirs(next) | Seen::Newer(next) | Seen::Unproven(next) => {
+                return Attached::Alone(next);
+            }
+            Seen::Vacant(next) | Seen::OlderPeer { why: next, .. } => why = next,
         }
     }
     // Held until here: startup and classification are both done, and a
@@ -2161,15 +2238,37 @@ pub(crate) fn core_wakes(
 pub(crate) fn spawn_monitor(repo: &std::path::Path) -> std::io::Result<Box<dyn Started>> {
     use std::os::unix::process::CommandExt;
 
-    std::process::Command::new(std::env::current_exe()?)
-        .args(["monitor", "start", "--repo"])
-        .arg(repo)
+    let installed = match crate::build_stamp::rendezvous() {
+        Some(rendezvous) => rendezvous,
+        None => crate::build_stamp::Rendezvous {
+            path: std::env::current_exe()?,
+            source: crate::build_stamp::Source::Fallback,
+        },
+    };
+    monitor_command(&installed, repo)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
         .map(|child| Box::new(Spawned(child)) as Box<dyn Started>)
+}
+
+/// The command that starts `repo`'s monitor from the installation at
+/// `installed`, telling it where that is so it compares against the same
+/// file it was started from.
+fn monitor_command(
+    installed: &crate::build_stamp::Rendezvous,
+    repo: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(&installed.path);
+    command
+        .args(["monitor", "start", "--repo"])
+        .arg(repo)
+        .arg("--installed-at")
+        .arg(&installed.path)
+        .args(["--installed-from", installed.source.as_str()]);
+    command
 }
 
 /// Held for the life of the monitor. Dropping it — including by dying —
@@ -2555,6 +2654,7 @@ const CLIENT_QUEUE: usize = 2;
 pub async fn run(args: super::MonitorArgs) -> anyhow::Result<()> {
     match args.command {
         super::MonitorCmd::Start(a) => start(a).await,
+        super::MonitorCmd::Upgrade => super::monitor_upgrade::run().await,
     }
 }
 
@@ -2594,6 +2694,34 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
     let repo = std::sync::Arc::new(dunce::canonicalize(&repo).unwrap_or(repo));
 
+    // The build before the lease: a monitor already stale when it first
+    // looks never owns the repo, so a replacement between its exec and
+    // here is not advertised.
+    let running = crate::build_stamp::running();
+    let installed = match args.installed_at.clone() {
+        Some(path) => Some(crate::build_stamp::Rendezvous {
+            path,
+            source: args
+                .installed_from
+                .as_deref()
+                .and_then(crate::build_stamp::Source::parse)
+                .unwrap_or(crate::build_stamp::Source::Invocation),
+        }),
+        None => crate::build_stamp::rendezvous(),
+    };
+    let mut installation = installed
+        .as_ref()
+        .map(|r| crate::build_stamp::Installation::at(r.path.clone()));
+    if let Some(installation) = &mut installation
+        && let crate::build_stamp::Install::Replaced(other) = installation.look(running)
+    {
+        eprintln!(
+            "monitor: {} holds build {other}, not this one ({running}); not starting",
+            installation.path().display()
+        );
+        return Ok(());
+    }
+
     // The lease first: everything after it assumes no other owner,
     // including clearing a socket a dead one left behind.
     let lease = acquire_lease(&repo).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2602,10 +2730,47 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let pid = std::process::id() as i32;
     let (listener, socket) = bind_listener(&socket_dirs(me, xdg.as_deref()), pid, me, &lease)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    forget_dead_observations(&repo);
+    let described = installed.as_ref().map(|r| DescribedBuild {
+        running: running.to_string(),
+        installed_at: r.path.to_string_lossy().into_owned(),
+        source: r.source,
+    });
     let mut tenure = Tenure::new(lease);
+    if let (Some(installation), Some(installed)) = (installation, installed.as_ref()) {
+        let (repo, birth) = (repo.clone(), crate::proc_identity::token_for(pid));
+        let (installed_at, source) = (
+            installed.path.to_string_lossy().into_owned(),
+            installed.source,
+        );
+        tenure = tenure.with_build(Built::new(
+            installation,
+            running,
+            Box::new(move |install| {
+                let observation = Observation {
+                    pid,
+                    birth: birth.clone(),
+                    running: running.to_string(),
+                    installed_at: installed_at.clone(),
+                    source,
+                    state: install.into(),
+                };
+                if let Err(e) = note_observation(&repo, &observation) {
+                    eprintln!("monitor: cannot record what it sees of its installation: {e}");
+                }
+            }),
+        ));
+    }
+    let describe_this = {
+        let (repo, socket, described) = (repo.clone(), socket.clone(), described.clone());
+        move || Descriptor {
+            build: described.clone(),
+            ..describe(&repo, pid, &socket)
+        }
+    };
     let republish = {
-        let (repo, socket) = (repo.clone(), socket.clone());
-        move || publish(&repo, &describe(&repo, pid, &socket)).map_err(|e| e.to_string())
+        let (repo, describe_this) = (repo.clone(), describe_this.clone());
+        move || publish(&repo, &describe_this()).map_err(|e| e.to_string())
     };
     let lease_lost = tenure.watch.clone();
 
@@ -2616,7 +2781,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // the watchdog, in this process, and a stalled fold reaches a
     // client as silence rather than as a number that failed to move.
     let mut fold: u64 = 0;
-    publish(&repo, &describe(&repo, pid, &socket))?;
+    publish(&repo, &describe_this())?;
     println!(
         "monitor for {} listening on {}",
         repo.display(),
@@ -2728,7 +2893,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     recovery.discover_pending(&crate::agent_store::agents_root(&repo));
     let (record_changes, mut changed_records) = tokio::sync::mpsc::unbounded_channel();
     let records = crate::cli::recovery::RecordWatch::spawn(record_changes);
-    loop {
+    let ended = loop {
         if tenure.retiring() {
             tenure
                 .watch
@@ -2991,6 +3156,10 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     // panel is open. The ones that get nothing read
                     // EOF, which is the recovery door they already
                     // have.
+                    // A monitor already retiring (a stale build, a lost
+                    // lease) leaves by its own retirement, with the
+                    // producer drain, not this short one.
+                    Greeted::StandDown if !owner => continue,
                     Greeted::StandDown => {
                         let decision = stand_down(
                             &repo,
@@ -3189,7 +3358,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 }
             }
         }
-    }
+    };
+    let _ = std::fs::remove_file(observation_path(&repo, pid));
+    ended
 }
 
 /// What woke the monitor's loop, received before anything is done
@@ -3867,6 +4038,52 @@ pub(crate) enum Settled {
     Owner,
     Retaken(Detection),
     Retire(Detection),
+    /// A different build is installed: retire, and never repair or
+    /// advertise.
+    Stale {
+        running: crate::build_stamp::Stamp,
+        installed: crate::build_stamp::Stamp,
+    },
+}
+
+/// A monitor's view of its own build against the installation.
+pub(crate) struct Built {
+    installation: crate::build_stamp::Installation,
+    running: crate::build_stamp::Stamp,
+    shown: Option<crate::build_stamp::Install>,
+    /// Records a changed state where status reads it.
+    note: Box<dyn Fn(&crate::build_stamp::Install) + Send>,
+}
+
+impl Built {
+    pub(crate) fn new(
+        installation: crate::build_stamp::Installation,
+        running: crate::build_stamp::Stamp,
+        note: Box<dyn Fn(&crate::build_stamp::Install) + Send>,
+    ) -> Self {
+        Built {
+            installation,
+            running,
+            shown: None,
+            note,
+        }
+    }
+
+    /// Look at the installation, noting and logging only a change.
+    fn look(&mut self) -> crate::build_stamp::Install {
+        let install = self.installation.look(self.running);
+        if self.shown.as_ref() != Some(&install) {
+            eprintln!(
+                "monitor: installation {} at {}: {install:?} (running {})",
+                self.installation.path().display(),
+                timestamp(),
+                self.running
+            );
+            (self.note)(&install);
+            self.shown = Some(install.clone());
+        }
+        install
+    }
 }
 
 /// The loop's hold on the repo, and the only code that re-takes the
@@ -3875,6 +4092,7 @@ pub(crate) struct Tenure {
     lease: MonitorLease,
     watch: std::sync::Arc<LeaseWatch>,
     retiring: bool,
+    build: Option<Built>,
 }
 
 impl Tenure {
@@ -3884,6 +4102,14 @@ impl Tenure {
             lease,
             watch,
             retiring: false,
+            build: None,
+        }
+    }
+
+    pub(crate) fn with_build(self, build: Built) -> Self {
+        Tenure {
+            build: Some(build),
+            ..self
         }
     }
 
@@ -3893,6 +4119,17 @@ impl Tenure {
     pub(crate) fn settle(&mut self, publish: &dyn Fn() -> Result<(), String>) -> Settled {
         if self.retiring {
             return Settled::Retire(self.given_up());
+        }
+        // The build first: a stale build retires before the lease could
+        // be repaired or the descriptor republished.
+        if let Some(build) = &mut self.build
+            && let crate::build_stamp::Install::Replaced(installed) = build.look()
+        {
+            self.retiring = true;
+            return Settled::Stale {
+                running: build.running,
+                installed,
+            };
         }
         let found = self.lease.check();
         if found == Found::Held {
@@ -3933,7 +4170,7 @@ impl Tenure {
     /// Whether what a wake leads to may run as owner: the lease looked
     /// at now, and a loss settled first.
     pub(crate) fn may_act(&mut self, publish: &dyn Fn() -> Result<(), String>) -> bool {
-        !matches!(self.settle(publish), Settled::Retire(_))
+        matches!(self.settle(publish), Settled::Owner | Settled::Retaken(_))
     }
 
     pub(crate) fn retiring(&self) -> bool {
@@ -4534,7 +4771,129 @@ pub(crate) fn describe(repo: &std::path::Path, pid: i32, socket: &std::path::Pat
         pid,
         repo: repo.to_string_lossy().to_string(),
         socket: socket.to_string_lossy().to_string(),
+        build: None,
     }
+}
+
+/// What one monitor process has seen of its installation: kept apart
+/// from the routing descriptor, under that process's own name, so it can
+/// be written at any time without touching where clients connect.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Observation {
+    pub(crate) pid: i32,
+    pub(crate) birth: Option<crate::proc_identity::ProcToken>,
+    pub(crate) running: String,
+    pub(crate) installed_at: String,
+    pub(crate) source: crate::build_stamp::Source,
+    pub(crate) state: Observed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Observed {
+    Current,
+    Replaced { installed: String },
+    Unavailable { why: String },
+}
+
+impl From<&crate::build_stamp::Install> for Observed {
+    fn from(install: &crate::build_stamp::Install) -> Self {
+        use crate::build_stamp::Install;
+        match install {
+            Install::Current => Observed::Current,
+            Install::Replaced(stamp) => Observed::Replaced {
+                installed: stamp.to_string(),
+            },
+            Install::Unavailable(why) => Observed::Unavailable { why: why.clone() },
+        }
+    }
+}
+
+const OBSERVATION_PREFIX: &str = "build-";
+
+fn observation_path(repo: &std::path::Path, pid: i32) -> std::path::PathBuf {
+    runtime_path(repo, &format!("{OBSERVATION_PREFIX}{pid}.json"))
+}
+
+/// Write `observation` as its process's record for `repo`, by rename.
+pub(crate) fn note_observation(
+    repo: &std::path::Path,
+    observation: &Observation,
+) -> std::io::Result<()> {
+    let path = observation_path(repo, observation.pid);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(observation)?)?;
+    std::fs::rename(tmp, path)
+}
+
+/// Remove this repo's observation records whose process is gone, as
+/// left by monitors that died.
+fn forget_dead_observations(repo: &std::path::Path) {
+    let marker = runtime_path(repo, OBSERVATION_PREFIX);
+    let (Some(dir), Some(prefix)) = (marker.parent(), marker.file_name()) else {
+        return;
+    };
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let alive = std::fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Observation>(&bytes).ok())
+            .is_some_and(|o| o.birth.is_some_and(|b| b.still_holds(o.pid)));
+        if !alive {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The serving monitor's build, for `clank status`: the routing
+/// descriptor joined to the observation record of the process it names.
+pub(crate) fn build_line(repo: &std::path::Path) -> Option<String> {
+    match published(repo) {
+        Published::Ours(d) => {
+            let observed = std::fs::read(observation_path(repo, d.pid))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Observation>(&bytes).ok())
+                .filter(|o| {
+                    o.pid == d.pid && o.birth.as_ref().is_some_and(|b| b.still_holds(o.pid))
+                });
+            Some(describe_build(d.pid, d.build.as_ref(), observed.as_ref()))
+        }
+        Published::Other { proto, .. } => Some(format!("proto {proto}, build unknown (legacy)")),
+        Published::Nothing | Published::Untrusted(_) => None,
+    }
+}
+
+fn describe_build(
+    pid: i32,
+    build: Option<&DescribedBuild>,
+    observed: Option<&Observation>,
+) -> String {
+    let Some(build) = build else {
+        return format!("pid {pid}, build unknown (legacy)");
+    };
+    let state = match observed.map(|o| &o.state) {
+        Some(Observed::Current) => "current".to_string(),
+        Some(Observed::Replaced { installed }) => {
+            format!("replaced by {installed}, retiring")
+        }
+        Some(Observed::Unavailable { why }) => format!("install path unavailable: {why}"),
+        None => "not yet observed".to_string(),
+    };
+    let fallback = if build.source == crate::build_stamp::Source::Fallback {
+        " (fallback path)"
+    } else {
+        ""
+    };
+    format!(
+        "pid {pid}, build {} at {}{fallback}: {state}",
+        build.running, build.installed_at
+    )
 }
 
 /// Fold, and move the heartbeat ONLY if that succeeded.
@@ -7417,6 +7776,7 @@ mod tests {
                 pid: 4499,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: socket.to_string_lossy().to_string(),
+                build: None,
             },
         )
         .unwrap();
@@ -7818,6 +8178,7 @@ mod tests {
             pid: 4242,
             repo: "/w/proj".into(),
             socket: "/tmp/clank-socks-501/4242.sock".into(),
+            build: None,
         };
         let back: Descriptor = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back, d);
@@ -7833,6 +8194,7 @@ mod tests {
             pid: 4242,
             repo: repo.to_string_lossy().to_string(),
             socket: "/tmp/clank-socks-501/4242.sock".into(),
+            build: None,
         }
     }
 
@@ -8302,6 +8664,7 @@ mod tests {
                 pid: 4242,
                 repo: repo.to_string_lossy().to_string(),
                 socket: path.to_string_lossy().to_string(),
+                build: None,
             },
         )
         .unwrap();
@@ -8411,6 +8774,7 @@ mod tests {
                 pid: 1,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: "/tmp/clank-socks-501/nobody-home.sock".into(),
+                build: None,
             },
         )
         .unwrap();
@@ -8428,6 +8792,7 @@ mod tests {
                 pid: 1,
                 repo: "/w/elsewhere".into(),
                 socket: "/tmp/clank-socks-501/elsewhere.sock".into(),
+                build: None,
             },
         )
         .unwrap();
@@ -8705,6 +9070,7 @@ mod tests {
             pid: 4343,
             repo: repo.to_string_lossy().to_string(),
             socket: path.to_string_lossy().to_string(),
+            build: None,
         };
         (dir, d)
     }
@@ -9154,7 +9520,7 @@ mod tests {
         let (_dir, _served) = fake_monitor(repo.path(), Some(decline));
         assert!(matches!(
             look_at(repo.path(), agent("codex"), ATTACH_BUDGET, connect_within),
-            Seen::OlderPeer(_)
+            Seen::OlderPeer { .. }
         ));
     }
 
@@ -9459,6 +9825,7 @@ mod tests {
                 pid: 4801,
                 repo: repo.path().to_string_lossy().to_string(),
                 socket: old_sock.to_string_lossy().to_string(),
+                build: None,
             },
         )
         .unwrap();
@@ -9544,6 +9911,7 @@ mod tests {
                         pid: 4802,
                         repo: r.to_string_lossy().to_string(),
                         socket: new_sock.to_string_lossy().to_string(),
+                        build: None,
                     },
                 )
                 .map_err(std::io::Error::other)?;
@@ -9797,6 +10165,7 @@ mod tests {
                     pid: 4777,
                     repo: repo.path().to_string_lossy().to_string(),
                     socket: socket.to_string_lossy().to_string(),
+                    build: None,
                 },
             )
             .unwrap();
@@ -9952,6 +10321,7 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .to_string(),
+                build: None,
             },
         )
         .unwrap();
@@ -13375,5 +13745,299 @@ mod lease_tests {
                 .any(|row| format!("{:?}", row.item).contains("finished")),
             "the work's output was lost to the cancellation"
         );
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use crate::build_stamp::{Install, Installation, Rendezvous, Source, Stamp, running};
+
+    fn other() -> Stamp {
+        let mut stamp = running().0;
+        stamp[0] ^= 1;
+        Stamp(stamp)
+    }
+
+    fn install(path: &std::path::Path, stamp: Stamp) {
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, crate::build_stamp::executable_with(stamp)).unwrap();
+        std::fs::rename(tmp, path).unwrap();
+    }
+
+    fn noted() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<Install>>>,
+        Box<dyn Fn(&Install) + Send>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = seen.clone();
+        (
+            seen,
+            Box::new(move |i: &Install| into.lock().unwrap().push(i.clone())),
+        )
+    }
+
+    fn counting() -> (
+        std::rc::Rc<std::cell::Cell<u32>>,
+        impl Fn() -> Result<(), String>,
+    ) {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let c = count.clone();
+        (count, move || {
+            c.set(c.get() + 1);
+            Ok(())
+        })
+    }
+
+    fn repo() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    /// A replaced build retires without repairing a lost lease or
+    /// republishing, and stays retired; an unavailable one keeps owning.
+    #[test]
+    fn a_replaced_build_retires_and_never_repairs() {
+        let repo = repo();
+        let bin = tempfile::tempdir().unwrap();
+        let path = bin.path().join("clank");
+        install(&path, running());
+        let (seen, note) = noted();
+        let lease = acquire_lease(repo.path()).unwrap();
+        let lease_path = lease.path().to_path_buf();
+        let mut tenure = Tenure::new(lease).with_build(Built::new(
+            Installation::at(path.clone()),
+            running(),
+            note,
+        ));
+        let (published, publish) = counting();
+        assert!(tenure.may_act(&publish));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            tenure.may_act(&publish),
+            "an unavailable installation keeps ownership"
+        );
+
+        install(&path, other());
+        std::fs::remove_file(&lease_path).unwrap();
+        assert_eq!(
+            tenure.settle(&publish),
+            Settled::Stale {
+                running: running(),
+                installed: other()
+            }
+        );
+        assert!(
+            !lease_path.exists(),
+            "the lease was repaired by a stale build"
+        );
+        assert!(!tenure.may_act(&publish));
+        assert_eq!(published.get(), 0, "a stale build advertised");
+        let seen = seen.lock().unwrap();
+        assert!(
+            matches!(seen.as_slice(), [Install::Current, Install::Unavailable(_), Install::Replaced(s)] if *s == other())
+        );
+    }
+
+    /// The old monitor's last word lands under its own process, never on
+    /// the routing descriptor: a successor that took the repo after the
+    /// old one's last owner look keeps it.
+    #[test]
+    fn a_late_observation_cannot_take_routing_back() {
+        let repo = repo();
+        let bin = tempfile::tempdir().unwrap();
+        let path = bin.path().join("clank");
+        install(&path, running());
+        let old_pid = std::process::id() as i32;
+        let note: Box<dyn Fn(&Install) + Send> = {
+            let repo = repo.path().to_path_buf();
+            Box::new(move |install: &Install| {
+                note_observation(
+                    &repo,
+                    &Observation {
+                        pid: old_pid,
+                        birth: crate::proc_identity::token_for(old_pid),
+                        running: running().to_string(),
+                        installed_at: "/bin/clank".into(),
+                        source: Source::Invocation,
+                        state: install.into(),
+                    },
+                )
+                .unwrap()
+            })
+        };
+        let lease = acquire_lease(repo.path()).unwrap();
+        let lease_path = lease.path().to_path_buf();
+        let mut tenure = Tenure::new(lease).with_build(Built::new(
+            Installation::at(path.clone()),
+            running(),
+            note,
+        ));
+        let (_, owner_publish) = counting();
+        assert!(
+            tenure.may_act(&owner_publish),
+            "the old monitor's last owner look"
+        );
+
+        std::fs::remove_file(&lease_path).unwrap();
+        let _successor = acquire_lease(repo.path()).unwrap();
+        let successor = Descriptor {
+            pid: 999_999,
+            ..describe(
+                repo.path(),
+                999_999,
+                std::path::Path::new("/tmp/successor.sock"),
+            )
+        };
+        publish(repo.path(), &successor).unwrap();
+        install(&path, other());
+        assert!(
+            !tenure.may_act(&counting().1),
+            "a stale build acted as owner"
+        );
+
+        assert_eq!(
+            read_published(repo.path()),
+            Some(successor),
+            "routing was taken back"
+        );
+        let observed: Observation =
+            serde_json::from_slice(&std::fs::read(observation_path(repo.path(), old_pid)).unwrap())
+                .unwrap();
+        assert_eq!(
+            observed.state,
+            Observed::Replaced {
+                installed: other().to_string()
+            }
+        );
+        let _ = std::fs::remove_file(observation_path(repo.path(), old_pid));
+    }
+
+    /// Status joins the routed monitor to its own observation record,
+    /// and believes the record only of the living process it names.
+    #[test]
+    fn status_shows_the_routed_monitors_build() {
+        let repo = repo();
+        let me = std::process::id() as i32;
+        let build = DescribedBuild {
+            running: running().to_string(),
+            installed_at: "/bin/clank".into(),
+            source: Source::Invocation,
+        };
+        publish(
+            repo.path(),
+            &Descriptor {
+                build: Some(build.clone()),
+                ..describe(repo.path(), me, std::path::Path::new("/tmp/x.sock"))
+            },
+        )
+        .unwrap();
+        let observe = |state: Observed, birth| {
+            note_observation(
+                repo.path(),
+                &Observation {
+                    pid: me,
+                    birth,
+                    running: build.running.clone(),
+                    installed_at: build.installed_at.clone(),
+                    source: build.source,
+                    state,
+                },
+            )
+            .unwrap()
+        };
+        let line = || build_line(repo.path()).unwrap();
+        assert!(line().ends_with("not yet observed"), "{}", line());
+        observe(Observed::Current, crate::proc_identity::token_for(me));
+        assert!(line().ends_with(": current"), "{}", line());
+        observe(
+            Observed::Replaced {
+                installed: other().to_string(),
+            },
+            crate::proc_identity::token_for(me),
+        );
+        assert!(line().contains("retiring"), "{}", line());
+        observe(
+            Observed::Unavailable { why: "gone".into() },
+            crate::proc_identity::token_for(me),
+        );
+        assert!(
+            line().contains("install path unavailable: gone"),
+            "{}",
+            line()
+        );
+        observe(Observed::Current, None);
+        assert!(
+            line().ends_with("not yet observed"),
+            "a record with no birth is not believed"
+        );
+
+        publish(
+            repo.path(),
+            &describe(repo.path(), me, std::path::Path::new("/tmp/x.sock")),
+        )
+        .unwrap();
+        assert!(line().contains("unknown (legacy)"), "{}", line());
+        let _ = std::fs::remove_file(observation_path(repo.path(), me));
+        assert_eq!(
+            describe_build(
+                1,
+                Some(&DescribedBuild {
+                    source: Source::Fallback,
+                    ..build
+                }),
+                None
+            ),
+            format!(
+                "pid 1, build {} at /bin/clank (fallback path): not yet observed",
+                running()
+            )
+        );
+    }
+
+    /// The successor is started from the same path it will compare
+    /// against, and told so.
+    #[test]
+    fn a_monitor_is_started_from_its_rendezvous() {
+        let command = monitor_command(
+            &Rendezvous {
+                path: "/opt/bin/clank".into(),
+                source: Source::Invocation,
+            },
+            std::path::Path::new("/w/repo"),
+        );
+        assert_eq!(command.get_program(), "/opt/bin/clank");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "monitor",
+                "start",
+                "--repo",
+                "/w/repo",
+                "--installed-at",
+                "/opt/bin/clank",
+                "--installed-from",
+                "invocation"
+            ]
+        );
+    }
+
+    /// A proto-12 client is still refused by this build, so it works
+    /// alone rather than being served by a monitor it cannot read.
+    #[test]
+    fn an_older_client_is_declined() {
+        let repo = repo();
+        let hello = format!(
+            "{{\"proto\":12,\"repo\":\"{}\",\"who\":{{\"as\":\"observer\"}}}}",
+            repo.path().display()
+        );
+        assert!(matches!(
+            greeting_of(&hello, repo.path()),
+            Greeting::Decline(Welcome::Decline { proto: 13, .. })
+        ));
     }
 }

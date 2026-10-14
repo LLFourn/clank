@@ -139,6 +139,9 @@ name = "clank-web-cloudflare"
 path = "src/bin/clank-web-cloudflare.rs"
 test = false
 
+[build-dependencies]
+sha2 = "0.11"
+
 [dev-dependencies]
 clank-web-cloudflare = { path = "../web-cloudflare", features = ["test-support"] }
 # Only to answer a handshake by hand in the live connector test.
