@@ -1943,6 +1943,7 @@ async fn run_leased_command_source(
     }
 
     let mut failures: u32 = 0;
+    let secrets = std::sync::Arc::new(crate::cli::source_diagnostic::host_secrets());
 
     source_group::retire_on_termination();
     let mut deferral_warned = false;
@@ -2023,6 +2024,13 @@ async fn run_leased_command_source(
             }
         };
         let mut exit = None;
+        let mut ended = match &launch_error {
+            Some(why) => crate::cli::source_diagnostic::Ended::Launch(why.clone()),
+            None => crate::cli::source_diagnostic::Ended::Unknown,
+        };
+        let tail = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::cli::source_diagnostic::Tail::default(),
+        ));
         if let Some((owned, mut child)) = launched {
             if let Some(pid) = child.id() {
                 tx.report(
@@ -2036,17 +2044,28 @@ async fn run_leased_command_source(
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             let reading = owners.reading(cs::producer_path(&store_dir, &key));
-            if let Some(err) = stderr {
-                // Diagnostics, not events: surfaced for a human
-                // reading the wait's own output, never ingested.
-                let name = src.name.clone();
-                tokio::spawn(async move {
-                    let mut lines = tokio::io::BufReader::new(err).lines();
-                    while let Ok(Some(l)) = lines.next_line().await {
-                        eprintln!("wait: command source `{name}`: {l}");
-                    }
-                });
-            }
+            // Diagnostics, not events: kept as this run's bounded tail for
+            // its failure event, and echoed only to a person watching a
+            // terminal. A piped wait's parent collects all of its stderr,
+            // so an echo there would grow without bound.
+            let stderr_reader = stderr.map(|err| {
+                use std::io::IsTerminal;
+                let echo = std::io::stderr()
+                    .is_terminal()
+                    .then(crate::cli::source_diagnostic::NonBlocking::terminal)
+                    .flatten()
+                    .map(|out| (src.name.clone(), out));
+                crate::cli::source_diagnostic::Reader::spawn(crate::cli::source_diagnostic::drain(
+                    err,
+                    tail.clone(),
+                    echo,
+                    secrets.clone(),
+                ))
+            });
+            // One cutoff for the run's output once its root exits, shared
+            // by stdout and stderr: neither gets a fresh window after the
+            // other's.
+            let mut cutoff: Option<tokio::time::Instant> = None;
             if let Some(out) = stdout {
                 let mut lines = tokio::io::BufReader::new(out).lines();
                 // The root's EXIT ends a run, not the pipe's EOF. A
@@ -2073,8 +2092,10 @@ async fn run_leased_command_source(
                                 .drain_cutoff()
                                 .map(|cutoff| cutoff.saturating_duration_since(std::time::Instant::now()))
                                 .unwrap_or(Duration::from_millis(100));
-                            let _ = tokio::time::timeout(
-                                read_for,
+                            let by = tokio::time::Instant::now() + read_for;
+                            cutoff = Some(by);
+                            let _ = tokio::time::timeout_at(
+                                by,
                                 async {
                                     while let Ok(Some(raw)) = lines.next_line().await {
                                         if let Some(what) =
@@ -2121,7 +2142,19 @@ async fn run_leased_command_source(
                 }
             }
             drop(reading);
-            exit = child.wait().await.ok().and_then(|status| status.code());
+            let status = child.wait().await.ok();
+            exit = status.and_then(|status| status.code());
+            ended = crate::cli::source_diagnostic::Ended::of(status);
+            if let Some(reader) = stderr_reader {
+                let by = cutoff.unwrap_or_else(|| {
+                    tokio::time::Instant::now()
+                        + owners
+                            .drain_cutoff()
+                            .map(|c| c.saturating_duration_since(std::time::Instant::now()))
+                            .unwrap_or(Duration::from_millis(100))
+                });
+                reader.finish_by(by).await;
+            }
             // The command's end is not its group's: a descendant it
             // left, and the anchor, are still there.
             if let Err((owned, why)) = retire_off_the_runtime(owned).await {
@@ -2139,14 +2172,21 @@ async fn run_leased_command_source(
         }
         failures = failures.saturating_add(1);
         if failures == cs::FAILURES_BEFORE_SURFACING {
+            let rendered = tail
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .render(&secrets);
             let live = cs::report_failure(
                 &src,
                 &key,
                 &mut log,
                 &mut seen,
-                &format!(
-                    "`{}` has stopped {failures} times in a row and is being restarted",
-                    src.command.join(" ")
+                &crate::cli::source_diagnostic::failure_text(
+                    &src.command,
+                    failures,
+                    &ended,
+                    &rendered,
+                    &secrets,
                 ),
                 |item| {
                     tx.send((item, crate::cli::event_source::Durability::Logged))
@@ -6850,6 +6890,84 @@ mod tests {
             rows.iter()
                 .any(|row| format!("{:?}", row.item).contains("finished")),
             "never logged"
+        );
+    }
+
+    /// Through the real host: the failure event raised after three
+    /// failed runs says how the LAST run ended and carries its stderr
+    /// tail, sanitized. A run that flooded stderr is drained without
+    /// blocking, and a descendant holding stderr open neither delays the
+    /// restart nor puts its output into a later run's tail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_failure_says_how_its_last_run_ended() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let runs = root.path().join("runs");
+        let script = root.path().join("producer.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "n=$(( $(cat '{runs}' 2>/dev/null || echo 0) + 1 )); echo $n > '{runs}'\n\
+                 case $n in\n\
+                 1) yes 'a short flood line' | head -c 5000000 >&2 ;;\n\
+                 2) (echo 'from run 2s descendant' >&2; sleep 30 >&2) & echo 'run 2' >&2 ;;\n\
+                 *) echo 'run 3 token=abc123' >&2 ;;\n\
+                 esac\n\
+                 exit 3\n",
+                runs = runs.display()
+            ),
+        )
+        .unwrap();
+        let src = command_source("flaky", &["sh", &script.display().to_string()]);
+        let key = src.source_key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events.clone()),
+            key,
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+        ));
+        let failure = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (item, _) = rx.recv().await.expect("the source stopped sending");
+                let shown = format!("{item:?}");
+                if shown.contains("has stopped") {
+                    return shown;
+                }
+            }
+        })
+        .await
+        .expect("no failure event");
+        let took = started.elapsed();
+        task.abort();
+        let _ = task.await;
+        assert!(failure.contains("exit 3"), "{failure}");
+        assert!(failure.contains("run 3"), "{failure}");
+        assert!(!failure.contains("abc123"), "a token leaked: {failure}");
+        assert!(
+            !failure.contains("run 2") && !failure.contains("flood"),
+            "{failure}"
+        );
+        assert!(
+            took < Duration::from_secs(10),
+            "a descendant holding stderr delayed the restarts: {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_signalled_run_names_its_signal() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            crate::cli::source_diagnostic::Ended::of(Some(status)),
+            crate::cli::source_diagnostic::Ended::Signal(9)
         );
     }
 }

@@ -69,6 +69,7 @@ pub mod run;
 pub mod send;
 pub(crate) mod session_holder;
 pub mod setup;
+pub(crate) mod source_diagnostic;
 pub mod source_group;
 pub(crate) mod source_ids;
 pub(crate) mod source_status;
