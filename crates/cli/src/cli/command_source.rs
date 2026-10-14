@@ -1791,6 +1791,20 @@ pub(crate) fn may_escalate(
     }
 }
 
+/// Ask a recorded group to end, without ending it: TERM, sent only while
+/// its leader is still verifiably the one recorded, so the pgid cannot
+/// have passed to anyone else. Whether it was sent.
+pub(crate) fn ask_to_end(record: &Producer, os: &impl Os) -> bool {
+    let Some(pgid) = crate::signal::Pgid::new(record.pgid()) else {
+        return false;
+    };
+    if standing(&os.leader(record), &os.group(pgid)) != Standing::Ours {
+        return false;
+    }
+    os.signal(pgid, libc::SIGTERM);
+    true
+}
+
 /// Whose group a retirement is ending, for what it reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Whose {
@@ -1812,6 +1826,18 @@ pub(crate) fn retire(
     record: &Producer,
     os: &impl Os,
     whose: Whose,
+) -> Retired {
+    retire_after(path, record, os, whose, ESCALATE_AFTER)
+}
+
+/// [`retire`], escalating to KILL after `escalate_after` rather than the
+/// usual grace: a drain has already given its groups theirs.
+pub(crate) fn retire_after(
+    path: &std::path::Path,
+    record: &Producer,
+    os: &impl Os,
+    whose: Whose,
+    escalate_after: std::time::Duration,
 ) -> Retired {
     // Validated BEFORE anything is looked at or signalled, and the
     // validation is what the rest of this function then carries: a
@@ -1884,7 +1910,7 @@ pub(crate) fn retire(
         eprintln!("wait: a command source left a producer behind (pgid {pgid}); ending it");
     }
     os.signal(pgid, libc::SIGTERM);
-    os.pause(ESCALATE_AFTER);
+    os.pause(escalate_after);
     os.collect();
 
     // Looked at AGAIN, leader included: the term may have ended the

@@ -362,6 +362,15 @@ pub(crate) enum Watch {
     StandDown,
 }
 
+/// Whether a bounded retirement is under way, as the watchdog sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retiring {
+    No,
+    Within,
+    /// Past its deadline and the margin after it.
+    Overdue,
+}
+
 /// Fold the watchdog's state forward by one look.
 ///
 /// A state machine rather than a predicate because the question is
@@ -375,7 +384,27 @@ pub(crate) enum Watch {
 /// the monitor stands down on its own, from a thread that is not the
 /// fold loop (the thing that may be stuck), and the lease frees
 /// honestly for the next client to take.
-pub(crate) fn watchdog_look(seen: u64, now: u64, missed: u32, limit: u32) -> Watch {
+///
+/// A monitor retiring has stopped folding on purpose, so while its
+/// retirement is within its deadline the fold's age is not judged; past
+/// it, the monitor is forced out like a stalled one.
+pub(crate) fn watchdog_look(
+    seen: u64,
+    now: u64,
+    missed: u32,
+    limit: u32,
+    retiring: Retiring,
+) -> Watch {
+    match retiring {
+        Retiring::No => {}
+        Retiring::Within => {
+            return Watch::Keep {
+                tick: now,
+                missed: 0,
+            };
+        }
+        Retiring::Overdue => return Watch::StandDown,
+    }
     if now != seen {
         return Watch::Keep {
             tick: now,
@@ -2145,9 +2174,111 @@ pub(crate) fn spawn_monitor(repo: &std::path::Path) -> std::io::Result<Box<dyn S
 
 /// Held for the life of the monitor. Dropping it — including by dying —
 /// frees it, so there is no stale-holder protocol to get wrong.
+///
+/// A lock on a file no longer at the lease's path proves nothing: no one
+/// looking at the path sees it, so the next client finds the path free
+/// and starts a second monitor. So the lease knows which file it locked
+/// and can be asked whether that is still the file at its path.
 #[derive(Debug)]
 pub(crate) struct MonitorLease {
     _file: std::fs::File,
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    me: u32,
+    held: FileId,
+}
+
+/// Which file: its device and inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    fn of(md: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        FileId {
+            dev: md.dev(),
+            ino: md.ino(),
+        }
+    }
+}
+
+impl std::fmt::Display for FileId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dev {} inode {}", self.dev, self.ino)
+    }
+}
+
+/// Why a lease was not taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaseError {
+    /// Another holder has the file at the path.
+    Busy(String),
+    /// What was locked could not be shown to be the file at the path.
+    /// Never ownership, and never a reason to lease somewhere else.
+    Unverifiable(String),
+}
+
+impl std::error::Error for LeaseError {}
+
+impl std::fmt::Display for LeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeaseError::Busy(why) | LeaseError::Unverifiable(why) => f.write_str(why),
+        }
+    }
+}
+
+/// What is at a lease's path, against what the lease locked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Found {
+    Held,
+    Absent,
+    Other(FileId),
+    Unreadable(String),
+}
+
+impl std::fmt::Display for Found {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Found::Held => f.write_str("the file held"),
+            Found::Absent => f.write_str("absent"),
+            Found::Other(id) => write!(f, "{id}"),
+            Found::Unreadable(why) => write!(f, "unreadable ({why})"),
+        }
+    }
+}
+
+/// What is at `path`, against `held`.
+fn found_at(path: &std::path::Path, held: FileId) -> Found {
+    match std::fs::metadata(path) {
+        Ok(md) if FileId::of(&md) == held => Found::Held,
+        Ok(md) => Found::Other(FileId::of(&md)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Found::Absent,
+        Err(e) => Found::Unreadable(e.to_string()),
+    }
+}
+
+impl MonitorLease {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(crate) fn held(&self) -> FileId {
+        self.held
+    }
+
+    /// Whether the file this lease locked is still the one at its path.
+    pub(crate) fn check(&self) -> Found {
+        found_at(&self.path, self.held)
+    }
+
+    /// Take the lease at this lease's path afresh, verified as at first.
+    fn retake(&self) -> Result<MonitorLease, LeaseError> {
+        acquire_lease_with(&self.dir, self.path.clone(), self.me, |_| {})
+    }
 }
 
 /// Take a repo's monitor lease, or report who has it.
@@ -2156,7 +2287,7 @@ pub(crate) struct MonitorLease {
 /// taken, the previous owner is gone, whatever a descriptor still says.
 /// The pid in the descriptor is for diagnostics and is never the
 /// authority — a pid can be reused, a lease cannot.
-pub(crate) fn acquire_lease(repo: &std::path::Path) -> Result<MonitorLease, String> {
+pub(crate) fn acquire_lease(repo: &std::path::Path) -> Result<MonitorLease, LeaseError> {
     let me = unsafe { libc::getuid() };
     acquire_lease_in(repo, &runtime_dir(me), me)
 }
@@ -2175,35 +2306,82 @@ pub(crate) fn acquire_lease_in(
     repo: &std::path::Path,
     dir: &std::path::Path,
     me: u32,
-) -> Result<MonitorLease, String> {
+) -> Result<MonitorLease, LeaseError> {
+    acquire_lease_with(dir, runtime_path_in(dir, repo, "lock"), me, |_| {})
+}
+
+/// The lease at `path`, accepted only when the file locked is the file
+/// at the path. `between` runs after each open and before its lock, so
+/// a test can replace the path there. A path replaced in that window is
+/// tried once more, then unverifiable.
+fn acquire_lease_with(
+    dir: &std::path::Path,
+    path: std::path::PathBuf,
+    me: u32,
+    between: impl Fn(&std::path::Path),
+) -> Result<MonitorLease, LeaseError> {
     use std::os::fd::AsRawFd;
 
     if let Err(why) = ensure_dir(dir, me) {
-        return Err(format!("cannot use this uid's runtime directory: {why}"));
+        return Err(LeaseError::Unverifiable(format!(
+            "cannot use this uid's runtime directory: {why}"
+        )));
     }
-    let path = runtime_path_in(dir, repo, "lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(|e| {
-            format!(
-                "cannot open this repo's monitor lease at {}: {e}",
+    let mut replaced = None;
+    for _ in 0..2 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                LeaseError::Unverifiable(format!(
+                    "cannot open the monitor lease at {}: {e}",
+                    path.display()
+                ))
+            })?;
+        between(&path);
+        // SAFETY: valid owned fd; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(if e.kind() == std::io::ErrorKind::WouldBlock {
+                LeaseError::Busy(format!(
+                    "another monitor already owns this repo: its lease at {} is held",
+                    path.display()
+                ))
+            } else {
+                LeaseError::Unverifiable(format!(
+                    "cannot lock the monitor lease at {}: {e}",
+                    path.display()
+                ))
+            });
+        }
+        let held = file.metadata().map(|md| FileId::of(&md)).map_err(|e| {
+            LeaseError::Unverifiable(format!(
+                "cannot read the locked lease at {}: {e}",
                 path.display()
-            )
+            ))
         })?;
-    // SAFETY: valid owned fd; flock has no memory effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        return Err(format!(
-            "another monitor already owns {}: its lease at {} is held",
-            repo.display(),
-            path.display()
-        ));
+        match found_at(&path, held) {
+            Found::Held => {
+                return Ok(MonitorLease {
+                    _file: file,
+                    dir: dir.to_path_buf(),
+                    path,
+                    me,
+                    held,
+                });
+            }
+            other => replaced = Some((held, other)),
+        }
     }
-    Ok(MonitorLease { _file: file })
+    let (held, found) = replaced.expect("the loop ran");
+    Err(LeaseError::Unverifiable(format!(
+        "the monitor lease at {} kept changing while it was taken: locked {held}, found {found}",
+        path.display()
+    )))
 }
 
 /// Publish a descriptor by RENAME, never by truncating in place.
@@ -2424,6 +2602,12 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let pid = std::process::id() as i32;
     let (listener, socket) = bind_listener(&socket_dirs(me, xdg.as_deref()), pid, me, &lease)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut tenure = Tenure::new(lease);
+    let republish = {
+        let (repo, socket) = (repo.clone(), socket.clone());
+        move || publish(&repo, &describe(&repo, pid, &socket)).map_err(|e| e.to_string())
+    };
+    let lease_lost = tenure.watch.clone();
 
     // The monitor's own fold counter. Private on purpose: it was
     // once published and put on every frame, and no reader ever
@@ -2475,7 +2659,12 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // the accept loop would prove only that the process breathes —
     // which is precisely the wedged monitor it has to detect.
     let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(fold));
-    watch_the_fold(heartbeat.clone(), WATCHDOG_TICK, WATCHDOG_MISSES);
+    watch_the_fold(
+        heartbeat.clone(),
+        tenure.watch.clone(),
+        WATCHDOG_TICK,
+        WATCHDOG_MISSES,
+    );
 
     // THE producers for this repo. One set per author, owned by this
     // process rather than by whichever parked wait happened to take
@@ -2540,6 +2729,33 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let (record_changes, mut changed_records) = tokio::sync::mpsc::unbounded_channel();
     let records = crate::cli::recovery::RecordWatch::spawn(record_changes);
     loop {
+        if tenure.retiring() {
+            tenure
+                .watch
+                .begin_retiring(LEASE_RETIREMENT + SETTLE_BUDGET);
+            let decision = stand_down(
+                &repo,
+                std::mem::take(&mut clients),
+                std::mem::take(&mut leaving),
+                std::mem::take(&mut hosted),
+                std::mem::take(&mut owned),
+                &mut arrivals,
+                &mut from_sources,
+                folded_state.as_ref(),
+                &mut pending,
+                Some(Drain {
+                    owners: &crate::cli::source_group::OWNERS,
+                    grace: DRAIN_GRACE,
+                }),
+                LEASE_RETIREMENT,
+                SETTLE_BUDGET,
+            )
+            .await;
+            match decision {
+                Shutdown::ReadyToRelease(_) => break Ok(()),
+                Shutdown::RequiresProcessExit(_) => exit_holding_the_lease(),
+            }
+        }
         let timer_deadline = hosted
             .values()
             .filter_map(|host| {
@@ -2552,86 +2768,192 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             let wait = at.saturating_sub(crate::cli::recovery::unix_now());
             tokio::time::Instant::now() + Duration::from_secs(wait)
         });
-        tokio::select! {
-            _ = crate::cli::timer_source::deadline(recovery_due) => {
-                let acts = recovery.due(crate::cli::recovery::unix_now(), |author, session| {
-                    recovery_gate(&repo, &clients, author, session)
-                });
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &asks, &records, &mut owned);
-            }
-            Some(a) = authorizations.recv() => {
-                authorize(&repo, &clients, &hosted, &mut recovery, a);
-            }
-            Some((author, session, running)) = identified.recv() => {
-                let acts = recovery.identified(&author, &session, running, crate::cli::recovery::unix_now());
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &asks, &records, &mut owned);
-            }
-            Some((author, attempt, answer)) = answered.recv() => {
-                let acts = recovery.answer(&author, &attempt, answer, crate::cli::recovery::unix_now());
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &asks, &records, &mut owned);
-            }
+        // Receive, then look at the lease, then act: whatever woke the
+        // loop, nothing it leads to runs as owner on a lease not
+        // verified since.
+        let wake = tokio::select! {
+            // The watchdog saw the lease's path change.
+            _ = lease_lost.wake.notified() => Wake::LeaseChanged,
+            _ = crate::cli::timer_source::deadline(recovery_due) => Wake::RecoveryDue,
+            Some(a) = authorizations.recv() => Wake::Authorize(a),
+            Some(identity) = identified.recv() => Wake::Identified(identity),
+            Some(answer) = answered.recv() => Wake::Answered(answer),
             Some(event) = changed_records.recv() => {
                 let mut events = std::collections::BTreeSet::from([event]);
                 while let Ok(more) = changed_records.try_recv() {
                     events.insert(more);
                 }
+                Wake::Records(events)
+            }
+            _ = crate::cli::timer_source::deadline(timer_deadline) => Wake::TimersDue,
+            accepted = listener.accept() => Wake::Accepted(accepted?.0),
+            Some(greeted) = arrivals.recv() => Wake::Arrived(greeted),
+            Some((author, emission)) = from_sources.recv() => Wake::Emitted(author, emission),
+            Some(report) = lifecycles_in.recv() => Wake::Lifecycle(report),
+            // A cancelled producer finished winding down. Nothing to
+            // do but stop owning it — which is the point: this set is
+            // what a retirement would otherwise have to wait for, and
+            // collecting here keeps it from growing with the number of
+            // config changes a long-lived monitor sees.
+            Some(author) = owned.interrupting.next(), if !owned.interrupting.is_empty() => Wake::Interrupted(author),
+            Some(_) = owned.departing.next(), if !owned.departing.is_empty() => Wake::Collected,
+            // A handshake finished. Whatever it decided has already
+            // gone to `arrivals`; this only stops us owning the task.
+            Some(_) = owned.greeting.next(), if !owned.greeting.is_empty() => Wake::Collected,
+            // A beat: the FS event or the heartbeat, whichever landed.
+            // Receiving from a channel is cancel-safe and carries no
+            // state, which is the point — see `beats`.
+            beat = beats.recv() => Wake::Beat(beat.is_some()),
+        };
+        let owner = tenure.may_act(&republish);
+        match wake {
+            Wake::LeaseChanged | Wake::Collected => {}
+            Wake::RecoveryDue => {
+                if owner {
+                    let acts = recovery.due(crate::cli::recovery::unix_now(), |author, session| {
+                        recovery_gate(&repo, &clients, author, session)
+                    });
+                    act_on_recovery(
+                        &repo,
+                        &clients,
+                        acts,
+                        &recovery_answers,
+                        &asks,
+                        &records,
+                        &mut owned,
+                    );
+                }
+            }
+            // Dropped unanswered when retiring, which the asker reads as
+            // a veto.
+            Wake::Authorize(a) => {
+                if owner {
+                    authorize(&repo, &clients, &hosted, &mut recovery, a);
+                }
+            }
+            Wake::Identified((author, session, running)) => {
+                let acts = recovery.identified(
+                    &author,
+                    &session,
+                    running,
+                    crate::cli::recovery::unix_now(),
+                );
+                if owner {
+                    act_on_recovery(
+                        &repo,
+                        &clients,
+                        acts,
+                        &recovery_answers,
+                        &asks,
+                        &records,
+                        &mut owned,
+                    );
+                }
+            }
+            Wake::Answered((author, attempt, answer)) => {
+                let acts =
+                    recovery.answer(&author, &attempt, answer, crate::cli::recovery::unix_now());
+                if owner {
+                    act_on_recovery(
+                        &repo,
+                        &clients,
+                        acts,
+                        &recovery_answers,
+                        &asks,
+                        &records,
+                        &mut owned,
+                    );
+                }
+            }
+            Wake::Records(events) => {
                 let now = crate::cli::recovery::unix_now();
                 let mut acts = Vec::new();
                 for event in events {
                     acts.extend(recovery.changed(event, now));
                 }
-                act_on_recovery(&repo, &clients, acts, &recovery_answers, &asks, &records, &mut owned);
-            }
-            _ = crate::cli::timer_source::deadline(timer_deadline) => {
-                for host in hosted.values_mut() {
-                    if let Some(timers) = &mut host.timers { timers.due(); }
+                if owner {
+                    act_on_recovery(
+                        &repo,
+                        &clients,
+                        acts,
+                        &recovery_answers,
+                        &asks,
+                        &records,
+                        &mut owned,
+                    );
                 }
             }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let repo = repo.clone();
-                let joined = joined.clone();
-                // Handshaking OFF this loop is the point: a peer that
-                // connects and says nothing must not stall folding or
-                // anyone else's registration.
-                owned.greeting.push(tokio::spawn(async move {
-                    match greet(stream, &repo).await {
-                        // Ownership transfers on a SUCCESSFUL send. A
-                        // failed one means the receiver is gone, and
-                        // dropping the `Greeted` there would detach
-                        // the writer `admit` just spawned — a socket
-                        // task nothing accounts for, after the
-                        // admission cutoff (codex on b37b6b6). So the
-                        // greeting tears down what it could not hand
-                        // over, and the cutoff observes THIS task
-                        // ending.
-                        Ok(greeted) => {
-                            if let Err(returned) = joined.send(greeted) {
-                                if let Greeted::Client(c) = returned.0
-                                    && let Some(writer) = c.writer
-                                {
-                                    writer.abort();
-                                    let _ = writer.await;
+            Wake::TimersDue => {
+                if owner {
+                    for host in hosted.values_mut() {
+                        if let Some(timers) = &mut host.timers {
+                            timers.due();
+                        }
+                    }
+                }
+            }
+            // Dropped when retiring: the peer reads EOF and finds the
+            // successor.
+            Wake::Accepted(stream) => {
+                if owner {
+                    let repo = repo.clone();
+                    let joined = joined.clone();
+                    // Handshaking OFF this loop is the point: a peer that
+                    // connects and says nothing must not stall folding or
+                    // anyone else's registration.
+                    owned.greeting.push(tokio::spawn(async move {
+                        match greet(stream, &repo).await {
+                            // Ownership transfers on a SUCCESSFUL send. A
+                            // failed one means the receiver is gone, and
+                            // dropping the `Greeted` there would detach
+                            // the writer `admit` just spawned — a socket
+                            // task nothing accounts for, after the
+                            // admission cutoff (codex on b37b6b6). So the
+                            // greeting tears down what it could not hand
+                            // over, and the cutoff observes THIS task
+                            // ending.
+                            Ok(greeted) => {
+                                if let Err(returned) = joined.send(greeted) {
+                                    if let Greeted::Client(c) = returned.0
+                                        && let Some(writer) = c.writer
+                                    {
+                                        writer.abort();
+                                        let _ = writer.await;
+                                    }
                                 }
                             }
+                            Err(e) => eprintln!("monitor: a client was not admitted: {e}"),
                         }
-                        Err(e) => eprintln!("monitor: a client was not admitted: {e}"),
-                    }
-                }));
+                    }));
+                }
             }
-            Some(greeted) = arrivals.recv() => {
+            Wake::Arrived(greeted) => {
                 let client = match greeted {
+                    // Kept, not served: the retirement this leads to
+                    // presents to it with everyone else.
+                    Greeted::Client(client) if !owner => {
+                        clients.push(client);
+                        continue;
+                    }
                     Greeted::Client(client) => client,
-                    Greeted::Control { request, out, writer } => {
-                        let answered = restart_source(
-                            &repo,
-                            &mut hosted,
-                            &source_items,
-                            &lifecycle_tx,
-                            &mut owned.departing,
-                            &request,
-                        )
-                        .await;
+                    Greeted::Control {
+                        request,
+                        out,
+                        writer,
+                    } => {
+                        let answered = if owner {
+                            restart_source(
+                                &repo,
+                                &mut hosted,
+                                &source_items,
+                                &lifecycle_tx,
+                                &mut owned.departing,
+                                &request,
+                            )
+                            .await
+                        } else {
+                            Err("this monitor no longer holds the repo's lease".to_string())
+                        };
                         let note = match answered {
                             Ok(what) => {
                                 let Control::Restart { author, key, .. } = &request;
@@ -2639,7 +2961,12 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                     lifecycles.remove(&(author, key.clone()));
                                 }
                                 if let Some(birth) = &birth {
-                                    publish_sources(&repo, sources_account(&hosted, &lifecycles, birth.clone()), &mut account, &clients);
+                                    publish_sources(
+                                        &repo,
+                                        sources_account(&hosted, &lifecycles, birth.clone()),
+                                        &mut account,
+                                        &clients,
+                                    );
                                 }
                                 Note::Done { what }
                             }
@@ -2675,6 +3002,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             &mut from_sources,
                             folded_state.as_ref(),
                             &mut pending,
+                            None,
                             RETIRE_BUDGET,
                             SETTLE_BUDGET,
                         )
@@ -2685,20 +3013,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             // and it is only safe once nothing this
                             // monitor owned is still running.
                             Shutdown::ReadyToRelease(_) => break Ok(()),
-                            // Exit WITH the lease held rather than
-                            // unwind it. An ordinary return would drop
-                            // it first and let a successor take the
-                            // repo on top of a task that still owns
-                            // its resources; the kernel releases the
-                            // flock when this process dies, which is
-                            // the one release that cannot race.
-                            Shutdown::RequiresProcessExit(_) => {
-                                eprintln!(
-                                    "monitor: cancellation had not taken effect after \
-                                     {SETTLE_BUDGET:?}; exiting with the lease held"
-                                );
-                                crate::cli::source_group::exit(STOOD_DOWN_EXIT);
-                            }
+                            Shutdown::RequiresProcessExit(_) => exit_holding_the_lease(),
                         }
                     }
                 };
@@ -2723,53 +3038,59 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             // A source produced something. WHAT that author is owed is
             // decided from their logs, not from this item — except
             // when no log holds it, which is the one case the channel
-            // is the only record of.
-            Some((author, emission)) = from_sources.recv() => {
-                if roster_authors(&repo).contains(&author) {
+            // is the only record of. Kept and served whether or not
+            // this monitor still owns the repo: it is in its custody.
+            Wake::Emitted(author, emission) => {
+                if owner && roster_authors(&repo).contains(&author) {
                     owned.interrupting.notify(&repo, author.clone());
                 }
                 if matches!(emission.0, WaitItem::TimerEvent { .. })
-                    && let Some(backlog) = timer_backlogs.get_mut(&author) { backlog.invalidate(); }
+                    && let Some(backlog) = timer_backlogs.get_mut(&author)
+                {
+                    backlog.invalidate();
+                }
                 pending.extend(
                     transient_of(emission)
                         .into_iter()
                         .map(|item| (author.clone(), item)),
                 );
                 if let Some(state) = &folded_state {
-                    leaving.extend(serve_to_cached(&repo, &mut clients, state, Some(&author), &mut pending, &mut timer_backlogs, &hosted));
+                    leaving.extend(serve_to_cached(
+                        &repo,
+                        &mut clients,
+                        state,
+                        Some(&author),
+                        &mut pending,
+                        &mut timer_backlogs,
+                        &hosted,
+                    ));
                 }
             }
             // A hosted producer moved: started, ended, backing off.
-            Some(report) = lifecycles_in.recv() => {
-                if record_lifecycle(&hosted, &mut lifecycles, report) {
-                    if let Some(birth) = &birth {
-                        publish_sources(&repo, sources_account(&hosted, &lifecycles, birth.clone()), &mut account, &clients);
-                    }
+            Wake::Lifecycle(report) => {
+                if record_lifecycle(&hosted, &mut lifecycles, report)
+                    && owner
+                    && let Some(birth) = &birth
+                {
+                    publish_sources(
+                        &repo,
+                        sources_account(&hosted, &lifecycles, birth.clone()),
+                        &mut account,
+                        &clients,
+                    );
                 }
             }
-            // A cancelled producer finished winding down. Nothing to
-            // do but stop owning it — which is the point: this set is
-            // what a retirement would otherwise have to wait for, and
-            // collecting here keeps it from growing with the number of
-            // config changes a long-lived monitor sees.
-            Some(author) = owned.interrupting.next(), if !owned.interrupting.is_empty() => {
-                owned.interrupting.completed(&repo, author);
-            }
-            Some(_) = owned.departing.next(), if !owned.departing.is_empty() => {}
-            // A handshake finished. Whatever it decided has already
-            // gone to `arrivals`; this only stops us owning the task.
-            Some(_) = owned.greeting.next(), if !owned.greeting.is_empty() => {}
-            // A beat: the FS event or the heartbeat, whichever landed.
-            // Receiving from a channel is cancel-safe and carries no
-            // state, which is the point — see `beats`.
-            beat = beats.recv() => {
-                if beat.is_none() {
+            Wake::Interrupted(author) => owned.interrupting.completed(&repo, author),
+            Wake::Beat(open) => {
+                if !open {
                     anyhow::bail!("the repo watcher stopped");
                 }
                 let events_changed = event_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
                 let timers_changed = timer_dirty.swap(false, std::sync::atomic::Ordering::AcqRel);
                 if timers_changed {
-                    for backlog in timer_backlogs.values_mut() { backlog.invalidate(); }
+                    for backlog in timer_backlogs.values_mut() {
+                        backlog.invalidate();
+                    }
                 }
                 // Fold BEFORE claiming one. The counter means a fold
                 // completed, so moving it first and then failing the
@@ -2782,36 +3103,72 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 match advance(&repo, fold, &heartbeat).await {
                     Some((next, state)) => {
                         fold = next;
-                        if events_changed {
-                            for author in roster_authors(&repo) { owned.interrupting.notify(&repo, author); }
+                        // Looked at again: the fold was a long await.
+                        let owner = owner && tenure.may_act(&republish);
+                        if events_changed && owner {
+                            for author in roster_authors(&repo) {
+                                owned.interrupting.notify(&repo, author);
+                            }
                         }
                         // `.clank/` is a wake dir, so an edited
                         // `wait_events` takes effect here rather than
                         // on a restart.
-                        owned.departing.extend(reconcile_hosting_reporting(
-                            &repo,
-                            &mut hosted,
-                            &source_items,
-                            timers_changed,
-                            Some(&lifecycle_tx),
-                        ));
-                        forget_replaced(&hosted, &mut lifecycles);
-                        if let Some(birth) = &birth {
-                            publish_sources(&repo, sources_account(&hosted, &lifecycles, birth.clone()), &mut account, &clients);
+                        if owner {
+                            owned.departing.extend(reconcile_hosting_reporting(
+                                &repo,
+                                &mut hosted,
+                                &source_items,
+                                timers_changed,
+                                Some(&lifecycle_tx),
+                            ));
+                            forget_replaced(&hosted, &mut lifecycles);
+                            if let Some(birth) = &birth {
+                                publish_sources(
+                                    &repo,
+                                    sources_account(&hosted, &lifecycles, birth.clone()),
+                                    &mut account,
+                                    &clients,
+                                );
+                            }
                         }
                         // ONE presentation, carrying the projection,
                         // the durable rows and anything held from
                         // before there was a state to present it
                         // against.
-                        leaving.extend(serve_to_cached(&repo, &mut clients, &state, None, &mut pending, &mut timer_backlogs, &hosted));
-                        let now = crate::cli::recovery::unix_now();
-                        let mut acts = recovery.reconcile(
-                            recovery_facts(&repo, &state, folded_from, &clients, &hosted, &mut timer_backlogs),
-                            now,
-                        );
-                        acts.extend(recovery.replies(now));
-                        act_on_recovery(&repo, &clients, acts, &recovery_answers, &asks, &records, &mut owned);
-                        identify_agents(&repo, &mut recovery, &identities, &mut owned);
+                        leaving.extend(serve_to_cached(
+                            &repo,
+                            &mut clients,
+                            &state,
+                            None,
+                            &mut pending,
+                            &mut timer_backlogs,
+                            &hosted,
+                        ));
+                        if owner {
+                            let now = crate::cli::recovery::unix_now();
+                            let mut acts = recovery.reconcile(
+                                recovery_facts(
+                                    &repo,
+                                    &state,
+                                    folded_from,
+                                    &clients,
+                                    &hosted,
+                                    &mut timer_backlogs,
+                                ),
+                                now,
+                            );
+                            acts.extend(recovery.replies(now));
+                            act_on_recovery(
+                                &repo,
+                                &clients,
+                                acts,
+                                &recovery_answers,
+                                &asks,
+                                &records,
+                                &mut owned,
+                            );
+                            identify_agents(&repo, &mut recovery, &identities, &mut owned);
+                        }
                         folded_state = Some(state);
                     }
                     // The counter stays where it is, so the
@@ -2821,14 +3178,39 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     None => {
                         // Keep an observed ack/config invalidation until a fold
                         // can apply it; clearing dirty must not strand Pending.
-                        if events_changed { event_dirty.store(true, std::sync::atomic::Ordering::Release); }
-                        if timers_changed { timer_dirty.store(true, std::sync::atomic::Ordering::Release); }
+                        if events_changed {
+                            event_dirty.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        if timers_changed {
+                            timer_dirty.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         eprintln!("monitor: fold failed, held at {fold}");
                     }
                 }
             }
         }
     }
+}
+
+/// What woke the monitor's loop, received before anything is done
+/// about it.
+enum Wake {
+    LeaseChanged,
+    RecoveryDue,
+    Authorize(Authorize),
+    Identified(Identified),
+    Answered(RecoveryAnswer),
+    Records(std::collections::BTreeSet<crate::cli::recovery::RecordEvent>),
+    TimersDue,
+    Accepted(tokio::net::UnixStream),
+    Arrived(Greeted),
+    Emitted(AgentLabel, crate::cli::event_source::Emission),
+    Lifecycle(crate::cli::event_source::LifecycleReport),
+    Interrupted(AgentLabel),
+    /// A task this loop owned has ended.
+    Collected,
+    /// Whether the watcher is still there.
+    Beat(bool),
 }
 
 /// What the monitor knows about each bound roster agent, for recovery.
@@ -3341,28 +3723,232 @@ fn act_on_recovery(
 /// the filesystem would add a way for this to be wrong (an unwritable
 /// `.clank/` would read as a stall) without adding anything it can
 /// learn.
-fn watch_the_fold(tick: std::sync::Arc<std::sync::atomic::AtomicU64>, every: Duration, limit: u32) {
+///
+/// It also looks at the lease's path, and only looks: a change it sees
+/// is flagged for the loop, which alone re-takes or retires.
+fn watch_the_fold(
+    tick: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    lease: std::sync::Arc<LeaseWatch>,
+    every: Duration,
+    limit: u32,
+) {
     std::thread::spawn(move || {
         let mut seen = tick.load(std::sync::atomic::Ordering::Acquire);
         let mut missed = 0;
         loop {
             std::thread::sleep(every);
             let now = tick.load(std::sync::atomic::Ordering::Acquire);
-            match watchdog_look(seen, now, missed, limit) {
+            let retiring = lease.retiring(unix_ms(), every * limit);
+            match watchdog_look(seen, now, missed, limit, retiring) {
                 Watch::Keep { tick, missed: m } => {
                     seen = tick;
                     missed = m;
                 }
                 Watch::StandDown => {
+                    let why = match retiring {
+                        Retiring::Overdue => "its retirement overran its deadline".to_string(),
+                        _ => format!(
+                            "the fold has not advanced past {seen} in {:?}",
+                            every * limit
+                        ),
+                    };
                     eprintln!(
-                        "monitor: the fold has not advanced past {seen} in {:?}; standing down so the lease frees",
-                        every * limit
+                        "monitor: lease {} ({}) at {}: forced: {why}; producers are cut off, \
+                         not drained",
+                        lease.path.display(),
+                        lease.held(),
+                        timestamp(),
                     );
                     crate::cli::source_group::exit(STOOD_DOWN_EXIT);
                 }
             }
+            if retiring == Retiring::No {
+                lease.observe();
+            }
         }
     });
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn timestamp() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "an unknown time".into())
+}
+
+/// What the loop and the watchdog share about the lease. The watchdog
+/// only looks, and wakes the loop when what it saw changed; the loop
+/// alone acts, after its own look.
+pub(crate) struct LeaseWatch {
+    path: std::path::PathBuf,
+    held: std::sync::Mutex<FileId>,
+    wake: tokio::sync::Notify,
+    /// Unix millis a retirement under way must be done by; 0 when none is.
+    retiring_until: std::sync::atomic::AtomicU64,
+}
+
+impl LeaseWatch {
+    fn new(lease: &MonitorLease) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(LeaseWatch {
+            path: lease.path().to_path_buf(),
+            held: std::sync::Mutex::new(lease.held()),
+            wake: tokio::sync::Notify::new(),
+            retiring_until: Default::default(),
+        })
+    }
+
+    fn held(&self) -> FileId {
+        *self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The watchdog's look: read-only. Wakes the loop when the path no
+    /// longer holds the file locked; it is the loop's look that decides.
+    fn observe(&self) {
+        if found_at(&self.path, self.held()) != Found::Held {
+            self.wake.notify_one();
+        }
+    }
+
+    fn begin_retiring(&self, within: Duration) {
+        self.retiring_until.store(
+            unix_ms() + within.as_millis() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    fn retiring(&self, now_ms: u64, margin: Duration) -> Retiring {
+        match self
+            .retiring_until
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => Retiring::No,
+            until if now_ms <= until + margin.as_millis() as u64 => Retiring::Within,
+            _ => Retiring::Overdue,
+        }
+    }
+}
+
+/// One look at the lease that found it lost, and what was done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Detection {
+    path: std::path::PathBuf,
+    held: FileId,
+    found: Found,
+    at: String,
+    done: String,
+}
+
+impl std::fmt::Display for Detection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lease {} held {}, path {}, at {}: {}",
+            self.path.display(),
+            self.held,
+            self.found,
+            self.at,
+            self.done
+        )
+    }
+}
+
+/// What settling the lease decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Settled {
+    Owner,
+    Retaken(Detection),
+    Retire(Detection),
+}
+
+/// The loop's hold on the repo, and the only code that re-takes the
+/// lease, publishes for it or gives it up.
+pub(crate) struct Tenure {
+    lease: MonitorLease,
+    watch: std::sync::Arc<LeaseWatch>,
+    retiring: bool,
+}
+
+impl Tenure {
+    pub(crate) fn new(lease: MonitorLease) -> Self {
+        let watch = LeaseWatch::new(&lease);
+        Tenure {
+            lease,
+            watch,
+            retiring: false,
+        }
+    }
+
+    /// Look at the lease and settle a loss: re-taken, verified and only
+    /// then republished by `publish`, or given up for retirement. Once
+    /// given up, it stays given up.
+    pub(crate) fn settle(&mut self, publish: &dyn Fn() -> Result<(), String>) -> Settled {
+        if self.retiring {
+            return Settled::Retire(self.given_up());
+        }
+        let found = self.lease.check();
+        if found == Found::Held {
+            return Settled::Owner;
+        }
+        let (path, held) = (self.lease.path().to_path_buf(), self.lease.held());
+        let detected = |done: String| Detection {
+            path,
+            held,
+            found,
+            at: timestamp(),
+            done,
+        };
+        let retaken = self.lease.retake().map_err(|e| e.to_string());
+        let republished = retaken.and_then(|lease| {
+            *self
+                .watch
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = lease.held();
+            let now = lease.held();
+            self.lease = lease;
+            publish().map(|()| now)
+        });
+        let settled = match republished {
+            Ok(now) => Settled::Retaken(detected(format!("re-taken as {now} and republished"))),
+            Err(why) => {
+                self.retiring = true;
+                Settled::Retire(detected(format!("retiring: {why}")))
+            }
+        };
+        if let Settled::Retaken(d) | Settled::Retire(d) = &settled {
+            eprintln!("monitor: {d}");
+        }
+        settled
+    }
+
+    /// Whether what a wake leads to may run as owner: the lease looked
+    /// at now, and a loss settled first.
+    pub(crate) fn may_act(&mut self, publish: &dyn Fn() -> Result<(), String>) -> bool {
+        !matches!(self.settle(publish), Settled::Retire(_))
+    }
+
+    pub(crate) fn retiring(&self) -> bool {
+        self.retiring
+    }
+
+    fn given_up(&self) -> Detection {
+        Detection {
+            path: self.lease.path().to_path_buf(),
+            held: self.lease.held(),
+            found: self.lease.check(),
+            at: timestamp(),
+            done: "already retiring".into(),
+        }
+    }
 }
 
 /// The sink `author`'s hosted sources emit into, reporting their
@@ -4400,6 +4986,32 @@ impl OwnedTasks {
     }
 }
 
+/// A stand-down's producer drain: every group asked to end, all given
+/// one `grace` together, before any is cut off.
+pub(crate) struct Drain {
+    pub(crate) owners: &'static crate::cli::source_group::Owners,
+    pub(crate) grace: Duration,
+}
+
+/// How long a lease-loss retirement gives its producers to drain.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// A lease-loss retirement's whole budget, so its drain is never cut
+/// short by the ordinary stand-down's.
+const LEASE_RETIREMENT: Duration = DRAIN_GRACE.saturating_add(RETIRE_BUDGET);
+
+/// Exit WITH the lease held rather than unwind it. An ordinary return
+/// would drop it first and let a successor take the repo on top of a
+/// task that still owns its resources; the kernel releases the flock
+/// when this process dies, which is the one release that cannot race.
+fn exit_holding_the_lease() -> ! {
+    eprintln!(
+        "monitor: cancellation had not taken effect after {SETTLE_BUDGET:?}; exiting with \
+         the lease held"
+    );
+    crate::cli::source_group::exit(STOOD_DOWN_EXIT)
+}
+
 /// Everything a stand-down does, from the cutoff to the decision.
 ///
 /// Extracted from `start`'s arm so the whole transition is reachable
@@ -4421,6 +5033,7 @@ async fn stand_down(
     )>,
     folded: Option<&crate::repo_state::RepoState>,
     pending: &mut Vec<(AgentLabel, WaitItem)>,
+    drain: Option<Drain>,
     budget: Duration,
     settle: Duration,
 ) -> Shutdown {
@@ -4430,6 +5043,10 @@ async fn stand_down(
     // be wrong about its own contract (codex on 5f7bc36).
     let by = tokio::time::Instant::now() + budget;
     let left = |by: tokio::time::Instant| by.saturating_duration_since(tokio::time::Instant::now());
+    // ZERO: the drain begins at the cutoff, not after the greetings
+    // settle, so they share one timeline: producer admission closes and
+    // every group has its TERM and its one cutoff now.
+    let draining = drain.map(|drain| drain.owners.drain(drain.grace));
     // ONE: stop the things that PRODUCE admissions, with the receiver
     // still open. A greeting that already handed its client over must
     // still land, and one cancelled mid-handshake must not be able to
@@ -4446,6 +5063,26 @@ async fn stand_down(
     if late > 0 {
         eprintln!("monitor: {late} admission(s) arrived during the cutoff");
     }
+
+    // Before any producer task is cancelled: a group draining still
+    // sends what it finishes into `from_sources`, read below, and its
+    // host reads until the group is gone.
+    let drained = match draining {
+        Some(draining) => {
+            let drainage = draining.finish(by).await;
+            for (source, how) in &drainage.outcomes {
+                eprintln!("monitor: source {}: {how}", source.display());
+            }
+            if drainage.end != crate::cli::source_group::DrainEnd::Complete {
+                eprintln!(
+                    "monitor: the producer drain did not finish: {:?}",
+                    drainage.end
+                );
+            }
+            drainage.end == crate::cli::source_group::DrainEnd::Complete
+        }
+        None => true,
+    };
 
     // Successful sends already hold custody in this queue; cancelling
     // the producers cannot discard a private forwarding buffer. Durable
@@ -4499,8 +5136,9 @@ async fn stand_down(
         );
     }
     // A greeting that could not be stopped is a live admission path,
-    // which is the one thing an orderly release must not leave behind.
-    match (greetings_ended, decision) {
+    // and a drain not accounted for may leave a producer running: an
+    // orderly release must leave neither behind.
+    match (greetings_ended && drained, decision) {
         (true, d) => d,
         (false, d) => Shutdown::RequiresProcessExit(d.report()),
     }
@@ -6225,6 +6863,7 @@ mod tests {
             &mut no_sources(),
             None,
             &mut Vec::new(),
+            None,
             Duration::from_secs(3),
             Duration::from_millis(500),
         )
@@ -6330,6 +6969,7 @@ mod tests {
             &mut from_sources,
             Some(&state),
             &mut pending,
+            None,
             Duration::from_secs(3),
             Duration::from_millis(500),
         )
@@ -6395,6 +7035,7 @@ mod tests {
             &mut no_sources(),
             None,
             &mut Vec::new(),
+            None,
             Duration::from_millis(200),
             Duration::from_millis(200),
         )
@@ -6478,6 +7119,7 @@ mod tests {
             &mut no_sources(),
             Some(&state),
             &mut pending,
+            None,
             Duration::from_secs(3),
             Duration::from_millis(500),
         )
@@ -8309,7 +8951,10 @@ mod tests {
             "and it says what was wrong: {refused}"
         );
         let refused = acquire_lease_in(repo.path(), &open, me).expect_err("no lease");
-        assert!(refused.contains("mode"), "{refused}");
+        assert!(
+            matches!(&refused, LeaseError::Unverifiable(why) if why.contains("mode")),
+            "an unreadable namespace is never owned: {refused:?}"
+        );
         let refused = take_repair_permit_in(repo.path(), &open, me);
         assert!(
             matches!(&refused, Repair::Unavailable(why) if why.contains("mode")),
@@ -12097,7 +12742,7 @@ something to promote
         let mut seen = ticks[0];
         let mut missed = 0;
         for (i, now) in ticks.iter().enumerate().skip(1) {
-            match watchdog_look(seen, *now, missed, limit) {
+            match watchdog_look(seen, *now, missed, limit, Retiring::No) {
                 Watch::Keep { tick, missed: m } => {
                     seen = tick;
                     missed = m;
@@ -12183,5 +12828,552 @@ something to promote
                 serde_json::from_str(&serde_json::to_string(&welcome).unwrap()).unwrap();
             assert_eq!(back, welcome);
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn me() -> u32 {
+        unsafe { libc::getuid() }
+    }
+
+    /// A namespace of its own and the lease path in it.
+    fn namespace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("ns");
+        let path = dir.join("repo.lock");
+        (home, dir, path)
+    }
+
+    fn take(dir: &std::path::Path, path: &std::path::Path) -> Result<MonitorLease, LeaseError> {
+        acquire_lease_with(dir, path.to_path_buf(), me(), |_| {})
+    }
+
+    /// Put a new file at `path`, as an outside cleanup and recreation
+    /// would.
+    fn replace(path: &std::path::Path) {
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, b"").unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    fn id_at(path: &std::path::Path) -> FileId {
+        FileId::of(&std::fs::metadata(path).unwrap())
+    }
+
+    #[test]
+    fn a_lease_is_owned_only_when_the_file_locked_is_the_file_at_the_path() {
+        let (_home, dir, path) = namespace();
+        let lease = take(&dir, &path).expect("unchanged: verified");
+        assert_eq!(lease.held(), id_at(&path));
+        assert_eq!(lease.check(), Found::Held);
+        assert!(matches!(take(&dir, &path), Err(LeaseError::Busy(_))));
+        drop(lease);
+
+        let always = acquire_lease_with(&dir, path.clone(), me(), replace);
+        assert!(
+            matches!(&always, Err(LeaseError::Unverifiable(why)) if why.contains("kept changing")),
+            "replaced between open and lock, every time: {always:?}"
+        );
+
+        let opened = Cell::new(0);
+        let once = acquire_lease_with(&dir, path.clone(), me(), |p| {
+            opened.set(opened.get() + 1);
+            if opened.get() == 1 {
+                replace(p);
+            }
+        })
+        .expect("replaced once, then verified on the retry");
+        assert_eq!(opened.get(), 2);
+        assert_eq!(once.held(), id_at(&path));
+    }
+
+    fn counting() -> (std::rc::Rc<Cell<u32>>, impl Fn() -> Result<(), String>) {
+        let count = std::rc::Rc::new(Cell::new(0));
+        let c = count.clone();
+        (count, move || {
+            c.set(c.get() + 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_unchanged_lease_only_looks() {
+        let (_home, dir, path) = namespace();
+        let mut tenure = Tenure::new(take(&dir, &path).unwrap());
+        let (published, publish) = counting();
+        assert_eq!(tenure.settle(&publish), Settled::Owner);
+        assert!(tenure.may_act(&publish));
+        assert_eq!(published.get(), 0);
+    }
+
+    /// Re-taken, verified, and only then republished; afterwards it is
+    /// the lease again, which a second monitor cannot take.
+    #[test]
+    fn a_removed_lease_is_retaken_before_it_is_republished() {
+        let (_home, dir, path) = namespace();
+        let lease = take(&dir, &path).unwrap();
+        let old = lease.held();
+        let mut tenure = Tenure::new(lease);
+        std::fs::remove_file(&path).unwrap();
+
+        let published = Cell::new(0);
+        let publish = || {
+            assert!(
+                matches!(take(&dir, &path), Err(LeaseError::Busy(_))),
+                "published before the lease was verifiably held"
+            );
+            published.set(published.get() + 1);
+            Ok(())
+        };
+        let Settled::Retaken(detection) = tenure.settle(&publish) else {
+            panic!("not re-taken");
+        };
+        assert_eq!(published.get(), 1);
+        assert_eq!(detection.found, Found::Absent);
+        let said = detection.to_string();
+        for part in [
+            path.display().to_string(),
+            old.to_string(),
+            "absent".into(),
+            id_at(&path).to_string(),
+        ] {
+            assert!(said.contains(&part), "{part:?} missing from {said:?}");
+        }
+        assert!(
+            said.contains(&time::OffsetDateTime::now_utc().year().to_string()),
+            "no time in {said:?}"
+        );
+        assert!(matches!(take(&dir, &path), Err(LeaseError::Busy(_))));
+        assert_eq!(tenure.settle(&publish), Settled::Owner);
+        assert_eq!(published.get(), 1);
+    }
+
+    #[test]
+    fn a_lease_another_holds_is_retired_from_and_never_republished() {
+        let (_home, dir, path) = namespace();
+        let lease = take(&dir, &path).unwrap();
+        let old = lease.held();
+        let mut tenure = Tenure::new(lease);
+        std::fs::remove_file(&path).unwrap();
+        let _theirs = take(&dir, &path).unwrap();
+        let (published, publish) = counting();
+
+        let Settled::Retire(detection) = tenure.settle(&publish) else {
+            panic!("kept acting as owner beside another");
+        };
+        assert_eq!(detection.found, Found::Other(id_at(&path)));
+        let said = detection.to_string();
+        assert!(said.contains(&old.to_string()) && said.contains(&id_at(&path).to_string()));
+        assert!(said.contains("retiring"), "{said}");
+        assert!(!tenure.may_act(&publish), "fenced from then on");
+        assert!(matches!(tenure.settle(&publish), Settled::Retire(_)));
+        assert_eq!(published.get(), 0);
+    }
+
+    fn woken(watch: &LeaseWatch) -> bool {
+        use futures_util::FutureExt;
+        watch.wake.notified().now_or_never().is_some()
+    }
+
+    /// The watchdog's look changes nothing: it wakes the loop, which
+    /// looks for itself and acts, once, however many looks saw it.
+    #[test]
+    fn the_watchdog_only_wakes_and_the_loop_acts_once() {
+        let (_home, dir, path) = namespace();
+        let mut tenure = Tenure::new(take(&dir, &path).unwrap());
+        let watch = tenure.watch.clone();
+        assert!(!woken(&watch));
+        std::fs::remove_file(&path).unwrap();
+        watch.observe();
+        watch.observe();
+        assert!(!path.exists(), "the watchdog re-took the lease");
+        assert!(woken(&watch));
+        assert!(!woken(&watch), "two looks, one wake");
+        let (published, publish) = counting();
+
+        assert!(tenure.may_act(&publish), "the wake's look re-takes it");
+        assert_eq!(published.get(), 1);
+        assert_eq!(tenure.settle(&publish), Settled::Owner);
+        watch.observe();
+        assert!(!woken(&watch), "the watchdog sees the file re-taken");
+        assert_eq!(published.get(), 1, "one action");
+    }
+
+    /// A wake is looked at before it is acted on, whether or not the
+    /// watchdog has seen anything: a replacement since the last look
+    /// fences the first owner action after it.
+    #[test]
+    fn a_wake_after_an_unseen_replacement_is_fenced() {
+        let (_home, dir, path) = namespace();
+        let mut tenure = Tenure::new(take(&dir, &path).unwrap());
+        let (published, publish) = counting();
+        assert_eq!(tenure.settle(&publish), Settled::Owner);
+        std::fs::remove_file(&path).unwrap();
+        let _successor = take(&dir, &path).unwrap();
+        assert!(!tenure.may_act(&publish));
+        assert!(tenure.retiring());
+        assert_eq!(published.get(), 0);
+    }
+
+    /// A retirement under way is judged by its deadline: a fold already
+    /// old when it began does not force it out, an overrun does, and a
+    /// stall outside one still does.
+    #[test]
+    fn a_retirement_is_judged_by_its_deadline_not_the_folds_age() {
+        assert_eq!(
+            watchdog_look(7, 7, 3, 4, Retiring::Within),
+            Watch::Keep { tick: 7, missed: 0 }
+        );
+        assert_eq!(
+            watchdog_look(7, 8, 0, 4, Retiring::Overdue),
+            Watch::StandDown
+        );
+        assert_eq!(watchdog_look(7, 7, 3, 4, Retiring::No), Watch::StandDown);
+
+        let (_home, dir, path) = namespace();
+        let watch = LeaseWatch::new(&take(&dir, &path).unwrap());
+        let margin = Duration::from_secs(20);
+        assert_eq!(watch.retiring(unix_ms(), margin), Retiring::No);
+        watch.begin_retiring(Duration::from_secs(13));
+        let now = unix_ms();
+        assert_eq!(watch.retiring(now, margin), Retiring::Within);
+        assert_eq!(watch.retiring(now + 32_000, margin), Retiring::Within);
+        assert_eq!(watch.retiring(now + 34_000, margin), Retiring::Overdue);
+    }
+
+    /// One timeline from the cutoff: a greeting that will not end and a
+    /// producer that ignores TERM together still finish inside the
+    /// budget and its settle allowance, rather than each stage starting
+    /// its own grace when the last one ran out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retirement_keeps_one_whole_deadline() {
+        use crate::cli::source_group::{self, tests::sh};
+        let owners = source_group::tests::owners();
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = sh("trap '' TERM; echo $$ > ready; exec sleep 300");
+        command.current_dir(dir.path());
+        let lease = std::sync::Arc::new(
+            crate::cli::github::log::IngestLease::try_acquire(dir.path(), "src")
+                .unwrap()
+                .unwrap(),
+        );
+        let (group, mut child) = source_group::launch(
+            owners,
+            &source_group::Arming::standard(),
+            dir.path(),
+            "src",
+            lease,
+            &mut command,
+        )
+        .await
+        .unwrap();
+        let host = tokio::spawn(async move {
+            let _ = child.wait().await;
+            let _ = tokio::task::spawn_blocking(move || group.retire()).await;
+        });
+        let stubborn = source_group::tests::pid_in(&dir.path().join("ready")).await;
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (ready, started) = std::sync::mpsc::channel();
+        let greeting = tokio::task::spawn_blocking(move || {
+            ready.send(()).unwrap();
+            let _ = hold.recv();
+        });
+        tokio::task::spawn_blocking(move || started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tasks = OwnedTasks::default();
+        tasks.greeting.push(greeting);
+        let (budget, settle) = (Duration::from_millis(325), Duration::from_millis(20));
+
+        let started = std::time::Instant::now();
+        let decision = stand_down(
+            dir.path(),
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+            tasks,
+            &mut tokio::sync::mpsc::unbounded_channel().1,
+            &mut tokio::sync::mpsc::unbounded_channel().1,
+            None,
+            &mut Vec::new(),
+            Some(Drain {
+                owners,
+                grace: Duration::from_millis(250),
+            }),
+            budget,
+            settle,
+        )
+        .await;
+        let took = started.elapsed();
+        let killed = crate::signal::probe_process(stubborn) == crate::signal::Probe::Gone;
+        release.send(()).unwrap();
+        host.await.unwrap();
+        assert!(killed, "the producer outlived the deadline");
+        assert!(matches!(decision, Shutdown::RequiresProcessExit(_)));
+        assert!(
+            took < budget + settle + Duration::from_millis(100),
+            "the retirement overran its one deadline: {took:?}"
+        );
+    }
+
+    /// A producer that ignores TERM, under a whole deadline shorter than
+    /// its grace.
+    async fn stubborn(
+        owners: &'static crate::cli::source_group::Owners,
+        dir: &std::path::Path,
+        script: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::cli::source_group::{self, tests::sh};
+        let mut command = sh(script);
+        command.current_dir(dir);
+        let lease = std::sync::Arc::new(
+            crate::cli::github::log::IngestLease::try_acquire(dir, "src")
+                .unwrap()
+                .unwrap(),
+        );
+        let (group, mut child) = source_group::launch(
+            owners,
+            &source_group::Arming::standard(),
+            dir,
+            "src",
+            lease,
+            &mut command,
+        )
+        .await
+        .unwrap();
+        let host = tokio::spawn(async move {
+            let _ = child.wait().await;
+            let _ = tokio::task::spawn_blocking(move || group.retire()).await;
+        });
+        source_group::tests::pid_in(&dir.join("ready")).await;
+        host
+    }
+
+    async fn draining_stand_down(
+        owners: &'static crate::cli::source_group::Owners,
+        grace: Duration,
+        budget: Duration,
+        settle: Duration,
+    ) -> (Shutdown, Duration) {
+        let started = std::time::Instant::now();
+        let decision = stand_down(
+            std::path::Path::new("/w/proj"),
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+            OwnedTasks::default(),
+            &mut tokio::sync::mpsc::unbounded_channel().1,
+            &mut tokio::sync::mpsc::unbounded_channel().1,
+            None,
+            &mut Vec::new(),
+            Some(Drain { owners, grace }),
+            budget,
+            settle,
+        )
+        .await;
+        (decision, started.elapsed())
+    }
+
+    /// A drain whose groups are not yet retired at the whole deadline is
+    /// never an orderly release, and it does not wait past the deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_unfinished_at_the_deadline_forbids_release() {
+        let owners = crate::cli::source_group::tests::owners();
+        let dir = tempfile::tempdir().unwrap();
+        let host = stubborn(
+            owners,
+            dir.path(),
+            "trap '' TERM; echo $$ > ready; exec sleep 300",
+        )
+        .await;
+        let (budget, settle) = (Duration::from_millis(50), Duration::from_millis(10));
+        let (decision, took) =
+            draining_stand_down(owners, Duration::from_millis(500), budget, settle).await;
+        host.await.unwrap();
+        assert!(matches!(decision, Shutdown::RequiresProcessExit(_)));
+        assert!(
+            took < budget + settle + Duration::from_millis(100),
+            "{took:?}"
+        );
+    }
+
+    /// A group whose end its retirement could not confirm forbids an
+    /// orderly release.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unconfirmed_retirement_forbids_release() {
+        let owners = crate::cli::source_group::tests::owners_unconfirmed_in_a_drain();
+        let dir = tempfile::tempdir().unwrap();
+        let host = stubborn(
+            owners,
+            dir.path(),
+            "trap 'exit 0' TERM; echo $$ > ready; while :; do sleep 0.1; done",
+        )
+        .await;
+        let (decision, _) = draining_stand_down(
+            owners,
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_millis(100),
+        )
+        .await;
+        host.await.unwrap();
+        assert!(matches!(decision, Shutdown::RequiresProcessExit(_)));
+    }
+
+    /// A host still reading its producer's output at the deadline forbids
+    /// an orderly release, and is not waited for past it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_outstanding_at_the_deadline_forbids_release() {
+        let owners = crate::cli::source_group::tests::owners();
+        let _reading = owners.reading(std::path::PathBuf::from("/src.producer"));
+        let (budget, settle) = (Duration::from_millis(100), Duration::from_millis(10));
+        let (decision, took) = draining_stand_down(owners, Duration::ZERO, budget, settle).await;
+        assert!(matches!(decision, Shutdown::RequiresProcessExit(_)));
+        assert!(
+            took < budget + settle + Duration::from_millis(100),
+            "{took:?}"
+        );
+    }
+
+    /// Settling a drain needs nothing from the blocking pool, so a full
+    /// one cannot hold a retirement past its deadline.
+    #[test]
+    fn a_full_blocking_pool_does_not_hold_a_drain_past_its_deadline() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let owners = crate::cli::source_group::tests::owners();
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let (ready, started) = std::sync::mpsc::channel();
+            let occupant = tokio::task::spawn_blocking(move || {
+                ready.send(()).unwrap();
+                let _ = hold.recv();
+            });
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            let retirement = tokio::spawn(draining_stand_down(
+                owners,
+                Duration::ZERO,
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+            ));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let in_time = retirement.is_finished();
+            release.send(()).unwrap();
+            occupant.await.unwrap();
+            let _ = retirement.await.unwrap();
+            assert!(in_time, "the retirement waited on the blocking pool");
+        });
+    }
+
+    /// The stand-down a lease loss leads to drains, through the real
+    /// source host: a root that exits on TERM leaves a descendant
+    /// finishing accepted work for three seconds, and what it prints when
+    /// done is logged before the host is cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lease_retirement_drains_its_producers() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let ready = root.path().join("ready");
+        let worker = root.path().join("worker.sh");
+        std::fs::write(
+            &worker,
+            format!(
+                "trap '' TERM\ntouch '{}'\nsleep 3\nprintf '%s\\n' '{{\"id\":\"late\",\"content\":\"finished\"}}'\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        let src = clank_core::agent_config::CommandSource {
+            interrupt: false,
+            interrupt_message: None,
+            name: "drained".into(),
+            command: [
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "sh '{}' & trap 'exit 0' TERM; while :; do sleep 0.1; done",
+                    worker.display()
+                ),
+            ]
+            .to_vec(),
+            reply_command: None,
+            receipt_command: None,
+            glyph: None,
+        };
+        let key = src.source_key();
+        let author = AgentLabel::parse("alpha").unwrap();
+        let (into, mut from_sources) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(crate::cli::wait::run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::for_author(into, author.clone()),
+            Some(events.clone()),
+            key.clone(),
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+        ));
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists());
+        let hosted = std::collections::BTreeMap::from([(
+            author,
+            Hosted {
+                spec: Vec::new(),
+                tasks: std::collections::BTreeMap::from([(
+                    key.clone(),
+                    HostedTask {
+                        instance: 1,
+                        handle,
+                    },
+                )]),
+                timers: None,
+            },
+        )]);
+
+        let (_joined, mut arrivals) = tokio::sync::mpsc::unbounded_channel::<Greeted>();
+        let decision = stand_down(
+            std::path::Path::new("/w/proj"),
+            Vec::new(),
+            Vec::new(),
+            hosted,
+            OwnedTasks::default(),
+            &mut arrivals,
+            &mut from_sources,
+            None,
+            &mut Vec::new(),
+            Some(Drain {
+                owners,
+                grace: Duration::from_secs(6),
+            }),
+            Duration::from_secs(9),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(matches!(decision, Shutdown::ReadyToRelease(_)));
+        let rows = crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert!(
+            rows.iter()
+                .any(|row| format!("{:?}", row.item).contains("finished")),
+            "the work's output was lost to the cancellation"
+        );
     }
 }

@@ -1652,6 +1652,7 @@ async fn run_command_source(
         events_dir,
         key,
         crate::cli::command_source::reap_previous_producer,
+        &crate::cli::source_group::OWNERS,
     )
     .await
 }
@@ -1664,12 +1665,13 @@ async fn run_command_source(
 /// observable as a child that did not start. Driving a real deferral
 /// would mean arranging a process this test cannot look at, which is
 /// not something to arrange on a developer's machine.
-async fn run_command_source_with(
+pub(crate) async fn run_command_source_with(
     src: clank_core::agent_config::CommandSource,
     tx: crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
     key: String,
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
+    owners: &'static crate::cli::source_group::Owners,
 ) {
     use crate::cli::command_source as cs;
 
@@ -1726,6 +1728,7 @@ async fn run_command_source_with(
                     events_dir,
                     &retire,
                     std::sync::Arc::new(lease),
+                    owners,
                 )
                 .await;
                 return;
@@ -1742,8 +1745,7 @@ async fn run_command_source_with(
                 }
                 // The holder may be this process, whose group deferred
                 // its retirement and so still holds the lease.
-                crate::cli::source_group::OWNERS
-                    .retry_deferred(&cs::producer_path(&store_dir, &key));
+                owners.retry_deferred(&cs::producer_path(&store_dir, &key));
                 // `read_rows` is the read-only inspector: a tailer
                 // must never quarantine a log it does not own.
                 if let Ok(log) = crate::cli::github::log::EventLog::open(&store_dir, &key)
@@ -1787,6 +1789,16 @@ async fn run_command_source_with(
     }
 }
 
+/// A retirement blocks for as long as its group's policy says, which
+/// during a drain is up to its cutoff: not on a runtime worker.
+async fn retire_off_the_runtime(
+    owned: crate::cli::source_group::Owned,
+) -> Result<(), (crate::cli::source_group::Owned, String)> {
+    tokio::task::spawn_blocking(move || owned.retire())
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
 /// The LEASE HOLDER's runtime: it alone spawns the producer and
 /// writes the log.
 #[allow(clippy::too_many_arguments)]
@@ -1799,6 +1811,7 @@ async fn run_leased_command_source(
     events_dir: Option<std::path::PathBuf>,
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
     lease: std::sync::Arc<crate::cli::github::log::IngestLease>,
+    owners: &'static crate::cli::source_group::Owners,
 ) {
     use crate::cli::command_source as cs;
     use crate::cli::source_group;
@@ -1929,7 +1942,7 @@ async fn run_leased_command_source(
     let mut unended: Option<source_group::Owned> = None;
     loop {
         if let Some(owned) = unended.take()
-            && let Err((owned, why)) = owned.retire()
+            && let Err((owned, why)) = retire_off_the_runtime(owned).await
         {
             if !deferral_warned {
                 eprintln!(
@@ -1984,7 +1997,7 @@ async fn run_leased_command_source(
         };
         let mut launch_error = None;
         let launched = match source_group::launch(
-            &source_group::OWNERS,
+            owners,
             &source_group::Arming::standard(),
             &store_dir,
             &key,
@@ -2013,6 +2026,7 @@ async fn run_leased_command_source(
             }
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
+            let reading = owners.reading(cs::producer_path(&store_dir, &key));
             if let Some(err) = stderr {
                 // Diagnostics, not events: surfaced for a human
                 // reading the wait's own output, never ingested.
@@ -2042,9 +2056,16 @@ async fn run_leased_command_source(
                             // Best-effort: take whatever is already
                             // buffered, then stop. Bounded, so a
                             // chatty descendant cannot hold the run
-                            // open by writing.
+                            // open by writing; but during a drain a
+                            // descendant still at work is owed its
+                            // grace, output included, and the group
+                            // is ended at the cutoff anyway.
+                            let read_for = owners
+                                .drain_cutoff()
+                                .map(|cutoff| cutoff.saturating_duration_since(std::time::Instant::now()))
+                                .unwrap_or(Duration::from_millis(100));
                             let _ = tokio::time::timeout(
-                                Duration::from_millis(100),
+                                read_for,
                                 async {
                                     while let Ok(Some(raw)) = lines.next_line().await {
                                         if let Some(what) =
@@ -2090,10 +2111,11 @@ async fn run_leased_command_source(
                     }
                 }
             }
+            drop(reading);
             exit = child.wait().await.ok().and_then(|status| status.code());
             // The command's end is not its group's: a descendant it
             // left, and the anchor, are still there.
-            if let Err((owned, why)) = owned.retire() {
+            if let Err((owned, why)) = retire_off_the_runtime(owned).await {
                 eprintln!(
                     "wait: command source `{}` — {why}; not starting another until it is settled",
                     src.name
@@ -4678,6 +4700,7 @@ mod tests {
                         cs::Retired::Clear
                     }
                 },
+                &crate::cli::source_group::OWNERS,
             ))
         };
 
@@ -6699,6 +6722,90 @@ mod tests {
         assert_eq!(
             got,
             serde_json::json!({ "items": [{ "kind": "idle", "prompt": "go" }] }),
+        );
+    }
+
+    /// Through the real host: a root that exits on TERM leaves a
+    /// descendant finishing accepted work, and what it prints when done
+    /// is read, logged and sent before the drain is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_reads_what_work_the_root_left_running_produces() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let ready = root.path().join("ready");
+        let worker = root.path().join("worker.sh");
+        std::fs::write(
+            &worker,
+            format!(
+                "trap '' TERM\ntouch '{}'\nsleep 3\nprintf '%s\\n' '{{\"id\":\"late\",\"content\":\"finished\"}}'\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        let src = command_source(
+            "drained",
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "sh '{}' & trap 'exit 0' TERM; while :; do sleep 0.1; done",
+                    worker.display()
+                ),
+            ],
+        );
+        let key = src.source_key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events.clone()),
+            key.clone(),
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+        ));
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists());
+
+        let drained = owners
+            .drain(Duration::from_secs(6))
+            .finish(tokio::time::Instant::now() + Duration::from_secs(8))
+            .await;
+        assert_eq!(drained.end, crate::cli::source_group::DrainEnd::Complete);
+        let drained = drained.outcomes;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            drained,
+            vec![(
+                crate::cli::command_source::producer_path(&events, &key),
+                crate::cli::source_group::Drained::WithinGrace
+            )]
+        );
+        let mut sent = Vec::new();
+        while let Ok((item, _)) = rx.try_recv() {
+            sent.push(format!("{item:?}"));
+        }
+        assert!(
+            sent.iter().any(|item| item.contains("finished")),
+            "never sent: {sent:?}"
+        );
+        let rows = crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert!(
+            rows.iter()
+                .any(|row| format!("{:?}", row.item).contains("finished")),
+            "never logged"
         );
     }
 }

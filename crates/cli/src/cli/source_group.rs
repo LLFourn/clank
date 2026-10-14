@@ -88,7 +88,8 @@ pub(crate) fn activation() -> Vec<u8> {
 pub(crate) struct Owners {
     table: Mutex<Table>,
     settled: Condvar,
-    retirement: fn(&Entry) -> Retired,
+    /// Ends a group, escalating to KILL after the given grace.
+    retirement: fn(&Entry, Duration) -> Retired,
 }
 
 struct Table {
@@ -99,6 +100,18 @@ struct Table {
     /// Groups whose ordinary retirement deferred after shutdown began:
     /// shutdown's to retire, once, since `live` admits nothing more.
     handed_to_shutdown: BTreeMap<u64, Entry>,
+    drain: Option<DrainPhase>,
+    /// Hosts still reading a producer's output, by its record.
+    readers: BTreeMap<PathBuf, usize>,
+}
+
+struct DrainPhase {
+    cutoff: std::time::Instant,
+    outcomes: Vec<(PathBuf, Drained)>,
+    /// Every group this process owned has been through its retirement.
+    retired: bool,
+    /// Rung when a retirement finishes or a reader stops.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 /// One owned group, and what ending it needs.
@@ -117,14 +130,15 @@ pub(crate) struct Entry {
     deferred: bool,
 }
 
-fn retire_natively(entry: &Entry) -> Retired {
-    cs::retire(
+fn retire_natively(entry: &Entry, escalate_after: Duration) -> Retired {
+    cs::retire_after(
         &entry.path,
         &entry.record,
         &cs::Native {
             children: &entry.children,
         },
         cs::Whose::Own,
+        escalate_after,
     )
 }
 
@@ -135,7 +149,7 @@ impl Owners {
         Self::retiring_by(retire_natively)
     }
 
-    const fn retiring_by(retirement: fn(&Entry) -> Retired) -> Self {
+    const fn retiring_by(retirement: fn(&Entry, Duration) -> Retired) -> Self {
         Self {
             table: Mutex::new(Table {
                 closing: false,
@@ -143,6 +157,8 @@ impl Owners {
                 live: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 handed_to_shutdown: BTreeMap::new(),
+                drain: None,
+                readers: BTreeMap::new(),
             }),
             settled: Condvar::new(),
             retirement,
@@ -221,7 +237,7 @@ impl Owners {
             if let Some(entry) = table.live.remove(&id) {
                 table.retiring.insert(id);
                 drop(table);
-                let out = (self.retirement)(&entry);
+                let out = self.retire_entry(&entry);
                 let mut table = self.table();
                 table.retiring.remove(&id);
                 if matches!(out, Retired::Deferred(_)) {
@@ -296,7 +312,7 @@ impl Owners {
             std::thread::scope(|scope| {
                 for (id, entry) in &batch {
                     scope.spawn(move || {
-                        if let Retired::Deferred(why) = (self.retirement)(entry) {
+                        if let Retired::Deferred(why) = self.retire_entry(entry) {
                             eprintln!(
                                 "clank: a command source's producer was not retired, and its \
                                  record is left for the next host: {why}"
@@ -307,6 +323,129 @@ impl Owners {
                     });
                 }
             });
+        }
+    }
+
+    /// Begin a drain: admit no more groups, ask every one running to
+    /// end, all at once, and give them until one shared cutoff `grace`
+    /// from now. From here every retirement, whoever runs it, waits for
+    /// its group's work to end or the cutoff, whichever is first, and
+    /// keeps the group and its source's lease until it is confirmed
+    /// ended.
+    pub(crate) fn drain(&'static self, grace: Duration) -> Draining {
+        {
+            let mut table = self.table();
+            table.closing = true;
+            table.drain = Some(DrainPhase {
+                cutoff: std::time::Instant::now() + grace,
+                outcomes: Vec::new(),
+                retired: false,
+                wake: Arc::new(tokio::sync::Notify::new()),
+            });
+            for entry in table.live.values().filter(|entry| !entry.deferred) {
+                cs::ask_to_end(
+                    &entry.record,
+                    &cs::Native {
+                        children: &entry.children,
+                    },
+                );
+            }
+        }
+        // A thread of its own, not the blocking pool: whether it runs
+        // must not depend on that pool having room.
+        std::thread::spawn(move || {
+            self.retire_all();
+            if let Some(drain) = &mut self.table().drain {
+                drain.retired = true;
+                drain.wake.notify_one();
+            }
+        });
+        Draining { owners: self }
+    }
+
+    /// The cutoff of a drain under way.
+    pub(crate) fn drain_cutoff(&self) -> Option<std::time::Instant> {
+        self.table().drain.as_ref().map(|drain| drain.cutoff)
+    }
+
+    /// Bring a drain's cutoff forward to now, for an exit that cannot
+    /// wait for it.
+    fn cut_off(&self) {
+        if let Some(drain) = &mut self.table().drain {
+            drain.cutoff = drain.cutoff.min(std::time::Instant::now());
+        }
+    }
+
+    /// Note that a host is reading `path`'s producer output, until the
+    /// guard is dropped. A drain is not over while one still is.
+    pub(crate) fn reading(&'static self, path: PathBuf) -> Reading {
+        *self.table().readers.entry(path.clone()).or_default() += 1;
+        Reading { owners: self, path }
+    }
+
+    /// Where a drain stands: complete, or what it is still waiting on.
+    fn drain_end(&self) -> DrainEnd {
+        let table = self.table();
+        let Some(drain) = &table.drain else {
+            return DrainEnd::Complete;
+        };
+        let unconfirmed = drain
+            .outcomes
+            .iter()
+            .filter(|(_, how)| *how == Drained::Unconfirmed)
+            .count();
+        let reading: usize = table.readers.values().sum();
+        if !drain.retired {
+            DrainEnd::StillRetiring
+        } else if unconfirmed > 0 {
+            DrainEnd::Unconfirmed(unconfirmed)
+        } else if reading > 0 {
+            DrainEnd::StillReading(reading)
+        } else {
+            DrainEnd::Complete
+        }
+    }
+
+    /// End `entry`'s group: by this registry's ordinary retirement, or,
+    /// during a drain, once its work has ended or the cutoff has come,
+    /// recording which.
+    fn retire_entry(&self, entry: &Entry) -> Retired {
+        if self.table().drain.is_none() {
+            return (self.retirement)(entry, cs::ESCALATE_AFTER);
+        }
+        let how = self.await_work(entry);
+        let out = (self.retirement)(entry, Duration::ZERO);
+        let how = match out {
+            Retired::Deferred(_) => Drained::Unconfirmed,
+            _ => how,
+        };
+        if let Some(drain) = &mut self.table().drain {
+            drain.outcomes.push((entry.path.clone(), how));
+        }
+        out
+    }
+
+    /// Wait for every member of `entry`'s group but its anchor to end,
+    /// or for the drain's cutoff.
+    fn await_work(&self, entry: &Entry) -> Drained {
+        use cs::Os;
+        let os = cs::Native {
+            children: &entry.children,
+        };
+        let anchor = entry.record.pgid();
+        loop {
+            os.collect();
+            let working = Pgid::new(anchor)
+                .and_then(crate::signal::group_members)
+                .map(|members| members.iter().any(|pid| *pid != anchor));
+            if working == Some(false) {
+                return Drained::WithinGrace;
+            }
+            let now = std::time::Instant::now();
+            match self.drain_cutoff() {
+                Some(cutoff) if now < cutoff => std::thread::sleep(DRAIN_POLL.min(cutoff - now)),
+                _ => return Drained::KilledAtGrace,
+            }
         }
     }
 
@@ -323,6 +462,110 @@ impl Owners {
     #[cfg(test)]
     fn owns(&self, id: u64) -> bool {
         self.table().live.contains_key(&id)
+    }
+}
+
+const DRAIN_POLL: Duration = Duration::from_millis(50);
+
+/// How a group asked to end by a drain did end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Drained {
+    /// It ended after TERM, before the deadline. That says it exited in
+    /// time, not that it finished its work: only a producer that drains
+    /// on TERM did that.
+    WithinGrace,
+    /// Still running at the deadline, so it was killed.
+    KilledAtGrace,
+    /// Its retirement could not confirm it ended.
+    Unconfirmed,
+}
+
+/// A drain under way.
+pub(crate) struct Draining {
+    owners: &'static Owners,
+}
+
+/// Whether a drain finished: only `Complete` accounts for every group
+/// and every reader it owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainEnd {
+    Complete,
+    /// The retirement of the groups had not finished.
+    StillRetiring,
+    /// Groups whose end could not be confirmed.
+    Unconfirmed(usize),
+    /// Hosts still reading producer output.
+    StillReading(usize),
+}
+
+/// What a drain did: how each group ended, and whether it finished.
+#[derive(Debug)]
+pub(crate) struct Drainage {
+    pub(crate) end: DrainEnd,
+    pub(crate) outcomes: Vec<(PathBuf, Drained)>,
+}
+
+impl Draining {
+    /// Wait, until `by` at the latest, for every group to be retired and
+    /// every host to finish reading its output. Past `by` it waits for
+    /// nothing, and says what was still outstanding.
+    pub(crate) async fn finish(self, by: tokio::time::Instant) -> Drainage {
+        let owners = self.owners;
+        let wake = owners
+            .table()
+            .drain
+            .as_ref()
+            .map(|drain| drain.wake.clone());
+        loop {
+            if owners.drain_end() == DrainEnd::Complete {
+                break;
+            }
+            let Some(wake) = &wake else { break };
+            // A ring before this wait is kept as a permit, so nothing is
+            // missed between the look above and here.
+            if tokio::time::timeout_at(by, wake.notified()).await.is_err() {
+                break;
+            }
+        }
+        let end = owners.drain_end();
+        let outcomes = owners
+            .table()
+            .drain
+            .as_mut()
+            .map(|drain| std::mem::take(&mut drain.outcomes))
+            .unwrap_or_default();
+        Drainage { end, outcomes }
+    }
+}
+
+/// A host reading a producer's output.
+pub(crate) struct Reading {
+    owners: &'static Owners,
+    path: PathBuf,
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut table = self.owners.table();
+        if let Some(count) = table.readers.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                table.readers.remove(&self.path);
+            }
+        }
+        if let Some(drain) = &table.drain {
+            drain.wake.notify_one();
+        }
+    }
+}
+
+impl std::fmt::Display for Drained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Drained::WithinGrace => "ended within grace",
+            Drained::KilledAtGrace => "killed at grace",
+            Drained::Unconfirmed => "not confirmed ended",
+        })
     }
 }
 
@@ -608,6 +851,7 @@ pub(crate) fn retire_on_termination() {
 /// A bare `process::exit` runs no destructor, so every deliberate exit
 /// of a process that may host sources goes through here.
 pub fn exit(code: i32) -> ! {
+    OWNERS.cut_off();
     OWNERS.retire_all();
     std::process::exit(code)
 }
@@ -620,6 +864,19 @@ pub(crate) mod tests {
 
     pub(crate) fn owners() -> &'static Owners {
         Box::leak(Box::new(Owners::new()))
+    }
+
+    /// Owners whose drain retirements end the group but cannot confirm
+    /// it.
+    pub(crate) fn owners_unconfirmed_in_a_drain() -> &'static Owners {
+        fn ends_but_cannot_confirm(entry: &Entry, escalate_after: Duration) -> Retired {
+            let out = retire_natively(entry, escalate_after);
+            if escalate_after.is_zero() {
+                return Retired::Deferred("cannot confirm it ended".into());
+            }
+            out
+        }
+        Box::leak(Box::new(Owners::retiring_by(ends_but_cannot_confirm)))
     }
 
     fn lease(dir: &Path, key: &str) -> Arc<IngestLease> {
@@ -1034,13 +1291,13 @@ pub(crate) mod tests {
     static RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    fn held_open_until_released(entry: &Entry) -> Retired {
+    fn held_open_until_released(entry: &Entry, _: Duration) -> Retired {
         use std::sync::atomic::Ordering;
         RETIRING.store(true, Ordering::Release);
         while !RELEASED.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        retire_natively(entry)
+        retire_natively(entry, cs::ESCALATE_AFTER)
     }
 
     /// Shutdown takes an armed, acknowledged group, and its anchor is
@@ -1104,11 +1361,11 @@ pub(crate) mod tests {
 
     static DEFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-    fn deferring_while_asked(entry: &Entry) -> Retired {
+    fn deferring_while_asked(entry: &Entry, _: Duration) -> Retired {
         if DEFER.load(std::sync::atomic::Ordering::Acquire) {
             Retired::Deferred("held for the test".into())
         } else {
-            retire_natively(entry)
+            retire_natively(entry, cs::ESCALATE_AFTER)
         }
     }
 
@@ -1204,7 +1461,7 @@ pub(crate) mod tests {
 
     /// The first attempt is held until released and then defers; the
     /// next succeeds, or defers too when `FINAL_DEFERS` is set.
-    fn first_held_then_deferred(entry: &Entry) -> Retired {
+    fn first_held_then_deferred(entry: &Entry, _: Duration) -> Retired {
         use std::sync::atomic::Ordering;
         if ATTEMPTS.fetch_add(1, Ordering::AcqRel) == 0 {
             FIRST_ENTERED.store(true, Ordering::Release);
@@ -1216,7 +1473,7 @@ pub(crate) mod tests {
         if FINAL_DEFERS.load(Ordering::Acquire) {
             Retired::Deferred("still cannot tell".into())
         } else {
-            retire_natively(entry)
+            retire_natively(entry, cs::ESCALATE_AFTER)
         }
     }
 
@@ -1354,5 +1611,210 @@ pub(crate) mod tests {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!marker.exists());
+    }
+
+    /// A host's loop around one launched producer: when its command
+    /// exits, the group is retired, as `wait`'s host does.
+    fn hosted(owned: Owned, mut child: tokio::process::Child) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            let _ = tokio::task::spawn_blocking(move || owned.retire()).await;
+        })
+    }
+
+    /// One deadline for all: two producers that each keep working for
+    /// longer than the old 200 ms escalation, and longer than the old
+    /// 3 s budget, both finish inside a grace shorter than their serial
+    /// sum; the one that ignores TERM is killed at the deadline. Each
+    /// source's lease is held until its producer has ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_gives_every_producer_one_shared_grace() {
+        let owners = owners();
+        let grace = Duration::from_secs(4);
+        let mut dirs = Vec::new();
+        let mut hosts = Vec::new();
+        for script in [
+            "trap 'sleep 3.5; touch done; exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done",
+            "trap 'sleep 3.5; touch done; exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done",
+            "trap '' TERM; echo $$ > pid; while :; do sleep 0.1; done",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut command = sh(script);
+            command.current_dir(dir.path());
+            let (owned, child) = launch(
+                owners,
+                &Arming::standard(),
+                dir.path(),
+                "src",
+                lease(dir.path(), "src"),
+                &mut command,
+            )
+            .await
+            .unwrap();
+            hosts.push(hosted(owned, child));
+            dirs.push(dir);
+        }
+        for dir in &dirs {
+            pid_in(&dir.path().join("pid")).await;
+        }
+        let stubborn = pid_in(&dirs[2].path().join("pid")).await;
+
+        let started = std::time::Instant::now();
+        let draining = owners.drain(grace);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for dir in &dirs {
+            assert!(
+                IngestLease::try_acquire(dir.path(), "src")
+                    .unwrap()
+                    .is_none(),
+                "a source's lease was let go while its producer still ran"
+            );
+        }
+        let late = tempfile::tempdir().unwrap();
+        let relaunched = launch(
+            owners,
+            &Arming::standard(),
+            late.path(),
+            "src",
+            lease(late.path(), "src"),
+            &mut sh("exec sleep 300"),
+        )
+        .await;
+        assert!(relaunched.is_err(), "a draining host started new work");
+        let drainage = draining
+            .finish(tokio::time::Instant::now() + grace + Duration::from_secs(2))
+            .await;
+        assert_eq!(drainage.end, DrainEnd::Complete);
+        let mut drained = drainage.outcomes;
+        let took = started.elapsed();
+        drained.sort();
+        let mut want: Vec<_> = dirs
+            .iter()
+            .map(|dir| cs::producer_path(dir.path(), "src"))
+            .zip([
+                Drained::WithinGrace,
+                Drained::WithinGrace,
+                Drained::KilledAtGrace,
+            ])
+            .collect();
+        want.sort();
+        assert_eq!(drained, want);
+        assert!(took >= grace, "the stubborn one was killed early: {took:?}");
+        assert!(
+            took < grace + Duration::from_secs(1),
+            "the producers were not given one deadline together: {took:?}"
+        );
+        for dir in &dirs[..2] {
+            assert!(dir.path().join("done").exists(), "its work was cut off");
+        }
+        assert!(gone(stubborn).await);
+        for host in hosts {
+            host.await.unwrap();
+        }
+        for dir in &dirs {
+            assert!(
+                IngestLease::try_acquire(dir.path(), "src")
+                    .unwrap()
+                    .is_some(),
+                "an ended producer's source stays leased"
+            );
+        }
+    }
+
+    /// A root that exits on TERM is not its group's end: a descendant
+    /// still doing accepted work keeps the group, and the drain waits
+    /// for it, through the host's own retirement too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_waits_for_work_the_root_left_running() {
+        let owners = owners();
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = sh(
+            "sh -c 'trap \"\" TERM; echo $$ > worker; sleep 2; touch done' & \
+             trap 'exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done",
+        );
+        command.current_dir(dir.path());
+        let (owned, child) = launch(
+            owners,
+            &Arming::standard(),
+            dir.path(),
+            "src",
+            lease(dir.path(), "src"),
+            &mut command,
+        )
+        .await
+        .unwrap();
+        let host = hosted(owned, child);
+        pid_in(&dir.path().join("pid")).await;
+        pid_in(&dir.path().join("worker")).await;
+        let drained = owners
+            .drain(Duration::from_secs(4))
+            .finish(tokio::time::Instant::now() + Duration::from_secs(6))
+            .await;
+        assert_eq!(drained.end, DrainEnd::Complete);
+        let drained = drained.outcomes;
+        host.await.unwrap();
+        assert!(
+            dir.path().join("done").exists(),
+            "the descendant's work was cut off"
+        );
+        assert_eq!(
+            drained,
+            vec![(cs::producer_path(dir.path(), "src"), Drained::WithinGrace)]
+        );
+    }
+
+    /// Ended at the cutoff, it is reported killed, never ended in grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn work_still_running_at_the_cutoff_is_reported_killed() {
+        let owners = owners();
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = sh("sh -c 'trap \"\" TERM; echo $$ > worker; sleep 30' & \
+             trap 'exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done");
+        command.current_dir(dir.path());
+        let (owned, child) = launch(
+            owners,
+            &Arming::standard(),
+            dir.path(),
+            "src",
+            lease(dir.path(), "src"),
+            &mut command,
+        )
+        .await
+        .unwrap();
+        let host = hosted(owned, child);
+        pid_in(&dir.path().join("pid")).await;
+        let worker = pid_in(&dir.path().join("worker")).await;
+        let drained = owners
+            .drain(Duration::from_millis(500))
+            .finish(tokio::time::Instant::now() + Duration::from_secs(3))
+            .await;
+        assert_eq!(drained.end, DrainEnd::Complete);
+        let drained = drained.outcomes;
+        host.await.unwrap();
+        assert!(gone(worker).await);
+        assert_eq!(
+            drained,
+            vec![(cs::producer_path(dir.path(), "src"), Drained::KilledAtGrace)]
+        );
+    }
+
+    /// A drain is not over while a host is still reading its producer's
+    /// output, though every group has ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_waits_for_its_readers() {
+        let owners = owners();
+        let reading = owners.reading(PathBuf::from("/src.producer"));
+        let finish = tokio::spawn(
+            owners
+                .drain(Duration::ZERO)
+                .finish(tokio::time::Instant::now() + Duration::from_secs(5)),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!finish.is_finished(), "finished with a host still reading");
+        drop(reading);
+        tokio::time::timeout(Duration::from_secs(1), finish)
+            .await
+            .expect("and finishes once it is done")
+            .unwrap();
     }
 }

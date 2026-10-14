@@ -135,6 +135,62 @@ pub fn probe_group(pgid: Pgid) -> Probe {
     probe_from(outcome(rc))
 }
 
+/// The processes in `pgid`, or `None` when the system will not say.
+///
+/// Enumerates, unlike [`probe_group`], because the question it answers
+/// is WHO is left: a group led by a process that outlives its work is
+/// occupied for as long as that leader lives.
+pub fn group_members(pgid: Pgid) -> Option<Vec<i32>> {
+    group_members_native(pgid.get())
+}
+
+#[cfg(target_os = "macos")]
+fn group_members_native(pgid: i32) -> Option<Vec<i32>> {
+    const CAP: usize = 4096;
+    let mut pids = vec![0i32; CAP];
+    // SAFETY: the buffer is valid for the byte size passed. Unlike
+    // `proc_listpids`, this answers with a COUNT of pids, not bytes.
+    let count = unsafe {
+        libc::proc_listpgrppids(
+            pgid,
+            pids.as_mut_ptr().cast(),
+            (CAP * std::mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if count < 0 {
+        return None;
+    }
+    let n = (count as usize).min(CAP);
+    Some(pids[..n].iter().copied().filter(|pid| *pid > 0).collect())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn group_members_native(pgid: i32) -> Option<Vec<i32>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The command name may hold spaces and parentheses, so the
+        // fields are counted from its LAST closing parenthesis.
+        let Some(rest) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+            continue;
+        };
+        if rest.split_whitespace().nth(2).and_then(|s| s.parse().ok()) == Some(pgid) {
+            members.push(pid);
+        }
+    }
+    Some(members)
+}
+
 /// Signal every process in `pgid`.
 pub fn signal_group(pgid: Pgid, sig: libc::c_int) {
     // SAFETY: a negative pid addresses the process group; the signal is
@@ -188,6 +244,29 @@ pub(crate) fn probe_from(errno: Option<i32>) -> Probe {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_groups_members_are_listed() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = super::Pgid::new(leader.id() as i32).unwrap();
+        let mut members = Vec::new();
+        for _ in 0..200 {
+            members = super::group_members(pgid).unwrap();
+            if members.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        super::signal_group(pgid, libc::SIGKILL);
+        let _ = leader.wait();
+        assert!(members.contains(&(leader.id() as i32)), "{members:?}");
+        assert_eq!(members.len(), 2, "the leader and its sleep: {members:?}");
+    }
+
     use super::*;
 
     /// The ids that mean something other than one target are refused by
