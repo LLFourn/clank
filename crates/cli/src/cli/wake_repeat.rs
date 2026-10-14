@@ -235,19 +235,24 @@ pub(crate) fn forget_if_stale(
 }
 
 /// The paragraph the hook adds once the same items have been delivered
-/// [`ESCALATE_AT`] times.
-pub(crate) fn escalation(count: u32) -> Option<String> {
+/// [`ESCALATE_AT`] times: the repetition, the limits it does not lift,
+/// and `duties`, one line per item saying what discharges it.
+pub(crate) fn escalation(count: u32, duties: &[String]) -> Option<String> {
     (count >= ESCALATE_AT).then(|| {
-        format!(
+        let mut text = format!(
             "\n\nThese items have been delivered to you {count} times unchanged. Ending your \
-             turn does not discharge pending Clank work: the items stay owed and will be \
-             delivered again. Follow the user's latest instruction, any explicit pause, and \
-             the actual reason given for any rejected action. If the work can proceed, act on \
-             it. If it genuinely depends on the user, describe the dependency with `clank block \
-             create <name> -m \"<question>\"`. A block asks a person to resolve a real \
-             dependency and pauses review work; it is not a mute button. Messages and events \
-             are still delivered during a block, and their required replies still hold."
-        )
+             turn does not discharge them: they stay owed and will be delivered again. Follow \
+             the user's latest instruction, any explicit pause, and the actual reason given for \
+             any rejected action; repeated delivery grants no new authority."
+        );
+        if !duties.is_empty() {
+            text.push_str(" What discharges each:");
+            for duty in duties {
+                text.push('\n');
+                text.push_str(duty);
+            }
+        }
+        text
     })
 }
 
@@ -516,13 +521,24 @@ mod tests {
     }
 
     #[test]
-    fn the_wording_escalates_at_the_threshold_and_names_a_valid_block() {
-        assert_eq!(escalation(ESCALATE_AT - 1), None);
-        let text = escalation(ESCALATE_AT).unwrap();
+    fn the_wording_escalates_at_the_threshold_with_its_limits_and_duties() {
+        let duties = vec!["- message m1: handle it".to_string()];
+        assert_eq!(escalation(ESCALATE_AT - 1, &duties), None);
+        let text = escalation(ESCALATE_AT, &duties).unwrap();
         assert!(text.contains(&format!("{ESCALATE_AT} times unchanged")));
-        assert!(text.contains("clank block create <name> -m"));
-        assert!(text.contains("still delivered during a block"));
-        assert!(!text.contains("without acting") && !text.contains("ignoring"));
+        for kept in [
+            "user's latest instruction",
+            "explicit pause",
+            "reason given for any rejected action",
+            "grants no new authority",
+        ] {
+            assert!(text.contains(kept), "{kept}");
+        }
+        assert!(text.ends_with("\n- message m1: handle it"));
+        assert!(
+            !text.contains("clank block"),
+            "a block is the duty's to offer"
+        );
     }
 
     /// A person's typed prompt is human; a hook wake, a peer's message,

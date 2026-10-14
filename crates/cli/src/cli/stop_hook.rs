@@ -518,9 +518,10 @@ async fn compute_outcome_capturing(
 }
 
 /// The continuation with its repetition stated, once the same items have
-/// been delivered enough times. Only the wording changes.
-fn escalated(outcome: HookOutcome, count: u32) -> HookOutcome {
-    match (outcome, super::wake_repeat::escalation(count)) {
+/// been delivered enough times, with what discharges each of them. Only
+/// the wording changes.
+fn escalated(outcome: HookOutcome, count: u32, duties: &[String]) -> HookOutcome {
+    match (outcome, super::wake_repeat::escalation(count, duties)) {
         (HookOutcome::Continue { mut reason }, Some(more)) => {
             reason.push_str(&more);
             HookOutcome::Continue { reason }
@@ -2626,18 +2627,21 @@ pub(crate) enum Discharge {
     Unconditioned,
 }
 
-/// Classify one wake. `reason` matters for `master`, whose several
-/// `WaitingReason`s discharge differently.
+/// Classify one wake: what ends it, and what the agent owes it.
+/// `reason` matters for `master`, whose several `WaitingReason`s
+/// discharge differently.
 ///
-/// TOTAL: every kind lands on a variant, so adding a `WaitKind`
-/// fails to compile here rather than falling into a catchall. That
-/// catchall is how `fix_commit_tag` went unclassified, and the
-/// hand-rolled `wire_tag_of` stand-in for this exhaustiveness was
-/// never called (the-turn-end-is-one-decision).
-pub(crate) fn discharge_of(
+/// TOTAL, and ONE decision per kind: every kind lands on both answers in
+/// the same arm, so adding a `WaitKind` fails to compile here rather
+/// than falling into a catchall, and the wake's condition and the
+/// escalation's duty cannot classify a kind differently. A catchall is
+/// how `fix_commit_tag` went unclassified, and the hand-rolled
+/// `wire_tag_of` stand-in for this exhaustiveness was never called
+/// (the-turn-end-is-one-decision).
+pub(crate) fn classify(
     kind: clank_core::wait::WaitKind,
     reason: Option<clank_core::vocab::WaitingReason>,
-) -> Discharge {
+) -> (Discharge, Duty) {
     use Discharge::*;
     use clank_core::vocab::WaitingReason;
     use clank_core::wait::WaitKind as K;
@@ -2648,36 +2652,74 @@ pub(crate) fn discharge_of(
             // which fires only when a background task is actually
             // live — advertising it unconditionally here would tell an
             // agent with nothing running to record nothing.
-            Some(WaitingReason::GateContinue) => Until("fires until a commit moves the gate"),
-            Some(WaitingReason::AddressCommitChanges) => {
-                Until("fires until you commit work addressing the feedback on that sha")
+            Some(WaitingReason::GateContinue) => {
+                (Until("fires until a commit moves the gate"), Duty::Step)
             }
-            Some(WaitingReason::ReadyToFinalize) => Until("fires until `clank finish` runs"),
+            Some(WaitingReason::AddressCommitChanges) => (
+                Until("fires until you commit work addressing the feedback on that sha"),
+                Duty::Step,
+            ),
+            Some(WaitingReason::ReadyToFinalize) => {
+                (Until("fires until `clank finish` runs"), Duty::Step)
+            }
             Some(WaitingReason::CommitPlanRevision) => {
-                Until("fires until the plan edit is committed")
+                (Until("fires until the plan edit is committed"), Duty::Step)
             }
             // Master never carries these, and a borrowed condition
             // reads as authoritative — worse than none.
             Some(WaitingReason::SessionFinished | WaitingReason::CommitNeedsReview) | None => {
-                Unconditioned
+                (Unconditioned, Duty::Nothing)
             }
         },
-        K::Reviewer => Until("fires until you write feedback for that sha"),
-        K::FixCommitTag => Until("fires until the commit's plan tag is corrected"),
-        K::PromoteFromQueue => Until("fires until the item is promoted or removed from the queue"),
-        K::Message => Until("fires until the message is acked — `clank events ack`"),
-        K::GithubEvent => Until("fires until the event is acked — `clank events ack`"),
-        K::AdHocReview => Until("fires until feedback exists for that sha"),
-        K::AdHocRevise => Until("fires until you commit the revision"),
-        K::PrReviewer => Until("fires until your review for that round is written"),
-        K::PrMaster => Until("fires until you act on that round"),
-        K::Unblocked => Until("fires until you acknowledge it — `clank block clean`"),
-        K::Blocked => Until(
-            "you CANNOT clear this — only the human can answer it. Do not act on it, and do \
-             not answer it yourself",
+        K::Reviewer => (
+            Until("fires until you write feedback for that sha"),
+            Duty::Step,
         ),
-        K::Idle => Until("fires while there is nothing else to do"),
-        K::DraftChanged => Until("read the draft, do not reply to the edit, then ack the event"),
+        K::FixCommitTag => (
+            Until("fires until the commit's plan tag is corrected"),
+            Duty::Step,
+        ),
+        K::PromoteFromQueue => (
+            Until("fires until the item is promoted or removed from the queue"),
+            Duty::Step,
+        ),
+        K::Message => (
+            Until("fires until the message is acked — `clank events ack`"),
+            Duty::Event,
+        ),
+        K::GithubEvent => (
+            Until("fires until the event is acked — `clank events ack`"),
+            Duty::Event,
+        ),
+        K::AdHocReview => (
+            Until("fires until feedback exists for that sha"),
+            Duty::Step,
+        ),
+        K::AdHocRevise => (Until("fires until you commit the revision"), Duty::Step),
+        K::PrReviewer => (
+            Until("fires until your review for that round is written"),
+            Duty::Step,
+        ),
+        K::PrMaster => (Until("fires until you act on that round"), Duty::Step),
+        K::Unblocked => (
+            Until("fires until you acknowledge it — `clank block clean`"),
+            Duty::Unblocked,
+        ),
+        K::Blocked => (
+            Until(
+                "you CANNOT clear this — only the human can answer it. Do not act on it, and \
+                 do not answer it yourself",
+            ),
+            Duty::HumanOnly,
+        ),
+        K::Idle => (
+            Until("fires while there is nothing else to do"),
+            Duty::Nothing,
+        ),
+        K::DraftChanged => (
+            Until("read the draft, do not reply to the edit, then ack the event"),
+            Duty::Event,
+        ),
         // Same discharge as a github event, because it is the same
         // WAL: a command source's event is durable, re-presented on
         // every arm, and finished by an ack
@@ -2685,11 +2727,132 @@ pub(crate) fn discharge_of(
         // say "change or remove the command source" — true when an
         // exiting producer WAS the event, and advice to break the
         // watch now that one isn't.
-        K::CommandEvent | K::TimerEvent => {
-            Until("fires until the event is acked — `clank events ack`")
-        }
-        K::ForCommit | K::ForFinished | K::ForBlocked => ObserverOnly,
+        K::CommandEvent | K::TimerEvent => (
+            Until("fires until the event is acked — `clank events ack`"),
+            Duty::Event,
+        ),
+        K::ForCommit | K::ForFinished | K::ForBlocked => (ObserverOnly, Duty::Nothing),
     }
+}
+
+/// What ends one wake: [`classify`]'s condition.
+pub(crate) fn discharge_of(
+    kind: clank_core::wait::WaitKind,
+    reason: Option<clank_core::vocab::WaitingReason>,
+) -> Discharge {
+    classify(kind, reason).0
+}
+
+/// What an agent owes an item, for an escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Duty {
+    /// An event: handled and acked by its selector, before the turn ends,
+    /// whatever it waits on.
+    Event,
+    /// A workflow step, named by its condition.
+    Step,
+    /// Acknowledged with `clank block clean`.
+    Unblocked,
+    /// Only the human can clear it.
+    HumanOnly,
+    /// Nothing the agent can do discharges it.
+    Nothing,
+}
+
+impl WaitItem {
+    /// What `clank events read` and `clank events ack` take for this
+    /// item: its own selector, or its presentation's.
+    fn event_selector(&self) -> Option<String> {
+        self.selector
+            .clone()
+            .or_else(|| self.presentation.as_ref().map(|p| p.selector()))
+    }
+
+    /// Which item this is, by every identifying field it carries.
+    fn identified(&self) -> String {
+        let mut out = self.raw_kind().to_string();
+        if let Some(next) = &self.next {
+            out.push_str(&format!(" {next}"));
+        }
+        if let Some(plan) = &self.plan {
+            out.push_str(&format!(" {plan}"));
+        }
+        if let Some(name) = &self.name {
+            out.push_str(&format!(" {name}"));
+        }
+        if let Some(pr) = self.pr {
+            out.push_str(&format!(" PR #{pr}"));
+        }
+        if let Some(round) = self.round {
+            out.push_str(&format!(" round {round}"));
+        }
+        if let Some(sha) = &self.sha {
+            out.push_str(&format!(" @ {}", short_sha(sha)));
+        }
+        if let Some(selector) = self.event_selector() {
+            out.push_str(&format!(" {selector}"));
+        }
+        out
+    }
+}
+
+/// One escalation line: what discharges `item`, or nothing when nothing
+/// the agent does would.
+fn duty_line(item: &WaitItem) -> Option<String> {
+    use clank_core::wait::WaitKind as K;
+    let kind = item.wake_kind()?;
+    let (discharge, duty) = classify(kind, item.wake_reason());
+    let what = item.identified();
+    let line = match duty {
+        Duty::Event => {
+            let Some(s) = item.event_selector() else {
+                let Discharge::Until(until) = discharge else {
+                    return None;
+                };
+                return Some(format!("- {what}: {until}"));
+            };
+            let finish = if kind == K::DraftChanged {
+                format!(
+                    "read the draft (`clank events read {s}`), do not reply to the edit, then \
+                     `clank events ack {s}`"
+                )
+            } else if item.requires_reply.unwrap_or(false) {
+                format!(
+                    "read it (`clank events read {s}`), then `clank events ack {s} --reply <text>`. \
+                     A reply is required, and waiting on anyone or anything does not waive it: \
+                     say in the reply what you are waiting on, and follow up when it arrives"
+                )
+            } else {
+                format!(
+                    "read it (`clank events read {s}`), reply if its source asks for one \
+                     (`clank events reply {s} -m <text>`), then `clank events ack {s}`. If it \
+                     waits on anyone or anything, answer or ack it now saying so, and follow up \
+                     when that arrives"
+                )
+            };
+            format!("- {what}: you MUST handle this before ending your turn: {finish}.")
+        }
+        Duty::Step => {
+            let Discharge::Until(until) = discharge else {
+                return None;
+            };
+            let block = if item.plan.is_some() {
+                " If this step genuinely depends on a person, record that with `clank block \
+                 create <name> -m \"<question>\"`: it pauses this plan's review work and \
+                 discharges nothing else."
+            } else {
+                ""
+            };
+            format!("- {what}: {until}.{block}")
+        }
+        Duty::Unblocked => format!("- {what}: acknowledge it with `clank block clean`."),
+        Duty::HumanOnly => format!(
+            "- {what}: only the human can clear this. Do not act on it, and do not answer it \
+             yourself; it does not excuse the other items."
+        ),
+        Duty::Nothing => return None,
+    };
+    Some(line)
 }
 
 /// The condition line for one item, or nothing.
@@ -3015,7 +3178,7 @@ struct ReceiptCapture {
     selected: Vec<clank_core::wait::EventPresentation>,
     /// This delivery and the agent dir its count is kept in: counted only
     /// as it is sent.
-    counting: Option<(PathBuf, super::wake_repeat::Delivery)>,
+    counting: Option<(PathBuf, super::wake_repeat::Delivery, Vec<String>)>,
 }
 impl ReceiptCapture {
     fn selected(
@@ -3052,7 +3215,11 @@ impl ReceiptCapture {
     ) -> Self {
         let agent_dir = crate::agent_store::agents_root(repo).join(author.as_str());
         Self {
-            counting: Some((agent_dir, delivery_of(input, boundary, items))),
+            counting: Some((
+                agent_dir,
+                delivery_of(input, boundary, items),
+                items.iter().filter_map(duty_line).collect(),
+            )),
             ..Self::selected(repo, author, tool, input.session_id.as_str(), items)
         }
     }
@@ -3238,16 +3405,19 @@ async fn emit_delivery(
         };
     }
     let emission = match capture.counting.take() {
-        Some((agent_dir, delivery)) if matches!(outcome, HookOutcome::Continue { .. }) => {
+        Some((agent_dir, delivery, duties)) if matches!(outcome, HookOutcome::Continue { .. }) => {
             let binding = capture.binding.as_ref();
             super::wake_repeat::send_counted(
                 &agent_dir,
                 &delivery,
                 || binding.is_some_and(|b| b.current()),
                 |count| match count {
-                    Some(count) => {
-                        emit_wire(&escalated(outcome.clone(), count), tool, stdout, stderr)
-                    }
+                    Some(count) => emit_wire(
+                        &escalated(outcome.clone(), count, &duties),
+                        tool,
+                        stdout,
+                        stderr,
+                    ),
                     // Rebound while waiting: this session is no longer the agent's.
                     None => emit_wire(
                         &HookOutcome::Silent {
@@ -3481,6 +3651,24 @@ mod tests {
     /// every time or none; the same Stop seen again, even after bookkeeping
     /// appends to its record, does not; a send that fails counts nothing;
     /// and the text states the count committed.
+    /// The hook itself carries the delivered items' duties: the repeated
+    /// continuation the agent receives names the message's ack by its
+    /// selector.
+    #[tokio::test]
+    async fn the_hook_escalates_with_the_delivered_items_duties() {
+        let c = Continuations::new();
+        let wire = serde_json::json!({"items":[{"kind":"message","handle":"h",
+            "selector":"messages@9"}]});
+        let items = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        let mut reason = String::new();
+        for _ in 0..super::super::wake_repeat::ESCALATE_AT {
+            c.answer();
+            reason = c.send(c.capture_of(None, &items), false).await;
+        }
+        assert!(reason.contains("times unchanged"), "{reason}");
+        assert!(reason.contains("`clank events ack messages@9`"), "{reason}");
+    }
+
     #[tokio::test]
     async fn repeated_delivery_is_counted_by_continuation_not_by_what_was_said() {
         let c = Continuations::new();
@@ -7363,5 +7551,201 @@ mod tests {
             Some("10s"),
             "without one: from the decision, as before"
         );
+    }
+
+    fn duties(items: &[serde_json::Value]) -> Vec<String> {
+        let wire = serde_json::json!({ "items": items });
+        parse_wait_json(wire.to_string().as_bytes())
+            .unwrap()
+            .iter()
+            .filter_map(duty_line)
+            .collect()
+    }
+
+    fn one(item: serde_json::Value) -> String {
+        let mut lines = duties(&[item]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.remove(0)
+    }
+
+    /// Each kind's escalation line says what discharges it, by its own
+    /// fields and class.
+    #[test]
+    fn each_repeated_item_says_what_discharges_it() {
+        let required = one(serde_json::json!({"kind":"message","handle":"request",
+            "requires_reply":true,"selector":"messages@7"}));
+        assert!(
+            required.contains("MUST handle this before ending your turn"),
+            "{required}"
+        );
+        assert!(
+            required.contains("`clank events read messages@7`"),
+            "{required}"
+        );
+        assert!(
+            required.contains("`clank events ack messages@7 --reply <text>`"),
+            "{required}"
+        );
+        assert!(required.contains("does not waive it"), "{required}");
+        assert!(!required.contains("clank block"), "{required}");
+        assert!(
+            !required.contains("request"),
+            "the handle is not the selector: {required}"
+        );
+
+        let event = one(
+            serde_json::json!({"kind":"command_event","name":"questions",
+            "selector":"command-questions-abcd@7"}),
+        );
+        assert!(
+            event.contains("`clank events ack command-questions-abcd@7`."),
+            "{event}"
+        );
+        assert!(event.contains("answer or ack it now saying so"), "{event}");
+        assert!(!event.contains("clank block"), "{event}");
+
+        let draft = one(serde_json::json!({"kind":"draft_changed","pr":12,
+            "selector":"draft-pr-12-run-1:3"}));
+        assert!(draft.contains("do not reply to the edit"), "{draft}");
+
+        let review = one(serde_json::json!({"kind":"adhoc_review","sha":FULL_SHA}));
+        assert!(review.contains(&FULL_SHA[..12]), "{review}");
+        assert!(review.contains("feedback exists for that sha"), "{review}");
+        assert!(!review.contains("clank block"), "{review}");
+        let revise = one(serde_json::json!({"kind":"adhoc_revise","sha":FULL_SHA}));
+        assert!(revise.contains("commit the revision"), "{revise}");
+
+        let master = one(
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+            "next":"revise","reason":"address_commit_changes"}),
+        );
+        assert!(
+            master.contains("commit work addressing the feedback"),
+            "{master}"
+        );
+        assert!(master.contains("`clank block create <name> -m"), "{master}");
+        let promote =
+            one(serde_json::json!({"kind":"promote_from_queue","name":"n","priority":500}));
+        assert!(!promote.contains("clank block"), "{promote}");
+
+        let unblocked = one(serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"}));
+        assert!(unblocked.contains("`clank block clean`"), "{unblocked}");
+        let blocked = one(
+            serde_json::json!({"kind":"blocked","agent":"claude","name":"q",
+            "plan":"p","question":"?"}),
+        );
+        assert!(
+            blocked.contains("only the human can clear this"),
+            "{blocked}"
+        );
+        assert!(blocked.contains("do not answer it yourself"), "{blocked}");
+        assert!(!blocked.contains("clank events") && !blocked.contains("clank block create"));
+
+        assert!(duties(&[serde_json::json!({"kind":"idle","prompt":"go"})]).is_empty());
+        assert!(duties(&[serde_json::json!({"kind":"a_kind_from_the_future"})]).is_empty());
+    }
+
+    /// A mixed delivery treats each item by its own class: the block is
+    /// offered for the plan's step alone, and a blocked item excuses
+    /// nothing else.
+    #[test]
+    fn a_mixed_delivery_owes_each_item_its_own_duty() {
+        let lines = duties(&[
+            serde_json::json!({"kind":"message","handle":"h","selector":"messages@3"}),
+            serde_json::json!({"kind":"master","plan":"p","sha":FULL_SHA,
+                "next":"continue","reason":"gate_continue"}),
+            serde_json::json!({"kind":"blocked","agent":"claude","name":"q","plan":"p"}),
+        ]);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let with_block: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("clank block create"))
+            .collect();
+        assert_eq!(with_block.len(), 1, "{lines:?}");
+        assert!(with_block[0].contains("master continue p"), "{lines:?}");
+        assert!(
+            lines[0].contains("`clank events ack messages@3`"),
+            "{lines:?}"
+        );
+    }
+
+    /// Wired through the hook: a repeated continuation carries its items'
+    /// duties after the limits it keeps.
+    #[test]
+    fn a_repeated_continuation_carries_its_items_duties() {
+        let lines = duties(&[serde_json::json!({"kind":"message","handle":"h",
+            "selector":"messages@3"})]);
+        let reason = |count| match escalated(
+            HookOutcome::Continue {
+                reason: "Items:".into(),
+            },
+            count,
+            &lines,
+        ) {
+            HookOutcome::Continue { reason } => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reason(super::super::wake_repeat::ESCALATE_AT - 1), "Items:");
+        let escalated = reason(super::super::wake_repeat::ESCALATE_AT);
+        assert!(escalated.contains("grants no new authority"), "{escalated}");
+        assert!(escalated.ends_with(&lines[0]), "{escalated}");
+    }
+
+    /// The line for an item as the real wait projection carries it.
+    fn projected(item: clank_core::wait::WaitItem) -> String {
+        let wire = serde_json::json!({"items":[crate::cli::wait::render_json(&item)]});
+        let parsed = parse_wait_json(wire.to_string().as_bytes()).unwrap();
+        duty_line(&parsed[0]).unwrap()
+    }
+
+    /// Through the real projection, every item is addressed by what
+    /// identifies it: a GitHub event by its presentation's selector, an
+    /// ad hoc commit by its sha, a PR item by its number and round.
+    #[test]
+    fn a_projected_item_is_addressed_by_its_own_identity() {
+        use clank_core::wait::{EventPresentation, PrMasterNext, WaitItem as I};
+        let github = projected(I::GithubEvent {
+            presentation: Some(EventPresentation {
+                source: "github-fixture".into(),
+                seq: 7,
+                ident: "fixture-event".into(),
+            }),
+            repo: "o/r".into(),
+            event: "issue_opened".into(),
+            detail: None,
+            number: Some(1),
+            title: None,
+            actor: None,
+            url: None,
+            instructions: None,
+            content: None,
+        });
+        assert!(
+            github.contains("`clank events read github-fixture@7`"),
+            "{github}"
+        );
+        assert!(
+            github.contains("`clank events ack github-fixture@7`"),
+            "{github}"
+        );
+        assert!(github.contains("MUST handle this"), "{github}");
+
+        let sha = clank_core::ids::CommitSha::parse(FULL_SHA).unwrap();
+        let review = projected(I::AdHocReview {
+            sha: sha.clone(),
+            feedback_path: "unused".into(),
+        });
+        assert!(review.contains(&FULL_SHA[..12]), "{review}");
+        let revise = projected(I::AdHocRevise { sha });
+        assert!(revise.contains(&FULL_SHA[..12]), "{revise}");
+
+        let reviewer = projected(I::PrReviewer { pr: 12, round: 3 });
+        assert!(reviewer.contains("PR #12 round 3"), "{reviewer}");
+        let master = projected(I::PrMaster {
+            pr: 12,
+            round: 0,
+            next: PrMasterNext::Draft,
+        });
+        assert!(master.contains("PR #12 round 0"), "{master}");
     }
 }

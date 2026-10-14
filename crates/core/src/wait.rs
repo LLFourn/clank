@@ -134,6 +134,13 @@ pub struct EventPresentation {
     pub ident: String,
 }
 
+impl EventPresentation {
+    /// What `clank events read` and `clank events ack` take for this event.
+    pub fn selector(&self) -> String {
+        format!("{}@{}", self.source, self.seq)
+    }
+}
+
 /// Flat tagged list `wait` returns from one refold round.
 /// Empty list at the call site means "no outcome, keep blocking."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
