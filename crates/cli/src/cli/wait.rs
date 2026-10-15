@@ -1951,6 +1951,12 @@ async fn run_leased_command_source(
     // ended. Still owned, so nothing replaces it until it does.
     let mut unended: Option<source_group::Owned> = None;
     loop {
+        // Closing is terminal: whatever the last pass did, nothing more
+        // is started, retried or counted. A group still owned goes to the
+        // shutdown that closed the registry, with its lease.
+        if owners.closing() {
+            return;
+        }
         if let Some(owned) = unended.take()
             && let Err((owned, why)) = retire_off_the_runtime(owned).await
         {
@@ -2017,6 +2023,9 @@ async fn run_leased_command_source(
         .await
         {
             Ok(launched) => Some(launched),
+            // This process is draining or exiting: nothing more may start,
+            // and that is not the source failing.
+            Err(source_group::LaunchError::Closed) => return,
             Err(e) => {
                 eprintln!("wait: command source `{}` did not start: {e}", src.name);
                 launch_error = Some(format!("{e:#}"));
@@ -2164,6 +2173,11 @@ async fn run_leased_command_source(
                 );
                 unended = Some(owned);
             }
+        }
+        // A run, or a launch, that the registry's closing interrupted did
+        // not fail, and there is nothing to restart it into.
+        if owners.closing() {
+            return;
         }
         // A run long enough to count as healthy clears the streak, so
         // a producer restarted nightly does not creep to the cap.
@@ -6969,5 +6983,195 @@ mod tests {
             crate::cli::source_diagnostic::Ended::of(Some(status)),
             crate::cli::source_diagnostic::Ended::Signal(9)
         );
+    }
+
+    /// A host whose registry closes while it backs off after a failed
+    /// run stops: it starts no further producer, counts nothing, and
+    /// raises no failure event.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closing_host_stops_relaunching() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let runs = root.path().join("runs");
+        let src = command_source(
+            "flaky",
+            &[
+                "sh",
+                "-c",
+                &format!("echo run >> '{}'; exit 3", runs.display()),
+            ],
+        );
+        let key = src.source_key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events.clone()),
+            key,
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+        ));
+        for _ in 0..500 {
+            if runs.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(runs.exists(), "the first run never happened");
+        // Into the backoff after that run, before the next launch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::task::spawn_blocking(move || owners.retire_all())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a closing host kept relaunching")
+            .unwrap();
+        let ran = std::fs::read_to_string(&runs).unwrap().lines().count();
+        assert!(ran <= 2, "it kept starting producers: {ran} runs");
+        while let Ok((item, _)) = rx.try_recv() {
+            assert!(
+                !format!("{item:?}").contains("has stopped"),
+                "a false failure event"
+            );
+        }
+    }
+
+    /// Closing while a run is still going ends the host with that run:
+    /// no backoff is waited out, because nothing will be restarted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_ended_by_closing_is_not_backed_off() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let ready = root.path().join("ready");
+        let src = command_source(
+            "long",
+            &[
+                "sh",
+                "-c",
+                &format!("touch '{}'; exec sleep 300", ready.display()),
+            ],
+        );
+        let key = src.source_key();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events.clone()),
+            key,
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+        ));
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists(), "the run never started");
+        tokio::task::spawn_blocking(move || owners.retire_all())
+            .await
+            .unwrap();
+        let closed = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the host did not end")
+            .unwrap();
+        assert!(
+            closed.elapsed() < crate::cli::command_source::BACKOFF_FIRST,
+            "it waited out a backoff: {:?}",
+            closed.elapsed()
+        );
+    }
+
+    /// A host whose registry is already closed returns, though the
+    /// previous producer it would otherwise keep waiting on still defers
+    /// its retirement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_host_does_not_wait_on_a_deferred_predecessor() {
+        let owners = crate::cli::source_group::tests::owners();
+        tokio::task::spawn_blocking(move || owners.retire_all())
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let src = command_source("any", &["sh", "-c", "exit 0"]);
+        let key = src.source_key();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events),
+            key,
+            |_: &Path, _: &str| {
+                crate::cli::command_source::Retired::Deferred("still settling".into())
+            },
+            owners,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a closed host kept waiting on its predecessor")
+            .unwrap();
+    }
+
+    /// Two real failures, then the registry closes during the backoff
+    /// before the third attempt: no false third failure is raised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_after_two_failures_raises_no_third() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let runs = root.path().join("runs");
+        let src = command_source(
+            "flaky",
+            &[
+                "sh",
+                "-c",
+                &format!("echo run >> '{}'; exit 3", runs.display()),
+            ],
+        );
+        let key = src.source_key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events),
+            key,
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+        ));
+        let count = || {
+            std::fs::read_to_string(&runs)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        for _ in 0..600 {
+            if count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count(), 2, "two runs first");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::task::spawn_blocking(move || owners.retire_all())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the host did not stop")
+            .unwrap();
+        assert_eq!(count(), 2, "a third producer started");
+        while let Ok((item, _)) = rx.try_recv() {
+            assert!(
+                !format!("{item:?}").contains("has stopped"),
+                "a false failure event"
+            );
+        }
     }
 }

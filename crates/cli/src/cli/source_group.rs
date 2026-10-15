@@ -187,7 +187,7 @@ impl Owners {
     ) -> std::io::Result<Owned> {
         let mut table = self.table();
         if table.closing {
-            return Err(std::io::Error::other("this process is exiting"));
+            return Err(std::io::Error::other(Closed));
         }
         let published = cs::record_producer(store_dir, key, &entry.record);
         let id = table.next;
@@ -215,7 +215,7 @@ impl Owners {
     ) -> std::io::Result<tokio::process::Child> {
         let mut table = self.table();
         if table.closing {
-            return Err(std::io::Error::other("this process is exiting"));
+            return Err(std::io::Error::other(Closed));
         }
         let Some(entry) = table.live.get_mut(&id).filter(|entry| !entry.deferred) else {
             return Err(std::io::Error::other("its group is being retired"));
@@ -454,8 +454,9 @@ impl Owners {
         self.table().live.remove(&id);
     }
 
-    #[cfg(test)]
-    fn closing(&self) -> bool {
+    /// Whether this registry admits no more groups: the process is
+    /// draining or exiting.
+    pub(crate) fn closing(&self) -> bool {
         self.table().closing
     }
 
@@ -805,20 +806,70 @@ pub(crate) async fn launch(
     key: &str,
     lease: Arc<IngestLease>,
     command: &mut tokio::process::Command,
-) -> Result<(Owned, tokio::process::Child), String> {
-    let spawned =
-        Spawned::spawn(&arming.program).map_err(|e| format!("its anchor could not start ({e})"))?;
-    let recorded = spawned
-        .record(owners, store_dir, key, lease)
-        .map_err(|e| format!("its group could not be recorded ({e})"))?;
+) -> Result<(Owned, tokio::process::Child), LaunchError> {
+    if owners.closing() {
+        return Err(LaunchError::Closed);
+    }
+    // Whatever stopped it, a launch the registry closed on was not the
+    // source failing.
+    let failed = |why: String| match owners.closing() {
+        true => LaunchError::Closed,
+        false => LaunchError::Failed(why),
+    };
+    let spawned = Spawned::spawn(&arming.program)
+        .map_err(|e| failed(format!("its anchor could not start ({e})")))?;
+    let recorded =
+        spawned
+            .record(owners, store_dir, key, lease)
+            .map_err(|e| match refused(&e) {
+                true => LaunchError::Closed,
+                false => failed(format!("its group could not be recorded ({e})")),
+            })?;
     let armed = recorded
         .arm(&arming.token, arming.deadline)
         .await
-        .map_err(|e| format!("its anchor was not armed: {e}"))?;
-    armed
-        .spawn(command)
-        .map_err(|e| format!("it failed to spawn ({e})"))
+        .map_err(|e| failed(format!("its anchor was not armed: {e}")))?;
+    armed.spawn(command).map_err(|e| match refused(&e) {
+        true => LaunchError::Closed,
+        false => failed(format!("it failed to spawn ({e})")),
+    })
 }
+
+/// Why a producer did not start.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LaunchError {
+    /// The registry admits no more groups: this process is draining or
+    /// exiting. Not the source failing.
+    Closed,
+    Failed(String),
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LaunchError::Closed => f.write_str("this process is exiting"),
+            LaunchError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Whether `e` is the registry refusing because it is closing.
+fn refused(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Closed>())
+}
+
+/// The registry's refusal once it is closing, told apart from every
+/// other launch error by its type.
+#[derive(Debug)]
+struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this process is exiting")
+    }
+}
+
+impl std::error::Error for Closed {}
 
 /// Retire this process's groups when it is told to stop, then stop as
 /// that signal would have stopped it.
@@ -1816,5 +1867,104 @@ pub(crate) mod tests {
             .await
             .expect("and finishes once it is done")
             .unwrap();
+    }
+
+    /// A closed registry refuses a launch as `Closed`, before any anchor
+    /// starts, and its admission refusal is told apart by type; a command
+    /// that cannot spawn is still a failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_registry_refuses_as_closed_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing = tokio::process::Command::new("/nonexistent/producer");
+        let failed = launch(
+            owners(),
+            &Arming::standard(),
+            dir.path(),
+            "src",
+            lease(dir.path(), "src"),
+            &mut missing,
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(LaunchError::Failed(_))),
+            "{:?}",
+            failed.err()
+        );
+
+        let closed = owners();
+        tokio::task::spawn_blocking(move || closed.retire_all())
+            .await
+            .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let out = launch(
+            closed,
+            &Arming::standard(),
+            other.path(),
+            "src",
+            lease(other.path(), "src"),
+            &mut sh("exec sleep 300"),
+        )
+        .await;
+        assert!(matches!(out, Err(LaunchError::Closed)), "{:?}", out.err());
+        assert!(
+            !cs::producer_path(other.path(), "src").exists(),
+            "a group was recorded"
+        );
+
+        let spawned = Spawned::spawn(&anchor_program()).unwrap();
+        let recorded = tokio::task::spawn_blocking({
+            let dir = other.path().to_path_buf();
+            move || {
+                spawned
+                    .record(closed, &dir, "src", lease(&dir, "src"))
+                    .map(drop)
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            refused(&recorded.unwrap_err()),
+            "admission's refusal is not typed"
+        );
+    }
+
+    /// A registry that closes while a launch is arming its anchor ends
+    /// that launch as `Closed`, not as a failure of the source.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_while_arming_is_closed_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let owners = owners();
+        let program = fake_anchor("IFS= read -r t; exec </dev/null sleep 300");
+        let task = {
+            let dir = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                launch(
+                    owners,
+                    &Arming {
+                        program,
+                        ..Arming::standard()
+                    },
+                    &dir,
+                    "src",
+                    lease(&dir, "src"),
+                    &mut sh("exec sleep 300"),
+                )
+                .await
+                .err()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "arming ended before the registry closed"
+        );
+        tokio::task::spawn_blocking(move || owners.retire_all())
+            .await
+            .unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, Some(LaunchError::Closed));
     }
 }
