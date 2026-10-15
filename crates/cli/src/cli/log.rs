@@ -481,7 +481,10 @@ pub(crate) fn event_row_text(g: &crate::cli::github::timeline::MergedEvent) -> S
     // Every field entering a terminal row uses the existing single-line
     // projection; stored content and the full detail page stay unchanged.
     let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
-    let mut out = g.destination().to_string();
+    let mut out = match (&g.backend, &g.sender) {
+        (Backend::Message, Some(sender)) => g.route(sender),
+        _ => g.destination().to_string(),
+    };
     let iconless = g
         .glyph
         .as_deref()
@@ -2054,8 +2057,9 @@ mod json_output_tests {
             panic!("a message reply")
         };
         assert!(
-            described.starts_with(&format!("→ @coordinator ({})", to.repo.display())),
-            "an outgoing reply names its target and the repo it is in: {described}"
+            described.starts_with("@")
+                && described.contains(&format!(" → @coordinator ({})", to.repo.display())),
+            "an outgoing reply names its sender, its target and the repo it is in: {described}"
         );
         assert_eq!(event_badge(reply), "✉");
         let reviews = Default::default();
@@ -2115,6 +2119,7 @@ mod json_output_tests {
             actor: Some("alice".into()),
             url: None,
             seen_by: vec!["claude".into()],
+            sender: None,
             members: vec![test_member(unhandled)],
             unhandled,
             baseline: false,
@@ -2625,6 +2630,7 @@ mod json_output_tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
+            sender: None,
             members: vec![test_member(true)],
             unhandled: true,
             baseline: false,
@@ -2676,6 +2682,7 @@ mod json_output_tests {
             actor: None,
             url: None,
             seen_by: vec!["claude".into()],
+            sender: None,
             members: vec![test_member(true)],
             unhandled: true,
             baseline: false,
@@ -3071,6 +3078,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
+            sender: None,
             members: Vec::new(),
             unhandled: false,
             baseline: false,
@@ -3409,6 +3417,7 @@ mod event_row_tests {
             actor: None,
             url: None,
             seen_by: seen_by.iter().map(|s| s.to_string()).collect(),
+            sender: None,
             members: Vec::new(),
             unhandled: true,
             baseline: false,

@@ -259,6 +259,10 @@ pub(crate) struct MergedEvent {
     /// Local recipient labels holding an inbox copy, sorted, deduped. An
     /// outgoing sender's custody does not count as having received the reply.
     pub(crate) seen_by: Vec<String>,
+    /// Who sent a message. Messages only: an event from outside clank has
+    /// no agent behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sender: Option<Sender>,
     /// Every copy's full address + state, sorted by
     /// (agent, source, seq, ident) — the page's target space and the
     /// ack fanout list.
@@ -369,6 +373,66 @@ impl MergedEvent {
 }
 
 /// Who an event is for.
+/// The agent that sent a message, and its repo when that is not the repo
+/// the timeline is read in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Sender {
+    pub(crate) agent: String,
+    pub(crate) repo: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Display for Sender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::cli::status_tui::text::one_line_whole;
+        match &self.repo {
+            Some(repo) => write!(
+                f,
+                "@{} ({})",
+                one_line_whole(&self.agent),
+                one_line_whole(&repo_shown(repo))
+            ),
+            None => write!(f, "@{}", one_line_whole(&self.agent)),
+        }
+    }
+}
+
+impl MergedEvent {
+    /// A message as it went: `@sender → @recipient,…`, each recipient
+    /// once, with its repo when it is not this one.
+    pub(crate) fn route(&self, sender: &Sender) -> String {
+        use crate::cli::status_tui::text::one_line_whole;
+        let destination = self.destination();
+        let mut to: Vec<Recipient> = destination
+            .local
+            .iter()
+            .map(|agent| Recipient {
+                agent: agent.clone(),
+                repo: None,
+            })
+            .chain(destination.outgoing)
+            .collect();
+        to.sort();
+        to.dedup();
+        let to: Vec<String> = to
+            .iter()
+            .map(|r| match &r.repo {
+                Some(repo) => format!(
+                    "@{} ({})",
+                    one_line_whole(&r.agent),
+                    one_line_whole(&repo_shown(repo))
+                ),
+                None => format!("@{}", one_line_whole(&r.agent)),
+            })
+            .collect();
+        let to = if to.is_empty() {
+            "@?".to_string()
+        } else {
+            to.join(", ")
+        };
+        format!("{sender} → {to}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Destination {
     /// Local agents holding a copy, sorted and deduplicated.
@@ -820,10 +884,30 @@ pub(crate) fn timeline_snapshot(repo: &Path) -> TimelineSnapshot {
     }
     nudges.sort_by(|a, b| (a.record.at, &a.agent).cmp(&(b.record.at, &b.agent)));
     TimelineSnapshot {
-        events: merge(copies),
+        events: merge(copies, &local_repo),
         notices: notices.into_iter().collect(),
         nudges,
     }
+}
+
+/// Who sent a message, from its copies' message items: an inbox copy's
+/// `from`, and an outgoing copy's too, which names its author. A repo is
+/// kept only when it is not this one.
+fn sender_of<'a>(mut copies: impl Iterator<Item = &'a Copy>, local_repo: &Path) -> Option<Sender> {
+    copies.find_map(|copy| match &copy.item {
+        WaitItem::Message {
+            from: Some(from),
+            repo,
+            ..
+        } => Some(Sender {
+            agent: from.clone(),
+            repo: repo.as_deref().map(Path::new).and_then(|repo| {
+                let repo = dunce::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+                (repo != local_repo).then_some(repo)
+            }),
+        }),
+        _ => None,
+    })
 }
 
 fn delivery_alias(repo: &Path, recipient: &str, id: &str) -> (String, String) {
@@ -863,7 +947,7 @@ fn command_glyphs(repo: &Path, label: &str) -> HashMap<String, String> {
 
 /// Union-find over copies sharing any alias; keyless copies stay
 /// singletons.
-fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
+fn merge(copies: Vec<Copy>, local_repo: &Path) -> Vec<MergedEvent> {
     let n = copies.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(parent: &mut [usize], i: usize) -> usize {
@@ -1006,6 +1090,9 @@ fn merge(copies: Vec<Copy>) -> Vec<MergedEvent> {
                         .and_then(|v| v.github?.url)
                         .map(str::to_owned)
                 }),
+                sender: (copies[members[0]].backend == Backend::Message)
+                    .then(|| sender_of(members.iter().map(|&i| &copies[i]), local_repo))
+                    .flatten(),
                 seen_by,
                 members: member_refs,
                 unhandled: inbound.iter().any(|&i| !copies[i].acked),
@@ -2384,6 +2471,50 @@ pub(crate) mod tests {
         assert!(
             !external.path().exists(),
             "rendering does not recreate the remote repo"
+        );
+    }
+
+    /// A message's row names who sent it to whom. A reply delivered
+    /// within the repo reads `@worker → @coordinator`, never the recipient
+    /// on both sides, which is how it read when the row took its left-hand
+    /// side from the copies' holders.
+    #[test]
+    fn a_message_row_reads_sender_to_recipient() {
+        let row = |snapshot: &TimelineSnapshot, about: &str| {
+            snapshot
+                .events
+                .iter()
+                .map(crate::cli::log::event_row_text)
+                .find(|text| text.contains(about))
+                .unwrap()
+        };
+
+        let (repo, _external, _source, _target, _op) = reply_fixture(true, true);
+        let snapshot = timeline_snapshot(repo.path());
+        let reply = row(&snapshot, "Answer");
+        assert!(reply.starts_with("@worker → @coordinator  "), "{reply}");
+        assert!(!reply.contains("@coordinator → @coordinator"), "{reply}");
+        let original = row(&snapshot, "Original question");
+        assert!(
+            original.starts_with("@coordinator → @worker  "),
+            "{original}"
+        );
+
+        let (repo, external, _source, _target, _op) = reply_fixture(false, true);
+        let there = dunce::canonicalize(external.path())
+            .unwrap()
+            .display()
+            .to_string();
+        let snapshot = timeline_snapshot(repo.path());
+        let sent = row(&snapshot, "Answer");
+        assert!(
+            sent.starts_with(&format!("@worker → @coordinator ({there})")),
+            "{sent}"
+        );
+        let received = row(&snapshot, "Original question");
+        assert!(
+            received.starts_with(&format!("@coordinator ({there}) → @worker  ")),
+            "{received}"
         );
     }
 

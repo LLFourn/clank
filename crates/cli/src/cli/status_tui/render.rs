@@ -5819,6 +5819,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: vec!["master".into()],
+            sender: None,
             members: Vec::new(),
             unhandled: true,
             baseline: false,
@@ -9228,6 +9229,7 @@ mod tests {
                 actor: None,
                 url: None,
                 seen_by: vec!["alpha".into()],
+                sender: None,
                 unhandled: false,
                 baseline: false,
                 members: vec![crate::cli::github::timeline::MemberRef {
@@ -9381,6 +9383,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: vec!["alpha".into()],
+            sender: None,
             unhandled: false,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
@@ -9444,6 +9447,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: vec!["alpha".into()],
+            sender: None,
             unhandled: false,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
@@ -9772,6 +9776,7 @@ mod tests {
             actor: Some("hubot".into()),
             url: Some("https://github.com/o/r/pull/12".into()),
             seen_by: vec!["alpha".into()],
+            sender: None,
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
@@ -9952,6 +9957,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
+            sender: None,
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
@@ -10048,6 +10054,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: vec!["grok".into()],
+            sender: None,
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
@@ -10133,6 +10140,7 @@ mod tests {
                 actor: None,
                 url: None,
                 seen_by: vec!["claude".into()],
+                sender: None,
                 unhandled: true,
                 baseline: false,
                 members: vec![crate::cli::github::timeline::MemberRef {
@@ -10286,6 +10294,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: vec!["claude".into()],
+            sender: None,
             unhandled: true,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
@@ -10383,6 +10392,7 @@ mod tests {
             actor: Some("hubot".into()),
             url: Some("https://github.com/o/r/pull/12".into()),
             seen_by: vec!["alpha".into(), "beta".into()],
+            sender: None,
             unhandled: true,
             baseline: false,
             members: vec![
@@ -10959,6 +10969,7 @@ mod tests {
             actor: Some("LLFourn".into()),
             url: None,
             seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),
+            sender: None,
             unhandled: members.iter().any(|m| !m.acked),
             baseline: false,
             members,

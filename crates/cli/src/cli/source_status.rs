@@ -325,6 +325,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
+            sender: None,
             members: members
                 .into_iter()
                 .map(|key| MemberRef {

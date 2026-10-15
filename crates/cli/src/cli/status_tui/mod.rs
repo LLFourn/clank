@@ -5948,7 +5948,7 @@ pub(crate) mod tests {
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         let event_rows: Vec<&crate::cli::log::OnelineRow> = rows
             .iter()
-            .filter(|r| matches!(r, crate::cli::log::OnelineRow::Github { line, .. } if line.starts_with("→ @codex")))
+            .filter(|r| matches!(r, crate::cli::log::OnelineRow::Github { line, .. } if line.contains(" → @codex")))
             .collect();
         assert_eq!(event_rows.len(), 3);
         let lines: Vec<String> = event_rows
@@ -6128,7 +6128,7 @@ pub(crate) mod tests {
                 row.glyph.as_deref(),
                 Some(format!("{} ✉", state.glyph()).as_str())
             );
-            let sent = web.iter().find(|r| r.text.starts_with("→ @")).unwrap();
+            let sent = web.iter().find(|r| r.text.contains(" → @")).unwrap();
             assert_eq!(sent.glyph.as_deref(), Some("→ ✉"));
         }
     }
@@ -6309,6 +6309,7 @@ pub(crate) mod tests {
             actor: None,
             url: None,
             seen_by: members.iter().map(|m| m.key.agent.clone()).collect(),
+            sender: None,
             unhandled: members.iter().any(|m| !m.acked),
             baseline: false,
             members,
@@ -6822,7 +6823,7 @@ pub(crate) mod tests {
         let ledger = ledger_rows(&rows);
         assert_eq!(ledger[0].glyph.as_deref(), Some("→ ✉"));
         assert!(
-            ledger[0].text.starts_with("→ @coordinator ("),
+            ledger[0].text.starts_with('@') && ledger[0].text.contains(" → @coordinator ("),
             "{}",
             ledger[0].text
         );
@@ -9576,6 +9577,7 @@ pub(crate) mod tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
+            sender: None,
             unhandled: false,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {

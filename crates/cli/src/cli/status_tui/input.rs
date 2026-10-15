@@ -3124,6 +3124,7 @@ mod tests {
             actor: None,
             url: None,
             seen_by: Vec::new(),
+            sender: None,
             unhandled: false,
             baseline: false,
             members: vec![crate::cli::github::timeline::MemberRef {
