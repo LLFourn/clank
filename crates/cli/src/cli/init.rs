@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use super::{InitArgs, resolve_repo};
+use super::InitArgs;
 
 use crate::init_facts::{
     POST_REWRITE_BODY, POST_REWRITE_MARKER, clank_gitignore_body, classify_gitignore_body,
@@ -33,7 +33,7 @@ use crate::init_facts::{
 /// `teams-based-agent-registration` (lloyd 2026-06-09: init
 /// assigns nothing).
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
-    let repo = resolve_repo(args.repo.as_deref())?;
+    let repo = repo_for_init(args.repo.as_deref(), &std::env::current_dir()?)?;
     write_scaffold(&repo)?;
     migrate_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
@@ -53,6 +53,35 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
         None => seed_bare(home.as_deref(), &repo)?,
     }
     Ok(())
+}
+
+/// The repository `clank init` sets up: the one containing the selected
+/// directory (`explicit`, else `cwd`), or, when discovery proves there
+/// is none, a new one created there. Init only: every other command
+/// still requires an existing repository.
+pub fn repo_for_init(explicit: Option<&Path>, cwd: &Path) -> anyhow::Result<std::path::PathBuf> {
+    use crate::git_io::Discovery;
+    let selected = explicit.unwrap_or(cwd);
+    let dir = dunce::canonicalize(selected)
+        .map_err(|e| anyhow::anyhow!("`{}`: {e}", selected.display()))?;
+    anyhow::ensure!(dir.is_dir(), "`{}` is not a directory", dir.display());
+    match crate::git_io::discover(&dir) {
+        Discovery::WorkTree(root) => Ok(dunce::canonicalize(root)?),
+        Discovery::Absent => {
+            crate::git_plumbing::init_repo(&dir)?;
+            eprintln!("created a git repository in {}", dir.display());
+            Ok(dir)
+        }
+        Discovery::Bare(git_dir) => anyhow::bail!(
+            "`{}` is inside a bare repository ({}), which has no work tree for clank",
+            dir.display(),
+            git_dir.display()
+        ),
+        Discovery::Failed(why) => anyhow::bail!(
+            "could not tell whether `{}` is inside a git repository ({why}); nothing was created",
+            dir.display()
+        ),
+    }
 }
 
 /// The team bare `clank init` seeds a fresh repo from, when the user
@@ -1130,6 +1159,141 @@ mod tests {
             team_ref(RosterRole::Master),
         );
         seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", dev)]);
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn init_outside_any_repo_creates_one_there_with_no_commit_or_remote() {
+        for explicit in [false, true] {
+            let outside = tempfile::tempdir().unwrap();
+            let dir = dunce::canonicalize(outside.path()).unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let (arg, cwd) = match explicit {
+                true => (Some(dir.as_path()), elsewhere.path()),
+                false => (None, dir.as_path()),
+            };
+            let repo = repo_for_init(arg, cwd).unwrap();
+            assert_eq!(repo, dir);
+            let top = git(&repo, &["rev-parse", "--show-toplevel"]);
+            assert_eq!(
+                dunce::canonicalize(String::from_utf8(top.stdout).unwrap().trim()).unwrap(),
+                dir
+            );
+            assert!(
+                !git(&repo, &["rev-parse", "--verify", "HEAD"])
+                    .status
+                    .success()
+            );
+            assert!(git(&repo, &["remote"]).stdout.is_empty());
+            write_scaffold(&repo).unwrap();
+            write_post_rewrite_hook(&repo, false).unwrap();
+            assert!(repo.join(".clank/.gitignore").is_file());
+            assert!(repo.join(".git/hooks/post-rewrite").is_file());
+        }
+    }
+
+    #[test]
+    fn init_inside_a_repo_or_worktree_uses_it_and_creates_nothing() {
+        let main = init_repo();
+        let root = dunce::canonicalize(main.path()).unwrap();
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(repo_for_init(Some(&sub), Path::new("/")).unwrap(), root);
+        assert_eq!(repo_for_init(None, &sub).unwrap(), root);
+        assert!(!sub.join(".git").exists());
+
+        assert!(
+            git(&root, &["commit", "--allow-empty", "-qm", "base"])
+                .status
+                .success()
+        );
+        let linked = tempfile::tempdir().unwrap();
+        let wt = linked.path().join("wt");
+        assert!(
+            git(&root, &["worktree", "add", "-q", wt.to_str().unwrap()])
+                .status
+                .success()
+        );
+        let wt = dunce::canonicalize(&wt).unwrap();
+        assert_eq!(repo_for_init(None, &wt).unwrap(), wt);
+        assert!(wt.join(".git").is_file(), "still a linked worktree");
+    }
+
+    #[test]
+    fn a_missing_path_or_unreadable_git_metadata_creates_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("nope");
+        assert!(repo_for_init(Some(&missing), parent.path()).is_err());
+        assert!(!missing.exists());
+
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(
+            broken.path().join(".git"),
+            "gitdir: /nonexistent/clank-test\n",
+        )
+        .unwrap();
+        let err = repo_for_init(None, broken.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was created"),
+            "{err:#}"
+        );
+        assert!(broken.path().join(".git").is_file(), "left as it was");
+    }
+
+    #[test]
+    fn a_bare_repository_missing_any_one_part_is_refused_and_left_alone() {
+        for part in ["HEAD", "refs", "objects", "config"] {
+            let bare = tempfile::tempdir().unwrap();
+            assert!(git(bare.path(), &["init", "--bare", "-q"]).status.success());
+            std::fs::rename(
+                bare.path().join(part),
+                bare.path().join(format!("{part}.saved")),
+            )
+            .unwrap();
+            assert!(repo_for_init(None, bare.path()).is_err(), "{part}");
+            assert!(!bare.path().join(".git").exists(), "{part}");
+            assert!(!bare.path().join(".clank").exists(), "{part}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_project_with_a_config_file_is_initialized_and_left_as_it_was() {
+        let project = tempfile::tempdir().unwrap();
+        let config = project.path().join("config");
+        std::fs::write(&config, "[core]\nmode = useful\n").unwrap();
+        let repo = repo_for_init(None, project.path()).unwrap();
+        assert!(repo.join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "[core]\nmode = useful\n"
+        );
+    }
+
+    /// Its config says nothing: only the part count sees a repository.
+    #[test]
+    fn a_bare_repository_without_head_and_with_an_emptied_config_is_refused() {
+        let bare = tempfile::tempdir().unwrap();
+        assert!(git(bare.path(), &["init", "--bare", "-q"]).status.success());
+        std::fs::remove_file(bare.path().join("HEAD")).unwrap();
+        std::fs::write(bare.path().join("config"), "").unwrap();
+        assert!(repo_for_init(None, bare.path()).is_err());
+        assert!(!bare.path().join(".git").exists());
+    }
+
+    #[test]
+    fn a_bare_repository_is_refused() {
+        let bare = tempfile::tempdir().unwrap();
+        assert!(git(bare.path(), &["init", "--bare", "-q"]).status.success());
+        let err = repo_for_init(None, bare.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("bare repository"), "{err:#}");
     }
 
     fn seed_user_team_default(home: &Path) {

@@ -514,6 +514,13 @@ pub fn write_index_tree(repo: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Create a repository whose work tree is `dir`, with no commit and no
+/// remote. Not gix: `git init` applies the user's `init.*` config (the
+/// default branch) and template directory, which gix's init does not.
+pub fn init_repo(dir: &Path) -> anyhow::Result<()> {
+    run(dir, &["init", "--quiet"])
+}
+
 pub fn reset_hard(repo: &Path, rev: &str) -> anyhow::Result<()> {
     run(repo, &["reset", "--hard", "--quiet", rev])
 }

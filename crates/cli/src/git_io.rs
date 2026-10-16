@@ -1129,6 +1129,80 @@ pub fn common_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
     Ok(absolutize(repo, r.common_dir()))
 }
 
+/// What upward discovery from a directory found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Discovery {
+    WorkTree(PathBuf),
+    /// A repository without a work tree, at this git dir.
+    Bare(PathBuf),
+    /// Proven: no repository at the start directory or any parent.
+    Absent,
+    /// Discovery itself failed: unreadable or malformed git metadata, a
+    /// trust refusal, a ceiling or filesystem limit.
+    Failed(String),
+}
+
+/// Upward discovery from `start`, keeping a proven absence apart from a
+/// discovery that could not finish.
+pub fn discover(start: &Path) -> Discovery {
+    match gix::discover(start) {
+        Ok(r) => match r.workdir() {
+            Some(work) => Discovery::WorkTree(work.to_path_buf()),
+            None => Discovery::Bare(r.git_dir().to_path_buf()),
+        },
+        // gix also reports no repository past a candidate it could not
+        // use, worktree pointer or bare git dir alike.
+        Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
+            ..
+        })) => match git_metadata_on_path(start, exists) {
+            Ok(None) => Discovery::Absent,
+            Ok(Some(found)) => Discovery::Failed(format!(
+                "`{}` looks like git metadata but is not a usable repository",
+                found.display()
+            )),
+            Err(e) => Discovery::Failed(e),
+        },
+        Err(e) => Discovery::Failed(e.to_string()),
+    }
+}
+
+/// Whether `path` exists. Any failure other than not-found is unknown.
+fn exists(path: &Path) -> std::io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The first directory on `start`'s path that holds git metadata: a
+/// `.git` entry, or a git dir itself. A git dir is three of `HEAD`,
+/// `objects`, `refs` and `config`, so a repository missing any one of
+/// them still counts, while one stray file of those names does not.
+fn git_metadata_on_path(
+    start: &Path,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+) -> Result<Option<PathBuf>, String> {
+    let probe = |path: PathBuf| {
+        exists(&path).map_err(|e| format!("cannot inspect `{}`: {e}", path.display()))
+    };
+    for dir in start.ancestors() {
+        if probe(dir.join(".git"))? {
+            return Ok(Some(dir.join(".git")));
+        }
+        let mut parts = 0;
+        for part in ["HEAD", "objects", "refs", "config"] {
+            if probe(dir.join(part))? {
+                parts += 1;
+            }
+        }
+        if parts >= 3 {
+            return Ok(Some(dir.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
 /// Discover the repository containing `start` — searching UPWARD,
 /// like `git rev-parse --show-toplevel` — and return its working-tree
 /// root. `Ok(None)` when `start` isn't inside a (non-bare) git repo.
@@ -2925,6 +2999,20 @@ mod tests {
             "modified tracked file still detected: {:?}",
             st.changed
         );
+    }
+
+    #[test]
+    fn an_unreadable_path_entry_is_unknown_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let denied = |path: &Path| {
+            if path.ends_with(".git") {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(false)
+            }
+        };
+        assert!(git_metadata_on_path(dir.path(), denied).is_err());
+        assert_eq!(git_metadata_on_path(dir.path(), |_| Ok(false)), Ok(None));
     }
 
     #[test]
