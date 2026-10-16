@@ -191,7 +191,12 @@ fn brief(state: &AgentState, now: u64) -> String {
         Activity::Asking => format!("asking {age}"),
         Activity::Interrupted => format!("interrupted {age}"),
         Activity::Unknown(_) => "unknown".to_string(),
-        Activity::Unobserved => "not observed".to_string(),
+        // Unobserved is no proof of no work while a waiter is parked:
+        // its work was never folded.
+        Activity::Unobserved if state.suppressors.contains(&Suppressor::Delivering) => {
+            "waiting for work".to_string()
+        }
+        Activity::Unobserved => "no work".to_string(),
     };
     match &state.nudge {
         Nudge::Nothing => {}
@@ -213,9 +218,11 @@ pub(crate) fn line(state: &AgentState, now: u64) -> String {
     if let Activity::Unknown(why) = &state.activity {
         out.push_str(&format!(": {why}"));
     }
+    let unobserved = state.activity == Activity::Unobserved;
     for s in &state.suppressors {
         out.push_str(match s {
             Suppressor::Attending => " · attended",
+            Suppressor::Delivering if unobserved => "",
             Suppressor::Delivering => " · waiting for work",
             Suppressor::NativeRetry => " · retrying itself",
             Suppressor::AutoOff => " · auto off",
@@ -223,6 +230,10 @@ pub(crate) fn line(state: &AgentState, now: u64) -> String {
     }
     if let Nudge::WaitingForYou(why) = &state.nudge {
         out.push_str(&format!(" · {why}"));
+    }
+    // Nothing is owed to nudge or resume for.
+    if unobserved {
+        return out;
     }
     if let Some(how) = &state.resumes {
         out.push_str(&format!(" · resumed: {how}"));
@@ -270,17 +281,60 @@ mod tests {
         assert!(stale(&s, Some("s1"), "master", Some(42), |_| false).is_some());
     }
 
-    /// An unobserved agent reads as not observed, never idle.
-    #[test]
-    fn unobserved_is_never_shown_idle() {
-        let s = AgentState {
+    fn unobserved(suppressors: Vec<Suppressor>) -> AgentState {
+        AgentState {
             activity: Activity::Unobserved,
-            suppressors: vec![Suppressor::Delivering],
+            suppressors,
+            resumes: Some("retries only".into()),
+            cannot_resume: Some("its version is not known yet".into()),
             ..state()
+        }
+    }
+
+    /// A parked waiter took the place of a fold, so whether work is
+    /// pending is not known: it is waiting for work, said once.
+    #[test]
+    fn an_unobserved_agent_with_a_waiter_is_waiting_for_work() {
+        let shown = line(&unobserved(vec![Suppressor::Delivering]), 1000);
+        assert_eq!(shown, "waiting for work");
+    }
+
+    /// The TUI row reads the same words through `brief`.
+    #[test]
+    fn the_tui_row_tells_a_waiter_from_no_work() {
+        assert_eq!(
+            brief(&unobserved(vec![Suppressor::Delivering]), 1000),
+            "waiting for work"
+        );
+        assert_eq!(brief(&unobserved(Vec::new()), 1000), "no work");
+    }
+
+    /// The fold ran and found nothing owed.
+    #[test]
+    fn an_unobserved_agent_without_a_waiter_has_no_work() {
+        assert_eq!(line(&unobserved(Vec::new()), 1000), "no work");
+        assert_eq!(
+            line(&unobserved(vec![Suppressor::AutoOff]), 1000),
+            "no work · auto off"
+        );
+    }
+
+    /// Owed work keeps every caveat.
+    #[test]
+    fn an_owing_agent_keeps_its_resume_and_nudge_caveats() {
+        let s = AgentState {
+            activity: Activity::Idle,
+            suppressors: vec![Suppressor::Delivering],
+            ..unobserved(Vec::new())
         };
         let shown = line(&s, 1000);
-        assert!(!shown.contains("idle"), "{shown}");
-        assert!(shown.starts_with("not observed"), "{shown}");
+        for clause in [
+            "waiting for work",
+            "resumed: retries only",
+            "not nudged: its version is not known yet",
+        ] {
+            assert!(shown.contains(clause), "{clause}: {shown}");
+        }
     }
 
     /// The line gives every reason the state holds: why the record cannot

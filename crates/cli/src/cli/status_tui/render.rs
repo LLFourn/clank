@@ -11202,7 +11202,7 @@ mod tests {
                 Some(view_of(Activity::Failed("overloaded".into()), None)),
                 "failed (overloaded)",
             ),
-            (Some(view_of(Activity::Unobserved, None)), "not observed"),
+            (Some(view_of(Activity::Unobserved, None)), "no work"),
         ] {
             let r = row(state, &plain);
             assert!(r.contains(says) && !r.contains(SPINNER[0]), "{r}");
