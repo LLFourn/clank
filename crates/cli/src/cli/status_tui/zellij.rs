@@ -191,7 +191,7 @@ fn rename_pane(id: &str, name: &str) {
 /// pane roles (the pane's actual role comes from the batch's listing).
 /// Pane titles have ONE owner — the worker — so these renames can
 /// never race the reconciler's role stamps (codex ff9579f).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StatusGlyphs {
     /// label → the title its pane should carry: status glyph plus
     /// `<label> (<role>)`, the role being the ROSTER's. The pane's own
@@ -1047,6 +1047,99 @@ pub(super) enum WorkerMsg {
     /// Probe pane presence now — the loop asks when the agent panel
     /// or an agent's page is entered, so what it shows is current.
     Probe,
+    /// A watched pane process exited.
+    Exited(PaneLaunch),
+    /// This repo's launch records for this session, after they changed.
+    Launches(Vec<PaneLaunch>),
+    /// The loop is gone. The exit watch holds a sender too, so the
+    /// channel alone never disconnects.
+    Close,
+}
+
+use crate::cli::pane_target::PaneLaunch;
+use crate::proc_identity::exit_watch::Armed;
+
+/// Arms and disarms kernel exit watches, so [`Watches`] is testable
+/// without real processes.
+pub(super) trait Arm {
+    fn arm(&mut self, launch: &PaneLaunch) -> Armed;
+    fn disarm(&mut self, launch: &PaneLaunch);
+}
+
+impl Arm for Option<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>> {
+    fn arm(&mut self, launch: &PaneLaunch) -> Armed {
+        match self {
+            Some(watch) => watch.arm(launch.clone(), launch.pid, &launch.birth),
+            None => Armed::Unknown,
+        }
+    }
+    fn disarm(&mut self, launch: &PaneLaunch) {
+        if let Some(watch) = self {
+            watch.disarm(launch);
+        }
+    }
+}
+
+/// One outcome per launch record, remembered until the record goes or
+/// names another process. Records outlive their processes, so without
+/// the memory every listing would re-arm a dead identity, find it
+/// ended, and list again.
+#[derive(Default)]
+pub(super) struct Watches {
+    tracked: std::collections::HashMap<std::path::PathBuf, (PaneLaunch, Armed)>,
+}
+
+impl Watches {
+    /// Whether the set changed, which is a reason to list.
+    fn rederive(&mut self, launches: Vec<PaneLaunch>, arm: &mut impl Arm) -> bool {
+        let incoming: std::collections::HashMap<_, _> = launches
+            .into_iter()
+            .map(|l| (l.record.clone(), l))
+            .collect();
+        let mut changed = false;
+        self.tracked.retain(|record, (launch, armed)| {
+            let keep = incoming.get(record) == Some(launch);
+            if !keep {
+                if *armed == Armed::Watching {
+                    arm.disarm(launch);
+                }
+                changed = true;
+            }
+            keep
+        });
+        for (record, launch) in incoming {
+            if !self.tracked.contains_key(&record) {
+                let armed = arm.arm(&launch);
+                self.tracked.insert(record, (launch, armed));
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether this exit is news. Only the current watch of a record
+    /// counts, and only once.
+    fn exited(&mut self, launch: &PaneLaunch) -> bool {
+        match self.tracked.get_mut(&launch.record) {
+            Some((current, armed)) if current == launch && *armed == Armed::Watching => {
+                *armed = Armed::Ended;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Folds the batch's watch traffic into its `probe`.
+    pub(super) fn absorb(&mut self, batch: &mut WorkerBatch, arm: &mut impl Arm) {
+        let mut list = false;
+        if let Some(launches) = batch.launches.take() {
+            list |= self.rederive(launches, arm);
+        }
+        for launch in std::mem::take(&mut batch.exits) {
+            list |= self.exited(&launch);
+        }
+        batch.probe |= list;
+    }
 }
 
 /// One batch of work for the worker, coalesced from the queue.
@@ -1055,9 +1148,10 @@ pub(super) struct WorkerBatch {
     pub(super) roster: Option<RosterView>,
     pub(super) glyphs: Option<StatusGlyphs>,
     pub(super) reopens: Vec<String>,
-    /// List panes for presence: the period elapsed, the loop asked, or
-    /// a refresh arrived (which lists anyway).
+    /// List panes now: the loop asked, or a watched pane changed.
     pub(super) probe: bool,
+    pub(super) exits: Vec<PaneLaunch>,
+    pub(super) launches: Option<Vec<PaneLaunch>>,
 }
 
 /// What the worker tells the loop. One channel, drained without
@@ -1073,14 +1167,6 @@ pub(super) enum Report {
     Reopened(String, ReopenOutcome),
 }
 
-/// How long the worker waits for a message before probing presence
-/// on its own. A pane closed by hand or a process that exits changes
-/// nothing under the repo, so nothing else would ever ask
-/// (the-tui-knows-whether-a-pane-is-open). One ~25 ms listing per
-/// period per TUI, followed by a process check only for bound agents
-/// whose pane is missing.
-pub(super) const PRESENCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// The worker's per-batch state: the reconciler AND the retitler,
 /// co-owned so pane titles have exactly ONE writer and a retitle can
 /// never race a relocation's role stamps (codex ff9579f). A reconcile
@@ -1095,6 +1181,11 @@ struct WorkerState {
     /// are only trustworthy while the roster TARGET is unchanged.
     last_roster: Option<RosterView>,
     tab: TabMirror,
+    /// The newest retitle data the loop sent.
+    glyphs: Option<StatusGlyphs>,
+    /// The glyphs the last answered listing retitled with. A refresh
+    /// that brings the same glyphs again is no reason to list.
+    listed_for: Option<StatusGlyphs>,
 }
 
 impl WorkerState {
@@ -1105,7 +1196,16 @@ impl WorkerState {
             lost: Default::default(),
             last_roster: None,
             tab: TabMirror::new(caller),
+            glyphs: None,
+            listed_for: None,
         }
+    }
+
+    /// Pane titles may name pre-relocation roles: the next glyphs,
+    /// equal or not, retitle off a fresh listing.
+    fn invalidate(&mut self) {
+        self.panes.invalidate();
+        self.listed_for = None;
     }
 
     /// Returns what the loop should hear: each reopen's outcome in
@@ -1128,8 +1228,8 @@ impl WorkerState {
     }
 
     /// [`Self::handle`] with the tab's zellij operations. The tab is
-    /// reconciled on every batch that lists, the periodic probe
-    /// included, so a stale name is found without the repo changing.
+    /// reconciled on every batch that lists, a probe included, so a
+    /// stale name is found without the repo changing.
     fn handle_with(
         &mut self,
         batch: WorkerBatch,
@@ -1142,6 +1242,7 @@ impl WorkerState {
             glyphs,
             reopens,
             probe,
+            ..
         } = batch;
         if let Some(view) = roster {
             // Invalidate on any TARGET change, not just on our own
@@ -1152,7 +1253,7 @@ impl WorkerState {
             self.last_roster = Some(view.clone());
             let acted = self.reconciler.reconcile(view, io);
             if acted || changed {
-                self.panes.invalidate();
+                self.invalidate();
             }
         }
         let mut reports: Vec<Report> = reopens
@@ -1163,17 +1264,24 @@ impl WorkerState {
                     None => ReopenOutcome::NotOnRoster,
                 };
                 if outcome == ReopenOutcome::Reopened {
-                    self.panes.invalidate();
+                    self.invalidate();
                 }
                 Report::Reopened(label, outcome)
             })
             .collect();
-        let listed = probe || glyphs.is_some();
-        let listing = if listed { io.snapshot() } else { None };
         if let Some(g) = glyphs {
             self.tab.want(&g.tab);
+            self.glyphs = Some(g);
+        }
+        let retitle = self.glyphs.is_some() && self.glyphs != self.listed_for;
+        let listed = probe || retitle;
+        let listing = if listed { io.snapshot() } else { None };
+        if let (true, Some(g)) = (listed, &self.glyphs) {
             let rows = listing.as_ref().map(|snap| io.title_rows(snap));
-            self.panes.update_with(&g, rows, rename);
+            self.panes.update_with(g, rows, rename);
+            if listing.is_some() {
+                self.listed_for = Some(g.clone());
+            }
         }
         if let Some(snap) = &listing {
             self.tab.reconcile(|caller| io.tab_of(snap, caller), tabs);
@@ -1240,7 +1348,10 @@ impl ReconcileWorker {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
         let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
         let mut worker = Self::in_session(report_rx);
+        let watch_tx = tx.clone();
         let join = std::thread::spawn(move || {
+            let mut arm = watch_launches(&repo, watch_tx);
+            let mut watches = Watches::default();
             let mut state = WorkerState::new(crate::cli::open_zellij::caller_pane_id());
             let mut tabs = ZellijTabIo;
             let io = ZellijPaneIo { repo: &repo };
@@ -1251,7 +1362,8 @@ impl ReconcileWorker {
             };
             serve(
                 &rx,
-                PRESENCE_PERIOD,
+                &mut watches,
+                &mut arm,
                 &mut state,
                 &mut io,
                 &mut tabs,
@@ -1387,9 +1499,69 @@ impl ReconcileWorker {
 
 impl Drop for ReconcileWorker {
     fn drop(&mut self) {
-        self.tx.take();
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(WorkerMsg::Close);
+        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+    }
+}
+
+/// The exit watch over this session's launch records for `repo`, which
+/// sends the worker the current records once, then again on every
+/// change, and each watched pane process's exit. `None` where the
+/// kernel offers no watch: presence then follows other events only.
+fn watch_launches(
+    repo: &std::path::Path,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+) -> Option<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>> {
+    use crate::proc_identity::exit_watch::ExitWatch;
+    let session = crate::cli::open_zellij::current_session()?;
+    let dir = crate::cli::monitor::ensure_runtime_dir()
+        .ok()
+        .map(|()| crate::cli::pane_target::launch_dir(repo).0);
+    let last: std::sync::Arc<std::sync::Mutex<Option<Vec<PaneLaunch>>>> = Default::default();
+    let read = {
+        let repo = repo.to_path_buf();
+        move || crate::cli::pane_target::launches_in(&repo, &session)
+    };
+    let watch = ExitWatch::new(
+        dir.as_deref(),
+        launch_sink(read.clone(), tx.clone(), last.clone()),
+    )
+    .ok();
+    // Read after the directory is watched, so no record written in
+    // between is missed.
+    let now = read();
+    let mut seeded = last.lock().unwrap();
+    if seeded.is_none() {
+        *seeded = Some(now.clone());
+        let _ = tx.send(WorkerMsg::Launches(now));
+    }
+    watch
+}
+
+/// What the watch thread does with a wake. The launch directory is
+/// shared by every repo, so a directory wake reaches the worker only
+/// when this repo's records for this session changed.
+fn launch_sink(
+    read: impl Fn() -> Vec<PaneLaunch> + Send + 'static,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+    last: std::sync::Arc<std::sync::Mutex<Option<Vec<PaneLaunch>>>>,
+) -> impl FnMut(crate::proc_identity::exit_watch::Wake<PaneLaunch>) + Send + 'static {
+    use crate::proc_identity::exit_watch::Wake;
+    move |wake| match wake {
+        Wake::Exited(launch) => {
+            let _ = tx.send(WorkerMsg::Exited(launch));
+        }
+        Wake::Dir => {
+            let now = read();
+            let mut last = last.lock().unwrap();
+            if last.as_ref() != Some(&now) {
+                *last = Some(now.clone());
+                let _ = tx.send(WorkerMsg::Launches(now));
+            }
         }
     }
 }
@@ -1399,14 +1571,16 @@ impl Drop for ReconcileWorker {
 #[allow(clippy::too_many_arguments)]
 fn serve<I: PaneIo>(
     rx: &std::sync::mpsc::Receiver<WorkerMsg>,
-    period: std::time::Duration,
+    watches: &mut Watches,
+    arm: &mut impl Arm,
     state: &mut WorkerState,
     io: &mut I,
     tabs: &mut impl TabIo,
     mut rename: impl FnMut(&str, &str),
     mut reports: impl FnMut(Vec<Report>),
 ) {
-    worker_loop(rx, period, |batch| {
+    worker_loop(rx, |mut batch| {
+        watches.absorb(&mut batch, arm);
         reports(state.handle_with(batch, io, &mut rename, tabs))
     });
     state.tab.restore(tabs);
@@ -1416,33 +1590,33 @@ fn serve<I: PaneIo>(
 /// coalescing contract is testable without zellij
 /// (tui-reconcile-off-loop): messages QUEUED before a batch starts
 /// collapse to the newest OF EACH KIND; arrivals DURING a batch
-/// collapse into exactly one follow-up batch. Exits when the channel
-/// disconnects (after at most one final drained batch).
-/// A wait that ends with no message is a batch of its own — a probe
-/// — so presence is re-read every `period` even when nothing else in
-/// the world moves.
-fn worker_loop(
-    rx: &std::sync::mpsc::Receiver<WorkerMsg>,
-    period: std::time::Duration,
-    mut batch: impl FnMut(WorkerBatch),
-) {
+/// collapse into exactly one follow-up batch. Exits on `Close` or
+/// disconnect, after at most one final drained batch. Nothing wakes it
+/// but a message: an idle worker costs zellij nothing.
+fn worker_loop(rx: &std::sync::mpsc::Receiver<WorkerMsg>, mut batch: impl FnMut(WorkerBatch)) {
     loop {
         let mut b = WorkerBatch::default();
-        let take = |m: WorkerMsg, b: &mut WorkerBatch| match m {
+        let mut closing = false;
+        let mut take = |m: WorkerMsg, b: &mut WorkerBatch| match m {
             WorkerMsg::Roster(v) => b.roster = Some(v),
             WorkerMsg::Glyphs(g) => b.glyphs = Some(g),
             WorkerMsg::Reopen(label) => b.reopens.push(label),
             WorkerMsg::Probe => b.probe = true,
+            WorkerMsg::Exited(launch) => b.exits.push(launch),
+            WorkerMsg::Launches(launches) => b.launches = Some(launches),
+            WorkerMsg::Close => closing = true,
         };
-        match rx.recv_timeout(period) {
+        match rx.recv() {
             Ok(first) => take(first, &mut b),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => b.probe = true,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(_) => return,
         }
         while let Ok(m) = rx.try_recv() {
             take(m, &mut b);
         }
         batch(b);
+        if closing {
+            return;
+        }
     }
 }
 
@@ -2043,7 +2217,7 @@ mod tests {
     }
 
     /// Through the worker: the first glyphs reach the tab, a refused
-    /// rename is retried by the periodic probe alone, and the worker's
+    /// rename is retried by a probe alone, and the worker's
     /// last act, after the final queued batch, is the restore.
     #[test]
     fn the_worker_keeps_the_tab_right_between_refreshes() {
@@ -2075,7 +2249,8 @@ mod tests {
         drop(tx);
         serve(
             &rx,
-            std::time::Duration::from_secs(60),
+            &mut Watches::default(),
+            &mut None,
             &mut state,
             &mut io,
             &mut tabs,
@@ -2202,7 +2377,7 @@ mod tests {
             roster,
             glyphs,
             reopens,
-            probe: false,
+            ..Default::default()
         }
     }
 
@@ -3011,32 +3186,13 @@ mod tests {
                 glyphs: Some(glyphs(&[("claude", "M", "R"), ("codex", "M", "R")])),
                 reopens: Vec::new(),
                 probe: true,
+                ..Default::default()
             },
             &mut io,
             |_, _| {},
         );
         assert_eq!(io.snapshots_taken, 1);
         assert!(matches!(reports.as_slice(), [Report::Presence(Some(_))]));
-    }
-
-    #[test]
-    fn the_worker_probes_when_its_wait_ends_with_no_message() {
-        // A hand-closed pane changes nothing under the repo; the
-        // worker's own clock is the only thing that would ever look
-        // (codex on 63548a9).
-        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
-        let mut batches = Vec::new();
-        let period = std::time::Duration::from_millis(20);
-        std::thread::spawn(move || {
-            std::thread::sleep(period * 4);
-            drop(tx);
-        });
-        worker_loop(&rx, period, |b| batches.push(b.probe));
-        assert!(
-            !batches.is_empty(),
-            "the wait ended without a message and that was a batch"
-        );
-        assert!(batches.iter().all(|p| *p), "every timeout batch is a probe");
     }
 
     #[test]
@@ -3062,12 +3218,18 @@ mod tests {
         let refresh = glyphs(&[("claude", "M", "R")]);
         let reports = state.handle(wb(None, Some(refresh), Vec::new()), &mut io, |_, _| {});
         assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
-        // The NEXT refresh, with the retitler's map already in hand,
-        // lists and reports all the same: the listing is per refresh,
-        // and presence rides on every one (codex on 44e937e).
+        // The same glyphs again are no reason to list.
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true), ("r1", false)]))]);
         let reports = state.handle(
             wb(None, Some(glyphs(&[("claude", "M", "R")])), Vec::new()),
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(io.snapshots_taken, 0);
+        assert!(reports.is_empty());
+        // Changed glyphs are, and presence rides on that listing.
+        let reports = state.handle(
+            wb(None, Some(glyphs(&[("claude", "W", "R")])), Vec::new()),
             &mut io,
             |_, _| {},
         );
@@ -3243,9 +3405,7 @@ mod tests {
         tx.send(WorkerMsg::Reopen("r1".into())).unwrap();
         drop(tx);
         let mut batches = Vec::new();
-        worker_loop(&rx, PRESENCE_PERIOD, |WorkerBatch { reopens, .. }| {
-            batches.push(reopens)
-        });
+        worker_loop(&rx, |WorkerBatch { reopens, .. }| batches.push(reopens));
         assert_eq!(batches, vec![vec!["r1", "r2", "r1"]]);
     }
 
@@ -3279,19 +3439,15 @@ mod tests {
         let (entered2, release2, log2) = (entered.clone(), release.clone(), log.clone());
         let join = std::thread::spawn(move || {
             let first = AtomicBool::new(true);
-            worker_loop(
-                &rx,
-                PRESENCE_PERIOD,
-                move |WorkerBatch { roster, .. }| {
-                    if let Some(v) = roster {
-                        log2.lock().unwrap().push(v);
-                    }
-                    if first.swap(false, Ordering::SeqCst) {
-                        entered2.wait();
-                        release2.wait();
-                    }
-                },
-            )
+            worker_loop(&rx, move |WorkerBatch { roster, .. }| {
+                if let Some(v) = roster {
+                    log2.lock().unwrap().push(v);
+                }
+                if first.swap(false, Ordering::SeqCst) {
+                    entered2.wait();
+                    release2.wait();
+                }
+            })
         });
         tx.send(WorkerMsg::Roster(view(&["v1"], None))).unwrap();
         entered.wait(); // the first batch is now provably in-flight
@@ -3330,15 +3486,11 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let join = std::thread::spawn(move || {
-            worker_loop(
-                &rx,
-                PRESENCE_PERIOD,
-                move |WorkerBatch { roster, glyphs, .. }| {
-                    log2.lock()
-                        .unwrap()
-                        .push((roster, glyphs.map(|g| g.titles.keys().cloned().collect())));
-                },
-            );
+            worker_loop(&rx, move |WorkerBatch { roster, glyphs, .. }| {
+                log2.lock()
+                    .unwrap()
+                    .push((roster, glyphs.map(|g| g.titles.keys().cloned().collect())));
+            });
         });
         join.join().expect("worker exits when the channel closes");
         assert_eq!(
@@ -3523,6 +3675,242 @@ mod tests {
                 ("terminal_0".to_string(), "R claude (reviewer)".to_string()),
                 ("terminal_1".to_string(), "M codex (master)".to_string()),
             ]
+        );
+    }
+
+    fn launch(record: &str, pid: i32) -> PaneLaunch {
+        PaneLaunch {
+            record: record.into(),
+            label: "claude".into(),
+            pid,
+            birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 2 },
+        }
+    }
+
+    /// Answers each arm from a script by pid; `Watching` otherwise.
+    #[derive(Default)]
+    struct FakeArm {
+        answers: std::collections::HashMap<i32, Armed>,
+        armed: Vec<i32>,
+        disarmed: Vec<i32>,
+    }
+
+    impl Arm for FakeArm {
+        fn arm(&mut self, launch: &PaneLaunch) -> Armed {
+            self.armed.push(launch.pid);
+            self.answers
+                .get(&launch.pid)
+                .copied()
+                .unwrap_or(Armed::Watching)
+        }
+        fn disarm(&mut self, launch: &PaneLaunch) {
+            self.disarmed.push(launch.pid);
+        }
+    }
+
+    /// Each of `msgs` as its own batch through the real `serve`.
+    fn served(
+        msgs: Vec<WorkerMsg>,
+        watches: &mut Watches,
+        arm: &mut FakeArm,
+        io: &mut FakeIo,
+    ) -> Vec<Report> {
+        let mut state = WorkerState::new(None);
+        let mut reports = Vec::new();
+        for msg in msgs {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(msg).unwrap();
+            tx.send(WorkerMsg::Close).unwrap();
+            serve(
+                &rx,
+                watches,
+                arm,
+                &mut state,
+                io,
+                &mut NoTabs,
+                |_, _| {},
+                |r| reports.extend(r),
+            );
+        }
+        reports
+    }
+
+    #[test]
+    fn an_idle_worker_never_lists() {
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])); 4]);
+        let join = std::thread::spawn(move || {
+            let mut state = WorkerState::new(None);
+            serve(
+                &rx,
+                &mut Watches::default(),
+                &mut FakeArm::default(),
+                &mut state,
+                &mut io,
+                &mut NoTabs,
+                |_, _| {},
+                |_| {},
+            );
+            io.snapshots_taken
+        });
+        // Longer than the 5 s period this loop used to probe on.
+        std::thread::sleep(std::time::Duration::from_millis(5500));
+        assert!(!join.is_finished(), "it waits on its channel, not a clock");
+        tx.send(WorkerMsg::Close).unwrap();
+        assert_eq!(join.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_pane_closed_while_its_session_lives_on_lists_once_and_reads_lost() {
+        let pane = launch("/run/r.pane-launch-a.json", 41);
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])), Some(Vec::new())]);
+        io.lost = ["claude".to_string()].into();
+        let mut watches = Watches::default();
+        let mut arm = FakeArm::default();
+        served(
+            vec![WorkerMsg::Launches(vec![pane.clone()])],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(io.snapshots_taken, 1, "a new record lists");
+        let reports = served(
+            vec![WorkerMsg::Exited(pane)],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(io.snapshots_taken, 2, "the exit lists once");
+        assert_eq!(presence_of(&reports), Some(Some(Vec::new())));
+        assert!(reports.contains(&Report::Lost(["claude".to_string()].into())));
+    }
+
+    #[test]
+    fn a_dead_retained_record_is_consumed_once() {
+        let dead = launch("/run/r.pane-launch-a.json", 41);
+        let mut io = FakeIo::new(vec![Some(Vec::new()); 8]);
+        let mut watches = Watches::default();
+        let mut arm = FakeArm::default();
+        arm.answers.insert(41, Armed::Ended);
+        served(
+            vec![
+                WorkerMsg::Launches(vec![dead.clone()]),
+                WorkerMsg::Launches(vec![dead.clone()]),
+                WorkerMsg::Probe,
+                WorkerMsg::Launches(vec![dead.clone()]),
+                WorkerMsg::Exited(dead.clone()),
+                WorkerMsg::Launches(vec![dead]),
+            ],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(arm.armed, [41], "armed once, never re-armed");
+        assert_eq!(io.snapshots_taken, 2, "the record's arrival and the probe");
+    }
+
+    #[test]
+    fn a_rebind_replaces_the_watch_and_a_stale_exit_is_discarded() {
+        let old = launch("/run/r.pane-launch-a.json", 41);
+        let new = launch("/run/r.pane-launch-a.json", 42);
+        let mut io = FakeIo::new(vec![Some(Vec::new()); 8]);
+        let mut watches = Watches::default();
+        let mut arm = FakeArm::default();
+        served(
+            vec![
+                WorkerMsg::Launches(vec![old.clone()]),
+                WorkerMsg::Launches(vec![new.clone()]),
+            ],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(arm.disarmed, [41]);
+        assert_eq!(io.snapshots_taken, 2);
+        served(
+            vec![WorkerMsg::Exited(old)],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(io.snapshots_taken, 2, "the replaced watch's exit is stale");
+        served(
+            vec![WorkerMsg::Exited(new.clone()), WorkerMsg::Exited(new)],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(io.snapshots_taken, 3, "the new one's exit lists, once");
+    }
+
+    #[test]
+    fn an_unknown_watch_never_reads_as_an_exit() {
+        let pane = launch("/run/r.pane-launch-a.json", 41);
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])); 4]);
+        let mut watches = Watches::default();
+        let mut arm = FakeArm::default();
+        arm.answers.insert(41, Armed::Unknown);
+        let reports = served(
+            vec![
+                WorkerMsg::Launches(vec![pane.clone()]),
+                WorkerMsg::Exited(pane.clone()),
+                WorkerMsg::Launches(vec![pane]),
+            ],
+            &mut watches,
+            &mut arm,
+            &mut io,
+        );
+        assert_eq!(arm.armed, [41]);
+        assert_eq!(io.snapshots_taken, 1, "the arrival only");
+        assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
+    }
+
+    #[test]
+    fn two_records_for_one_label_are_both_watched() {
+        let mut watches = Watches::default();
+        let mut arm = FakeArm::default();
+        let a = launch("/run/r.pane-launch-a.json", 41);
+        let b = launch("/run/r.pane-launch-b.json", 42);
+        assert!(watches.rederive(vec![a.clone(), b.clone()], &mut arm));
+        arm.armed.sort();
+        assert_eq!(arm.armed, [41, 42]);
+        assert!(watches.exited(&a));
+        assert!(watches.exited(&b));
+    }
+
+    #[test]
+    fn the_sink_forwards_only_this_repos_record_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let last = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let mut sink = launch_sink(
+            move || crate::cli::pane_target::launches_at(&path, "mine.pane-launch-", "live"),
+            tx,
+            last,
+        );
+        let birth = crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 2 };
+        let publish = |name: &str, session: &str| {
+            crate::cli::pane_target::publish_for_test(
+                &dir.path().join(name),
+                session,
+                "claude",
+                7,
+                birth.clone(),
+            )
+        };
+        publish("theirs.pane-launch-x.json", "live");
+        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        publish("mine.pane-launch-y.json", "other");
+        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        assert!(rx.try_recv().is_err(), "another repo's or session's record");
+        publish("mine.pane-launch-z.json", "live");
+        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        let got: Vec<WorkerMsg> = rx.try_iter().collect();
+        assert!(
+            matches!(got.as_slice(), [WorkerMsg::Launches(l)] if l.len() == 1),
+            "one batch for the one change"
         );
     }
 }

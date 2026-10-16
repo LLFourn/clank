@@ -2923,7 +2923,7 @@ fn ledger_row(row: &crate::cli::log::OnelineRow) -> LedgerRow {
 
 /// The spinner's frame rate — the only thing on screen that needs a
 /// fast tick.
-const SPINNER_TICK: Duration = Duration::from_millis(120);
+const SPINNER_TICK: Duration = Duration::from_millis(500);
 
 /// How long the pane sleeps with nothing animating. Every elapsed
 /// clank draws is minute-resolution ([`crate::age::coarse`]), so this
@@ -5256,9 +5256,9 @@ pub(crate) async fn run_tui(
                     }
                     log.request_fill();
                 }
-                // Entering the agents' screens asks for a fresh listing,
-                // so the menu is right when it opens rather than at the
-                // next period.
+                // Entering the agents' screens asks for a fresh listing:
+                // a pane moved or opened outside clank announces nothing,
+                // and this is how the user gets it seen.
                 if mode_shows_agents(&mode) && !was_on_agents {
                     reconcile_worker.probe();
                 }

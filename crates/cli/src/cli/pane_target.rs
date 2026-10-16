@@ -109,6 +109,9 @@ struct Launch {
     program: String,
     pid: i32,
     birth: ProcToken,
+    /// Absent from a record written before launches were watched.
+    #[serde(default)]
+    label: Option<String>,
     /// The version of the file exec'd, asked of it just before, or why
     /// there is none. Absent from a record written before clank asked.
     #[serde(default)]
@@ -158,9 +161,95 @@ pub(crate) fn record(
             program: program.into(),
             pid,
             birth,
+            label: Some(label.as_str().to_string()),
             harness: Some(harness),
         },
     )
+}
+
+/// A recorded pane launch. The process was exec'd in its pane, so it
+/// lives exactly as long as the pane holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneLaunch {
+    pub(crate) record: PathBuf,
+    pub(crate) label: String,
+    pub(crate) pid: i32,
+    pub(crate) birth: ProcToken,
+}
+
+/// The directory launch records live in, and this repo's filename
+/// prefix there.
+pub(crate) fn launch_dir(repo: &Path) -> (PathBuf, String) {
+    let probe = super::monitor::runtime_path(repo, "pane-launch-");
+    let prefix = probe
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (
+        probe.parent().map(Path::to_path_buf).unwrap_or_default(),
+        prefix,
+    )
+}
+
+/// This repo's labelled launch records for zellij `session`, in path
+/// order. Records written before labels were, and unreadable ones, are
+/// left out.
+pub(crate) fn launches_in(repo: &Path, session: &str) -> Vec<PaneLaunch> {
+    let (dir, prefix) = launch_dir(repo);
+    launches_at(&dir, &prefix, session)
+}
+
+pub(crate) fn launches_at(dir: &Path, prefix: &str, session: &str) -> Vec<PaneLaunch> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PaneLaunch> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(prefix) && name.ends_with(".json")
+        })
+        .filter_map(|entry| {
+            let record = entry.path();
+            let launch = read(&record).ok()?;
+            (launch.session == session).then_some(())?;
+            Some(PaneLaunch {
+                label: launch.label?,
+                pid: launch.pid,
+                birth: launch.birth,
+                record,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.record.cmp(&b.record));
+    found
+}
+
+/// A labelled launch record at `destination`, for tests elsewhere.
+#[cfg(test)]
+pub(crate) fn publish_for_test(
+    destination: &Path,
+    session: &str,
+    label: &str,
+    pid: i32,
+    birth: ProcToken,
+) {
+    publish(
+        destination,
+        &Launch {
+            version: 1,
+            session: session.into(),
+            pane: "terminal_1".into(),
+            tool: Tool::Claude,
+            program: "claude".into(),
+            pid,
+            birth,
+            label: Some(label.into()),
+            harness: None,
+        },
+    )
+    .unwrap();
 }
 
 fn publish(destination: &Path, launch: &Launch) -> anyhow::Result<()> {
@@ -322,8 +411,40 @@ mod tests {
             program: "/opt/bin/grok".into(),
             pid: 123,
             birth: ProcToken::MacStart { sec: 1, usec: 2 },
+            label: None,
             harness: None,
         }
+    }
+
+    #[test]
+    fn launches_are_this_repos_labelled_records_for_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, session: &str, label: Option<&str>| {
+            let mut l = launch();
+            l.session = session.into();
+            l.label = label.map(str::to_string);
+            publish(&dir.path().join(name), &l).unwrap();
+        };
+        write("tag.pane-launch-a.json", "live", Some("claude"));
+        write("tag.pane-launch-b.json", "live", Some("claude"));
+        write("tag.pane-launch-c.json", "other", Some("codex"));
+        write("tag.pane-launch-d.json", "live", None);
+        write("elsewhere.pane-launch-e.json", "live", Some("codex"));
+        let found = launches_at(dir.path(), "tag.pane-launch-", "live");
+        let names: Vec<String> = found
+            .iter()
+            .map(|l| l.record.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["tag.pane-launch-a.json", "tag.pane-launch-b.json"]);
+        assert!(found.iter().all(|l| l.label == "claude"));
+    }
+
+    #[test]
+    fn a_record_written_before_labels_still_parses() {
+        let mut json = serde_json::to_value(launch()).unwrap();
+        json.as_object_mut().unwrap().remove("label");
+        let parsed: Launch = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.label, None);
     }
     fn observed(program: &str) -> Inspection {
         Inspection::Verified(inspect::ProcessDetails {

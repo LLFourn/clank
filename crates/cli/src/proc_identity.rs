@@ -13,6 +13,7 @@
 //! understand must be refused outright rather than compared field by
 //! field against a shape it does not have.
 
+pub mod exit_watch;
 pub mod inspect;
 
 #[cfg(any(target_os = "linux", test))]
