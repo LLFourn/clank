@@ -1147,7 +1147,9 @@ fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let role: RosterRole = ReviewKind::from(args.review).into();
+    let role = args.review.map_or(NewRole::Default, |kind| {
+        NewRole::Given(ReviewKind::from(kind).into())
+    });
 
     if args.global {
         let tool = args.tool.ok_or_else(|| {
@@ -1520,6 +1522,54 @@ pub fn declare_global_agent(
     Ok(())
 }
 
+/// The role an added agent takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewRole {
+    Given(RosterRole),
+    /// Master on a roster that has none, otherwise `commit`.
+    Default,
+}
+
+impl From<RosterRole> for NewRole {
+    fn from(role: RosterRole) -> Self {
+        NewRole::Given(role)
+    }
+}
+
+impl NewRole {
+    fn on(self, roster: &RepoConfigFile) -> RosterRole {
+        match self {
+            NewRole::Given(role) => role,
+            NewRole::Default
+                if roster
+                    .agents
+                    .values()
+                    .any(|agent| agent.role == RosterRole::Master) =>
+            {
+                RosterRole::Commit
+            }
+            NewRole::Default => RosterRole::Master,
+        }
+    }
+
+    /// Why a defaulted agent became master, so it never happens silently.
+    fn why(self, role: RosterRole) -> &'static str {
+        match (self, role) {
+            (NewRole::Default, RosterRole::Master) => " (the roster had no master)",
+            _ => "",
+        }
+    }
+}
+
+/// Serializes an add's read, role decision and write, so two adds to a
+/// roster with no master cannot both make theirs master, and neither
+/// write loses the other's agent.
+fn roster_lock(repo: &Path) -> anyhow::Result<std::fs::File> {
+    let dir = repo.join(".clank");
+    std::fs::create_dir_all(&dir)?;
+    crate::agent_store::exclusive_lock(&dir.join("roster.lock"))
+}
+
 /// Insert a fresh agent (built inline from a description) into
 /// THIS repo's roster with the given role. Errors if the label is
 /// already on the roster (a roster entry is never silently
@@ -1528,9 +1578,12 @@ pub fn add_repo_roster_agent(
     repo: &Path,
     label: &AgentLabel,
     desc: AgentDescription,
-    role: RosterRole,
+    role: impl Into<NewRole>,
 ) -> anyhow::Result<()> {
+    let _roster = roster_lock(repo)?;
     let mut repo_cfg = read_repo_config(repo)?;
+    let choice = role.into();
+    let role = choice.on(&repo_cfg);
     let before = repo_cfg.clone();
     if repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
@@ -1549,9 +1602,10 @@ pub fn add_repo_roster_agent(
         RosterTransitionPolicy::PreserveGate,
     )?;
     eprintln!(
-        "added `{}` to this repo's roster: {}",
+        "added `{}` to this repo's roster: {}{}",
         label.as_str(),
-        role_phrase(role)
+        role_phrase(role),
+        choice.why(role)
     );
     Ok(())
 }
@@ -1587,9 +1641,12 @@ pub fn add_repo_roster_agent_by_name(
     repo: &Path,
     home: Option<&Path>,
     label: &AgentLabel,
-    role: RosterRole,
+    role: impl Into<NewRole>,
 ) -> anyhow::Result<()> {
+    let _roster = roster_lock(repo)?;
     let mut repo_cfg = read_repo_config(repo)?;
+    let choice = role.into();
+    let role = choice.on(&repo_cfg);
     let before = repo_cfg.clone();
     if repo_cfg.agents.contains_key(label) {
         anyhow::bail!(
@@ -1609,9 +1666,10 @@ pub fn add_repo_roster_agent_by_name(
         RosterTransitionPolicy::PreserveGate,
     )?;
     eprintln!(
-        "added `{}` to this repo's roster: {} (copied from the library)",
+        "added `{}` to this repo's roster: {}{} (copied from the library)",
         label.as_str(),
-        role_phrase(role)
+        role_phrase(role),
+        choice.why(role)
     );
     Ok(())
 }
@@ -2516,6 +2574,104 @@ mod tests {
             2,
             "the raw writer must appear only at its definition and inside write_repo_transition"
         );
+    }
+
+    // ── agent add, default role ──────────────────────────────
+
+    #[test]
+    fn a_default_add_to_a_roster_without_a_master_makes_it_master() {
+        for body in [
+            r#"{ "agents": {} }"#,
+            r#"{ "agents": { "codex": { "tool": "codex", "role": "commit" } } }"#,
+        ] {
+            let repo = tempfile::tempdir().unwrap();
+            seed_repo_config(repo.path(), body);
+            let claude = AgentLabel::parse("claude").unwrap();
+            add_repo_roster_agent(repo.path(), &claude, desc(Tool::Claude), NewRole::Default)
+                .unwrap();
+            assert_eq!(
+                read_repo(repo.path()).agents[&claude].role,
+                RosterRole::Master
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_add_beside_a_master_is_commit_and_an_explicit_tier_wins() {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let codex = AgentLabel::parse("codex").unwrap();
+        add_repo_roster_agent(repo.path(), &codex, desc(Tool::Codex), NewRole::Default).unwrap();
+        assert_eq!(
+            read_repo(repo.path()).agents[&codex].role,
+            RosterRole::Commit
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        seed_repo_config(empty.path(), r#"{ "agents": {} }"#);
+        add_repo_roster_agent(empty.path(), &codex, desc(Tool::Codex), RosterRole::Commit).unwrap();
+        assert_eq!(
+            read_repo(empty.path()).agents[&codex].role,
+            RosterRole::Commit
+        );
+    }
+
+    #[test]
+    fn a_default_add_by_name_follows_the_same_rule() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        seed_repo_config(repo.path(), r#"{ "agents": {} }"#);
+        seed_user_config(
+            home.path(),
+            &[("claude", Tool::Claude), ("codex", Tool::Codex)],
+        );
+        let claude = AgentLabel::parse("claude").unwrap();
+        let codex = AgentLabel::parse("codex").unwrap();
+        add_repo_roster_agent_by_name(repo.path(), Some(home.path()), &claude, NewRole::Default)
+            .unwrap();
+        add_repo_roster_agent_by_name(repo.path(), Some(home.path()), &codex, NewRole::Default)
+            .unwrap();
+        let roster = read_repo(repo.path());
+        assert_eq!(roster.agents[&claude].role, RosterRole::Master);
+        assert_eq!(roster.agents[&codex].role, RosterRole::Commit);
+    }
+
+    #[test]
+    fn concurrent_default_adds_keep_both_agents_and_one_master() {
+        for _ in 0..10 {
+            let repo = tempfile::tempdir().unwrap();
+            seed_repo_config(repo.path(), r#"{ "agents": {} }"#);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let adds: Vec<_> = ["claude", "codex"]
+                .into_iter()
+                .map(|name| {
+                    let (path, barrier) = (repo.path().to_path_buf(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let label = AgentLabel::parse(name).unwrap();
+                        barrier.wait();
+                        add_repo_roster_agent(&path, &label, desc(Tool::Claude), NewRole::Default)
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for add in adds {
+                add.join().unwrap();
+            }
+            let roles: Vec<RosterRole> = read_repo(repo.path())
+                .agents
+                .values()
+                .map(|a| a.role)
+                .collect();
+            assert_eq!(roles.len(), 2, "both adds survive");
+            assert_eq!(
+                roles.iter().filter(|r| **r == RosterRole::Master).count(),
+                1,
+                "{roles:?}"
+            );
+        }
     }
 
     // ── agent add (inline) ───────────────────────────────────

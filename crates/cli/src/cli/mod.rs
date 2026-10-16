@@ -1371,11 +1371,12 @@ pub struct AgentAddArgs {
     /// from the user-scope `agents` library.
     #[arg(long, value_enum)]
     pub tool: Option<ToolArg>,
-    /// Tier for the new roster entry: `commit` (default), `plan`,
-    /// `final`, or `gate`. Ignored with `--global` (the library has
-    /// no role).
-    #[arg(long, value_enum, default_value = "commit")]
-    pub review: ReviewKindArg,
+    /// Tier for the new roster entry: `commit`, `plan`, `final`, or
+    /// `gate`. Omitted, the agent becomes master on a roster that has
+    /// none, and `commit` otherwise. Ignored with `--global` (the
+    /// library has no role).
+    #[arg(long, value_enum)]
+    pub review: Option<ReviewKindArg>,
     /// Write the agent DESCRIPTION to the user-scope library
     /// (`~/.clank/config.json#/agents`, reusable, NO role) instead
     /// of the repo roster. Requires `--tool`. No repo change.

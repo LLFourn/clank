@@ -135,9 +135,8 @@ shell it belongs to — that distinction is the whole mental model.
 ```sh
 cd ~/src/my-project
 clank init                                   # scaffold .clank/
-clank agent add alice --tool claude
-clank agent promote alice                    # alice is the master
-clank agent add bob --tool codex --review commit
+clank agent add alice --tool claude          # the first agent is the master
+clank agent add bob --tool codex             # later ones review commits
 ```
 
 (Or seed a whole roster from a saved template: `clank init --team

@@ -273,7 +273,12 @@ fn apply_confirm(
             if let Some(c) = picker.get(idx)
                 && let Ok(label) = clank_core::ids::AgentLabel::parse(&c.label)
             {
-                crate::cli::agent::add_repo_roster_agent_by_name(repo, home, &label, tier.into())?;
+                crate::cli::agent::add_repo_roster_agent_by_name(
+                    repo,
+                    home,
+                    &label,
+                    crate::cli::teams_config::RosterRole::from(tier),
+                )?;
             }
             Ok(())
         }

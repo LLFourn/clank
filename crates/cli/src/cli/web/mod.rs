@@ -972,7 +972,7 @@ fn perform_agent_action(repo: &Path, home: Option<&Path>, ask: AgentAsk) -> anyh
             review,
         } => {
             let label = parse(&label)?;
-            let role = review.into();
+            let role: crate::cli::teams_config::RosterRole = review.into();
             match tool {
                 Some(tool) => agent::add_repo_roster_agent(
                     repo,
