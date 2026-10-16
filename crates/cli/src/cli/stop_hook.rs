@@ -1052,6 +1052,7 @@ async fn peek_items(repo: &Path, label: &AgentLabel) -> Result<Vec<WaitItem>, St
     }
 }
 
+use super::hook_owner::Lifetime;
 use tokio::process::Command;
 
 /// Argv for the in-hook wait. Separate from the spawn so the shape
@@ -1133,11 +1134,53 @@ impl OwnedWait {
 
     /// Collect the wait, holding the owner handle across the whole
     /// await and dropping it only afterwards.
+    #[cfg(test)]
     async fn run(self) -> std::io::Result<std::process::Output> {
         let Self { child, owner_end } = self;
         let output = child.wait_with_output().await;
         drop(owner_end);
         output
+    }
+}
+
+/// How long an abandoned wait gets to finish its own shutdown before it
+/// is killed.
+const ABANDON_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How a wait run against its owner's lifetime ended.
+enum Ran {
+    Finished(std::io::Result<std::process::Output>),
+    /// The owner went away first. The wait's shutdown, still to be
+    /// awaited: the poll deadline must not cut it short.
+    Abandoned(std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>),
+}
+
+/// A running wait that the hook's owner going away ends cooperatively.
+trait Run {
+    async fn run_until(self, abandon: impl std::future::Future<Output = ()>) -> Ran;
+}
+
+impl Run for OwnedWait {
+    async fn run_until(self, abandon: impl std::future::Future<Output = ()>) -> Ran {
+        let Self { child, owner_end } = self;
+        let mut collect = Box::pin(child.wait_with_output());
+        tokio::pin!(abandon);
+        tokio::select! {
+            biased;
+            () = &mut abandon => {
+                // Closing the owner pipe is the wait's own shutdown: its
+                // EOF sentinel retires what it owns before it exits. Only
+                // a wait that outlives the grace is killed, on drop.
+                drop(owner_end);
+                Ran::Abandoned(Box::pin(async move {
+                    let _ = tokio::time::timeout(ABANDON_GRACE, collect).await;
+                }))
+            }
+            output = &mut collect => {
+                drop(owner_end);
+                Ran::Finished(output)
+            }
+        }
     }
 }
 
@@ -1219,13 +1262,14 @@ async fn compute_wait_outcome(
     // Fixed at hook entry, so everything below — current_exe, command
     // construction, the child spawn — is charged against it.
     let deadline = poll_deadline(started);
+    let mut life = super::hook_owner::lifetime_for(tool, &super::hook_owner::Native);
     let arm = || {
         let exe = std::env::current_exe().map_err(|e| format!("hook: current_exe failed: {e}"))?;
         let mut cmd = wait_command(&exe, repo, label, session, tool);
-        Ok(OwnedWait::spawn(&mut cmd)?.run())
+        OwnedWait::spawn(&mut cmd)
     };
     wait_then_present_capturing(
-        await_wait_under_deadline(deadline, on_deadline, arm),
+        await_wait_under_deadline(deadline, on_deadline, &mut life, arm),
         label,
         live_ids,
         || crate::agent_store::binding_matches(repo, label, tool, session),
@@ -1287,14 +1331,16 @@ async fn wait_then_present_capturing(
 /// leave BOTH production exits free to regress to silence while the
 /// test stayed green — which is exactly what an earlier version of
 /// these tests did.
-async fn await_wait_under_deadline<F>(
+async fn await_wait_under_deadline<W: Run>(
     deadline: std::time::Instant,
     on_deadline: DeadlineAction,
-    arm: impl FnOnce() -> Result<F, String>,
-) -> Result<std::process::Output, HookOutcome>
-where
-    F: std::future::Future<Output = std::io::Result<std::process::Output>>,
-{
+    life: &mut Lifetime,
+    arm: impl FnOnce() -> Result<W, String>,
+) -> Result<std::process::Output, HookOutcome> {
+    let owner_gone = || outcome_of(&TurnDecision::NotOurs(NotOurs::OwnerGone));
+    if life.gone_now() {
+        return Err(owner_gone());
+    }
     // The RARER exit and the strictly worse one: it dies having done no
     // waiting at all, so a setup slow near the boundary must not be
     // what puts the agent to sleep. Short-circuits BEFORE arming.
@@ -1303,7 +1349,7 @@ where
     }
 
     let waiting = match arm() {
-        Ok(f) => f,
+        Ok(w) => w,
         Err(message) => return Err(HookOutcome::Diagnostic { message }),
     };
 
@@ -1314,10 +1360,17 @@ where
     // same way.
     // Re-checked here by construction: the deadline is absolute, so
     // the arming above has already eaten into it.
-    match under_deadline(waiting, deadline).await {
+    // Owner loss outranks whatever the wait found, and the deadline:
+    // there is nobody left to deliver to or re-arm for.
+    match under_deadline(waiting.run_until(life.ended()), deadline).await {
+        Some(Ran::Abandoned(shutdown)) => {
+            shutdown.await;
+            Err(owner_gone())
+        }
+        _ if life.gone_now() => Err(owner_gone()),
         None => Err(deadline_outcome(on_deadline)),
-        Some(Ok(o)) => Ok(o),
-        Some(Err(e)) => Err(HookOutcome::Diagnostic {
+        Some(Ran::Finished(Ok(o))) => Ok(o),
+        Some(Ran::Finished(Err(e))) => Err(HookOutcome::Diagnostic {
             message: format!("hook: waiting on wait failed: {e}"),
         }),
     }
@@ -2273,6 +2326,8 @@ pub(crate) enum NotOurs {
     /// `clank attending --clear` cancelled the attendance this turn
     /// was holding a timer for.
     AttendanceCleared,
+    /// The client that spawned the hook has exited.
+    OwnerGone,
 }
 
 /// Who wakes the agent instead — and the evidence that says so.
@@ -2318,6 +2373,7 @@ fn decision_from_label(why: SilentReason) -> Option<TurnDecision> {
         SilentReason::AutoOff => Some(TurnDecision::NotOurs(NotOurs::AutoOff)),
         SilentReason::StaleBinding => Some(TurnDecision::NotOurs(NotOurs::Superseded)),
         SilentReason::AttendanceCleared => Some(TurnDecision::NotOurs(NotOurs::AttendanceCleared)),
+        SilentReason::OwnerGone => Some(TurnDecision::NotOurs(NotOurs::OwnerGone)),
         // Carries a waker, but not one this function may invent: the
         // token lives at the site. See `EVIDENCED`.
         SilentReason::AttendingBackgroundTask => None,
@@ -2357,6 +2413,9 @@ pub(crate) fn outcome_of(decision: &TurnDecision) -> HookOutcome {
         },
         TurnDecision::NotOurs(NotOurs::AttendanceCleared) => HookOutcome::Silent {
             why: SilentReason::AttendanceCleared,
+        },
+        TurnDecision::NotOurs(NotOurs::OwnerGone) => HookOutcome::Silent {
+            why: SilentReason::OwnerGone,
         },
         TurnDecision::Yield(YieldTo::AttendedTask { .. }) => HookOutcome::Silent {
             why: SilentReason::AttendingBackgroundTask,
@@ -5220,7 +5279,12 @@ mod tests {
     #[test]
     fn every_silence_is_intentional_or_evidenced() {
         use SilentReason as S;
-        let intentional = [S::AutoOff, S::StaleBinding, S::AttendanceCleared];
+        let intentional = [
+            S::AutoOff,
+            S::StaleBinding,
+            S::AttendanceCleared,
+            S::OwnerGone,
+        ];
 
         for why in SilentReason::ALL {
             let buckets = [intentional.contains(why), EVIDENCED.contains(why)];
@@ -5627,13 +5691,203 @@ mod tests {
     /// could regress to silence with the test still green (codex on
     /// 12d2e29). Going through `await_wait_under_deadline` is the
     /// whole point: that function is where both exits live.
+    /// A wait double: abandoning it drops it.
+    struct Plain<F>(F);
+
+    impl<F: std::future::Future<Output = std::io::Result<std::process::Output>>> Run for Plain<F> {
+        async fn run_until(self, abandon: impl std::future::Future<Output = ()>) -> Ran {
+            let wait = self.0;
+            tokio::pin!(wait);
+            tokio::pin!(abandon);
+            tokio::select! {
+                biased;
+                () = &mut abandon => Ran::Abandoned(Box::pin(async {})),
+                output = &mut wait => Ran::Finished(output),
+            }
+        }
+    }
+
+    /// A wait whose shutdown after abandonment takes `shutdown`.
+    struct SlowShutdown {
+        shutdown: std::time::Duration,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Run for SlowShutdown {
+        async fn run_until(self, abandon: impl std::future::Future<Output = ()>) -> Ran {
+            abandon.await;
+            Ran::Abandoned(Box::pin(async move {
+                tokio::time::sleep(self.shutdown).await;
+                self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_loss_near_the_deadline_keeps_its_silence_and_its_shutdown() {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut life, end) = Lifetime::signalled();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let wait = SlowShutdown {
+            shutdown: std::time::Duration::from_secs(2),
+            done: done.clone(),
+        };
+        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, &mut life, || {
+            let _ = end.send(());
+            Ok(wait)
+        })
+        .await;
+        assert!(owner_gone(&got), "{got:?}");
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "the shutdown outlived the poll deadline"
+        );
+    }
+
+    fn owner_gone(got: &Result<std::process::Output, HookOutcome>) -> bool {
+        matches!(
+            got,
+            Err(HookOutcome::Silent {
+                why: SilentReason::OwnerGone
+            })
+        )
+    }
+
+    fn found_work() -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"[]".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_owner_gone_before_arming_spawns_no_wait() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut armed = false;
+        let got =
+            await_wait_under_deadline(deadline, DeadlineAction::ReArm, &mut Lifetime::Gone, || {
+                armed = true;
+                Ok(Plain(std::future::pending::<
+                    std::io::Result<std::process::Output>,
+                >()))
+            })
+            .await;
+        assert!(owner_gone(&got), "{got:?}");
+        assert!(!armed);
+    }
+
+    #[tokio::test]
+    async fn an_owner_ending_mid_wait_drops_the_wait_silently() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut life, end) = Lifetime::signalled();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let guard = Dropped(dropped.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = end.send(());
+        });
+        // Well inside the 30 s deadline, which would also end the wait.
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            await_wait_under_deadline(deadline, DeadlineAction::ReArm, &mut life, || {
+                Ok(Plain(async move {
+                    let _guard = guard;
+                    std::future::pending::<std::io::Result<std::process::Output>>().await
+                }))
+            }),
+        )
+        .await
+        .expect("the owner's exit ends the wait at once");
+        assert!(owner_gone(&got), "{got:?}");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the wait was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_loss_closes_the_pipe_and_collects_the_wait_after_its_own_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cleaned-up");
+        // Stands in for the wait: it runs until its owner pipe closes,
+        // then does its shutdown work.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "cat >/dev/null; sleep 0.2; touch '{}'",
+                marker.display()
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let (mut life, end) = Lifetime::signalled();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = end.send(());
+        });
+        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, &mut life, || {
+            OwnedWait::spawn(&mut cmd)
+        })
+        .await;
+        assert!(owner_gone(&got), "{got:?}");
+        assert!(
+            marker.exists(),
+            "the wait finished its shutdown before the hook returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_loss_outranks_a_wake_the_wait_already_found() {
+        let (mut life, end) = Lifetime::signalled();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, &mut life, || {
+            Ok(Plain(async move {
+                let _ = end.send(());
+                Ok(found_work())
+            }))
+        })
+        .await;
+        assert!(owner_gone(&got), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn a_live_owner_lets_the_wake_through() {
+        let (mut life, _end) = Lifetime::signalled();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, &mut life, || {
+            Ok(Plain(async { Ok(found_work()) }))
+        })
+        .await;
+        assert!(got.is_ok(), "{got:?}");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_deadline_re_arms_without_spinning_opencode() {
-        let arm = || Ok(std::future::pending::<std::io::Result<std::process::Output>>());
+        let arm = || {
+            Ok(Plain(std::future::pending::<
+                std::io::Result<std::process::Output>,
+            >()))
+        };
 
         for tool in [Tool::Claude, Tool::Codex] {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let got = await_wait_under_deadline(deadline, deadline_action(tool), arm).await;
+            let got = await_wait_under_deadline(
+                deadline,
+                deadline_action(tool),
+                &mut Lifetime::Unbound,
+                arm,
+            )
+            .await;
             assert!(
                 matches!(got, Err(HookOutcome::Continue { .. })),
                 "{tool:?} must re-arm at the deadline, got {got:?}"
@@ -5641,7 +5895,13 @@ mod tests {
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let got = await_wait_under_deadline(deadline, deadline_action(Tool::OpenCode), arm).await;
+        let got = await_wait_under_deadline(
+            deadline,
+            deadline_action(Tool::OpenCode),
+            &mut Lifetime::Unbound,
+            arm,
+        )
+        .await;
         assert_eq!(got, Err(HookOutcome::RenewWait));
     }
 
@@ -5653,11 +5913,14 @@ mod tests {
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
 
         let armed = std::cell::Cell::new(false);
-        let got = await_wait_under_deadline(past, DeadlineAction::ReArm, || {
-            armed.set(true);
-            Ok(std::future::pending::<std::io::Result<std::process::Output>>())
-        })
-        .await;
+        let got =
+            await_wait_under_deadline(past, DeadlineAction::ReArm, &mut Lifetime::Unbound, || {
+                armed.set(true);
+                Ok(Plain(std::future::pending::<
+                    std::io::Result<std::process::Output>,
+                >()))
+            })
+            .await;
         assert!(
             matches!(got, Err(HookOutcome::Continue { .. })),
             "the pre-check must re-arm too, got {got:?}"
@@ -5667,9 +5930,16 @@ mod tests {
             "it must short-circuit BEFORE arming — spawning a wait it cannot await leaks one"
         );
 
-        let got = await_wait_under_deadline(past, DeadlineAction::RenewWait, || {
-            Ok(std::future::pending::<std::io::Result<std::process::Output>>())
-        })
+        let got = await_wait_under_deadline(
+            past,
+            DeadlineAction::RenewWait,
+            &mut Lifetime::Unbound,
+            || {
+                Ok(Plain(std::future::pending::<
+                    std::io::Result<std::process::Output>,
+                >()))
+            },
+        )
         .await;
         assert!(
             matches!(got, Err(HookOutcome::RenewWait)),
@@ -5682,16 +5952,21 @@ mod tests {
     async fn work_arriving_before_the_deadline_survives_the_seam() {
         use std::os::unix::process::ExitStatusExt;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, || {
-            Ok(async {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                Ok(std::process::Output {
-                    status: std::process::ExitStatus::from_raw(0),
-                    stdout: b"items".to_vec(),
-                    stderr: Vec::new(),
-                })
-            })
-        })
+        let got = await_wait_under_deadline(
+            deadline,
+            DeadlineAction::ReArm,
+            &mut Lifetime::Unbound,
+            || {
+                Ok(Plain(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: b"items".to_vec(),
+                        stderr: Vec::new(),
+                    })
+                }))
+            },
+        )
         .await;
         match got {
             Ok(o) => assert_eq!(o.stdout, b"items"),
@@ -5705,9 +5980,16 @@ mod tests {
     async fn consecutive_expiries_each_re_arm() {
         for period in 0..2 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, || {
-                Ok(std::future::pending::<std::io::Result<std::process::Output>>())
-            })
+            let got = await_wait_under_deadline(
+                deadline,
+                DeadlineAction::ReArm,
+                &mut Lifetime::Unbound,
+                || {
+                    Ok(Plain(std::future::pending::<
+                        std::io::Result<std::process::Output>,
+                    >()))
+                },
+            )
             .await;
             assert!(
                 matches!(got, Err(HookOutcome::Continue { .. })),
@@ -5726,9 +6008,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_re_arm_reason_cannot_be_mistaken_for_work() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let got = await_wait_under_deadline(deadline, DeadlineAction::ReArm, || {
-            Ok(std::future::pending::<std::io::Result<std::process::Output>>())
-        })
+        let got = await_wait_under_deadline(
+            deadline,
+            DeadlineAction::ReArm,
+            &mut Lifetime::Unbound,
+            || {
+                Ok(Plain(std::future::pending::<
+                    std::io::Result<std::process::Output>,
+                >()))
+            },
+        )
         .await;
         let Err(HookOutcome::Continue { reason }) = got else {
             panic!("the deadline must re-arm, got {got:?}");

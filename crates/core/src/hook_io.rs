@@ -359,6 +359,9 @@ silent_reasons! {
     AttendanceCleared,
     /// This hook's session no longer holds the label.
     StaleBinding,
+    /// The codex client that spawned this hook has exited; nobody is
+    /// left to deliver to.
+    OwnerGone,
     /// Every item was work the agent is already attending: it has a
     /// LIVE background task recorded, and nothing arrived that it did
     /// not already know. Waking here is what turned one long build
