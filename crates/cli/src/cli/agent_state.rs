@@ -191,12 +191,9 @@ fn brief(state: &AgentState, now: u64) -> String {
         Activity::Asking => format!("asking {age}"),
         Activity::Interrupted => format!("interrupted {age}"),
         Activity::Unknown(_) => "unknown".to_string(),
-        // Unobserved is no proof of no work while a waiter is parked:
-        // its work was never folded.
-        Activity::Unobserved if state.suppressors.contains(&Suppressor::Delivering) => {
-            "waiting for work".to_string()
-        }
-        Activity::Unobserved => "no work".to_string(),
+        // Clank has nothing for it, whether a parked wait or a nudge
+        // would deliver the next thing.
+        Activity::Unobserved => "waiting for work".to_string(),
     };
     match &state.nudge {
         Nudge::Nothing => {}
@@ -299,23 +296,22 @@ mod tests {
         assert_eq!(shown, "waiting for work");
     }
 
-    /// The TUI row reads the same words through `brief`.
+    /// The TUI row reads the same words through `brief`, waiter or not.
     #[test]
-    fn the_tui_row_tells_a_waiter_from_no_work() {
-        assert_eq!(
-            brief(&unobserved(vec![Suppressor::Delivering]), 1000),
-            "waiting for work"
-        );
-        assert_eq!(brief(&unobserved(Vec::new()), 1000), "no work");
+    fn the_tui_row_reads_waiting_for_work_either_way() {
+        for suppressors in [vec![Suppressor::Delivering], Vec::new()] {
+            assert_eq!(brief(&unobserved(suppressors), 1000), "waiting for work");
+        }
     }
 
-    /// The fold ran and found nothing owed.
+    /// No parked waiter: still waiting for work, as far as the user is
+    /// concerned.
     #[test]
-    fn an_unobserved_agent_without_a_waiter_has_no_work() {
-        assert_eq!(line(&unobserved(Vec::new()), 1000), "no work");
+    fn an_unobserved_agent_without_a_waiter_is_waiting_for_work_too() {
+        assert_eq!(line(&unobserved(Vec::new()), 1000), "waiting for work");
         assert_eq!(
             line(&unobserved(vec![Suppressor::AutoOff]), 1000),
-            "no work · auto off"
+            "waiting for work · auto off"
         );
     }
 
