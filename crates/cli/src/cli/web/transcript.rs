@@ -439,6 +439,9 @@ mod claude {
         if e.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
             return Vec::new();
         }
+        if let Some(turn) = absorbed_prompt(&e) {
+            return vec![Parsed::Turn(turn)];
+        }
         let (Some(kind), Some(uuid), Some(message)) = (
             e.get("type").and_then(|v| v.as_str()),
             e.get("uuid").and_then(|v| v.as_str()),
@@ -455,6 +458,35 @@ mod claude {
             "user" => user(uuid, at, content),
             _ => Vec::new(),
         }
+    }
+
+    /// A message the person sent while Claude was working. Claude Code
+    /// absorbs it into the running turn and records it as a
+    /// `queued_command` attachment, not a user message, so it has no
+    /// `message` to parse.
+    fn absorbed_prompt(e: &serde_json::Value) -> Option<Turn> {
+        if e.get("type")?.as_str()? != "attachment" {
+            return None;
+        }
+        let a = e.get("attachment")?;
+        let human = a
+            .get("origin")
+            .and_then(|o| o.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("human")
+            || a.get("humanTurn").and_then(|h| h.as_bool()) == Some(true);
+        if a.get("type")?.as_str()? != "queued_command"
+            || a.get("commandMode")?.as_str()? != "prompt"
+            || !human
+        {
+            return None;
+        }
+        Some(Turn {
+            id: e.get("uuid")?.as_str()?.to_string(),
+            at: epoch(e.get("timestamp").and_then(|v| v.as_str())),
+            who: Who::Person,
+            body: Body::prose(a.get("prompt")?.as_str()?.to_string()),
+        })
     }
 
     fn assistant(uuid: &str, at: Option<i64>, content: &serde_json::Value) -> Vec<Parsed> {
@@ -1220,6 +1252,86 @@ mod tests {
             "{title}"
         );
         assert_eq!(detail.len(), 400, "the detail is not cut");
+    }
+
+    fn absorbed(attachment: serde_json::Value) -> String {
+        serde_json::json!({
+            "parentUuid": "b891", "isSidechain": false, "type": "attachment",
+            "uuid": "c71511e4-278c-46f2-8dcf-122afe8c248c",
+            "timestamp": "2026-10-16T23:16:34.977Z",
+            "attachment": attachment,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_prompt_absorbed_mid_turn_is_the_persons_turn() {
+        // The shape secg-search's transcript recorded, 2026-10-17.
+        let text =
+            "Sure don’t start the experiment until the plan is finished and I’ve given my go-ahead";
+        for human in [
+            serde_json::json!({"origin": {"kind": "human"}, "humanTurn": true}),
+            serde_json::json!({"origin": {"kind": "human"}}),
+            serde_json::json!({"humanTurn": true}),
+        ] {
+            let mut a = serde_json::json!({
+                "type": "queued_command", "prompt": text,
+                "source_uuid": "a518", "commandMode": "prompt",
+            });
+            a.as_object_mut()
+                .unwrap()
+                .extend(human.as_object().unwrap().clone());
+            let parsed = parse(Tool::Claude, &absorbed(a));
+            let [Parsed::Turn(turn)] = parsed.as_slice() else {
+                panic!("{parsed:?}");
+            };
+            assert_eq!(turn.id, "c71511e4-278c-46f2-8dcf-122afe8c248c");
+            assert_eq!(turn.who, Who::Person);
+            assert_eq!(turn.body, Body::prose(text.to_string()));
+            assert!(turn.at.is_some());
+        }
+    }
+
+    /// The page settles a pending row from a person text turn; the
+    /// absorbed prompt must reach it in exactly a typed message's shape.
+    #[test]
+    fn an_absorbed_prompt_reaches_the_page_as_a_typed_message_would() {
+        let typed = serde_json::json!({"type": "user", "uuid": "u1",
+            "timestamp": "2026-10-16T23:16:34.977Z",
+            "message": {"role": "user", "content": "go"}})
+        .to_string();
+        let absorbed = absorbed(serde_json::json!({"type": "queued_command", "prompt": "go",
+            "commandMode": "prompt", "origin": {"kind": "human"}}));
+        let shape = |line: &str| {
+            let parsed = parse(Tool::Claude, line);
+            let [Parsed::Turn(turn)] = parsed.as_slice() else {
+                panic!("{line}");
+            };
+            let mut v = serde_json::to_value(turn).unwrap();
+            v.as_object_mut().unwrap().remove("id");
+            v
+        };
+        assert_eq!(shape(&absorbed), shape(&typed));
+    }
+
+    #[test]
+    fn other_attachments_and_non_human_or_non_prompt_commands_are_not_turns() {
+        for a in [
+            serde_json::json!({"type": "queued_command", "prompt": "x", "commandMode": "prompt", "origin": {"kind": "hook"}}),
+            serde_json::json!({"type": "queued_command", "prompt": "/compact", "commandMode": "bash", "origin": {"kind": "human"}}),
+            serde_json::json!({"type": "edited_text_file", "prompt": "x"}),
+        ] {
+            assert!(parse(Tool::Claude, &absorbed(a.clone())).is_empty(), "{a}");
+        }
+        let mut side: serde_json::Value = serde_json::from_str(&absorbed(serde_json::json!({
+            "type": "queued_command", "prompt": "x", "commandMode": "prompt", "origin": {"kind": "human"},
+        })))
+        .unwrap();
+        side["isSidechain"] = serde_json::json!(true);
+        assert!(parse(Tool::Claude, &side.to_string()).is_empty());
+        let op = serde_json::json!({"type": "queue-operation", "operation": "remove",
+            "content": "x", "reason": "absorbed_mid_turn"});
+        assert!(parse(Tool::Claude, &op.to_string()).is_empty());
     }
 
     #[test]

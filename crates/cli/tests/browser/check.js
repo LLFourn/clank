@@ -13,6 +13,45 @@ const clickUnavailableChat = async (page) => {
 
 (async () => {
   try {
+  // ---- a message Claude absorbed mid-turn settles its pending row
+  {
+    const { browser, page, errors } = await open();
+    const said = 'Sure don’t start the experiment until the plan is finished and I’ve given my go-ahead';
+    await page.evaluate((d) => window.__send('status', d),
+      facts([{ ...agent('claude', 'master', null, null, true), session: 's1', tool: 'claude' }]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['claude']));
+    await page.evaluate((d) => window.__send('turns', d), turns('claude', []));
+    await page.evaluate(() => {
+      window.__says = 0;
+      window.fetch = async (url) => {
+        if (url === '/say') window.__says += 1;
+        return { ok: true, status: 204, text: async () => '' };
+      };
+    });
+    for (const words of [said, 'something else']) {
+      await page.fill('#text', words);
+      await page.click('#send');
+      await page.waitForTimeout(30);
+    }
+    ok('both submissions wait for Chat history', await page.locator('.turn.outgoing').count() === 2);
+    // The person turn the parser now makes from the queued_command
+    // attachment: the line's uuid, the prompt verbatim.
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'claude', session: 's1', generation: 1,
+      turn: text('c71511e4-278c-46f2-8dcf-122afe8c248c', 'person', said, said),
+    });
+    ok('the absorbed message retires its own pending row only',
+       await page.locator('.turn.outgoing').count() === 1
+       && (await page.textContent('.turn.outgoing')).includes('something else'));
+    await page.evaluate((d) => window.__send('turns', d), turns('claude', [
+      text('c71511e4-278c-46f2-8dcf-122afe8c248c', 'person', said, said),
+    ]));
+    ok('a replay leaves the other row pending', await page.locator('.turn.outgoing').count() === 1);
+    ok('nothing was resent', await page.evaluate(() => window.__says) === 2);
+    ok('no page errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- a finished run's end rule is a textless line in the timeline
   {
     const { page, errors } = await open();
