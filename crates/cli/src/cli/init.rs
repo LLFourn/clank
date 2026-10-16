@@ -50,28 +50,54 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
             })?;
             register_repo_team_guarded(home_ref, &repo, team_name, args.force)?;
         }
-        // Bare `clank init`: write a VALID empty new-shape config
-        // (empty agents, default team) WITHOUT requiring any global
-        // template. This is the from-scratch escape from the
-        // no-compat chicken-and-egg. Never CLOBBER an existing team
-        // selection on re-init.
-        None => {
-            if repo_has_team(&repo)? {
-                // Already configured; bare re-init preserves it.
-            } else {
-                bootstrap_empty_repo_config(&repo)?;
-            }
-        }
+        None => seed_bare(home.as_deref(), &repo)?,
     }
     Ok(())
+}
+
+/// The team bare `clank init` seeds a fresh repo from, when the user
+/// has declared one by this name.
+const DEFAULT_TEAM: &str = "default";
+
+/// Bare `clank init`: a repo with a valid roster keeps it, checked
+/// before any user config is read. Otherwise the user's `default` team
+/// seeds it, or, with no such team, an empty roster that needs no
+/// template.
+pub fn seed_bare(home: Option<&Path>, repo: &Path) -> anyhow::Result<()> {
+    if repo_has_team(repo)? {
+        return Ok(());
+    }
+    match home {
+        Some(home) if user_team_declared(home, DEFAULT_TEAM)? => {
+            register_repo_team(home, repo, DEFAULT_TEAM)?;
+            eprintln!("seeded the roster from your `{DEFAULT_TEAM}` team");
+            Ok(())
+        }
+        _ => bootstrap_empty_repo_config(repo),
+    }
+}
+
+/// Whether the user config declares team `name`. An absent config is
+/// no team; an unreadable one is an error, never an empty roster.
+fn user_team_declared(home: &Path, name: &str) -> anyhow::Result<bool> {
+    let path = home.join(".clank/config.json");
+    let raw: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            anyhow::anyhow!("user-scope config {} is unreadable ({e})", path.display())
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("reading {}", path.display())));
+        }
+    };
+    Ok(raw.get("teams").and_then(|t| t.get(name)).is_some())
 }
 
 /// Write a valid empty new-shape [`RepoConfigFile`] (an empty
 /// roster). Standalone — needs no user-scope template. The repo
 /// then has a parseable config; the user adds agents via
-/// `clank agent add <label> --tool <claude|codex|grok|opencode>` and designates
-/// a master via `clank agent promote <agent>` before any
-/// workflow command works.
+/// `clank agent add <label> --tool <claude|codex|grok|opencode>`, the
+/// first of which becomes master.
 ///
 /// Called only when there's no VALID new-shape config (the
 /// `repo_has_team` guard already ran), so an OLD-shape config is
@@ -83,8 +109,9 @@ fn bootstrap_empty_repo_config(repo: &Path) -> anyhow::Result<()> {
     write_repo_config(&repo_cfg_path, &RepoConfigFile::default())?;
     eprintln!(
         "wrote empty roster to {} — add agents with \
-         `clank agent add <label> --tool <claude|codex|grok|opencode>` and pick a master with \
-         `clank agent promote <agent>`",
+         `clank agent add <label> --tool <claude|codex|grok|opencode>`; the first becomes \
+         master (seed a whole team instead by declaring a `{DEFAULT_TEAM}` team, or with \
+         `clank init --team <name>`)",
         repo_cfg_path.display()
     );
     Ok(())
@@ -472,7 +499,7 @@ pub(crate) fn load_user_team_roster(
         anyhow::bail!(
             "team `{team_name}` not declared in user-scope teams \
              (`~/.clank/config.json#/teams`). Either run bare `clank init` and build a \
-             roster locally (`clank agent add` + `clank agent promote`), or — to make \
+             roster locally (`clank agent add`; the first becomes master), or — to make \
              `{team_name}` a reusable template — build it in a repo and publish with \
              `clank team save {team_name}`."
         );
@@ -1103,6 +1130,92 @@ mod tests {
             team_ref(RosterRole::Master),
         );
         seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", dev)]);
+    }
+
+    fn seed_user_team_default(home: &Path) {
+        use crate::cli::teams_config::{RosterRole, TeamRoster};
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::Tool;
+        let mut team: TeamRoster = std::collections::BTreeMap::new();
+        team.insert(
+            AgentLabel::parse("claude").unwrap(),
+            team_ref(RosterRole::Master),
+        );
+        team.insert(
+            AgentLabel::parse("codex").unwrap(),
+            team_ref(RosterRole::Commit),
+        );
+        seed_user_config(
+            home,
+            &[("claude", Tool::Claude), ("codex", Tool::Codex)],
+            &[("default", team)],
+        );
+    }
+
+    fn roster_of(repo: &Path) -> crate::cli::teams_config::RepoConfigFile {
+        serde_json::from_str(&std::fs::read_to_string(repo.join(".clank/config.json")).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn bare_init_seeds_a_fresh_repo_from_the_default_team() {
+        use crate::cli::teams_config::RosterRole;
+        use clank_core::ids::AgentLabel;
+        use clank_core::vocab::Tool;
+        let home = tempfile::tempdir().unwrap();
+        seed_user_team_default(home.path());
+        let repo = init_repo();
+        seed_bare(Some(home.path()), repo.path()).unwrap();
+        let roster = roster_of(repo.path());
+        let claude = &roster.agents[&AgentLabel::parse("claude").unwrap()];
+        assert_eq!(claude.role, RosterRole::Master);
+        assert_eq!(claude.tool, Tool::Claude);
+        assert_eq!(
+            roster.agents[&AgentLabel::parse("codex").unwrap()].role,
+            RosterRole::Commit
+        );
+    }
+
+    #[test]
+    fn bare_init_without_a_default_team_or_home_writes_the_empty_roster() {
+        let other = tempfile::tempdir().unwrap();
+        seed_user_team_dev(other.path());
+        let missing = tempfile::tempdir().unwrap();
+        for home in [Some(other.path()), Some(missing.path()), None] {
+            let repo = init_repo();
+            seed_bare(home, repo.path()).unwrap();
+            assert!(roster_of(repo.path()).agents.is_empty(), "{home:?}");
+        }
+    }
+
+    #[test]
+    fn bare_reinit_keeps_an_existing_roster_without_reading_the_user_config() {
+        let home = tempfile::tempdir().unwrap();
+        seed_user_team_dev(home.path());
+        let repo = init_repo();
+        register_repo_team(home.path(), repo.path(), "dev").unwrap();
+        let before = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        seed_user_team_default(home.path());
+        seed_bare(Some(home.path()), repo.path()).unwrap();
+        std::fs::write(home.path().join(".clank/config.json"), "{ not json").unwrap();
+        seed_bare(Some(home.path()), repo.path()).unwrap();
+        let after = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn a_broken_default_team_is_an_error_not_an_empty_roster() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            r#"{ "teams": { "default": { "ghost": { "ref": "nobody", "role": "master" } } } }"#,
+        )
+        .unwrap();
+        let repo = init_repo();
+        assert!(seed_bare(Some(home.path()), repo.path()).is_err());
+        std::fs::write(home.path().join(".clank/config.json"), "{ not json").unwrap();
+        assert!(seed_bare(Some(home.path()), repo.path()).is_err());
     }
 
     #[test]

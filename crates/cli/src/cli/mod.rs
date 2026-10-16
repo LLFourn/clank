@@ -163,10 +163,11 @@ pub struct InitArgs {
     /// Seed this repo's roster from a user-scope team template.
     /// Copies the named template's roster + referenced agent
     /// definitions into `<repo>/.clank/config.json`. The template
-    /// must exist in `~/.clank/config.json#/teams`. When omitted, the
-    /// repo starts with no roster — build one with `clank agent add`
-    /// / `clank agent promote`; workflow commands (`wait`,
-    /// `finish`) require a master until you do.
+    /// must exist in `~/.clank/config.json#/teams`. When omitted, a
+    /// repo without a roster is seeded from your team named `default`
+    /// if you have one, and otherwise starts with no roster — build one
+    /// with `clank agent add` (the first agent becomes master). An
+    /// existing roster is never replaced by a bare init.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
 }

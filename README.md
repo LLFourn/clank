@@ -140,7 +140,8 @@ clank agent add bob --tool codex             # later ones review commits
 ```
 
 (Or seed a whole roster from a saved template: `clank init --team
-<name>`; save one with `clank team save <name>`.)
+<name>`; save one with `clank team save <name>`. A template saved as
+`default` seeds every bare `clank init` of a repo with no roster.)
 
 **2. You — launch the team.**
 
