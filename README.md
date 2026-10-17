@@ -255,7 +255,11 @@ optional `active_plan` name.
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
-remote: Space there (or `r` from the log view) is the switch. In the
+remote: Space there (or `r` from the log view) is the switch. From a
+shell, `clank remote on|off` asks the repo's running `clank tui` to do
+the same, and `clank remote status` shows its state and address; on
+while on and off while off change nothing. A `clank tui` started
+before this existed cannot take these requests until it restarts. In the
 default mode, the TUI starts a separate host process on the port the
 repo remembers in `.clank/config.json`, attaches this repo to it,
 and sends your browser in. Switching off, or closing the TUI, stops

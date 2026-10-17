@@ -26,6 +26,13 @@ pub(crate) struct Holder {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) pane: Option<String>,
     pub(super) at: String,
+    /// Who the holder is, beyond a pid the OS may reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) birth: Option<crate::proc_identity::ProcToken>,
+    /// The `clank remote` protocol this holder serves. Absent from a
+    /// holder that predates it: positive evidence of an older build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) remote_protocol: Option<u32>,
 }
 
 impl Holder {
@@ -35,6 +42,8 @@ impl Holder {
             session: std::env::var("ZELLIJ_SESSION_NAME").ok(),
             pane: std::env::var("ZELLIJ_PANE_ID").ok(),
             at: crate::cli::stop_hook::now_rfc3339(),
+            birth: crate::proc_identity::token_for(std::process::id() as i32),
+            remote_protocol: Some(crate::cli::remote_control::PROTOCOL),
         }
     }
 
@@ -106,6 +115,56 @@ pub(super) fn acquire(repo: &Path) -> Result<StatusLease, String> {
         let _ = file.flush();
     }
     Ok(StatusLease { _file: file })
+}
+
+/// Whether anyone holds `repo`'s lease, asked without keeping it: a
+/// non-blocking flock taken and released at once. `true` is authoritative
+/// absence. Otherwise, the holder record if it could be read.
+pub(crate) fn probe(repo: &Path) -> (bool, Option<crate::cli::remote_control::Holder>) {
+    use std::os::fd::AsRawFd;
+    let path = lock_path(repo);
+    let file = match std::fs::OpenOptions::new().read(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (true, None),
+        Err(_) => return (false, None),
+    };
+    // SAFETY: valid owned fd; flock has no memory effects.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // SAFETY: as above; the lock is released before anyone else
+        // could be told this repo has no owner.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return (true, None);
+    }
+    let holder = read_holder(&path).map(|h| crate::cli::remote_control::Holder {
+        pid: h.pid,
+        birth: h.birth,
+        remote_protocol: h.remote_protocol,
+    });
+    (false, holder)
+}
+
+/// Take the lease, recording `holder` as its holder: a test standing
+/// in for a TUI that is another process.
+#[cfg(test)]
+pub(crate) fn hold_as(repo: &Path, holder: &crate::cli::remote_control::Holder) -> StatusLease {
+    use std::io::Write;
+    let lease = acquire(repo).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(lock_path(repo))
+        .unwrap();
+    let record = Holder {
+        pid: holder.pid,
+        session: None,
+        pane: None,
+        at: String::new(),
+        birth: holder.birth.clone(),
+        remote_protocol: holder.remote_protocol,
+    };
+    file.write_all(&serde_json::to_vec(&record).unwrap())
+        .unwrap();
+    lease
 }
 
 fn read_holder(path: &Path) -> Option<Holder> {
@@ -286,6 +345,32 @@ mod tests {
         );
     }
 
+    /// The probe reads absence only from taking the lock itself, and a
+    /// held lease names a holder that serves the protocol.
+    #[test]
+    fn the_probe_tells_a_free_lease_from_a_held_one() {
+        let repo = TempRepo::new();
+        assert_eq!(probe(repo.path()), (true, None), "never taken");
+        let lease = acquire(repo.path()).unwrap();
+        let (free, holder) = probe(repo.path());
+        assert!(!free, "held");
+        let holder = holder.unwrap();
+        assert_eq!(holder.pid, std::process::id() as i32);
+        assert!(holder.birth.is_some());
+        assert_eq!(
+            holder.remote_protocol,
+            Some(crate::cli::remote_control::PROTOCOL)
+        );
+        drop(lease);
+        // A test spawning a process in parallel holds a forked copy of
+        // the lock's fd until its exec, so release can lag a moment.
+        let freed = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            probe(repo.path()).0
+        });
+        assert!(freed, "freed with the lease");
+    }
+
     #[test]
     fn the_holder_records_where_to_look() {
         let h = Holder {
@@ -293,6 +378,8 @@ mod tests {
             session: Some("clank-full-app-sim--38b0".into()),
             pane: Some("59".into()),
             at: "2026-09-02T17:34:42Z".into(),
+            birth: None,
+            remote_protocol: None,
         };
         assert_eq!(
             h.describe(),

@@ -62,6 +62,7 @@ pub mod purge;
 pub(crate) mod question_state;
 pub mod queue;
 pub(crate) mod recovery;
+pub(crate) mod remote_control;
 pub mod rereview;
 pub(crate) mod resume;
 pub mod rewire;
@@ -732,6 +733,29 @@ pub enum WaitFor {
 pub struct MonitorArgs {
     #[command(subcommand)]
     pub command: MonitorCmd,
+}
+
+/// `clank remote`: switch this repo's remote through the `clank tui`
+/// that owns it.
+#[derive(clap::Args, Debug)]
+pub struct RemoteArgs {
+    #[command(subcommand)]
+    pub command: RemoteCmd,
+    #[arg(long, global = true)]
+    pub repo: Option<PathBuf>,
+    /// Seconds to wait for the owning TUI's answer.
+    #[arg(long, global = true, default_value_t = 30)]
+    pub timeout: u64,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum RemoteCmd {
+    /// Who owns this repo's remote, and its state and address.
+    Status,
+    /// Start serving; already on is done at once.
+    On,
+    /// Stop serving; already off is done at once.
+    Off,
 }
 
 #[derive(clap::Subcommand, Debug)]

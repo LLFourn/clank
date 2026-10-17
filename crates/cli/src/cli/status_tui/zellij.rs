@@ -1066,7 +1066,7 @@ pub(super) trait Arm {
     fn disarm(&mut self, launch: &PaneLaunch);
 }
 
-impl Arm for Option<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>> {
+impl Arm for Option<std::sync::Arc<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>>> {
     fn arm(&mut self, launch: &PaneLaunch) -> Armed {
         match self {
             Some(watch) => watch.arm(launch.clone(), launch.pid, &launch.birth),
@@ -1333,7 +1333,11 @@ impl ReconcileWorker {
     /// sends go nowhere). `wake` is called after a batch that produced
     /// a report, so the loop paints changed presence or lost-process
     /// marks without waiting for its next event.
-    pub(super) fn spawn(repo: std::path::PathBuf, wake: impl Fn() + Send + 'static) -> Self {
+    pub(super) fn spawn(
+        repo: std::path::PathBuf,
+        runtime: &RuntimeWatch,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
         if !crate::cli::open_zellij::in_session() {
             return Self {
                 tx: None,
@@ -1348,9 +1352,8 @@ impl ReconcileWorker {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
         let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
         let mut worker = Self::in_session(report_rx);
-        let watch_tx = tx.clone();
+        let mut arm = runtime.attach_worker(tx.clone());
         let join = std::thread::spawn(move || {
-            let mut arm = watch_launches(&repo, watch_tx);
             let mut watches = Watches::default();
             let mut state = WorkerState::new(crate::cli::open_zellij::caller_pane_id());
             let mut tabs = ZellijTabIo;
@@ -1508,61 +1511,162 @@ impl Drop for ReconcileWorker {
     }
 }
 
-/// The exit watch over this session's launch records for `repo`, which
-/// sends the worker the current records once, then again on every
-/// change, and each watched pane process's exit. `None` where the
-/// kernel offers no watch: presence then follows other events only.
-fn watch_launches(
-    repo: &std::path::Path,
-    tx: std::sync::mpsc::Sender<WorkerMsg>,
-) -> Option<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>> {
-    use crate::proc_identity::exit_watch::ExitWatch;
-    let session = crate::cli::open_zellij::current_session()?;
-    let dir = crate::cli::monitor::ensure_runtime_dir()
-        .ok()
-        .map(|()| crate::cli::pane_target::launch_dir(repo).0);
-    let last: std::sync::Arc<std::sync::Mutex<Option<Vec<PaneLaunch>>>> = Default::default();
-    let read = {
-        let repo = repo.to_path_buf();
-        move || crate::cli::pane_target::launches_in(&repo, &session)
-    };
-    let watch = ExitWatch::new(
-        dir.as_deref(),
-        launch_sink(read.clone(), tx.clone(), last.clone()),
-    )
-    .ok();
-    // Read after the directory is watched, so no record written in
-    // between is missed.
-    let now = read();
-    let mut seeded = last.lock().unwrap();
-    if seeded.is_none() {
-        *seeded = Some(now.clone());
-        let _ = tx.send(WorkerMsg::Launches(now));
-    }
-    watch
+/// The TUI's one watch on the per-repo runtime directory, held for its
+/// whole life, in or out of zellij. It hears this repo's `clank remote`
+/// requests for the loop, and, once a reconcile worker attaches, this
+/// session's launch records and the pane exits that worker arms on it.
+pub(super) struct RuntimeWatch {
+    watch: Option<std::sync::Arc<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>>>,
+    /// Why there is no watch, when there is none.
+    pub(super) unavailable: Option<String>,
+    feed: std::sync::Arc<LaunchFeed>,
 }
 
-/// What the watch thread does with a wake. The launch directory is
-/// shared by every repo, so a directory wake reaches the worker only
-/// when this repo's records for this session changed.
-fn launch_sink(
-    read: impl Fn() -> Vec<PaneLaunch> + Send + 'static,
-    tx: std::sync::mpsc::Sender<WorkerMsg>,
-    last: std::sync::Arc<std::sync::Mutex<Option<Vec<PaneLaunch>>>>,
-) -> impl FnMut(crate::proc_identity::exit_watch::Wake<PaneLaunch>) + Send + 'static {
-    use crate::proc_identity::exit_watch::Wake;
-    move |wake| match wake {
-        Wake::Exited(launch) => {
-            let _ = tx.send(WorkerMsg::Exited(launch));
-        }
-        Wake::Dir => {
-            let now = read();
-            let mut last = last.lock().unwrap();
-            if last.as_ref() != Some(&now) {
-                *last = Some(now.clone());
-                let _ = tx.send(WorkerMsg::Launches(now));
+impl RuntimeWatch {
+    /// Arm the watch. Each new request id goes to `requests`, then `wake`.
+    pub(super) fn start(
+        repo: &std::path::Path,
+        requests: std::sync::mpsc::Sender<String>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
+        use crate::proc_identity::exit_watch::{ExitWatch, Wake};
+        let feed = std::sync::Arc::new(LaunchFeed::new({
+            let repo = repo.to_path_buf();
+            let session = crate::cli::open_zellij::current_session();
+            move || match &session {
+                Some(session) => crate::cli::pane_target::launches_in(&repo, session),
+                None => Vec::new(),
             }
+        }));
+        let dir = crate::cli::monitor::ensure_runtime_dir()
+            .map(|()| crate::cli::pane_target::launch_dir(repo).0);
+        let mut requests_seen = RequestScan::new(repo);
+        let scan_dir = dir.clone().ok();
+        let launches = feed.clone();
+        let sink = move |wake_: Wake<PaneLaunch>| match wake_ {
+            Wake::Dir => {
+                if let Some(dir) = &scan_dir {
+                    for id in requests_seen.new_ids(dir) {
+                        let _ = requests.send(id);
+                        wake();
+                    }
+                }
+                launches.changed();
+            }
+            Wake::Exited(launch) => launches.exited(launch),
+        };
+        let (watch, unavailable) = match dir {
+            Ok(dir) => match ExitWatch::new(Some(&dir), sink) {
+                Ok(watch) => (Some(std::sync::Arc::new(watch)), None),
+                Err(e) => (None, Some(format!("cannot watch {}: {e}", dir.display()))),
+            },
+            Err(e) => (None, Some(format!("no runtime directory: {e}"))),
+        };
+        Self {
+            watch,
+            unavailable,
+            feed,
         }
+    }
+
+    /// The reconcile worker joins: launch changes and pane exits go to
+    /// `tx` from now on, starting with the records there are now. Returns
+    /// the shared watch it arms pane exits on.
+    pub(super) fn attach_worker(
+        &self,
+        tx: std::sync::mpsc::Sender<WorkerMsg>,
+    ) -> Option<std::sync::Arc<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>>> {
+        self.feed.attach(tx);
+        self.watch.clone()
+    }
+}
+
+/// This session's launch records as the reconcile worker last heard
+/// them, and the worker to tell. Reading the records, comparing and
+/// sending happen under one lock, which attaching takes too, so the
+/// worker hears snapshots in the order they were read: a directory
+/// change read before an attach can never arrive after it.
+struct LaunchFeed {
+    read: Box<dyn Fn() -> Vec<PaneLaunch> + Send + Sync>,
+    state: std::sync::Mutex<FeedState>,
+}
+
+#[derive(Default)]
+struct FeedState {
+    worker: Option<std::sync::mpsc::Sender<WorkerMsg>>,
+    last: Option<Vec<PaneLaunch>>,
+}
+
+impl LaunchFeed {
+    fn new(read: impl Fn() -> Vec<PaneLaunch> + Send + Sync + 'static) -> Self {
+        Self {
+            read: Box::new(read),
+            state: Default::default(),
+        }
+    }
+
+    /// The directory changed. The launch directory is shared by every
+    /// repo, so the worker hears only of a change to this repo's
+    /// records for this session; before it attaches there is no one to
+    /// tell, and attaching reads afresh.
+    fn changed(&self) {
+        let mut state = self.state.lock().unwrap();
+        let Some(worker) = state.worker.clone() else {
+            return;
+        };
+        let now = (self.read)();
+        if state.last.as_ref() != Some(&now) {
+            state.last = Some(now.clone());
+            let _ = worker.send(WorkerMsg::Launches(now));
+        }
+    }
+
+    fn exited(&self, launch: PaneLaunch) {
+        if let Some(worker) = &self.state.lock().unwrap().worker {
+            let _ = worker.send(WorkerMsg::Exited(launch));
+        }
+    }
+
+    fn attach(&self, worker: std::sync::mpsc::Sender<WorkerMsg>) {
+        let mut state = self.state.lock().unwrap();
+        let now = (self.read)();
+        state.last = Some(now.clone());
+        let _ = worker.send(WorkerMsg::Launches(now));
+        state.worker = Some(worker);
+    }
+}
+
+/// Which of this repo's request files are new since the last look.
+struct RequestScan {
+    repo: std::path::PathBuf,
+    seen: std::collections::HashSet<String>,
+}
+
+impl RequestScan {
+    fn new(repo: &std::path::Path) -> Self {
+        Self {
+            repo: repo.to_path_buf(),
+            seen: Default::default(),
+        }
+    }
+
+    fn new_ids(&mut self, dir: &std::path::Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let present: std::collections::HashSet<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| crate::cli::remote_control::request_id(&self.repo, &e.path()))
+            .collect();
+        // Forget ids whose files are gone, so the set stays the size of
+        // the directory.
+        self.seen.retain(|id| present.contains(id));
+        let mut fresh: Vec<String> = present
+            .into_iter()
+            .filter(|id| self.seen.insert(id.clone()))
+            .collect();
+        fresh.sort();
+        fresh
     }
 }
 
@@ -3879,15 +3983,17 @@ mod tests {
     }
 
     #[test]
-    fn the_sink_forwards_only_this_repos_record_changes() {
+    fn the_feed_forwards_only_this_repos_record_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
-        let last = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
-        let mut sink = launch_sink(
-            move || crate::cli::pane_target::launches_at(&path, "mine.pane-launch-", "live"),
-            tx,
-            last,
+        let feed = LaunchFeed::new(move || {
+            crate::cli::pane_target::launches_at(&path, "mine.pane-launch-", "live")
+        });
+        feed.attach(tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(WorkerMsg::Launches(l)) if l.is_empty()),
+            "the records there are on attaching"
         );
         let birth = crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 2 };
         let publish = |name: &str, session: &str| {
@@ -3900,17 +4006,72 @@ mod tests {
             )
         };
         publish("theirs.pane-launch-x.json", "live");
-        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        feed.changed();
         publish("mine.pane-launch-y.json", "other");
-        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        feed.changed();
         assert!(rx.try_recv().is_err(), "another repo's or session's record");
         publish("mine.pane-launch-z.json", "live");
-        sink(crate::proc_identity::exit_watch::Wake::Dir);
-        sink(crate::proc_identity::exit_watch::Wake::Dir);
+        feed.changed();
+        feed.changed();
         let got: Vec<WorkerMsg> = rx.try_iter().collect();
         assert!(
             matches!(got.as_slice(), [WorkerMsg::Launches(l)] if l.len() == 1),
             "one batch for the one change"
         );
+    }
+
+    /// The watch thread reads the records for a directory change while
+    /// the worker attaches, and the records change in between: the
+    /// worker must never hear the older read after the newer one.
+    #[test]
+    fn a_change_read_while_the_worker_attaches_never_arrives_after_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let version = Arc::new(AtomicUsize::new(1));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = Mutex::new(gate_rx);
+        let records = version.clone();
+        let feed = Arc::new(LaunchFeed::new(move || {
+            let v = records.load(Ordering::SeqCst);
+            if std::thread::current().name() == Some("dir") {
+                let _ = entered_tx.send(());
+                let _ = gate_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+            (0..v as i32)
+                .map(|i| launch(&format!("/run/r.pane-launch-{i}.json"), 40 + i))
+                .collect()
+        }));
+        let watch_thread = {
+            let feed = feed.clone();
+            std::thread::Builder::new()
+                .name("dir".into())
+                .spawn(move || feed.changed())
+                .unwrap()
+        };
+        let _ = entered_rx.recv_timeout(Duration::from_millis(500));
+        version.store(2, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let attaching = {
+            let feed = feed.clone();
+            std::thread::spawn(move || feed.attach(tx))
+        };
+        let t = std::time::Instant::now();
+        while !attaching.is_finished() && t.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = gate_tx.send(());
+        watch_thread.join().unwrap();
+        attaching.join().unwrap();
+        let heard: Vec<usize> = rx
+            .try_iter()
+            .map(|m| match m {
+                WorkerMsg::Launches(l) => l.len(),
+                _ => panic!("only launch records were sent"),
+            })
+            .collect();
+        assert_eq!(heard.last(), Some(&2), "{heard:?}");
+        assert!(heard.windows(2).all(|w| w[0] <= w[1]), "{heard:?}");
     }
 }

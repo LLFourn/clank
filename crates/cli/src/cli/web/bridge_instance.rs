@@ -70,6 +70,7 @@ pub(crate) struct BridgeInstance {
     pub(crate) url: String,
     pub(crate) public_url: Option<String>,
     admin_credential: Option<String>,
+    known_secrets: Vec<String>,
     admin_client: reqwest::Client,
     host: Option<OwnedHost>,
     #[cfg(test)]
@@ -319,6 +320,9 @@ impl BridgeInstance {
             blocking.clone(),
             verify_rx,
         ));
+        let known_secrets = std::iter::once(credential.clone())
+            .chain(admin_credential.clone())
+            .collect();
         tasks.spawn(connector(
             endpoint,
             session,
@@ -332,6 +336,7 @@ impl BridgeInstance {
             url,
             public_url: ready.public_url,
             admin_credential,
+            known_secrets,
             admin_client,
             host,
             #[cfg(test)]
@@ -372,11 +377,21 @@ impl BridgeInstance {
                 Ok(instance)
             }
             failure => {
-                instance.stop().await;
                 let why = match failure {
                     clank_web::bridge::ConnectionStatus::Disconnected(why) => why,
                     _ => "connector ended before publishing its first image".into(),
                 };
+                // The connector's refusal can quote what it was sent, and
+                // this attempt's credentials are known only here: no one
+                // past this error can mask them.
+                let why = instance
+                    .known_secrets
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .fold(why, |why, secret| {
+                        why.replace(secret.as_str(), "[redacted]")
+                    });
+                instance.stop().await;
                 anyhow::bail!("the web host started but the repo did not attach: {why}")
             }
         }
@@ -408,6 +423,11 @@ impl BridgeInstance {
         if let Some(builder) = &self.builder {
             builder.request();
         }
+    }
+
+    /// The connector and administration credentials this instance holds.
+    pub(crate) fn known_secrets(&self) -> &[String] {
+        &self.known_secrets
     }
 
     pub(crate) fn connection_problem(&self) -> Option<String> {

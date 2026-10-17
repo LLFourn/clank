@@ -50,6 +50,7 @@ pub(crate) mod input;
 use input::*;
 
 mod remote;
+mod remote_owner;
 mod render;
 use render::*;
 
@@ -3205,9 +3206,21 @@ pub(crate) async fn run_tui(
     // Declared BEFORE the alt-screen guard: reverse drop order joins
     // the worker AFTER the terminal is restored, on every exit path
     // (tui-reconcile-off-loop).
+    // `starting` is published before the watch that serves `clank
+    // remote` exists, so a caller waits for `ready` instead of concluding
+    // anything from a missing status.
+    let mut served = remote_owner::Served::starting(&repo);
+    let mut remote_notice = None;
+    let (remote_req_tx, remote_req_rx) = mpsc::channel::<String>();
+    let runtime = {
+        let wake = ev_tx.clone();
+        zellij::RuntimeWatch::start(&repo, remote_req_tx, move || {
+            let _ = wake.send(Ev::Remote);
+        })
+    };
     let mut reconcile_worker = {
         let wake = ev_tx.clone();
-        zellij::ReconcileWorker::spawn(repo.clone(), move || {
+        zellij::ReconcileWorker::spawn(repo.clone(), &runtime, move || {
             let _ = wake.send(Ev::Worker);
         })
     };
@@ -3238,6 +3251,7 @@ pub(crate) async fn run_tui(
             std::sync::Arc::new(move || crate::cli::web::tunnel::configured(home.as_deref()))
         })
     };
+    served.armed(runtime.unavailable.clone(), &remote);
 
     let _guard = AltScreen::enter();
     {
@@ -3382,6 +3396,12 @@ pub(crate) async fn run_tui(
         for (label, answer) in web_reopen_rx.try_iter() {
             reopen_pending.push_back((label.clone(), Some(answer)));
             reconcile_worker.reopen(&label);
+        }
+        if let Some(n) = remote_owner::pump(&mut served, &mut remote, &remote_req_rx, &snapshot)
+            .await
+            .pop()
+        {
+            remote_notice = Some(n);
         }
         // Answer web requests even while a document overlay owns the TUI.
         // Keep the outcomes for the normal panel path to paint afterward.
@@ -3552,9 +3572,8 @@ pub(crate) async fn run_tui(
         // one paints.
         // The remote's word is for the operator wherever they are:
         // the overlay mounts over any page, and the loop goes round
-        // to draw it, as a reopen's does. Drained before the view
-        // borrows the switch for its row.
-        if let Some(n) = remote.drain(&snapshot).await.pop() {
+        // to draw it, as a reopen's does.
+        if let Some(n) = remote_notice.take() {
             detail = Some(Overlay::notice(n));
             continue;
         }

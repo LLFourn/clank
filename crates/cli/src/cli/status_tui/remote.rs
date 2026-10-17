@@ -165,6 +165,8 @@ pub(super) struct Remote<O: Opener> {
     outcomes: Arc<Mutex<Vec<(u64, Outcome)>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
     reopen: Option<crate::cli::web::Reopener>,
+    /// Kept after its instance is gone: a failure can quote one later.
+    secrets: Vec<String>,
 }
 
 impl<O: Opener> Remote<O> {
@@ -193,6 +195,7 @@ impl<O: Opener> Remote<O> {
             outcomes: Arc::new(Mutex::new(Vec::new())),
             wake,
             reopen: None,
+            secrets: Vec::new(),
         }
     }
 
@@ -242,6 +245,37 @@ impl<O: Opener> Remote<O> {
         }
     }
 
+    /// The address the remote serves at, while on: a base address only.
+    pub(super) fn base_url(&self) -> Option<String> {
+        match &self.state {
+            State::On { instance } => Some(
+                instance
+                    .public_url
+                    .clone()
+                    .unwrap_or_else(|| instance.url.clone()),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Why the remote is not serving as it should, if it is not.
+    pub(super) fn failure(&self) -> Option<String> {
+        match &self.state {
+            State::Failed { why } => Some(why.clone()),
+            State::On { instance } => instance.connection_problem(),
+            State::Off => match &*self.configured.borrow() {
+                Configured::Broken(why) => Some(why.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Every credential an instance of this remote has held.
+    pub(super) fn secrets(&self) -> Vec<String> {
+        self.secrets.clone()
+    }
+
     /// What the row says beside the state: the URL when on, the
     /// reason when failed, nothing otherwise.
     pub(super) fn detail(&self) -> Option<String> {
@@ -286,6 +320,18 @@ impl<O: Opener> Remote<O> {
     /// long join never freezes the pane. A press while either is in
     /// flight is nothing.
     pub(super) fn toggle(&mut self, snap: &crate::cli::status::StatusSnapshot) -> Option<Notice> {
+        match &self.state {
+            State::On { .. } => {
+                self.switch_off();
+                None
+            }
+            State::Starting { .. } | State::Stopping { .. } => None,
+            State::Off | State::Failed { .. } => self.switch_on(snap),
+        }
+    }
+
+    /// Begin stopping, from On only; anything else is left as it is.
+    pub(super) fn switch_off(&mut self) {
         match std::mem::replace(&mut self.state, State::Off) {
             State::On { instance } => {
                 let mut report = self.reporter();
@@ -294,9 +340,19 @@ impl<O: Opener> Remote<O> {
                     report(Outcome::Stopped);
                 });
                 self.state = State::Stopping { task };
-                None
             }
-            s @ (State::Starting { .. } | State::Stopping { .. }) => {
+            other => self.state = other,
+        }
+    }
+
+    /// Begin starting, from Off or Failed only; anything else is left as
+    /// it is. A notice says why it could not start at all.
+    pub(super) fn switch_on(
+        &mut self,
+        snap: &crate::cli::status::StatusSnapshot,
+    ) -> Option<Notice> {
+        match std::mem::replace(&mut self.state, State::Off) {
+            s @ (State::On { .. } | State::Starting { .. } | State::Stopping { .. }) => {
                 self.state = s;
                 None
             }
@@ -513,6 +569,11 @@ impl<O: Opener> Remote<O> {
             }
             match (outcome, &self.state) {
                 (Outcome::Started(instance), State::Starting { .. }) => {
+                    for secret in instance.known_secrets() {
+                        if !self.secrets.contains(secret) {
+                            self.secrets.push(secret.clone());
+                        }
+                    }
                     instance.observe(snap);
                     self.state = State::On { instance };
                     self.open_again().await;
@@ -621,6 +682,108 @@ impl Opener for Browser {
 
 #[cfg(test)]
 mod tests {
+
+    /// A first start whose connector is refused, quoting the credential
+    /// it was sent: no instance ever succeeded, and neither the answer
+    /// nor the published status carries that credential (codex's
+    /// regression on d95c4ed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_refused_attachment_never_publishes_its_credential() {
+        use super::super::remote_owner::{self, Served};
+        use crate::cli::config::{WebAttach, WebSection};
+        use crate::cli::remote_control as rc;
+        use futures_util::{SinkExt, StreamExt};
+        const SECRET: &str = "SECRETFIRST";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = socket.next().await.unwrap().unwrap();
+            assert!(hello.to_text().unwrap().contains(SECRET));
+            let refusal =
+                serde_json::json!({"type": "refused", "why": format!("rejected value {SECRET}")});
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    refusal.to_string().into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let repo = repo_with_config();
+        let mut config = crate::agent_store::load_repo_config_required(repo.path()).unwrap();
+        config.web = Some(WebSection {
+            port: None,
+            attach: Some(WebAttach {
+                endpoint: format!("ws://{addr}/connector"),
+                session: "session".into(),
+                credential: SECRET.into(),
+                browser_url: format!("http://{addr}"),
+            }),
+        });
+        crate::agent_store::write_typed_config(&repo.path().join(".clank/config.json"), &config)
+            .unwrap();
+        let mut r = Remote::new(
+            repo.path().to_path_buf(),
+            None,
+            Arc::new(|| {
+                Ok(Arc::new(FakePanes {
+                    answers: true,
+                    slow: std::time::Duration::ZERO,
+                }) as Arc<dyn Panes>)
+            }),
+            crate::cli::web::PANE_POLL,
+            crate::cli::web::STOP_GRACE,
+            Recorder::default(),
+            Arc::new(|| {}),
+        )
+        .tunnel_from(Arc::new(|| Ok(None)));
+        crate::cli::monitor::ensure_runtime_dir().unwrap();
+        let mut served = Served::starting(repo.path());
+        served.armed(None, &r);
+        let id = "first-failure";
+        rc::write_atomic(
+            &rc::request_path(repo.path(), id),
+            &rc::Request {
+                id: id.into(),
+                want: rc::Want::On,
+                owner: remote_owner::me().unwrap(),
+            },
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(id.to_string()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut notices = Vec::new();
+        let response = loop {
+            notices.extend(remote_owner::pump(&mut served, &mut r, &rx, &snap()).await);
+            if let Some(response) = rc::read::<rc::Response>(&rc::result_path(repo.path(), id)) {
+                break response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no failed-start result"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        server.await.unwrap();
+        let answered = serde_json::to_string(&response).unwrap();
+        assert!(
+            matches!(&response.outcome, rc::Outcome::Failed { reason } if reason.contains("rejected value")),
+            "{answered}"
+        );
+        assert!(!answered.contains(SECRET), "{answered}");
+        let published = std::fs::read_to_string(rc::status_path(repo.path())).unwrap();
+        assert!(published.contains("\"failed\""), "{published}");
+        assert!(!published.contains(SECRET), "{published}");
+        assert!(
+            notices.iter().all(|n| !n.message.contains(SECRET)),
+            "nor the operator's notice: {notices:?}"
+        );
+        r.stop().await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_existing_host_uses_its_login_and_keeps_its_own_lifetime() {
@@ -1038,6 +1201,39 @@ mod tests {
         assert!(rec.opened.lock().unwrap().is_empty(), "no browser");
         // Nothing was bound: the repo never had to remember a port.
         assert_eq!(crate::agent_store::web_port(repo.path()).unwrap(), None);
+        r.stop().await;
+    }
+
+    /// The desired-state primitives a `clank remote` request uses: on
+    /// while on, and off while off, change nothing; the transitions go
+    /// through the same tasks as the keyboard's toggle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn switching_to_the_state_it_is_in_does_nothing() {
+        use std::time::Duration;
+        let repo = repo_with_config();
+        let (mut r, _) = remote_with(
+            repo.path(),
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(150),
+        );
+        let snap = snap();
+        r.switch_off();
+        assert_eq!(r.shown(), Shown::Off, "off while off");
+        assert!(r.switch_on(&snap).is_none());
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::On);
+        let generation = r.generation;
+        assert!(r.switch_on(&snap).is_none());
+        assert_eq!(
+            (r.shown(), r.generation),
+            (Shown::On, generation),
+            "on while on: no restart"
+        );
+        r.switch_off();
+        settle(&mut r, &snap).await;
+        assert_eq!(r.shown(), Shown::Off);
         r.stop().await;
     }
 
@@ -1630,6 +1826,53 @@ mod tests {
         r.stop().await;
         assert_eq!(r.shown(), Shown::Off);
         assert!(reqwest::get(&url).await.is_err());
+    }
+
+    /// What a `clank remote` request needs from the loop is the pump
+    /// alone: a real start and a real stop each complete and are
+    /// answered while every notice is left unshown, as when an overlay
+    /// holds the screen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_is_answered_by_the_pump_while_its_notices_wait() {
+        use super::super::remote_owner::{self, Served};
+        use crate::cli::remote_control as rc;
+        crate::cli::monitor::ensure_runtime_dir().unwrap();
+        let repo = repo_with_config();
+        let (mut r, _rec) = remote(repo.path(), true);
+        let snap = snap();
+        let mut served = Served::starting(repo.path());
+        served.armed(None, &r);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut unshown = Vec::new();
+        for (id, want, lands) in [
+            ("pump-on", rc::Want::On, rc::Shown::On),
+            ("pump-off", rc::Want::Off, rc::Shown::Off),
+        ] {
+            let request = rc::Request {
+                id: id.into(),
+                want,
+                owner: remote_owner::me().unwrap(),
+            };
+            rc::write_atomic(&rc::request_path(repo.path(), id), &request).unwrap();
+            tx.send(id.to_string()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let answer = loop {
+                unshown.extend(remote_owner::pump(&mut served, &mut r, &rx, &snap).await);
+                if let Some(answer) = rc::read::<rc::Response>(&rc::result_path(repo.path(), id)) {
+                    break answer;
+                }
+                assert!(std::time::Instant::now() < deadline, "{id} never answered");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            assert_eq!(answer.outcome, rc::Outcome::Applied { shown: lands });
+            let status: rc::Status = rc::read(&rc::status_path(repo.path())).unwrap();
+            assert_eq!(status.shown, lands);
+            assert!(
+                !r.secrets().is_empty(),
+                "the instance's credentials are kept for masking, after it too"
+            );
+        }
+        r.stop().await;
     }
 
     /// A zellij that does not answer is a failed start with that

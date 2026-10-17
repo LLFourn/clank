@@ -88,6 +88,8 @@ pub enum Command {
     /// owed. Delivery does not move — a waiter still speaks its own
     /// adapter's protocol.
     Monitor(crate::cli::MonitorArgs),
+    /// Switch this repo's remote on or off through its `clank tui`.
+    Remote(crate::cli::RemoteArgs),
     /// Print the repo timeline: commits, reviews, github events
     ///
     /// Chronological and newest-first, with github events interleaved
@@ -278,6 +280,7 @@ pub async fn dispatch_with(
         Command::Send(args) => crate::cli::send::run(args).await,
         Command::Nudge(args) => crate::cli::nudge::run(args).await,
         Command::Monitor(args) => crate::cli::monitor::run(args).await,
+        Command::Remote(args) => crate::cli::remote_control::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::QuestionHook => crate::cli::web::claude_questions::run().await,
