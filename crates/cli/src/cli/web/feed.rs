@@ -113,6 +113,13 @@ pub(crate) struct Retained {
     /// Each agent's transcript window, by label.
     pub(crate) turns: BTreeMap<String, AgentTurns>,
     pub(crate) questions: BTreeMap<String, super::native_questions::Window>,
+    /// The subscription whose frames are accepted; older ones' are not.
+    pub(crate) generation: u64,
+    /// Per pane, bumped whenever its retained viewport changes.
+    pub(crate) revisions: BTreeMap<String, u64>,
+    /// Per pane, when the bridge last took or confirmed its viewport:
+    /// what `age_ms` counts from. A lower bound, never proof.
+    pub(crate) taken: BTreeMap<String, std::time::Instant>,
 }
 
 impl Retained {
@@ -138,9 +145,47 @@ impl Retained {
             &serde_json::json!({"agents":self.questions}),
         ));
         for (id, viewport) in &self.viewports {
-            out.push(pane_frame(id, viewport));
+            out.push(self.pane_frame(id, viewport));
         }
         out
+    }
+
+    fn pane_frame(&self, id: &str, viewport: &[String]) -> clank_web::service::BrowserFrame {
+        let age = self
+            .taken
+            .get(id)
+            .map(|at| at.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        pane_frame(
+            id,
+            viewport,
+            self.revisions.get(id).copied().unwrap_or(0),
+            age,
+        )
+    }
+
+    fn freshness_view(&self) -> super::freshness::Retained {
+        super::freshness::Retained {
+            generation: self.generation,
+            revisions: self.revisions.clone(),
+            viewports: self.viewports.clone(),
+            live: self
+                .panes
+                .iter()
+                .filter(|p| !p.exited && !self.closed.contains(&p.id))
+                .map(|p| p.id.clone())
+                .collect(),
+        }
+    }
+
+    /// Replace `id`'s viewport with content the bridge just took.
+    fn take(&mut self, id: String, viewport: Vec<String>) -> clank_web::service::BrowserFrame {
+        if self.viewports.get(&id) != Some(&viewport) {
+            *self.revisions.entry(id.clone()).or_default() += 1;
+        }
+        self.taken.insert(id.clone(), std::time::Instant::now());
+        self.viewports.insert(id.clone(), viewport);
+        self.pane_frame(&id, &self.viewports[&id])
     }
 }
 
@@ -148,10 +193,20 @@ impl Retained {
 /// table's to say (`panes` frames), never a viewport's: a retained
 /// viewport replayed to a late browser must not reopen a pane the
 /// table just said was closed (codex on 56d1e6a).
-fn pane_frame(id: &str, viewport: &[String]) -> clank_web::service::BrowserFrame {
+fn pane_frame(
+    id: &str,
+    viewport: &[String],
+    revision: u64,
+    age_ms: u64,
+) -> clank_web::service::BrowserFrame {
     browser_frame(
         "pane",
-        &serde_json::json!({ "pane_id": id, "screen": repaint(viewport) }),
+        &serde_json::json!({
+            "pane_id": id,
+            "screen": repaint(viewport),
+            "revision": revision,
+            "age_ms": age_ms,
+        }),
     )
 }
 
@@ -369,15 +424,100 @@ impl Feed {
         });
     }
 
+    /// The pane table as last listed.
+    pub(crate) fn table(&self) -> Vec<PaneMeta> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .panes
+            .clone()
+    }
+
+    /// Start a new subscription generation; frames from any earlier one
+    /// are dropped from now on.
+    pub(crate) fn next_generation(&self) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.generation += 1;
+        state.generation
+    }
+
+    /// A line from subscription `generation`; dropped if retired.
+    pub(crate) fn event_in(&self, generation: u64, ev: SubscribeEvent) {
+        self.event_at(Some(generation), ev);
+    }
+
+    /// What a verification sample is ordered against.
+    pub(crate) fn freshness_view(&self) -> super::freshness::Retained {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.freshness_view()
+    }
+
+    /// Commit a finished verification sample as one transition: it is
+    /// judged against the content current now, under the lock that also
+    /// publishes its result, so no frame can land between the judgement
+    /// and the publication. A proven stall publishes the sample and
+    /// retires the stalled generation; the returned generation is the
+    /// one its replacement subscription must use.
+    pub(crate) fn commit_sample(
+        &self,
+        fresh: &mut super::freshness::Freshness,
+        sampled: BTreeMap<String, Vec<String>>,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        let mut replaced = None;
+        self.publish(|s| {
+            let out = fresh.done(sampled, &s.freshness_view(), now);
+            let mut frames = Vec::new();
+            if !out.stalled.is_empty() {
+                for (id, viewport) in out.stalled {
+                    if s.panes.iter().any(|p| p.id == id) {
+                        frames.push(s.take(id, viewport));
+                    }
+                }
+                s.generation += 1;
+                replaced = Some(s.generation);
+            }
+            let at = std::time::Instant::now();
+            for (request, pane, revision) in out.confirmed {
+                if s.revisions.get(&pane) != Some(&revision) {
+                    continue;
+                }
+                s.taken.insert(pane.clone(), at);
+                frames.push(browser_frame(
+                    "confirmed",
+                    &serde_json::json!({
+                        "tab": request.tab,
+                        "id": request.id,
+                        "pane_id": pane,
+                        "revision": revision,
+                    }),
+                ));
+            }
+            frames
+        });
+        replaced
+    }
+
     /// A subscription line. Unknown kinds are kept out of the way,
     /// not treated as errors.
     pub(crate) fn event(&self, ev: SubscribeEvent) {
+        self.event_at(None, ev);
+    }
+
+    /// A line from subscription `generation`, or from whatever is
+    /// current when `None`. The generation is checked under the same
+    /// lock that applies the line, so a retired reader can never write.
+    fn event_at(&self, generation: Option<u64>, ev: SubscribeEvent) {
+        let retired = |s: &Retained| generation.is_some_and(|g| g != s.generation);
         match ev.event.as_str() {
             "pane_update" => {
                 let (Some(id), Some(viewport)) = (ev.pane_id, ev.viewport) else {
                     return;
                 };
                 self.publish(|s| {
+                    if retired(s) {
+                        return Vec::new();
+                    }
                     let mut frames = Vec::new();
                     // Output means open. The TABLE says so, before the
                     // content arrives, because content never carries
@@ -385,8 +525,7 @@ impl Feed {
                     if s.closed.remove(&id) {
                         frames.push(browser_frame("panes", &panes_data(&s.panes, &s.closed)));
                     }
-                    frames.push(pane_frame(&id, &viewport));
-                    s.viewports.insert(id, viewport);
+                    frames.push(s.take(id, viewport));
                     frames
                 });
             }
@@ -395,6 +534,9 @@ impl Feed {
                     return;
                 };
                 self.publish(|s| {
+                    if retired(s) {
+                        return Vec::new();
+                    }
                     s.closed.insert(id);
                     vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
                 });
@@ -414,6 +556,8 @@ impl Feed {
             }
             let ids: BTreeSet<String> = table.iter().map(|p| p.id.clone()).collect();
             s.viewports.retain(|id, _| ids.contains(id));
+            s.revisions.retain(|id, _| ids.contains(id));
+            s.taken.retain(|id, _| ids.contains(id));
             s.closed.retain(|id| ids.contains(id));
             s.panes = table;
             vec![browser_frame("panes", &panes_data(&s.panes, &s.closed))]
@@ -750,6 +894,130 @@ mod tests {
     /// A browser that connects after the child's initial viewports
     /// went by receives every pane's current viewport and the
     /// status, before any live frame.
+    fn line(screen: &str) -> SubscribeEvent {
+        serde_json::from_value(serde_json::json!({"event":"pane_update","is_initial":false,
+            "pane_id":"p","viewport":[screen],"scrollback":null}))
+        .unwrap()
+    }
+
+    fn asked(f: &mut super::super::freshness::Freshness, at: std::time::Instant) {
+        f.verify(
+            super::super::freshness::RequestId {
+                tab: "t".into(),
+                id: "r".into(),
+            },
+            ["p".to_string()].into(),
+            at,
+        );
+    }
+
+    /// Newer live output that lands after a sample was taken but before
+    /// it is committed wins: the commit judges against what is current.
+    #[test]
+    fn a_sample_overtaken_just_before_its_commit_publishes_nothing() {
+        let feed = Feed::new();
+        feed.panes(vec![meta("p", "codex", 80)]);
+        let generation = feed.next_generation();
+        feed.event_in(generation, line("a"));
+        let mut fresh = super::super::freshness::Freshness::default();
+        let t = std::time::Instant::now();
+        asked(&mut fresh, t);
+        fresh.tick(t, &feed.freshness_view()).unwrap();
+        feed.event_in(generation, line("newer"));
+        let replaced = feed.commit_sample(
+            &mut fresh,
+            [("p".to_string(), vec!["sampled".to_string()])].into(),
+            t,
+        );
+        assert_eq!(replaced, None);
+        assert_eq!(
+            feed.freshness_view().viewports["p"],
+            vec!["newer".to_string()]
+        );
+    }
+
+    /// A frame landing while the confirming sample runs wins: the stall is
+    /// judged against the revision current at commit, not at its start.
+    #[test]
+    fn a_frame_during_the_confirming_sample_voids_the_stall() {
+        let feed = Feed::new();
+        feed.panes(vec![meta("p", "codex", 80)]);
+        let generation = feed.next_generation();
+        feed.event_in(generation, line("a"));
+        let mut fresh = super::super::freshness::Freshness::default();
+        let t = std::time::Instant::now();
+        asked(&mut fresh, t);
+        fresh.tick(t, &feed.freshness_view()).unwrap();
+        feed.commit_sample(
+            &mut fresh,
+            [("p".to_string(), vec!["b".to_string()])].into(),
+            t,
+        );
+        let at = t + super::super::freshness::CONFIRM_AFTER;
+        fresh.tick(at, &feed.freshness_view()).unwrap();
+        feed.event_in(generation, line("newer"));
+        let replaced = feed.commit_sample(
+            &mut fresh,
+            [("p".to_string(), vec!["c".to_string()])].into(),
+            at,
+        );
+        assert_eq!(replaced, None);
+        assert_eq!(
+            feed.freshness_view().viewports["p"],
+            vec!["newer".to_string()]
+        );
+    }
+
+    /// A stall commit retires the stalled generation in the same step, so
+    /// its reader's later frames are dropped.
+    #[test]
+    fn a_stall_commit_retires_the_stalled_reader() {
+        let feed = Feed::new();
+        feed.panes(vec![meta("p", "codex", 80)]);
+        let stalled = feed.next_generation();
+        feed.event_in(stalled, line("a"));
+        let mut fresh = super::super::freshness::Freshness::default();
+        let t = std::time::Instant::now();
+        asked(&mut fresh, t);
+        fresh.tick(t, &feed.freshness_view()).unwrap();
+        feed.commit_sample(
+            &mut fresh,
+            [("p".to_string(), vec!["b".to_string()])].into(),
+            t,
+        );
+        let at = t + super::super::freshness::CONFIRM_AFTER;
+        fresh.tick(at, &feed.freshness_view()).unwrap();
+        let replaced = feed.commit_sample(
+            &mut fresh,
+            [("p".to_string(), vec!["c".to_string()])].into(),
+            at,
+        );
+        assert_eq!(replaced, Some(stalled + 1));
+        feed.event_in(stalled, line("late"));
+        assert_eq!(feed.freshness_view().viewports["p"], vec!["c".to_string()]);
+    }
+
+    /// A retired subscription's late frame cannot overwrite the current
+    /// one's content.
+    #[test]
+    fn a_frame_from_a_retired_generation_is_dropped() {
+        let feed = Feed::new();
+        feed.panes(vec![meta("p", "codex", 80)]);
+        let old = feed.next_generation();
+        let ev = |screen: &str| -> SubscribeEvent {
+            serde_json::from_value(serde_json::json!({"event":"pane_update","is_initial":false,
+                "pane_id":"p","viewport":[screen],"scrollback":null}))
+            .unwrap()
+        };
+        feed.event_in(old, ev("old"));
+        let current = feed.next_generation();
+        feed.event_in(current, ev("new"));
+        feed.event_in(old, ev("late"));
+        let v = feed.freshness_view();
+        assert_eq!(v.viewports["p"], vec!["new".to_string()]);
+        assert_eq!(v.revisions["p"], 2);
+    }
+
     #[test]
     fn a_late_browser_receives_the_state_first() {
         let feed = Feed::new();

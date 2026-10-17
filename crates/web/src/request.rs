@@ -53,6 +53,14 @@ pub enum BrowserRequest {
     Site {
         path: String,
     },
+    /// Confirm these panes' screens against their source. `tab` keys the
+    /// viewer's demand; `id` is the request the viewer timed, echoed in
+    /// the `confirmed` frames that answer it.
+    Verify {
+        tab: String,
+        id: String,
+        panes: Vec<String>,
+    },
 }
 
 /// A retained attachment, never a filesystem path. The window and content key

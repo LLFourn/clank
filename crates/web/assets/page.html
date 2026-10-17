@@ -283,6 +283,8 @@
   .turn pre[hidden] { display: none; }
 
   /* Terminal: the pane at its desktop size, in a scroller. */
+  .terminal .fresh { font: 12px var(--mono); color: var(--muted); padding: 0 6px 4px 0; }
+  .terminal .fresh.live { color: var(--accent-ink); }
   .terminal { -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y pinch-zoom; padding: 6px 0 0 6px; background: var(--pane); color: var(--pane-ink); }
   .terminal .term { width: max-content; }
   .terminal .gone { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--pane-ink); background: color-mix(in srgb, var(--pane) 78%, transparent); }
@@ -1034,7 +1036,7 @@
   function ensureViews(label) {
     if (views.has(label)) return;
     const transcript = document.createElement('div'); transcript.className = 'view transcript'; transcript.innerHTML = '<div class="native-recovery empty-note" hidden><span></span> <button class="native-reconnect" type="button">Reconnect questions</button></div><div class="turns"></div>';
-    const terminal = document.createElement('div'); terminal.className = 'view terminal'; terminal.innerHTML = '<div class="term"></div><div class="gone"></div>';
+    const terminal = document.createElement('div'); terminal.className = 'view terminal'; terminal.innerHTML = '<div class="fresh" role="status"></div><div class="term"></div><div class="gone"></div>';
     viewsEl.append(transcript, terminal);
     const term = new Terminal({ cols: 80, rows: 24, disableStdin: true, cursorBlink: false, scrollback: 0, fontFamily: 'ui-monospace, Menlo, "SF Mono", Consolas, monospace', fontSize: 13, allowProposedApi: true, theme: { background: '#1a1917', foreground: '#e8e4dc' } });
     term.open(terminal.querySelector('.term'));
@@ -1775,7 +1777,85 @@
   function onPane(d) {
     const p = panes.get(d.pane_id); if (!p) return;
     views.get(p.meta.label)?.term.write(d.screen);
+    const f = freshness.get(d.pane_id) || {};
+    freshness.set(d.pane_id, { ...f, revision: d.revision ?? 0, ageMs: d.age_ms ?? 0, at: performance.now() });
+    paintFresh();
   }
+
+  // ---- whether the terminal shows its pane as it is now ----
+  // A screen reads live only on a confirmation THIS page asked for, and
+  // only until FRESH after it asked: the delivery time, which nothing
+  // measures, counts against the window. A frame, a replay or a
+  // reconnect updates the screen but never makes it live.
+  const FRESH_MS = 30000, VERIFY_EVERY_MS = 15000;
+  const newId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  const TAB = newId();
+  const freshness = new Map();   // pane id → {revision, ageMs, at, liveRevision, liveUntil}
+  const asked = new Map();       // request id → when this page sent it
+  let demanding = false, lastAsk = -Infinity;
+  function demandedPane() {
+    if (live !== true || document.visibilityState !== 'visible') return null;
+    if (!shown || workspace || modeFor(shown) !== 'terminal') return null;
+    if (timelineOpen && narrowTimeline.matches) return null;
+    // A plan, queue or stash page covers the agent views entirely.
+    if (viewsEl.hidden || $('views').hidden) return null;
+    if (!views.get(shown)?.terminal.classList.contains('on')) return null;
+    const id = paneOf.get(shown);
+    return id && !panes.get(id)?.closed ? id : null;
+  }
+  function askVerify(list) {
+    const id = newId();
+    if (list.length) asked.set(id, performance.now());
+    fetch(route('/verify'), { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tab: TAB, id, panes: list }) }).catch(() => {});
+  }
+  function verifyTick(now_ = false) {
+    const pane = demandedPane();
+    const now = performance.now();
+    for (const [id, at] of asked) if (now - at >= FRESH_MS) asked.delete(id);
+    if (!pane) {
+      if (demanding) { demanding = false; askVerify([]); }
+    } else if (now_ || !demanding || now - lastAsk >= VERIFY_EVERY_MS) {
+      demanding = true; lastAsk = now; askVerify([pane]);
+    }
+    paintFresh();
+  }
+  function onConfirmed(d) {
+    if (d.tab !== TAB) return;
+    const sent = asked.get(d.id);
+    const f = freshness.get(d.pane_id);
+    if (sent === undefined || !f || f.revision !== d.revision) return;
+    f.liveRevision = d.revision; f.liveUntil = sent + FRESH_MS;
+    paintFresh();
+  }
+  function freshText(id) {
+    if (live !== true) return ['disconnected', ''];
+    const f = freshness.get(id);
+    if (!f) return ['awaiting first frame', ''];
+    const now = performance.now();
+    if (f.liveRevision === f.revision && now < f.liveUntil) return ['live', 'live'];
+    return [`not verified for ${Math.round((f.ageMs + (now - f.at)) / 1000)} s`, ''];
+  }
+  function paintFresh() {
+    for (const [label, v] of views) {
+      const id = paneOf.get(label);
+      const el = v.terminal.querySelector('.fresh');
+      if (!el || !id) continue;
+      const [text, cls] = freshText(id);
+      el.textContent = text;
+      el.className = `fresh ${cls}`;
+    }
+  }
+  setInterval(() => verifyTick(), 1000);
+  // Coming back: reconnect, so the host replays every retained screen
+  // and this page catches up on what it missed, then ask at once.
+  function resync() {
+    if (document.visibilityState !== 'visible') { verifyTick(); return; }
+    if (socket && socket.readyState === 1) { retry = -1; socket.close(); }
+    verifyTick(true);
+  }
+  document.addEventListener('visibilitychange', resync);
+  window.addEventListener('pageshow', resync);
 
   // ---- the queue ----
   // Page locations arrive with the exact handles in the status frame.
@@ -2456,7 +2536,7 @@
   // a stream, while an upgrade's frames come through at once. The
   // frames themselves are unchanged — `event: NAME\ndata: JSON` —
   // so the server side of the feed did not have to move.
-  const handlers = { connection: (d) => { live = d.connected === true; paintHeader(); paintEmpty(); for (const label of views.keys()) paintTranscript(label); }, status: onStatus, panes: onPanes, pane: onPane, turns: applyTurns, turn: applyTurn, questions: onQuestions };
+  const handlers = { connection: (d) => { live = d.connected === true; for (const f of freshness.values()) f.liveUntil = 0; paintHeader(); paintEmpty(); for (const label of views.keys()) paintTranscript(label); verifyTick(true); }, status: onStatus, panes: onPanes, pane: onPane, confirmed: onConfirmed, turns: applyTurns, turn: applyTurn, questions: onQuestions };
   let socket = null, retry = 0, closedForGood = false;
 
   function deliver(text) {

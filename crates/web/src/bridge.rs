@@ -709,6 +709,7 @@ impl Session {
                     inbound = transport.recv(), if pending.len() < 2 => match inbound? {
                         Some(Wire::Snapshot { snapshot }) => {
                             let sequence = snapshot.sequence;
+                            let snapshot = Snapshot { sequence, state: crate::replay::stamp_snapshot(&snapshot.state)? };
                             {
                                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                                 if state.ready {
@@ -914,6 +915,44 @@ mod tests {
             );
         }
     }
+    /// A quiet pane in the connector's snapshot, held by the host for
+    /// five minutes, replays to a late browser five minutes older: the
+    /// host stamps it as it ingests the snapshot.
+    #[tokio::test]
+    async fn a_snapshot_pane_held_by_the_host_replays_older_by_the_time_held() {
+        use std::sync::atomic::Ordering;
+        let session = Arc::new(Session::new("test"));
+        let (peer, _host) = admitted(session.clone()).await;
+        let mut peer = crate::bridge_transport::Connection::new(peer);
+        peer.send(Wire::Snapshot {
+            snapshot: Snapshot {
+                sequence: 0,
+                state: serde_json::json!({"replay": [
+                    {"event":"pane","data":{"pane_id":"terminal_6","screen":"x","revision":2,"age_ms":40}}
+                ]}),
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            peer.recv().await.unwrap(),
+            Some(Wire::Applied { sequence: 0 })
+        );
+        let (view, _) = session.subscribe_with_snapshot().await;
+        crate::replay::TEST_CLOCK_OFFSET.fetch_add(300_000, Ordering::SeqCst);
+        let frames = crate::service::replay(&view).unwrap();
+        crate::replay::TEST_CLOCK_OFFSET.fetch_sub(300_000, Ordering::SeqCst);
+        let pane = frames
+            .iter()
+            .find(|f| f.starts_with("event: pane"))
+            .unwrap();
+        let data: serde_json::Value =
+            serde_json::from_str(pane.lines().find_map(|l| l.strip_prefix("data: ")).unwrap())
+                .unwrap();
+        let age = data["age_ms"].as_u64().unwrap();
+        assert!(age >= 300_040, "replayed at {age} ms old");
+    }
+
     #[tokio::test]
     async fn a_host_gap_requests_resync_and_old_snapshots_cannot_move_it_backwards() {
         let session = Arc::new(Session::new("test"));

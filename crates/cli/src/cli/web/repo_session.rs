@@ -22,6 +22,7 @@ pub(crate) struct RepoSession {
     questions: Option<Arc<super::native_questions::Owners>>,
     claude_questions: Option<Arc<super::claude_questions::Registry>>,
     images: super::transcript_images::Images,
+    verify: Option<tokio::sync::mpsc::UnboundedSender<super::Verify>>,
 }
 
 impl RepoSession {
@@ -45,7 +46,17 @@ impl RepoSession {
             questions: None,
             claude_questions: None,
             images: Default::default(),
+            verify: None,
         }
+    }
+
+    /// Where `verify` requests go: the pane supervisor.
+    pub(crate) fn with_verify(
+        mut self,
+        verify: tokio::sync::mpsc::UnboundedSender<super::Verify>,
+    ) -> Self {
+        self.verify = Some(verify);
+        self
     }
     pub(crate) fn with_questions(
         mut self,
@@ -85,6 +96,15 @@ impl RepoSession {
             BrowserRequest::QuestionAnswer { ask } => match &self.questions {
                 Some(questions) => questions.answer(ask).await,
                 None => plain(409, "native question answers are unavailable"),
+            },
+            // Registered and answered at once: the answer is a later
+            // `confirmed` frame, because this connector handles one
+            // request at a time and a held reply would stall it.
+            BrowserRequest::Verify { tab, id, panes } => match &self.verify {
+                Some(verify) if verify.send(super::Verify { tab, id, panes }).is_ok() => {
+                    plain(204, "")
+                }
+                _ => plain(409, "screen verification is unavailable"),
             },
             BrowserRequest::Say {
                 pane,

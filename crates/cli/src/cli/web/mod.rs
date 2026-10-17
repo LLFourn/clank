@@ -17,6 +17,7 @@ pub(crate) mod claude_questions;
 pub(crate) mod dns;
 pub(crate) mod door;
 mod feed;
+mod freshness;
 mod native_questions;
 mod repo_session;
 pub(crate) mod transcript;
@@ -56,6 +57,16 @@ pub(crate) trait Panes: Send + Sync + 'static {
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()>;
     /// Interrupt the pane — Escape, the way its own user would.
     fn stop(&self, pane: &str) -> anyhow::Result<()>;
+    /// An independent read of these panes' current viewports, taken by
+    /// a subscription of its own and given up at `deadline`. `None` when
+    /// it could not be taken.
+    fn sample(
+        &self,
+        _ids: &[String],
+        _deadline: std::time::Duration,
+    ) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+        None
+    }
 }
 
 /// The real session this TUI runs in.
@@ -113,6 +124,17 @@ impl Panes for Zellij {
     }
     fn subscribe(&self, ids: &[String]) -> Option<SubscribeChild> {
         open_zellij::subscribe_panes(&self.session, ids)
+    }
+    fn sample(
+        &self,
+        ids: &[String],
+        deadline: std::time::Duration,
+    ) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+        sample_initial(
+            open_zellij::subscribe_panes(&self.session, ids)?,
+            ids,
+            deadline,
+        )
     }
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
         if let Some(panes) = open_zellij::snapshot_panes_in(&self.session) {
@@ -320,6 +342,53 @@ impl SiteBuilder {
     }
 }
 
+/// The initial viewport of each of `ids` from a fresh subscription,
+/// read until all have arrived or `deadline` passes. The child is killed
+/// on return either way, which also ends its reader.
+fn sample_initial(
+    mut child: SubscribeChild,
+    ids: &[String],
+    deadline: std::time::Duration,
+) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    let stdout = child.take_stdout()?;
+    let (tx, rx) = std::sync::mpsc::channel::<SubscribeEvent>();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(ev) = serde_json::from_str::<SubscribeEvent>(&line)
+                && tx.send(ev).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let until = std::time::Instant::now() + deadline;
+    let mut seen = std::collections::BTreeMap::new();
+    while seen.len() < ids.len() {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        let Ok(ev) = rx.recv_timeout(left) else { break };
+        if let (Some(id), Some(viewport)) = (ev.pane_id, ev.viewport)
+            && ev.is_initial
+            && ids.contains(&id)
+        {
+            seen.insert(id, viewport);
+        }
+    }
+    drop(rx);
+    drop(child);
+    let _ = reader.join();
+    (seen.len() == ids.len()).then_some(seen)
+}
+
+/// A viewer's `verify`, as the repo connector received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Verify {
+    pub(crate) tab: String,
+    pub(crate) id: String,
+    pub(crate) panes: Vec<String>,
+}
+
 /// The child reading one Zellij pane subscription.
 struct Subscription {
     child: SubscribeChild,
@@ -337,6 +406,16 @@ impl Subscription {
 /// Subscribe to the panes that are alive; the child's lines feed the
 /// page until the child ends.
 fn subscribe(panes: &dyn Panes, table: &[PaneMeta], feed: &Feed) -> Option<Subscription> {
+    subscribe_in(panes, table, feed, feed.next_generation())
+}
+
+/// [`subscribe`], in a generation the caller already started.
+fn subscribe_in(
+    panes: &dyn Panes,
+    table: &[PaneMeta],
+    feed: &Feed,
+    generation: u64,
+) -> Option<Subscription> {
     let ids: Vec<String> = table
         .iter()
         .filter(|p| !p.exited)
@@ -350,7 +429,7 @@ fn subscribe(panes: &dyn Panes, table: &[PaneMeta], feed: &Feed) -> Option<Subsc
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if let Ok(ev) = serde_json::from_str::<SubscribeEvent>(&line) {
-                feed.event(ev);
+                feed.event_in(generation, ev);
             }
         }
     });
@@ -606,9 +685,38 @@ fn window_turns(
 /// change the watcher sees, and a resize changes nothing it watches.
 pub(crate) const PANE_POLL: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// Re-list the panes every [`PANE_POLL`]; a change of membership
-/// restarts the subscription for the panes there are now. Ends on
-/// the cancel signal, its subscription with it (`stop` ends that).
+/// The first wait before a dead subscription is restarted; it doubles
+/// on each failed restart, up to [`RESTART_MAX`].
+const RESTART_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const RESTART_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Replace the subscription with one for `table`'s live panes, in a
+/// new generation, and end the old one.
+fn resubscribe(
+    panes: &dyn Panes,
+    table: &[PaneMeta],
+    feed: &Feed,
+    subscription: &Mutex<Option<Subscription>>,
+    generation: Option<u64>,
+) {
+    let generation = generation.unwrap_or_else(|| feed.next_generation());
+    let fresh = subscribe_in(panes, table, feed, generation);
+    let old = std::mem::replace(
+        &mut *subscription.lock().unwrap_or_else(|e| e.into_inner()),
+        fresh,
+    );
+    if let Some(old) = old {
+        old.end();
+    }
+}
+
+/// The repo's pane supervisor. It re-lists the panes every
+/// [`PANE_POLL`], restarting the subscription when membership changes;
+/// restarts a subscription whose reader ended, with backoff; and runs
+/// the verification samples [`freshness::Freshness`] calls for,
+/// answering viewers' `verify` requests. Ends on the cancel signal, its
+/// subscription with it (`stop` ends that).
+#[allow(clippy::too_many_arguments)]
 async fn pane_poll(
     panes: Arc<dyn Panes>,
     feed: Feed,
@@ -616,30 +724,105 @@ async fn pane_poll(
     mut cancelled: tokio::sync::watch::Receiver<bool>,
     poll: std::time::Duration,
     blocking: Arc<Blocking>,
+    mut verify: tokio::sync::mpsc::UnboundedReceiver<Verify>,
 ) {
+    use std::time::Instant;
+    // The runtime's clock, so a paused test drives the schedule.
+    let clock = || tokio::time::Instant::now().into_std();
+    let mut fresh = freshness::Freshness::default();
+    let mut table = feed.table();
+    let mut listed = clock();
+    let mut tick = tokio::time::interval(poll.min(std::time::Duration::from_secs(1)));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sampling: Option<
+        std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Option<Option<std::collections::BTreeMap<String, Vec<String>>>>,
+                    > + Send,
+            >,
+        >,
+    > = None;
+    let mut backoff = RESTART_MIN;
+    let mut restart_at: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = cancelled.changed() => return,
-            _ = tokio::time::sleep(poll) => {}
-        }
-        // The listing is waited for, not abandoned: a blocking call
-        // cannot be cancelled, so cancel is checked after it.
-        let listing = panes.clone();
-        let listed = blocking.run(move || listing.table()).await;
-        if *cancelled.borrow() {
-            return;
-        }
-        let Some(Some(table)) = listed else {
-            continue;
-        };
-        if feed.panes(table.clone()) == TableChange::Membership {
-            let fresh = subscribe(&*panes, &table, &feed);
-            let old = std::mem::replace(
-                &mut *subscription.lock().unwrap_or_else(|e| e.into_inner()),
-                fresh,
-            );
-            if let Some(old) = old {
-                old.end();
+            Some(ask) = verify.recv() => {
+                fresh.verify(
+                    freshness::RequestId { tab: ask.tab, id: ask.id },
+                    ask.panes.into_iter().collect(),
+                    clock(),
+                );
+            }
+            result = async { sampling.as_mut().expect("guarded").await }, if sampling.is_some() => {
+                sampling = None;
+                let now = clock();
+                match result.flatten() {
+                    Some(sampled) => {
+                        if let Some(generation) = feed.commit_sample(&mut fresh, sampled, now) {
+                            resubscribe(&*panes, &table, &feed, &subscription, Some(generation));
+                        }
+                    }
+                    None => fresh.abandon(),
+                }
+            }
+            _ = tick.tick() => {
+                if *cancelled.borrow() {
+                    return;
+                }
+                let now = clock();
+                if now.duration_since(listed) >= poll {
+                    listed = now;
+                    // The listing is waited for, not abandoned: a blocking
+                    // call cannot be cancelled, so cancel is checked after it.
+                    let listing = panes.clone();
+                    let got = blocking.run(move || listing.table()).await;
+                    if *cancelled.borrow() {
+                        return;
+                    }
+                    if let Some(Some(listed_now)) = got {
+                        let change = feed.panes(listed_now.clone());
+                        table = listed_now;
+                        if change == TableChange::Membership {
+                            resubscribe(&*panes, &table, &feed, &subscription, None);
+                        }
+                    }
+                }
+                let dead = table.iter().any(|p| !p.exited)
+                    && subscription
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_none_or(|s| s.reader.is_finished());
+                match (dead, restart_at) {
+                    (false, _) => {
+                        restart_at = None;
+                        backoff = RESTART_MIN;
+                    }
+                    (true, None) => restart_at = Some(now + backoff),
+                    (true, Some(at)) if now >= at => {
+                        resubscribe(&*panes, &table, &feed, &subscription, None);
+                        backoff = (backoff * 2).min(RESTART_MAX);
+                        restart_at = Some(now + backoff);
+                    }
+                    (true, Some(_)) => {}
+                }
+                if fresh.timed_out(now) {
+                    sampling = None;
+                }
+                if sampling.is_none()
+                    && let Some(start) = fresh.tick(now, &feed.freshness_view())
+                {
+                    let sampler = panes.clone();
+                    let ids: Vec<String> = start.panes.into_iter().collect();
+                    let blocking = blocking.clone();
+                    sampling = Some(Box::pin(async move {
+                        blocking
+                            .run(move || sampler.sample(&ids, freshness::SAMPLE_TIMEOUT))
+                            .await
+                    }));
+                }
             }
         }
     }
@@ -1034,6 +1217,234 @@ fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
+    mod supervisor {
+        use super::super::*;
+        use std::collections::{BTreeMap, VecDeque};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// Panes whose subscription is a test process and whose samples
+        /// are scripted.
+        struct Scripted {
+            alive: bool,
+            samples: Mutex<VecDeque<&'static str>>,
+            subscribed: AtomicUsize,
+            sampled: AtomicUsize,
+        }
+
+        impl Scripted {
+            fn new(alive: bool, samples: &[&'static str]) -> Arc<Self> {
+                Arc::new(Self {
+                    alive,
+                    samples: Mutex::new(samples.iter().copied().collect()),
+                    subscribed: AtomicUsize::new(0),
+                    sampled: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl Panes for Scripted {
+            fn session(&self) -> &str {
+                "test"
+            }
+            fn table(&self) -> Option<Vec<PaneMeta>> {
+                Some(table())
+            }
+            fn subscribe(&self, _: &[String]) -> Option<SubscribeChild> {
+                self.subscribed.fetch_add(1, Ordering::SeqCst);
+                let script = if self.alive {
+                    "exec sleep 300"
+                } else {
+                    "exit 0"
+                };
+                let child = std::process::Command::new("/bin/sh")
+                    .args(["-c", script])
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .ok()?;
+                Some(SubscribeChild::from_child(child))
+            }
+            fn say(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&self, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn sample(&self, _: &[String], _: Duration) -> Option<BTreeMap<String, Vec<String>>> {
+                self.sampled.fetch_add(1, Ordering::SeqCst);
+                let screen = self.samples.lock().unwrap().pop_front()?;
+                Some([("p".to_string(), vec![screen.to_string()])].into())
+            }
+        }
+
+        fn table() -> Vec<PaneMeta> {
+            vec![PaneMeta {
+                id: "p".into(),
+                label: "codex".into(),
+                columns: 80,
+                rows: 24,
+                exited: false,
+            }]
+        }
+
+        fn frame(feed: &Feed, screen: &str) {
+            let ev: SubscribeEvent = serde_json::from_value(serde_json::json!({
+                "event": "pane_update", "is_initial": false, "pane_id": "p",
+                "viewport": [screen], "scrollback": null,
+            }))
+            .unwrap();
+            feed.event_in(feed.freshness_view().generation, ev);
+        }
+
+        struct Running {
+            feed: Feed,
+            verify: tokio::sync::mpsc::UnboundedSender<Verify>,
+            cancel: tokio::sync::watch::Sender<bool>,
+            task: tokio::task::JoinHandle<()>,
+            subscription: Arc<Mutex<Option<Subscription>>>,
+        }
+
+        fn supervise(panes: Arc<Scripted>) -> Running {
+            let feed = Feed::new();
+            feed.panes(table());
+            let subscription = Arc::new(Mutex::new(subscribe(&*panes, &table(), &feed)));
+            frame(&feed, "a");
+            let (cancel, cancelled) = tokio::sync::watch::channel(false);
+            let (verify, rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(pane_poll(
+                panes,
+                feed.clone(),
+                subscription.clone(),
+                cancelled,
+                Duration::from_secs(3600),
+                Arc::new(Blocking::default()),
+                rx,
+            ));
+            Running {
+                feed,
+                verify,
+                cancel,
+                task,
+                subscription,
+            }
+        }
+
+        impl Running {
+            fn ask(&self, id: &str) {
+                self.verify
+                    .send(Verify {
+                        tab: "t".into(),
+                        id: id.into(),
+                        panes: vec!["p".into()],
+                    })
+                    .unwrap();
+            }
+            async fn stop(self) {
+                let _ = self.cancel.send(true);
+                let _ = self.task.await;
+                if let Some(s) = self.subscription.lock().unwrap().take() {
+                    tokio::task::spawn_blocking(move || s.end()).await.unwrap();
+                }
+            }
+        }
+
+        fn shown(feed: &Feed) -> (Vec<String>, u64) {
+            let v = feed.freshness_view();
+            (v.viewports["p"].clone(), v.revisions["p"])
+        }
+
+        /// `secs` of the paused clock, giving the real threads (a
+        /// subscription's reader noticing EOF) a moment at each step.
+        async fn pass(secs: u64) {
+            for _ in 0..secs * 4 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(3)))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_alive_but_stalled_subscription_is_proven_by_two_samples_and_replaced() {
+            let panes = Scripted::new(true, &["b", "c"]);
+            let run = supervise(panes.clone());
+            run.ask("r1");
+            pass(1).await;
+            assert_eq!(
+                shown(&run.feed),
+                (vec!["a".to_string()], 1),
+                "one mismatch proves nothing"
+            );
+            pass(3).await;
+            assert_eq!(
+                shown(&run.feed),
+                (vec!["c".to_string()], 2),
+                "the confirming sample is published"
+            );
+            assert_eq!(
+                panes.subscribed.load(Ordering::SeqCst),
+                2,
+                "and the subscription restarted"
+            );
+            run.stop().await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_quiet_healthy_pane_is_confirmed_without_churn() {
+            let panes = Scripted::new(true, &["a", "a"]);
+            let run = supervise(panes.clone());
+            run.ask("r1");
+            pass(2).await;
+            run.ask("r2");
+            pass(20).await;
+            assert_eq!(
+                panes.sampled.load(Ordering::SeqCst),
+                2,
+                "one sample per window"
+            );
+            assert_eq!(
+                panes.subscribed.load(Ordering::SeqCst),
+                1,
+                "never restarted"
+            );
+            assert_eq!(shown(&run.feed), (vec!["a".to_string()], 1));
+            run.stop().await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_changing_healthy_pane_is_not_restarted() {
+            let panes = Scripted::new(true, &["b", "b"]);
+            let run = supervise(panes.clone());
+            run.ask("r1");
+            pass(1).await;
+            frame(&run.feed, "b");
+            pass(3).await;
+            assert_eq!(panes.subscribed.load(Ordering::SeqCst), 1);
+            assert_eq!(shown(&run.feed), (vec!["b".to_string()], 2));
+            run.stop().await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_subscription_is_restarted_with_backoff() {
+            let panes = Scripted::new(false, &[]);
+            let run = supervise(panes.clone());
+            pass(20).await;
+            let n = panes.subscribed.load(Ordering::SeqCst);
+            // Restarts at about 1, 3, 7 and 15 s: doubling, not once a second.
+            assert!((4..=6).contains(&n), "{n} subscriptions in 20 s");
+            run.stop().await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn nothing_is_sampled_without_demand() {
+            let panes = Scripted::new(true, &["a"]);
+            let run = supervise(panes.clone());
+            pass(60).await;
+            assert_eq!(panes.sampled.load(Ordering::SeqCst), 0);
+            run.stop().await;
+        }
+    }
+
     #[test]
     fn replay_and_incremental_task_observations_have_the_same_turns_and_ids() {
         use clank_core::vocab::Tool;

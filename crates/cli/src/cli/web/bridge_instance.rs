@@ -291,6 +291,7 @@ impl BridgeInstance {
                 None
             }
         };
+        let (verify_tx, verify_rx) = tokio::sync::mpsc::unbounded_channel();
         let backend = Arc::new(
             super::repo_session::RepoSession::new(
                 repo.clone(),
@@ -302,7 +303,8 @@ impl BridgeInstance {
                 cancelled.clone(),
             )
             .with_questions(questions.clone())
-            .with_claude_questions(claude_questions.clone()),
+            .with_claude_questions(claude_questions.clone())
+            .with_verify(verify_tx),
         );
         let mut tasks = JoinSet::new();
         let (attached_tx, mut attached_rx) =
@@ -315,6 +317,7 @@ impl BridgeInstance {
             cancelled.clone(),
             poll,
             blocking.clone(),
+            verify_rx,
         ));
         tasks.spawn(connector(
             endpoint,

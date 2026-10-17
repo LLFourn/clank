@@ -165,6 +165,7 @@ impl WebService {
                     | "agents/reopen"
                     | "upload"
                     | "transcript/image"
+                    | "verify"
             ) | (Method::GET, "agents/candidates")
         ) || (method == Method::GET && path.starts_with("html/"));
         if !recognized {
@@ -219,7 +220,8 @@ impl WebService {
                 | "blocks/answer"
                 | "questions/reconnect"
                 | "questions/answer"
-                | "agents/reopen",
+                | "agents/reopen"
+                | "verify",
                 // Image reads use the same admission and bridge action path.
             )
             | (Method::GET, "agents/candidates")
@@ -447,8 +449,23 @@ struct BlockInput {
     answer: String,
 }
 
+#[derive(Deserialize)]
+struct VerifyInput {
+    tab: String,
+    id: String,
+    panes: Vec<String>,
+}
+
 fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
     Ok(match path {
+        "verify" => {
+            let input: VerifyInput = serde_json::from_slice(bytes)?;
+            BrowserRequest::Verify {
+                tab: input.tab,
+                id: input.id,
+                panes: input.panes,
+            }
+        }
         "questions/reconnect" => BrowserRequest::QuestionReconnect {
             ask: serde_json::from_slice(bytes)?,
         },
@@ -657,14 +674,14 @@ fn connection_frame(connected: bool) -> String {
     BrowserFrame::new("connection", serde_json::json!({"connected":connected})).to_sse()
 }
 
-fn replay(view: &SessionView) -> anyhow::Result<Vec<String>> {
+pub(crate) fn replay(view: &SessionView) -> anyhow::Result<Vec<String>> {
     let Some(snapshot) = &view.snapshot else {
         return Ok(Vec::new());
     };
     Ok(BrowserFrames::from_state(&snapshot.state)?
         .replay
-        .into_iter()
-        .map(|frame| frame.to_sse())
+        .iter()
+        .map(|frame| crate::replay::aged(frame).to_sse())
         .collect())
 }
 
@@ -682,6 +699,49 @@ fn bytes(status: StatusCode, body: impl Into<Bytes>, content_type: &'static str)
 
 #[cfg(test)]
 mod tests {
+    /// A quiet pane that arrived in the connector's snapshot and sat in
+    /// the host for five minutes replays to a late browser five minutes
+    /// older: ingress stamps the snapshot, and replay ages it.
+    #[test]
+    fn a_snapshot_pane_retained_by_the_host_replays_older_by_the_time_held() {
+        use std::sync::atomic::Ordering;
+        let state = serde_json::json!({"replay": [
+            {"event":"pane","data":{"pane_id":"terminal_6","screen":"x","revision":2,"age_ms":40}}
+        ]});
+        let ingested = crate::bridge::Snapshot {
+            sequence: 1,
+            state: crate::replay::stamp_snapshot(&state).unwrap(),
+        };
+        let mut view = crate::bridge::SessionView {
+            revision: 0,
+            generation: 0,
+            connected: false,
+            snapshot: None,
+        };
+        crate::bridge::apply_event(
+            &mut view,
+            crate::bridge::SessionEvent::Snapshot {
+                revision: 1,
+                generation: 1,
+                snapshot: ingested,
+            },
+        )
+        .unwrap();
+        crate::replay::TEST_CLOCK_OFFSET.fetch_add(300_000, Ordering::SeqCst);
+        let frames = super::replay(&view).unwrap();
+        crate::replay::TEST_CLOCK_OFFSET.fetch_sub(300_000, Ordering::SeqCst);
+        let pane = frames
+            .iter()
+            .find(|f| f.starts_with("event: pane"))
+            .unwrap();
+        let data: serde_json::Value =
+            serde_json::from_str(pane.lines().find_map(|l| l.strip_prefix("data: ")).unwrap())
+                .unwrap();
+        let age = data["age_ms"].as_u64().unwrap();
+        assert!(age >= 300_040, "replayed at {age} ms old");
+        assert_eq!(data["revision"], 2);
+    }
+
     #[test]
     fn native_answer_route_preserves_opaque_identity_and_rejects_untyped_input() {
         let body = serde_json::json!({"agent":"codex","session":"session","owner":"epoch:2",

@@ -1913,6 +1913,12 @@ pub(crate) fn subscribe_argv(session: &str, panes: &[String]) -> Option<Vec<Stri
 pub(crate) struct SubscribeChild(std::process::Child);
 
 impl SubscribeChild {
+    /// A test's own process standing in for `zellij subscribe`.
+    #[cfg(test)]
+    pub(crate) fn from_child(child: std::process::Child) -> Self {
+        Self(child)
+    }
+
     pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
         self.0.stdout.take()
     }

@@ -13,6 +13,63 @@ const clickUnavailableChat = async (page) => {
 
 (async () => {
   try {
+  // ---- a terminal reads live only on a confirmation this page asked for, in time
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => { window.__now = 1000; performance.now = () => window.__now; });
+    await page.evaluate((d) => window.__send('status', d), facts([agent('codex', 'master')]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['codex']));
+    await page.evaluate(() => window.__send('pane', { pane_id: 'pane-codex', screen: 'x', revision: 1, age_ms: 0 }));
+    const fresh = async () => (await page.textContent('.view.terminal.on .fresh')) || '';
+    const asks = () => page.evaluate(() => window.__frames
+      .filter(([u, b]) => String(u).endsWith('/verify') && b && JSON.parse(b).panes.length)
+      .map(([, b]) => JSON.parse(b)));
+    ok('a frame alone is not live', (await fresh()).startsWith('not verified'), await fresh());
+    await page.waitForFunction(() => window.__frames.some(([u, b]) => String(u).endsWith('/verify') && b && JSON.parse(b).panes.length));
+    const first = (await asks()).pop();
+    ok('the page demands its visible pane', first.panes[0] === 'pane-codex' && !!first.tab && !!first.id);
+    await page.evaluate(() => { window.__now += 31000; });
+    await page.evaluate((a) => window.__send('confirmed', { tab: a.tab, id: a.id, pane_id: 'pane-codex', revision: 1 }), first);
+    ok('a confirmation arriving after FRESH confirms nothing', !(await fresh()).startsWith('live'), await fresh());
+    await page.waitForFunction((n) => window.__frames.filter(([u, b]) => String(u).endsWith('/verify') && b && JSON.parse(b).panes.length).length > n, (await asks()).length);
+    const timely = (await asks()).pop();
+    await page.evaluate((a) => window.__send('confirmed', { tab: 'another-tab', id: a.id, pane_id: 'pane-codex', revision: 1 }), timely);
+    ok('another tab\'s answer is not this page\'s', !(await fresh()).startsWith('live'));
+    await page.evaluate((a) => window.__send('confirmed', { tab: a.tab, id: a.id, pane_id: 'pane-codex', revision: 1 }), timely);
+    ok('a timely confirmation of the shown revision is live', (await fresh()) === 'live', await fresh());
+    await page.evaluate(() => window.__send('pane', { pane_id: 'pane-codex', screen: 'y', revision: 2, age_ms: 0 }));
+    ok('a newer revision is not live until it is confirmed', (await fresh()).startsWith('not verified'), await fresh());
+    await page.evaluate(() => window.__send('pane', { pane_id: 'pane-codex', screen: 'y', revision: 2, age_ms: 300000 }));
+    ok('a replayed frame shows its age', (await fresh()) === 'not verified for 300 s', await fresh());
+    await page.evaluate(() => {
+      window.__opened = 0;
+      const Stub = window.WebSocket;
+      window.WebSocket = class extends Stub { constructor(...a) { super(...a); window.__opened++; } };
+      Stub.prototype.close = function () { setTimeout(() => this.onclose && this.onclose(), 0); };
+      Object.defineProperty(Stub.prototype, 'readyState', { get() { return 1; } });
+    });
+    const before = (await asks()).length;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    ok('returning to the page asks at once', (await asks()).length === before + 1);
+    const reconnected = await page.waitForFunction(() => window.__opened === 1, null, { timeout: 5000 })
+      .then(() => true, () => false);
+    ok('returning to the page reconnects, so the host replays every retained screen', reconnected);
+    await page.evaluate(() => window.__send('connection', { connected: true }));
+    await page.evaluate(() => window.__send('pane', { pane_id: 'pane-codex', screen: 'z', revision: 3, age_ms: 9000 }));
+    ok('the replayed screen replaces the stale one', (await fresh()) === 'not verified for 9 s', await fresh());
+    await page.evaluate(() => window.__send('connection', { connected: false }));
+    ok('a lost connection says so', (await fresh()) === 'disconnected');
+    await page.evaluate(() => window.__send('connection', { connected: true }));
+    await page.evaluate(() => document.getElementById('queue-new').click());
+    await page.waitForFunction(() => window.__frames.some(([u, b]) => String(u).endsWith('/verify') && b && JSON.parse(b).panes.length === 0));
+    const covered = (await asks()).length;
+    await page.evaluate(() => { window.__now += 20000; });
+    await page.waitForTimeout(1500);
+    ok('a plan page over the Terminal ends demand', (await asks()).length === covered, `${(await asks()).length} vs ${covered}`);
+    ok('no page errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- a message Claude absorbed mid-turn settles its pending row
   {
     const { browser, page, errors } = await open();
