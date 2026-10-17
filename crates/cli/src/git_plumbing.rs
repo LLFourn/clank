@@ -122,6 +122,257 @@ pub fn replay_change(repo: &Path, sha: &str, onto_tree: &str) -> anyhow::Result<
     ))
 }
 
+/// A commit of `tree` on `parent` (`None`: a root commit), authored and
+/// committed by the configured identity now.
+pub fn commit_new(
+    repo: &Path,
+    tree_sha: &str,
+    parent: Option<&str>,
+    message: &str,
+) -> anyhow::Result<String> {
+    let r = open(repo)?;
+    let author = ambient_committer(&r)?;
+    let committer = author.clone();
+    write_commit(&r, tree_sha, parent, author, committer, message.into())
+}
+
+/// A scratch index file in the worktree's git directory, removed on drop.
+pub struct ScratchIndex(std::path::PathBuf);
+
+impl ScratchIndex {
+    fn new(repo: &Path) -> anyhow::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = crate::git_io::git_dir(repo)?;
+        Ok(Self(dir.join(format!(
+            "clank-scratch-{}-{}.index",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))))
+    }
+
+    fn git(&self, repo: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_INDEX_FILE", &self.0)
+            .output()
+            .with_context(|| format!("spawning git {}", args.join(" ")))
+    }
+
+    fn git_ok(&self, repo: &Path, args: &[&str]) -> anyhow::Result<String> {
+        let out = self.git(repo, args)?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+impl Drop for ScratchIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.0.with_extension("index.lock"));
+    }
+}
+
+/// The tree of the worktree's tracked state: the index, with every
+/// tracked file's working-tree content (or its deletion) staged over
+/// it. Untracked and ignored files are never in it, and the real index
+/// is not touched. Why not gix: staging working-tree content needs
+/// git's clean filters, fileMode and autocrlf handling, which `git add
+/// -u` applies.
+pub fn tracked_tree(repo: &Path) -> anyhow::Result<String> {
+    let scratch = ScratchIndex::new(repo)?;
+    let real = crate::git_io::git_dir(repo)?.join("index");
+    match std::fs::copy(&real, &scratch.0) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("copying `{}`", real.display())),
+    }
+    scratch.git_ok(repo, &["add", "-u"])?;
+    scratch.git_ok(repo, &["write-tree"])
+}
+
+/// What [`move_worktree`] did.
+pub enum Moved {
+    /// The working tree is at the new tree, and this index describes it.
+    Done(ScratchIndex),
+    /// A dry run found nothing in the way.
+    Clear,
+    /// Nothing was written: git's own lines naming each path in the way.
+    Refused(Vec<String>),
+    /// The check passed but writing failed part way (a filter, the disk,
+    /// a permission): some paths may be moved and some not.
+    Partial(Vec<String>),
+}
+
+/// Move the working tree from `from_tree` to `to_tree`, touching only
+/// the paths that differ, as `git checkout` does: every path is
+/// verified before any is written, and a tracked path whose disk content
+/// is not `from_tree`'s, or an untracked or ignored entry the move would
+/// overwrite or remove, refuses the whole move. A write that fails after
+/// that check passed is [`Moved::Partial`]. `dry` only verifies. The
+/// real index is not touched; [`install_index`] installs the one this
+/// returns. Why not gix: it has no two-tree checkout with git's
+/// up-to-date and untracked-overwrite checks.
+pub fn move_worktree(
+    repo: &Path,
+    from_tree: &str,
+    to_tree: &str,
+    dry: bool,
+) -> anyhow::Result<Moved> {
+    let scratch = ScratchIndex::new(repo)?;
+    scratch.git_ok(repo, &["read-tree", from_tree])?;
+    // Matching the disk is what makes an unchanged path up to date; a
+    // path that does not match stays stale, and that is the refusal.
+    let _ = scratch.git(repo, &["update-index", "-q", "--refresh"])?;
+    // The check alone first: only its refusal proves nothing was written.
+    let checked = scratch.git(repo, &["read-tree", "-m", "-u", "-n", from_tree, to_tree])?;
+    if !checked.status.success() {
+        return Ok(Moved::Refused(said(&checked)));
+    }
+    if dry {
+        return Ok(Moved::Clear);
+    }
+    let out = scratch.git(repo, &["read-tree", "-m", "-u", from_tree, to_tree])?;
+    if !out.status.success() {
+        return Ok(Moved::Partial(said(&out)));
+    }
+    Ok(Moved::Done(scratch))
+}
+
+fn said(out: &std::process::Output) -> Vec<String> {
+    let mut lines: Vec<String> = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "Aborting")
+        .map(|l| l.trim_start_matches("error: ").to_string())
+        .collect();
+    if lines.is_empty() {
+        lines.push(format!("git read-tree exited {:?}", out.status.code()));
+    }
+    lines
+}
+
+/// Git's own lock on the worktree's HEAD, held so that nothing can
+/// switch, attach or detach HEAD meanwhile: any git command that would
+/// fails to take it. Dropped, it is released and HEAD is unchanged;
+/// [`HeadLock::commit`] writes a detached HEAD set by
+/// [`HeadLock::point_at`].
+pub struct HeadLock {
+    head: std::path::PathBuf,
+    lock: std::path::PathBuf,
+    pending: Option<String>,
+    released: bool,
+}
+
+impl HeadLock {
+    pub fn take(repo: &Path) -> anyhow::Result<Self> {
+        let dir = crate::git_io::git_dir(repo)?;
+        let lock = dir.join("HEAD.lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .with_context(|| {
+                format!(
+                    "HEAD is locked (`{}` exists): another git command is running",
+                    lock.display()
+                )
+            })?;
+        Ok(Self {
+            head: dir.join("HEAD"),
+            lock,
+            pending: None,
+            released: false,
+        })
+    }
+
+    /// Whether HEAD is attached to `binding`, or with `None` detached at
+    /// `commit`.
+    pub fn names(&self, binding: Option<&str>, commit: &str) -> anyhow::Result<bool> {
+        let head = std::fs::read_to_string(&self.head)
+            .with_context(|| format!("reading `{}`", self.head.display()))?;
+        let head = head.trim();
+        Ok(match binding {
+            Some(name) => head.strip_prefix("ref:").map(str::trim) == Some(name),
+            None => head == commit,
+        })
+    }
+
+    /// Detach HEAD at `commit` once [`HeadLock::commit`] runs.
+    pub fn point_at(&mut self, commit: &str) {
+        self.pending = Some(commit.to_string());
+    }
+
+    pub fn commit(mut self) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        if let Some(commit) = self.pending.take() {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.lock)
+                .with_context(|| format!("writing `{}`", self.lock.display()))?;
+            file.write_all(format!("{commit}\n").as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&self.lock, &self.head)
+                .with_context(|| format!("moving HEAD to {commit}"))?;
+        } else {
+            let _ = std::fs::remove_file(&self.lock);
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for HeadLock {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = std::fs::remove_file(&self.lock);
+        }
+    }
+}
+
+/// Make `prepared` the worktree's index, under git's own `index.lock`,
+/// but only while the index is still the one `expected` digests (see
+/// [`crate::git_io::index_digest_at`]). `Ok(false)`: someone changed
+/// the index meanwhile, and it was left as they made it.
+pub fn install_index(
+    repo: &Path,
+    prepared: ScratchIndex,
+    expected: Option<&str>,
+) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    let dir = crate::git_io::git_dir(repo)?;
+    let index = dir.join("index");
+    let lock = dir.join("index.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .with_context(|| format!("taking `{}`", lock.display()))?;
+    let release = |e: anyhow::Error| {
+        let _ = std::fs::remove_file(&lock);
+        e
+    };
+    let now = crate::git_io::index_digest_at(repo).map_err(|e| release(e.into()))?;
+    if now.as_deref() != expected {
+        let _ = std::fs::remove_file(&lock);
+        return Ok(false);
+    }
+    let bytes = std::fs::read(&prepared.0).map_err(|e| release(e.into()))?;
+    file.write_all(&bytes).map_err(|e| release(e.into()))?;
+    file.sync_all().map_err(|e| release(e.into()))?;
+    std::fs::rename(&lock, &index).map_err(|e| release(e.into()))?;
+    Ok(true)
+}
+
 /// The empty tree, written so a commit can name it.
 pub fn empty_tree(repo: &Path) -> anyhow::Result<String> {
     let r = open(repo)?;

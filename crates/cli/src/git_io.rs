@@ -1244,6 +1244,75 @@ pub fn current_branch_at(repo: &Path) -> Result<Option<String>, GitIoError> {
     open(repo)?.current_branch()
 }
 
+/// The full name of the ref HEAD is attached to (`refs/heads/main`),
+/// or `None` when HEAD is detached.
+pub fn head_binding_at(repo: &Path) -> Result<Option<String>, GitIoError> {
+    match open(repo)?.0.head_name() {
+        Ok(name) => Ok(name.map(|n| n.as_bstr().to_string())),
+        Err(e) => Err(gix_err("head_binding", format!("head_name: {e}"))),
+    }
+}
+
+/// `sha`'s first parent, or `None` for a root commit.
+pub fn first_parent_at(repo: &Path, sha: &str) -> Result<Option<String>, GitIoError> {
+    let r = open(repo)?;
+    let oid = gix::ObjectId::from_hex(sha.as_bytes()).map_err(|e| GitIoError::Parse {
+        context: "first_parent".into(),
+        detail: format!("oid hex: {e}"),
+    })?;
+    let commit =
+        r.0.find_commit(oid)
+            .map_err(|e| gix_err("first_parent", format!("find_commit: {e}")))?;
+    Ok(commit.parent_ids().next().map(|id| id.detach().to_string()))
+}
+
+/// A digest of the worktree's index entries (each path, mode, object
+/// and stage), or `None` when there is no index: what a caller compares
+/// to tell whether anyone staged anything since it last looked. Stat
+/// data is left out, because any `git status` rewrites it.
+pub fn index_digest_at(repo: &Path) -> Result<Option<String>, GitIoError> {
+    let path = git_dir(repo)?.join("index");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let index = gix::index::File::at(&path, gix::hash::Kind::Sha1, false, Default::default())
+        .map_err(|e| gix_err("index_digest", format!("read `{}`: {e}", path.display())))?;
+    let mut hasher = blake3::Hasher::new();
+    for entry in index.entries() {
+        hasher.update(entry.path(&index));
+        hasher.update(&[0]);
+        hasher.update(&entry.mode.bits().to_be_bytes());
+        hasher.update(entry.id.as_bytes());
+        hasher.update(&[entry.stage_raw() as u8]);
+    }
+    Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
+/// Every non-directory path in the tree `tree_sha`.
+pub fn tree_files_at(
+    repo: &Path,
+    tree_sha: &str,
+) -> Result<std::collections::BTreeSet<String>, GitIoError> {
+    let r = open(repo)?;
+    let oid = gix::ObjectId::from_hex(tree_sha.as_bytes()).map_err(|e| GitIoError::Parse {
+        context: "tree_files".into(),
+        detail: format!("oid hex: {e}"),
+    })?;
+    let tree =
+        r.0.find_tree(oid)
+            .map_err(|e| gix_err("tree_files", format!("find_tree: {e}")))?;
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    tree.traverse()
+        .breadthfirst(&mut recorder)
+        .map_err(|e| gix_err("tree_files", format!("traverse: {e}")))?;
+    Ok(recorder
+        .records
+        .into_iter()
+        .filter(|e| !e.mode.is_tree())
+        .map(|e| String::from_utf8_lossy(&e.filepath).into_owned())
+        .collect())
+}
+
 impl Repo {
     /// The branch checked out in the MAIN worktree — from a linked
     /// worktree, the base it split from; on the main worktree, HEAD's

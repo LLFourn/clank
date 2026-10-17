@@ -188,7 +188,7 @@ fn unshelve_restores_and_resets_reviews() {
 }
 
 #[test]
-fn interleaved_plan_refuses() {
+fn another_plans_commit_interleaved_is_kept() {
     let env = TestEnv::init();
     env.register_team("claude", &[], &[]);
     let repo = env.repo();
@@ -197,66 +197,28 @@ fn interleaved_plan_refuses() {
         ".clank/.gitignore",
         "/cache/\n/agents/\n/stash/\n/shelved/\n",
     );
+    write(repo, "src/base.rs", "// base\n");
+    commit(repo, "[misc] base");
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
-    // A second plan's commit interleaves into foo's range.
-    write(repo, ".clank/plans/bar.md", "# bar\n");
-    commit(repo, "[bar] intro");
+    write(repo, "src/bar.rs", "// bar\n");
+    commit(repo, "[bar] independent work");
     write(repo, "src/a.rs", "// a\n");
     commit(repo, "[foo] impl a");
 
-    let err = block_on(clank::cli::stash::run_shelve_alias(push_args(
+    block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("foreign commit"),
-        "interleaved plan must refuse with the foreign-commit error; got: {err}"
+    .unwrap();
+    let log = git_out(repo, &["log", "--format=%s"]);
+    assert!(!log.contains("[foo]"), "{log}");
+    assert!(log.contains("[bar] independent work"), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/bar.rs")).unwrap(),
+        "// bar\n"
     );
-    // Nothing mutated: no ref, no state, branch intact.
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
-    assert!(!repo.join(".clank/stash/foo.json").exists());
-}
-
-#[test]
-fn untagged_adhoc_commit_in_range_refuses() {
-    // A DISTINCT source of foreign status from `interleaved_plan_refuses`:
-    // that one proves a commit tagged for ANOTHER plan is refused, this
-    // one proves an UNTAGGED ad-hoc commit is. Both are `!attributed`
-    // today, but only a test keeps them that way — the case for deleting
-    // the old `Rewrite` tier was that this arm still catches everything
-    // the plan's own timeline does not claim, so an attribution refactor
-    // that quietly made untagged work attributed would hollow it out
-    // (stash-stops-refusing-impl-commits).
-    let env = TestEnv::init();
-    env.register_team("claude", &[], &[]);
-    let repo = env.repo();
-    write(
-        repo,
-        ".clank/.gitignore",
-        "/cache/\n/agents/\n/stash/\n/shelved/\n",
-    );
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-    // Ad-hoc work with NO plan tag lands mid-range.
-    write(repo, "src/unrelated.rs", "// unrelated\n");
-    commit(repo, "drive-by fix");
-    write(repo, "src/a.rs", "// a\n");
-    commit(repo, "[foo] impl a");
-
-    let err = block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap_err()
-    .to_string();
-    assert!(
-        err.contains("foreign commit"),
-        "an untagged ad-hoc commit in the range must refuse; got: {err}"
-    );
-    // And nothing was set aside.
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
-    assert!(!repo.join(".clank/stash/foo.json").exists());
+    assert!(!repo.join("src/a.rs").exists());
+    assert!(!repo.join(".clank/plans/foo.md").exists());
 }
 
 #[test]
@@ -335,7 +297,7 @@ fn unshelve_refuses_when_plan_active_again() {
 }
 
 #[test]
-fn conflicted_unshelve_leaves_ref_and_state_intact() {
+fn conflicted_unshelve_moves_nothing_and_leaves_ref_and_state_intact() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
     block_on(clank::cli::stash::run_shelve_alias(push_args(
@@ -346,6 +308,7 @@ fn conflicted_unshelve_leaves_ref_and_state_intact() {
     // Conflicting content at a path the shelved commits also touch.
     write(repo, "src/a.rs", "// conflicting\n");
     commit(repo, "[misc] conflicting change");
+    let head = git_out(repo, &["rev-parse", "HEAD"]);
 
     let err = block_on(clank::cli::stash::run_unshelve_alias(
         clank::cli::UnshelveArgs {
@@ -355,8 +318,17 @@ fn conflicted_unshelve_leaves_ref_and_state_intact() {
     ))
     .unwrap_err()
     .to_string();
-    assert!(err.contains("cherry-pick"), "got: {err}");
-    // Fail-closed: protective ref + state survive the conflict.
+    assert!(
+        err.contains("conflicts") && err.contains("src/a.rs"),
+        "got: {err}"
+    );
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head);
+    let pick = git_out(repo, &["rev-parse", "--git-path", "CHERRY_PICK_HEAD"]);
+    assert!(
+        !repo.join(pick.trim()).exists(),
+        "no cherry-pick is left in progress"
+    );
+    assert_eq!(git_out(repo, &["status", "--porcelain"]), "");
     assert!(git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
     assert!(repo.join(".clank/stash/foo.json").is_file());
 }
@@ -431,35 +403,34 @@ fn status_surfaces_stash_with_for_nudge() {
 }
 
 #[test]
-fn rewrite_refusal_rolls_back_ref_and_state() {
-    // codex 1f4800a: the protective ref + state land BEFORE the
-    // rewrite, but a rewrite refusal (here: a dirty working tree,
-    // the blocker that protects WORK) must roll them back — nothing
-    // was dropped, so the branch still reaches every commit, and
-    // stale state would block the next attempt.
+fn uncommitted_work_is_stashed_as_an_automatic_commit() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
     std::fs::write(repo.join("src/a.rs"), "uncommitted edit\n").unwrap();
 
-    let err = block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("working tree dirty"), "got: {err}");
-
-    // Rolled back: no ref, no state, commits untouched.
-    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
-    assert!(!repo.join(".clank/stash/foo.json").exists());
-    assert!(git_out(repo, &["log", "--format=%s"]).contains("[foo] impl b"));
-
-    // And the retry path is clear: a corrected attempt succeeds.
-    git_out(repo, &["checkout", "--", "src/a.rs"]);
     block_on(clank::cli::stash::run_shelve_alias(push_args(
         &env, false, None,
     )))
     .unwrap();
-    assert!(repo.join(".clank/stash/foo.json").is_file());
+    assert_eq!(git_out(repo, &["status", "--porcelain"]), "");
+    assert!(!repo.join("src/a.rs").exists());
+    let set_aside = git_out(repo, &["log", "--format=%s", "refs/clank/stash/foo", "-1"]);
+    assert_eq!(
+        set_aside.trim(),
+        "[foo] clank stash: uncommitted work at stash time"
+    );
+
+    block_on(clank::cli::stash::run_unshelve_alias(
+        clank::cli::UnshelveArgs {
+            plan: Some("foo".into()),
+            repo: Some(repo.to_path_buf()),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/a.rs")).unwrap(),
+        "uncommitted edit\n"
+    );
 }
 
 #[test]

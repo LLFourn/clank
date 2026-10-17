@@ -4,11 +4,14 @@
 //! (rename-shelve-to-stash, stash-does-what-you-mean; formerly
 //! `clank shelve`/`unshelve`, kept as hidden aliases for a release).
 //!
-//! Push order is the data-safety invariant: the protective ref
-//! (`refs/clank/stash/<plan>`) is written BEFORE the rewrite drops
-//! anything, so the plan's commits stay reachable and GC-protected
-//! even if every later step fails. Pop cherry-picks the recorded shas
-//! back; reviews RESET by design (new shas, new context — the fold
+//! Push and pop are one transaction each (`stash_txn`): the result is
+//! built in the object database, checked against the working tree, and
+//! only then published. Push writes the protective ref
+//! (`refs/clank/stash/<plan>`) before the branch moves, so the plan's
+//! commits stay reachable and GC-protected if a later step fails.
+//! Uncommitted work goes into the stash as an automatic commit; foreign
+//! commits stay, replayed as their changes. Pop replays the recorded
+//! shas back; reviews RESET by design (new shas, new context — the fold
 //! derives Unreviewed and reviewers re-review; nothing migrates).
 //!
 //! STORAGE — read both, write new: records land at
@@ -23,10 +26,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::cli::rewrite::{RewriteOpts, run as run_rewrite};
+use crate::cli::stash_txn as txn;
 use crate::lifecycle::PlanKey;
 use crate::rebuild::CachePolicy;
-use clank_core::api::{RewriteCommit, RewriteDisposition};
 use clank_core::ids::CommitSha;
 
 use super::{
@@ -38,8 +40,8 @@ use super::{
 /// shape is unchanged from the shelve era, so legacy records parse.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct StashRecord {
-    /// The plan's attributed commit shas, oldest first — the
-    /// cherry-pick order for pop.
+    /// The plan's attributed commit shas, plus any automatic commit of
+    /// uncommitted work, oldest first — the order pop replays them in.
     pub shas: Vec<String>,
     /// The protective ref keeping those commits reachable.
     pub git_ref: String,
@@ -334,6 +336,15 @@ fn resolve_stashed(
 }
 
 pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
+    push_with(args, &mut |_, _| {}).await
+}
+
+/// [`run_push`], with `hooks` run at each [`Stage`] of the transaction.
+#[doc(hidden)]
+pub async fn push_with(
+    args: StashPushArgs,
+    hooks: &mut (dyn FnMut(Stage, &Path) + Send),
+) -> anyhow::Result<()> {
     if !args.to_queue {
         if args.priority.is_some() {
             anyhow::bail!("--priority only applies with --to-queue");
@@ -352,7 +363,24 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     // already-stashed check, so two pushes of one stem cannot both
     // pass it, and across the ref + record writes that follow.
     let _slot = super::plan_mutation::lock(&repo)?;
-    let _lock = lock_stash(&repo)?;
+    // A dry run writes nothing, not even the lock file in the stash
+    // directory; the plan mutation lock above still serializes it.
+    let _lock = if args.dry {
+        None
+    } else {
+        Some(lock_stash(&repo)?)
+    };
+    if let Some(named) = args
+        .plan
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        && PlanKey::parse(named).is_ok()
+        && find_record_path(&repo, named).is_some()
+    {
+        println!("`{named}` is already stashed; `clank stash pop {named}` restores it");
+        return Ok(());
+    }
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&repo)
         .ok_or_else(|| anyhow::anyhow!("unknown repo basename: {}", repo.display()))?;
     let state = crate::rebuild::rebuild_repo_with_policy(&repo, CachePolicy::Use)
@@ -363,11 +391,8 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     let stem = plan_key.as_str().to_string();
 
     if find_record_path(&repo, &stem).is_some() {
-        anyhow::bail!(
-            "plan `{stem}` is already stashed. \
-             `clank stash pop {stem}` to restore it, or \
-             `clank stash drop {stem}` to discard it first."
-        );
+        println!("`{stem}` is already stashed; `clank stash pop {stem}` restores it");
+        return Ok(());
     }
     if let Some(for_plan) = args.waiting_for.as_deref() {
         PlanKey::parse(for_plan)
@@ -377,175 +402,299 @@ pub async fn run_push(args: StashPushArgs) -> anyhow::Result<()> {
     let preview = crate::preview::build_rewrite_preview(&repo, &state, &plan_key, true)
         .await
         .map_err(|e| anyhow::anyhow!("rewrite preview failed: {e}"))?;
-
-    // Same tiered safety as demote had: foreign commits in the
-    // range are an unconditional refusal (interleaved plans can't
-    // be stashed; `plan-reorder` is the future enabler), non-plan
-    // content dropped with the plan.
-    safety_check(&preview.commits)?;
-
-    let plan_rel = crate::init_facts::plan_md_rel(&stem);
-    if plan_file_dirty(&repo, &plan_rel, preview.head_sha.as_str())? {
-        anyhow::bail!(
-            "`{plan_rel}` in the working tree differs from HEAD. \
-             Commit your plan-body changes or `git stash` before pushing."
-        );
-    }
-
-    // --to-queue: read the body + pre-check the target before any
-    // mutation, demote-style.
-    let queue_target = if args.to_queue {
-        let body = crate::git_io::show_blob(&repo, &preview.head_sha, Path::new(&plan_rel))
-            .context(format!("reading `{plan_rel}` from HEAD into memory"))?;
-        let n = args.priority.unwrap_or(500);
-        let target = repo.join(format!(".clank/queue/{n:03}-{stem}.md"));
-        if target.exists() {
-            anyhow::bail!(
-                "target file `{}` already exists; pick a different --priority",
-                target.strip_prefix(&repo).unwrap_or(&target).display()
-            );
-        }
-        Some((target, body))
-    } else {
-        None
-    };
-
-    let shas: Vec<String> = preview
+    let intro = preview
+        .intro_sha
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("plan `{stem}` has no intro commit"))?;
+    let base = crate::git_io::first_parent_at(&repo, intro.as_str())?;
+    let owned: Vec<String> = preview
         .commits
         .iter()
         .filter(|c| !c.foreign)
         .map(|c| c.sha.as_str().to_string())
         .collect();
-    if shas.is_empty() {
-        anyhow::bail!("plan `{stem}` has no commits to stash");
-    }
+    let foreign: Vec<String> = preview
+        .commits
+        .iter()
+        .filter(|c| c.foreign)
+        .map(|c| c.sha.as_str().to_string())
+        .collect();
+    let plan_rel = crate::init_facts::plan_md_rel(&stem);
+    let automatic = format!("[{stem}] clank stash: uncommitted work at stash time");
 
-    if args.dry {
-        println!("dry-run: would stash `{stem}`");
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let captured = txn::Capture::read(&repo)?;
+        if captured.head != preview.head_sha.as_str() {
+            anyhow::bail!(
+                "HEAD moved from {} to {} while the plan was being read; nothing moved",
+                txn::short(preview.head_sha.as_str()),
+                txn::short(&captured.head)
+            );
+        }
+        let snap = txn::snapshot(&repo, &captured, &automatic)?;
+        let t0 = snap.clone().unwrap_or_else(|| captured.head.clone());
+        let mut set_aside = owned.clone();
+        set_aside.extend(snap.clone());
+        let (tip, replayed) = match txn::replay_onto(&repo, base.as_deref(), &foreign)? {
+            txn::Built::Conflict { sha, paths } => anyhow::bail!(
+                "stash refuses: {} ({}) is not this plan's, and it does not apply without \
+                 the plan's commits, at {}. Nothing moved.",
+                txn::short(&sha),
+                subject(&repo, &sha),
+                paths.join(", ")
+            ),
+            txn::Built::Tip { tip, replayed } => (tip, replayed),
+        };
+        let (tip, emptied) = match tip {
+            Some(tip) => (tip, false),
+            None => {
+                let empty = crate::git_plumbing::empty_tree(&repo)?;
+                let root = crate::git_plumbing::commit_new(
+                    &repo,
+                    &empty,
+                    None,
+                    &format!("clank stash: {stem} set aside; it was this branch's whole history"),
+                )?;
+                (root, true)
+            }
+        };
+
+        // --to-queue: the body as it is on disk now, which the snapshot holds.
+        let queue_target = if args.to_queue {
+            let body = crate::git_io::show_blob(
+                &repo,
+                &CommitSha::parse(&t0).map_err(|e| anyhow::anyhow!("sha `{t0}`: {e}"))?,
+                Path::new(&plan_rel),
+            )
+            .context(format!("reading `{plan_rel}` into memory"))?;
+            let n = args.priority.unwrap_or(500);
+            let target = repo.join(format!(".clank/queue/{n:03}-{stem}.md"));
+            if target.exists() {
+                anyhow::bail!(
+                    "target file `{}` already exists; pick a different --priority",
+                    target.strip_prefix(&repo).unwrap_or(&target).display()
+                );
+            }
+            Some((target, body))
+        } else {
+            None
+        };
+
+        let blocked = txn::preflight(&repo, &captured.tracked, &tip)?;
+        if args.dry {
+            println!("dry-run: would stash `{stem}`");
+            println!(
+                "  protective ref: {} @ {}",
+                ref_name(&stem),
+                txn::short(&t0)
+            );
+            println!("  commits set aside: {}", set_aside.len());
+            if snap.is_some() {
+                let paths = crate::git_io::working_tree_status(&repo)
+                    .map(|s| s.changed)
+                    .unwrap_or_default();
+                println!("  automatic commit `{automatic}` of: {}", paths.join(", "));
+            }
+            for r in &replayed {
+                println!("  would keep {}", describe_replay(&repo, r));
+            }
+            if !blocked.is_empty() {
+                println!("  would refuse, in the way: {}", blocked.join("; "));
+            }
+            if let Some((target, _)) = &queue_target {
+                println!(
+                    "  plan body → {}",
+                    target.strip_prefix(&repo).unwrap_or(target).display()
+                );
+            }
+            return Ok(());
+        }
+        if !blocked.is_empty() {
+            anyhow::bail!(
+                "stash refuses: the working tree has files the stash would destroy: {}. \
+                 Nothing moved.",
+                blocked.join("; ")
+            );
+        }
+        hooks(Stage::Checked, &repo);
+        match txn::fence(&repo, &captured)? {
+            txn::Fence::Same => {}
+            txn::Fence::Newer if attempt < ATTEMPTS => continue,
+            txn::Fence::Newer => anyhow::bail!(
+                "the work kept changing while stashing ({ATTEMPTS} tries); nothing moved"
+            ),
+            txn::Fence::Moved(why) => anyhow::bail!("{why}; nothing moved"),
+        }
+        hooks(Stage::Fenced, &repo);
+
+        // ── PROTECT FIRST: the ref and record land before anything moves. ──
+        git_update_ref(&repo, &ref_name(&stem), &t0)?;
+        let record = StashRecord {
+            shas: set_aside.clone(),
+            git_ref: ref_name(&stem),
+            waiting_for: args.waiting_for.clone(),
+        };
+        let sp = state_path(&repo, &stem);
+        std::fs::create_dir_all(sp.parent().expect("state path has parent"))?;
+        std::fs::write(&sp, serde_json::to_string_pretty(&record)?)
+            .with_context(|| format!("writing `{}`", sp.display()))?;
+        let unprotect = || {
+            let _ = crate::git_plumbing::delete_ref_at(&repo, &ref_name(&stem), Some(&t0));
+            let _ = std::fs::remove_file(&sp);
+        };
+
+        let published = match txn::publish(&repo, &captured, &captured.tracked, &tip) {
+            Ok(txn::Published::RolledBack(lines)) => {
+                unprotect();
+                anyhow::bail!(
+                    "stash refuses: something changed while stashing: {}. Nothing moved.",
+                    lines.join("; ")
+                );
+            }
+            Ok(txn::Published::Partial { lines, at_tip }) => anyhow::bail!(
+                "stash: {}, but the working tree may be only partly written: {}. Every \
+                 set-aside commit, the uncommitted work among them, is kept on {} and in {}. \
+                 Fix the cause, then {}.",
+                where_head(&captured, &tip, at_tip),
+                lines.join("; "),
+                ref_name(&stem),
+                sp.display(),
+                if at_tip {
+                    format!(
+                        "`git reset --hard` finishes the move, or `clank stash pop {stem}` \
+                         undoes it"
+                    )
+                } else {
+                    format!("`git reset --hard {}` finishes the move", txn::short(&tip))
+                }
+            ),
+            Ok(published) => published,
+            Err(e) => {
+                // `publish` errs only while nothing has moved.
+                unprotect();
+                return Err(e);
+            }
+        };
+
+        if let Some((target, body)) = &queue_target {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, body)
+                .with_context(|| format!("writing plan body to `{}`", target.display()))?;
+        }
         println!(
-            "  protective ref: {} @ {}",
+            "stashed `{stem}`: now at {} ({} commits set aside on {})",
+            txn::short(&tip),
+            set_aside.len(),
             ref_name(&stem),
-            preview.head_sha.as_str()
         );
-        println!("  commits set aside: {}", shas.len());
+        if let Some(snap) = &snap {
+            println!(
+                "  automatic commit {} holds the uncommitted work, set aside with the plan",
+                txn::short(snap)
+            );
+        }
+        for r in &replayed {
+            println!("  kept {}", describe_replay(&repo, r));
+        }
+        if emptied {
+            println!(
+                "  the plan was this branch's whole history: it now starts at an empty commit"
+            );
+        }
+        if published == txn::Published::IndexKept {
+            println!(
+                "  the index changed while stashing and was left as it was; \
+                 `git status` shows the difference"
+            );
+        }
+        warn_untracked(&repo);
         if let Some((target, _)) = &queue_target {
             println!(
                 "  plan body → {}",
                 target.strip_prefix(&repo).unwrap_or(target).display()
             );
         }
+        if let Some(for_plan) = &args.waiting_for {
+            println!("  waiting on `{for_plan}` — `clank status` will nudge when it finishes");
+        }
+        println!("  restore with `clank stash pop {stem}`");
         return Ok(());
     }
+}
 
-    // No confirmation: the ordering below — record and ref before
-    // the branch moves — is the safety, not a prompt in front of it,
-    // and clank asks no y/N anywhere (stash-does-what-you-mean).
-
-    // ── PROTECT FIRST: the ref lands before anything rewrites. ──
-    git_update_ref(&repo, &ref_name(&stem), preview.head_sha.as_str())?;
-    let record = StashRecord {
-        shas: shas.clone(),
-        git_ref: ref_name(&stem),
-        waiting_for: args.waiting_for.clone(),
-    };
-    let sp = state_path(&repo, &stem);
-    std::fs::create_dir_all(sp.parent().expect("state path has parent"))?;
-    std::fs::write(&sp, serde_json::to_string_pretty(&record)?)
-        .with_context(|| format!("writing `{}`", sp.display()))?;
-
-    // ── Drop the plan's commits via the guarded rewrite path. ──
-    let drop_commits: Vec<RewriteCommit> = preview
-        .commits
-        .iter()
-        .map(|c| {
-            if c.foreign {
-                c.clone()
-            } else {
-                RewriteCommit {
-                    sha: c.sha.clone(),
-                    subject: c.subject.clone(),
-                    disposition: RewriteDisposition::Drop,
-                    foreign: false,
-                    strip_paths: c.strip_paths.clone(),
-                }
-            }
-        })
-        .collect();
-    let rewrite_result = run_rewrite(RewriteOpts {
-        repo: &repo,
-        intro_sha: preview.intro_sha.as_ref(),
-        head_sha: &preview.head_sha,
-        linear: preview.linear,
-        commits: &drop_commits,
-        into_branch: None,
-        dry: false,
-        squash: None,
-        squash_tip: None,
-        head_strip_paths: &preview.head_strip_paths,
-    })
-    .await;
-    let outcome = match rewrite_result {
-        Ok(o) => o,
-        Err(e) => {
-            // Roll back the protective ref + state ONLY when the
-            // branch never moved (a pre-rewrite refusal, e.g. a dirty
-            // working tree): the branch
-            // still reaches every commit, and stranded state would
-            // block the next attempt (codex 1f4800a). But
-            // run_rewrite can also fail AFTER moving the branch
-            // (update-ref ok, reset --hard failed) — then the
-            // commits ARE dropped and the protective ref is the
-            // ONLY thing keeping them GC-safe; it must survive
-            // (codex 115c014).
-            let head_now = git_head(&repo);
-            if head_now.as_deref() == Some(preview.head_sha.as_str()) {
-                let _ = git_delete_ref(&repo, &ref_name(&stem));
-                let _ = std::fs::remove_file(&sp);
-            } else {
-                eprintln!(
-                    "stash: rewrite failed AFTER the branch moved; keeping \
-                     {} and {} so the commits stay recoverable",
-                    ref_name(&stem),
-                    sp.display()
-                );
-            }
-            return Err(e);
-        }
-    };
-
-    if let Some((target, body)) = &queue_target {
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(target, body)
-            .with_context(|| format!("writing plan body to `{}`", target.display()))?;
-    }
-
-    if let (Some(tip), Some(branch)) = (outcome.new_tip, outcome.updated_branch) {
-        println!(
-            "stashed `{stem}`: branch `{branch}` now at {} ({} commits set aside on {})",
-            &tip[..tip.len().min(12)],
-            shas.len(),
-            ref_name(&stem),
-        );
+/// Where a partial publish left HEAD, for its message.
+fn where_head(captured: &txn::Capture, tip: &str, at_tip: bool) -> String {
+    let on = captured
+        .binding
+        .as_deref()
+        .map(|b| format!("`{}`", b.trim_start_matches("refs/heads/")))
+        .unwrap_or_else(|| "HEAD".into());
+    if at_tip {
+        format!("{on} is at {}", txn::short(tip))
     } else {
-        println!(
-            "stashed `{stem}` ({} commits set aside on {})",
-            shas.len(),
-            ref_name(&stem)
-        );
+        format!("{on} is still at {}", txn::short(&captured.head))
     }
-    if let Some((target, _)) = &queue_target {
-        println!(
-            "  plan body → {}",
-            target.strip_prefix(&repo).unwrap_or(target).display()
-        );
+}
+
+/// Where pop keeps its result reachable while it writes the working tree.
+/// It lives from just before the write until that attempt succeeds or is
+/// proven to have written nothing; a partial attempt leaves it, and every
+/// later pop of the plan refuses until the operator has recovered from it
+/// and deleted it.
+fn pop_ref(stem: &str) -> String {
+    format!("refs/clank/stash-pop/{stem}")
+}
+
+/// How many times a transaction is rebuilt for work that changed under it.
+const ATTEMPTS: usize = 3;
+
+/// Where a transaction is when its test seam runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum Stage {
+    /// Built and checked against the working tree; not yet fenced.
+    Checked,
+    /// Fenced; about to publish.
+    Fenced,
+}
+
+fn subject(repo: &Path, sha: &str) -> String {
+    CommitSha::parse(sha)
+        .ok()
+        .and_then(|s| crate::git_io::open(repo).ok()?.commit_subject(&s).ok())
+        .unwrap_or_default()
+}
+
+fn describe_replay(repo: &Path, r: &txn::Replay) -> String {
+    format!(
+        "{} → {} {}{}",
+        txn::short(&r.original),
+        txn::short(&r.new),
+        subject(repo, &r.original),
+        if r.linearized {
+            " (a merge, kept as one commit)"
+        } else {
+            ""
+        }
+    )
+}
+
+fn warn_untracked(repo: &Path) {
+    let left = txn::untracked_left(repo);
+    if left.is_empty() {
+        return;
     }
-    if let Some(for_plan) = &args.waiting_for {
-        println!("  waiting on `{for_plan}` — `clank status` will nudge when it finishes");
+    const SHOWN: usize = 10;
+    let more = left.len().saturating_sub(SHOWN);
+    let mut names = left.into_iter().take(SHOWN).collect::<Vec<_>>().join(", ");
+    if more > 0 {
+        names.push_str(&format!(" and {more} more"));
     }
-    println!("  restore with `clank stash pop {stem}`");
-    Ok(())
+    eprintln!("warning: untracked files were left as they are: {names}");
 }
 
 pub(crate) async fn run_pop_inner(
@@ -561,6 +710,17 @@ pub(crate) async fn run_pop_checked(
     repo_override: Option<&Path>,
     plan: Option<&str>,
     expected_revision: Option<&str>,
+) -> anyhow::Result<()> {
+    pop_with(repo_override, plan, expected_revision, &mut |_, _| {}).await
+}
+
+/// [`run_pop_checked`], with `hooks` run at each [`Stage`].
+#[doc(hidden)]
+pub async fn pop_with(
+    repo_override: Option<&Path>,
+    plan: Option<&str>,
+    expected_revision: Option<&str>,
+    hooks: &mut (dyn FnMut(Stage, &Path) + Send),
 ) -> anyhow::Result<()> {
     let repo = super::resolve_repo(repo_override)?;
     // The other verb that destroys the pair: pop deletes the ref and
@@ -588,39 +748,124 @@ pub(crate) async fn run_pop_checked(
         );
     }
     slot.empty_state()?;
-    // The rewrite engine's policy, not a raw status: clank's own
-    // untracked scratch under `.clank/` — this very stash's record,
-    // in a repo whose `.clank/.gitignore` does not cover it — is not
-    // the operator's work and must not refuse the pop.
-    if crate::cli::rewrite::working_tree_dirty(&repo)? {
-        anyhow::bail!("working tree dirty; commit or stash before popping");
+    if let Some(held) = crate::git_io::resolve_commit(&repo, &pop_ref(&stem)) {
+        anyhow::bail!(
+            "an earlier pop of `{stem}` stopped part way, and its result, with the \
+             uncommitted work from before it, is still kept on {} at {}. Nothing moved. \
+             Restore what you need from it (`git reset --hard {}` puts the branch and \
+             working tree there), then remove it with `git update-ref -d {}` and pop again.",
+            pop_ref(&stem),
+            txn::short(held.as_str()),
+            txn::short(held.as_str()),
+            pop_ref(&stem)
+        );
     }
+    let protected = crate::git_io::resolve_commit(&repo, &record.git_ref)
+        .ok_or_else(|| anyhow::anyhow!("protective ref `{}` is gone", record.git_ref))?;
 
-    // Cherry-pick oldest-first. On the first conflict git leaves
-    // the cherry-pick in progress for the user; the protective ref
-    // and record are NOT touched (fail-closed) — finishing by hand
-    // + `clank stash drop` completes the restore.
-    for sha in &record.shas {
-        if !crate::git_plumbing::cherry_pick(&repo, sha)? {
+    let mut attempt = 0;
+    let (tip, snap) = loop {
+        attempt += 1;
+        let captured = txn::Capture::read(&repo)?;
+        // No plan is active, so no plan owns this work.
+        let snap = txn::snapshot(
+            &repo,
+            &captured,
+            "clank stash pop: uncommitted work at pop time",
+        )?;
+        let base = snap.clone().unwrap_or_else(|| captured.head.clone());
+        let tip = match txn::replay_onto(&repo, Some(&base), &record.shas)? {
+            txn::Built::Conflict { sha, paths } => anyhow::bail!(
+                "pop refuses: stashed commit {} ({}) conflicts with the branch as it is now, \
+                 at {}. Nothing moved, and the stash is untouched.",
+                txn::short(&sha),
+                subject(&repo, &sha),
+                paths.join(", ")
+            ),
+            txn::Built::Tip { tip, .. } => tip.expect("replayed onto a base"),
+        };
+        let blocked = txn::preflight(&repo, &captured.tracked, &tip)?;
+        if !blocked.is_empty() {
             anyhow::bail!(
-                "cherry-pick of {sha} stopped (conflict?). Resolve with git \
-                 (`git cherry-pick --continue` / `--abort`); the stash ref \
-                 `{}` and record are untouched. After completing by hand, run \
-                 `clank stash drop {stem}`.",
-                record.git_ref
+                "pop refuses: the working tree has files the restore would destroy: {}. \
+                 Nothing moved, and the stash is untouched.",
+                blocked.join("; ")
             );
         }
-    }
+        hooks(Stage::Checked, &repo);
+        match txn::fence(&repo, &captured)? {
+            txn::Fence::Same => {}
+            txn::Fence::Newer if attempt < ATTEMPTS => continue,
+            txn::Fence::Newer => anyhow::bail!(
+                "the work kept changing while popping ({ATTEMPTS} tries); nothing moved"
+            ),
+            txn::Fence::Moved(why) => anyhow::bail!("{why}; nothing moved"),
+        }
+        hooks(Stage::Fenced, &repo);
+        // The result, the pre-pop snapshot under it, is kept reachable
+        // before the working tree is written, so no failure loses it.
+        let held = pop_ref(&stem);
+        // Create-only: an existing one is an earlier attempt's, possibly
+        // the last copy of its work, and never this attempt's to replace.
+        crate::git_plumbing::update_ref(
+            &repo,
+            &held,
+            &tip,
+            crate::git_plumbing::ExpectedRef::CreateOnly,
+        )
+        .with_context(|| format!("{held} appeared while popping; nothing moved"))?;
+        let published = match txn::publish(&repo, &captured, &captured.tracked, &tip) {
+            Ok(published) => published,
+            Err(e) => {
+                let _ = crate::git_plumbing::delete_ref_at(&repo, &held, Some(&tip));
+                return Err(e);
+            }
+        };
+        if !matches!(published, txn::Published::Partial { .. }) {
+            let _ = crate::git_plumbing::delete_ref_at(&repo, &held, Some(&tip));
+        }
+        match published {
+            txn::Published::RolledBack(lines) => anyhow::bail!(
+                "pop refuses: something changed while popping: {}. Nothing moved, and the \
+                 stash is untouched.",
+                lines.join("; ")
+            ),
+            txn::Published::Partial { lines, at_tip } => anyhow::bail!(
+                "pop: {}, but the working tree may be only partly written: {}. The restored \
+                 commits, with the uncommitted work from before the pop committed under \
+                 them, are kept on {held}; the stash ref and record are kept too. Fix the \
+                 cause, then `git reset --hard {}` finishes the restore, and `clank stash \
+                 drop {stem}` and `git update-ref -d {held}` clear what is left.",
+                where_head(&captured, &tip, at_tip),
+                lines.join("; "),
+                txn::short(&tip)
+            ),
+            txn::Published::IndexKept => println!(
+                "  the index changed while popping and was left as it was; \
+                 `git status` shows the difference"
+            ),
+            txn::Published::Done => {}
+        }
+        break (tip, snap);
+    };
 
     // Restore fully landed: drop the protective ref + record (pop =
     // restore AND consume, matching git stash pop).
-    git_delete_ref(&repo, &record.git_ref)?;
+    crate::git_plumbing::delete_ref_at(&repo, &record.git_ref, Some(protected.as_str()))?;
     std::fs::remove_file(&sp).with_context(|| format!("removing `{}`", sp.display()))?;
 
     println!(
-        "popped `{stem}`: {} commits replayed onto HEAD",
-        record.shas.len()
+        "popped `{stem}`: {} commits replayed, now at {}",
+        record.shas.len(),
+        txn::short(&tip)
     );
+    if let Some(snap) = &snap {
+        println!(
+            "  automatic commit {} holds the uncommitted work from before the pop",
+            txn::short(snap)
+        );
+    }
+    warn_untracked(&repo);
     println!("  reviews reset — the new commits are unreviewed; reviewers will wake");
     Ok(())
 }
@@ -843,78 +1088,9 @@ async fn run_list(repo_override: Option<&Path>) -> anyhow::Result<()> {
 /// Current HEAD sha, or None if it can't be read (detached states
 /// and read failures both land on the SAFE side of the rollback
 /// decision: keep the protective ref).
-fn git_head(repo: &Path) -> Option<String> {
-    crate::git_io::rev_parse_head(repo)
-        .ok()
-        .flatten()
-        .map(|s| s.as_str().to_string())
-}
-
 fn git_update_ref(repo: &Path, name: &str, sha: &str) -> anyhow::Result<()> {
     // Unconditional set — the protective ref is ours to overwrite.
     crate::git_plumbing::update_ref(repo, name, sha, crate::git_plumbing::ExpectedRef::Any)
-}
-
-fn git_delete_ref(repo: &Path, name: &str) -> anyhow::Result<()> {
-    crate::git_plumbing::delete_ref(repo, name)
-}
-
-/// Foreign-commit refusal. The ONLY tier: a commit the plan's own
-/// timeline does not claim cannot be set aside as a side effect of
-/// stashing that plan, and `--force` does not bypass it (codex
-/// 625b8af: a foreign commit can classify as `Rewrite`, so ANY
-/// foreign is refused, not just `KeepVerbatim`). Note this covers
-/// two sources of foreignness — another plan's commits AND untagged
-/// ad-hoc work interleaved in the range — because `foreign` is
-/// `!attributed`, attribution being membership in the plan's own
-/// timeline.
-///
-/// There used to be a second tier: any non-foreign commit whose
-/// disposition is `Rewrite` — that is, one touching content beyond
-/// the plan document — refused unless `--force`. That is what an
-/// implementation commit IS, so it fired for every plan past its
-/// intro and made `clank stash` unusable on real work, while
-/// offering nothing but an instruction to pass `--force`. It was
-/// inherited from `demote`, which no longer exists.
-///
-/// It is not replaced by a smarter predicate, because none exists: a
-/// `[plan]` tag asserts ownership of the whole commit, not that no
-/// unrelated change rides along in it. What remains is a deliberate
-/// trade, and `purge` already makes it on the IRREVERSIBLE path (see
-/// `purge::drop_safety_check`) — stash pops back, so it costs
-/// strictly less here (stash-stops-refusing-impl-commits).
-fn safety_check(commits: &[RewriteCommit]) -> anyhow::Result<()> {
-    let foreign_shas = crate::preview::foreign_shas(commits);
-    if !foreign_shas.is_empty() {
-        let list: Vec<String> = foreign_shas
-            .iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
-        anyhow::bail!(
-            "stash push refuses: foreign commit(s) interleaved in plan range: {}. \
-             Disentangle first (see the `plan-reorder` queue item) or coordinate \
-             with the author(s).",
-            list.join(", ")
-        );
-    }
-    Ok(())
-}
-
-/// True if `rel_path` in the working tree differs from its content
-/// at `head_sha` (inherited from demote).
-fn plan_file_dirty(repo: &Path, rel_path: &str, head_sha: &str) -> anyhow::Result<bool> {
-    let wt_path = repo.join(rel_path);
-    let wt_content = match std::fs::read_to_string(&wt_path) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading `{}`", wt_path.display()));
-        }
-    };
-    let head_sha_parsed = CommitSha::parse(head_sha)
-        .map_err(|e| anyhow::anyhow!("invalid head SHA `{head_sha}`: {e}"))?;
-    let head_content = crate::git_io::show_blob(repo, &head_sha_parsed, Path::new(rel_path)).ok();
-    Ok(wt_content != head_content)
 }
 
 #[cfg(test)]

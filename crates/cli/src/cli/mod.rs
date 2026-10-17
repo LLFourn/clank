@@ -76,6 +76,7 @@ pub mod source_group;
 pub(crate) mod source_ids;
 pub(crate) mod source_status;
 pub mod stash;
+pub(crate) mod stash_txn;
 pub mod status;
 pub(crate) mod status_tui;
 pub mod stop_hook;

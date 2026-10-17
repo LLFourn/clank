@@ -35,6 +35,7 @@ mod pr_review_integration;
 mod rereview_integration;
 mod signal_boundary;
 mod standby_wakes;
+mod stash_dwim;
 mod stash_integration;
 mod status_log_integration;
 mod tui_is_the_command;
