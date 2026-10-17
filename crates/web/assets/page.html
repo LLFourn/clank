@@ -188,6 +188,10 @@
   /* What the person said is a block of its own, so who is speaking
      needs no label. */
   .turn.person { margin: 14px 0; padding: 12px 14px; background: var(--bezel); border: 1px solid var(--edge); border-radius: 10px; }
+  .turn.peer { margin: 14px 0; padding: 10px 14px; border: 1px solid var(--edge); border-left-width: 3px; border-radius: 10px; }
+  .turn.peer .from { font: 12px var(--mono); color: var(--muted); }
+  .turn.peer .from .id { margin-left: 6px; }
+  .turn.peer .text { max-height: 50vh; overflow: auto; overscroll-behavior: contain; }
   .turn.outgoing { border-style: dashed; }
   .turn.outgoing .text { white-space: pre-wrap; }
   .turn.outgoing .delivery { display: block; margin-top: 6px; color: var(--muted); font: 12px var(--mono); overflow-wrap: anywhere; }
@@ -1187,6 +1191,7 @@
     const b = t.body;
     const age = `<span class="age"></span>`;
     if (b.kind === 'text') return `${age}<div class="text prose"></div>`;
+    if (b.kind === 'message') return `${age}<div class="from"><span class="who"></span><details class="id"><summary>id</summary><code></code></details></div><div class="text prose"></div>`;
     if (b.kind === 'thinking') return `${age}<details><summary>thinking</summary><pre class="text"></pre></details>`;
     if (b.kind === 'image') return `${age}<span class="shots"></span>`;
     if (b.kind === 'tool' && b.question) {
@@ -1329,6 +1334,15 @@
       // `render_markdown` made this markup: raw HTML escaped, every
       // destination checked against an allow-list. A turn from before
       // that existed has no `html`, and falls back to its own text.
+      const box = el.querySelector('.text');
+      if (b.html) box.innerHTML = b.html; else box.textContent = b.text;
+      return;
+    }
+    if (b.kind === 'message') {
+      el.querySelector('.from .who').textContent = `message from ${b.name || 'another agent'}`;
+      el.querySelector('.from .id code').textContent = b.from || '';
+      el.querySelector('.from .id').hidden = !b.from;
+      // Server-rendered with raw HTML escaped; the text is the fallback.
       const box = el.querySelector('.text');
       if (b.html) box.innerHTML = b.html; else box.textContent = b.text;
       return;

@@ -2260,6 +2260,17 @@ pub(crate) fn safe_destination(dest: &str) -> bool {
 }
 
 pub(crate) fn render_markdown(md: &str) -> String {
+    render_markdown_with(md, false)
+}
+
+/// [`render_markdown`] keeping every line break: a single newline is a
+/// line break, not a space. For text whose author laid out lines by
+/// hand, like a numbered list without blank lines between items.
+pub(crate) fn render_markdown_lines(md: &str) -> String {
+    render_markdown_with(md, true)
+}
+
+fn render_markdown_with(md: &str, hard_breaks: bool) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -2300,6 +2311,7 @@ pub(crate) fn render_markdown(md: &str) -> String {
         // on 2709ac1). A stack pairs them.
         let ev = match ev {
             Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+            Event::SoftBreak if hard_breaks => Event::HardBreak,
             Event::Start(Tag::Link { ref dest_url, .. })
             | Event::Start(Tag::Image { ref dest_url, .. }) => {
                 let drop = !safe_destination(dest_url);
@@ -3951,6 +3963,21 @@ mod tests {
         assert!(
             !html.contains("<div>") && !html.contains("<script>"),
             "and never as markup: {html}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_lines_keeps_each_line_and_still_escapes() {
+        let md = "(1) one\n(2) two\n(3) say <script>alert(1)</script>";
+        let lines = render_markdown_lines(md);
+        assert_eq!(lines.matches("<br />").count(), 2, "{lines}");
+        assert!(
+            lines.contains("&lt;script&gt;") && !lines.contains("<script>"),
+            "{lines}"
+        );
+        assert!(
+            !render_markdown("(1) one\n(2) two").contains("<br"),
+            "plain prose is unchanged"
         );
     }
 

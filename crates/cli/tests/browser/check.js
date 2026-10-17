@@ -70,6 +70,41 @@ const clickUnavailableChat = async (page) => {
     await browser.close();
   }
 
+  // ---- another agent's message is its own labelled card, never the person's
+  for (const width of [390, 1280]) {
+    const { browser, page, errors } = await open();
+    await page.setViewportSize({ width, height: 800 });
+    const long = Array.from({ length: 80 }, (_, i) => `(${i + 1}) a finding`).join('\n');
+    const html = Array.from({ length: 80 }, (_, i) => `(${i + 1}) a finding`).join('<br />') + ' &lt;b&gt;';
+    await page.evaluate((d) => window.__send('status', d),
+      facts([{ ...agent('claude', 'master', null, null, true), session: 's1', tool: 'claude' }]));
+    await page.evaluate((d) => window.__send('panes', d), panes(['claude']));
+    await page.evaluate((d) => window.__send('turns', d), turns('claude', []));
+    await page.evaluate(() => { window.fetch = async () => ({ ok: true, status: 204, text: async () => '' }); });
+    await page.fill('#text', long);
+    await page.click('#send');
+    await page.waitForTimeout(30);
+    await page.evaluate((d) => window.__send('turn', d), {
+      agent: 'claude', session: 's1', generation: 1,
+      turn: { id: 'peer-1', who: 'peer', at: Math.floor(Date.now() / 1000),
+        body: { kind: 'message', name: 'general-purpose', from: 'ab3b5297c68b0ddd2', text: long, html } },
+    });
+    const card = page.locator('.turn.peer.message');
+    ok(`${width}px: the peer message is a labelled card`, await card.count() === 1
+       && (await card.locator('.from .who').textContent()) === 'message from general-purpose');
+    ok(`${width}px: it is not the person's bubble`, await page.locator('.turn.person:not(.outgoing)').count() === 0);
+    ok(`${width}px: it cannot settle the person's pending message`, await page.locator('.turn.outgoing').count() === 1);
+    const box = await card.locator('.text').boundingBox();
+    const say = await page.locator('#say').boundingBox();
+    const scrolls = await card.locator('.text').evaluate((el) => el.scrollHeight > el.clientHeight);
+    ok(`${width}px: a long message scrolls within its card and leaves the composer clear`,
+       scrolls && box.height <= 800 * 0.5 + 1 && say && say.y >= 0 && say.y + say.height <= 800,
+       JSON.stringify({ h: box.height, say }));
+    ok(`${width}px: its markup stays text`, (await card.locator('.text').innerHTML()).includes('&lt;b&gt;'));
+    ok(`${width}px: no page errors`, errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- a message Claude absorbed mid-turn settles its pending row
   {
     const { browser, page, errors } = await open();
