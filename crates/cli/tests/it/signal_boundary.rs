@@ -27,7 +27,7 @@
 //! guess about what the next person will write, so the gate now names
 //! the modules that may signal AT ALL and refuses the rest.
 
-use crate::common::{crates_dir, rs_files, strip_test_code};
+use crate::common::{Production, crates_dir, rs_files, strip_test_code};
 
 /// The files that may aim a signal, each owning a validated target
 /// type whose constructor refuses the ids that do not name one target.
@@ -86,10 +86,11 @@ fn no_signal_is_aimed_from_outside_a_validating_module() {
 
     let mut violations: Vec<String> = Vec::new();
     let mut signal_modules_seen = 0;
+    let production = Production::of(&files);
     for f in &files {
         let owns = owns_a_signal_target(f);
         signal_modules_seen += usize::from(owns);
-        let prod = strip_test_code(&std::fs::read_to_string(f).unwrap_or_default());
+        let prod = production.text(f);
         for (i, line) in prod.lines().enumerate() {
             if !owns && names_a_libc_signal(line) {
                 violations.push(format!(

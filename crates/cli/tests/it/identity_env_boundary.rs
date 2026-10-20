@@ -12,7 +12,7 @@
 //! Test code is EXEMPT: a fixture may name whatever it likes, because
 //! naming it is the opposite of inheriting it.
 
-use crate::common::{crates_dir, rs_files, strip_test_code};
+use crate::common::{Production, crates_dir, rs_files};
 
 /// The variables that decide identity — the production list itself,
 /// not a copy of it.
@@ -50,11 +50,12 @@ fn identity_is_read_only_where_it_can_be_stated() {
     assert!(!files.is_empty(), "scanned no source files");
 
     let mut violations: Vec<String> = Vec::new();
+    let production = Production::of(&files);
     for f in &files {
         if f.file_name().is_some_and(|n| n == OWNER) {
             continue;
         }
-        let prod = strip_test_code(&std::fs::read_to_string(f).unwrap_or_default());
+        let prod = production.text(f);
         for (i, line) in prod.lines().enumerate() {
             if !reads_the_environment(line) {
                 continue;

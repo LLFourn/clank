@@ -9,7 +9,7 @@
 //! This is the whole point of the centralization: a new git/gix use
 //! anywhere else fails `cargo test`, so the boundary can't erode.
 
-use crate::common::{crates_dir, rs_files, strip_test_code};
+use crate::common::{Production, crates_dir, rs_files, strip_test_code};
 
 /// The only files allowed to name `git`/`gix` directly.
 const LAYER_FILES: &[&str] = &["git_io.rs", "git_plumbing.rs"];
@@ -47,12 +47,13 @@ fn no_raw_git_or_gix_outside_layer() {
     assert!(!files.is_empty(), "scanned no source files");
 
     let mut violations: Vec<String> = Vec::new();
+    let production = Production::of(&files);
     for f in &files {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if LAYER_FILES.contains(&name) {
             continue;
         }
-        let prod = strip_test_code(&std::fs::read_to_string(f).unwrap_or_default());
+        let prod = production.text(f);
         for (i, line) in prod.lines().enumerate() {
             if let Some(what) = line_violation(line) {
                 violations.push(format!("{}:{} — {what}", f.display(), i + 1));

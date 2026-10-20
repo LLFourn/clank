@@ -203,13 +203,16 @@ pub async fn assert_stays_parked(repo: &Path, args: clank::cli::WaitArgs, what: 
 // name. They all walk the same files the same way; the walk is not
 // what any of them is about.
 
-/// Remove `#[cfg(test)]` items (modules and fns — both brace-delimited
-/// in this tree) so a scan sees only production code.
+/// Blank out `#[cfg(test)]` items so a scan sees only production code.
+/// An item ends at its closing brace, or at a `;` before any brace
+/// (`#[cfg(test)] #[path = "x.rs"] mod tests;`). Dropped lines stay as
+/// empty lines, so a line number in the result is one in the source.
 pub fn strip_test_code(src: &str) -> String {
     let mut out = String::new();
     let mut in_test = false;
     let mut depth = 0i32;
     let mut entered = false; // seen the item's opening brace yet?
+    let mut ended = false;
     let mut lexer = Lexer::default();
     for line in src.lines() {
         if !in_test {
@@ -217,6 +220,7 @@ pub fn strip_test_code(src: &str) -> String {
                 in_test = true;
                 depth = 0;
                 entered = false;
+                ended = false;
                 // fall through: count this attr line's braces (usually none)
             } else {
                 lexer.scan(line, &mut |_| {});
@@ -226,19 +230,206 @@ pub fn strip_test_code(src: &str) -> String {
             }
         }
         lexer.scan(line, &mut |c| match c {
-            '{' => {
+            '{' if !ended => {
                 depth += 1;
                 entered = true;
             }
-            '}' => depth -= 1,
+            '}' if !ended => {
+                depth -= 1;
+                ended = entered && depth <= 0;
+            }
+            ';' if !entered => ended = true,
             _ => {}
         });
-        if entered && depth <= 0 {
+        if ended {
             in_test = false;
         }
-        // lines while `in_test` are dropped
+        out.push('\n');
     }
     out
+}
+
+/// The production text of each scanned file: [`strip_test_code`], and
+/// nothing at all for a file that only test code includes.
+///
+/// A file such as `grok_hook_tests.rs` says nothing about itself; what
+/// makes it test code is the `#[cfg(test)] #[path = …] mod tests;` that
+/// includes it. The inclusions come from each file's PARSED module tree,
+/// with its attributes attached and inline modules nested, so a comment
+/// or a string that looks like a declaration includes nothing. A file is
+/// test-only when every inclusion is in test code (or in a test-only
+/// file), production as soon as one is production or none is found, and
+/// if any production declaration cannot be resolved, or a file does not
+/// parse, nothing is exempt: an inclusion clank cannot see might be the
+/// production one.
+pub struct Production {
+    test_only: std::collections::HashSet<PathBuf>,
+}
+
+/// One `mod name;` that loads `file` from `from`, and whether it sits in
+/// test code.
+struct Inclusion {
+    file: PathBuf,
+    from: PathBuf,
+    in_test: bool,
+}
+
+impl Production {
+    pub fn of(files: &[PathBuf]) -> Self {
+        let mut found: Vec<Inclusion> = Vec::new();
+        let mut uncertain = false;
+        for f in files {
+            let src = std::fs::read_to_string(f).unwrap_or_default();
+            let Ok(parsed) = syn::parse_file(&src) else {
+                uncertain = true;
+                continue;
+            };
+            let Some(dir) = f.parent() else {
+                uncertain = true;
+                continue;
+            };
+            let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let plain = if matches!(stem, "mod" | "lib" | "main") {
+                dir.to_path_buf()
+            } else {
+                dir.join(stem)
+            };
+            let at = ModuleDirs {
+                plain,
+                path_attr: dir.to_path_buf(),
+            };
+            collect_inclusions(&parsed.items, &at, false, f, &mut found, &mut uncertain);
+        }
+        if uncertain {
+            return Production {
+                test_only: Default::default(),
+            };
+        }
+        let mut test_only = std::collections::HashSet::new();
+        loop {
+            let before = test_only.len();
+            for inc in &found {
+                let target = normal(&inc.file);
+                if test_only.contains(&target) {
+                    continue;
+                }
+                let all_test = found
+                    .iter()
+                    .filter(|other| normal(&other.file) == target)
+                    .all(|other| other.in_test || test_only.contains(&normal(&other.from)));
+                if all_test {
+                    test_only.insert(target);
+                }
+            }
+            if test_only.len() == before {
+                break;
+            }
+        }
+        Production { test_only }
+    }
+
+    pub fn text(&self, f: &Path) -> String {
+        if self.test_only.contains(&normal(f)) {
+            return String::new();
+        }
+        strip_test_code(&std::fs::read_to_string(f).unwrap_or_default())
+    }
+}
+
+/// Where a module declared at this point is looked for: `plain` for
+/// `mod x;`, `path_attr` for `#[path = "…"] mod x;`. They differ only at
+/// a file's top level, where a `#[path]` is relative to the file's own
+/// directory (the Rust reference, "The path attribute").
+struct ModuleDirs {
+    plain: PathBuf,
+    path_attr: PathBuf,
+}
+
+fn collect_inclusions(
+    items: &[syn::Item],
+    at: &ModuleDirs,
+    in_test: bool,
+    from: &Path,
+    found: &mut Vec<Inclusion>,
+    uncertain: &mut bool,
+) {
+    use quote::ToTokens;
+    for item in items {
+        let syn::Item::Mod(m) = item else {
+            continue;
+        };
+        let in_test = in_test || m.attrs.iter().any(is_cfg_test);
+        let name = m.ident.to_string();
+        let path = m.attrs.iter().find_map(path_attr);
+        let conditional_path = m.attrs.iter().any(|a| {
+            a.path().is_ident("cfg_attr") && a.meta.to_token_stream().to_string().contains("path")
+        });
+        if conditional_path && !in_test {
+            *uncertain = true;
+            continue;
+        }
+        match &m.content {
+            None => {
+                let target = match &path {
+                    Some(p) => Some(at.path_attr.join(p)).filter(|p| p.exists()),
+                    None => [
+                        at.plain.join(format!("{name}.rs")),
+                        at.plain.join(&name).join("mod.rs"),
+                    ]
+                    .into_iter()
+                    .find(|p| p.exists()),
+                };
+                match target {
+                    Some(file) => found.push(Inclusion {
+                        file,
+                        from: from.to_path_buf(),
+                        in_test,
+                    }),
+                    None if !in_test => *uncertain = true,
+                    None => {}
+                }
+            }
+            Some((_, inner)) => {
+                if path.is_some() {
+                    if !in_test {
+                        *uncertain = true;
+                    }
+                    continue;
+                }
+                let dir = at.plain.join(&name);
+                let nested = ModuleDirs {
+                    plain: dir.clone(),
+                    path_attr: dir,
+                };
+                collect_inclusions(inner, &nested, in_test, from, found, uncertain);
+            }
+        }
+    }
+}
+
+fn is_cfg_test(a: &syn::Attribute) -> bool {
+    a.path().is_ident("cfg")
+        && matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
+}
+
+fn path_attr(a: &syn::Attribute) -> Option<String> {
+    let syn::Meta::NameValue(nv) = &a.meta else {
+        return None;
+    };
+    if !nv.path.is_ident("path") {
+        return None;
+    }
+    match &nv.value {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(s),
+            ..
+        }) => Some(s.value()),
+        _ => None,
+    }
+}
+
+fn normal(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Enough Rust lexing to count braces that are actually CODE.
@@ -317,10 +508,19 @@ impl Lexer {
                             self.inside = Some(Inside::Str);
                             i += 1;
                         }
-                        // A char literal, not a lifetime: `'}'` must
-                        // not count, and `'a` must not swallow the line.
-                        b'\'' if b.get(i + 1) == Some(&b'\\') => i += 4,
-                        b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+                        // A char literal, not a lifetime: `'}'` and
+                        // `'\u{1b}'` must not count, and `'a` must not
+                        // swallow the line.
+                        b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                            i += 3;
+                            while i < b.len() && b[i] != b'\'' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        b'\'' if char_literal_len(line, i).is_some() => {
+                            i += char_literal_len(line, i).unwrap();
+                        }
                         b'r' if raw_opens(b, i).is_some() => {
                             let (hashes, after) = raw_opens(b, i).unwrap();
                             self.inside = Some(Inside::Raw(hashes));
@@ -337,6 +537,14 @@ impl Lexer {
     }
 }
 
+/// The byte length of an unescaped char literal opening at `i`, such as
+/// `'}'` or `'é'`.
+fn char_literal_len(line: &str, i: usize) -> Option<usize> {
+    let c = line.get(i + 1..)?.chars().next()?;
+    let close = i + 1 + c.len_utf8();
+    (line.as_bytes().get(close) == Some(&b'\'')).then_some(close + 1 - i)
+}
+
 /// The hash count and the index just past `r#*"`, if one opens at `i`.
 fn raw_opens(b: &[u8], i: usize) -> Option<(usize, usize)> {
     let mut hashes = 0;
@@ -350,6 +558,126 @@ fn raw_opens(b: &[u8], i: usize) -> Option<(usize, usize)> {
 
 fn find(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     (from..b.len().saturating_sub(needle.len() - 1)).find(|&k| b[k..].starts_with(needle))
+}
+
+/// A file is test code exactly when test code is all that includes it,
+/// read from the parsed module tree.
+///
+/// `grok_hook_tests.rs` is the real shape: nothing in the file says it is
+/// a test, the `#[cfg(test)] #[path = …] mod tests;` that loads it does.
+#[test]
+fn a_file_only_test_code_includes_is_test_code() {
+    const GIT: &str = "pub fn f() { std::process::Command::new(\"git\"); }\n";
+    // Which of `layout`'s files the gates would scan as production.
+    let scanned = |layout: &[(&str, &str)]| -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, body) in layout {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let mut files = Vec::new();
+        rs_files(dir.path(), &mut files);
+        let production = Production::of(&files);
+        let mut out: Vec<String> = files
+            .iter()
+            .filter(|f| production.text(f).contains("Command::new"))
+            .map(|f| f.strip_prefix(dir.path()).unwrap().display().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    let with = |host: &str| {
+        vec![
+            ("lib.rs", host.to_string()),
+            ("host_tests.rs", GIT.to_string()),
+        ]
+    };
+    let run = |layout: Vec<(&str, String)>| {
+        let refs: Vec<(&str, &str)> = layout.iter().map(|(p, b)| (*p, b.as_str())).collect();
+        scanned(&refs)
+    };
+    let none: Vec<String> = Vec::new();
+    let host_tests = vec!["host_tests.rs".to_string()];
+
+    let guarded = "#[cfg(test)]\n#[path = \"host_tests.rs\"]\nmod tests;\n";
+    assert_eq!(run(with(guarded)), none, "included only by test code");
+    let one_line = "#[cfg(test)] #[path = \"host_tests.rs\"] mod tests;\n";
+    assert_eq!(run(with(one_line)), none);
+
+    let unguarded = "#[path = \"host_tests.rs\"]\nmod tests;\n";
+    assert_eq!(
+        run(with(unguarded)),
+        host_tests,
+        "the guard is what exempts it"
+    );
+
+    let commented = format!(
+        "{guarded}#[path = \"host_tests.rs\"]\n// a comment between the attribute and its item\nmod live;\n"
+    );
+    assert_eq!(
+        run(with(&commented)),
+        host_tests,
+        "a production inclusion wins, comment or not"
+    );
+
+    let quoted = "#[cfg(test)]\nmod tests {\n    const EXAMPLE: &str = r#\"\n#[path = \"host_tests.rs\"]\nmod imaginary;\n\"#;\n}\n";
+    assert_eq!(
+        run(with(quoted)),
+        host_tests,
+        "a declaration in a string includes nothing"
+    );
+
+    assert_eq!(
+        run(with("pub fn f() {}\n")),
+        host_tests,
+        "included by nothing found"
+    );
+
+    // Inside an inline module a `#[path]` is relative to that module's
+    // directory: `lib.rs`'s `mod tests { #[path = "shared.rs"] mod inner; }`
+    // loads `tests/shared.rs`, and the root `shared.rs` is someone else.
+    let inline = "#[cfg(test)]\nmod tests {\n    #[path = \"shared.rs\"]\n    mod inner;\n}\n";
+    assert_eq!(
+        run(vec![
+            ("lib.rs", inline.to_string()),
+            ("tests/shared.rs", GIT.to_string()),
+            ("shared.rs", GIT.to_string()),
+        ]),
+        vec!["shared.rs".to_string()],
+    );
+
+    let via = |host: &str| {
+        vec![
+            ("lib.rs", host.to_string()),
+            (
+                "host_tests.rs",
+                "#[path = \"leaf.rs\"]\nmod leaf;\n".to_string(),
+            ),
+            ("leaf.rs", GIT.to_string()),
+        ]
+    };
+    assert_eq!(run(via(guarded)), none, "test-only by inheritance");
+    assert_eq!(
+        run(via(unguarded)),
+        vec!["leaf.rs".to_string()],
+        "and production through a production file"
+    );
+
+    let mut unresolved = with(guarded);
+    unresolved.push(("other.rs", "mod nowhere;\n".to_string()));
+    assert_eq!(
+        run(unresolved),
+        host_tests,
+        "an inclusion clank cannot resolve might be production"
+    );
+    let mut unparsed = with(guarded);
+    unparsed.push(("broken.rs", "fn {\n".to_string()));
+    assert_eq!(
+        run(unparsed),
+        host_tests,
+        "nor can a file that does not parse"
+    );
 }
 
 /// The stripper keeps production and drops tests, and is not fooled by
@@ -439,6 +767,50 @@ fn the_stripper_counts_only_code_braces() {
         !kept(src).contains("fn leak()"),
         "a multi-line block comment ended the module early"
     );
+
+    // An escaped char literal is longer than four bytes: `'\u{1b}'`
+    // carries a brace. This is the shape that ended `stop_hook.rs`'s test
+    // module early and handed its fixture `git` call to the gate.
+    for literal in [
+        "    assert!(!hint.contains('\\u{1b}'));",
+        "    let c = '\\u{7d}';",
+        "    let c = '\\'';",
+        "    let c = '\\\\';",
+        "    let c = 'é'; let d = '}';",
+    ] {
+        let src = format!(
+            "fn prod() {{}}\n#[cfg(test)]\nmod tests {{\n{literal}\n    fn leak() {{}}\n}}\nfn after() {{}}\n"
+        );
+        let out = kept(&src);
+        assert!(
+            !out.contains("fn leak()"),
+            "`{literal}` ended the module early:\n{out}"
+        );
+        assert!(
+            out.contains("fn after()"),
+            "`{literal}` swallowed production:\n{out}"
+        );
+    }
+
+    // A test item without a body ends at its semicolon; the production
+    // after it is kept.
+    for item in [
+        "#[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod tests;",
+        "#[cfg(test)] #[path = \"x_tests.rs\"] mod tests;",
+        "#[cfg(test)]\nuse std::fmt;",
+    ] {
+        let src = format!("fn prod() {{}}\n{item}\nfn after() {{}}\n#[cfg(test)]\nfn t() {{}}\n");
+        let out = kept(&src);
+        assert!(
+            out.contains("fn after()"),
+            "`{item}` swallowed production:\n{out}"
+        );
+        assert!(!out.contains("fn t()"), "{out}");
+    }
+
+    // Line numbers survive: a dropped line is an empty line.
+    let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nfn b() {}\n";
+    assert_eq!(kept(src).lines().nth(5), Some("fn b() {}"));
 
     // A lifetime is not a char literal: `'a` must not swallow the rest
     // of the line and lose its braces.

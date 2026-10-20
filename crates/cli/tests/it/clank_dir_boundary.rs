@@ -31,7 +31,7 @@
 //! across two lines, and a repo variable that happened to be called
 //! `repo_home` all walked past it (codex on 9dfc3e3).
 
-use crate::common::{crates_dir, rs_files, strip_test_code};
+use crate::common::{Production, crates_dir, rs_files};
 
 /// What production code may create directly under a repo's `.clank/`.
 ///
@@ -374,9 +374,10 @@ fn production_creates_no_undeclared_path_under_clank() {
     assert!(!files.is_empty(), "scanned no source files");
 
     let mut strays: Vec<String> = Vec::new();
+    let production = Production::of(&files);
     for f in &files {
         let shown = f.display().to_string();
-        let prod = strip_test_code(&std::fs::read_to_string(f).unwrap_or_default());
+        let prod = production.text(f);
         strays.extend(strays_in(&prod, &shown));
     }
 

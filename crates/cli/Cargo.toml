@@ -165,6 +165,10 @@ oxc_semantic = "0.151"
 # the toolchain already needs (the-pages-logic-can-be-tested).
 rquickjs = "0.14"
 filetime = "0.2"
+# test-only: the source gates read each file's module tree from the
+# parse, so a comment or string that looks like `mod x;` includes nothing.
+syn = { version = "2", features = ["full"] }
+quote = "1"
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).
 tokio = { version = "1", features = ["test-util"] }
