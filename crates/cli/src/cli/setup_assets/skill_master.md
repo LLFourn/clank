@@ -78,7 +78,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   <plan>` fully deletes a plan (commits + body)
 - roster: `clank agent add <name> [--tool claude|codex|grok|opencode] [--review
   commit|plan|final|gate|standby]` (by name from the global library, or `--tool`
-  to define inline), `clank agent promote <name>` (elevate an agent to
+  to define inline), `clank agent make-master <name>` (elevate an agent to
   master, demoting the current one — NOT `clank queue promote`, which
   activates a queued plan), `clank agent set-review <name>
   commit|plan|final|gate|standby` (change a reviewer's tier in place;
@@ -91,7 +91,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   kept), and `--clear` is the bare tool.
   Put MCP servers and feature switches in the tool's own config, or a per-agent
   home (`--env CODEX_HOME=…`), not on the launch line.
-- `clank send (--to <label> | --master) [--repo <path>] -m "…"` —
+- `clank send (--to <agent> | --master) [--repo <path>] -m "…"` —
   message an agent, here or in another repo (see Messages).
 - `clank block ask <name> -m "question"` — ask the human. A block is
   always repo-wide: one pending block parks you entirely until it is

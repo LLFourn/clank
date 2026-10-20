@@ -375,8 +375,8 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |
 | `unfinish` | Move a finalized plan back to active |
 | `rereview` | Make every reviewer review a plan's latest commit again |
-| `agent` | Roster: `add` / `promote` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
-| `team` | Your saved teams (`save` / `list` / `show` / `delete`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
+| `agent` | Roster: `add` / `make-master` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
+| `team` | Your saved teams (`save` / `list` / `show` / `remove`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove` |
 | `pr-review` | Multi-agent review loop against a GitHub PR: `start` / `note` / `propose` / `status` / `finish` / `abort` |
 | `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
@@ -406,7 +406,9 @@ itself or they exist for one-off upgrades. They still work:
 
 Older spellings still work, hidden: `block create` is `block ask`, `unblock`
 is `block answer`, `agent add --global --tool` and `agent remove --global`
-are `team agent add` and `team agent remove`, and `open zellij` is `open`.
+are `team agent add` and `team agent remove`, `open zellij` is `open`, `agent promote` is `agent make-master`, `team
+delete` is `team remove`, `--dry` is `--dry-run` and `html open
+--print-path` is `--print`.
 
 ### Messages: send, interrupt, nudge
 

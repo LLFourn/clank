@@ -1631,7 +1631,7 @@ pub(super) enum ConfirmAction {
         /// `ReviewKind` has no `Master` variant, so "add as master"
         /// is unrepresentable here rather than rejected downstream.
         /// Adding a master means demoting the incumbent, which is
-        /// `clank agent promote`'s job.
+        /// `clank agent make-master`'s job.
         tier: crate::cli::teams_config::ReviewKind,
     },
     /// Remove the agent at this index in `snapshot.agents`.

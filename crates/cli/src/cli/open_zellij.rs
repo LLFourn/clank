@@ -609,7 +609,7 @@ async fn open_tab(
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
             "this repo has no agents configured. Run `clank agent add <name>` + \
-             `clank agent promote <name>` to build a roster, or `clank init --team <name>` \
+             `clank agent make-master <name>` to build a roster, or `clank init --team <name>` \
              to seed one from a template."
         );
     };

@@ -115,7 +115,7 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
 fn no_team_configured() -> anyhow::Error {
     anyhow::anyhow!(
         "this repo has no master agent. Run `clank init --team <name>` or \
-         `clank agent promote <agent>` to set one."
+         `clank agent make-master <agent>` to set one."
     )
 }
 

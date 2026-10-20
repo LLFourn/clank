@@ -88,7 +88,7 @@ fn git(repo: &Path, args: &[&str]) {
 ///
 /// Sequence mirrors what a user would run on a fresh repo:
 /// `clank agent add <name> --tool …` for each agent, then
-/// `clank agent promote <master>`.
+/// `clank agent make-master <master>`.
 pub fn register_team(
     home: &Path,
     repo: &Path,

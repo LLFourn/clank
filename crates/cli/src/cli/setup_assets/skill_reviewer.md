@@ -37,7 +37,7 @@ Compose the command yourself:
 ```
 clank feedback write --commit <sha> \
   --verdict continue|finished|request-changes \
-  --author <label> -m "<message>"
+  --author <agent> -m "<message>"
 ```
 
 `-m` supplies a summary and details; Clank prepends the verdict.

@@ -281,7 +281,7 @@ fn team_save(args: TeamSaveArgs) -> anyhow::Result<()> {
     save_team(&home_dir()?, &repo, &args.name, args.force)
 }
 
-/// `clank team delete <name> [--force]` — thin shell.
+/// `clank team remove <name> [--force]` — thin shell.
 fn delete(home: &Path, args: TeamDeleteArgs) -> anyhow::Result<()> {
     delete_team(home, &args.team, args.force)
 }

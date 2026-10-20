@@ -220,7 +220,7 @@ pub fn refuse_parent_options(args: &StashArgs) -> anyhow::Result<()> {
         (p.waiting_for.is_some(), "--for"),
         (p.to_queue, "--to-queue"),
         (p.priority.is_some(), "--priority"),
-        (p.dry, "--dry"),
+        (p.dry, "--dry-run"),
     ]
     .into_iter()
     .filter_map(|(set, name)| set.then_some(name))

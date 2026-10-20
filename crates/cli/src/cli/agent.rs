@@ -112,7 +112,7 @@ fn list(args: AgentListArgs) -> anyhow::Result<()> {
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
             "this repo has no master agent. Run `clank init --team <name>` or \
-             `clank agent promote <agent>` to set one."
+             `clank agent make-master <agent>` to set one."
         );
     };
     let mut rows: Vec<AgentRow> = Vec::new();
@@ -273,7 +273,7 @@ async fn start_with(
     let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
         anyhow::bail!(
             "this repo has no master agent. Run `clank init --team <name>` or \
-             `clank agent promote <agent>` to set one."
+             `clank agent make-master <agent>` to set one."
         );
     };
     let desc = find_in_set(&set, &label).ok_or_else(|| {
@@ -1919,7 +1919,7 @@ fn set_review(args: AgentSetReviewArgs) -> anyhow::Result<()> {
 /// changes). Takes [`ReviewKind`] (which has no `Master` variant) so the
 /// "this only ever sets a reviewer tier" invariant is compiler-enforced —
 /// a caller cannot ask to write a second master. Refuses if `<label>` is
-/// the master (changing the master is `clank agent promote`, which
+/// the master (changing the master is `clank agent make-master`, which
 /// auto-demotes the old one) or isn't on the roster; no-op if already at
 /// `tier`.
 pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> anyhow::Result<()> {
@@ -1936,7 +1936,7 @@ pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> any
     if agent.role == RosterRole::Master {
         anyhow::bail!(
             "agent `{}` is the master, not a reviewer. To change the master, \
-             promote a different agent with `clank agent promote <other>` \
+             promote a different agent with `clank agent make-master <other>` \
              (which demotes the current master).",
             label.as_str()
         );
@@ -3864,7 +3864,7 @@ mod tests {
         let msg = format!("{err:#}");
         // Points only at the command that exists (promote), never `demote`.
         assert!(
-            msg.contains("is the master") && msg.contains("clank agent promote"),
+            msg.contains("is the master") && msg.contains("clank agent make-master"),
             "{msg}"
         );
         assert!(

@@ -187,7 +187,7 @@ async fn dry_run_fresh_composite(
     let stem = plan_key.as_str();
     let default_msg = format!("[{stem}] finish");
     let msg = commit_message.unwrap_or(&default_msg);
-    println!("# clank finish --dry preview");
+    println!("# clank finish --dry-run preview");
     println!("# plan: {}", preview.plan_id);
     println!("# would create finalize commit:");
     println!("#   message: {msg}");

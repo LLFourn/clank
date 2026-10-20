@@ -414,7 +414,7 @@ pub struct HtmlOpenArgs {
     /// Print the resolved target path on stdout and exit
     /// without launching a browser. Mirrors `--print` on
     /// `clank agent start`, `clank diff`, `clank open`.
-    #[arg(long)]
+    #[arg(long = "print", alias = "print-path")]
     pub print_path: bool,
 }
 
@@ -580,7 +580,7 @@ pub struct WaitArgs {
     /// identity resolver (CLANK_AGENT env > session lookup via
     /// CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID). Pass explicitly
     /// to override or to run from outside a session.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     /// Exit when the process that spawned this wait goes away.
     ///
@@ -788,7 +788,7 @@ pub struct NudgeArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// The agent to nudge, by its label on that repo's roster.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub to: Option<String>,
     /// Nudge whoever that repo's roster names master.
     #[arg(long)]
@@ -807,7 +807,7 @@ pub struct NudgeArgs {
 #[command(group(clap::ArgGroup::new("body").required(true).args(["message", "file"])))]
 pub struct SendArgs {
     /// Require a reply to this concrete agent in the invoking repo.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub reply_to: Option<String>,
     /// Reply destination repo; defaults to the invoking repo, independently of --repo.
     #[arg(long, value_name = "PATH", requires = "reply_to")]
@@ -819,7 +819,7 @@ pub struct SendArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// The agent to send to, by its label on that repo's roster.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub to: Option<String>,
     /// Send to whoever that repo's roster names master.
     #[arg(long)]
@@ -861,7 +861,7 @@ pub struct EventsListArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Agent whose inbox to read (default: the session's binding).
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     /// Include handled (acked) events too.
     #[arg(long)]
@@ -879,7 +879,7 @@ pub struct EventsAckArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Agent whose inbox to ack in (default: the session's binding).
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     /// Event ids from `clank events list` — a bare seq, or
     /// `<source>@<seq>` when several sources share a seq.
@@ -892,7 +892,7 @@ pub struct EventsAckArgs {
 pub struct EventsReplyArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     /// Retry this retained operation; omit to send a new deliberate reply.
     #[arg(long, value_name = "OP")]
@@ -912,7 +912,7 @@ pub struct EventsShowArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Agent whose inbox to read (default: the session's binding).
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     /// An id from `clank events list`.
     #[arg(value_name = "ID")]
@@ -967,7 +967,7 @@ pub struct FeedbackWriteArgs {
     /// gate counts each reviewer's verdict by this label, so it is the
     /// reviewer's own roster label, written out rather than guessed from
     /// whichever session happens to run the command.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: String,
     /// Review message (like `git commit -m`). First line is the
     /// summary; subsequent lines are details. Required. Don't restate
@@ -1073,7 +1073,7 @@ pub struct PrReviewNoteArgs {
     #[arg(long)]
     pub pr: Option<u32>,
     /// Agent label. Defaults to the session-bound identity.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
 }
 
@@ -1099,6 +1099,7 @@ pub struct AsArgs {
     /// The agent label to bind this session to. Subsequent calls
     /// to `clank wait` / `clank auto` / the stop-hook resolve to
     /// this label for the duration of this agent session.
+    #[arg(value_name = "AGENT")]
     pub label: String,
 }
 
@@ -1154,7 +1155,7 @@ pub struct DoctorArgs {
 #[derive(Args, Debug)]
 pub struct SetupArgs {
     /// Install Grok assets for this repo's configured Grok agent/profile.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub grok_agent: Option<String>,
     /// Repo used by --grok-agent. Defaults to the current repo.
     #[arg(long, value_name = "PATH", requires = "grok_agent")]
@@ -1318,8 +1319,8 @@ Examples:
     /// Make an agent the repo's master
     ///
     /// The previous master becomes a `commit` reviewer. The agent must
-    /// already be on the roster. Not to be confused with
-    /// `clank queue promote`, which starts a queued plan.
+    /// already be on the roster. (`agent promote` is the old spelling.)
+    #[command(name = "make-master", alias = "promote")]
     Promote(AgentPromoteArgs),
     /// Take an agent off this repo's roster
     ///
@@ -1337,7 +1338,7 @@ Examples:
     /// One config write, so the role is never vacant and the gate never
     /// briefly expects fewer reviewers. The incoming agent is copied
     /// from your library and must not already be on the roster. The
-    /// master is not swapped this way (use `agent promote`).
+    /// master is not swapped this way (use `agent make-master`).
     Swap(AgentSwapArgs),
     /// Show or set how an agent's tool is launched
     ///
@@ -1375,6 +1376,7 @@ pub struct AgentListArgs {
 #[derive(Args, Debug)]
 pub struct AgentStartArgs {
     /// Agent label to start.
+    #[arg(value_name = "AGENT")]
     pub name: String,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
@@ -1391,6 +1393,7 @@ pub struct AgentStartArgs {
 #[derive(Args, Debug)]
 pub struct AgentAddArgs {
     /// Agent label to add.
+    #[arg(value_name = "AGENT")]
     pub label: String,
     /// Tool this agent runs, to define it here. Omit it to add `<label>`
     /// by name, copied from your library (`clank team agent add`).
@@ -1455,6 +1458,7 @@ pub struct AgentAddArgs {
 #[derive(Args, Debug)]
 pub struct AgentLaunchArgs {
     /// Agent label.
+    #[arg(value_name = "AGENT")]
     pub name: String,
     /// The executable `clank agent start` runs, instead of the tool's
     /// own name.
@@ -1480,6 +1484,7 @@ pub struct AgentLaunchArgs {
 pub struct AgentPromoteArgs {
     /// Agent label to designate as the repo's master. Must already
     /// be on the roster (`clank agent add <name>` first).
+    #[arg(value_name = "AGENT")]
     pub name: String,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
@@ -1489,6 +1494,7 @@ pub struct AgentPromoteArgs {
 #[derive(Args, Debug)]
 pub struct AgentRemoveArgs {
     /// Agent label to remove.
+    #[arg(value_name = "AGENT")]
     pub label: String,
     /// The old spelling of `clank team agent remove`.
     #[arg(long, hide = true)]
@@ -1501,6 +1507,7 @@ pub struct AgentRemoveArgs {
 #[derive(Args, Debug)]
 pub struct AgentSetReviewArgs {
     /// Reviewer label whose tier to change.
+    #[arg(value_name = "AGENT")]
     pub name: String,
     /// New tier: `commit`, `plan`, `final`, `gate`, or `standby`.
     #[arg(value_enum)]
@@ -1538,10 +1545,11 @@ pub enum TeamCmd {
     Agent(TeamAgentArgs),
     /// Show a single global team template (its roster).
     Show(TeamShowArgs),
-    /// Delete a saved team
+    /// Remove a saved team
     ///
     /// Needs `--force`: clank cannot tell which repos were seeded from
     /// it.
+    #[command(name = "remove", alias = "delete")]
     Delete(TeamDeleteArgs),
 }
 
@@ -1564,6 +1572,7 @@ pub enum TeamAgentCmd {
 #[derive(Args, Debug)]
 pub struct TeamAgentAddArgs {
     /// Agent label.
+    #[arg(value_name = "AGENT")]
     pub label: String,
     /// Tool this agent runs.
     #[arg(long, value_enum)]
@@ -1588,6 +1597,7 @@ pub struct TeamAgentAddArgs {
 #[derive(Args, Debug)]
 pub struct TeamAgentRemoveArgs {
     /// Agent label.
+    #[arg(value_name = "AGENT")]
     pub label: String,
 }
 
@@ -1716,7 +1726,7 @@ pub struct PickArgs {
     pub purge: bool,
     /// Print the resolved plan order and each plan's commits without
     /// picking anything (the same computation the live run applies).
-    #[arg(long)]
+    #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
 }
 
@@ -1792,7 +1802,7 @@ pub struct FinishArgs {
     /// reword plan for a bare `-m` on an already-finished plan (the same
     /// computation the live run applies). Ignored on a plain fresh finish
     /// (no history rewrite happens there).
-    #[arg(long)]
+    #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
     /// Finalize even when the review gate hasn't said FINISHED
     /// (unreviewed / continued / changes-requested / pending gate tier).
@@ -1902,7 +1912,7 @@ pub struct StashPushArgs {
     #[arg(long, value_name = "N")]
     pub priority: Option<u16>,
     /// Print the plan without changing anything.
-    #[arg(long)]
+    #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
 }
 
@@ -1930,7 +1940,7 @@ pub struct ShelveArgs {
     #[arg(long, value_name = "N")]
     pub priority: Option<u16>,
     /// Print the plan without changing anything.
-    #[arg(long)]
+    #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
 }
 
@@ -1991,7 +2001,7 @@ pub enum BlockCmd {
 #[derive(Args, Debug)]
 pub struct BlockMigrateArgs {
     /// Print what would change without touching anything.
-    #[arg(long)]
+    #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -2005,7 +2015,7 @@ pub struct BlockCreateArgs {
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
     /// Agent label. Resolved from env when omitted.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -2047,7 +2057,7 @@ pub struct RunArgs {
           value_parser = crate::cli::attending::parse_expect)]
     pub expect: std::time::Duration,
     /// Agent label. Resolved from env when omitted.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -2087,7 +2097,7 @@ pub struct AttendingArgs {
     #[arg(long)]
     pub clear: bool,
     /// Agent label. Resolved from env when omitted.
-    #[arg(long, value_name = "LABEL")]
+    #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -2130,12 +2140,12 @@ pub struct PurgeArgs {
     pub into_branch: Option<String>,
     /// Print the planned rewrite and exit 0 without creating any
     /// commits or moving any refs.
-    #[arg(long)]
+    #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
     /// Collapse the plan-attributed range into a single commit
     /// with the supplied message, moving commits that are not the
     /// plan's ahead of it. Not pipeable to `git rebase` —
-    /// see `--dry` output for the planned target tree.
+    /// see `--dry-run` output for the planned target tree.
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,
     /// Amend HEAD instead of building a new chain. HEAD must
@@ -2528,15 +2538,12 @@ mod agent_team_cli_parse_tests {
 
     #[test]
     fn team_repo_subcommands_are_removed() {
-        // repo-agents-no-team: team {add,remove,set-master,show <none>}
-        // are gone (they moved to `clank agent …`).
+        // repo-agents-no-team: team {add,set-master,show <none>} are gone
+        // (they moved to `clank agent …`). `team remove` is back, naming a
+        // saved team (`cli-one-word-one-meaning`).
         assert!(
             TeamT::try_parse_from(["t", "add", "codex"]).is_err(),
             "team add must no longer be a subcommand"
-        );
-        assert!(
-            TeamT::try_parse_from(["t", "remove", "codex"]).is_err(),
-            "team remove must no longer be a subcommand"
         );
         assert!(
             TeamT::try_parse_from(["t", "set-master", "codex"]).is_err(),

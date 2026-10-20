@@ -10453,7 +10453,7 @@ pub(crate) mod tests {
     /// `AddCandidate` carries a `ReviewKind`, which has no `Master`
     /// variant, so the invalid state cannot be built. This pins the
     /// property the type provides: adding a master would mean demoting
-    /// the incumbent, which is `clank agent promote`'s job.
+    /// the incumbent, which is `clank agent make-master`'s job.
     #[test]
     fn no_reviewer_tier_can_become_master() {
         use crate::cli::teams_config::{ReviewKind, RosterRole};

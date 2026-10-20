@@ -238,7 +238,7 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
 
     if args.dry {
         println!(
-            "# clank pick --dry ({} plan(s) from `{}`)",
+            "# clank pick --dry-run ({} plan(s) from `{}`)",
             keys.len(),
             args.from
         );
@@ -273,7 +273,7 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
                 }
             }
         }
-        println!("# (--dry: no commits, no refs updated)");
+        println!("# (--dry-run: no commits, no refs updated)");
         return Ok(());
     }
 

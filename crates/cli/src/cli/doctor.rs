@@ -415,7 +415,7 @@ pub fn repo_checks(
                 SECTION,
                 "agents",
                 "this repo has no agents configured; run `clank agent add <name>` + \
-                 `clank agent promote <name>` (or `clank init --team <name>`) to register agents"
+                 `clank agent make-master <name>` (or `clank init --team <name>`) to register agents"
                     .to_string(),
             ));
             return out;

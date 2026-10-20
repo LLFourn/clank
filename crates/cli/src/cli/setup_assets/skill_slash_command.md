@@ -9,7 +9,7 @@ User invoked `/clank` with arguments: "$ARGUMENTS"
   - "Enable auto-mode" → `clank auto on`
   - "Disable auto-mode" → `clank auto off`
   Run the chosen command, then re-print state. (Role is roster-derived —
-  change it with `clank agent promote` (elevates an agent to master — a
+  change it with `clank agent make-master` (elevates an agent to master — a
   roster op, distinct from promoting a queued plan) / `clank agent add`,
   NOT via `clank auto`.)
 - **Otherwise**: run `clank $ARGUMENTS` and relay the full stdout.

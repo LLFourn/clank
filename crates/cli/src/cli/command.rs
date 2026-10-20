@@ -1567,6 +1567,115 @@ mod tests {
         );
     }
 
+    /// Each renamed word parses the old spelling to the same request.
+    #[test]
+    fn renamed_words_parse_to_the_same_request() {
+        fn dump(m: &clap::ArgMatches) -> String {
+            let mut out = String::new();
+            for id in m.ids() {
+                let raw: Vec<String> = m
+                    .get_raw(id.as_str())
+                    .map(|v| v.map(|s| s.to_string_lossy().into_owned()).collect())
+                    .unwrap_or_default();
+                out.push_str(&format!("{id}={raw:?};"));
+            }
+            if let Some((name, sub)) = m.subcommand() {
+                out.push_str(&format!(" {name}[{}]", dump(sub)));
+            }
+            out
+        }
+        let req = |argv: &str| {
+            use clap::CommandFactory;
+            dump(
+                &Cli::command()
+                    .try_get_matches_from(argv.split(' '))
+                    .unwrap(),
+            )
+        };
+        for (new, old) in [
+            ("clank agent make-master codex", "clank agent promote codex"),
+            (
+                "clank team remove pair --force",
+                "clank team delete pair --force",
+            ),
+            ("clank finish p -m x --dry-run", "clank finish p -m x --dry"),
+            ("clank stash --dry-run", "clank stash --dry"),
+            ("clank stash push --dry-run", "clank stash push --dry"),
+            (
+                "clank pick p --from b --dry-run",
+                "clank pick p --from b --dry",
+            ),
+            ("clank purge p --dry-run", "clank purge p --dry"),
+            ("clank block migrate --dry-run", "clank block migrate --dry"),
+            (
+                "clank html open p --print",
+                "clank html open p --print-path",
+            ),
+        ] {
+            assert_eq!(req(new), req(old), "`{old}` should be `{new}`");
+        }
+        let Command::Finish(f) =
+            Cli::try_parse_from(["clank", "finish", "p", "-m", "x", "--dry-run"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert!(f.dry, "--dry-run is the no-effect mode");
+    }
+
+    /// Help advertises only the new words.
+    #[test]
+    fn help_advertises_only_the_new_words() {
+        let mut root = cli_at(100);
+        root.build();
+        let mut help = |path: &[&str]| {
+            let mut c = &mut root;
+            for p in path {
+                c = c.find_subcommand_mut(p).unwrap();
+            }
+            c.render_long_help().to_string()
+        };
+        let listed = |text: &str, name: &str| {
+            text.lines()
+                .any(|l| l.starts_with("  ") && l.split_whitespace().next() == Some(name))
+        };
+        let agent = help(&["agent"]);
+        assert!(
+            listed(&agent, "make-master") && !listed(&agent, "promote"),
+            "{agent}"
+        );
+        let team = help(&["team"]);
+        assert!(
+            listed(&team, "remove") && !listed(&team, "delete"),
+            "{team}"
+        );
+        for path in [&["finish"][..], &["stash"], &["pick"], &["purge"]] {
+            let h = help(path);
+            assert!(
+                h.contains("--dry-run") && !h.contains("--dry "),
+                "{path:?}:\n{h}"
+            );
+        }
+        let html = help(&["html", "open"]);
+        assert!(
+            html.contains("--print") && !html.contains("--print-path"),
+            "{html}"
+        );
+        for path in [
+            &["agent", "add"][..],
+            &["agent", "start"],
+            &["as"],
+            &["team", "agent", "add"],
+        ] {
+            let h = help(path);
+            assert!(
+                h.contains("<AGENT>") && !h.contains("<LABEL>") && !h.contains("<NAME>"),
+                "{path:?}:\n{h}"
+            );
+        }
+    }
+
     #[test]
     fn queue_unqueue_parses() {
         let parsed = Cli::try_parse_from(["clank", "queue", "unqueue", "foo"]).unwrap();

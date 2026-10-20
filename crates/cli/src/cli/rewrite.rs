@@ -716,7 +716,7 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
         }
         println!("#");
         println!("# Every todo command below is commented out because of");
-        println!("# the blockers above. Address them, re-run `--dry`,");
+        println!("# the blockers above. Address them, re-run `--dry-run`,");
         println!("# and only then pipe to git.");
         println!("#");
     } else {
@@ -879,7 +879,7 @@ fn squash_dry_run_text(
         out,
         "# Squash mode is NOT pipeable to git rebase. Run the live command"
     );
-    let _ = writeln!(out, "# without --dry to materialize the squashed commit.");
+    let _ = writeln!(out, "# without --dry-run to materialize the squashed commit.");
     out
 }
 

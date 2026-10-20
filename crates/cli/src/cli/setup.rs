@@ -2335,7 +2335,7 @@ mod tests {
             }
             assert!(
                 compose_skill(Role::Master, tool)
-                    .contains("- `clank send (--to <label> | --master)"),
+                    .contains("- `clank send (--to <agent> | --master)"),
                 "{tool:?}: the master's command list names `clank send`"
             );
         }
@@ -2352,7 +2352,7 @@ mod tests {
                 "master must document finish"
             );
             assert!(
-                master.contains("clank agent promote"),
+                master.contains("clank agent make-master"),
                 "master must document roster commands"
             );
             assert!(
@@ -2523,7 +2523,7 @@ mod tests {
             for part in [
                 "clank feedback write --commit <sha>",
                 "--verdict continue|finished|request-changes",
-                "--author <label> -m \"<message>\"",
+                "--author <agent> -m \"<message>\"",
             ] {
                 assert!(
                     reviewer.contains(part),

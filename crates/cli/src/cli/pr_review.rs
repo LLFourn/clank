@@ -1516,7 +1516,7 @@ fn require_master(
     let set = crate::agent_store::try_resolve_via_team_with(repo, home)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no master agent configured; cannot authorize `pr-review {verb}`. \
-             Build a roster with `clank agent add` / `clank agent promote`."
+             Build a roster with `clank agent add` / `clank agent make-master`."
         )
     })?;
     if crate::agent_store::role_from_registered_set(&set, caller) == Some(Role::Master) {

@@ -249,7 +249,7 @@ pub(crate) fn render_amend_dry(program: &AmendProgram) -> String {
     for p in &program.strip_paths {
         out.push_str(&format!("#   - {p}\n"));
     }
-    out.push_str("# (--dry: no commits, no refs touched)\n");
+    out.push_str("# (--dry-run: no commits, no refs touched)\n");
     out
 }
 
@@ -706,7 +706,7 @@ mod tests {
             );
         }
         assert!(
-            rendered.contains("--dry: no commits"),
+            rendered.contains("--dry-run: no commits"),
             "render should include dry-run notice; got:\n{rendered}"
         );
     }
