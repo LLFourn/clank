@@ -849,7 +849,7 @@ fn seed_autosquash_default(user_config: &Path, dry_run: bool) -> anyhow::Result<
         format!(
             "{verb} finish.autosquash=true (default): `clank finish` now collapses each plan \
              by REWRITING the current branch in place — on an already-pushed branch this \
-             rewrites published history. Disable with `clank config finish.autosquash set false`, \
+             rewrites published history. Disable with `clank config finish.autosquash false`, \
              or skip one finish with `--no-squash`."
         )
     };
@@ -2233,7 +2233,7 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains("published history"), "{notice}");
-        assert!(notice.contains("finish.autosquash set false"), "{notice}");
+        assert!(notice.contains("finish.autosquash false"), "{notice}");
         assert!(notice.contains("--no-squash"), "{notice}");
         assert!(crate::cli::config::json_path_present(
             &cfg,

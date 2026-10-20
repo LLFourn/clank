@@ -6,20 +6,68 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::{OpenArgs, OpenCmd, OpenDryArgs};
+use super::{OpenArgs, OpenCmd, OpenDryArgs, OpenZellijArgs};
 use clank_core::agent_config::AgentConfig;
 
 pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     match args.command {
-        Some(OpenCmd::Dry(dry)) => run_dry(dry).await,
-        // Explicit escape hatch: force the zellij layout even outside
-        // a session.
-        Some(OpenCmd::Zellij(zellij)) => super::open_zellij::run(zellij).await,
+        Some(OpenCmd::Dry(dry)) => {
+            refuse_open_options_for_dry(&args.zellij)?;
+            run_dry(dry).await
+        }
+        Some(OpenCmd::Zellij(zellij)) => {
+            super::open_zellij::run(zellij_args(args.zellij, zellij)?).await
+        }
         // Bare `clank open` and `clank open zellij` are the same
         // thing. The subcommand survives as an alias so nothing that
         // invokes it breaks (zellij-is-the-workspace).
         None => super::open_zellij::run(args.zellij).await,
     }
+}
+
+/// The opener's options from both sides of `zellij`: `clank open --repo R
+/// zellij` and `clank open zellij --repo R` are the same request. An
+/// option given on both sides must agree, and the one-of `--fork` /
+/// `--pr` / `--all` still holds across them.
+pub(crate) fn zellij_args(
+    before: OpenZellijArgs,
+    after: OpenZellijArgs,
+) -> anyhow::Result<OpenZellijArgs> {
+    fn one<T: PartialEq + std::fmt::Debug>(
+        name: &str,
+        before: Option<T>,
+        after: Option<T>,
+    ) -> anyhow::Result<Option<T>> {
+        match (before, after) {
+            (Some(b), Some(a)) if b != a => {
+                anyhow::bail!("`--{name}` given twice with different values: {b:?} and {a:?}")
+            }
+            (b, a) => Ok(a.or(b)),
+        }
+    }
+    let merged = OpenZellijArgs {
+        repo: one("repo", before.repo, after.repo)?,
+        fork: one("fork", before.fork, after.fork)?,
+        pr: one("pr", before.pr, after.pr)?,
+        all: before.all || after.all,
+        print: before.print || after.print,
+    };
+    let targets = [merged.fork.is_some(), merged.pr.is_some(), merged.all];
+    if targets.iter().filter(|t| **t).count() > 1 {
+        anyhow::bail!("`--fork`, `--pr` and `--all` choose one target; give one");
+    }
+    Ok(merged)
+}
+
+/// `open dry` reads its repo from the path it is given; an opener option
+/// before it would be ignored, so it is refused instead.
+fn refuse_open_options_for_dry(before: &OpenZellijArgs) -> anyhow::Result<()> {
+    if *before != OpenZellijArgs::default() {
+        anyhow::bail!(
+            "`clank open dry` takes no opener options: its repo is the one containing the path"
+        );
+    }
+    Ok(())
 }
 
 pub async fn run_dry(args: OpenDryArgs) -> anyhow::Result<()> {
@@ -752,6 +800,7 @@ fn rec_label(r: &Recommendation) -> String {
 #[cfg(test)]
 mod open_args_tests {
     use super::super::{OpenArgs, OpenCmd};
+    use super::{refuse_open_options_for_dry, zellij_args};
     use clap::Parser;
 
     /// Minimal root so the OpenArgs clap shape is testable
@@ -786,17 +835,47 @@ mod open_args_tests {
         assert_eq!(o.zellij.repo.as_deref(), Some(std::path::Path::new("/r")));
     }
 
+    /// codex 458bb8e: `clank open --print zellij` once parsed with the
+    /// parent `--print` silently dropped, because dispatch read only the
+    /// subcommand's args. The options on either side of `zellij` are now
+    /// one request, and nothing given is dropped.
     #[test]
-    fn parent_flags_with_subcommand_is_a_parse_error_not_silently_ignored() {
-        // codex 458bb8e: `clank open --print zellij` used to parse
-        // with the parent --print silently ignored (dispatch reads
-        // only the subcommand's args when one is present).
-        // args_conflicts_with_subcommands makes the mixed form a
-        // loud parse error instead.
-        assert!(T::try_parse_from(["t", "open", "--print", "zellij"]).is_err());
-        assert!(T::try_parse_from(["t", "open", "--repo", "/r", "dry", "/x"]).is_err());
-        // And the pre-rename muscle-memory form `clank open <path>`
-        // errors rather than mis-parsing (ruthless a25f71d minor).
+    fn options_before_zellij_are_kept_not_dropped() {
+        let merged = |argv: &[&str]| {
+            let o = parse(argv);
+            let Some(OpenCmd::Zellij(after)) = o.command else {
+                panic!("expected zellij")
+            };
+            zellij_args(o.zellij, after)
+        };
+        let r = Some(std::path::Path::new("/r"));
+        let m = merged(&["t", "open", "--repo", "/r", "zellij"]).unwrap();
+        assert_eq!(m.repo.as_deref(), r);
+        let m = merged(&["t", "open", "zellij", "--repo", "/r"]).unwrap();
+        assert_eq!(m.repo.as_deref(), r);
+        let m = merged(&["t", "open", "--print", "zellij", "--repo", "/r"]).unwrap();
+        assert!(m.print && m.repo.as_deref() == r, "both sides count");
+        assert!(
+            merged(&["t", "open", "--repo", "/a", "zellij", "--repo", "/b"]).is_err(),
+            "two different repos are refused, not one silently kept"
+        );
+        assert!(merged(&["t", "open", "--repo", "/r", "zellij", "--repo", "/r"]).is_ok());
+        assert!(
+            merged(&["t", "open", "--fork", "a", "zellij", "--pr", "3"]).is_err(),
+            "one target across both sides"
+        );
+    }
+
+    /// `open dry` owns its repo through the path, so an opener option
+    /// before it is refused rather than ignored.
+    #[test]
+    fn open_dry_refuses_opener_options() {
+        let o = parse(&["t", "open", "--repo", "/r", "dry", "/x"]);
+        assert!(refuse_open_options_for_dry(&o.zellij).is_err());
+        let o = parse(&["t", "open", "dry", "/x"]);
+        assert!(refuse_open_options_for_dry(&o.zellij).is_ok());
+        // The pre-rename form `clank open <path>` still errors rather than
+        // mis-parsing (ruthless a25f71d minor).
         assert!(T::try_parse_from(["t", "open", "/some/path"]).is_err());
     }
 

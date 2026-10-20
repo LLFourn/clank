@@ -210,7 +210,7 @@ fn unfinish_reopens_the_empty_slot_and_refuses_to_replace_an_occupied_one() {
     commit(repo, "[first] finish");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let args = || clank::cli::UnfinishArgs {
-        plan: Some("first".into()),
+        plan: "first".into(),
         repo: Some(repo.into()),
     };
     runtime.block_on(clank::cli::unfinish::run(args())).unwrap();

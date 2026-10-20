@@ -778,7 +778,7 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
     }
 }
 
-fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
+pub(crate) fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
     match cmd {
         ConfigKey::ReviewAdhocFeedback(a)
         | ConfigKey::ReviewPlanFeedback(a)
@@ -834,8 +834,8 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
         .find(|d| format!("{}.{}", d.section, d.name) == key)
         .expect("key_name always returns a catalog key");
 
-    match kargs.action.as_deref() {
-        None => {
+    match key_op(kargs)? {
+        KeyOp::Describe => {
             let kvs = resolve_key_values(&repo);
             let kv = kvs.iter().find(|kv| kv.key == key);
             println!("key:     {}.{}", def.section, def.name);
@@ -847,15 +847,11 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             }
             println!("help:    {}", def.help);
         }
-        Some("get") => {
+        KeyOp::Get => {
             let cfg = load(&repo);
             println!("{}", get_value(&cfg, key));
         }
-        Some("set") => {
-            let value = kargs
-                .value
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("set requires a value"))?;
+        KeyOp::Set(value) => {
             if def.type_desc == "bool" && value != "true" && value != "false" {
                 anyhow::bail!("{key} is a bool; value must be true or false");
             }
@@ -880,12 +876,44 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
             }
         }
-        Some(action) => {
-            anyhow::bail!("unknown action `{action}`; expected get or set");
-        }
     }
 
     Ok(())
+}
+
+/// What `clank config <key> …` asks for, decided before anything is read
+/// or written.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyOp<'a> {
+    /// `<key>`: the key, its value and where that value comes from.
+    Describe,
+    /// `<key> get`, the older read spelling: the bare value.
+    Get,
+    /// `<key> <value>`, or the older `<key> set <value>`.
+    Set(&'a str),
+}
+
+/// `get` and `set` keep their old meaning, so the words themselves are
+/// written through `set`: `set get`, `set set`. Anything left over is an
+/// error rather than ignored, so no typo turns into a write.
+fn key_op(args: &super::ConfigKeyArgs) -> anyhow::Result<KeyOp<'_>> {
+    Ok(match (args.value.as_deref(), args.then.as_deref()) {
+        (None, _) => KeyOp::Describe,
+        (Some("get"), None) => KeyOp::Get,
+        (Some("get"), Some(extra)) => {
+            anyhow::bail!(
+                "`get` takes no value (got `{extra}`); to write the word get, use `set get`"
+            )
+        }
+        (Some("set"), Some(value)) => KeyOp::Set(value),
+        (Some("set"), None) => {
+            anyhow::bail!("`set` needs a value; to write the word set itself, use `set set`")
+        }
+        (Some(value), None) => KeyOp::Set(value),
+        (Some(value), Some(extra)) => {
+            anyhow::bail!("one value only: got `{value}` and `{extra}`")
+        }
+    })
 }
 
 /// Thin repo-scope wrapper over [`set_key`] (used by tests).
@@ -1143,8 +1171,8 @@ mod tests {
         let args = super::super::ConfigArgs {
             command: Some(super::super::ConfigKey::ReviewAdhocFeedback(
                 super::super::ConfigKeyArgs {
-                    action: Some("set".to_string()),
                     value: Some("banana".to_string()),
+                    then: None,
                 },
             )),
             repo: Some(tmp.path().to_path_buf()),
@@ -1209,23 +1237,41 @@ mod tests {
         assert!(v["hooks"]["blocked"].is_null());
     }
 
-    #[test]
-    fn unknown_action_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let args = super::super::ConfigArgs {
-            command: Some(super::super::ConfigKey::ReviewAdhocFeedback(
-                super::super::ConfigKeyArgs {
-                    action: Some("nope".to_string()),
-                    value: None,
-                },
-            )),
-            repo: Some(tmp.path().to_path_buf()),
-            json: false,
-            global: false,
+    fn op(value: Option<&str>, then: Option<&str>) -> anyhow::Result<String> {
+        let args = super::super::ConfigKeyArgs {
+            value: value.map(str::to_string),
+            then: then.map(str::to_string),
         };
-        let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown action"));
+        key_op(&args).map(|op| format!("{op:?}"))
+    }
+
+    /// The new spelling, the old one, and the edges between them.
+    #[test]
+    fn a_key_operation_is_one_unambiguous_thing() {
+        assert_eq!(op(None, None).unwrap(), "Describe");
+        assert_eq!(op(Some("true"), None).unwrap(), "Set(\"true\")");
+        assert_eq!(
+            op(Some("get"), None).unwrap(),
+            "Get",
+            "old `get` is still a read"
+        );
+        assert_eq!(op(Some("set"), Some("true")).unwrap(), "Set(\"true\")");
+        assert_eq!(
+            op(Some("set"), Some("get")).unwrap(),
+            "Set(\"get\")",
+            "writing the word get"
+        );
+        assert_eq!(
+            op(Some("set"), Some("set")).unwrap(),
+            "Set(\"set\")",
+            "writing the word set"
+        );
+        assert!(op(Some("set"), None).is_err(), "`set` alone writes nothing");
+        assert!(op(Some("get"), Some("x")).is_err(), "`get` takes no value");
+        assert!(
+            op(Some("a"), Some("b")).is_err(),
+            "a second value is not ignored"
+        );
     }
 
     #[test]

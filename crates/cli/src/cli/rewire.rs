@@ -11,9 +11,6 @@ use super::{RewireArgs, resolve_repo};
 use crate::disk_format::canonical_feedback_path;
 
 pub async fn run(args: RewireArgs) -> anyhow::Result<()> {
-    if !args.from_stdin {
-        anyhow::bail!("`clank rewire` currently requires --from-stdin");
-    }
     let repo = resolve_repo(args.repo.as_deref())?;
     let mut input = String::new();
     std::io::stdin()

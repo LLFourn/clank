@@ -9,10 +9,7 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
 
-    let stem = match args.plan.as_deref() {
-        Some(raw) => crate::cli::plan_resolve::parse_arg(raw, &basename)?,
-        None => anyhow::bail!("plan argument is required for unfinish"),
-    };
+    let stem = crate::cli::plan_resolve::parse_arg(&args.plan, &basename)?;
     let plan_key = clank_core::ids::PlanKey::parse(&stem)
         .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
 

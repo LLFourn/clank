@@ -162,6 +162,13 @@ Examples:
   clank send --master -m \"CI is red on main\"
   clank send --to codex --repo ../other -m \"Your review is waiting\"";
 
+const CONFIG_EXAMPLES: &str = "\
+Examples:
+  clank config
+  clank config finish.autosquash
+  clank config finish.autosquash true
+  clank config diff.wait false --global";
+
 const STASH_EXAMPLES: &str = "\
 Examples:
   # set the active plan aside, run another, then bring it back
@@ -386,6 +393,11 @@ pub enum Command {
     /// checked in on once, and nothing is cancelled.
     Run(crate::cli::RunArgs),
     /// Read or write clank config values
+    ///
+    /// Bare, every key with its value and source. `clank config <key>` shows
+    /// one; `clank config <key> <value>` writes it (the repo's config, or
+    /// yours with `--global`).
+    #[command(after_long_help = CONFIG_EXAMPLES)]
     Config(crate::cli::ConfigArgs),
     /// Dump the repo's roster config as JSON
     ///
@@ -1360,6 +1372,157 @@ mod tests {
                 .any(|l| l.starts_with("  ") && l.split_whitespace().next() == Some(*name));
             assert!(!listed, "`{name}` is listed:\n{help}");
         }
+    }
+
+    /// A group's `--repo` is accepted before or after its subcommand, and
+    /// either way lands where the dispatch reads it.
+    #[test]
+    fn a_group_repo_is_read_wherever_it_is_written() {
+        use std::path::Path;
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv.iter().copied()).unwrap().command;
+        let r = Some(Path::new("/r"));
+        for argv in [
+            &["clank", "queue", "--repo", "/r", "promote", "p"][..],
+            &["clank", "queue", "promote", "p", "--repo", "/r"],
+            &["clank", "queue", "--repo", "/r"],
+        ] {
+            let Command::Queue(q) = parse(argv) else {
+                panic!()
+            };
+            assert_eq!(q.repo.as_deref(), r, "{argv:?}");
+        }
+        for argv in [
+            &["clank", "pr-review", "--repo", "/r", "status"][..],
+            &["clank", "pr-review", "status", "--repo", "/r"],
+        ] {
+            let Command::PrReview(a) = parse(argv) else {
+                panic!()
+            };
+            assert_eq!(a.repo.as_deref(), r, "{argv:?}");
+        }
+        for argv in [
+            &["clank", "html", "--repo", "/r", "open"][..],
+            &["clank", "html", "open", "--repo", "/r"],
+            &["clank", "html", "--repo", "/r"],
+        ] {
+            let Command::Html(a) = parse(argv) else {
+                panic!()
+            };
+            assert_eq!(a.repo.as_deref(), r, "{argv:?}");
+        }
+        for argv in [
+            &[
+                "clank",
+                "config",
+                "--repo",
+                "/r",
+                "--global",
+                "-j",
+                "diff.wait",
+            ][..],
+            &[
+                "clank",
+                "config",
+                "diff.wait",
+                "--repo",
+                "/r",
+                "--global",
+                "-j",
+            ],
+        ] {
+            let Command::Config(a) = parse(argv) else {
+                panic!()
+            };
+            assert_eq!(a.repo.as_deref(), r, "{argv:?}");
+            assert!(a.global && a.json, "{argv:?}");
+        }
+        // `open`'s options before and after `zellij` are one request.
+        let Command::Open(o) = parse(&["clank", "open", "--repo", "/r"]) else {
+            panic!()
+        };
+        assert_eq!(o.zellij.repo.as_deref(), r);
+        let Command::Open(o) = parse(&["clank", "open", "zellij", "--repo", "/r"]) else {
+            panic!()
+        };
+        let Some(crate::cli::OpenCmd::Zellij(z)) = o.command else {
+            panic!()
+        };
+        assert_eq!(z.repo.as_deref(), r);
+        let Command::Open(o) = parse(&["clank", "open", "--repo", "/r", "zellij"]) else {
+            panic!()
+        };
+        let Some(crate::cli::OpenCmd::Zellij(after)) = o.command else {
+            panic!()
+        };
+        let merged = crate::cli::open::zellij_args(o.zellij, after).unwrap();
+        assert_eq!(
+            merged.repo.as_deref(),
+            r,
+            "before the subcommand reaches the opener"
+        );
+        let Command::Open(o) = parse(&["clank", "open", "--repo", "/a", "zellij", "--repo", "/b"])
+        else {
+            panic!()
+        };
+        let Some(crate::cli::OpenCmd::Zellij(after)) = o.command else {
+            panic!()
+        };
+        assert!(
+            crate::cli::open::zellij_args(o.zellij, after).is_err(),
+            "and two repos are refused"
+        );
+    }
+
+    /// The config write reaches the repo named after the key, through the
+    /// real dispatch.
+    #[test]
+    fn config_repo_after_the_key_writes_that_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().to_str().unwrap();
+        let Command::Config(args) = Cli::try_parse_from([
+            "clank",
+            "config",
+            "review.adhoc_feedback",
+            "true",
+            "--repo",
+            path,
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(crate::cli::config::run(args))
+            .unwrap();
+        let written = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        assert!(written.contains("adhoc_feedback"), "{written}");
+    }
+
+    /// The config commands clank prints as advice are the current
+    /// spelling and parse as writes.
+    #[test]
+    fn the_config_commands_clank_suggests_are_writes() {
+        for line in [
+            "clank config diff.editor.command emacsclient",
+            "clank config finish.autosquash false",
+        ] {
+            let Command::Config(c) = Cli::try_parse_from(line.split(' ')).unwrap().command else {
+                panic!("{line}")
+            };
+            let key = c.command.unwrap_or_else(|| panic!("{line}: no key"));
+            let args = crate::cli::config::key_args(&key);
+            assert!(args.value.is_some() && args.then.is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn unfinish_and_rewire_say_what_they_require() {
+        assert!(Cli::try_parse_from(["clank", "unfinish"]).is_err());
+        assert!(Cli::try_parse_from(["clank", "unfinish", "p"]).is_ok());
+        assert!(Cli::try_parse_from(["clank", "rewire"]).is_err());
+        assert!(Cli::try_parse_from(["clank", "rewire", "--from-stdin"]).is_ok());
     }
 
     #[test]

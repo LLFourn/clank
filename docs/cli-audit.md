@@ -58,7 +58,8 @@ whole commands that agents are told to run.
 
 F3 and F4 were fixed by `cli-help-says-what-it-is-for`, F7 by
 `cli-help-is-beautiful` (sectioned, styled top-level help), F8 by
-`cli-readme-covers-the-surface`, and F1 by `cli-plumbing-out-of-sight`.
+`cli-readme-covers-the-surface`, F1 by `cli-plumbing-out-of-sight`, and F5
+by `cli-usage-is-the-contract`.
 F1's claim that `open dry` had no caller was wrong: `open-worktree.sh`
 calls it, so it is hidden and kept. Their sections
 record what was found, and the verdicts below show what remains.
@@ -342,14 +343,14 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `doctor` | when something is not waking or binding | both | R | keep | |
 | `status` | to see the plan, its gate and the agents | both | R S | fix doc | F2: README credits `--watch` with TUI keys (the `--tui` text is fixed) |
 | `wait` | Grok agents arm it; people use `--for` to block on an event | both | R S | keep | Grok agents arm it themselves (`setup.rs` WORK_LOOP_GROK); `--for` serves observers; Claude/codex/opencode skills forbid it, correctly |
-| `queue` | to see what plans are lined up | both | R S | fix usage | F5: `--repo` only before the subcommand |
+| `queue` | to see what plans are lined up | both | R S | keep | `--repo` after the subcommand fixed |
 | `queue add` | to line up a drafted plan | agent | R S | keep | |
 | `queue remove` | to discard a queued plan | both | H | fix doc | F6: real distinction from `unqueue`, not in the README |
 | `queue promote` | when clank says the next plan can start | agent | R S | keep | F6: the clash is fixed on the `agent` side |
 | `queue reprioritise` | to reorder the queue | both | R | keep |  |
 | `queue unqueue` | to take a plan back to drafts for editing | both | R | keep |  |
 | `feedback` | (group) | agent | R S | keep | |
-| `feedback write` | a reviewer recording its verdict | agent | R S | fix usage | F5: `--author` required, unlike every other author flag; establish why |
+| `feedback write` | a reviewer recording its verdict | agent | R S | keep | F5: `--author` stays explicit, the gate attributes by it; its help says why |
 | `feedback read` | the master reading a commit's verdicts | agent | R S | keep |  |
 | `events` | (group) | agent | R S | keep | F6: the about now states the show/read distinction |
 | `events list` | to see unhandled github and other events | agent | R S | keep | |
@@ -368,7 +369,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `remote off` | to stop serving it | human | H | keep | |
 | `log` | to read the commit and review timeline | human | R | keep | |
 | `finish` | when the gate says FINISHED | agent | R S | rename flag | F6: `--dry` |
-| `unfinish` | to reopen a plan finished by mistake | human | R | fix usage | F5: `[PLAN]` is required |
+| `unfinish` | to reopen a plan finished by mistake | human | R | keep | `<PLAN>` required in clap |
 | `agent` | (group) | human | R S | keep | |
 | `agent list` | to see the roster | both | S | keep | |
 | `agent start` | to launch or resume one agent | human | R | rename arg | F6: `<NAME>` |
@@ -406,7 +407,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `unshelve` | old spelling of `stash pop` | legacy | none | keep | F1 |
 | `pick` | to bring plans over from another branch | human | R | rename flag | F6: `--dry` |
 | `purge` | to remove a plan's traces from history | agent | R S | rename flag | F6: `--dry`, `--drop` |
-| `pr-review` | (group) | agent | R S | fix usage | F5: `--repo` only before the subcommand |
+| `pr-review` | (group) | agent | R S | keep | `--repo` after the subcommand fixed |
 | `pr-review start` | the master starting a review of a GitHub PR | agent | S | keep | |
 | `pr-review note` | a reviewer recording its verdict on the draft | agent | S | keep | |
 | `pr-review propose` | the master asking for another round | agent | S | keep | |
@@ -414,7 +415,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `pr-review finish` | to hand the agreed review over | agent | S | keep | |
 | `pr-review status` | to see who is still reviewing | agent | S | keep | |
 | `diff` | to read a plan's changes in your editor | human | R | rename flag | F6: `--print` kept; target heuristic is documented |
-| `html` | to build the static site | human | R | fix usage | F5: `--repo` only before the subcommand |
+| `html` | to build the static site | human | R | keep | `--repo` after the subcommand fixed |
 | `html open` | to look at it in a browser | human | R | rename flag | F6: `--print-path` |
 | `block` | (group) | agent | R S | merge | F2: ask and answer in one group |
 | `block create` | an agent asking the human a question it cannot answer | agent | R S | rename | F2: `block ask` |
@@ -424,18 +425,18 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `attending` | an agent waiting on a task it started some other way | agent | R S | keep |  |
 | `tui` | to drive a running team | human | R | keep | |
 | `run` | an agent backgrounding a long command | agent | R S | keep |  |
-| `config` | to see every setting | human | S | fix usage | F5: `[ACTION] [VALUE]`; `--repo` only before the key |
-| `config review.adhoc_feedback` | to set this value | human | H | fix usage | F5 |
-| `config review.plan_feedback` | to set this value | human | H | fix usage | F5 |
-| `config review.require_commit_prefix` | to set this value | human | H | fix usage | F5 |
-| `config hooks.blocked` | to set this value | human | H | fix usage | F5 |
-| `config diff.editor.command` | to set this value | human | H | fix usage | F5 |
-| `config diff.wait` | to set this value | human | H | fix usage | F5 |
-| `config finish.autosquash` | to set this value | human | H | fix usage | F5 |
-| `config recovery.blind_nudge` | to set this value | human | H | fix usage | F5 |
+| `config` | to see every setting | human | S | keep | `config <key> [value]`; `--repo`, `-j`, `--global` after the key |
+| `config review.adhoc_feedback` | to set this value | human | H | keep | |
+| `config review.plan_feedback` | to set this value | human | H | keep | |
+| `config review.require_commit_prefix` | to set this value | human | H | keep | |
+| `config hooks.blocked` | to set this value | human | H | keep | |
+| `config diff.editor.command` | to set this value | human | H | keep | |
+| `config diff.wait` | to set this value | human | H | keep | |
+| `config finish.autosquash` | to set this value | human | H | keep | |
+| `config recovery.blind_nudge` | to set this value | human | H | keep | |
 | `export` | to get the raw roster JSON | human | R | keep | F2: raw shape differs from `agent list -j`; no internal caller, external use unknown |
 | `rereview` | to make reviewers look at a commit again | human | R | keep |  |
-| `rewire` | never by hand; the git hook runs it | hook | R | fix usage | hidden; F5: only the hook form works |
+| `rewire` | never by hand; the git hook runs it | hook | R | keep | hidden; `--from-stdin` required in clap |
 | `stop-hook` | never by hand; the tool's hook runs it | hook | R | keep | hidden |
 | `question-hook` | never by hand; the tool's hook runs it | hook | none | keep | already hidden |
 <!-- verdicts:end -->
@@ -495,7 +496,7 @@ Generated. Do not edit by hand.
 | `remote off` | action |  |  | Stop serving; already off is done at once |  |  |
 | `log` | action |  |  | Print the repo timeline: commits, reviews, github events | [RANGE] | --repo -j/--json --plan -n --oneline --no-github --diagnostics |
 | `finish` | action |  |  | Finalize a plan into `finished/` | [PLAN] | --repo -m/--message --purge --squash --no-squash --into-branch --dry --force --no-cache |
-| `unfinish` | action |  |  | Move a finalized plan back to active | [PLAN] | --repo |
+| `unfinish` | action |  |  | Move a finalized plan back to active | <PLAN> | --repo |
 | `agent` | group |  |  | Manage this repo's agent roster |  |  |
 | `agent list` | action |  |  | List the roster: each agent's role, review tier and binding |  | --repo -j/--json |
 | `agent start` | action |  |  | Start an agent's tool, resuming its session when it has one | <NAME> | --repo --print |
@@ -552,17 +553,17 @@ Generated. Do not edit by hand.
 | `tui` | action |  |  | The full-screen pane for driving a running team |  | --repo --no-cache |
 | `run` | action |  |  | Run a command under clank, so it knows exactly when the work ends | <CMD> | --desc (required) --expect --author --repo |
 | `config` | group, bare runs |  |  | Read or write clank config values |  | --repo -j/--json --global |
-| `config review.adhoc_feedback` | action |  | review_adhoc_feedback | Review commits outside any plan | [ACTION] [VALUE] |  |
-| `config review.plan_feedback` | action |  | review_plan_feedback | Review a plan's commits | [ACTION] [VALUE] |  |
-| `config review.require_commit_prefix` | action |  | review_require_commit_prefix | Require a [plan] or [misc] commit subject prefix | [ACTION] [VALUE] |  |
-| `config hooks.blocked` | action |  | hooks_blocked | Command to run when an agent blocks | [ACTION] [VALUE] |  |
-| `config diff.editor.command` | action |  | diff_editor_command | Editor that `clank diff` opens | [ACTION] [VALUE] |  |
-| `config diff.wait` | action |  | diff_wait | Whether `clank diff` waits for the editor | [ACTION] [VALUE] |  |
-| `config finish.autosquash` | action |  | finish_autosquash | Squash a plan into one commit when it finishes | [ACTION] [VALUE] |  |
-| `config recovery.blind_nudge` | action |  | recovery_blind_nudge | Nudge an agent whose state clank cannot read | [ACTION] [VALUE] |  |
+| `config review.adhoc_feedback` | action |  | review_adhoc_feedback | Review commits outside any plan | [VALUE] [THEN] (hidden) |  |
+| `config review.plan_feedback` | action |  | review_plan_feedback | Review a plan's commits | [VALUE] [THEN] (hidden) |  |
+| `config review.require_commit_prefix` | action |  | review_require_commit_prefix | Require a [plan] or [misc] commit subject prefix | [VALUE] [THEN] (hidden) |  |
+| `config hooks.blocked` | action |  | hooks_blocked | Command to run when an agent blocks | [VALUE] [THEN] (hidden) |  |
+| `config diff.editor.command` | action |  | diff_editor_command | Editor that `clank diff` opens | [VALUE] [THEN] (hidden) |  |
+| `config diff.wait` | action |  | diff_wait | Whether `clank diff` waits for the editor | [VALUE] [THEN] (hidden) |  |
+| `config finish.autosquash` | action |  | finish_autosquash | Squash a plan into one commit when it finishes | [VALUE] [THEN] (hidden) |  |
+| `config recovery.blind_nudge` | action |  | recovery_blind_nudge | Nudge an agent whose state clank cannot read | [VALUE] [THEN] (hidden) |  |
 | `export` | action |  |  | Dump the repo's roster config as JSON |  | --repo |
 | `rereview` | action |  |  | Re-open review on a plan's latest reviewable commit | [PLAN] | --repo |
-| `rewire` | action | hidden |  | Remap feedback after a rebase or amend |  | --repo --from-stdin |
+| `rewire` | action | hidden |  | Remap feedback after a rebase or amend |  | --repo --from-stdin (required) |
 | `stop-hook` | action | hidden |  | The per-tool Stop-hook adapter |  | --tool (required) --repo --session-start --loop --observe --turn-id --class --status --recovery-helper --recovery-reply --attempt --opened-by --started |
 | `question-hook` | action | hidden |  | Native Claude question hook adapter (installed by setup) |  |  |
 <!-- inventory:end -->

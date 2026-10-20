@@ -94,23 +94,26 @@ pub(crate) mod web;
 pub struct ConfigArgs {
     #[command(subcommand)]
     pub command: Option<ConfigKey>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub repo: Option<PathBuf>,
-    #[arg(short = 'j', long)]
+    #[arg(short = 'j', long, global = true)]
     pub json: bool,
     /// Write to the USER-scope config (`~/.clank/config.json`) instead of the
     /// repo's `.clank/config.json`. Only affects `set`; reads always show the
     /// effective merged value (repo shadows user).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub global: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct ConfigKeyArgs {
-    /// Action: get or set
-    pub action: Option<String>,
-    /// Value (for set)
+    /// The value to write. Omit it to show the key, its value and where
+    /// that value comes from. The older `get` and `set <value>` spellings
+    /// still work, so to write the word `get` or `set` itself, use
+    /// `set get` or `set set`.
     pub value: Option<String>,
+    #[arg(hide = true)]
+    pub then: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -316,8 +319,10 @@ pub struct RewireArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Read git `post-rewrite` pairs (`<old> <new> [extra]`,
-    /// one per line) from stdin and rewire feedback in place.
-    #[arg(long)]
+    /// one per line) from stdin and rewire feedback in place. Required:
+    /// stdin is the only input, and it stays a flag because the
+    /// `post-rewrite` hook `clank init` installs passes it.
+    #[arg(long, required = true)]
     pub from_stdin: bool,
 }
 
@@ -354,7 +359,7 @@ pub struct HtmlArgs {
     #[command(subcommand)]
     pub command: Option<HtmlCmd>,
     /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub repo: Option<PathBuf>,
     /// Ignore the cached `clank:last-built-sha` marker and
     /// re-render every page from scratch.
@@ -418,7 +423,6 @@ pub struct HtmlOpenArgs {
 /// `clank-open-zellij-context`). Subcommands: `dry` = the
 /// read-only path classifier; `zellij` = the opener, explicit.
 #[derive(Args, Debug)]
-#[command(args_conflicts_with_subcommands = true)]
 pub struct OpenArgs {
     #[command(subcommand)]
     pub command: Option<OpenCmd>,
@@ -460,7 +464,7 @@ pub struct OpenDryArgs {
     pub json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone, PartialEq, Eq)]
 pub struct OpenZellijArgs {
     /// Repo root override. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
@@ -958,7 +962,10 @@ pub struct FeedbackWriteArgs {
     /// `REQUEST_CHANGES <body>`.
     #[arg(long, value_enum)]
     pub verdict: VerdictArg,
-    /// Agent label to attribute the feedback to.
+    /// Agent label the verdict is attributed to. Explicit on purpose: the
+    /// gate counts each reviewer's verdict by this label, so it is the
+    /// reviewer's own roster label, written out rather than guessed from
+    /// whichever session happens to run the command.
     #[arg(long, value_name = "LABEL")]
     pub author: String,
     /// Review message (like `git commit -m`). First line is the
@@ -995,7 +1002,7 @@ pub struct PrReviewArgs {
     #[command(subcommand)]
     pub command: PrReviewCmd,
     /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub repo: Option<PathBuf>,
 }
 
@@ -1269,7 +1276,7 @@ impl From<ToolArg> for clank_core::Tool {
 pub struct QueueArgs {
     #[command(subcommand)]
     pub command: Option<QueueCmd>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub repo: Option<PathBuf>,
 }
 
@@ -1913,8 +1920,8 @@ pub struct UnshelveArgs {
 
 #[derive(Args, Debug)]
 pub struct UnfinishArgs {
-    /// Plan to unfinish. Required.
-    pub plan: Option<String>,
+    /// Plan to unfinish: `<repo>/<stem>.md` or just `<stem>`.
+    pub plan: String,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
 }
