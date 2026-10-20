@@ -56,8 +56,9 @@ whole commands that agents are told to run.
 
 ## Findings
 
-F3 and F4 were fixed by `cli-help-says-what-it-is-for`, and F7 by
-`cli-help-is-beautiful` (sectioned, styled top-level help). Their sections
+F3 and F4 were fixed by `cli-help-says-what-it-is-for`, F7 by
+`cli-help-is-beautiful` (sectioned, styled top-level help), and F8 by
+`cli-readme-covers-the-surface`. Their sections
 record what was found, and the verdicts below show what remains.
 
 ### F1. Plumbing is listed beside user commands
@@ -343,23 +344,23 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `queue add` | to line up a drafted plan | agent | R S | keep | |
 | `queue remove` | to discard a queued plan | both | H | fix doc | F6: real distinction from `unqueue`, not in the README |
 | `queue promote` | when clank says the next plan can start | agent | R S | keep | F6: the clash is fixed on the `agent` side |
-| `queue reprioritise` | to reorder the queue | both | H | fix doc | F8 |
-| `queue unqueue` | to take a plan back to drafts for editing | both | H | fix doc | F8 |
+| `queue reprioritise` | to reorder the queue | both | R | keep |  |
+| `queue unqueue` | to take a plan back to drafts for editing | both | R | keep |  |
 | `feedback` | (group) | agent | R S | keep | |
 | `feedback write` | a reviewer recording its verdict | agent | R S | fix usage | F5: `--author` required, unlike every other author flag; establish why |
-| `feedback read` | the master reading a commit's verdicts | agent | S | fix doc | F8 |
+| `feedback read` | the master reading a commit's verdicts | agent | R S | keep |  |
 | `events` | (group) | agent | R S | keep | F6: the about now states the show/read distinction |
 | `events list` | to see unhandled github and other events | agent | R S | keep | |
 | `events ack` | when an event is dealt with | agent | R S | keep | |
-| `events reply` | to answer an event without closing it | agent | R | fix doc | F8: missing from the reference table |
+| `events reply` | to answer an event without closing it | agent | R | keep |  |
 | `events show` | to inspect an event's metadata safely | agent | R S | keep | F6: distinction stated in the group about |
-| `events read` | to read an event's untrusted content | agent | R S | fix doc | F8 |
+| `events read` | to read an event's untrusted content | agent | R S | keep |  |
 | `send` | to message another agent | both | R S | keep | |
-| `nudge` | when an agent cannot receive `send` | human | H | fix doc | F8 (help now names the attempt history) |
+| `nudge` | when an agent cannot receive `send` | human | R | keep |  |
 | `monitor` | (group, plumbing) | hook | none | hide | F1 |
 | `monitor start` | never by hand; clank spawns it | hook | none | hide | F1: spawned by clank (`monitor.rs:2269`) |
 | `monitor upgrade` | once, to retire monitors from old builds | legacy | H | hide | F1: one-time migration; verify before removing |
-| `remote` | (group) | human | R | fix doc | F8: missing from the reference table |
+| `remote` | (group) | human | R | keep |  |
 | `remote status` | to see whether the remote is serving | human | R | keep | |
 | `remote on` | to start serving the repo remotely | human | R | keep | |
 | `remote off` | to stop serving it | human | H | keep | |
@@ -373,12 +374,12 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `agent promote` | to make an agent master | human | S | rename | F6: clashes with `queue promote` |
 | `agent remove` | to take an agent off the roster | human | S | merge | F2: `--global` moves to `team` |
 | `agent set-review` | to change what a reviewer reviews | human | S | keep | |
-| `agent swap` | to replace one reviewer with another | human | H | fix doc | F8 |
+| `agent swap` | to replace one reviewer with another | human | R | keep |  |
 | `agent launch` | to see or set how an agent's tool is launched | human | R S | keep | F6: `<NAME>` |
 | `team` | (group) | human | R | merge | F2: gains the agent library |
 | `team save` | to reuse this repo's roster elsewhere | human | R | keep | |
-| `team list` | to see saved teams | human | H | fix doc | F8 |
-| `team show` | to see one saved team | human | H | fix doc | F8 |
+| `team list` | to see saved teams | human | R | keep |  |
+| `team show` | to see one saved team | human | R | keep |  |
 | `team delete` | to discard a saved team | human | H | rename | F6: `remove` |
 | `as` | in a session you started by hand | both | R S | keep | |
 | `auto` | (group) | both | R S | keep | |
@@ -390,8 +391,8 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `open zellij` | the same as bare `open` | human | H | merge | F2 |
 | `fork` | (group) | human | R | keep | |
 | `fork create` | to try something in a parallel worktree | human | R | keep | |
-| `fork list` | to see the forks | human | H | fix doc | F8 |
-| `fork remove` | to clean one up | human | H | fix doc | F8 |
+| `fork list` | to see the forks | human | R | keep |  |
+| `fork remove` | to clean one up | human | R | keep |  |
 | `stash` | to set a plan aside for another | agent | R S | rename flag | F6: `--dry` |
 | `stash push` | the same as bare `stash` | agent | S | keep | |
 | `stash pop` | to bring the plan back | agent | S | keep | |
@@ -403,7 +404,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `unshelve` | old spelling of `stash pop` | legacy | none | keep | F1 |
 | `pick` | to bring plans over from another branch | human | R | rename flag | F6: `--dry` |
 | `purge` | to remove a plan's traces from history | agent | R S | rename flag | F6: `--dry`, `--drop` |
-| `pr-review` | (group) | agent | S | fix usage | F5: `--repo` only before the subcommand; F8 |
+| `pr-review` | (group) | agent | R S | fix usage | F5: `--repo` only before the subcommand |
 | `pr-review start` | the master starting a review of a GitHub PR | agent | S | keep | |
 | `pr-review note` | a reviewer recording its verdict on the draft | agent | S | keep | |
 | `pr-review propose` | the master asking for another round | agent | S | keep | |
@@ -418,9 +419,9 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `block clean` | tidying answered questions | agent | S | keep | |
 | `block migrate` | once, on a repo with the old layout | legacy | H | hide | F1: verify legacy layouts are gone or migrate on read |
 | `unblock` | the human answering | human | R | merge | F2: `block answer` |
-| `attending` | an agent waiting on a task it started some other way | agent | rt | fix doc | F2, F8: taught only by stop-hook text |
+| `attending` | an agent waiting on a task it started some other way | agent | R S | keep |  |
 | `tui` | to drive a running team | human | R | keep | |
-| `run` | an agent backgrounding a long command | agent | rt | fix doc | F2, F8: taught only by stop-hook text |
+| `run` | an agent backgrounding a long command | agent | R S | keep |  |
 | `config` | to see every setting | human | S | fix usage | F5: `[ACTION] [VALUE]`; `--repo` only before the key |
 | `config review.adhoc_feedback` | to set this value | human | H | fix usage | F5 |
 | `config review.plan_feedback` | to set this value | human | H | fix usage | F5 |
@@ -431,7 +432,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `config finish.autosquash` | to set this value | human | H | fix usage | F5 |
 | `config recovery.blind_nudge` | to set this value | human | H | fix usage | F5 |
 | `export` | to get the raw roster JSON | human | R | keep | F2: raw shape differs from `agent list -j`; no internal caller, external use unknown |
-| `rereview` | to make reviewers look at a commit again | human | H | fix doc | F8 |
+| `rereview` | to make reviewers look at a commit again | human | R | keep |  |
 | `rewire` | never by hand; the git hook runs it | hook | R | hide | F1, F5: only the hook form works |
 | `stop-hook` | never by hand; the tool's hook runs it | hook | R | hide | F1 |
 | `question-hook` | never by hand; the tool's hook runs it | hook | none | keep | already hidden |

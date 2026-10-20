@@ -2453,6 +2453,29 @@ mod tests {
         );
     }
 
+    /// Every role on every tool is taught to hand long background work to
+    /// clank: `run` for new work, `attending` with a real task id and pid
+    /// for work already running, and no polling while it runs.
+    #[test]
+    fn every_skill_teaches_background_attendance() {
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
+            for role in [Role::Master, Role::Reviewer] {
+                let skill = compose_skill(role, tool);
+                for needle in [
+                    "clank run --desc",
+                    "clank attending <task-id>",
+                    "--pid <pid>",
+                    "never poll it",
+                ] {
+                    assert!(
+                        skill.contains(needle),
+                        "{role:?} skill for {tool:?} does not teach `{needle}`"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn role_invariants_lead_each_body() {
         for tool in [Tool::Claude, Tool::Codex] {

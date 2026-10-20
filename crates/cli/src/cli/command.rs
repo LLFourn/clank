@@ -586,6 +586,117 @@ mod tests {
         );
     }
 
+    /// The README's reference table rows, keyed by each command its first
+    /// cell names (`block` / `unblock` share one), with the row's text.
+    fn readme_rows(text: &str) -> Vec<(String, String)> {
+        let reference = text
+            .split("## Command reference")
+            .nth(1)
+            .expect("a Command reference section")
+            .split("\n## ")
+            .next()
+            .unwrap();
+        let mut rows = Vec::new();
+        for line in reference.lines() {
+            let Some(rest) = line.strip_prefix("| `") else {
+                continue;
+            };
+            let Some(cell) = rest.split(" |").next() else {
+                continue;
+            };
+            for name in cell.split(" / ") {
+                rows.push((name.trim().trim_matches('`').to_string(), line.to_string()));
+            }
+        }
+        rows
+    }
+
+    /// Whether `row` names `child` of `parent` in code: `child`,
+    /// `parent child`, or `clank parent child`, as the first word of a
+    /// backticked span.
+    fn row_names_child(row: &str, parent: &str, child: &str) -> bool {
+        row.split('`').skip(1).step_by(2).any(|span| {
+            let mut words = span.split_whitespace().peekable();
+            if words.peek() == Some(&"clank") {
+                words.next();
+            }
+            if words.peek() == Some(&parent) {
+                words.next();
+            }
+            words.next() == Some(child)
+        })
+    }
+
+    /// Every visible command has a row in the README's reference table,
+    /// and every visible subcommand is named in its own parent's row.
+    /// Hidden commands and aliases are left out on purpose.
+    fn readme_gaps(text: &str) -> Vec<String> {
+        use clap::CommandFactory;
+        let rows = readme_rows(text);
+        let mut gaps = Vec::new();
+        let cmd = Cli::command();
+        for top in visible_children(&cmd) {
+            let name = top.get_name();
+            let Some((_, row)) = rows.iter().find(|(n, _)| n == name) else {
+                gaps.push(format!("no row for `{name}`"));
+                continue;
+            };
+            for child in visible_children(top) {
+                if !row_names_child(row, name, child.get_name()) {
+                    gaps.push(format!(
+                        "`{name}`'s row does not name `{}`",
+                        child.get_name()
+                    ));
+                }
+            }
+        }
+        gaps
+    }
+
+    #[test]
+    fn the_readme_reference_covers_every_visible_command() {
+        let gaps = readme_gaps(&readme());
+        assert!(
+            gaps.is_empty(),
+            "the README reference is missing:\n{}",
+            gaps.join("\n")
+        );
+    }
+
+    /// The check fails on what it exists to catch: a dropped row, a
+    /// dropped child, and a child named only in someone else's row.
+    #[test]
+    fn readme_gaps_catches_a_missing_row_and_a_missing_child() {
+        let text = readme();
+        let row_of = |name: &str| {
+            text.lines()
+                .find(|l| l.starts_with(&format!("| `{name}` |")))
+                .unwrap()
+                .to_string()
+        };
+        let without_remote = text.replace(&format!("{}\n", row_of("remote")), "");
+        assert!(readme_gaps(&without_remote).contains(&"no row for `remote`".to_string()));
+        let queue = row_of("queue");
+        let without_unqueue = text.replace(&queue, &queue.replace("`unqueue`", "unqueue"));
+        assert!(
+            readme_gaps(&without_unqueue)
+                .contains(&"`queue`'s row does not name `unqueue`".to_string())
+        );
+        let moved =
+            without_unqueue.replace(&row_of("init"), &format!("{} `unqueue`", row_of("init")));
+        assert!(
+            readme_gaps(&moved).contains(&"`queue`'s row does not name `unqueue`".to_string()),
+            "a mention in another row does not count"
+        );
+        let block = row_of("block` / `unblock");
+        let without_unblock = text.replace(
+            &block,
+            &block.replace("| `block` / `unblock` |", "| `block` |"),
+        );
+        assert!(readme_gaps(&without_unblock).contains(&"no row for `unblock`".to_string()));
+        assert!(readme_gaps(&text).is_empty());
+    }
+
     /// The README must tell a newcomer how to START the agents.
     ///
     /// The defect the rewrite existed to fix: the Quickstart built a

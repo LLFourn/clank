@@ -361,32 +361,71 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `setup` | Install skills, hooks + the opencode plugin into `~/.claude`, `~/.codex`, `~/.grok`, `~/.config/opencode` |
 | `doctor` | Diagnose repo / user / session setup; exits 1 on FAIL |
 | `as` | Bind this agent session to a roster label |
-| `auto` | Per-agent auto-mode on / off / status |
-| `tui` | The full-screen pane: the way you drive a running team |
-| `status` | Repo state; `--watch` live (Enter on a github row opens the event page: preview, ack, open-in-browser), `-j` JSON |
+| `auto` | Per-agent auto-mode: `on` / `off` / `status` |
+| `tui` | The full-screen pane: the way you drive a running team (Enter on a github row opens the event page: preview, ack, open-in-browser) |
+| `status` | Repo state; `--watch` re-prints it as it changes, `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
-| `events` | Event inbox: `list` / `ack` / `show` (see below) |
-| `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo) |
+| `run` | Run a long command under clank, so the Stop hook knows it is in hand (see below) |
+| `attending` | Record a background task that is already running, by task id and `--pid` (see below) |
+| `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply` (see below) |
+| `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
+| `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
 | `feedback` | `write` / `read` review feedback via a typed surface |
-| `queue` | `add` / `promote` / `remove` / `reprioritise` queued plans |
+| `queue` | `add` / `promote` / `remove` / `unqueue` (back to drafts) / `reprioritise` queued plans |
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |
 | `unfinish` | Move a finalized plan back to active |
-| `agent` | Roster: `add` / `promote` / `remove` / `list` / `set-review` / `start` |
+| `rereview` | Make every reviewer review a plan's latest commit again |
+| `agent` | Roster: `add` / `promote` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
 | `team` | Global team templates: `save` / `list` / `show` / `delete` |
-| `fork` | Linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds) |
-| `pr-review` | Multi-agent review loop against a GitHub PR |
-| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
+| `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove` |
+| `pr-review` | Multi-agent review loop against a GitHub PR: `start` / `note` / `propose` / `status` / `finish` / `abort` |
+| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one (`zellij` is the same; `dry` reports what it would do) |
+| `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
 | `html` | Render the event log + status to a static site; `html open` |
 | `diff` | Launch the configured editor on a plan / range diff |
-| `stash` | Set a plan's commits aside (bare pushes, like `git stash`) / `pop` restores / `list` |
+| `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` / `unblock` | Ask the human a blocking question / answer it |
-| `config` | Read/write typed config values (repo or `--global`) |
+| `block` / `unblock` | Ask the human a blocking question (`block create`) / answer it; `block clean` tidies answered ones, `block migrate` flattens the legacy layout |
+| `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge` |
 | `export` | Dump the repo's roster config as JSON |
+| `monitor` | The per-repo watcher every wait and TUI shares; clank starts it itself (`start`), and `upgrade` replaces monitors from builds that predate self-retirement |
 | `rewire` | Remap feedback after rebase/amend (installed as a git hook) |
 | `stop-hook` | The per-tool Stop-hook adapter (installed by `setup`) |
+
+### Messages: send, interrupt, nudge
+
+Three levels, for three situations:
+
+- `clank send` writes a durable event to the agent's inbox. It wakes the
+  agent until the agent acknowledges it with `clank events ack`.
+- `clank send --interrupt` writes the same durable event and also tries to
+  interrupt the agent's current turn. If the interrupt cannot be made, the
+  event still waits in the inbox.
+- `clank nudge` is the recovery route for when the inbox cannot reach the
+  agent at all: a wedged hook, a stale binding, a wake that never fires. It
+  interrupts the agent's pane and types the message into its terminal,
+  reading no inbox and no binding. Nothing waits to be acknowledged, but
+  each attempt and its outcome is kept in the agent's nudge history.
+
+### Background work: run and attending
+
+An agent that starts long work in the background (a test suite, a build)
+would otherwise be woken by the Stop hook with work it is already doing.
+
+- `clank run --desc "two words" -- <command>` is the usual way. Clank
+  records what the agent is attending, then becomes the command (same pid,
+  stdio and exit status), so the task's lifetime is the work's lifetime.
+- `clank attending <task-id> --desc "two words" --pid <pid>` records a task
+  that is already running. The task id is the harness's own, and the live
+  `--pid` is required: without a pid clank cannot prove the work is still
+  running, and refuses.
+
+Either takes `--expect` (default 5m): if the work is still running past
+that, the agent is checked in on once. Nothing is cancelled and nothing
+times out. The harness's own notification that the task finished is still
+what wakes the agent when it ends.
 
 Status shows a commit warning only when it belongs to HEAD and amending that
 commit can repair it, such as introducing another plan while one is active or

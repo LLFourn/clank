@@ -19,6 +19,10 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
   you started by hand. Your ROLE is roster-derived — master or
   reviewer because the roster says so, not a flag.
 {{WORK_LOOP}}
+- **Long background work**: run it as `clank run --desc "two words"
+  -- <cmd>`, or for a running task `clank attending <task-id> --desc "…"
+  --pid <pid>`. Past `--expect` (5m) you get one check-in. Its completion
+  still wakes you: never poll it or start a wait.
 
 ## Core commands (run via {{SHELL}})
 

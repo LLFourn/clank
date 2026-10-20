@@ -768,7 +768,8 @@ fn a_clank_bindings_scope_is_rusts() {
         "unreadable syntax reaching a bound root is reported: {:?}",
         caught(bound_unreadable)
     );
-    let unrelated_unreadable = "fn p(repo: &Path) {\n    let other = repo.join(\"x\");\n    odd!(other @ \"fine\");\n}\n";
+    let unrelated_unreadable =
+        "fn p(repo: &Path) {\n    let other = repo.join(\"x\");\n    odd!(other @ \"fine\");\n}\n";
     assert_eq!(
         caught(unrelated_unreadable),
         Vec::<String>::new(),
