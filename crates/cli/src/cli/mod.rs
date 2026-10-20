@@ -352,10 +352,9 @@ pub struct HtmlArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum HtmlCmd {
-    /// Build the site, then launch the host browser
-    /// (`open` / `xdg-open` / `explorer`) on the generated
-    /// `index.html` — or on `plan/<stem>.html` if a plan name
-    /// is supplied.
+    /// Build the site and open it in your browser
+    ///
+    /// Opens the index, or one plan's page when a plan is named.
     Open(HtmlOpenArgs),
 }
 
@@ -417,8 +416,7 @@ pub struct OpenArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum OpenCmd {
-    /// Classify a path against the active repo; emit JSON or
-    /// human-readable. Renamed from `clank open <path>`.
+    /// Report what `clank open` would do for a path, without opening anything
     Dry(OpenDryArgs),
     /// Auto-generate a zellij layout (KDL) for master + reviewer
     /// panes and spawn it via `zellij --layout`.
@@ -435,11 +433,8 @@ pub enum OpenCmd {
 
 #[derive(Args, Debug)]
 pub struct OpenDryArgs {
-    /// Path to inspect. Echoed back verbatim as `requested_path`;
-    /// not canonicalized until existence is confirmed. The repo
-    /// root is derived from this path's `git rev-parse --show-toplevel`,
-    /// so no `--repo` flag is needed — codex caught on 30a0194
-    /// that adding one would have been a silent no-op.
+    /// Path to inspect. Its repo is the one containing it, so there
+    /// is no `--repo`. Echoed back verbatim as `requested_path`.
     pub path: String,
     /// Emit the response as JSON.
     #[arg(short = 'j', long)]
@@ -538,10 +533,9 @@ pub struct StatusArgs {
     /// line per update.
     #[arg(long)]
     pub watch: bool,
-    /// Full-screen read-only live status view, sized for a small
-    /// The full-screen pane — an alias for `clank tui`, kept so the
-    /// panes of sessions opened before the rename keep working; it
-    /// says so on stderr. Conflicts with --json/--watch/--plan.
+    /// Open the full-screen pane: the same as `clank tui`, which it
+    /// says on stderr. Kept so panes opened before `tui` existed
+    /// still work. Conflicts with --json/--watch/--plan.
     #[arg(long, conflicts_with_all = ["json", "watch", "plan"])]
     pub tui: bool,
 }
@@ -650,31 +644,6 @@ impl WaitArgs {
 /// fallback applies only when it's `None`.
 pub fn resolve_poll(explicit: Option<bool>, codex_sandbox: Option<&str>) -> bool {
     explicit.unwrap_or_else(|| codex_sandbox == Some("seatbelt"))
-}
-
-#[cfg(test)]
-mod role_arg_alias_tests {
-    use super::RoleArg;
-    use clap::ValueEnum;
-
-    #[test]
-    fn role_arg_accepts_canonical_singular() {
-        let parsed = RoleArg::from_str("reviewer", false).unwrap();
-        assert!(matches!(parsed, RoleArg::Reviewer));
-    }
-
-    #[test]
-    fn role_arg_accepts_plural_alias() {
-        // Plan acceptance: `--role reviewers` keeps working via
-        // the clap alias.
-        let parsed = RoleArg::from_str("reviewers", false).unwrap();
-        assert!(matches!(parsed, RoleArg::Reviewer));
-    }
-
-    #[test]
-    fn role_arg_rejects_unrelated_strings() {
-        assert!(RoleArg::from_str("xyzzy", false).is_err());
-    }
 }
 
 #[cfg(test)]
@@ -1106,12 +1075,11 @@ pub struct AutoArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum AutoCmd {
-    /// Enable auto-mode (wait-for-work long-poll). Optionally
-    /// update role.
+    /// Let the Stop hook hand this session its work
     On(AutoOnArgs),
-    /// Disable auto-mode. Optionally update role.
+    /// Drive this session by hand
     Off(AutoOffArgs),
-    /// Print current auto-mode + role for the calling agent.
+    /// Print this session's auto-mode and its roster role
     Status(AutoStatusArgs),
 }
 
@@ -1119,20 +1087,12 @@ pub enum AutoCmd {
 pub struct AutoOnArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Designate this agent as `master` or `reviewer` for the
-    /// repo. `master` writes `.clank/config.json` with this
-    /// label; `reviewer` clears master only if this agent
-    /// currently holds it.
-    #[arg(long, value_enum)]
-    pub role: Option<RoleArg>,
 }
 
 #[derive(Args, Debug)]
 pub struct AutoOffArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    #[arg(long, value_enum)]
-    pub role: Option<RoleArg>,
 }
 
 #[derive(Args, Debug)]
@@ -1142,17 +1102,6 @@ pub struct AutoStatusArgs {
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
-}
-
-/// Role designation for `--role`.
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
-pub enum RoleArg {
-    Master,
-    /// Singular per `role-reviewers-to-reviewer-rename`.
-    /// `alias = "reviewers"` preserves backwards compat for
-    /// users typing `--role reviewers`.
-    #[clap(alias = "reviewers")]
-    Reviewer,
 }
 
 #[derive(Args, Debug)]
@@ -1306,46 +1255,53 @@ pub struct AgentArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum AgentCmd {
-    /// Enumerate the repo's roster (master + reviewers) with their
-    /// role, review tier, and bind state.
+    /// List the roster: each agent's role, review tier and binding
     List(AgentListArgs),
-    /// Launch an agent's CLI tool with any configured `launch`
-    /// profile applied. With a bound session it RESUMES that
-    /// session; without one it bootstraps, exec'ing the bare tool
-    /// with a seed prompt telling the agent to run `clank as
-    /// <name>` (agent-start-bootstraps-missing-skeleton).
+    /// Start an agent's tool, resuming its session when it has one
+    ///
+    /// The tool runs with the agent's launch profile. A session bound
+    /// with the same tool is resumed. Without one, or when the roster
+    /// now names a different tool, the tool starts fresh and is told to
+    /// bind itself with `clank as <name>`; the old binding stays until
+    /// the new session reports in.
     Start(AgentStartArgs),
-    /// Add an agent to the repo's roster (ONE step — definition +
-    /// role). Three modes: `--global --tool` writes a reusable
-    /// DESCRIPTION to the user-scope library (no repo change);
-    /// repo-scope `--tool` defines a fresh agent inline; repo-scope
-    /// by-name (no `--tool`) copies a description from the
-    /// user-scope library. `--review commit|plan|final|gate|standby`
-    /// sets the tier (default `commit`); `standby` reviews nothing.
+    /// Put an agent on this repo's roster, with its review tier
+    ///
+    /// By name, the agent is copied from your user-scope library; with
+    /// `--tool`, it is defined here. `--review` sets the tier; without
+    /// it the agent becomes master on a roster that has none, and a
+    /// `commit` reviewer otherwise. With `--global --tool`,
+    /// the description is saved to the library instead, and this repo
+    /// is not touched.
     Add(AgentAddArgs),
-    /// Promote an agent to the repo's master:
-    /// `repo.agents[<name>].role = master`, demoting the previous
-    /// master to `commit`. The agent must already be on the roster.
-    /// (Distinct from `clank queue promote`, which activates a queued
-    /// plan.)
+    /// Make an agent the repo's master
+    ///
+    /// The previous master becomes a `commit` reviewer. The agent must
+    /// already be on the roster. Not to be confused with
+    /// `clank queue promote`, which starts a queued plan.
     Promote(AgentPromoteArgs),
-    /// Remove an agent from the repo's roster. `--global` instead
-    /// drops a DESCRIPTION from the user-scope `agents` library
-    /// (and scrubs any team template referencing it). Per-agent
-    /// skeleton dir + feedback history are preserved.
+    /// Take an agent off this repo's roster
+    ///
+    /// Its feedback history is kept. With `--global`, a description is
+    /// removed from your user-scope library instead, and from every
+    /// saved team that uses it.
     Remove(AgentRemoveArgs),
-    /// Change a non-master agent's tier (commit / plan / final / gate,
-    /// or standby: reviewing nothing) in place — no remove/re-add, so
-    /// the agent's session and zellij pane are undisturbed. Refuses on
-    /// the master (not a reviewer tier).
+    /// Change what a reviewer reviews
+    ///
+    /// The tiers are `commit`, `plan`, `final`, `gate`, and `standby`
+    /// (reviews nothing). The agent's session and pane are untouched.
+    /// The master has no tier; this refuses it.
     SetReview(AgentSetReviewArgs),
-    /// Replace a reviewer with another, keeping the role: one config
-    /// write, so the role is never observed vacant and the gate's
-    /// expected reviewer set never briefly shrinks. Refuses on the
-    /// master (use `agent promote`) and refuses when the incoming
-    /// label is already on the roster.
+    /// Replace one reviewer with another in the same role
+    ///
+    /// One config write, so the role is never vacant and the gate never
+    /// briefly expects fewer reviewers. The incoming agent is copied
+    /// from your library and must not already be on the roster. The
+    /// master is not swapped this way (use `agent promote`).
     Swap(AgentSwapArgs),
-    /// Show an agent's launch profile and the command `agent start`
+    /// Show or set how an agent's tool is launched
+    ///
+    /// Bare, it shows the launch profile and the command `agent start`
     /// would run. Given `--cmd`, `--env` or `-- <args>`, that is the
     /// agent's whole new launch (nothing is kept from before); `--clear`
     /// is the bare tool. The agent keeps its role, session and pane, and
@@ -1403,8 +1359,8 @@ pub struct AgentAddArgs {
     /// from the user-scope `agents` library.
     #[arg(long, value_enum)]
     pub tool: Option<ToolArg>,
-    /// Tier for the new roster entry: `commit`, `plan`, `final`, or
-    /// `gate`. Omitted, the agent becomes master on a roster that has
+    /// Tier for the new roster entry: `commit`, `plan`, `final`,
+    /// `gate`, or `standby`. Omitted, the agent becomes master on a roster that has
     /// none, and `commit` otherwise. Ignored with `--global` (the
     /// library has no role).
     #[arg(long, value_enum)]
@@ -1515,7 +1471,7 @@ pub struct AgentRemoveArgs {
 pub struct AgentSetReviewArgs {
     /// Reviewer label whose tier to change.
     pub name: String,
-    /// New tier: `commit`, `plan`, `final`, or `gate`.
+    /// New tier: `commit`, `plan`, `final`, `gate`, or `standby`.
     #[arg(value_enum)]
     pub review: ReviewKindArg,
     /// Repo root. Defaults to the cwd's git toplevel.
@@ -1546,8 +1502,10 @@ pub enum TeamCmd {
     List(TeamListArgs),
     /// Show a single global team template (its roster).
     Show(TeamShowArgs),
-    /// Delete a global team template. Refuses without `--force`
-    /// (clank can't introspect which repos reference it).
+    /// Delete a saved team
+    ///
+    /// Needs `--force`: clank cannot tell which repos were seeded from
+    /// it.
     Delete(TeamDeleteArgs),
 }
 
@@ -1921,7 +1879,7 @@ pub struct BlockArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum BlockCmd {
-    /// Create a block.
+    /// Ask the human a question, and wait for the answer
     Create(BlockCreateArgs),
     /// Remove answered block+unblock pairs for this agent.
     Clean(BlockCleanArgs),

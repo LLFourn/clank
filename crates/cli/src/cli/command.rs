@@ -52,19 +52,22 @@ pub enum Command {
     Wait(crate::cli::WaitCommandArgs),
     /// Manage the plan queue
     ///
-    /// `queue add` consumes a draft from `.clank/drafts/`; `promote`
-    /// activates the next plan; `remove` / `reprioritise` curate.
+    /// Plans wait here in priority order until the master starts them.
+    /// A queued plan's body is written first as `.clank/drafts/<name>.md`.
+    /// Removing an entry deletes it; unqueueing returns it to drafts.
     Queue(crate::cli::QueueArgs),
     /// Read or write review feedback
     ///
-    /// A typed surface over the on-disk feedback files: `feedback
-    /// write --commit <sha> --verdict … -m "…"` and `feedback read`.
+    /// Reviewers record one verdict per commit; the master reads them.
+    /// Use this rather than reading the files under `.clank/agents/`.
     Feedback(crate::cli::FeedbackArgs),
-    /// The github event inbox: list, ack, show
+    /// The event inbox: what your wake sources delivered
     ///
-    /// Every github event a wait ingests lands here and re-wakes the
-    /// agent until acked. `list` shows the unhandled backlog, `ack`
-    /// closes items out, `show` prints one full record.
+    /// Every event a wait ingests (GitHub activity, messages, scheduled
+    /// events) lands here and keeps waking its agent until it is
+    /// acknowledged. Listing and showing give metadata only. Reading
+    /// returns the content, which is external and untrusted, and
+    /// records that it was delivered to you.
     Events(crate::cli::EventsArgs),
     /// Put a message in an agent's inbox
     ///
@@ -76,17 +79,16 @@ pub enum Command {
     ///
     /// The escape hatch for when `clank send` cannot be delivered —
     /// a wedged hook, a stale binding, a wake that never fires. It
-    /// reads no inbox and no session binding, leaves no durable
-    /// record, and fails rather than guess which pane it meant.
+    /// reads no inbox and no session binding, and fails rather than
+    /// guess which pane it meant. Unlike `send`, it leaves nothing
+    /// waiting to be acknowledged; each attempt and its outcome is
+    /// added to the agent's nudge history.
     Nudge(crate::cli::NudgeArgs),
     /// Watch a repo once, for every waiter
     ///
-    /// A repo was being watched once per WAITER: every parked
-    /// `clank wait` attached its own filesystem watcher and refolded
-    /// the whole repo on each change, as did every `clank tui`. The
-    /// monitor does it once and hands each waiter what its author is
-    /// owed. Delivery does not move — a waiter still speaks its own
-    /// adapter's protocol.
+    /// One process per repo watches it and hands every waiting agent
+    /// and `clank tui` what it is owed. Clank starts it when needed;
+    /// you do not run it yourself.
     Monitor(crate::cli::MonitorArgs),
     /// Switch this repo's remote on or off through its `clank tui`.
     Remote(crate::cli::RemoteArgs),
@@ -109,15 +111,12 @@ pub enum Command {
     // ── the roster & workspaces ──
     /// Manage this repo's agent roster
     ///
-    /// `agent add` / `promote` / `remove` / `list` / `set-review` /
-    /// `start`. Each agent carries its tool + launch profile and
-    /// role; `agent add <name>` pulls from the global library, or
-    /// `--tool` defines one inline.
+    /// Each agent on the roster has a tool, a launch profile and a
+    /// role: master, a review tier, or standby.
     Agent(crate::cli::AgentArgs),
     /// Save and reuse roster templates across repos
     ///
-    /// `team save` captures this repo's roster; `team list` / `show`
-    /// / `delete` manage the library. Seed a repo with
+    /// A team is a saved roster. Seed a new repo from one with
     /// `clank init --team <name>`.
     Team(crate::cli::TeamArgs),
     /// Bind this session to a roster label
@@ -128,14 +127,15 @@ pub enum Command {
     As(crate::cli::AsArgs),
     /// Manage this agent's auto-mode
     ///
-    /// `auto on|off|status`, with an optional role designation; the
-    /// Stop hook reads it to drive the work loop.
+    /// With auto-mode on, the Stop hook keeps the session working: each
+    /// time it ends a turn, clank wakes it with the next piece of work.
+    /// Off, the session is driven by hand. Its role comes from the
+    /// roster, not from here.
     Auto(crate::cli::AutoArgs),
     /// Open the team workspace in zellij
     ///
     /// Inside a live session, a new tab; outside one, attach to (or
-    /// create) the repo's session. `open dry <path>` classifies
-    /// without opening.
+    /// create) the repo's session.
     Open(crate::cli::OpenArgs),
     /// Fork the team into a linked worktree
     ///
@@ -147,9 +147,11 @@ pub enum Command {
     /// Set a plan's commits aside and restore them later
     ///
     /// Bare `clank stash [PLAN]` pushes, as `git stash` does: the one
-    /// in-flight plan, or the named one. `pop` / `show` / `drop` take
-    /// the one stashed plan when there is one; `list` lists.
-    /// `--to-queue` re-queues the plan body for a later attempt.
+    /// in-flight plan, or the named one. Its commits are kept on a
+    /// protective ref and taken off the branch, so another plan can
+    /// run. Where only one plan is stashed, commands that act on a
+    /// stash take it without a name. `--to-queue` re-queues the plan
+    /// body for a later attempt instead.
     Stash(crate::cli::StashArgs),
     /// Hidden alias for `clank stash push` (+ `shelve clean` →
     /// `stash drop`). One release of back-compat.
@@ -181,7 +183,10 @@ pub enum Command {
     /// Writes `.clank/html/`; `clank html open` builds and launches
     /// it in your browser.
     Html(crate::cli::HtmlArgs),
-    /// Ask the human a blocking question
+    /// Questions only the human can answer
+    ///
+    /// An agent blocks on a decision it must not make itself; the human
+    /// answers with `clank unblock`.
     Block(crate::cli::BlockArgs),
     /// Answer a pending block
     Unblock(crate::cli::UnblockArgs),
@@ -218,8 +223,10 @@ pub enum Command {
     /// Re-open review on a plan's latest reviewable commit
     ///
     /// Rewrites it with the same tree and message so it becomes a new
-    /// commit that every reviewer owes a fresh verdict on. Use after a
-    /// promotion auto-continued a demoted master's self-review.
+    /// commit that every reviewer owes a fresh verdict on. Use it when a
+    /// commit was accepted without the review it needed, such as a
+    /// master's own commit continued automatically after it was
+    /// demoted.
     Rereview(crate::cli::RereviewArgs),
     /// Remap feedback after a rebase or amend
     ///
@@ -641,6 +648,163 @@ mod tests {
             missing.is_empty() && unknown.is_empty() && twice.is_empty(),
             "unjudged: {missing:?}; not commands: {unknown:?}; judged twice: {twice:?}"
         );
+    }
+
+    /// The children a group's help names as a list, which clap already
+    /// prints beneath it: a run of two or more child names linked by
+    /// `,` `/` or `|`, each name bare or a backticked command (`pop`,
+    /// `clank stash pop`, `auto on|off`). A child mentioned on its own
+    /// in prose ("use `read` when you need the body") is guidance, not
+    /// a list, and an `Examples:` block is usage.
+    fn hand_listed_children(text: &str, group: &str, children: &[&str]) -> Vec<String> {
+        let text = text.split("\nExamples:").next().unwrap_or(text);
+        let mut flat = String::new();
+        for (i, span) in text.split('`').enumerate() {
+            if i % 2 == 0 {
+                flat.push_str(span);
+                continue;
+            }
+            let mut words = span.split_whitespace().peekable();
+            if words.peek() == Some(&"clank") {
+                words.next();
+            }
+            if words.peek() == Some(&group) {
+                words.next();
+            }
+            flat.push_str(words.next().unwrap_or(""));
+        }
+        for sep in [',', '/', '|'] {
+            flat = flat.replace(sep, &format!(" {sep} "));
+        }
+        let mut named: Vec<String> = Vec::new();
+        let mut run: Vec<&str> = Vec::new();
+        let mut linked = false;
+        let flush = |run: &mut Vec<&str>, named: &mut Vec<String>| {
+            if run.len() >= 2 {
+                named.extend(run.iter().map(|s| s.to_string()));
+            }
+            run.clear();
+        };
+        for tok in flat.split_whitespace() {
+            let word = tok.trim_end_matches(['.', ';', ':']);
+            if matches!(tok, "," | "/" | "|") {
+                if run.is_empty() || linked {
+                    flush(&mut run, &mut named);
+                    linked = false;
+                } else {
+                    linked = true;
+                }
+            } else if children.contains(&word) {
+                if !(run.is_empty() || linked) {
+                    flush(&mut run, &mut named);
+                }
+                run.push(word);
+                linked = false;
+                if word != tok {
+                    flush(&mut run, &mut named);
+                }
+            } else {
+                flush(&mut run, &mut named);
+                linked = false;
+            }
+        }
+        flush(&mut run, &mut named);
+        named.sort();
+        named.dedup();
+        named
+    }
+
+    #[test]
+    fn hand_listed_children_tells_a_list_from_prose() {
+        let events = ["list", "ack", "reply", "show", "read"];
+        assert_eq!(
+            hand_listed_children("The github event inbox: list, ack, show", "events", &events),
+            ["ack", "list", "show"],
+        );
+        let stash = ["push", "pop", "show", "drop", "list"];
+        assert!(
+            !hand_listed_children("`pop` / `show` / `drop` take the one", "stash", &stash)
+                .is_empty()
+        );
+        assert!(
+            !hand_listed_children(
+                "`auto on|off|status`, with",
+                "auto",
+                &["on", "off", "status"]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            hand_listed_children("The event inbox: list/ack/show", "events", &events),
+            ["ack", "list", "show"],
+        );
+        assert_eq!(
+            hand_listed_children("Run `list`, `ack`, and then rest", "events", &events),
+            ["ack", "list"],
+        );
+        assert!(
+            hand_listed_children(
+                "Use `read` when you need the body. Use `ack` after handling the event.",
+                "events",
+                &events,
+            )
+            .is_empty(),
+            "children explained one at a time are guidance",
+        );
+        assert!(
+            hand_listed_children(
+                "Read or write review feedback",
+                "feedback",
+                &["write", "read"]
+            )
+            .is_empty()
+        );
+        assert!(
+            hand_listed_children(
+                "Switch this repo's remote on or off",
+                "remote",
+                &["status", "on", "off"]
+            )
+            .is_empty()
+        );
+        assert!(
+            hand_listed_children(
+                "Set a plan aside\nExamples:\n  clank stash pop\n  `clank stash list`, `clank stash drop`",
+                "stash",
+                &stash,
+            )
+            .is_empty(),
+            "an Examples block is usage",
+        );
+    }
+
+    /// No group's help keeps its own copy of the subcommand list clap
+    /// prints; the copies are what drifted (docs/cli-audit.md, F3).
+    #[test]
+    fn no_group_help_lists_its_own_subcommands() {
+        use clap::CommandFactory;
+        fn walk(c: &clap::Command, found: &mut Vec<String>) {
+            for sub in c.get_subcommands().filter(|s| s.has_subcommands()) {
+                let children: Vec<&str> = sub
+                    .get_subcommands()
+                    .map(|s| s.get_name())
+                    .filter(|n| *n != "help")
+                    .collect();
+                for text in [sub.get_about(), sub.get_long_about()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let named = hand_listed_children(&text.to_string(), sub.get_name(), &children);
+                    if !named.is_empty() {
+                        found.push(format!("{}: {named:?}", sub.get_name()));
+                    }
+                }
+                walk(sub, found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&Cli::command(), &mut found);
+        assert!(found.is_empty(), "group help lists its children: {found:?}");
     }
 
     #[test]

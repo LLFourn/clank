@@ -56,6 +56,9 @@ whole commands that agents are told to run.
 
 ## Findings
 
+F3 and F4 were fixed by `cli-help-says-what-it-is-for`; their sections
+record what was found, and the verdicts below show what remains.
+
 ### F1. Plumbing is listed beside user commands
 
 Some commands are run only by a hook clank installed, a process clank spawned,
@@ -333,9 +336,9 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `init` | once per repo, to start using clank there | human | R | keep | |
 | `setup` | after installing or upgrading clank | human | R | rename flag | F6: `--dry-run` is the one to keep |
 | `doctor` | when something is not waking or binding | both | R | keep | |
-| `status` | to see the plan, its gate and the agents | both | R S | fix doc | F1/F2: `--tui` text corrupted; README credits `--watch` with TUI keys |
+| `status` | to see the plan, its gate and the agents | both | R S | fix doc | F2: README credits `--watch` with TUI keys (the `--tui` text is fixed) |
 | `wait` | Grok agents arm it; people use `--for` to block on an event | both | R S | keep | Grok agents arm it themselves (`setup.rs` WORK_LOOP_GROK); `--for` serves observers; Claude/codex/opencode skills forbid it, correctly |
-| `queue` | to see what plans are lined up | both | R S | fix doc | F3: about omits `unqueue`; F5: `--repo` only before the subcommand |
+| `queue` | to see what plans are lined up | both | R S | fix usage | F5: `--repo` only before the subcommand |
 | `queue add` | to line up a drafted plan | agent | R S | keep | |
 | `queue remove` | to discard a queued plan | both | H | fix doc | F6: real distinction from `unqueue`, not in the README |
 | `queue promote` | when clank says the next plan can start | agent | R S | keep | F6: the clash is fixed on the `agent` side |
@@ -344,14 +347,14 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `feedback` | (group) | agent | R S | keep | |
 | `feedback write` | a reviewer recording its verdict | agent | R S | fix usage | F5: `--author` required, unlike every other author flag; establish why |
 | `feedback read` | the master reading a commit's verdicts | agent | S | fix doc | F8 |
-| `events` | (group) | agent | R S | fix doc | F3: about lists three of five; F6: show/read distinction unstated |
+| `events` | (group) | agent | R S | keep | F6: the about now states the show/read distinction |
 | `events list` | to see unhandled github and other events | agent | R S | keep | |
 | `events ack` | when an event is dealt with | agent | R S | keep | |
 | `events reply` | to answer an event without closing it | agent | R | fix doc | F8: missing from the reference table |
-| `events show` | to inspect an event's metadata safely | agent | R S | fix doc | F6 |
-| `events read` | to read an event's untrusted content | agent | R S | fix doc | F6, F8 |
+| `events show` | to inspect an event's metadata safely | agent | R S | keep | F6: distinction stated in the group about |
+| `events read` | to read an event's untrusted content | agent | R S | fix doc | F8 |
 | `send` | to message another agent | both | R S | keep | |
-| `nudge` | when an agent cannot receive `send` | human | H | fix doc | F2: help says no durable record, but each attempt is logged; F8 |
+| `nudge` | when an agent cannot receive `send` | human | H | fix doc | F8 (help now names the attempt history) |
 | `monitor` | (group, plumbing) | hook | none | hide | F1 |
 | `monitor start` | never by hand; clank spawns it | hook | none | hide | F1: spawned by clank (`monitor.rs:2269`) |
 | `monitor upgrade` | once, to retire monitors from old builds | legacy | H | hide | F1: one-time migration; verify before removing |
@@ -362,13 +365,13 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `log` | to read the commit and review timeline | human | R | keep | |
 | `finish` | when the gate says FINISHED | agent | R S | rename flag | F6: `--dry` |
 | `unfinish` | to reopen a plan finished by mistake | human | R | fix usage | F5: `[PLAN]` is required |
-| `agent` | (group) | human | R S | fix doc | F3: about lists six of eight |
-| `agent list` | to see the roster | both | S | fix doc | F3: "(master + reviewers)" |
-| `agent start` | to launch or resume one agent | human | R | fix doc | F4: plan name in help; F6: `<NAME>` |
+| `agent` | (group) | human | R S | keep | |
+| `agent list` | to see the roster | both | S | keep | |
+| `agent start` | to launch or resume one agent | human | R | rename arg | F6: `<NAME>` |
 | `agent add` | to put an agent on the roster | human | R S | merge | F2: three modes; the library mode moves to `team` |
-| `agent promote` | to make an agent master | human | S | rename | F6: clashes with `queue promote`; F4: help shows the config write |
-| `agent remove` | to take an agent off the roster | human | S | merge | F2: `--global` moves to `team`; F4 |
-| `agent set-review` | to change what a reviewer reviews | human | S | fix doc | F3: tier list omits `standby` |
+| `agent promote` | to make an agent master | human | S | rename | F6: clashes with `queue promote` |
+| `agent remove` | to take an agent off the roster | human | S | merge | F2: `--global` moves to `team` |
+| `agent set-review` | to change what a reviewer reviews | human | S | keep | |
 | `agent swap` | to replace one reviewer with another | human | H | fix doc | F8 |
 | `agent launch` | to see or set how an agent's tool is launched | human | R S | keep | F6: `<NAME>` |
 | `team` | (group) | human | R | merge | F2: gains the agent library |
@@ -377,12 +380,12 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `team show` | to see one saved team | human | H | fix doc | F8 |
 | `team delete` | to discard a saved team | human | H | rename | F6: `remove` |
 | `as` | in a session you started by hand | both | R S | keep | |
-| `auto` | (group) | both | R S | fix doc | F3: promises a role designation |
-| `auto on` | to let the Stop hook drive the session | both | R S | remove flag | F3: `--role` is a no-op |
-| `auto off` | to drive the session by hand | both | R S | remove flag | F3 |
+| `auto` | (group) | both | R S | keep | |
+| `auto on` | to let the Stop hook drive the session | both | R S | keep | `--role` removed |
+| `auto off` | to drive the session by hand | both | R S | keep | `--role` removed |
 | `auto status` | to check which it is | both | S | keep | |
 | `open` | to open the team's workspace | human | R | merge | F2: bare `open` is `open zellij` |
-| `open dry` | no known reason | legacy | H | hide | F1: no internal caller outside its tests, external use unknown; F4 |
+| `open dry` | no known reason | legacy | H | hide | F1: no internal caller outside its tests, external use unknown |
 | `open zellij` | the same as bare `open` | human | H | merge | F2 |
 | `fork` | (group) | human | R | keep | |
 | `fork create` | to try something in a parallel worktree | human | R | keep | |
@@ -408,7 +411,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `pr-review status` | to see who is still reviewing | agent | S | keep | |
 | `diff` | to read a plan's changes in your editor | human | R | rename flag | F6: `--print` kept; target heuristic is documented |
 | `html` | to build the static site | human | R | fix usage | F5: `--repo` only before the subcommand |
-| `html open` | to look at it in a browser | human | R | fix doc | F4; F6: `--print-path` |
+| `html open` | to look at it in a browser | human | R | rename flag | F6: `--print-path` |
 | `block` | (group) | agent | R S | merge | F2: ask and answer in one group |
 | `block create` | an agent asking the human a question it cannot answer | agent | R S | rename | F2: `block ask` |
 | `block clean` | tidying answered questions | agent | S | keep | |
@@ -427,7 +430,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `config finish.autosquash` | to set this value | human | H | fix usage | F5 |
 | `config recovery.blind_nudge` | to set this value | human | H | fix usage | F5 |
 | `export` | to get the raw roster JSON | human | R | keep | F2: raw shape differs from `agent list -j`; no internal caller, external use unknown |
-| `rereview` | to make reviewers look at a commit again | human | H | fix doc | F4, F8 |
+| `rereview` | to make reviewers look at a commit again | human | H | fix doc | F8 |
 | `rewire` | never by hand; the git hook runs it | hook | R | hide | F1, F5: only the hook form works |
 | `stop-hook` | never by hand; the tool's hook runs it | hook | R | hide | F1 |
 | `question-hook` | never by hand; the tool's hook runs it | hook | none | keep | already hidden |
@@ -471,7 +474,7 @@ Generated. Do not edit by hand.
 | `feedback` | group |  |  | Read or write review feedback |  |  |
 | `feedback write` | action |  |  | Write a feedback file |  | --repo --commit (required) --verdict (required) --author (required) -m (required) |
 | `feedback read` | action |  |  | Show all feedback for a commit |  | --commit --plan --repo -j/--json |
-| `events` | group |  |  | The github event inbox: list, ack, show |  |  |
+| `events` | group |  |  | The event inbox: what your wake sources delivered |  |  |
 | `events list` | action |  |  | List event metadata without reading content (unhandled by default) |  | --repo --author --all -j/--json |
 | `events ack` | action |  |  | Mark events handled so they stop waking you | <ID> | --reply --repo --author |
 | `events reply` | action |  |  | Send a further reply to an event whose backend takes replies, without acknowledging it | <ID> | --repo --author --operation -m/--message -F/--file one of --message/--file (required) |
@@ -490,26 +493,26 @@ Generated. Do not edit by hand.
 | `finish` | action |  |  | Finalize a plan into `finished/` | [PLAN] | --repo -m/--message --purge --squash --no-squash --into-branch --dry --force --no-cache |
 | `unfinish` | action |  |  | Move a finalized plan back to active | [PLAN] | --repo |
 | `agent` | group |  |  | Manage this repo's agent roster |  |  |
-| `agent list` | action |  |  | Enumerate the repo's roster (master + reviewers) with their role, review tier, and bind state |  | --repo -j/--json |
-| `agent start` | action |  |  | Launch an agent's CLI tool with any configured `launch` profile applied. With a bound session it RESUMES that session; without one it bootstraps, exec'ing the bare tool with a seed prompt telling the agent to run `clank as <name>` (agent-start-bootstraps-missing-skeleton) | <NAME> | --repo --print |
-| `agent add` | action |  |  | Add an agent to the repo's roster (ONE step — definition + role). Three modes: `--global --tool` writes a reusable DESCRIPTION to the user-scope library (no repo change); repo-scope `--tool` defines a fresh agent inline; repo-scope by-name (no `--tool`) copies a description from the user-scope library. `--review commit\|plan\|final\|gate\|standby` sets the tier (default `commit`); `standby` reviews nothing | <LABEL> -- TOOL ARGS… | --tool --review --global --cmd --env --launch-cmd (hidden) --launch-arg (hidden) --launch-env (hidden) --initial-prompt --repo |
-| `agent promote` | action |  |  | Promote an agent to the repo's master: `repo.agents[<name>].role = master`, demoting the previous master to `commit`. The agent must already be on the roster. (Distinct from `clank queue promote`, which activates a queued plan.) | <NAME> | --repo |
-| `agent remove` | action |  |  | Remove an agent from the repo's roster. `--global` instead drops a DESCRIPTION from the user-scope `agents` library (and scrubs any team template referencing it). Per-agent skeleton dir + feedback history are preserved | <LABEL> | --global --repo |
-| `agent set-review` | action |  |  | Change a non-master agent's tier (commit / plan / final / gate, or standby: reviewing nothing) in place — no remove/re-add, so the agent's session and zellij pane are undisturbed. Refuses on the master (not a reviewer tier) | <NAME> <REVIEW> | --repo |
-| `agent swap` | action |  |  | Replace a reviewer with another, keeping the role: one config write, so the role is never observed vacant and the gate's expected reviewer set never briefly shrinks. Refuses on the master (use `agent promote`) and refuses when the incoming label is already on the roster | <OUT> <IN> | --repo |
-| `agent launch` | action |  |  | Show an agent's launch profile and the command `agent start` would run. Given `--cmd`, `--env` or `-- <args>`, that is the agent's whole new launch (nothing is kept from before); `--clear` is the bare tool. The agent keeps its role, session and pane, and the change applies from its next start | <NAME> -- TOOL ARGS… | --cmd --env --clear --repo |
+| `agent list` | action |  |  | List the roster: each agent's role, review tier and binding |  | --repo -j/--json |
+| `agent start` | action |  |  | Start an agent's tool, resuming its session when it has one | <NAME> | --repo --print |
+| `agent add` | action |  |  | Put an agent on this repo's roster, with its review tier | <LABEL> -- TOOL ARGS… | --tool --review --global --cmd --env --launch-cmd (hidden) --launch-arg (hidden) --launch-env (hidden) --initial-prompt --repo |
+| `agent promote` | action |  |  | Make an agent the repo's master | <NAME> | --repo |
+| `agent remove` | action |  |  | Take an agent off this repo's roster | <LABEL> | --global --repo |
+| `agent set-review` | action |  |  | Change what a reviewer reviews | <NAME> <REVIEW> | --repo |
+| `agent swap` | action |  |  | Replace one reviewer with another in the same role | <OUT> <IN> | --repo |
+| `agent launch` | action |  |  | Show or set how an agent's tool is launched | <NAME> -- TOOL ARGS… | --cmd --env --clear --repo |
 | `team` | group |  |  | Save and reuse roster templates across repos |  |  |
 | `team save` | action |  |  | Publish THIS repo's roster as a reusable global template under `<name>` (user-scope `teams`), copying the roster's agent definitions into user-scope `agents`. Refuses if a referenced agent already exists globally with a different body; pass `--force` to overwrite an existing team name | <NAME> | --force --repo |
 | `team list` | action |  |  | List the global team-template library (user-scope) |  | -j/--json |
 | `team show` | action |  |  | Show a single global team template (its roster) | <TEAM> | -j/--json |
-| `team delete` | action |  |  | Delete a global team template. Refuses without `--force` (clank can't introspect which repos reference it) | <TEAM> | --force |
+| `team delete` | action |  |  | Delete a saved team | <TEAM> | --force |
 | `as` | action |  |  | Bind this session to a roster label | <LABEL> | --repo |
 | `auto` | group |  |  | Manage this agent's auto-mode |  |  |
-| `auto on` | action |  |  | Enable auto-mode (wait-for-work long-poll). Optionally update role |  | --repo --role |
-| `auto off` | action |  |  | Disable auto-mode. Optionally update role |  | --repo --role |
-| `auto status` | action |  |  | Print current auto-mode + role for the calling agent |  | --repo -j/--json |
+| `auto on` | action |  |  | Let the Stop hook hand this session its work |  | --repo |
+| `auto off` | action |  |  | Drive this session by hand |  | --repo |
+| `auto status` | action |  |  | Print this session's auto-mode and its roster role |  | --repo -j/--json |
 | `open` | group, bare runs |  |  | Open the team workspace in zellij |  | --repo --fork --pr --all --print |
-| `open dry` | action |  |  | Classify a path against the active repo; emit JSON or human-readable. Renamed from `clank open <path>` | <PATH> | -j/--json |
+| `open dry` | action |  |  | Report what `clank open` would do for a path, without opening anything | <PATH> | -j/--json |
 | `open zellij` | action |  |  | Auto-generate a zellij layout (KDL) for master + reviewer panes and spawn it via `zellij --layout` |  | --repo --fork --pr --all --print |
 | `fork` | group |  |  | Fork the team into a linked worktree |  |  |
 | `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open --review |
@@ -535,9 +538,9 @@ Generated. Do not edit by hand.
 | `pr-review status` | action |  |  | Round + per-reviewer verdicts + who we're waiting on |  | --pr |
 | `diff` | action |  |  | Open a plan or commit-range diff in your editor | [TARGET] | --plan --range --prompt --focus --wait --no-wait --print --repo |
 | `html` | group, bare runs |  |  | Render the timeline + status to a static site |  | --repo --rebuild --quiet |
-| `html open` | action |  |  | Build the site, then launch the host browser (`open` / `xdg-open` / `explorer`) on the generated `index.html` — or on `plan/<stem>.html` if a plan name is supplied | [PLAN] | --commit --queue --stash --print-path |
-| `block` | group |  |  | Ask the human a blocking question |  |  |
-| `block create` | action |  |  | Create a block | <NAME> | -m (required) --author --repo |
+| `html open` | action |  |  | Build the site and open it in your browser | [PLAN] | --commit --queue --stash --print-path |
+| `block` | group |  |  | Questions only the human can answer |  |  |
+| `block create` | action |  |  | Ask the human a question, and wait for the answer | <NAME> | -m (required) --author --repo |
 | `block clean` | action |  |  | Remove answered block+unblock pairs for this agent |  | --repo |
 | `block migrate` | action |  |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry --repo |
 | `unblock` | action |  |  | Answer a pending block | <AGENT> <NAME> | -m (required) --repo |
