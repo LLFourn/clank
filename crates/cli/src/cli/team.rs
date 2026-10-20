@@ -33,6 +33,7 @@ pub async fn run(args: TeamArgs) -> anyhow::Result<()> {
     match args.command {
         TeamCmd::Save(a) => team_save(a),
         TeamCmd::List(a) => list(&home_dir()?, a),
+        TeamCmd::Agent(a) => crate::cli::agent::run_library(a.command),
         TeamCmd::Show(a) => show_team(&home_dir()?, a),
         TeamCmd::Delete(a) => delete(&home_dir()?, a),
     }

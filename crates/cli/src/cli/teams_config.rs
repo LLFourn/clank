@@ -309,7 +309,7 @@ pub fn resolve_team(
 pub enum TeamResolveError {
     #[error(
         "team member `{member}` references library agent `{target}`, which is not in \
-         user-scope `agents`; add it (`clank agent add {target} --global --tool <tool>`) \
+         user-scope `agents`; add it (`clank team agent add {target} --tool <tool>`) \
          or define the member inline"
     )]
     UnknownRef {

@@ -6,7 +6,8 @@ use crate::agent_store::agents_root;
 
 pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
     match args.command {
-        BlockCmd::Create(a) => run_create(a).await,
+        BlockCmd::Ask(a) | BlockCmd::Create(a) => run_create(a).await,
+        BlockCmd::Answer(a) => run_unblock(a).await,
         BlockCmd::Clean(a) => run_clean(a).await,
         BlockCmd::Migrate(a) => run_migrate(a).await,
     }
@@ -454,6 +455,49 @@ mod tests {
                 .contains("already answered")
         );
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("first answer"));
+    }
+
+    /// `block ask`/`block answer` and the old `block create`/`unblock`
+    /// leave the same flat pair.
+    #[tokio::test]
+    async fn the_old_and_new_spellings_leave_the_same_pair() {
+        let ask = |root: &std::path::Path| crate::cli::BlockCreateArgs {
+            name: "q".into(),
+            message: "why?".into(),
+            author: Some("claude".into()),
+            repo: Some(root.to_path_buf()),
+        };
+        let answer = |root: &std::path::Path| crate::cli::UnblockArgs {
+            agent: "claude".into(),
+            name: "q".into(),
+            message: "yes".into(),
+            repo: Some(root.to_path_buf()),
+        };
+        let new = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        run(BlockArgs {
+            command: BlockCmd::Ask(ask(new.path())),
+        })
+        .await
+        .unwrap();
+        run(BlockArgs {
+            command: BlockCmd::Answer(answer(new.path())),
+        })
+        .await
+        .unwrap();
+        run(BlockArgs {
+            command: BlockCmd::Create(ask(old.path())),
+        })
+        .await
+        .unwrap();
+        run_unblock(answer(old.path())).await.unwrap();
+        for rel in [
+            ".clank/agents/claude/blocks/q.md",
+            ".clank/agents/claude/unblocks/q.md",
+        ] {
+            let read = |root: &std::path::Path| std::fs::read_to_string(root.join(rel)).unwrap();
+            assert_eq!(read(new.path()), read(old.path()), "{rel}");
+        }
     }
 
     #[tokio::test]

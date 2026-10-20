@@ -3130,25 +3130,25 @@ mod tests {
         // skill that still teaches it hands agents a failing command.
         // Scoped to the recipe's own paragraph: `--plan` is a real
         // flag on other commands the skill teaches.
-        // `block create` is a MASTER command — reviewers must not
+        // `block ask` is a MASTER command — reviewers must not
         // carry it.
         for tool in [Tool::Claude, Tool::Codex] {
             let body = compose_skill(Role::Master, tool);
             assert!(
-                body.contains(r#"clank block create <name> -m "question""#),
-                "master must document the flat block create recipe"
+                body.contains(r#"clank block ask <name> -m "question""#),
+                "master must document the flat block ask recipe"
             );
             let recipe = body
                 .split("\n\n")
-                .find(|para| para.contains("clank block create"))
-                .expect("the block create recipe");
+                .find(|para| para.contains("clank block ask"))
+                .expect("the block ask recipe");
             assert!(
                 !recipe.contains("--plan"),
-                "block create recipe must not carry the deleted --plan flag: {recipe}"
+                "block ask recipe must not carry the deleted --plan flag: {recipe}"
             );
             assert!(
-                !compose_skill(Role::Reviewer, tool).contains("clank block create"),
-                "reviewer must not carry the master-only block-create command"
+                !compose_skill(Role::Reviewer, tool).contains("clank block ask"),
+                "reviewer must not carry the master-only block-ask command"
             );
         }
     }

@@ -21,9 +21,9 @@ investigated while authoring this checklist and need no plan.
   today).
 - [ ] **`first-run-experience-test`** — walk the true
   first-contact path on a clean machine/user: install → `clank
-  setup` → agent declarations (`clank agent add --global`) +
+  setup` → agent declarations (`clank team agent add`) +
   a saved team (`clank team save`) → `clank init --team` →
-  `clank open zellij` → first plan through the full review
+  `clank open` → first plan through the full review
   loop. Every rough edge found becomes a checklist
   addendum. (Several first-run fixes already landed this cycle:
   bare `clank init` adopts the user's `default` team; init warns

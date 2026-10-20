@@ -58,8 +58,8 @@ whole commands that agents are told to run.
 
 F3 and F4 were fixed by `cli-help-says-what-it-is-for`, F7 by
 `cli-help-is-beautiful` (sectioned, styled top-level help), F8 by
-`cli-readme-covers-the-surface`, F1 by `cli-plumbing-out-of-sight`, and F5
-by `cli-usage-is-the-contract`.
+`cli-readme-covers-the-surface`, F1 by `cli-plumbing-out-of-sight`, F5
+by `cli-usage-is-the-contract`, and F2 by `cli-one-noun-one-group`.
 F1's claim that `open dry` had no caller was wrong: `open-worktree.sh`
 calls it, so it is hidden and kept. Their sections
 record what was found, and the verdicts below show what remains.
@@ -373,13 +373,17 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `agent` | (group) | human | R S | keep | |
 | `agent list` | to see the roster | both | S | keep | |
 | `agent start` | to launch or resume one agent | human | R | rename arg | F6: `<NAME>` |
-| `agent add` | to put an agent on the roster | human | R S | merge | F2: three modes; the library mode moves to `team` |
+| `agent add` | to put an agent on the roster | human | R S | keep | the library mode moved to `team agent add`; `--global` is its hidden old spelling |
 | `agent promote` | to make an agent master | human | S | rename | F6: clashes with `queue promote` |
-| `agent remove` | to take an agent off the roster | human | S | merge | F2: `--global` moves to `team` |
+| `agent remove` | to take an agent off the roster | human | S | keep | `--global` is the hidden old spelling of `team agent remove` |
 | `agent set-review` | to change what a reviewer reviews | human | S | keep | |
 | `agent swap` | to replace one reviewer with another | human | R | keep |  |
 | `agent launch` | to see or set how an agent's tool is launched | human | R S | keep | F6: `<NAME>` |
-| `team` | (group) | human | R | merge | F2: gains the agent library |
+| `team` | (group) | human | R | keep | holds the agent library too |
+| `team agent` | (group) | human | R | keep | your library of agent descriptions |
+| `team agent add` | to save an agent description for any repo | human | R | keep | |
+| `team agent remove` | to drop one, and from the teams that use it | human | R | keep | |
+| `team agent list` | to see your library | human | R | keep | |
 | `team save` | to reuse this repo's roster elsewhere | human | R | keep | |
 | `team list` | to see saved teams | human | R | keep |  |
 | `team show` | to see one saved team | human | R | keep |  |
@@ -389,9 +393,9 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `auto on` | to let the Stop hook drive the session | both | R S | keep | `--role` removed |
 | `auto off` | to drive the session by hand | both | R S | keep | `--role` removed |
 | `auto status` | to check which it is | both | S | keep | |
-| `open` | to open the team's workspace | human | R | merge | F2: bare `open` is `open zellij` |
+| `open` | to open the team's workspace | human | R | keep | one action; options before or after the hidden `zellij` are one request |
 | `open dry` | to read what `clank open` would do, as JSON | hook | R | keep | hidden; `open-worktree.sh` reads its JSON, so the audit's "no caller" was wrong |
-| `open zellij` | the same as bare `open` | human | H | merge | F2 |
+| `open zellij` | the same as bare `open` | legacy | R | keep | hidden old spelling |
 | `fork` | (group) | human | R | keep | |
 | `fork create` | to try something in a parallel worktree | human | R | keep | |
 | `fork list` | to see the forks | human | R | keep |  |
@@ -417,11 +421,13 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `diff` | to read a plan's changes in your editor | human | R | rename flag | F6: `--print` kept; target heuristic is documented |
 | `html` | to build the static site | human | R | keep | `--repo` after the subcommand fixed |
 | `html open` | to look at it in a browser | human | R | rename flag | F6: `--print-path` |
-| `block` | (group) | agent | R S | merge | F2: ask and answer in one group |
-| `block create` | an agent asking the human a question it cannot answer | agent | R S | rename | F2: `block ask` |
+| `block` | (group) | agent | R S | keep | ask and answer in one group |
+| `block ask` | an agent asking the human a question it cannot answer | agent | R S | keep | |
+| `block create` | an agent asking the human a question it cannot answer | legacy | R | keep | hidden old spelling of `block ask` |
+| `block answer` | the human answering | human | R | keep | |
 | `block clean` | tidying answered questions | agent | S | keep | |
 | `block migrate` | once, on a repo with the old layout | legacy | R | keep | hidden; kept, since legacy layouts can exist on other machines |
-| `unblock` | the human answering | human | R | merge | F2: `block answer` |
+| `unblock` | the human answering | legacy | R | keep | hidden old spelling of `block answer` |
 | `attending` | an agent waiting on a task it started some other way | agent | R S | keep |  |
 | `tui` | to drive a running team | human | R | keep | |
 | `run` | an agent backgrounding a long command | agent | R S | keep |  |
@@ -500,15 +506,19 @@ Generated. Do not edit by hand.
 | `agent` | group |  |  | Manage this repo's agent roster |  |  |
 | `agent list` | action |  |  | List the roster: each agent's role, review tier and binding |  | --repo -j/--json |
 | `agent start` | action |  |  | Start an agent's tool, resuming its session when it has one | <NAME> | --repo --print |
-| `agent add` | action |  |  | Put an agent on this repo's roster, with its review tier | <LABEL> -- TOOL ARGS… | --tool --review --global --cmd --env --launch-cmd (hidden) --launch-arg (hidden) --launch-env (hidden) --initial-prompt --repo |
+| `agent add` | action |  |  | Put an agent on this repo's roster, with its review tier | <LABEL> -- TOOL ARGS… | --tool --review --global (hidden) --cmd --env --launch-cmd (hidden) --launch-arg (hidden) --launch-env (hidden) --initial-prompt --repo |
 | `agent promote` | action |  |  | Make an agent the repo's master | <NAME> | --repo |
-| `agent remove` | action |  |  | Take an agent off this repo's roster | <LABEL> | --global --repo |
+| `agent remove` | action |  |  | Take an agent off this repo's roster | <LABEL> | --global (hidden) --repo |
 | `agent set-review` | action |  |  | Change what a reviewer reviews | <NAME> <REVIEW> | --repo |
 | `agent swap` | action |  |  | Replace one reviewer with another in the same role | <OUT> <IN> | --repo |
 | `agent launch` | action |  |  | Show or set how an agent's tool is launched | <NAME> -- TOOL ARGS… | --cmd --env --clear --repo |
-| `team` | group |  |  | Save and reuse roster templates across repos |  |  |
+| `team` | group |  |  | Your saved teams and agent descriptions, shared across repos |  |  |
 | `team save` | action |  |  | Save this repo's roster as a team other repos can use | <NAME> | --force --repo |
 | `team list` | action |  |  | List the global team-template library (user-scope) |  | -j/--json |
+| `team agent` | group |  |  | Your library of agent descriptions, which rosters and teams copy |  |  |
+| `team agent add` | action |  |  | Save an agent description to your library | <LABEL> -- TOOL ARGS… | --tool (required) --cmd --env --initial-prompt |
+| `team agent remove` | action |  |  | Remove a description from your library and the teams that use it | <LABEL> |  |
+| `team agent list` | action |  |  | List your library's agent descriptions |  | -j/--json |
 | `team show` | action |  |  | Show a single global team template (its roster) | <TEAM> | -j/--json |
 | `team delete` | action |  |  | Delete a saved team | <TEAM> | --force |
 | `as` | action |  |  | Bind this session to a roster label | <LABEL> | --repo |
@@ -518,7 +528,7 @@ Generated. Do not edit by hand.
 | `auto status` | action |  |  | Print this session's auto-mode and its roster role |  | --repo -j/--json |
 | `open` | group, bare runs |  |  | Open the team workspace in zellij |  | --repo --fork --pr --all --print |
 | `open dry` | action | hidden |  | Report what `clank open` would do for a path, without opening anything | <PATH> | -j/--json |
-| `open zellij` | action |  |  | Open the workspace, the same as bare `clank open` |  | --repo --fork --pr --all --print |
+| `open zellij` | action | hidden |  | Open the workspace, the same as bare `clank open` |  | --repo --fork --pr --all --print |
 | `fork` | group |  |  | Fork the team into a linked worktree |  |  |
 | `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open --review |
 | `fork list` | action |  |  | List this repo's forks |  | --repo |
@@ -545,10 +555,12 @@ Generated. Do not edit by hand.
 | `html` | group, bare runs |  |  | Render the timeline + status to a static site |  | --repo --rebuild --quiet |
 | `html open` | action |  |  | Build the site and open it in your browser | [PLAN] | --commit --queue --stash --print-path |
 | `block` | group |  |  | Questions only the human can answer |  |  |
-| `block create` | action |  |  | Ask the human a question, and wait for the answer | <NAME> | -m (required) --author --repo |
+| `block ask` | action |  |  | Ask the human a question, and wait for the answer | <NAME> | -m (required) --author --repo |
+| `block create` | action | hidden |  | The old spelling of `block ask` | <NAME> | -m (required) --author --repo |
+| `block answer` | action |  |  | Answer an agent's question | <AGENT> <NAME> | -m (required) --repo |
 | `block clean` | action |  |  | Remove answered block+unblock pairs for this agent |  | --repo |
 | `block migrate` | action | hidden |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry --repo |
-| `unblock` | action |  |  | Answer a pending block | <AGENT> <NAME> | -m (required) --repo |
+| `unblock` | action | hidden |  | The old spelling of `block answer` | <AGENT> <NAME> | -m (required) --repo |
 | `attending` | action |  |  | Tell clank which background task you are waiting on | [TASK_ID] | --pid --desc --expect --clear --author --repo |
 | `tui` | action |  |  | The full-screen pane for driving a running team |  | --repo --no-cache |
 | `run` | action |  |  | Run a command under clank, so it knows exactly when the work ends | <CMD> | --desc (required) --expect --author --repo |

@@ -1255,9 +1255,8 @@ fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
 // ── clank agent add / promote / remove ────────────────────
 //
 // The repo's `agents` IS the roster. `agent add` is ONE step
-// (definition + role). Three modes:
-//   - `--global --tool`: write a role-free DESCRIPTION into the
-//     user-scope `agents` LIBRARY (no repo change);
+// (definition + role). Two modes (the library is `team agent`, and
+// the hidden `--global` spelling routes there):
 //   - repo `--tool`: define a fresh agent inline → insert a
 //     RosterAgent with the `--review` role;
 //   - repo by-name (no `--tool`): copy a description from the
@@ -1276,21 +1275,8 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     });
 
     if args.global {
-        let tool = args.tool.ok_or_else(|| {
-            anyhow::anyhow!("--global requires --tool (a library description needs a tool)")
-        })?;
-        let launch = launch_from_add(&args)?;
-        let desc = AgentDescription {
-            tool: tool.into(),
-            launch,
-            initial_prompt: args.initial_prompt.clone(),
-        };
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let home_ref = home
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
-        declare_global_agent(home_ref, &label, desc)?;
-        return Ok(());
+        let (label, desc) = library_entry_from_add(&args)?;
+        return declare_global_agent(&library_home()?, &label, desc);
     }
 
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -1752,7 +1738,7 @@ fn library_description(
             "unknown agent `{label}`: not in the user-scope `agents` library. \
              Define it inline with `clank agent add {label} --tool <claude|codex|grok|opencode>`, \
              or add it to the library first with \
-             `clank agent add {label} --global --tool <claude|codex|grok|opencode>`.",
+             `clank team agent add {label} --tool <claude|codex|grok|opencode>`.",
             label = label.as_str()
         )
     })
@@ -1981,13 +1967,7 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
 
     if args.global {
-        // User-scope op: needs only $HOME, never repo discovery (mirror
-        // `agent add --global`).
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let home_ref = home
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
-        remove_global_agent(home_ref, &label)?;
+        remove_global_agent(&library_home()?, &label)?;
     } else {
         let repo = resolve_repo(args.repo.as_deref())?;
         // Capture the role BEFORE removal: only a reviewer's pane is in
@@ -2120,6 +2100,114 @@ fn parse_env_overrides(raw: &[String]) -> anyhow::Result<BTreeMap<String, String
 /// declaration's `launch` field is absent rather than `Some({})`).
 /// The launch profile `agent add` was given, in either spelling; clap
 /// refuses the two mixed.
+/// `$HOME`, whose `~/.clank/config.json` holds the agent library. Library
+/// operations need nothing else: no repo, no discovery.
+fn library_home() -> anyhow::Result<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("the agent library needs $HOME"))
+}
+
+/// `clank team agent add|remove|list`: your library of agent descriptions.
+pub(crate) fn run_library(cmd: crate::cli::TeamAgentCmd) -> anyhow::Result<()> {
+    use crate::cli::TeamAgentCmd;
+    let home = library_home()?;
+    match cmd {
+        TeamAgentCmd::Add(a) => {
+            let (label, desc) = library_entry(&a)?;
+            declare_global_agent(&home, &label, desc)
+        }
+        TeamAgentCmd::Remove(a) => {
+            let label = AgentLabel::parse(&a.label)
+                .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", a.label))?;
+            remove_global_agent(&home, &label)
+        }
+        TeamAgentCmd::List(a) => print_library(&home, a.json),
+    }
+}
+
+/// The library entry `clank team agent add` describes.
+fn library_entry(
+    args: &crate::cli::TeamAgentAddArgs,
+) -> anyhow::Result<(AgentLabel, AgentDescription)> {
+    let label = AgentLabel::parse(&args.label)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
+    let launch = build_launch(
+        args.cmd.clone(),
+        args.tool_args.clone(),
+        parse_env_overrides(&args.env)?,
+    );
+    Ok((
+        label,
+        AgentDescription {
+            tool: args.tool.into(),
+            launch,
+            initial_prompt: args.initial_prompt.clone(),
+        },
+    ))
+}
+
+/// The same entry, from the old `clank agent add --global --tool` spelling.
+fn library_entry_from_add(args: &AgentAddArgs) -> anyhow::Result<(AgentLabel, AgentDescription)> {
+    let label = AgentLabel::parse(&args.label)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
+    let tool = args.tool.ok_or_else(|| {
+        anyhow::anyhow!("--global requires --tool (a library description needs a tool)")
+    })?;
+    Ok((
+        label,
+        AgentDescription {
+            tool: tool.into(),
+            launch: launch_from_add(args)?,
+            initial_prompt: args.initial_prompt.clone(),
+        },
+    ))
+}
+
+/// `clank team agent list`: each description's label, tool and launch.
+pub fn print_library(home: &Path, json: bool) -> anyhow::Result<()> {
+    let file = read_user_config(home)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&file.agents)?);
+        return Ok(());
+    }
+    if file.agents.is_empty() {
+        println!(
+            "no agents in your library; add one with `clank team agent add <label> --tool <tool>`"
+        );
+        return Ok(());
+    }
+    let width = file
+        .agents
+        .keys()
+        .map(|l| l.as_str().len())
+        .max()
+        .unwrap_or(0);
+    for (label, desc) in &file.agents {
+        let tool = desc.tool.as_str();
+        let line = desc.launch.as_ref().map(|l| {
+            let mut words: Vec<String> = l
+                .env
+                .iter()
+                .map(|(k, v)| shell_quote(&format!("{k}={v}")))
+                .collect();
+            words.push(
+                l.command
+                    .as_deref()
+                    .map(shell_quote)
+                    .unwrap_or_else(|| tool.to_string()),
+            );
+            words.extend(l.args.iter().map(|a| shell_quote(a)));
+            words.join(" ")
+        });
+        match line {
+            Some(line) => println!("{:<width$}  {tool}  {line}", label.as_str()),
+            None => println!("{:<width$}  {tool}", label.as_str()),
+        }
+    }
+    Ok(())
+}
+
 fn launch_from_add(args: &AgentAddArgs) -> anyhow::Result<Option<LaunchConfig>> {
     let mut env = parse_env_overrides(&args.env)?;
     env.extend(parse_env_overrides(&args.launch_envs)?);
@@ -3068,7 +3156,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown agent `phantom`"));
         assert!(msg.contains("--tool"));
-        assert!(msg.contains("--global"));
+        assert!(msg.contains("clank team agent add phantom"), "{msg}");
     }
 
     #[test]
@@ -3853,6 +3941,95 @@ mod tests {
         let phantom = AgentLabel::parse("phantom").unwrap();
         let err = remove_repo_agent(repo.path(), &phantom).unwrap_err();
         assert!(format!("{err:#}").contains("not on this repo's roster"));
+    }
+
+    /// `clank team agent add` and the old `clank agent add --global`
+    /// describe the same library entry, launch included.
+    #[test]
+    fn both_library_spellings_describe_the_same_entry() {
+        use crate::cli::command::{Cli, Command};
+        use clap::Parser;
+        let tail = [
+            "--tool",
+            "codex",
+            "--cmd",
+            "codex-beta",
+            "--env",
+            "CODEX_HOME=/h",
+            "--",
+            "--no-daemon",
+        ];
+        let new: Vec<&str> = ["clank", "team", "agent", "add", "web"]
+            .into_iter()
+            .chain(tail)
+            .collect();
+        let old: Vec<&str> = ["clank", "agent", "add", "web", "--global"]
+            .into_iter()
+            .chain(tail)
+            .collect();
+        let Command::Team(crate::cli::TeamArgs {
+            command:
+                crate::cli::TeamCmd::Agent(crate::cli::TeamAgentArgs {
+                    command: crate::cli::TeamAgentCmd::Add(new),
+                }),
+        }) = Cli::try_parse_from(new).unwrap().command
+        else {
+            panic!("team agent add")
+        };
+        let Command::Agent(crate::cli::AgentArgs {
+            command: crate::cli::AgentCmd::Add(old),
+        }) = Cli::try_parse_from(old).unwrap().command
+        else {
+            panic!("agent add --global")
+        };
+        let new = library_entry(&new).unwrap();
+        assert_eq!(new, library_entry_from_add(&old).unwrap());
+        let launch = new.1.launch.expect("the launch is kept");
+        assert_eq!(launch.command.as_deref(), Some("codex-beta"));
+        assert_eq!(launch.args, vec!["--no-daemon".to_string()]);
+    }
+
+    /// The library round trip touches only the user's config: no repo is
+    /// named, found or written.
+    #[test]
+    fn the_library_lives_in_the_users_config_only() {
+        let home = tempfile::tempdir().unwrap();
+        let label = AgentLabel::parse("web").unwrap();
+        let desc = AgentDescription {
+            tool: Tool::Codex,
+            launch: build_launch(None, vec!["--no-daemon".into()], Default::default()),
+            initial_prompt: None,
+        };
+        declare_global_agent(home.path(), &label, desc.clone()).unwrap();
+        assert_eq!(
+            read_user_config(home.path()).unwrap().agents.get(&label),
+            Some(&desc)
+        );
+        print_library(home.path(), false).unwrap();
+        print_library(home.path(), true).unwrap();
+        remove_global_agent(home.path(), &label).unwrap();
+        assert!(read_user_config(home.path()).unwrap().agents.is_empty());
+        let entries: Vec<_> = walk(home.path());
+        assert_eq!(
+            entries,
+            vec![".clank".to_string(), ".clank/config.json".to_string()]
+        );
+
+        fn walk(root: &Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let p = e.path();
+                    out.push(p.strip_prefix(root).unwrap().display().to_string());
+                    if p.is_dir() {
+                        stack.push(p);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
     }
 
     #[test]

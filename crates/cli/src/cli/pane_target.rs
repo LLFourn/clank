@@ -82,7 +82,7 @@ pub(crate) fn locate(scan: &SessionScan, repo: &Path, label: &AgentLabel) -> any
             missed()
         ),
         [] => anyhow::bail!(
-            "no pane for `{label}` in {} in any live zellij session — `clank open zellij` \
+            "no pane for `{label}` in {} in any live zellij session — `clank open` \
              starts the team.",
             repo.display()
         ),

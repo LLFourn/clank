@@ -41,7 +41,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
             "queue", "finish", "unfinish", "stash", "pick", "purge", "rereview", "diff", "html",
         ],
     ),
-    ("Review", &["feedback", "pr-review", "block", "unblock"]),
+    ("Review", &["feedback", "pr-review", "block"]),
     ("The team", &["agent", "team", "open", "fork"]),
     ("Talking", &["send", "nudge", "events"]),
     ("Remote", &["remote"]),
@@ -292,10 +292,11 @@ pub enum Command {
     /// Each agent on the roster has a tool, a launch profile and a
     /// role: master, a review tier, or standby.
     Agent(crate::cli::AgentArgs),
-    /// Save and reuse roster templates across repos
+    /// Your saved teams and agent descriptions, shared across repos
     ///
-    /// A team is a saved roster. Seed a new repo from one with
-    /// `clank init --team <name>`.
+    /// A team is a saved roster; seed a new repo from one with
+    /// `clank init --team <name>`. Your agent library holds the
+    /// descriptions rosters copy by name.
     Team(crate::cli::TeamArgs),
     /// Bind this session to a roster label
     ///
@@ -364,10 +365,11 @@ pub enum Command {
     Html(crate::cli::HtmlArgs),
     /// Questions only the human can answer
     ///
-    /// An agent blocks on a decision it must not make itself; the human
-    /// answers with `clank unblock`.
+    /// An agent asks when it needs a decision it must not make itself,
+    /// and waits; the human's answer wakes it.
     Block(crate::cli::BlockArgs),
-    /// Answer a pending block
+    /// The old spelling of `block answer`.
+    #[command(hide = true)]
     Unblock(crate::cli::UnblockArgs),
     /// Tell clank which background task you are waiting on
     ///
@@ -626,18 +628,19 @@ mod tests {
     }
 
     /// Whether `row` names `child` of `parent` in code: `child`,
-    /// `parent child`, or `clank parent child`, as the first word of a
-    /// backticked span.
+    /// `parent child`, or `clank parent child`, leading a backticked span.
+    /// `child` may be a nested path such as `agent add`.
     fn row_names_child(row: &str, parent: &str, child: &str) -> bool {
+        let want: Vec<&str> = child.split(' ').collect();
         row.split('`').skip(1).step_by(2).any(|span| {
-            let mut words = span.split_whitespace().peekable();
-            if words.peek() == Some(&"clank") {
-                words.next();
+            let mut words: Vec<&str> = span.split_whitespace().collect();
+            if words.first() == Some(&"clank") {
+                words.remove(0);
             }
-            if words.peek() == Some(&parent) {
-                words.next();
+            if words.first() == Some(&parent) {
+                words.remove(0);
             }
-            words.next() == Some(child)
+            words.starts_with(&want)
         })
     }
 
@@ -661,6 +664,12 @@ mod tests {
                         "`{name}`'s row does not name `{}`",
                         child.get_name()
                     ));
+                }
+                for leaf in visible_children(child) {
+                    let path = format!("{} {}", child.get_name(), leaf.get_name());
+                    if !row_names_child(row, name, &path) {
+                        gaps.push(format!("`{name}`'s row does not name `{path}`"));
+                    }
                 }
             }
         }
@@ -702,12 +711,13 @@ mod tests {
             readme_gaps(&moved).contains(&"`queue`'s row does not name `unqueue`".to_string()),
             "a mention in another row does not count"
         );
-        let block = row_of("block` / `unblock");
-        let without_unblock = text.replace(
-            &block,
-            &block.replace("| `block` / `unblock` |", "| `block` |"),
+        let team = row_of("team");
+        let without_leaf = text.replace(&team, &team.replace("`agent list`", "agent list"));
+        assert!(
+            readme_gaps(&without_leaf)
+                .contains(&"`team`'s row does not name `agent list`".to_string()),
+            "a nested operation is checked too"
         );
-        assert!(readme_gaps(&without_unblock).contains(&"no row for `unblock`".to_string()));
         assert!(readme_gaps(&text).is_empty());
     }
 
@@ -1334,6 +1344,9 @@ mod tests {
         ("monitor", "upgrade", &["monitor", "upgrade"]),
         ("block", "migrate", &["block", "migrate", "--dry"]),
         ("open", "dry", &["open", "dry", "/some/path", "--json"]),
+        ("", "unblock", &["unblock", "claude", "q", "-m", "yes"]),
+        ("block", "create", &["block", "create", "q", "-m", "why?"]),
+        ("open", "zellij", &["open", "zellij", "--print"]),
     ];
 
     /// Hiding is presentation only: every installed hook string and
@@ -1523,6 +1536,35 @@ mod tests {
         assert!(Cli::try_parse_from(["clank", "unfinish", "p"]).is_ok());
         assert!(Cli::try_parse_from(["clank", "rewire"]).is_err());
         assert!(Cli::try_parse_from(["clank", "rewire", "--from-stdin"]).is_ok());
+    }
+
+    /// Each old spelling parses to the same request as the new one.
+    #[test]
+    fn old_spellings_parse_to_the_new_requests() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv.iter().copied()).unwrap().command;
+        let ask = |argv: &[&str]| match parse(argv) {
+            Command::Block(crate::cli::BlockArgs {
+                command: crate::cli::BlockCmd::Ask(a) | crate::cli::BlockCmd::Create(a),
+            }) => format!("{a:?}"),
+            _ => panic!("{argv:?}"),
+        };
+        assert_eq!(
+            ask(&["clank", "block", "ask", "q", "-m", "why?", "--author", "a"]),
+            ask(&[
+                "clank", "block", "create", "q", "-m", "why?", "--author", "a"
+            ]),
+        );
+        let answer = |argv: &[&str]| match parse(argv) {
+            Command::Block(crate::cli::BlockArgs {
+                command: crate::cli::BlockCmd::Answer(a),
+            })
+            | Command::Unblock(a) => format!("{a:?}"),
+            _ => panic!("{argv:?}"),
+        };
+        assert_eq!(
+            answer(&["clank", "block", "answer", "claude", "q", "-m", "yes"]),
+            answer(&["clank", "unblock", "claude", "q", "-m", "yes"]),
+        );
     }
 
     #[test]

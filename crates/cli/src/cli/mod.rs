@@ -413,7 +413,7 @@ pub struct HtmlOpenArgs {
     pub stash: Option<String>,
     /// Print the resolved target path on stdout and exit
     /// without launching a browser. Mirrors `--print` on
-    /// `clank agent start`, `clank diff`, `clank open zellij`.
+    /// `clank agent start`, `clank diff`, `clank open`.
     #[arg(long)]
     pub print_path: bool,
 }
@@ -451,6 +451,7 @@ pub enum OpenCmd {
     ///
     /// Use `--print` to emit the composed KDL on stdout + the
     /// would-be-spawned argv on stderr instead of shelling out.
+    #[command(hide = true)]
     Zellij(OpenZellijArgs),
 }
 
@@ -1301,12 +1302,10 @@ pub enum AgentCmd {
     Start(AgentStartArgs),
     /// Put an agent on this repo's roster, with its review tier
     ///
-    /// By name, the agent is copied from your user-scope library; with
-    /// `--tool`, it is defined here. `--review` sets the tier; without
-    /// it the agent becomes master on a roster that has none, and a
-    /// `commit` reviewer otherwise. With `--global --tool`,
-    /// the description is saved to the library instead, and this repo
-    /// is not touched.
+    /// By name, the agent is copied from your library (`clank team agent
+    /// add` puts one there); with `--tool`, it is defined here. `--review`
+    /// sets the tier; without it the agent becomes master on a roster that
+    /// has none, and a `commit` reviewer otherwise.
     #[command(after_long_help = "\
 Examples:
   # a codex reviewer that reviews every commit
@@ -1324,9 +1323,8 @@ Examples:
     Promote(AgentPromoteArgs),
     /// Take an agent off this repo's roster
     ///
-    /// Its feedback history is kept. With `--global`, a description is
-    /// removed from your user-scope library instead, and from every
-    /// saved team that uses it.
+    /// Its feedback history is kept. Your library's copy, if any, is not
+    /// touched (`clank team agent remove` does that).
     Remove(AgentRemoveArgs),
     /// Change what a reviewer reviews
     ///
@@ -1383,7 +1381,7 @@ pub struct AgentStartArgs {
     pub repo: Option<PathBuf>,
     /// Instead of execing the composed command, print the argv
     /// (shell-quoted, on stdout) and the env diff (on stderr)
-    /// and exit 0. Useful for `clank open zellij` to introspect
+    /// and exit 0. Useful for `clank open` to introspect
     /// the spawn line, and for integration tests that can't
     /// observe an exec'd process.
     #[arg(long)]
@@ -1394,23 +1392,17 @@ pub struct AgentStartArgs {
 pub struct AgentAddArgs {
     /// Agent label to add.
     pub label: String,
-    /// Tool this agent runs (`claude` / `codex`). REQUIRED with
-    /// `--global` (a library description needs a tool) and to
-    /// define a fresh agent inline at repo scope. OMIT at repo
-    /// scope to add `<label>` BY NAME — its description is copied
-    /// from the user-scope `agents` library.
+    /// Tool this agent runs, to define it here. Omit it to add `<label>`
+    /// by name, copied from your library (`clank team agent add`).
     #[arg(long, value_enum)]
     pub tool: Option<ToolArg>,
     /// Tier for the new roster entry: `commit`, `plan`, `final`,
-    /// `gate`, or `standby`. Omitted, the agent becomes master on a roster that has
-    /// none, and `commit` otherwise. Ignored with `--global` (the
-    /// library has no role).
+    /// `gate`, or `standby`. Omitted, the agent becomes master on a roster
+    /// that has none, and `commit` otherwise.
     #[arg(long, value_enum)]
     pub review: Option<ReviewKindArg>,
-    /// Write the agent DESCRIPTION to the user-scope library
-    /// (`~/.clank/config.json#/agents`, reusable, NO role) instead
-    /// of the repo roster. Requires `--tool`. No repo change.
-    #[arg(long)]
+    /// The old spelling of `clank team agent add`.
+    #[arg(long, hide = true)]
     pub global: bool,
     /// The executable `clank agent start` runs, instead of the tool's
     /// own name.
@@ -1498,11 +1490,8 @@ pub struct AgentPromoteArgs {
 pub struct AgentRemoveArgs {
     /// Agent label to remove.
     pub label: String,
-    /// Remove the DESCRIPTION from the user-scope library
-    /// (`~/.clank/config.json#/agents`) and scrub it from any team
-    /// template that references it. Without `--global`, removes the
-    /// agent from THIS repo's roster.
-    #[arg(long)]
+    /// The old spelling of `clank team agent remove`.
+    #[arg(long, hide = true)]
     pub global: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
@@ -1542,6 +1531,11 @@ pub enum TeamCmd {
     Save(TeamSaveArgs),
     /// List the global team-template library (user-scope).
     List(TeamListArgs),
+    /// Your library of agent descriptions, which rosters and teams copy
+    ///
+    /// A description is a tool and its launch, with no role: a repo's
+    /// roster gives it one when `clank agent add <name>` copies it.
+    Agent(TeamAgentArgs),
     /// Show a single global team template (its roster).
     Show(TeamShowArgs),
     /// Delete a saved team
@@ -1549,6 +1543,52 @@ pub enum TeamCmd {
     /// Needs `--force`: clank cannot tell which repos were seeded from
     /// it.
     Delete(TeamDeleteArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TeamAgentArgs {
+    #[command(subcommand)]
+    pub command: TeamAgentCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum TeamAgentCmd {
+    /// Save an agent description to your library
+    Add(TeamAgentAddArgs),
+    /// Remove a description from your library and the teams that use it
+    Remove(TeamAgentRemoveArgs),
+    /// List your library's agent descriptions
+    List(TeamListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TeamAgentAddArgs {
+    /// Agent label.
+    pub label: String,
+    /// Tool this agent runs.
+    #[arg(long, value_enum)]
+    pub tool: ToolArg,
+    /// The executable `clank agent start` runs, instead of the tool's
+    /// own name.
+    #[arg(long, value_name = "EXECUTABLE")]
+    pub cmd: Option<String>,
+    /// An environment variable for the agent's process, `KEY=VAL`;
+    /// repeatable.
+    #[arg(long = "env", value_name = "KEY=VAL")]
+    pub env: Vec<String>,
+    /// Initial prompt passed to the resumed tool, as for `agent add`.
+    #[arg(long, value_name = "STRING")]
+    pub initial_prompt: Option<String>,
+    /// The tool's own arguments, after `--`, exactly as you would type
+    /// them to the tool.
+    #[arg(last = true, value_name = "TOOL ARGS")]
+    pub tool_args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamAgentRemoveArgs {
+    /// Agent label.
+    pub label: String,
 }
 
 #[derive(Args, Debug)]
@@ -1935,7 +1975,12 @@ pub struct BlockArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum BlockCmd {
     /// Ask the human a question, and wait for the answer
+    Ask(BlockCreateArgs),
+    /// The old spelling of `block ask`.
+    #[command(hide = true)]
     Create(BlockCreateArgs),
+    /// Answer an agent's question
+    Answer(UnblockArgs),
     /// Remove answered block+unblock pairs for this agent.
     Clean(BlockCleanArgs),
     /// Flatten legacy plan-scoped blocks to the repo-wide layout.

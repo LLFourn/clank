@@ -2897,7 +2897,7 @@ fn duty_line(item: &WaitItem) -> Option<String> {
             };
             let block = if item.plan.is_some() {
                 " If this step genuinely depends on a person, record that with `clank block \
-                 create <name> -m \"<question>\"`: it pauses this plan's review work and \
+                 ask <name> -m \"<question>\"`: it pauses this plan's review work and \
                  discharges nothing else."
             } else {
                 ""
@@ -7912,7 +7912,7 @@ mod tests {
             master.contains("commit work addressing the feedback"),
             "{master}"
         );
-        assert!(master.contains("`clank block create <name> -m"), "{master}");
+        assert!(master.contains("`clank block ask <name> -m"), "{master}");
         let promote =
             one(serde_json::json!({"kind":"promote_from_queue","name":"n","priority":500}));
         assert!(!promote.contains("clank block"), "{promote}");
@@ -7928,7 +7928,7 @@ mod tests {
             "{blocked}"
         );
         assert!(blocked.contains("do not answer it yourself"), "{blocked}");
-        assert!(!blocked.contains("clank events") && !blocked.contains("clank block create"));
+        assert!(!blocked.contains("clank events") && !blocked.contains("clank block ask"));
 
         assert!(duties(&[serde_json::json!({"kind":"idle","prompt":"go"})]).is_empty());
         assert!(duties(&[serde_json::json!({"kind":"a_kind_from_the_future"})]).is_empty());
@@ -7948,7 +7948,7 @@ mod tests {
         assert_eq!(lines.len(), 3, "{lines:?}");
         let with_block: Vec<_> = lines
             .iter()
-            .filter(|l| l.contains("clank block create"))
+            .filter(|l| l.contains("clank block ask"))
             .collect();
         assert_eq!(with_block.len(), 1, "{lines:?}");
         assert!(with_block[0].contains("master continue p"), "{lines:?}");

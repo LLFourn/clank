@@ -376,10 +376,10 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `unfinish` | Move a finalized plan back to active |
 | `rereview` | Make every reviewer review a plan's latest commit again |
 | `agent` | Roster: `add` / `promote` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
-| `team` | Global team templates: `save` / `list` / `show` / `delete` |
+| `team` | Your saved teams (`save` / `list` / `show` / `delete`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove` |
 | `pr-review` | Multi-agent review loop against a GitHub PR: `start` / `note` / `propose` / `status` / `finish` / `abort` |
-| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one (`zellij` is the same) |
+| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
 | `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
 | `html` | Render the event log + status to a static site; `html open` |
@@ -387,7 +387,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` / `unblock` | Ask the human a blocking question (`block create`) / answer it; `block clean` tidies answered ones |
+| `block` | Questions only the human can answer: an agent's `block ask`, the human's `block answer`, and `block clean` to tidy answered ones |
 | `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge` |
 | `export` | Dump the repo's roster config as JSON |
 
@@ -403,6 +403,10 @@ itself or they exist for one-off upgrades. They still work:
 - `block migrate` flattens the legacy plan-scoped block layout.
 - `open dry <path> [--json]` reports what `clank open` would do for a path
   without opening anything; `open-worktree.sh` reads its JSON.
+
+Older spellings still work, hidden: `block create` is `block ask`, `unblock`
+is `block answer`, `agent add --global --tool` and `agent remove --global`
+are `team agent add` and `team agent remove`, and `open zellij` is `open`.
 
 ### Messages: send, interrupt, nudge
 
@@ -566,7 +570,7 @@ agent's session.
   - ending a turn does not discharge pending work;
   - the user's latest instruction, any explicit pause, and the stated reason for
     a rejected action are followed;
-  - a real dependency on the user belongs in `clank block create <name> -m "…"`.
+  - a real dependency on the user belongs in `clank block ask <name> -m "…"`.
 
   A block pauses review work only; messages and events are still delivered.
 - **Resets:** the count resets when the items, the session, or the blocks (which

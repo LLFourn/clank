@@ -2288,7 +2288,7 @@ pub(super) fn render_candidate_screen(
     if picker.is_empty() {
         out.push(emit(
             &[dim(
-                "  no agents available — declare one with `clank agent add --global`".to_string(),
+                "  no agents available — declare one with `clank team agent add`".to_string(),
             )],
             "",
             cols,
@@ -8165,7 +8165,7 @@ mod tests {
     }
 
     #[test]
-    fn add_picker_empty_state_points_at_global() {
+    fn add_picker_empty_state_points_at_the_library() {
         let s = two_agent_snap();
         let out = render_at(
             &s,
@@ -8178,8 +8178,8 @@ mod tests {
         .0
         .join("\n");
         assert!(
-            out.contains("no agents available") && out.contains("--global"),
-            "empty picker points at `clank agent add --global`: {out}"
+            out.contains("no agents available") && out.contains("team agent add"),
+            "empty picker points at `clank team agent add`: {out}"
         );
     }
 
