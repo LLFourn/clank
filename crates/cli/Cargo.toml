@@ -19,7 +19,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+# Help sections wrap to the same width clap measures.
+terminal_size = "0.4"
 
 # File watcher
 notify = "8"

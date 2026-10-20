@@ -1,5 +1,5 @@
 use clank::cli::command::{Cli, dispatch, exit_code_for};
-use clap::Parser;
+use clap::FromArgMatches;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -10,7 +10,9 @@ async fn main() -> anyhow::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     init_tracing();
-    if let Err(e) = dispatch(Cli::parse()).await {
+    let cli = Cli::from_arg_matches(&clank::cli::command::cli().get_matches())
+        .unwrap_or_else(|e| e.exit());
+    if let Err(e) = dispatch(cli).await {
         let code = exit_code_for(&e);
         eprintln!("{e:#}");
         clank::cli::source_group::exit(code);

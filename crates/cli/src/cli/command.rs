@@ -3,13 +3,180 @@
 //! tested where every other test is — the bin has no test target of
 //! its own (the-test-suite-takes-a-million-years).
 
-use clap::{Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Styles};
+use clap::{CommandFactory, Parser, Subcommand};
+
+/// Headings and command names stand out; clap drops the colour where
+/// the terminal or `NO_COLOR` says to.
+pub const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Yellow.on_default().bold())
+    .usage(AnsiColor::Yellow.on_default().bold())
+    .literal(AnsiColor::Cyan.on_default().bold())
+    .placeholder(AnsiColor::Cyan.on_default())
+    .error(AnsiColor::Red.on_default().bold())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Yellow.on_default());
+
+/// How `clank --help` groups the top level. Names only: each row's
+/// summary is the command's own about, so this table cannot disagree
+/// with clap about what a command does.
+pub const SECTIONS: &[(&str, &[&str])] = &[
+    ("Getting set up", &["init", "setup", "doctor"]),
+    (
+        "The daily flow",
+        &[
+            "status",
+            "tui",
+            "log",
+            "wait",
+            "as",
+            "auto",
+            "run",
+            "attending",
+        ],
+    ),
+    (
+        "Plans",
+        &[
+            "queue", "finish", "unfinish", "stash", "pick", "purge", "rereview", "diff", "html",
+        ],
+    ),
+    ("Review", &["feedback", "pr-review", "block", "unblock"]),
+    ("The team", &["agent", "team", "open", "fork"]),
+    ("Talking", &["send", "nudge", "events"]),
+    ("Remote", &["remote"]),
+    ("Settings", &["config", "export"]),
+    ("Plumbing", &["monitor", "rewire", "stop-hook"]),
+];
+
+/// Below this many columns beside the names, a summary reads better on
+/// its own lines under its name than squeezed into a sliver.
+const MIN_SUMMARY_ROOM: usize = 24;
+
+/// The command line as `main` parses it: the derived tree with the
+/// sectioned top-level help, wrapped to the terminal.
+pub fn cli() -> clap::Command {
+    let width = terminal_size::terminal_size()
+        .map(|(w, _)| usize::from(w.0))
+        .unwrap_or(80)
+        .min(100);
+    cli_at(width)
+}
+
+/// [`cli`] laid out for a terminal `width` columns wide.
+pub fn cli_at(width: usize) -> clap::Command {
+    let cmd = Cli::command().term_width(width);
+    let header = STYLES.get_header();
+    let sections = sections_help(&cmd, width);
+    cmd.help_template(format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}{header}Options:{header:#}\n{{options}}{{after-help}}"
+    ))
+}
+
+/// The top level's command list, one block per [`SECTIONS`] entry. Each
+/// summary wraps under its own column; when that column would leave too
+/// little room, the summary goes under its name instead.
+fn sections_help(cmd: &clap::Command, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let header = STYLES.get_header();
+    let literal = STYLES.get_literal();
+    let name_width = SECTIONS
+        .iter()
+        .flat_map(|(_, names)| names.iter())
+        .map(|n| n.width())
+        .max()
+        .unwrap_or(0);
+    let beside = 2 + name_width + 2;
+    let stacked = width.saturating_sub(beside) < MIN_SUMMARY_ROOM;
+    let column = if stacked { 4 } else { beside };
+    let room = width.saturating_sub(column).max(1);
+    let mut out = String::new();
+    for (heading, names) in SECTIONS {
+        out.push_str(&format!("{header}{heading}:{header:#}\n"));
+        for name in *names {
+            let about = cmd
+                .find_subcommand(name)
+                .and_then(|c| c.get_about())
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let mut lines = wrap(&about, room).into_iter();
+            if stacked {
+                out.push_str(&format!("  {literal}{name}{literal:#}\n"));
+            } else {
+                let pad = " ".repeat(name_width - name.width());
+                out.push_str(&format!(
+                    "  {literal}{name}{literal:#}{pad}  {}\n",
+                    lines.next().unwrap_or_default()
+                ));
+            }
+            for line in lines {
+                out.push_str(&format!("{}{line}\n", " ".repeat(column)));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Greedy word wrap by display width. A word wider than `room` gets a
+/// line to itself rather than being cut.
+fn wrap(text: &str, room: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.width() + 1 + word.width() > room {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+const INIT_EXAMPLES: &str = "\
+Examples:
+  # start using clank in the current repo
+  clank init
+  # and seed its roster from a saved team
+  clank init --team review-pair";
+
+const STATUS_EXAMPLES: &str = "\
+Examples:
+  clank status
+  # keep re-printing as things change
+  clank status --watch
+  clank status -j";
+
+const FINISH_EXAMPLES: &str = "\
+Examples:
+  # finish the one active plan: what changed, then why
+  clank finish -m \"Parse errors name the line\" -m \"Users could not find the typo\"";
+
+const SEND_EXAMPLES: &str = "\
+Examples:
+  clank send --master -m \"CI is red on main\"
+  clank send --to codex --repo ../other -m \"Your review is waiting\"";
+
+const STASH_EXAMPLES: &str = "\
+Examples:
+  # set the active plan aside, run another, then bring it back
+  clank stash
+  clank stash pop
+  # give the plan up for now, keeping its body in the queue
+  clank stash --to-queue";
 
 #[derive(Parser)]
 #[command(
     name = "clank",
     version,
-    about = "Multi-agent peer review around plans"
+    about = "Multi-agent peer review around plans",
+    styles = STYLES
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,6 +191,7 @@ pub enum Command {
     /// Creates `plans/` and the managed `.gitignore`, and installs the
     /// `post-rewrite` hook. `--team <name>` seeds the roster from a
     /// saved template.
+    #[command(after_long_help = INIT_EXAMPLES)]
     Init(crate::cli::InitArgs),
     /// Install skills and hooks into ~/.claude, ~/.codex, ~/.grok
     ///
@@ -42,6 +210,7 @@ pub enum Command {
     ///
     /// HEAD, plans, phases, and the roster. `--watch` renders live,
     /// `-j` emits JSON; the full-screen pane is `clank tui`.
+    #[command(after_long_help = STATUS_EXAMPLES)]
     Status(crate::cli::StatusArgs),
     /// Block until this agent has actionable work
     ///
@@ -74,8 +243,9 @@ pub enum Command {
     /// Addressed by repo (`--repo`, default the current one) and label
     /// (`--to`), or `--master` for whoever that repo's roster names
     /// master. The message wakes its agent until it is handled.
+    #[command(after_long_help = SEND_EXAMPLES)]
     Send(crate::cli::SendArgs),
-    /// Interrupt an agent's current turn, then submit a message to its terminal
+    /// Interrupt an agent and type a message into its terminal
     ///
     /// The escape hatch for when `clank send` cannot be delivered —
     /// a wedged hook, a stale binding, a wake that never fires. It
@@ -104,6 +274,7 @@ pub enum Command {
     /// Runs when the gate says FINISHED; `-m` is required (what
     /// changed, then why). With `finish.autosquash` the plan's
     /// commits collapse into one.
+    #[command(after_long_help = FINISH_EXAMPLES)]
     Finish(crate::cli::FinishArgs),
     /// Move a finalized plan back to active
     Unfinish(crate::cli::UnfinishArgs),
@@ -152,6 +323,7 @@ pub enum Command {
     /// run. Where only one plan is stashed, commands that act on a
     /// stash take it without a name. `--to-queue` re-queues the plan
     /// body for a later attempt instead.
+    #[command(after_long_help = STASH_EXAMPLES)]
     Stash(crate::cli::StashArgs),
     /// Hidden alias for `clank stash push` (+ `shelve clean` →
     /// `stash drop`). One release of back-compat.
@@ -190,17 +362,17 @@ pub enum Command {
     Block(crate::cli::BlockArgs),
     /// Answer a pending block
     Unblock(crate::cli::UnblockArgs),
-    /// Record the background task you are waiting on, so the Stop hook
-    /// stops waking you with work you are already doing
+    /// Tell clank which background task you are waiting on
     ///
-    /// Say how long you expect it to take (`--expect`, default 5m): if
+    /// The Stop hook then stops waking you with work you are already
+    /// doing. Say how long you expect it to take (`--expect`, default 5m): if
     /// it is still running past that you are checked in on once, so a
     /// hang cannot hold you asleep. Nothing is cancelled.
     Attending(crate::cli::AttendingArgs),
-    /// The full-screen pane: the repo's state live, the agents, the
-    /// plan and its gate, and the remote switch
+    /// The full-screen pane for driving a running team
     ///
-    /// One per repo. The `--tui` flag it grew out of still opens it,
+    /// The repo's state live: the agents, the plan and its gate, and the
+    /// remote switch. One per repo. The `--tui` flag it grew out of still opens it,
     /// and says so.
     Tui(crate::cli::TuiArgs),
     /// Run a command under clank, so it knows exactly when the work ends
@@ -805,6 +977,224 @@ mod tests {
         let mut found = Vec::new();
         walk(&Cli::command(), &mut found);
         assert!(found.is_empty(), "group help lists its children: {found:?}");
+    }
+
+    fn visible_children(c: &clap::Command) -> Vec<&clap::Command> {
+        c.get_subcommands()
+            .filter(|s| !s.is_hide_set() && s.get_name() != "help")
+            .collect()
+    }
+
+    /// Every group's help, the top level included, as clap renders it
+    /// at `width` columns, paired with the children it lists.
+    fn rendered_groups(width: usize) -> Vec<(String, String, Vec<(String, String)>)> {
+        fn walk(
+            c: &clap::Command,
+            path: &str,
+            width: usize,
+            out: &mut Vec<(String, String, Vec<(String, String)>)>,
+        ) {
+            for sub in visible_children(c)
+                .into_iter()
+                .filter(|s| s.has_subcommands())
+            {
+                let path = format!("{path} {}", sub.get_name());
+                let children = visible_children(sub)
+                    .iter()
+                    .map(|k| (k.get_name().to_string(), about_of(k)))
+                    .collect();
+                let rendered = sub.clone().term_width(width).render_help().to_string();
+                out.push((path.clone(), rendered, children));
+                walk(sub, &path, width, out);
+            }
+        }
+        let mut root = cli_at(width);
+        root.build();
+        let children = visible_children(&root)
+            .iter()
+            .map(|k| (k.get_name().to_string(), about_of(k)))
+            .collect();
+        let mut out = vec![(
+            "clank".to_string(),
+            root.clone().render_help().to_string(),
+            children,
+        )];
+        walk(&root, "clank", width, &mut out);
+        out
+    }
+
+    fn about_of(c: &clap::Command) -> String {
+        c.get_about().map(|a| a.to_string()).unwrap_or_default()
+    }
+
+    /// Every visible top-level command sits in exactly one section, and
+    /// the sections name nothing else.
+    #[test]
+    fn the_help_sections_hold_every_visible_command_once() {
+        let cmd = Cli::command();
+        let visible: Vec<&str> = visible_children(&cmd)
+            .iter()
+            .map(|c| c.get_name())
+            .collect();
+        let listed: Vec<&str> = SECTIONS
+            .iter()
+            .flat_map(|(_, n)| n.iter().copied())
+            .collect();
+        let missing: Vec<_> = visible.iter().filter(|v| !listed.contains(v)).collect();
+        let stray: Vec<_> = listed.iter().filter(|l| !visible.contains(l)).collect();
+        let mut seen = std::collections::HashSet::new();
+        let twice: Vec<_> = listed.iter().filter(|l| !seen.insert(**l)).collect();
+        assert!(
+            missing.is_empty() && stray.is_empty() && twice.is_empty(),
+            "unsectioned: {missing:?}; not visible commands: {stray:?}; twice: {twice:?}"
+        );
+    }
+
+    /// At 80 columns every summary fits on its row: the row for each
+    /// child carries its whole about, so nothing wraps.
+    #[test]
+    fn every_summary_fits_one_line_at_80_columns() {
+        let mut long = Vec::new();
+        for (path, rendered, children) in rendered_groups(80) {
+            for (name, about) in children {
+                let row = rendered
+                    .lines()
+                    .find(|l| l.trim_start().split_whitespace().next() == Some(name.as_str()))
+                    .unwrap_or_default();
+                if !row.contains(about.as_str()) {
+                    long.push(format!("{path} {name}: {about}"));
+                }
+            }
+        }
+        assert!(
+            long.is_empty(),
+            "summaries that wrap at 80 columns:\n{}",
+            long.join("\n")
+        );
+    }
+
+    /// A summary is a sentence-case phrase: no trailing period, and it
+    /// starts with a capital or a quoted name.
+    #[test]
+    fn every_summary_is_a_phrase() {
+        fn walk(c: &clap::Command, path: &str, bad: &mut Vec<String>) {
+            for sub in visible_children(c) {
+                let path = format!("{path} {}", sub.get_name());
+                let about = about_of(sub);
+                let first = about.chars().next();
+                if about.is_empty()
+                    || about.ends_with('.')
+                    || !first.is_some_and(|c| c.is_uppercase() || c == '`')
+                {
+                    bad.push(format!("{path}: {about:?}"));
+                }
+                walk(sub, &path, bad);
+            }
+        }
+        let mut bad = Vec::new();
+        walk(&Cli::command(), "clank", &mut bad);
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// In a narrow pane the summaries wrap instead of running off the
+    /// edge, beside their names or, below the side-by-side minimum, under
+    /// them, and none of their words is lost. Only a word wider than the
+    /// pane itself may overflow it.
+    #[test]
+    fn the_top_level_wraps_in_a_narrow_pane() {
+        use unicode_width::UnicodeWidthStr;
+        for width in [24, 30, 33, 44] {
+            let mut root = cli_at(width);
+            root.build();
+            let rendered = root.clone().render_help().to_string();
+            for line in rendered.lines() {
+                let indent = line.len() - line.trim_start().len();
+                let unbreakable = line.split_whitespace().count() == 1
+                    && line.trim().width() > width.saturating_sub(indent);
+                assert!(
+                    line.width() <= width || unbreakable,
+                    "{width} columns, too wide: {line:?}"
+                );
+            }
+            let flat: Vec<&str> = rendered.split_whitespace().collect();
+            for child in visible_children(&root) {
+                let about = about_of(child);
+                let words: Vec<&str> = about.split_whitespace().collect();
+                assert!(
+                    flat.windows(words.len()).any(|w| w == words.as_slice()),
+                    "{width} columns: `{}` lost words: {about}",
+                    child.get_name()
+                );
+            }
+        }
+    }
+
+    /// Styled where colour is wanted, plain where it is not: the same
+    /// help carries escapes only in its ANSI form.
+    #[test]
+    fn the_help_is_styled_only_when_colour_is_on() {
+        let mut root = cli_at(80);
+        root.build();
+        let help = root.clone().render_help();
+        let header = STYLES.get_header().render().to_string();
+        assert!(
+            help.ansi().to_string().contains(&header),
+            "headings and names are styled"
+        );
+        assert!(
+            !help.to_string().contains('\u{1b}'),
+            "plain output has no escapes"
+        );
+        let queue = root.find_subcommand_mut("queue").unwrap().render_help();
+        assert!(
+            queue.ansi().to_string().contains(&header),
+            "subcommands share the styles"
+        );
+    }
+
+    /// Every `Examples:` line in any command's help parses as that
+    /// command. Parsing, not running: the examples name repos and plans
+    /// that a test has no business creating.
+    #[test]
+    fn every_example_parses_as_its_command() {
+        fn walk(c: &clap::Command, path: &[String], found: &mut Vec<(Vec<String>, String)>) {
+            for sub in c.get_subcommands() {
+                let mut path = path.to_vec();
+                path.push(sub.get_name().to_string());
+                let text = sub
+                    .get_after_long_help()
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                if let Some(block) = text.split("Examples:").nth(1) {
+                    for line in block.lines().map(str::trim) {
+                        if line.starts_with("clank ") {
+                            found.push((path.clone(), line.to_string()));
+                        }
+                    }
+                }
+                walk(sub, &path, found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&Cli::command(), &[], &mut found);
+        assert!(
+            found.len() >= 7,
+            "the most-typed commands carry examples: {found:?}"
+        );
+        for (path, line) in found {
+            let argv = shell_words::split(&line).unwrap();
+            let matches = Cli::command()
+                .try_get_matches_from(&argv)
+                .unwrap_or_else(|e| panic!("`{line}` does not parse: {e}"));
+            let mut at = &matches;
+            for name in &path {
+                let (sub, m) = at
+                    .subcommand()
+                    .unwrap_or_else(|| panic!("`{line}` is not `{}`", path.join(" ")));
+                assert_eq!(sub, name, "`{line}` is not `{}`", path.join(" "));
+                at = m;
+            }
+        }
     }
 
     #[test]

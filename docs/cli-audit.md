@@ -56,7 +56,8 @@ whole commands that agents are told to run.
 
 ## Findings
 
-F3 and F4 were fixed by `cli-help-says-what-it-is-for`; their sections
+F3 and F4 were fixed by `cli-help-says-what-it-is-for`, and F7 by
+`cli-help-is-beautiful` (sectioned, styled top-level help). Their sections
 record what was found, and the verdicts below show what remains.
 
 ### F1. Plumbing is listed beside user commands
@@ -466,25 +467,25 @@ Generated. Do not edit by hand.
 | `status` | action |  |  | Show the repo's clank state |  | --repo -j/--json --no-cache --plan --watch --tui |
 | `wait` | action |  |  | Block until this agent has actionable work |  | --repo --author --die-with-owner --deliver-to-session (hidden) -j/--json --event --for --peek --no-cache --poll --no-poll |
 | `queue` | group, bare runs |  |  | Manage the plan queue |  | --repo |
-| `queue add` | action |  |  | Add a queued plan at `.clank/queue/<NNN>-<name>.md`. Body comes from `.clank/drafts/<name>.md` (write the draft, then `queue add <name>` consumes it) or `-m "<body>"` for a trivial inline body. Empty / header-only content is rejected | <NAME> | --priority -m/--message |
+| `queue add` | action |  |  | Queue a drafted plan | <NAME> | --priority -m/--message |
 | `queue remove` | action |  |  | Remove an item from the queue | <NAME> |  |
 | `queue promote` | action |  |  | Promote a queued item to an active plan | <NAME> |  |
 | `queue reprioritise` | action |  | reprioritize | Change a queued item's priority (renames its `NNN-` prefix) | <NAME> <PRIORITY> |  |
-| `queue unqueue` | action |  |  | Take an item out of the queue and back to `.clank/drafts/<name>.md` — the inverse of `add`. `remove` deletes; this keeps the body | <NAME> |  |
+| `queue unqueue` | action |  |  | Move a queued plan back to drafts | <NAME> |  |
 | `feedback` | group |  |  | Read or write review feedback |  |  |
 | `feedback write` | action |  |  | Write a feedback file |  | --repo --commit (required) --verdict (required) --author (required) -m (required) |
 | `feedback read` | action |  |  | Show all feedback for a commit |  | --commit --plan --repo -j/--json |
 | `events` | group |  |  | The event inbox: what your wake sources delivered |  |  |
 | `events list` | action |  |  | List event metadata without reading content (unhandled by default) |  | --repo --author --all -j/--json |
 | `events ack` | action |  |  | Mark events handled so they stop waking you | <ID> | --reply --repo --author |
-| `events reply` | action |  |  | Send a further reply to an event whose backend takes replies, without acknowledging it | <ID> | --repo --author --operation -m/--message -F/--file one of --message/--file (required) |
+| `events reply` | action |  |  | Reply to an event without acknowledging it | <ID> | --repo --author --operation -m/--message -F/--file one of --message/--file (required) |
 | `events show` | action |  |  | Inspect one event's metadata without reading content | <ID> | --repo --author -j/--json |
 | `events read` | action |  |  | Read an event's content and record delivery to your bound agent | <ID> | --repo --author -j/--json |
 | `send` | action |  |  | Put a message in an agent's inbox |  | --reply-to --reply-repo --interrupt --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
-| `nudge` | action |  |  | Interrupt an agent's current turn, then submit a message to its terminal |  | --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
+| `nudge` | action |  |  | Interrupt an agent and type a message into its terminal |  | --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
 | `monitor` | group |  |  | Watch a repo once, for every waiter |  |  |
 | `monitor start` | action |  |  | Watch this repo once, for every waiter |  | --repo --installed-at (hidden) --installed-from (hidden) |
-| `monitor upgrade` | action |  |  | Ask every reachable monitor older than this build to stand down, and start this build's in their repos. Run once after installing |  |  |
+| `monitor upgrade` | action |  |  | Replace monitors from older builds with this one |  |  |
 | `remote` | group |  |  | Switch this repo's remote on or off through its `clank tui` |  | --repo --timeout |
 | `remote status` | action |  |  | Who owns this repo's remote, and its state and address |  |  |
 | `remote on` | action |  |  | Start serving; already on is done at once |  |  |
@@ -502,7 +503,7 @@ Generated. Do not edit by hand.
 | `agent swap` | action |  |  | Replace one reviewer with another in the same role | <OUT> <IN> | --repo |
 | `agent launch` | action |  |  | Show or set how an agent's tool is launched | <NAME> -- TOOL ARGS… | --cmd --env --clear --repo |
 | `team` | group |  |  | Save and reuse roster templates across repos |  |  |
-| `team save` | action |  |  | Publish THIS repo's roster as a reusable global template under `<name>` (user-scope `teams`), copying the roster's agent definitions into user-scope `agents`. Refuses if a referenced agent already exists globally with a different body; pass `--force` to overwrite an existing team name | <NAME> | --force --repo |
+| `team save` | action |  |  | Save this repo's roster as a team other repos can use | <NAME> | --force --repo |
 | `team list` | action |  |  | List the global team-template library (user-scope) |  | -j/--json |
 | `team show` | action |  |  | Show a single global team template (its roster) | <TEAM> | -j/--json |
 | `team delete` | action |  |  | Delete a saved team | <TEAM> | --force |
@@ -513,14 +514,14 @@ Generated. Do not edit by hand.
 | `auto status` | action |  |  | Print this session's auto-mode and its roster role |  | --repo -j/--json |
 | `open` | group, bare runs |  |  | Open the team workspace in zellij |  | --repo --fork --pr --all --print |
 | `open dry` | action |  |  | Report what `clank open` would do for a path, without opening anything | <PATH> | -j/--json |
-| `open zellij` | action |  |  | Auto-generate a zellij layout (KDL) for master + reviewer panes and spawn it via `zellij --layout` |  | --repo --fork --pr --all --print |
+| `open zellij` | action |  |  | Open the workspace, the same as bare `clank open` |  | --repo --fork --pr --all --print |
 | `fork` | group |  |  | Fork the team into a linked worktree |  |  |
 | `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open --review |
 | `fork list` | action |  |  | List this repo's forks |  | --repo |
 | `fork remove` | action |  |  | Remove a fork's worktree or clone | <NAME> | --force --repo |
 | `stash` | group, bare runs |  |  | Set a plan's commits aside and restore them later | [PLAN] | --repo --for --to-queue --priority --dry |
-| `stash push` | action |  |  | Set a plan's commits aside (kept restorable on a protective ref) and clean them off the branch — the same as bare `clank stash` | [PLAN] | --repo --for --to-queue --priority --dry |
-| `stash pop` | action |  |  | Restore a stashed plan: replay its commits onto HEAD and consume the stash. Reviews reset (the replayed commits are re-reviewed) | [PLAN] | --repo |
+| `stash push` | action |  |  | Set a plan aside, the same as bare `clank stash` | [PLAN] | --repo --for --to-queue --priority --dry |
+| `stash pop` | action |  |  | Bring a stashed plan back onto the branch | [PLAN] | --repo |
 | `stash show` | action |  |  | Print a stashed plan's body (from its protective ref) + commits | [PLAN] | --repo |
 | `stash drop` | action |  |  | Permanently discard a plan's stashed commits + record | [PLAN] | --repo |
 | `stash list` | action |  |  | List the stashed plans |  | --repo |
@@ -530,11 +531,11 @@ Generated. Do not edit by hand.
 | `pick` | action |  |  | Copy plans from another branch | <PLANS> | --from (required) --repo --squash --purge --dry |
 | `purge` | action |  |  | Strip a plan's `.clank/` artifacts from history | [PLAN] | --all --repo --into-branch --dry --squash --amend --no-cache --drop |
 | `pr-review` | group |  |  | Run the review loop against a GitHub PR |  | --repo |
-| `pr-review start` | action |  |  | Start reviewing a GitHub PR: pin its head sha and scaffold `.clank/pr-reviews/<pr>/` | <PR> | --fork --checkout |
+| `pr-review start` | action |  |  | Start reviewing a GitHub PR | <PR> | --fork --checkout |
 | `pr-review note` | action |  |  | Record your reviewer verdict for the current round |  | --verdict (required) -m (required) --pr --author |
-| `pr-review propose` | action |  |  | Open/re-open the review for the current draft: bump the round and summon reviewers (master-only) |  | --pr |
+| `pr-review propose` | action |  |  | Ask the reviewers for another round (master only) |  | --pr |
 | `pr-review abort` | action |  |  | Discard a PR review's local scratch (master-only) |  | --pr |
-| `pr-review finish` | action |  |  | Hand the converged review over as a DRAFT (master-only). Nothing is submitted: the pending review stays yours to read, edit and submit on GitHub |  | --pr |
+| `pr-review finish` | action |  |  | Hand the agreed review over as a draft (master only) |  | --pr |
 | `pr-review status` | action |  |  | Round + per-reviewer verdicts + who we're waiting on |  | --pr |
 | `diff` | action |  |  | Open a plan or commit-range diff in your editor | [TARGET] | --plan --range --prompt --focus --wait --no-wait --print --repo |
 | `html` | group, bare runs |  |  | Render the timeline + status to a static site |  | --repo --rebuild --quiet |
@@ -544,18 +545,18 @@ Generated. Do not edit by hand.
 | `block clean` | action |  |  | Remove answered block+unblock pairs for this agent |  | --repo |
 | `block migrate` | action |  |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry --repo |
 | `unblock` | action |  |  | Answer a pending block | <AGENT> <NAME> | -m (required) --repo |
-| `attending` | action |  |  | Record the background task you are waiting on, so the Stop hook stops waking you with work you are already doing | [TASK_ID] | --pid --desc --expect --clear --author --repo |
-| `tui` | action |  |  | The full-screen pane: the repo's state live, the agents, the plan and its gate, and the remote switch |  | --repo --no-cache |
+| `attending` | action |  |  | Tell clank which background task you are waiting on | [TASK_ID] | --pid --desc --expect --clear --author --repo |
+| `tui` | action |  |  | The full-screen pane for driving a running team |  | --repo --no-cache |
 | `run` | action |  |  | Run a command under clank, so it knows exactly when the work ends | <CMD> | --desc (required) --expect --author --repo |
 | `config` | group, bare runs |  |  | Read or write clank config values |  | --repo -j/--json --global |
-| `config review.adhoc_feedback` | action |  | review_adhoc_feedback | Require review for ad-hoc (non-plan) commits. bool, default: false | [ACTION] [VALUE] |  |
-| `config review.plan_feedback` | action |  | review_plan_feedback | Require review for plan-attributed commits. bool, default: true | [ACTION] [VALUE] |  |
-| `config review.require_commit_prefix` | action |  | review_require_commit_prefix | Require [plan] or [misc] commit title prefixes. bool, default: false | [ACTION] [VALUE] |  |
-| `config hooks.blocked` | action |  | hooks_blocked | Shell command to run when an agent creates a block. string or null | [ACTION] [VALUE] |  |
-| `config diff.editor.command` | action |  | diff_editor_command | Editor executable for `clank diff`. string or null | [ACTION] [VALUE] |  |
-| `config diff.wait` | action |  | diff_wait | Default `--wait` behavior for `clank diff`. bool, default: false | [ACTION] [VALUE] |  |
-| `config finish.autosquash` | action |  | finish_autosquash | Auto-squash a plan into ONE commit at `clank finish`, REWRITING the current branch in place (rewrites published history if already pushed). bool, default: false. `--no-squash` skips it for one finish | [ACTION] [VALUE] |  |
-| `config recovery.blind_nudge` | action |  | recovery_blind_nudge | How often to blindly nudge an agent that owes work and whose record clank cannot read: at most one send per stuck interval. duration (30s, 40m, 1h) or `off`, default: off | [ACTION] [VALUE] |  |
+| `config review.adhoc_feedback` | action |  | review_adhoc_feedback | Review commits outside any plan | [ACTION] [VALUE] |  |
+| `config review.plan_feedback` | action |  | review_plan_feedback | Review a plan's commits | [ACTION] [VALUE] |  |
+| `config review.require_commit_prefix` | action |  | review_require_commit_prefix | Require a [plan] or [misc] commit subject prefix | [ACTION] [VALUE] |  |
+| `config hooks.blocked` | action |  | hooks_blocked | Command to run when an agent blocks | [ACTION] [VALUE] |  |
+| `config diff.editor.command` | action |  | diff_editor_command | Editor that `clank diff` opens | [ACTION] [VALUE] |  |
+| `config diff.wait` | action |  | diff_wait | Whether `clank diff` waits for the editor | [ACTION] [VALUE] |  |
+| `config finish.autosquash` | action |  | finish_autosquash | Squash a plan into one commit when it finishes | [ACTION] [VALUE] |  |
+| `config recovery.blind_nudge` | action |  | recovery_blind_nudge | Nudge an agent whose state clank cannot read | [ACTION] [VALUE] |  |
 | `export` | action |  |  | Dump the repo's roster config as JSON |  | --repo |
 | `rereview` | action |  |  | Re-open review on a plan's latest reviewable commit | [PLAN] | --repo |
 | `rewire` | action |  |  | Remap feedback after a rebase or amend |  | --repo --from-stdin |

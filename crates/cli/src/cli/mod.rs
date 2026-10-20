@@ -115,35 +115,51 @@ pub struct ConfigKeyArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ConfigKey {
-    /// Require review for ad-hoc (non-plan) commits. bool, default: false.
+    /// Review commits outside any plan
+    ///
+    /// bool, default: false.
     #[command(name = "review.adhoc_feedback", alias = "review_adhoc_feedback")]
     ReviewAdhocFeedback(ConfigKeyArgs),
-    /// Require review for plan-attributed commits. bool, default: true.
+    /// Review a plan's commits
+    ///
+    /// bool, default: true.
     #[command(name = "review.plan_feedback", alias = "review_plan_feedback")]
     ReviewPlanFeedback(ConfigKeyArgs),
-    /// Require [plan] or [misc] commit title prefixes. bool, default: false.
+    /// Require a [plan] or [misc] commit subject prefix
+    ///
+    /// bool, default: false.
     #[command(
         name = "review.require_commit_prefix",
         alias = "review_require_commit_prefix"
     )]
     ReviewRequireCommitPrefix(ConfigKeyArgs),
-    /// Shell command to run when an agent creates a block. string or null.
+    /// Command to run when an agent blocks
+    ///
+    /// string or null.
     #[command(name = "hooks.blocked", alias = "hooks_blocked")]
     HooksBlocked(ConfigKeyArgs),
-    /// Editor executable for `clank diff`. string or null.
+    /// Editor that `clank diff` opens
+    ///
+    /// string or null.
     #[command(name = "diff.editor.command", alias = "diff_editor_command")]
     DiffEditorCommand(ConfigKeyArgs),
-    /// Default `--wait` behavior for `clank diff`. bool, default: false.
+    /// Whether `clank diff` waits for the editor
+    ///
+    /// bool, default: false; `--wait` / `--no-wait` override it.
     #[command(name = "diff.wait", alias = "diff_wait")]
     DiffWait(ConfigKeyArgs),
-    /// Auto-squash a plan into ONE commit at `clank finish`, REWRITING the
-    /// current branch in place (rewrites published history if already pushed).
-    /// bool, default: false. `--no-squash` skips it for one finish.
+    /// Squash a plan into one commit when it finishes
+    ///
+    /// Rewrites the current branch in place, so published history changes
+    /// if it was already pushed. bool, default: false. `clank finish
+    /// --no-squash` skips it for one finish.
     #[command(name = "finish.autosquash", alias = "finish_autosquash")]
     FinishAutosquash(ConfigKeyArgs),
-    /// How often to blindly nudge an agent that owes work and whose record
-    /// clank cannot read: at most one send per stuck interval.
-    /// duration (30s, 40m, 1h) or `off`, default: off.
+    /// Nudge an agent whose state clank cannot read
+    ///
+    /// For an agent that owes work but whose record clank cannot read: at
+    /// most one nudge per stuck interval. duration (30s, 40m, 1h) or
+    /// `off`, default: off.
     #[command(name = "recovery.blind_nudge", alias = "recovery_blind_nudge")]
     RecoveryBlindNudge(ConfigKeyArgs),
 }
@@ -418,8 +434,10 @@ pub struct OpenArgs {
 pub enum OpenCmd {
     /// Report what `clank open` would do for a path, without opening anything
     Dry(OpenDryArgs),
-    /// Auto-generate a zellij layout (KDL) for master + reviewer
-    /// panes and spawn it via `zellij --layout`.
+    /// Open the workspace, the same as bare `clank open`
+    ///
+    /// Generates a zellij layout (KDL) for the master and reviewer panes
+    /// and spawns it via `zellij --layout`.
     ///
     /// Inside an existing zellij session, the layout opens as a
     /// new tab (no new session is spawned). Outside any session,
@@ -732,8 +750,10 @@ pub enum RemoteCmd {
 pub enum MonitorCmd {
     /// Watch this repo once, for every waiter.
     Start(MonitorStartArgs),
-    /// Ask every reachable monitor older than this build to stand down,
-    /// and start this build's in their repos. Run once after installing.
+    /// Replace monitors from older builds with this one
+    ///
+    /// Asks every reachable monitor older than this build to stand down,
+    /// and starts this build's in their repos. Run once after installing.
     Upgrade,
 }
 
@@ -818,8 +838,9 @@ pub enum EventsCmd {
     List(EventsListArgs),
     /// Mark events handled so they stop waking you.
     Ack(EventsAckArgs),
-    /// Send a further reply to an event whose backend takes replies, without
-    /// acknowledging it.
+    /// Reply to an event without acknowledging it
+    ///
+    /// Only for events whose backend takes replies.
     Reply(EventsReplyArgs),
     /// Inspect one event's metadata without reading content.
     Show(EventsShowArgs),
@@ -978,17 +999,21 @@ pub struct PrReviewArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum PrReviewCmd {
-    /// Start reviewing a GitHub PR: pin its head sha and scaffold
-    /// `.clank/pr-reviews/<pr>/`.
+    /// Start reviewing a GitHub PR
+    ///
+    /// Pins its head sha and scaffolds `.clank/pr-reviews/<pr>/`.
     Start(PrReviewStartArgs),
     /// Record your reviewer verdict for the current round.
     Note(PrReviewNoteArgs),
-    /// Open/re-open the review for the current draft: bump the round
-    /// and summon reviewers (master-only).
+    /// Ask the reviewers for another round (master only)
+    ///
+    /// Opens or re-opens the review of the current draft: bumps the
+    /// round and summons the reviewers.
     Propose(PrReviewProposeArgs),
     /// Discard a PR review's local scratch (master-only).
     Abort(PrReviewAbortArgs),
-    /// Hand the converged review over as a DRAFT (master-only).
+    /// Hand the agreed review over as a draft (master only)
+    ///
     /// Nothing is submitted: the pending review stays yours to read,
     /// edit and submit on GitHub.
     Finish(PrReviewFinishArgs),
@@ -1273,6 +1298,14 @@ pub enum AgentCmd {
     /// `commit` reviewer otherwise. With `--global --tool`,
     /// the description is saved to the library instead, and this repo
     /// is not touched.
+    #[command(after_long_help = "\
+Examples:
+  # a codex reviewer that reviews every commit
+  clank agent add codex --tool codex --review commit
+  # the tool's own arguments go after --
+  clank agent add web --tool codex -- --no-daemon -c model=o3
+  # copy an agent from your library by name
+  clank agent add opus")]
     Add(AgentAddArgs),
     /// Make an agent the repo's master
     ///
@@ -1492,11 +1525,11 @@ pub struct TeamArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum TeamCmd {
-    /// Publish THIS repo's roster as a reusable global template
-    /// under `<name>` (user-scope `teams`), copying the roster's
-    /// agent definitions into user-scope `agents`. Refuses if a
-    /// referenced agent already exists globally with a different
-    /// body; pass `--force` to overwrite an existing team name.
+    /// Save this repo's roster as a team other repos can use
+    ///
+    /// The roster's agent definitions are copied into your user-scope
+    /// library. Refuses if one of them already exists there with a
+    /// different body; `--force` overwrites an existing team name.
     Save(TeamSaveArgs),
     /// List the global team-template library (user-scope).
     List(TeamListArgs),
@@ -1577,10 +1610,17 @@ impl From<ReviewKindArg> for crate::cli::teams_config::ReviewKind {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum QueueCmd {
-    /// Add a queued plan at `.clank/queue/<NNN>-<name>.md`. Body comes
-    /// from `.clank/drafts/<name>.md` (write the draft, then `queue add
-    /// <name>` consumes it) or `-m "<body>"` for a trivial inline body.
-    /// Empty / header-only content is rejected.
+    /// Queue a drafted plan
+    ///
+    /// The body comes from `.clank/drafts/<name>.md`, which this consumes,
+    /// or from `-m "<body>"` for a trivial inline body. It lands at
+    /// `.clank/queue/<NNN>-<name>.md`. Empty or header-only content is
+    /// rejected.
+    #[command(after_long_help = "\
+Examples:
+  # after writing .clank/drafts/fix-the-parser.md
+  clank queue add fix-the-parser
+  clank queue add tidy-readme --priority 200 -m \"# Tidy the README\"")]
     Add(QueueAddArgs),
     /// Remove an item from the queue.
     Remove(QueueRemoveArgs),
@@ -1589,8 +1629,10 @@ pub enum QueueCmd {
     /// Change a queued item's priority (renames its `NNN-` prefix).
     #[command(alias = "reprioritize")]
     Reprioritise(QueueReprioritiseArgs),
-    /// Take an item out of the queue and back to `.clank/drafts/<name>.md`
-    /// — the inverse of `add`. `remove` deletes; this keeps the body.
+    /// Move a queued plan back to drafts
+    ///
+    /// The inverse of `add`: the body returns to
+    /// `.clank/drafts/<name>.md`. `remove` deletes it instead.
     Unqueue(QueueUnqueueArgs),
 }
 
@@ -1739,11 +1781,15 @@ pub struct StashArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum StashCmd {
-    /// Set a plan's commits aside (kept restorable on a protective ref)
-    /// and clean them off the branch — the same as bare `clank stash`.
+    /// Set a plan aside, the same as bare `clank stash`
+    ///
+    /// Its commits are kept restorable on a protective ref and taken off
+    /// the branch.
     Push(StashPushArgs),
-    /// Restore a stashed plan: replay its commits onto HEAD and consume
-    /// the stash. Reviews reset (the replayed commits are re-reviewed).
+    /// Bring a stashed plan back onto the branch
+    ///
+    /// Replays its commits onto HEAD and consumes the stash. The replayed
+    /// commits are reviewed afresh.
     Pop(StashPopArgs),
     /// Print a stashed plan's body (from its protective ref) + commits.
     Show(StashShowArgs),
