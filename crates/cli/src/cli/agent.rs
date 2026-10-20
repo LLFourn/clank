@@ -56,6 +56,10 @@ struct AgentRow {
     bound: bool,
     tool: Option<String>,
     session_id: Option<String>,
+    /// The roster's tool, when the bound session is another tool's: the
+    /// next start runs this one fresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    configured_tool: Option<String>,
 }
 
 impl AgentRow {
@@ -83,6 +87,20 @@ impl AgentRow {
             bound,
             tool: tool_str,
             session_id,
+            configured_tool: superseded_session(declared_tool, session)
+                .map(|_| declared_tool.as_str().to_string()),
+        }
+    }
+}
+
+impl AgentRow {
+    /// The tool column: the running tool, and the configured one beside it
+    /// when the next start will switch.
+    fn tool_shown(&self) -> String {
+        let tool = self.tool.as_deref().unwrap_or("—");
+        match &self.configured_tool {
+            Some(next) => format!("{tool} → {next} next start"),
+            None => tool.to_string(),
         }
     }
 }
@@ -137,19 +155,14 @@ fn print_human(rows: &[AgentRow]) {
     let w_label = rows.iter().map(|r| r.label.len()).max().unwrap_or(5).max(5);
     let w_role = rows.iter().map(|r| r.role.len()).max().unwrap_or(4).max(4);
     let w_bound = 5; // "BOUND"
-    let w_tool = rows
-        .iter()
-        .map(|r| r.tool.as_deref().unwrap_or("—").len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
+    let tools: Vec<String> = rows.iter().map(AgentRow::tool_shown).collect();
+    let w_tool = tools.iter().map(String::len).max().unwrap_or(4).max(4);
     println!(
         "{:<w_label$}  {:<w_role$}  {:<w_bound$}  {:<w_tool$}  SESSION",
         "LABEL", "ROLE", "BOUND", "TOOL"
     );
-    for r in rows {
+    for (r, tool) in rows.iter().zip(&tools) {
         let bound = if r.bound { "yes" } else { "NO" };
-        let tool = r.tool.as_deref().unwrap_or("—");
         let session = r.session_id.as_deref().unwrap_or("—");
         // Shorten session ID for the human view; JSON keeps the full id.
         let session_short: String = session.chars().take(8).collect();
@@ -181,7 +194,51 @@ fn print_human(rows: &[AgentRow]) {
 /// field (per `agent-add-cli-and-repo-scope`). Session binding
 /// state comes from the per-agent skeleton.
 async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
-    start_with(args, Purpose::Start, session_holder::find).await
+    start_with(args, Purpose::Start, session_holder::find)
+        .await
+        .map(|_| ())
+}
+
+/// The bound session the roster has moved away from: its tool is not
+/// the configured one, so the next start launches the configured tool
+/// fresh with its own profile, and this session is set aside, not
+/// resumed. One tool's session never runs with another tool's profile.
+pub(crate) fn superseded_session(configured: Tool, bound: Option<&Session>) -> Option<&Session> {
+    bound.filter(|s| s.tool != configured)
+}
+
+/// The fork intent the next start follows. One for another tool than
+/// the configured one, or under a superseded binding, would mix one tool
+/// with another's launch: it is set aside, and on a real start (not
+/// `print`) retired, so it cannot later gate the fresh session's bind
+/// either.
+fn fork_intent(
+    repo: &Path,
+    label: &AgentLabel,
+    configured: Tool,
+    superseded: Option<&Session>,
+    print: bool,
+) -> anyhow::Result<Option<crate::cli::fork::ForkSpec>> {
+    let Some(spec) = crate::cli::fork::load_fork_spec(repo, label)? else {
+        return Ok(None);
+    };
+    if superseded.is_none() && spec.tool == configured {
+        return Ok(Some(spec));
+    }
+    eprintln!(
+        "a {} fork intent for `{label}` is set aside: it is configured for {}{}",
+        spec.tool.as_str(),
+        configured.as_str(),
+        if print {
+            "; a real start retires it"
+        } else {
+            ", so it is retired"
+        }
+    );
+    if !print {
+        crate::cli::fork::take_fork_spec(repo, label)?;
+    }
+    Ok(None)
 }
 
 /// Whether `start_with` launches the agent or only shows what a launch
@@ -198,11 +255,13 @@ enum Purpose {
 /// test's answer.
 type FindHolder = fn(&Session, &AgentLabel, &str, String) -> Holder;
 
+/// `agent start`, or its preview. With `print`, the composed launch is
+/// printed and returned instead of run.
 async fn start_with(
     args: AgentStartArgs,
     purpose: Purpose,
     find_holder: FindHolder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ComposedLaunch>> {
     let print = args.print || purpose == Purpose::Preview;
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = AgentLabel::parse(&args.name)
@@ -226,7 +285,24 @@ async fn start_with(
     })?;
 
     let cfg = load_agent_config(&repo, &label)?;
-    let bound_session = cfg.as_ref().and_then(|c| c.session.as_ref());
+    let bound = cfg.as_ref().and_then(|c| c.session.as_ref());
+    let superseded = superseded_session(desc.tool, bound);
+    let bound_session = bound.filter(|_| superseded.is_none());
+    if let Some(old) = superseded {
+        eprintln!(
+            "`{label}` is configured for {new} but bound to a {old_tool} session ({id}); \
+             {verb} {new} fresh. The {old_tool} session stays bound until the new one \
+             reports in, and can still be resumed by hand with {old_tool}.",
+            new = desc.tool.as_str(),
+            old_tool = old.tool.as_str(),
+            id = old.id.as_str(),
+            verb = if print {
+                "the next start runs"
+            } else {
+                "starting"
+            },
+        );
+    }
     if bound_session.map_or(desc.tool, |s| s.tool) == Tool::Grok {
         super::grok_launch::validate_profile(desc.launch.as_ref())?;
     }
@@ -247,7 +323,7 @@ async fn start_with(
         // ancestor (fork-session-id-chaining). Grok retains its stable
         // preparation intent until the intended child binds. `--print` peeks.
         None => {
-            let spec = crate::cli::fork::load_fork_spec(&repo, &label)?;
+            let spec = fork_intent(&repo, &label, desc.tool, superseded, print)?;
             match spec {
                 Some(spec) if spec.tool == Tool::Grok => {
                     if print {
@@ -255,8 +331,9 @@ async fn start_with(
                             "Grok fork: prepare history in {} through ACP, then launch the child; preview does not prepare or consume the intent",
                             repo.display()
                         );
-                        print_composed(&compose_grok_preview(&repo, &label));
-                        return Ok(());
+                        let preview = compose_grok_preview(&repo, &label);
+                        print_composed(&preview);
+                        return Ok(Some(preview));
                     }
                     let provider =
                         super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
@@ -363,7 +440,7 @@ async fn start_with(
 
     if print {
         print_composed(&composed);
-        return Ok(());
+        return Ok(Some(composed));
     }
 
     if launch_tool == Tool::Grok && !grok_checked {
@@ -455,7 +532,7 @@ async fn start_with(
         composed.program = exe.to_string_lossy().into_owned();
     }
 
-    exec_composed(composed, workdir)
+    exec_composed(composed, workdir).map(|()| None)
 }
 
 /// The `--repo` this process was GIVEN, not the resolved path: the
@@ -2100,6 +2177,7 @@ async fn launch_with(args: AgentLaunchArgs, find_holder: FindHolder) -> anyhow::
         find_holder,
     )
     .await
+    .map(|_| ())
 }
 
 /// The change `agent launch` was asked for, or `None` to only show.
@@ -3318,6 +3396,257 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err:#}").contains("already running"), "{err:#}");
+    }
+
+    fn nobody_runs_it(_: &Session, _: &AgentLabel, _: &str, _: String) -> Holder {
+        Holder::Nobody
+    }
+
+    const OLD_SESSION: &str = "01a156a7-f516-7dc0-8b58-520faf122796";
+
+    /// A git repo whose `browser2` roster entry is `entry`, bound to a
+    /// session of `bound_tool`.
+    fn changed_tool(entry: &str, bound_tool: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        seed_repo_config(
+            repo.path(),
+            &format!(
+                r#"{{ "agents": {{
+                    "claude": {{ "tool": "claude", "role": "master" }},
+                    "browser2": {entry}
+                }} }}"#
+            ),
+        );
+        let skeleton = repo.path().join(".clank/agents/browser2/config.json");
+        std::fs::create_dir_all(skeleton.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skeleton,
+            format!(
+                r#"{{ "session": {{ "id": "{OLD_SESSION}", "tool": "{bound_tool}",
+                                   "updated_at": "2026-10-20T00:00:00Z" }} }}"#
+            ),
+        )
+        .unwrap();
+        repo
+    }
+
+    async fn next_start(repo: &Path, purpose: Purpose) -> ComposedLaunch {
+        start_with(
+            AgentStartArgs {
+                name: "browser2".into(),
+                repo: Some(repo.to_path_buf()),
+                print: true,
+            },
+            purpose,
+            nobody_runs_it,
+        )
+        .await
+        .unwrap()
+        .expect("print returns the launch")
+    }
+
+    fn snapshot(repo: &Path) -> Vec<(String, String)> {
+        let dir = repo.join(".clank/agents/browser2");
+        let mut files: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(e.path()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn a_tool_changed_from_codex_to_claude_starts_claude_with_its_own_args() {
+        let repo = changed_tool(
+            r#"{ "tool": "claude", "role": "standby", "launch": { "args": ["--chrome"] } }"#,
+            "codex",
+        );
+        let before = snapshot(repo.path());
+        for purpose in [Purpose::Start, Purpose::Preview] {
+            let launch = next_start(repo.path(), purpose).await;
+            assert_eq!(launch.program, "claude", "{launch:?}");
+            assert!(launch.args.iter().any(|a| a == "--chrome"), "{launch:?}");
+            assert!(
+                !launch.args.iter().any(|a| a.contains(OLD_SESSION)),
+                "the codex session is not resumed: {launch:?}"
+            );
+            assert_eq!(
+                launch.env_overrides.get("CLANK_AGENT").map(String::as_str),
+                Some("browser2"),
+                "a fresh session that binds as browser2: {launch:?}"
+            );
+        }
+        assert_eq!(snapshot(repo.path()), before, "the binding is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_tool_changed_away_from_grok_never_takes_the_grok_path() {
+        let repo = changed_tool(
+            r#"{ "tool": "codex", "role": "standby", "launch": { "args": ["--no-daemon"] } }"#,
+            "grok",
+        );
+        let launch = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(launch.program, "codex", "{launch:?}");
+        assert!(launch.args.iter().any(|a| a == "--no-daemon"), "{launch:?}");
+        assert!(!launch.args.iter().any(|a| a.contains(OLD_SESSION)));
+    }
+
+    #[tokio::test]
+    async fn an_older_tools_fork_intent_neither_runs_nor_is_consumed() {
+        let repo = changed_tool(
+            r#"{ "tool": "claude", "role": "standby", "launch": { "args": ["--chrome"] } }"#,
+            "codex",
+        );
+        let label = AgentLabel::parse("browser2").unwrap();
+        crate::cli::fork::save_fork_spec(
+            repo.path(),
+            &label,
+            &crate::cli::fork::ForkSpec {
+                tool: Tool::Codex,
+                from_session: Some("01a156a7-0000-7000-8000-00000000f0f0".into()),
+                prompt: "forked".into(),
+                grok: None,
+            },
+        )
+        .unwrap();
+        let launch = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(launch.program, "claude", "{launch:?}");
+        assert!(
+            !launch.args.iter().any(|a| a.contains("f0f0")),
+            "{launch:?}"
+        );
+        assert!(crate::cli::fork::fork_spec_path(repo.path(), &label).exists());
+    }
+
+    #[tokio::test]
+    async fn an_unbound_agents_fork_intent_for_another_tool_is_set_aside() {
+        let repo = changed_tool(
+            r#"{ "tool": "claude", "role": "standby", "launch": { "args": ["--chrome"] } }"#,
+            "claude",
+        );
+        let label = AgentLabel::parse("browser2").unwrap();
+        std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
+        crate::cli::fork::save_fork_spec(
+            repo.path(),
+            &label,
+            &crate::cli::fork::ForkSpec {
+                tool: Tool::Codex,
+                from_session: Some("01a156a7-0000-7000-8000-00000000f0f0".into()),
+                prompt: "forked".into(),
+                grok: None,
+            },
+        )
+        .unwrap();
+        let launch = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(launch.program, "claude", "{launch:?}");
+        assert!(launch.args.iter().any(|a| a == "--chrome"), "{launch:?}");
+        assert!(crate::cli::fork::fork_spec_path(repo.path(), &label).exists());
+    }
+
+    /// codex on e112390: a Grok fork intent left from an earlier switch,
+    /// under a Codex binding, now configured Grok again.
+    #[tokio::test]
+    async fn switching_back_to_grok_retires_the_old_grok_fork_and_the_fresh_session_binds() {
+        let repo = changed_tool(r#"{ "tool": "grok", "role": "standby" }"#, "codex");
+        let label = AgentLabel::parse("browser2").unwrap();
+        crate::cli::fork::save_fork_spec(
+            repo.path(),
+            &label,
+            &crate::cli::fork::ForkSpec {
+                tool: Tool::Grok,
+                from_session: Some("019a0000-0000-7000-8000-000000000010".into()),
+                prompt: "older Grok fork intent".into(),
+                grok: Some(crate::cli::fork::GrokForkIntent {
+                    source_cwd: repo.path().into(),
+                    child_id: "019a0000-0000-7000-8000-000000000011".into(),
+                    prepared: true,
+                }),
+            },
+        )
+        .unwrap();
+        let intent = crate::cli::fork::fork_spec_path(repo.path(), &label);
+
+        let launch = next_start(repo.path(), Purpose::Preview).await;
+        assert_eq!(launch.program, "grok");
+        assert!(
+            !launch.args.iter().any(|a| a.contains("000000000011")),
+            "{launch:?}"
+        );
+        assert!(intent.exists(), "a preview retires nothing");
+
+        let cfg = load_agent_config(repo.path(), &label).unwrap();
+        let old = cfg.as_ref().and_then(|c| c.session.as_ref());
+        let superseded = superseded_session(Tool::Grok, old);
+        assert!(superseded.is_some());
+        let chosen = fork_intent(repo.path(), &label, Tool::Grok, superseded, false).unwrap();
+        assert!(chosen.is_none(), "set aside");
+        assert!(!intent.exists(), "a real start retires it");
+
+        let fresh =
+            clank_core::ids::SessionId::parse("019a0000-0000-7000-8000-000000000012").unwrap();
+        crate::agent_store::bind_session_to_agent(repo.path(), &label, Tool::Grok, &fresh).unwrap();
+        let cfg = load_agent_config(repo.path(), &label).unwrap();
+        let now = cfg.as_ref().and_then(|c| c.session.as_ref()).unwrap();
+        assert_eq!(now.tool, Tool::Grok);
+        assert_eq!(
+            superseded_session(Tool::Grok, Some(now)),
+            None,
+            "the switch is done"
+        );
+    }
+
+    #[test]
+    fn a_matching_fork_intent_is_followed_and_kept() {
+        let repo = changed_tool(r#"{ "tool": "codex", "role": "standby" }"#, "codex");
+        let label = AgentLabel::parse("browser2").unwrap();
+        std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Codex,
+            from_session: None,
+            prompt: "forked".into(),
+            grok: None,
+        };
+        crate::cli::fork::save_fork_spec(repo.path(), &label, &spec).unwrap();
+        let chosen = fork_intent(repo.path(), &label, Tool::Codex, None, false).unwrap();
+        assert_eq!(chosen.map(|s| s.prompt), Some("forked".into()));
+        assert!(crate::cli::fork::fork_spec_path(repo.path(), &label).exists());
+    }
+
+    #[tokio::test]
+    async fn a_matching_tool_still_resumes_its_session() {
+        let repo = changed_tool(
+            r#"{ "tool": "codex", "role": "standby", "launch": { "args": ["--no-daemon"] } }"#,
+            "codex",
+        );
+        let launch = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(launch.program, "codex");
+        assert!(
+            launch.args.iter().any(|a| a.contains(OLD_SESSION)),
+            "{launch:?}"
+        );
+    }
+
+    #[test]
+    fn agent_list_shows_the_tool_the_next_start_switches_to() {
+        let label = AgentLabel::parse("browser2").unwrap();
+        let session: Session = serde_json::from_str(&format!(
+            r#"{{ "id": "{OLD_SESSION}", "tool": "codex", "updated_at": "x" }}"#
+        ))
+        .unwrap();
+        let changed =
+            AgentRow::from_join(&label, "standby", "standby", Tool::Claude, Some(&session));
+        assert_eq!(changed.tool_shown(), "codex → claude next start");
+        let same = AgentRow::from_join(&label, "standby", "standby", Tool::Codex, Some(&session));
+        assert_eq!(same.tool_shown(), "codex");
+        let unbound = AgentRow::from_join(&label, "standby", "standby", Tool::Claude, None);
+        assert_eq!(unbound.tool_shown(), "claude");
     }
 
     #[test]

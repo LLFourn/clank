@@ -217,6 +217,14 @@ pub(crate) struct AgentAutoRow {
     pub(crate) repeated: Option<u32>,
 }
 
+impl AgentAutoRow {
+    /// The bound session the roster's tool has moved away from.
+    pub(crate) fn superseded(&self) -> Option<&clank_core::Session> {
+        let configured = clank_core::Tool::from_str(&self.tool)?;
+        crate::cli::agent::superseded_session(configured, self.session.as_ref())
+    }
+}
+
 /// The invocation that runs an agent: launch command (or the bare tool
 /// name) + any launch args. Shared by the roster rows and the "+ add"
 /// candidates so both render the same string.
@@ -845,6 +853,17 @@ impl StatusSnapshot {
             let _ = writeln!(out, "  {url}");
         }
         for row in &self.agents {
+            if let Some(old) = row.superseded() {
+                let _ = writeln!(
+                    out,
+                    "tool changed: {} → bound to a {} session, configured {}; \
+                     its next start runs {} fresh",
+                    row.label,
+                    old.tool.as_str(),
+                    row.tool,
+                    row.tool
+                );
+            }
             if let Some(state) = &row.state {
                 let _ = writeln!(
                     out,
@@ -2721,6 +2740,32 @@ mod dirty_and_wake_tests {
             pid,
             at: at.unwrap_or("2026-08-20T14:51:09Z").to_string(),
         }
+    }
+
+    #[test]
+    fn a_changed_tool_is_said_until_the_new_session_binds() {
+        let bound = |tool: &str| -> clank_core::Session {
+            serde_json::from_str(&format!(
+                r#"{{ "id": "01a156a7-f516-7dc0-8b58-520faf122796", "tool": "{tool}",
+                     "updated_at": "x" }}"#
+            ))
+            .unwrap()
+        };
+        let mut snap = minimal_snapshot();
+        let mut row = agent_row("browser2", None);
+        row.tool = "claude".into();
+        row.session = Some(bound("codex"));
+        snap.agents = vec![row];
+        let out = snap.to_human();
+        assert!(
+            out.contains(
+                "tool changed: browser2 → bound to a codex session, configured claude; \
+                 its next start runs claude fresh"
+            ),
+            "{out}"
+        );
+        snap.agents[0].session = Some(bound("claude"));
+        assert!(!snap.to_human().contains("tool changed"));
     }
 
     #[test]

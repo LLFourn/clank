@@ -11,8 +11,6 @@
 
 use std::path::Path;
 
-use anyhow::Context as _;
-
 use crate::git_plumbing::{self as plumbing, ExpectedRef, Moved, Replayed};
 
 /// What a transaction read before building, and reads again before it
