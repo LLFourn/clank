@@ -1665,6 +1665,7 @@ impl Drop for TempRepo {
         // /var or /tmp alias. Their inode is keyed by that canonical path.
         if let Ok(repo) = dunce::canonicalize(self.0.path()) {
             let _ = std::fs::remove_file(runtime_path(&repo, "plan-mutation"));
+            let _ = std::fs::remove_file(runtime_path(&repo, "roster"));
         }
     }
 }

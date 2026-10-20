@@ -1685,11 +1685,10 @@ impl NewRole {
 
 /// Serializes an add's read, role decision and write, so two adds to a
 /// roster with no master cannot both make theirs master, and neither
-/// write loses the other's agent.
+/// write loses the other's agent. Process state, so it lives in the
+/// runtime namespace rather than the working tree.
 fn roster_lock(repo: &Path) -> anyhow::Result<std::fs::File> {
-    let dir = repo.join(".clank");
-    std::fs::create_dir_all(&dir)?;
-    crate::agent_store::exclusive_lock(&dir.join("roster.lock"))
+    Ok(super::plan_mutation::runtime_lock(repo, "roster")?.0)
 }
 
 /// Insert a fresh agent (built inline from a description) into
@@ -2894,10 +2893,15 @@ mod tests {
             let repo = tempfile::tempdir().unwrap();
             seed_repo_config(repo.path(), r#"{ "agents": {} }"#);
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let adds: Vec<_> = ["claude", "codex"]
+            // One add reaches the repo through a symlink: the lock is keyed
+            // by the canonical repo, so an alias is the same lock.
+            let alias = tempfile::tempdir().unwrap();
+            let linked = alias.path().join("repo");
+            std::os::unix::fs::symlink(repo.path(), &linked).unwrap();
+            let adds: Vec<_> = [("claude", repo.path().to_path_buf()), ("codex", linked)]
                 .into_iter()
-                .map(|name| {
-                    let (path, barrier) = (repo.path().to_path_buf(), barrier.clone());
+                .map(|(name, path)| {
+                    let barrier = barrier.clone();
                     std::thread::spawn(move || {
                         let label = AgentLabel::parse(name).unwrap();
                         barrier.wait();
@@ -2920,7 +2924,43 @@ mod tests {
                 1,
                 "{roles:?}"
             );
+            assert!(
+                !repo.path().join(".clank/roster.lock").exists(),
+                "the lock is process state, not the working tree's"
+            );
+            forget_roster_lock(repo.path());
         }
+    }
+
+    fn forget_roster_lock(repo: &Path) {
+        let canonical = dunce::canonicalize(repo).unwrap();
+        let _ = std::fs::remove_file(crate::cli::monitor::runtime_path(&canonical, "roster"));
+    }
+
+    /// The roster lock excludes a second holder until the first lets go,
+    /// whichever spelling of the repo each uses.
+    #[test]
+    fn the_roster_lock_excludes_across_aliases() {
+        let repo = tempfile::tempdir().unwrap();
+        let alias = tempfile::tempdir().unwrap();
+        let linked = alias.path().join("repo");
+        std::os::unix::fs::symlink(repo.path(), &linked).unwrap();
+        let held = roster_lock(repo.path()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _lock = roster_lock(&linked).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the alias took the lock while it was held"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the alias takes the lock once it is free");
+        waiter.join().unwrap();
+        forget_roster_lock(repo.path());
     }
 
     // ── agent add (inline) ───────────────────────────────────

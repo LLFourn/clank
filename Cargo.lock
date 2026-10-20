@@ -357,6 +357,7 @@ dependencies = [
  "oxc_parser",
  "oxc_semantic",
  "oxc_span",
+ "proc-macro2",
  "pulldown-cmark",
  "qrcode",
  "quote",

@@ -167,8 +167,10 @@ rquickjs = "0.14"
 filetime = "0.2"
 # test-only: the source gates read each file's module tree from the
 # parse, so a comment or string that looks like `mod x;` includes nothing.
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
+# test-only: line numbers for what the parsed-source gates report.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).
 tokio = { version = "1", features = ["test-util"] }

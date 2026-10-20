@@ -16,16 +16,23 @@ pub(crate) struct PlanMutationLock {
 }
 
 pub(crate) fn lock(repo: &Path) -> anyhow::Result<PlanMutationLock> {
+    let (file, repo) = runtime_lock(repo, "plan-mutation")?;
+    Ok(PlanMutationLock { _file: file, repo })
+}
+
+/// Hold this repo's `name` lock in the uid runtime namespace, blocking
+/// until it is free, and return it with the canonical repo it is keyed
+/// by: CLI, TUI, aliases and linked callers all reach the same inode.
+pub(crate) fn runtime_lock(repo: &Path, name: &str) -> anyhow::Result<(std::fs::File, PathBuf)> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Canonical identity is shared by CLI, TUI, aliases and linked callers.
     let repo = dunce::canonicalize(repo)
         .with_context(|| format!("resolving repo `{}`", repo.display()))?;
     super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
-    let path = super::monitor::runtime_path(&repo, "plan-mutation");
+    let path = super::monitor::runtime_path(&repo, name);
     // Never unlink in production: replacing a locked inode could admit a
-    // second holder at the same name while the first is still mutating Git.
+    // second holder at the same name while the first still holds it.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -34,15 +41,15 @@ pub(crate) fn lock(repo: &Path) -> anyhow::Result<PlanMutationLock> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .with_context(|| format!("opening plan mutation lock `{}`", path.display()))?;
+        .with_context(|| format!("opening lock `{}`", path.display()))?;
     loop {
         // SAFETY: valid owned fd; flock has no memory effects.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(PlanMutationLock { _file: file, repo });
+            return Ok((file, repo));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error).context("locking plan mutations");
+            return Err(error).with_context(|| format!("locking `{}`", path.display()));
         }
     }
 }

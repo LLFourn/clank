@@ -328,6 +328,11 @@ impl Production {
         Production { test_only }
     }
 
+    /// Whether only test code includes `f`.
+    pub fn is_test_only(&self, f: &Path) -> bool {
+        self.test_only.contains(&normal(f))
+    }
+
     pub fn text(&self, f: &Path) -> String {
         if self.test_only.contains(&normal(f)) {
             return String::new();
