@@ -1345,6 +1345,12 @@ pub enum AgentCmd {
     /// master (use `agent promote`) and refuses when the incoming
     /// label is already on the roster.
     Swap(AgentSwapArgs),
+    /// Show an agent's launch profile and the command `agent start`
+    /// would run. Given `--cmd`, `--env` or `-- <args>`, that is the
+    /// agent's whole new launch (nothing is kept from before); `--clear`
+    /// is the bare tool. The agent keeps its role, session and pane, and
+    /// the change applies from its next start.
+    Launch(AgentLaunchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1408,20 +1414,34 @@ pub struct AgentAddArgs {
     /// of the repo roster. Requires `--tool`. No repo change.
     #[arg(long)]
     pub global: bool,
-    /// Override the executable used by `clank agent start`. If
-    /// unset, the agent's tool name (`claude` / `codex`) is used.
-    #[arg(long, value_name = "CMD")]
+    /// The executable `clank agent start` runs, instead of the tool's
+    /// own name.
+    #[arg(long, value_name = "EXECUTABLE")]
+    pub cmd: Option<String>,
+    /// An environment variable for the agent's process, `KEY=VAL`;
+    /// repeatable. It wins over the inherited environment. A per-agent
+    /// tool home goes here: `--env CODEX_HOME=~/.codex-browser`.
+    #[arg(long = "env", value_name = "KEY=VAL")]
+    pub env: Vec<String>,
+    /// The old spelling of `--cmd`.
+    #[arg(long, value_name = "CMD", hide = true, conflicts_with_all = ["cmd", "tool_args"])]
     pub launch_cmd: Option<String>,
-    /// Arguments inserted on the tool invocation BEFORE the
-    /// session-restore suffix. Repeat for multiple args.
-    /// `allow_hyphen_values` lets you pass values that start with
-    /// `-` or `--` directly (e.g. `--launch-arg --profile`).
-    #[arg(long = "launch-arg", value_name = "ARG", allow_hyphen_values = true)]
+    /// The old spelling of the arguments after `--`, one per flag.
+    #[arg(
+        long = "launch-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        hide = true,
+        conflicts_with = "tool_args"
+    )]
     pub launch_args: Vec<String>,
-    /// Environment overrides applied to the spawned process.
-    /// Format `KEY=VAL`. Repeatable. `launch.env` wins over the
-    /// inherited environment on key collision.
-    #[arg(long = "launch-env", value_name = "KEY=VAL")]
+    /// The old spelling of `--env`.
+    #[arg(
+        long = "launch-env",
+        value_name = "KEY=VAL",
+        hide = true,
+        conflicts_with_all = ["env", "tool_args"]
+    )]
     pub launch_envs: Vec<String>,
     /// Initial prompt passed to the resumed tool as a trailing
     /// positional. Pass `""` to explicitly disable the prompt
@@ -1433,6 +1453,37 @@ pub struct AgentAddArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// The tool's own arguments, after `--`, exactly as you would type
+    /// them to the tool: `clank agent add web --tool codex -- --no-daemon
+    /// -c key=value`. Keep them to the few flags that select a
+    /// configuration; MCP servers and feature switches belong in the
+    /// tool's own config file or a per-agent home (`--env`).
+    #[arg(last = true, value_name = "TOOL ARGS")]
+    pub tool_args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentLaunchArgs {
+    /// Agent label.
+    pub name: String,
+    /// The executable `clank agent start` runs, instead of the tool's
+    /// own name.
+    #[arg(long, value_name = "EXECUTABLE")]
+    pub cmd: Option<String>,
+    /// An environment variable for the agent's process, `KEY=VAL`;
+    /// repeatable.
+    #[arg(long = "env", value_name = "KEY=VAL")]
+    pub env: Vec<String>,
+    /// Empty the launch profile, so the bare tool runs again.
+    #[arg(long, conflicts_with_all = ["cmd", "env", "tool_args"])]
+    pub clear: bool,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// The tool's own arguments, after `--`, exactly as you would type
+    /// them to the tool.
+    #[arg(last = true, value_name = "TOOL ARGS")]
+    pub tool_args: Vec<String>,
 }
 
 #[derive(Args, Debug)]

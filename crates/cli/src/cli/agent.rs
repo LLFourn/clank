@@ -29,8 +29,8 @@ use clank_core::vocab::{AutoMode, Tool};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
-    AgentSetReviewArgs, AgentStartArgs, AgentSwapArgs, resolve_repo,
+    AgentAddArgs, AgentArgs, AgentCmd, AgentLaunchArgs, AgentListArgs, AgentPromoteArgs,
+    AgentRemoveArgs, AgentSetReviewArgs, AgentStartArgs, AgentSwapArgs, resolve_repo,
 };
 use crate::shell_quote::shell_quote;
 
@@ -43,6 +43,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::Remove(a) => remove(a),
         AgentCmd::SetReview(a) => set_review(a),
         AgentCmd::Swap(a) => swap(a),
+        AgentCmd::Launch(a) => launch(a).await,
     }
 }
 
@@ -180,6 +181,29 @@ fn print_human(rows: &[AgentRow]) {
 /// field (per `agent-add-cli-and-repo-scope`). Session binding
 /// state comes from the per-agent skeleton.
 async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
+    start_with(args, Purpose::Start, session_holder::find).await
+}
+
+/// Whether `start_with` launches the agent or only shows what a launch
+/// would run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Start,
+    /// What the agent's next start runs. A pane already running it is
+    /// said, not refused: nothing is launched.
+    Preview,
+}
+
+/// Who already runs a bound session: [`session_holder::find`], or a
+/// test's answer.
+type FindHolder = fn(&Session, &AgentLabel, &str, String) -> Holder;
+
+async fn start_with(
+    args: AgentStartArgs,
+    purpose: Purpose,
+    find_holder: FindHolder,
+) -> anyhow::Result<()> {
+    let print = args.print || purpose == Purpose::Preview;
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
@@ -226,7 +250,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
             let spec = crate::cli::fork::load_fork_spec(&repo, &label)?;
             match spec {
                 Some(spec) if spec.tool == Tool::Grok => {
-                    if args.print {
+                    if print {
                         eprintln!(
                             "Grok fork: prepare history in {} through ACP, then launch the child; preview does not prepare or consume the intent",
                             repo.display()
@@ -248,7 +272,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                     )
                 }
                 Some(spec) => {
-                    if !args.print {
+                    if !print {
                         super::setup::ensure_launch_setup(&repo, spec.tool, desc.launch.as_ref())
                             .await?;
                         consume_fork = true;
@@ -261,7 +285,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                     )
                 }
                 None => {
-                    if !args.print {
+                    if !print {
                         super::setup::ensure_launch_setup(&repo, desc.tool, desc.launch.as_ref())
                             .await?;
                     }
@@ -269,12 +293,30 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 }
             }
         }
-        Some(session) => match session_holder::find(
-            session,
-            &label,
-            &repo_as_given(&args, &repo),
-            launch_program(Tool::Claude, desc.launch.as_ref()),
+        Some(session) => match match (
+            find_holder(
+                session,
+                &label,
+                &repo_as_given(&args, &repo),
+                launch_program(Tool::Claude, desc.launch.as_ref()),
+            ),
+            purpose,
         ) {
+            (
+                Holder::Pane {
+                    session: held_in,
+                    tab,
+                },
+                Purpose::Preview,
+            ) => {
+                eprintln!(
+                    "`{label}` is running now in zellij session `{held_in}`, tab `{tab}`; \
+                     this is what its next start runs"
+                );
+                Holder::Nobody
+            }
+            (holder, _) => holder,
+        } {
             Holder::Pane {
                 session: held_in,
                 tab,
@@ -291,7 +333,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
                 session.tool,
             ),
             Holder::Nobody => {
-                if !args.print {
+                if !print {
                     super::setup::ensure_launch_setup(&repo, session.tool, desc.launch.as_ref())
                         .await?;
                 }
@@ -319,7 +361,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         },
     };
 
-    if args.print {
+    if print {
         print_composed(&composed);
         return Ok(());
     }
@@ -1054,17 +1096,22 @@ fn session_restore_args(tool: Tool, session_id: &str, repo: &Path) -> Vec<String
 /// diff on stderr. Used by `--print` for tests + zellij-style
 /// introspection.
 fn print_composed(c: &ComposedLaunch) {
-    let mut line = shell_quote(&c.program);
-    for a in &c.args {
-        line.push(' ');
-        line.push_str(&shell_quote(a));
-    }
-    println!("{line}");
+    println!("{}", composed_line(c));
     if !c.env_overrides.is_empty() {
         for (k, v) in &c.env_overrides {
             eprintln!("env: {k}={v}");
         }
     }
+}
+
+/// The composed argv as one shell-quoted line a shell parses back to it.
+fn composed_line(c: &ComposedLaunch) -> String {
+    let mut line = shell_quote(&c.program);
+    for a in &c.args {
+        line.push(' ');
+        line.push_str(&shell_quote(a));
+    }
+    line
 }
 
 /// A fresh agent launch must not INHERIT another agent's identity:
@@ -1155,8 +1202,7 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         let tool = args.tool.ok_or_else(|| {
             anyhow::anyhow!("--global requires --tool (a library description needs a tool)")
         })?;
-        let env = parse_env_overrides(&args.launch_envs)?;
-        let launch = build_launch(args.launch_cmd, args.launch_args, env);
+        let launch = launch_from_add(&args)?;
         let desc = AgentDescription {
             tool: tool.into(),
             launch,
@@ -1174,8 +1220,7 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     match args.tool {
         // Inline definition: a fresh agent built from CLI flags.
         Some(tool) => {
-            let env = parse_env_overrides(&args.launch_envs)?;
-            let launch = build_launch(args.launch_cmd, args.launch_args, env);
+            let launch = launch_from_add(&args)?;
             let desc = AgentDescription {
                 tool: tool.into(),
                 launch,
@@ -1985,9 +2030,9 @@ fn parse_env_overrides(raw: &[String]) -> anyhow::Result<BTreeMap<String, String
     for s in raw {
         let (k, v) = s
             .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("--launch-env value `{s}` must be `KEY=VAL`"))?;
+            .ok_or_else(|| anyhow::anyhow!("--env value `{s}` must be `KEY=VAL`"))?;
         if k.is_empty() {
-            anyhow::bail!("--launch-env key cannot be empty: `{s}`");
+            anyhow::bail!("--env key cannot be empty: `{s}`");
         }
         out.insert(k.to_string(), v.to_string());
     }
@@ -1997,6 +2042,132 @@ fn parse_env_overrides(raw: &[String]) -> anyhow::Result<BTreeMap<String, String
 /// Construct a `LaunchConfig` from CLI args. Returns `None` when
 /// no launch-related flag was passed (Phase 6 default: skeleton
 /// declaration's `launch` field is absent rather than `Some({})`).
+/// The launch profile `agent add` was given, in either spelling; clap
+/// refuses the two mixed.
+fn launch_from_add(args: &AgentAddArgs) -> anyhow::Result<Option<LaunchConfig>> {
+    let mut env = parse_env_overrides(&args.env)?;
+    env.extend(parse_env_overrides(&args.launch_envs)?);
+    let tool_args = if args.tool_args.is_empty() {
+        args.launch_args.clone()
+    } else {
+        args.tool_args.clone()
+    };
+    Ok(build_launch(
+        args.cmd.clone().or_else(|| args.launch_cmd.clone()),
+        tool_args,
+        env,
+    ))
+}
+
+/// What `clank agent launch` was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchRequest {
+    Show,
+    /// The agent's whole new launch; `None` is the bare tool.
+    Set(Option<LaunchConfig>),
+}
+
+/// `clank agent launch <name> [...]`: show the profile and the composed
+/// command, or change the profile in place first.
+async fn launch(args: AgentLaunchArgs) -> anyhow::Result<()> {
+    launch_with(args, session_holder::find).await
+}
+
+async fn launch_with(args: AgentLaunchArgs, find_holder: FindHolder) -> anyhow::Result<()> {
+    let label = AgentLabel::parse(&args.name)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
+    let repo = resolve_repo(args.repo.as_deref())?;
+    if let LaunchRequest::Set(new) = launch_request(&args)? {
+        set_repo_launch(&repo, &label, new)?;
+        eprintln!(
+            "`{}`'s launch is changed; it applies from its next start",
+            label.as_str()
+        );
+    }
+    let cfg = read_repo_config(&repo)?;
+    let agent = cfg.agents.get(&label).ok_or_else(|| {
+        anyhow::anyhow!("agent `{}` is not on this repo's roster", label.as_str())
+    })?;
+    println!("{}", describe_launch(agent.tool, agent.launch.as_ref()));
+    println!("`clank agent start {}` runs:", label.as_str());
+    start_with(
+        AgentStartArgs {
+            name: args.name,
+            repo: Some(repo),
+            print: true,
+        },
+        Purpose::Preview,
+        find_holder,
+    )
+    .await
+}
+
+/// The change `agent launch` was asked for, or `None` to only show.
+/// What was written is the whole launch: nothing is kept from before.
+fn launch_request(args: &AgentLaunchArgs) -> anyhow::Result<LaunchRequest> {
+    if args.clear {
+        return Ok(LaunchRequest::Set(None));
+    }
+    if args.cmd.is_none() && args.env.is_empty() && args.tool_args.is_empty() {
+        return Ok(LaunchRequest::Show);
+    }
+    Ok(LaunchRequest::Set(build_launch(
+        args.cmd.clone(),
+        args.tool_args.clone(),
+        parse_env_overrides(&args.env)?,
+    )))
+}
+
+/// A launch profile as `agent launch` shows it.
+fn describe_launch(tool: Tool, launch: Option<&LaunchConfig>) -> String {
+    let Some(launch) = launch else {
+        return format!("launch: the bare `{}`", tool.as_str());
+    };
+    let mut out = format!(
+        "cmd:  {}",
+        launch
+            .command
+            .as_deref()
+            .map(shell_quote)
+            .unwrap_or_else(|| format!("{} (the tool's own)", tool.as_str()))
+    );
+    out.push_str("\nargs:");
+    for arg in &launch.args {
+        out.push(' ');
+        out.push_str(&shell_quote(arg));
+    }
+    for (key, value) in &launch.env {
+        out.push_str(&format!("\nenv:  {key}={}", shell_quote(value)));
+    }
+    out
+}
+
+/// Set a roster agent's whole launch profile in place (`None`: the bare
+/// tool): one config write, leaving its role, session binding and every
+/// other agent as they are.
+pub fn set_repo_launch(
+    repo: &Path,
+    label: &AgentLabel,
+    launch: Option<LaunchConfig>,
+) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    let before = repo_cfg.clone();
+    let Some(agent) = repo_cfg.agents.get_mut(label) else {
+        anyhow::bail!(
+            "agent `{label}` is not on this repo's roster. \
+             Add it with `clank agent add {label}` first.",
+            label = label.as_str()
+        );
+    };
+    agent.launch = launch;
+    write_repo_transition(
+        repo,
+        &before,
+        &repo_cfg,
+        RosterTransitionPolicy::PreserveGate,
+    )
+}
+
 fn build_launch(
     cmd: Option<String>,
     args: Vec<String>,
@@ -2847,6 +3018,327 @@ mod tests {
         set_repo_master(repo.path(), &claude).unwrap();
         let parsed = read_repo(repo.path());
         assert_eq!(parsed.agents[&claude].role, RosterRole::Master);
+    }
+
+    // ── agent launch, and add's `--` ────────────────────────
+
+    fn parse(argv: &[&str]) -> Result<crate::cli::AgentCmd, clap::Error> {
+        use clap::Parser as _;
+        let cli = crate::cli::command::Cli::try_parse_from(argv.iter().copied())?;
+        match cli.command {
+            crate::cli::command::Command::Agent(a) => Ok(a.command),
+            _ => panic!("not an agent command"),
+        }
+    }
+
+    fn add_args(argv: &[&str]) -> AgentAddArgs {
+        let mut full = vec!["clank", "agent", "add"];
+        full.extend_from_slice(argv);
+        match parse(&full).unwrap() {
+            crate::cli::AgentCmd::Add(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn launch_args(argv: &[&str]) -> AgentLaunchArgs {
+        let mut full = vec!["clank", "agent", "launch"];
+        full.extend_from_slice(argv);
+        match parse(&full).unwrap() {
+            crate::cli::AgentCmd::Launch(a) => a,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const AWKWARD: [&str; 6] = [
+        "--no-daemon",
+        "-c",
+        r#"k=["a","b c"]"#,
+        "",
+        "--review",
+        "it's \"quoted\"",
+    ];
+
+    #[test]
+    fn everything_after_the_double_dash_is_the_tools_arguments_verbatim() {
+        let mut argv = vec!["web", "--tool", "codex", "--env", "CODEX_HOME=/h", "--"];
+        argv.extend(AWKWARD);
+        let launch = launch_from_add(&add_args(&argv)).unwrap().unwrap();
+        assert_eq!(launch.args, AWKWARD);
+        assert_eq!(launch.env.get("CODEX_HOME").map(String::as_str), Some("/h"));
+        assert_eq!(launch.command, None);
+    }
+
+    #[test]
+    fn agent_add_stores_the_arguments_after_the_double_dash_on_the_roster() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": { "claude": { "tool": "claude", "role": "master" } } }"#,
+        );
+        let path = repo.path().to_str().unwrap().to_string();
+        let mut argv = vec![
+            "web", "--tool", "codex", "--review", "standby", "--repo", &path, "--",
+        ];
+        argv.extend(AWKWARD);
+        add(add_args(&argv)).unwrap();
+        let roster = read_repo(repo.path());
+        let web = &roster.agents[&AgentLabel::parse("web").unwrap()];
+        assert_eq!(web.launch.as_ref().unwrap().args, AWKWARD);
+        assert_eq!(web.role, RosterRole::Standby);
+    }
+
+    #[test]
+    fn the_old_flags_build_the_same_launch() {
+        let old = add_args(&[
+            "web",
+            "--tool",
+            "codex",
+            "--launch-cmd",
+            "codex2",
+            "--launch-env",
+            "A=1",
+            "--launch-arg",
+            "--no-daemon",
+            "--launch-arg",
+            "-c",
+        ]);
+        let new = add_args(&[
+            "web",
+            "--tool",
+            "codex",
+            "--cmd",
+            "codex2",
+            "--env",
+            "A=1",
+            "--",
+            "--no-daemon",
+            "-c",
+        ]);
+        assert_eq!(
+            launch_from_add(&old).unwrap(),
+            launch_from_add(&new).unwrap()
+        );
+    }
+
+    #[test]
+    fn mixing_the_old_flags_with_the_new_form_is_refused() {
+        for argv in [
+            &[
+                "clank",
+                "agent",
+                "add",
+                "w",
+                "--tool",
+                "codex",
+                "--launch-arg",
+                "x",
+                "--",
+                "y",
+            ][..],
+            &[
+                "clank",
+                "agent",
+                "add",
+                "w",
+                "--tool",
+                "codex",
+                "--launch-cmd",
+                "a",
+                "--cmd",
+                "b",
+            ],
+            &[
+                "clank",
+                "agent",
+                "add",
+                "w",
+                "--tool",
+                "codex",
+                "--launch-env",
+                "A=1",
+                "--env",
+                "B=2",
+            ],
+        ] {
+            let err = parse(argv).unwrap_err().to_string();
+            assert!(err.contains("cannot be used with"), "{argv:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn launch_without_a_change_only_shows_and_refuses_contradictions() {
+        assert_eq!(
+            launch_request(&launch_args(&["web"])).unwrap(),
+            LaunchRequest::Show
+        );
+        assert_eq!(
+            launch_request(&launch_args(&["web", "--"])).unwrap(),
+            LaunchRequest::Show
+        );
+        let mut argv = vec!["web", "--"];
+        argv.extend(AWKWARD);
+        assert_eq!(launch_args(&argv).tool_args, AWKWARD);
+        for bad in [
+            &["clank", "agent", "launch", "web", "--clear", "--", "x"][..],
+            &["clank", "agent", "launch", "web", "--clear", "--env", "A=1"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn seeded() -> (tempfile::TempDir, AgentLabel) {
+        let repo = tempfile::tempdir().unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "web": { "tool": "codex", "role": "standby", "initial_prompt": "go",
+                         "launch": { "args": ["--old"], "env": { "A": "1" } } }
+            } }"#,
+        );
+        (repo, AgentLabel::parse("web").unwrap())
+    }
+
+    fn set(repo: &Path, label: &AgentLabel, argv: &[&str]) {
+        let LaunchRequest::Set(new) = launch_request(&launch_args(argv)).unwrap() else {
+            panic!("{argv:?} only shows");
+        };
+        set_repo_launch(repo, label, new).unwrap();
+    }
+
+    #[test]
+    fn launch_sets_the_whole_profile_in_place_and_nothing_else() {
+        let (repo, web) = seeded();
+        let before = read_repo(repo.path());
+        let mut argv = vec!["web", "--env", "B=2", "--"];
+        argv.extend(AWKWARD);
+        set(repo.path(), &web, &argv);
+        let mut after = read_repo(repo.path());
+        let launch = after.agents.get_mut(&web).unwrap().launch.take().unwrap();
+        assert_eq!(launch.args, AWKWARD);
+        assert_eq!(
+            launch.env.keys().collect::<Vec<_>>(),
+            ["B"],
+            "exactly what was written: the old A=1 is gone"
+        );
+        assert_eq!(launch.command, None);
+        let mut expected = before;
+        expected.agents.get_mut(&web).unwrap().launch = None;
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "role, prompt and the other agents are untouched"
+        );
+        let agent = &read_repo(repo.path()).agents[&web];
+        let desc = AgentDescription {
+            tool: agent.tool,
+            launch: agent.launch.clone(),
+            initial_prompt: agent.initial_prompt.clone(),
+        };
+        let composed = compose_bootstrap_launch(repo.path(), &web, &desc).unwrap();
+        for arg in AWKWARD {
+            assert!(
+                composed.args.iter().any(|a| a == arg),
+                "{arg:?} in {:?}",
+                composed.args
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_without_arguments_has_none_and_clear_is_the_bare_tool() {
+        let (repo, web) = seeded();
+        set(
+            repo.path(),
+            &web,
+            &["web", "--cmd", "codex2", "--env", "B=2"],
+        );
+        let launch = read_repo(repo.path()).agents[&web].launch.clone().unwrap();
+        assert!(launch.args.is_empty(), "the old --old is gone");
+        assert_eq!(launch.command.as_deref(), Some("codex2"));
+        assert_eq!(launch.env.keys().collect::<Vec<_>>(), ["B"]);
+        set(repo.path(), &web, &["web", "--clear"]);
+        assert_eq!(read_repo(repo.path()).agents[&web].launch, None);
+    }
+
+    fn running_in_a_pane(_: &Session, _: &AgentLabel, _: &str, _: String) -> Holder {
+        Holder::Pane {
+            session: "elsewhere".into(),
+            tab: "work".into(),
+        }
+    }
+
+    /// A git repo whose `web` agent is bound to a session a pane runs.
+    fn bound_and_running() -> (tempfile::TempDir, String) {
+        let (repo, _) = seeded();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        let skeleton = repo.path().join(".clank/agents/web/config.json");
+        std::fs::create_dir_all(skeleton.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skeleton,
+            r#"{ "session": { "id": "019a0000-0000-7000-8000-000000000001",
+                             "tool": "codex", "updated_at": "2026-10-20T00:00:00Z" } }"#,
+        )
+        .unwrap();
+        let path = repo.path().to_str().unwrap().to_string();
+        (repo, path)
+    }
+
+    #[tokio::test]
+    async fn a_running_agent_can_be_shown_and_changed_for_its_next_start() {
+        let (repo, path) = bound_and_running();
+        let skeleton = repo.path().join(".clank/agents/web/config.json");
+        let bound = std::fs::read_to_string(&skeleton).unwrap();
+        launch_with(launch_args(&["web", "--repo", &path]), running_in_a_pane)
+            .await
+            .unwrap();
+        launch_with(
+            launch_args(&["web", "--repo", &path, "--", "--new"]),
+            running_in_a_pane,
+        )
+        .await
+        .unwrap();
+        let web = &read_repo(repo.path()).agents[&AgentLabel::parse("web").unwrap()];
+        assert_eq!(web.launch.as_ref().unwrap().args, ["--new"]);
+        assert_eq!(
+            std::fs::read_to_string(&skeleton).unwrap(),
+            bound,
+            "binding untouched"
+        );
+        let err = start_with(
+            AgentStartArgs {
+                name: "web".into(),
+                repo: Some(repo.path().to_path_buf()),
+                print: true,
+            },
+            Purpose::Start,
+            running_in_a_pane,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("already running"), "{err:#}");
+    }
+
+    #[test]
+    fn the_shown_command_line_parses_back_to_the_same_arguments() {
+        let launch = LaunchConfig {
+            command: None,
+            args: AWKWARD.map(String::from).to_vec(),
+            env: Default::default(),
+        };
+        let shown = describe_launch(Tool::Codex, Some(&launch));
+        let line = shown.lines().find_map(|l| l.strip_prefix("args:")).unwrap();
+        assert_eq!(shell_words::split(line).unwrap(), AWKWARD);
+        let composed = ComposedLaunch {
+            program: "codex".into(),
+            args: launch.args.clone(),
+            env_overrides: Default::default(),
+        };
+        assert_eq!(
+            shell_words::split(&composed_line(&composed)).unwrap()[1..],
+            AWKWARD
+        );
     }
 
     // ── agent set-review ─────────────────────────────────────

@@ -475,16 +475,30 @@ auto-mode drives it:
   never arms anything. Global and custom configuration directories load
   additively; multiple Clank plugin copies run one loop per client. Launch
   repair also upgrades an existing setup-owned global copy, preserving local
-  edits through the usual non-force ownership checks. The launch profile carries the model: after
-  `clank agent add kimi --tool opencode`, edit the agent's entry in
-  `.clank/config.json` (or `~/.clank/config.json` for `--global`):
+  edits through the usual non-force ownership checks. The launch profile carries the model:
+  `clank agent add kimi --tool opencode -- --model moonshotai/kimi-k3`.
 
-  ```json
-  "kimi": {
-    "tool": "opencode",
-    "launch": { "args": ["--model", "moonshotai/kimi-k3"] }
-  }
-  ```
+### An agent's launch
+
+Everything after `--` on `clank agent add` is the tool's own arguments, typed
+exactly as you would type them to the tool, quoted once by your shell. `--env
+KEY=VAL` and `--cmd <executable>` go before the `--`:
+
+```sh
+clank agent add web --tool codex --review standby \
+  --env CODEX_HOME=$HOME/.codex-web -- --no-daemon
+```
+
+`clank agent launch <name>` shows an agent's launch profile and the command
+`clank agent start` would run, even while the agent is running. Given `--cmd`,
+`--env` or `-- <args>`, what you write is the agent's whole new launch, with
+nothing kept from before; `--clear` goes back to the bare tool. The agent keeps
+its role, session and pane, and the change applies from its next start.
+
+Keep the launch line to the few flags that select a configuration. Structured
+tool configuration (MCP servers, feature switches, allow-lists) belongs in the
+tool's own config file, or in a per-agent home (`--env CODEX_HOME=…`) when only
+one agent should have it.
 
 Auto-mode is per-agent (`clank auto on|off|status`), inheriting a
 user-global default (`~/.clank/config.json`'s `"auto"`) when unset —

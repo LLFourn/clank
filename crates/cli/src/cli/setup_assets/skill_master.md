@@ -84,6 +84,13 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   commit|plan|final|gate|standby` (change a reviewer's tier in place;
   `standby` reviews nothing and is woken for everything else),
   `clank agent remove <name>`, `clank agent list`
+- an agent's launch: `clank agent add <name> --tool codex [--env K=V] [--cmd X]
+  -- <the tool's own args>`, everything after `--` exactly as typed to the tool.
+  `clank agent launch <name>` shows it and the command `agent start` runs;
+  given `--env`/`--cmd`/`-- <args>`, that is the whole new launch (nothing is
+  kept), and `--clear` is the bare tool.
+  Put MCP servers and feature switches in the tool's own config, or a per-agent
+  home (`--env CODEX_HOME=…`), not on the launch line.
 - `clank send (--to <label> | --master) [--repo <path>] -m "…"` —
   message an agent, here or in another repo (see Messages).
 - `clank block create <name> -m "question"` — ask the human. A block is
