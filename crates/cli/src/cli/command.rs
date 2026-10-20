@@ -46,7 +46,6 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
     ("Talking", &["send", "nudge", "events"]),
     ("Remote", &["remote"]),
     ("Settings", &["config", "export"]),
-    ("Plumbing", &["monitor", "rewire", "stop-hook"]),
 ];
 
 /// Below this many columns beside the names, a summary reads better on
@@ -259,6 +258,7 @@ pub enum Command {
     /// One process per repo watches it and hands every waiting agent
     /// and `clank tui` what it is owed. Clank starts it when needed;
     /// you do not run it yourself.
+    #[command(hide = true)]
     Monitor(crate::cli::MonitorArgs),
     /// Switch this repo's remote on or off through its `clank tui`.
     Remote(crate::cli::RemoteArgs),
@@ -404,12 +404,14 @@ pub enum Command {
     ///
     /// Installed as the `post-rewrite` git hook by `clank init`;
     /// reads old→new SHA pairs from stdin with `--from-stdin`.
+    #[command(hide = true)]
     Rewire(crate::cli::RewireArgs),
     /// The per-tool Stop-hook adapter
     ///
     /// Reads HookInput JSON on stdin and emits the tool's
     /// continuation output. Installed by `clank setup`; not typically
     /// invoked directly.
+    #[command(hide = true)]
     StopHook(crate::cli::StopHookArgs),
     /// Native Claude question hook adapter (installed by setup).
     #[command(hide = true)]
@@ -1305,6 +1307,58 @@ mod tests {
                 assert_eq!(sub, name, "`{line}` is not `{}`", path.join(" "));
                 at = m;
             }
+        }
+    }
+
+    /// What clank runs itself (hooks, the monitor), one-off migrations,
+    /// and `open dry`, which `open-worktree.sh` calls: the group that
+    /// would list it (empty for the top level), its name, and an argv a
+    /// real caller uses.
+    const PLUMBING: &[(&str, &str, &[&str])] = &[
+        ("", "stop-hook", &["stop-hook", "--tool", "claude"]),
+        ("", "question-hook", &["question-hook"]),
+        ("", "rewire", &["rewire", "--from-stdin"]),
+        ("", "monitor", &["monitor", "start"]),
+        ("monitor", "upgrade", &["monitor", "upgrade"]),
+        ("block", "migrate", &["block", "migrate", "--dry"]),
+        ("open", "dry", &["open", "dry", "/some/path", "--json"]),
+    ];
+
+    /// Hiding is presentation only: every installed hook string and
+    /// caller still parses to its command.
+    #[test]
+    fn hidden_plumbing_still_parses() {
+        for (_, _, argv) in PLUMBING {
+            let full: Vec<&str> = std::iter::once("clank")
+                .chain(argv.iter().copied())
+                .collect();
+            assert!(
+                Cli::try_parse_from(&full).is_ok(),
+                "`{}` no longer parses",
+                full.join(" ")
+            );
+        }
+    }
+
+    /// And none of it is listed: not in the sectioned top level, not in
+    /// its group's help.
+    #[test]
+    fn hidden_plumbing_is_not_listed() {
+        let mut root = cli_at(80);
+        root.build();
+        for (parent, name, _) in PLUMBING {
+            let help = if parent.is_empty() {
+                root.clone().render_help().to_string()
+            } else {
+                root.find_subcommand_mut(parent)
+                    .unwrap()
+                    .render_help()
+                    .to_string()
+            };
+            let listed = help
+                .lines()
+                .any(|l| l.starts_with("  ") && l.split_whitespace().next() == Some(*name));
+            assert!(!listed, "`{name}` is listed:\n{help}");
         }
     }
 

@@ -433,6 +433,7 @@ pub struct OpenArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum OpenCmd {
     /// Report what `clank open` would do for a path, without opening anything
+    #[command(hide = true)]
     Dry(OpenDryArgs),
     /// Open the workspace, the same as bare `clank open`
     ///
@@ -754,6 +755,7 @@ pub enum MonitorCmd {
     ///
     /// Asks every reachable monitor older than this build to stand down,
     /// and starts this build's in their repos. Run once after installing.
+    #[command(hide = true)]
     Upgrade,
 }
 
@@ -1930,6 +1932,7 @@ pub enum BlockCmd {
     /// Remove answered block+unblock pairs for this agent.
     Clean(BlockCleanArgs),
     /// Flatten legacy plan-scoped blocks to the repo-wide layout.
+    #[command(hide = true)]
     Migrate(BlockMigrateArgs),
 }
 

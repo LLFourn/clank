@@ -379,7 +379,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `team` | Global team templates: `save` / `list` / `show` / `delete` |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove` |
 | `pr-review` | Multi-agent review loop against a GitHub PR: `start` / `note` / `propose` / `status` / `finish` / `abort` |
-| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one (`zellij` is the same; `dry` reports what it would do) |
+| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one (`zellij` is the same) |
 | `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
 | `html` | Render the event log + status to a static site; `html open` |
@@ -387,12 +387,22 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` / `unblock` | Ask the human a blocking question (`block create`) / answer it; `block clean` tidies answered ones, `block migrate` flattens the legacy layout |
+| `block` / `unblock` | Ask the human a blocking question (`block create`) / answer it; `block clean` tidies answered ones |
 | `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge` |
 | `export` | Dump the repo's roster config as JSON |
-| `monitor` | The per-repo watcher every wait and TUI shares; clank starts it itself (`start`), and `upgrade` replaces monitors from builds that predate self-retirement |
-| `rewire` | Remap feedback after rebase/amend (installed as a git hook) |
-| `stop-hook` | The per-tool Stop-hook adapter (installed by `setup`) |
+
+Some commands are hidden from `clank --help` because clank runs them
+itself or they exist for one-off upgrades. They still work:
+
+- `stop-hook` and `question-hook` are the tool hooks `clank setup` installs.
+- `rewire --from-stdin` is the `post-rewrite` git hook `clank init` installs;
+  it remaps feedback after a rebase or amend.
+- `monitor start` runs the per-repo watcher that every wait and TUI shares;
+  clank starts it when needed. `monitor upgrade` replaces monitors from
+  builds that predate self-retirement; run it once after upgrading from one.
+- `block migrate` flattens the legacy plan-scoped block layout.
+- `open dry <path> [--json]` reports what `clank open` would do for a path
+  without opening anything; `open-worktree.sh` reads its JSON.
 
 ### Messages: send, interrupt, nudge
 

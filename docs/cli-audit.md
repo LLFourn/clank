@@ -57,8 +57,10 @@ whole commands that agents are told to run.
 ## Findings
 
 F3 and F4 were fixed by `cli-help-says-what-it-is-for`, F7 by
-`cli-help-is-beautiful` (sectioned, styled top-level help), and F8 by
-`cli-readme-covers-the-surface`. Their sections
+`cli-help-is-beautiful` (sectioned, styled top-level help), F8 by
+`cli-readme-covers-the-surface`, and F1 by `cli-plumbing-out-of-sight`.
+F1's claim that `open dry` had no caller was wrong: `open-worktree.sh`
+calls it, so it is hidden and kept. Their sections
 record what was found, and the verdicts below show what remains.
 
 ### F1. Plumbing is listed beside user commands
@@ -357,9 +359,9 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `events read` | to read an event's untrusted content | agent | R S | keep |  |
 | `send` | to message another agent | both | R S | keep | |
 | `nudge` | when an agent cannot receive `send` | human | R | keep |  |
-| `monitor` | (group, plumbing) | hook | none | hide | F1 |
-| `monitor start` | never by hand; clank spawns it | hook | none | hide | F1: spawned by clank (`monitor.rs:2269`) |
-| `monitor upgrade` | once, to retire monitors from old builds | legacy | H | hide | F1: one-time migration; verify before removing |
+| `monitor` | (group, plumbing) | hook | R | keep | hidden; README notes it |
+| `monitor start` | never by hand; clank spawns it | hook | R | keep | hidden with its group |
+| `monitor upgrade` | once, to retire monitors from old builds | legacy | R | keep | hidden; kept, since old monitors can exist on other machines |
 | `remote` | (group) | human | R | keep |  |
 | `remote status` | to see whether the remote is serving | human | R | keep | |
 | `remote on` | to start serving the repo remotely | human | R | keep | |
@@ -387,7 +389,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `auto off` | to drive the session by hand | both | R S | keep | `--role` removed |
 | `auto status` | to check which it is | both | S | keep | |
 | `open` | to open the team's workspace | human | R | merge | F2: bare `open` is `open zellij` |
-| `open dry` | no known reason | legacy | H | hide | F1: no internal caller outside its tests, external use unknown |
+| `open dry` | to read what `clank open` would do, as JSON | hook | R | keep | hidden; `open-worktree.sh` reads its JSON, so the audit's "no caller" was wrong |
 | `open zellij` | the same as bare `open` | human | H | merge | F2 |
 | `fork` | (group) | human | R | keep | |
 | `fork create` | to try something in a parallel worktree | human | R | keep | |
@@ -417,7 +419,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `block` | (group) | agent | R S | merge | F2: ask and answer in one group |
 | `block create` | an agent asking the human a question it cannot answer | agent | R S | rename | F2: `block ask` |
 | `block clean` | tidying answered questions | agent | S | keep | |
-| `block migrate` | once, on a repo with the old layout | legacy | H | hide | F1: verify legacy layouts are gone or migrate on read |
+| `block migrate` | once, on a repo with the old layout | legacy | R | keep | hidden; kept, since legacy layouts can exist on other machines |
 | `unblock` | the human answering | human | R | merge | F2: `block answer` |
 | `attending` | an agent waiting on a task it started some other way | agent | R S | keep |  |
 | `tui` | to drive a running team | human | R | keep | |
@@ -433,8 +435,8 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `config recovery.blind_nudge` | to set this value | human | H | fix usage | F5 |
 | `export` | to get the raw roster JSON | human | R | keep | F2: raw shape differs from `agent list -j`; no internal caller, external use unknown |
 | `rereview` | to make reviewers look at a commit again | human | R | keep |  |
-| `rewire` | never by hand; the git hook runs it | hook | R | hide | F1, F5: only the hook form works |
-| `stop-hook` | never by hand; the tool's hook runs it | hook | R | hide | F1 |
+| `rewire` | never by hand; the git hook runs it | hook | R | fix usage | hidden; F5: only the hook form works |
+| `stop-hook` | never by hand; the tool's hook runs it | hook | R | keep | hidden |
 | `question-hook` | never by hand; the tool's hook runs it | hook | none | keep | already hidden |
 <!-- verdicts:end -->
 
@@ -484,9 +486,9 @@ Generated. Do not edit by hand.
 | `events read` | action |  |  | Read an event's content and record delivery to your bound agent | <ID> | --repo --author -j/--json |
 | `send` | action |  |  | Put a message in an agent's inbox |  | --reply-to --reply-repo --interrupt --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
 | `nudge` | action |  |  | Interrupt an agent and type a message into its terminal |  | --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
-| `monitor` | group |  |  | Watch a repo once, for every waiter |  |  |
+| `monitor` | group | hidden |  | Watch a repo once, for every waiter |  |  |
 | `monitor start` | action |  |  | Watch this repo once, for every waiter |  | --repo --installed-at (hidden) --installed-from (hidden) |
-| `monitor upgrade` | action |  |  | Replace monitors from older builds with this one |  |  |
+| `monitor upgrade` | action | hidden |  | Replace monitors from older builds with this one |  |  |
 | `remote` | group |  |  | Switch this repo's remote on or off through its `clank tui` |  | --repo --timeout |
 | `remote status` | action |  |  | Who owns this repo's remote, and its state and address |  |  |
 | `remote on` | action |  |  | Start serving; already on is done at once |  |  |
@@ -514,7 +516,7 @@ Generated. Do not edit by hand.
 | `auto off` | action |  |  | Drive this session by hand |  | --repo |
 | `auto status` | action |  |  | Print this session's auto-mode and its roster role |  | --repo -j/--json |
 | `open` | group, bare runs |  |  | Open the team workspace in zellij |  | --repo --fork --pr --all --print |
-| `open dry` | action |  |  | Report what `clank open` would do for a path, without opening anything | <PATH> | -j/--json |
+| `open dry` | action | hidden |  | Report what `clank open` would do for a path, without opening anything | <PATH> | -j/--json |
 | `open zellij` | action |  |  | Open the workspace, the same as bare `clank open` |  | --repo --fork --pr --all --print |
 | `fork` | group |  |  | Fork the team into a linked worktree |  |  |
 | `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open --review |
@@ -544,7 +546,7 @@ Generated. Do not edit by hand.
 | `block` | group |  |  | Questions only the human can answer |  |  |
 | `block create` | action |  |  | Ask the human a question, and wait for the answer | <NAME> | -m (required) --author --repo |
 | `block clean` | action |  |  | Remove answered block+unblock pairs for this agent |  | --repo |
-| `block migrate` | action |  |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry --repo |
+| `block migrate` | action | hidden |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry --repo |
 | `unblock` | action |  |  | Answer a pending block | <AGENT> <NAME> | -m (required) --repo |
 | `attending` | action |  |  | Tell clank which background task you are waiting on | [TASK_ID] | --pid --desc --expect --clear --author --repo |
 | `tui` | action |  |  | The full-screen pane for driving a running team |  | --repo --no-cache |
@@ -560,7 +562,7 @@ Generated. Do not edit by hand.
 | `config recovery.blind_nudge` | action |  | recovery_blind_nudge | Nudge an agent whose state clank cannot read | [ACTION] [VALUE] |  |
 | `export` | action |  |  | Dump the repo's roster config as JSON |  | --repo |
 | `rereview` | action |  |  | Re-open review on a plan's latest reviewable commit | [PLAN] | --repo |
-| `rewire` | action |  |  | Remap feedback after a rebase or amend |  | --repo --from-stdin |
-| `stop-hook` | action |  |  | The per-tool Stop-hook adapter |  | --tool (required) --repo --session-start --loop --observe --turn-id --class --status --recovery-helper --recovery-reply --attempt --opened-by --started |
+| `rewire` | action | hidden |  | Remap feedback after a rebase or amend |  | --repo --from-stdin |
+| `stop-hook` | action | hidden |  | The per-tool Stop-hook adapter |  | --tool (required) --repo --session-start --loop --observe --turn-id --class --status --recovery-helper --recovery-reply --attempt --opened-by --started |
 | `question-hook` | action | hidden |  | Native Claude question hook adapter (installed by setup) |  |  |
 <!-- inventory:end -->
