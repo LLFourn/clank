@@ -2,7 +2,6 @@ use super::*;
 use crate::agent_env::Stated;
 use crate::cli::teams_config::{AgentDescription, RosterRole};
 use clank_core::AutoMode;
-use clank_core::agent_config::AgentConfig;
 use serde_json::json;
 
 const ARM: &str = crate::cli::wake_render::ARM_WAIT;
@@ -46,15 +45,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, AgentLabel, SessionId, Stated) {
         RosterRole::Master,
     )
     .unwrap();
-    crate::agent_store::save_agent_config(
-        &repo,
-        &label,
-        &AgentConfig {
-            auto_mode: Some(AutoMode::On),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    crate::agent_store::set_auto_mode(&repo, &label, AutoMode::On).unwrap();
     let session = SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap();
     let env = Stated::saying(&[
         ("CLANK_AGENT", "grok"),

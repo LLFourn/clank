@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::teams_config::{AgentDescription, RosterRole};
-use clank_core::{AutoMode, SessionId, Tool, agent_config::AgentConfig};
+use clank_core::{AutoMode, SessionId, Tool};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 fn fixture() -> (tempfile::TempDir, AgentLabel, SessionId) {
@@ -17,15 +17,7 @@ fn fixture() -> (tempfile::TempDir, AgentLabel, SessionId) {
         RosterRole::Master,
     )
     .unwrap();
-    crate::agent_store::save_agent_config(
-        temp.path(),
-        &author,
-        &AgentConfig {
-            auto_mode: Some(AutoMode::On),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    crate::agent_store::set_auto_mode(temp.path(), &author, AutoMode::On).unwrap();
     let session = SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap();
     crate::agent_store::bind_session_to_agent(temp.path(), &author, Tool::Grok, &session).unwrap();
     (temp, author, session)

@@ -52,7 +52,7 @@ fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &
         }),
         wait_events: Vec::new(),
     };
-    clank::agent_store::save_agent_config(env.repo(), &l, &cfg).unwrap();
+    clank::agent_store::update_agent_config(env.repo(), &l, |stored| *stored = cfg).unwrap();
     write_transcript(env.home(), tool, id);
 }
 
@@ -330,11 +330,7 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
     let claude = clank_core::ids::AgentLabel::parse("claude").unwrap();
 
     // Source claude: explicit auto OFF (on top of its bound session).
-    let mut src = clank::agent_store::load_agent_config(repo, &claude)
-        .unwrap()
-        .unwrap();
-    src.auto_mode = Some(AutoMode::Off);
-    clank::agent_store::save_agent_config(repo, &claude, &src).unwrap();
+    clank::agent_store::set_auto_mode(repo, &claude, AutoMode::Off).unwrap();
 
     let dest = block_on(clank::cli::fork::run_fork(
         &fork_args(&env, "wt"),
@@ -418,7 +414,7 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
             }),
             wait_events: Vec::new(),
         };
-        clank::agent_store::save_agent_config(&b, &l, &cfg).unwrap();
+        clank::agent_store::update_agent_config(&b, &l, |stored| *stored = cfg).unwrap();
     }
 
     // C: fork FROM B.

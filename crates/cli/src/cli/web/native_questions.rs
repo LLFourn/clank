@@ -1473,11 +1473,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        let mut cfg = crate::agent_store::load_agent_config(repo.path(), &label)
-            .unwrap()
-            .unwrap();
-        cfg.session.as_mut().unwrap().id = SessionId::parse("replacement").unwrap();
-        crate::agent_store::save_agent_config(repo.path(), &label, &cfg).unwrap();
+        crate::agent_store::update_agent_config(repo.path(), &label, |cfg| {
+            cfg.session.as_mut().unwrap().id = SessionId::parse("replacement").unwrap()
+        })
+        .unwrap();
         let changed = target_is_current(
             repo.path(),
             &owners.state.lock().unwrap().lanes[label.as_str()].target,

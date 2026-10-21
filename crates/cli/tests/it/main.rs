@@ -8,6 +8,7 @@
 
 mod common;
 
+mod agent_config_writes_boundary;
 mod agent_setup_acceptance;
 mod agent_swap_integration;
 mod block_blast_radius;

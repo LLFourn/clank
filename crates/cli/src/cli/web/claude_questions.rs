@@ -1264,11 +1264,10 @@ mod tests {
         registry.pre(hook.clone());
         let (_, receiver) = registry.permission(&hook).unwrap();
         let label = AgentLabel::parse("claude-question-agent").unwrap();
-        let mut config = crate::agent_store::load_agent_config(repo.path(), &label)
-            .unwrap()
-            .unwrap();
-        config.session = None;
-        crate::agent_store::save_agent_config(repo.path(), &label, &config).unwrap();
+        crate::agent_store::update_agent_config(repo.path(), &label, |config| {
+            config.session = None
+        })
+        .unwrap();
         registry.feed.question_claim(
             label.as_str(),
             Some(Window {

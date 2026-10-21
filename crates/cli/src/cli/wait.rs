@@ -4062,7 +4062,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        crate::agent_store::save_agent_config(repo.path(), &author, &cfg).unwrap();
+        crate::agent_store::update_agent_config(repo.path(), &author, |stored| *stored = cfg)
+            .unwrap();
         let declared = resolve_wait_event_sources(repo.path(), &author, &[]).unwrap();
         let (mut rx, sources) = spawn_local(&declared, None, None);
         let mut received = std::collections::BTreeMap::new();
@@ -4130,7 +4131,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        crate::agent_store::save_agent_config(repo.path(), &author, &cfg).unwrap();
+        crate::agent_store::update_agent_config(repo.path(), &author, |stored| *stored = cfg)
+            .unwrap();
         let declared = resolve_wait_event_sources(repo.path(), &author, &[]).unwrap();
         assert_eq!(declared.len(), 2, "both sources are admitted");
         let events = crate::agent_store::agents_root(repo.path())

@@ -39,12 +39,12 @@ fn session(tool: clank_core::vocab::Tool, id: &str) -> clank_core::agent_config:
 }
 
 /// Write the per-machine skeleton via the existing typed
-/// save_agent_config — no JSON literals.
+/// update_agent_config — no JSON literals.
 fn write_skeleton(repo: &Path, label: &str, cfg: &clank_core::agent_config::AgentConfig) {
-    clank::agent_store::save_agent_config(
+    clank::agent_store::update_agent_config(
         repo,
         &clank_core::ids::AgentLabel::parse(label).unwrap(),
-        cfg,
+        |stored| *stored = cfg.clone(),
     )
     .unwrap();
 }

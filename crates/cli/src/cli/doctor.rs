@@ -1767,7 +1767,8 @@ mod tests {
             wait_events: vec![clank_core::agent_config::WaitEventSource::Command(source)],
             ..Default::default()
         };
-        crate::agent_store::save_agent_config(dir.path(), &label, &cfg).unwrap();
+        crate::agent_store::update_agent_config(dir.path(), &label, |stored| *stored = cfg)
+            .unwrap();
         let results = repo_checks(dir.path(), None, None);
         let check = results
             .iter()

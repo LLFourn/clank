@@ -783,7 +783,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        crate::agent_store::save_agent_config(repo.path(), &codex, &config).unwrap();
+        crate::agent_store::update_agent_config(repo.path(), &codex, |stored| *stored = config)
+            .unwrap();
         assert_eq!(
             ask(
                 &backend,
@@ -894,7 +895,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        crate::agent_store::save_agent_config(dir.path(), &label, &config).unwrap();
+        crate::agent_store::update_agent_config(dir.path(), &label, |stored| *stored = config)
+            .unwrap();
         assert_eq!(reply(backend.dispatch(ask(None)).await).status, 409);
         assert_eq!(
             reply(backend.dispatch(ask(Some("session_1".into()))).await).status,

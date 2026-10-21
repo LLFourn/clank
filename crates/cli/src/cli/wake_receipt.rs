@@ -519,7 +519,8 @@ pub(super) mod fixtures {
                 wait_events: vec![WaitEventSource::Command(source.clone())],
                 ..AgentConfig::default()
             };
-            crate::agent_store::save_agent_config(&repo, &author, &cfg).unwrap();
+            crate::agent_store::update_agent_config(&repo, &author, |stored| *stored = cfg)
+                .unwrap();
             crate::agent_store::bind_session_to_agent(
                 &repo,
                 &author,
@@ -616,11 +617,10 @@ pub(super) mod fixtures {
         }
         pub fn update_source(&mut self, edit: impl FnOnce(&mut CommandSource)) {
             edit(&mut self.source);
-            let mut cfg = crate::agent_store::load_agent_config(&self.repo, &self.author)
-                .unwrap()
-                .unwrap();
-            cfg.wait_events = vec![WaitEventSource::Command(self.source.clone())];
-            crate::agent_store::save_agent_config(&self.repo, &self.author, &cfg).unwrap();
+            crate::agent_store::update_agent_config(&self.repo, &self.author, |cfg| {
+                cfg.wait_events = vec![WaitEventSource::Command(self.source.clone())]
+            })
+            .unwrap();
         }
     }
     impl Drop for Fixture {

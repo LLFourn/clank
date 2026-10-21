@@ -10550,10 +10550,10 @@ pub(crate) mod tests {
             session: Some(bound(clank_core::vocab::Tool::Codex, id)),
             ..Default::default()
         };
-        crate::agent_store::save_agent_config(
+        crate::agent_store::update_agent_config(
             repo,
             &clank_core::ids::AgentLabel::parse(label).unwrap(),
-            &cfg,
+            |stored| *stored = cfg,
         )
         .unwrap();
     }

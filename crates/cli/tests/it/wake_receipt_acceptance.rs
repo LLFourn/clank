@@ -96,7 +96,7 @@ impl Fixture {
             wait_events: vec![WaitEventSource::Command(source.clone())],
             ..AgentConfig::default()
         };
-        clank::agent_store::save_agent_config(&repo, &author, &cfg).unwrap();
+        clank::agent_store::update_agent_config(&repo, &author, |stored| *stored = cfg).unwrap();
         clank::agent_store::bind_session_to_agent(
             &repo,
             &author,
@@ -127,11 +127,10 @@ impl Fixture {
         self.source.receipt_command = Some(vec!["/usr/bin/python3".into(), "-c".into(),
             "import json,os,pathlib,sys; data={'receipt':json.load(sys.stdin),'cwd':os.getcwd(),'state':os.environ['CLANK_SOURCE_STATE_DIR'],'argv':sys.argv[1:3]}; pathlib.Path(sys.argv[3]).write_text(json.dumps(data)); print('callback stdout'); print('callback stderr',file=sys.stderr)".into(),
             "receipt".into(), "--flag".into(), self.output.to_str().unwrap().into()]);
-        let mut cfg = clank::agent_store::load_agent_config(&self.repo, &self.author)
-            .unwrap()
-            .unwrap();
-        cfg.wait_events = vec![WaitEventSource::Command(self.source.clone())];
-        clank::agent_store::save_agent_config(&self.repo, &self.author, &cfg).unwrap();
+        clank::agent_store::update_agent_config(&self.repo, &self.author, |cfg| {
+            cfg.wait_events = vec![WaitEventSource::Command(self.source.clone())]
+        })
+        .unwrap();
     }
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_clank"));
@@ -876,7 +875,8 @@ async fn receipt_does_not_retire_work_or_redirect_a_successor_masters_subscripti
         wait_events: vec![WaitEventSource::Command(fixture.source.clone())],
         ..AgentConfig::default()
     };
-    clank::agent_store::save_agent_config(&fixture.repo, &successor, &cfg).unwrap();
+    clank::agent_store::update_agent_config(&fixture.repo, &successor, |stored| *stored = cfg)
+        .unwrap();
     clank::agent_store::bind_session_to_agent(
         &fixture.repo,
         &successor,

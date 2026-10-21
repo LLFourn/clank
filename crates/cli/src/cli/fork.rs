@@ -879,16 +879,14 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
         if let Some(src_cfg) = &seed.cfg
             && src_cfg.auto_mode.is_some()
         {
-            let carried = clank_core::agent_config::AgentConfig {
-                auto_mode: src_cfg.auto_mode,
-                session: None,
+            crate::agent_store::update_agent_config(&dest, label, |cfg| {
+                cfg.auto_mode = src_cfg.auto_mode;
+                cfg.session = None;
                 // Extra wake sources are per-repo watch lists; the
                 // fork's controller context differs — start clean.
-                wait_events: Vec::new(),
-            };
-            crate::agent_store::save_agent_config(&dest, label, &carried).with_context(|| {
-                format!("carbon-copying `{}` config to the fork", label.as_str())
-            })?;
+                cfg.wait_events = Vec::new();
+            })
+            .with_context(|| format!("carbon-copying `{}` config to the fork", label.as_str()))?;
         }
     }
 

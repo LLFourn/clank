@@ -64,26 +64,46 @@ pub(crate) fn binding_matches(repo: &Path, label: &AgentLabel, tool: Tool, sessi
         .is_some_and(|s| s.tool == tool && s.id.as_str() == session)
 }
 
-/// Write this agent's config to disk atomically. Creates parent
-/// dirs if needed.
-pub fn save_agent_config(repo: &Path, label: &AgentLabel, cfg: &AgentConfig) -> anyhow::Result<()> {
-    let path = agent_config_path(repo, label);
+/// Only [`mutate_locked`] may call this: a write of a config loaded
+/// outside the label's lock puts back whatever another writer changed
+/// in between.
+fn save_agent_config(guard: &BindingGuard, cfg: &AgentConfig) -> anyhow::Result<()> {
+    let path = agent_config_path(guard.repo, guard.label);
     save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))?;
     Ok(())
 }
 
-/// Read-modify-write one agent's config, defaulting a missing file.
-/// The single mutation primitive: every field-level edit goes through
-/// here so unrelated fields (notably `wait_events`) are preserved
-/// across a partial update instead of being clobbered.
+/// Edit one agent's config in place, defaulting a missing file. Every
+/// writer of the file, binding transitions included, serializes on the
+/// same per-label lock, so an edit always starts from the last
+/// committed state and never reverts another writer's field. An
+/// unreadable config is an error, never replaced.
 pub fn update_agent_config(
     repo: &Path,
     label: &AgentLabel,
     edit: impl FnOnce(&mut AgentConfig),
 ) -> anyhow::Result<()> {
-    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
-    edit(&mut cfg);
-    save_agent_config(repo, label, &cfg)
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, edit)
+}
+
+/// The one config transaction: load under `guard`, edit, and replace
+/// the file only if the edit changed it. Taking the guard rather than
+/// the lock is what lets the binding transactions run their checks and
+/// side effects under the same acquisition without re-locking.
+fn mutate_locked<T>(
+    guard: &BindingGuard,
+    edit: impl FnOnce(&mut AgentConfig) -> T,
+) -> anyhow::Result<T> {
+    let loaded = load_agent_config(guard.repo, guard.label)?;
+    let mut cfg = loaded.clone().unwrap_or_default();
+    let out = edit(&mut cfg);
+    #[cfg(test)]
+    tests::inside_edit();
+    if loaded.as_ref() != Some(&cfg) {
+        save_agent_config(guard, &cfg)?;
+    }
+    Ok(out)
 }
 
 /// Set this agent's auto-mode, preserving the rest of its config.
@@ -586,20 +606,14 @@ pub fn release_binding(
     label: &AgentLabel,
     session: &SessionId,
 ) -> anyhow::Result<bool> {
-    let _owned = binding_lock(repo, label)?;
-    release_locked(repo, label, session)
-}
-
-/// [`release_binding`]'s body, for callers already holding the label's
-/// binding lock.
-fn release_locked(repo: &Path, label: &AgentLabel, session: &SessionId) -> anyhow::Result<bool> {
-    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
-    if cfg.session.as_ref().is_none_or(|s| &s.id != session) {
-        return Ok(false);
-    }
-    cfg.session = None;
-    save_agent_config(repo, label, &cfg)?;
-    Ok(true)
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        if cfg.session.as_ref().is_none_or(|s| &s.id != session) {
+            return false;
+        }
+        cfg.session = None;
+        true
+    })
 }
 
 /// Serializes every ownership transition on ONE label's binding.
@@ -612,14 +626,30 @@ fn release_locked(repo: &Path, label: &AgentLabel, session: &SessionId) -> anyho
 /// take this lock, so the compare and everything it authorises happen
 /// against the same state.
 ///
+/// The same lock covers every other edit of the label's config, so a
+/// field write cannot land between a binding's read and its write, nor
+/// a binding's write revert the field.
+///
 /// BLOCKING, unlike the leases elsewhere: a caller here is not
 /// choosing whether to drive, it is performing a short file write it
 /// must not do concurrently. Held for one label only, and never
 /// across another label's, so there is no lock order to get wrong.
-fn binding_lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File> {
-    let dir = agents_root(repo).join(label.as_str());
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
-    exclusive_lock(&dir.join("binding.lock"))
+struct BindingGuard<'a> {
+    repo: &'a Path,
+    label: &'a AgentLabel,
+    _lock: std::fs::File,
+}
+
+impl<'a> BindingGuard<'a> {
+    fn acquire(repo: &'a Path, label: &'a AgentLabel) -> anyhow::Result<Self> {
+        let dir = agents_root(repo).join(label.as_str());
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
+        Ok(Self {
+            repo,
+            label,
+            _lock: exclusive_lock(&dir.join("binding.lock"))?,
+        })
+    }
 }
 
 /// Block until this process holds `path`'s exclusive flock, creating
@@ -652,17 +682,14 @@ pub fn record_transcript(
     session: &SessionId,
     transcript: &str,
 ) -> anyhow::Result<bool> {
-    let _owned = binding_lock(repo, label)?;
-    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
-    let Some(bound) = cfg.session.as_mut().filter(|s| &s.id == session) else {
-        return Ok(false);
-    };
-    if bound.transcript.as_deref() == Some(transcript) {
-        return Ok(true);
-    }
-    bound.transcript = Some(transcript.to_string());
-    save_agent_config(repo, label, &cfg)?;
-    Ok(true)
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        let Some(bound) = cfg.session.as_mut().filter(|s| &s.id == session) else {
+            return false;
+        };
+        bound.transcript = Some(transcript.to_string());
+        true
+    })
 }
 
 pub fn bind_session_to_agent(
@@ -687,23 +714,23 @@ pub fn bind_session_to_agent(
     //
     // Under the label's lock, so a release that read this binding a
     // moment ago cannot land its clear on top of the claim.
-    let owned = binding_lock(repo, label)?;
+    let owned = BindingGuard::acquire(repo, label)?;
     let consume_grok_fork = if tool == Tool::Grok {
         crate::cli::grok_launch::check_binding(repo, label, session_id.as_str())?
     } else {
         false
     };
-    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting timestamp")?;
-    cfg.session = Some(Session {
-        id: session_id.clone(),
-        tool,
-        updated_at: now,
-        transcript: None,
-    });
-    save_agent_config(repo, label, &cfg)?;
+    mutate_locked(&owned, |cfg| {
+        cfg.session = Some(Session {
+            id: session_id.clone(),
+            tool,
+            updated_at: now,
+            transcript: None,
+        })
+    })?;
     if consume_grok_fork {
         std::fs::remove_file(crate::cli::fork::fork_spec_path(repo, label))
             .context("Grok child bound, but its launch intent could not be consumed")?;
@@ -769,6 +796,192 @@ mod tests {
 
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
+    }
+
+    thread_local! {
+        static INSIDE_EDIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs, once, whatever this thread armed with [`pause_inside_edit`]:
+    /// the seam that holds a writer inside the transaction whose edit is
+    /// not a closure the test can supply.
+    pub(super) fn inside_edit() {
+        if let Some(hook) = INSIDE_EDIT.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    const PAUSE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A writer held inside its edit until the test lets it go.
+    struct Paused {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        writer: std::thread::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl Paused {
+        fn wait_until_inside(&self) {
+            self.entered
+                .recv_timeout(PAUSE_BOUND)
+                .expect("writer A never reached its edit");
+        }
+
+        fn commit(self) {
+            self.release.send(()).unwrap();
+            self.writer.join().unwrap().unwrap();
+        }
+    }
+
+    /// Run `write` on its own thread and return once it has called the
+    /// hold it is handed, which blocks until [`Paused::commit`].
+    fn paused_writer(
+        write: impl FnOnce(Box<dyn FnOnce() + Send>) -> anyhow::Result<()> + Send + 'static,
+    ) -> Paused {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let hold: Box<dyn FnOnce() + Send> = Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(PAUSE_BOUND)
+                .expect("the test never released writer A");
+        });
+        let writer = std::thread::spawn(move || write(hold));
+        let paused = Paused {
+            entered,
+            release,
+            writer,
+        };
+        paused.wait_until_inside();
+        paused
+    }
+
+    fn pause_inside_edit(hold: Box<dyn FnOnce() + Send>) {
+        INSIDE_EDIT.with(|h| *h.borrow_mut() = Some(hold));
+    }
+
+    /// Whether another holder of the label's config lock would have to
+    /// wait right now. Non-blocking: a fresh open of the lock file is a
+    /// separate flock owner even within this process.
+    fn domain_is_held(repo: &Path, l: &AgentLabel) -> bool {
+        use std::os::fd::AsRawFd;
+        let path = agents_root(repo).join(l.as_str()).join("binding.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        // SAFETY: valid owned fd; flock has no memory effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return false;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+        true
+    }
+
+    fn github_source(repo: &str) -> clank_core::agent_config::WaitEventSource {
+        clank_core::agent_config::WaitEventSource::Github(clank_core::agent_config::GithubSource {
+            interrupt: false,
+            interrupt_message: None,
+            repo: repo.into(),
+            events: vec![clank_core::agent_config::GithubEventKind::PrOpened],
+            poll_interval: None,
+            watch: Vec::new(),
+            include_own_actions: false,
+            branches: Vec::new(),
+            prs: Vec::new(),
+            prompt: None,
+            delivery: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_field_edit_and_an_auto_flip_both_survive_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let l = label("claude");
+        update_agent_config(&repo, &l, |cfg| cfg.auto_mode = Some(AutoMode::On)).unwrap();
+
+        let a = paused_writer({
+            let (repo, l) = (repo.clone(), l.clone());
+            move |hold| {
+                update_agent_config(&repo, &l, |cfg| {
+                    cfg.wait_events.push(github_source("o/r"));
+                    hold();
+                })
+            }
+        });
+        assert!(
+            domain_is_held(&repo, &l),
+            "while A is inside its edit, set_auto_mode could enter and its write would be reverted"
+        );
+        a.commit();
+
+        set_auto_mode(&repo, &l, AutoMode::Off).unwrap();
+        let cfg = load_agent_config(&repo, &l).unwrap().unwrap();
+        assert_eq!(cfg.wait_events, vec![github_source("o/r")], "A's edit");
+        assert_eq!(cfg.auto_mode, Some(AutoMode::Off), "B's edit");
+    }
+
+    #[test]
+    fn a_transcript_record_and_an_auto_flip_share_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let l = label("claude");
+        let session = sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3");
+        bind_session_to_agent(&repo, &l, Tool::Claude, &session).unwrap();
+        set_auto_mode(&repo, &l, AutoMode::On).unwrap();
+
+        let a = paused_writer({
+            let (repo, l, session) = (repo.clone(), l.clone(), session.clone());
+            move |hold| {
+                pause_inside_edit(hold);
+                assert!(record_transcript(&repo, &l, &session, "/t/a.jsonl")?);
+                Ok(())
+            }
+        });
+        assert!(
+            domain_is_held(&repo, &l),
+            "a binding writer must hold the same lock as every other config edit"
+        );
+        a.commit();
+
+        set_auto_mode(&repo, &l, AutoMode::Off).unwrap();
+        let cfg = load_agent_config(&repo, &l).unwrap().unwrap();
+        let bound = cfg.session.expect("binding kept");
+        assert_eq!(bound.id, session);
+        assert_eq!(bound.transcript.as_deref(), Some("/t/a.jsonl"), "A's edit");
+        assert_eq!(cfg.auto_mode, Some(AutoMode::Off), "B's edit");
+    }
+
+    #[test]
+    fn an_unreadable_config_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let l = label("claude");
+        let path = agent_config_path(repo, &l);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let garbage = b"{\"auto_mode\": \"on\", trunc";
+        std::fs::write(&path, garbage).unwrap();
+
+        assert!(set_auto_mode(repo, &l, AutoMode::Off).is_err());
+        assert!(update_agent_config(repo, &l, |_| {}).is_err());
+        assert!(release_binding(repo, &l, &sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3")).is_err());
+        assert!(
+            bind_session_to_agent(
+                repo,
+                &l,
+                Tool::Claude,
+                &sess("e30f2b50-4cef-4955-86a0-fbfe64a768b3")
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
     }
 
     /// The transcript path is recorded only while the session that
@@ -1120,7 +1333,7 @@ mod tests {
             )],
             ..AgentConfig::default()
         };
-        save_agent_config(repo.path(), &lbl, &seed).unwrap();
+        update_agent_config(repo.path(), &lbl, |cfg| *cfg = seed.clone()).unwrap();
 
         set_auto_mode(repo.path(), &lbl, AutoMode::On).unwrap();
         let armed = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
