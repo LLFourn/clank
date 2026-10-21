@@ -1,18 +1,21 @@
-//! Grok's native SessionStart binds the session; Stop asks for an ordinary
-//! background wait when none is running. The monitor owns wait admission and
-//! delivery. This adapter never rewrites a tool call or waits for work itself.
+//! Grok's native lifecycle. SessionStart binds the session and SessionEnd
+//! releases it. A Stop that ends a turn is reported to the monitor with
+//! what it shows of a running `clank wait`; the monitor decides whether
+//! the agent is asked for one ([`clank_core::turn_policy::handoff_verdict`])
+//! and this adapter frames the answer. It never rewrites a tool call or
+//! waits for work itself.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clank_core::{AutoMode, SessionId, Tool};
+use clank_core::turn_policy::Handoff;
+use clank_core::{AgentLabel, SessionId, Tool};
 use serde::Deserialize;
 
+use super::turn_wire::{Frame, Report, WireVerdict};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
-use crate::agent_store::{binding_matches, load_agent_config};
-
-const ARM: &str = "Run `clank wait` as one background terminal task (block_until_ms: 0, with no positive timeout), then finish the turn. Its completion wakes you. Do not poll it or launch a second wait.";
+use crate::agent_store::binding_matches;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +50,9 @@ fn is_wait(command: &str) -> bool {
             && subcommand == "wait")
 }
 
-fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<&'static str>> {
+/// Route one native event: bind or release on the session's ends, and for
+/// a bound Stop that ended a turn, the evidence the monitor decides on.
+fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<(AgentLabel, Handoff)>> {
     if input.subagent_type.is_some() {
         return Ok(None);
     }
@@ -58,7 +63,7 @@ fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<&'stat
     let label = resolve_identity_for_hook_in(repo, Tool::Grok, &input.session_id, env)?;
     if input.hook_event_name == "session_start" {
         if env.var(crate::agent_env::ENV_CLANK_AGENT).is_some() {
-            crate::agent_store::resolve_role(repo, &label)?;
+            crate::agent_store::resolve_tool(repo, &label)?;
             crate::agent_store::bind_session_to_agent(repo, &label, Tool::Grok, &input.session_id)?;
         }
         return Ok(None);
@@ -75,31 +80,23 @@ fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<&'stat
     {
         return Ok(None);
     }
-    let cfg = load_agent_config(repo, &label)?;
-    if super::team::resolve_effective_auto_mode(cfg.as_ref(), env.home().as_deref())
-        == AutoMode::Off
-    {
-        return Ok(None);
-    }
-    crate::agent_store::resolve_role(repo, &label)?;
     let tasks = input
         .background_tasks
         .as_ref()
         .context("native Grok Stop omitted backgroundTasks")?;
-    if tasks.iter().any(|task| {
+    let wait_running = tasks.iter().any(|task| {
         task.kind == "shell"
             && task.status == "running"
             && task.command.as_deref().is_some_and(is_wait)
-    }) {
-        return Ok(None);
-    }
-    // Grok owns immediate task completion and queues its continuation. If the
-    // requested wait already finished, allow the Stop continuation to end.
-    // Never repeatedly request a broken/failed wait within the same turn.
-    if input.stop_hook_active {
-        return Ok(None);
-    }
-    Ok(Some(ARM))
+    });
+    Ok(Some((
+        label,
+        Handoff {
+            session: input.session_id.clone(),
+            wait_running,
+            continued: input.stop_hook_active,
+        },
+    )))
 }
 
 /// The repo a hook acts for: `--repo` exactly, else the worktree holding
@@ -111,8 +108,11 @@ fn hook_repo(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
-pub(super) fn hook(args: super::StopHookArgs) -> Result<()> {
-    let result = (|| -> Result<Option<&'static str>> {
+/// How long a Stop waits for the monitor's answer.
+const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
+    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, Handoff)>> {
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(1024 * 1024 + 1)
@@ -127,19 +127,85 @@ pub(super) fn hook(args: super::StopHookArgs) -> Result<()> {
         if !repo.join(".clank").is_dir() {
             return Ok(None);
         }
-        handle(&input, &repo, &Process)
+        Ok(route(&input, &repo, &Process)?.map(|(label, handoff)| (repo, label, handoff)))
     })();
-    match result {
-        Ok(Some(reason)) => println!(
-            "{}",
-            serde_json::json!({"decision":"block", "reason":reason})
-        ),
-        Ok(None) => {}
-        Err(error) => eprintln!(
-            "clank: Grok lifecycle unavailable: {error:#}. Pending work remains intact; check setup or use `clank auto off` for manual operation."
-        ),
+    let frame = match routed {
+        Ok(None) => return Ok(()),
+        Ok(Some((repo, label, handoff))) => {
+            let session = handoff.session.as_str().to_string();
+            let asked = super::stop_hook::answer_once(
+                &repo,
+                &label,
+                &session,
+                Report::Handoff {
+                    handoff,
+                    deadline: super::turn_custody::now_ms() + HANDOFF_BUDGET.as_millis() as u64,
+                },
+                HANDOFF_BUDGET,
+            );
+            still_bound(&repo, &label, &session, asked).await
+        }
+        Err(e) => Frame::bare(WireVerdict::Diagnostic {
+            message: format!("{e:#}"),
+        }),
+    };
+    let (out, err) = wire(&frame);
+    if let Some(out) = out {
+        println!("{out}");
+    }
+    if let Some(err) = err {
+        eprintln!("{err}");
     }
     Ok(())
+}
+
+/// The monitor's answer once `asked` resolves, while `session` still holds
+/// the label: one authorized for a binding replaced while it was in
+/// transit, or while its child was collected, is not this session's.
+async fn still_bound(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &str,
+    asked: impl std::future::Future<Output = Frame>,
+) -> Frame {
+    let frame = asked.await;
+    match binding_matches(repo, label, Tool::Grok, session) {
+        true => frame,
+        false => Frame::bare(WireVerdict::Silent {
+            why: clank_core::SilentReason::StaleBinding,
+        }),
+    }
+}
+
+/// Grok's wire for a verdict: a request for the wait blocks the Stop with
+/// its reason; a diagnostic goes to stderr; anything else says nothing.
+fn wire(frame: &Frame) -> (Option<String>, Option<String>) {
+    match &frame.verdict {
+        WireVerdict::Notify => (
+            Some(
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": frame.rendered.as_deref().unwrap_or_default(),
+                })
+                .to_string(),
+            ),
+            None,
+        ),
+        WireVerdict::Silent { .. } => (None, None),
+        WireVerdict::Diagnostic { message } => (
+            None,
+            Some(format!(
+                "clank: Grok lifecycle unavailable: {message}. Pending work remains intact; check \
+                 setup or use `clank auto off` for manual operation."
+            )),
+        ),
+        other => (
+            None,
+            Some(format!(
+                "clank: Grok lifecycle got a verdict it cannot frame: {other:?}"
+            )),
+        ),
+    }
 }
 
 #[cfg(test)]

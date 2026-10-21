@@ -59,28 +59,52 @@ pub struct HookInput {
     /// Claude's in-flight background work at turn end:
     /// `run_in_background` shells, subagents, MCP monitors, … . Claude
     /// lists ONLY live tasks here (`[]` once they finish) and re-fires
-    /// Stop when one completes — that's the documented signal for "the
-    /// turn ended because the session is *paused waiting for background
-    /// work to wake it back up*," not because it's idle. See
-    /// the attendance check. Codex omits the field, so it stays empty
-    /// there.
+    /// Stop when one completes. `None` when the provider omits the field
+    /// (codex), which says nothing about whether anything is running.
     #[serde(default)]
-    pub background_tasks: Vec<BackgroundTask>,
+    pub background_tasks: Option<Vec<BackgroundTask>>,
 }
 
-/// One entry of claude's Stop-hook `background_tasks` array. `command`
-/// (the raw shell command line for `shell` tasks) is captured so the hook
-/// can identify a background task; the rest
-/// (`description`, `type`, …) are ignored. Forward-compatible: every field
-/// is optional.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One entry of claude's Stop-hook `background_tasks` array.
+///
+/// Observed shapes (`crates/core/tests/fixtures/stop_hook/`): a subagent is
+/// `{id, type: "subagent", status, description, agent_type}` with its name
+/// in `description`; a finished task leaves the list rather than turning
+/// `completed`. Every field is optional, and `raw` keeps the whole entry as
+/// observed, so a field clank does not read yet is never lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "serde_json::Value", into = "serde_json::Value")]
 pub struct BackgroundTask {
-    #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
+    /// The raw shell command line, for `shell` tasks.
     pub command: Option<String>,
+    /// The provider's task kind: `subagent`, `shell`, `monitor`, … .
+    pub kind: Option<String>,
+    pub description: Option<String>,
+    pub agent_type: Option<String>,
+    pub raw: serde_json::Value,
+}
+
+impl From<BackgroundTask> for serde_json::Value {
+    fn from(task: BackgroundTask) -> Self {
+        task.raw
+    }
+}
+
+impl From<serde_json::Value> for BackgroundTask {
+    fn from(raw: serde_json::Value) -> Self {
+        let text = |key: &str| raw.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        Self {
+            id: text("id"),
+            status: text("status"),
+            command: text("command"),
+            kind: text("type"),
+            description: text("description"),
+            agent_type: text("agent_type"),
+            raw,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -252,48 +276,6 @@ fn push_boundary(tokens: &mut Vec<ShellToken>, word: &mut String, word_started: 
     }
 }
 
-impl HookInput {
-    /// The LIVE background tasks that are a `clank run` carrying this
-    /// description.
-    ///
-    /// The caller wants exactly one. Zero proves nothing is running.
-    /// Two or more means the description cannot tell them apart, and
-    /// picking either would be a guess about whether an agent may be
-    /// silenced — so both cases must decline to suppress. The tasks
-    /// themselves are returned, not a count, because the unique match
-    /// carries the one thing a `clank run` marker cannot: the harness
-    /// task id the agent would need to re-attend it.
-    pub fn live_clank_runs(&self, desc: &str) -> Vec<&BackgroundTask> {
-        self.background_tasks
-            .iter()
-            .filter(|t| t.status.as_deref() != Some("completed"))
-            .filter(|t| {
-                t.command
-                    .as_deref()
-                    .is_some_and(|cmd| clank_run_desc(cmd).as_deref() == Some(desc))
-            })
-            .collect()
-    }
-}
-
-impl HookInput {
-    /// Ids of background tasks the tool reports as live this turn.
-    ///
-    /// ONE of the three signals an `attending` marker needs, and not
-    /// sufficient alone: this list has been observed naming tasks that
-    /// had already finished (`a-dead-pid-voids-a-falsely-live-marker`
-    /// records a `cargo install` that exited 0, its pid gone from the
-    /// process table, still listed by the very next hook). Suppression
-    /// also requires a live pid and a token that still holds it.
-    pub fn live_task_ids(&self) -> Vec<String> {
-        self.background_tasks
-            .iter()
-            .filter(|t| t.status.as_deref() != Some("completed"))
-            .filter_map(|t| t.id.clone())
-            .collect()
-    }
-}
-
 /// What the stop-hook adapter decides to emit after evaluating
 /// agent config + work state. CLI maps to per-tool wire output
 /// (see [`claude_continuation_exit_code`],
@@ -336,7 +318,8 @@ macro_rules! silent_reasons {
         /// Why the hook let the agent stop silently — first-class data
         /// so each branch is named rather than re-derived at the call
         /// sites.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
         pub enum SilentReason {
             $($(#[$doc])* $variant),+
         }
@@ -353,21 +336,16 @@ macro_rules! silent_reasons {
 silent_reasons! {
     /// Effective auto-mode is off.
     AutoOff,
-    /// `clank attending --clear` removed the check-in this turn was
-    /// holding. The attendance was cancelled on purpose, so nothing
-    /// watches and nothing should.
-    AttendanceCleared,
     /// This hook's session no longer holds the label.
     StaleBinding,
     /// The codex client that spawned this hook has exited; nobody is
     /// left to deliver to.
     OwnerGone,
-    /// Every item was work the agent is already attending: it has a
-    /// LIVE background task recorded, and nothing arrived that it did
-    /// not already know. Waking here is what turned one long build
-    /// into a dozen identical wakes
-    /// (attending-suppresses-standing-wakes).
+    /// The agent attends background work whose completion wakes it, and
+    /// the monitor can check in on it at its deadline.
     AttendingBackgroundTask,
+    /// A native handoff's `clank wait` already carries the next wake.
+    WaitArmed,
 }
 
 /// Codex's stop-hook continuation wire shape, written to stdout
@@ -446,10 +424,7 @@ mod tests {
         assert_eq!(clank_run_desc("echo \"test run\""), None);
         assert_eq!(clank_run_desc("cargo test # test run"), None);
         assert_eq!(clank_run_desc("clank wait --author claude"), None);
-        assert_eq!(
-            clank_run_desc("clank attending x --desc \"test run\""),
-            None
-        );
+        assert_eq!(clank_run_desc("clank attend x --desc \"test run\""), None);
 
         // Everything after `--` belongs to the CHILD. Its `--desc` is
         // not clank's and must not be picked up.
@@ -462,48 +437,6 @@ mod tests {
             None,
             "a run with no --desc of its own matches nothing"
         );
-    }
-
-    #[test]
-    fn live_run_matches_counts_only_live_runs_with_that_exact_description() {
-        let input = |tasks: serde_json::Value| -> HookInput {
-            serde_json::from_value(serde_json::json!({
-                "session_id": "sess-run-match",
-                "cwd": "/tmp",
-                "stop_hook_active": false,
-                "background_tasks": tasks,
-            }))
-            .unwrap()
-        };
-        let run = |cmd: &str| serde_json::json!({"id": "t", "command": cmd});
-
-        let one = input(serde_json::json!([run(
-            "clank run --desc \"test run\" -- cargo test"
-        )]));
-        assert_eq!(one.live_clank_runs("test run").len(), 1);
-        assert_eq!(
-            one.live_clank_runs("test run")[0].id.as_deref(),
-            Some("t"),
-            "the unique match carries the harness id the marker cannot"
-        );
-        assert_eq!(one.live_clank_runs("other").len(), 0);
-
-        // A finished task is not evidence that anything is running.
-        let done = input(serde_json::json!([{
-            "id": "t",
-            "status": "completed",
-            "command": "clank run --desc \"test run\" -- cargo test"
-        }]));
-        assert_eq!(done.live_clank_runs("test run").len(), 0);
-
-        // Two live runs sharing a description cannot be told apart, so
-        // the caller's "exactly one" rule declines to suppress rather
-        // than picking either.
-        let two = input(serde_json::json!([
-            run("clank run --desc \"test run\" -- cargo test"),
-            run("clank run --desc \"test run\" -- cargo build"),
-        ]));
-        assert_eq!(two.live_clank_runs("test run").len(), 2);
     }
 
     #[test]

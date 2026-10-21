@@ -1780,7 +1780,7 @@ pub(super) struct WaitPage {
 }
 
 impl WaitPage {
-    pub(super) fn new(label: &str, att: &crate::cli::stop_hook::Attended) -> Self {
+    pub(super) fn new(label: &str, att: &crate::cli::agent_state::Attended) -> Self {
         Self {
             label: label.to_string(),
             task: att.task.clone(),
@@ -1792,7 +1792,7 @@ impl WaitPage {
 
     /// Is this still the same attendance? Compared in full — agent,
     /// task, instance, PID and full recorded birth token.
-    pub(super) fn matches(&self, label: &str, att: &crate::cli::stop_hook::Attended) -> bool {
+    pub(super) fn matches(&self, label: &str, att: &crate::cli::agent_state::Attended) -> bool {
         self.label == label
             && self.task == att.task
             && self.at == att.at
@@ -4916,13 +4916,16 @@ mod tests {
 
                 attending: attending
                     .contains(&i)
-                    .then(|| crate::cli::stop_hook::Attended {
+                    .then(|| crate::cli::agent_state::Attended {
                         expect: None,
                         task: format!("t{i}"),
                         desc: None,
                         pid: None,
                         token: None,
                         at: "2026-08-20T14:51:09Z".to_string(),
+                        subagent: false,
+                        pending: false,
+                        check_in: None,
                     }),
             })
             .collect()

@@ -32,7 +32,7 @@ use clank_core::wait::WaitItem;
 /// exact tool/session still holds the label. A terminal wait with no
 /// session remains a direct, unclaimed observer.
 #[derive(Debug, Clone)]
-pub(super) struct WaitBinding(
+pub(crate) struct WaitBinding(
     Option<(clank_core::Tool, clank_core::SessionId)>,
     WaitPolicy,
 );
@@ -53,6 +53,11 @@ struct WaitSuperseded(String);
 #[error("wait --peek found no work for this agent")]
 pub(crate) struct WaitNoWork;
 
+/// Whether `error` says this wait's session no longer holds its label.
+pub(crate) fn superseded(error: &anyhow::Error) -> bool {
+    error.is::<WaitSuperseded>()
+}
+
 impl WaitBinding {
     /// The pair this wait speaks for, as the monitor's hello wants it:
     /// both halves or neither, never a half.
@@ -65,7 +70,7 @@ impl WaitBinding {
             })
     }
 
-    fn capture(args: &WaitArgs) -> anyhow::Result<Self> {
+    pub(crate) fn capture(args: &WaitArgs) -> anyhow::Result<Self> {
         let detected = crate::agent_env::detect_session_from_env()?;
         if let Some(expected) = args.deliver_to_session.as_deref() {
             let Some((_, session)) = detected.as_ref() else {
@@ -127,6 +132,9 @@ impl WaitBinding {
 }
 
 pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
+    if args.turn_end {
+        return super::turn_child::run(args).await;
+    }
     if let Some((repo, author, binding)) = automatic_grok(&args, &crate::agent_env::Process)? {
         return run_automatic_grok(args, &repo, &author, &binding).await;
     }
@@ -241,6 +249,7 @@ async fn run_automatic_grok(
                 author: author.to_string(),
                 holder: binding.holder(),
                 has_cli_sources: false,
+                turn_end: None,
             },
             crate::cli::monitor::spawn_monitor,
         )
@@ -336,20 +345,62 @@ pub async fn items_observing(
     args: WaitArgs,
     starts: &SourceStarts,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, starts, &mut None).await
+    items_with_policy(args, starts, &mut None, Local::ANY).await
 }
 
 async fn items_with_context(
     args: WaitArgs,
     source_cwd: &mut Option<PathBuf>,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, &SourceStarts::default(), source_cwd).await
+    items_with_policy(args, &SourceStarts::default(), source_cwd, Local::ANY).await
+}
+
+/// Whether owed items end a wait. Items it declines are owed again at the
+/// next change, not lost.
+pub(crate) type Accept<'a> = &'a mut (dyn FnMut(&[WaitItem]) -> bool + Send);
+
+/// How a wait decides it is done with what it found.
+pub(crate) struct Local<'a> {
+    /// Whether it may share the monitor's watch rather than its own.
+    pub(crate) share: bool,
+    pub(crate) accept: Option<Accept<'a>>,
+}
+
+impl Local<'_> {
+    const ANY: Local<'static> = Local {
+        share: true,
+        accept: None,
+    };
+
+    fn takes(&mut self, items: &[WaitItem]) -> bool {
+        !items.is_empty() && self.accept.as_mut().is_none_or(|accept| accept(items))
+    }
+}
+
+/// A wait that never shares, ending only on items `accept` takes: the
+/// local fold a report's child falls back to when no monitor can decide.
+pub(crate) async fn items_alone(
+    args: WaitArgs,
+    source_cwd: &mut Option<PathBuf>,
+    accept: Accept<'_>,
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    items_with_policy(
+        args,
+        &SourceStarts::default(),
+        source_cwd,
+        Local {
+            share: false,
+            accept: Some(accept),
+        },
+    )
+    .await
 }
 
 async fn items_with_policy(
     args: WaitArgs,
     starts: &SourceStarts,
     source_cwd: &mut Option<PathBuf>,
+    mut local: Local<'_>,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
     *source_cwd = std::env::current_dir().ok();
     // Before ANY setup: the fold and the watcher attach can block for
@@ -471,7 +522,7 @@ async fn items_with_policy(
             }
             owed
         });
-        if !items.is_empty() {
+        if (args.peek || local.takes(&items)) && !items.is_empty() {
             binding.ensure_current(&repo, &author)?;
             return Ok(Some(items));
         }
@@ -507,7 +558,11 @@ async fn items_with_policy(
     let sources = WakeSources {
         events: event_sources,
     };
-    if let Some(conn) = share(&repo, &author, &binding, &sources).await {
+    let shared = match local.share {
+        true => share(&repo, &author, &binding, &sources).await,
+        false => None,
+    };
+    if let Some(conn) = shared {
         match shared_wait(conn, &repo, &author, &binding).await? {
             Shared::Woke(items, cwd) => {
                 *source_cwd = cwd;
@@ -675,7 +730,7 @@ async fn items_with_policy(
             // running memory-only (`events_dir: None`) has no WAL to
             // re-read them from.
             let items = owed_for(&repo, &author, &inputs, &status, &state.fold, &mut external);
-            if !items.is_empty() {
+            if local.takes(&items) {
                 binding.ensure_current(&repo, &author)?;
                 return Ok(items);
             }
@@ -995,6 +1050,7 @@ async fn share_with(
             // declared one never reaches here: `sources.is_empty()`
             // above already sent it to watch for itself.
             has_cli_sources: false,
+            turn_end: None,
         },
         spawn,
     )
@@ -1117,7 +1173,10 @@ async fn shared_wait_within(
 ///
 /// Dropping the receiver shuts down the socket and immediately releases the
 /// reader thread, including when a different source wins the wait's select.
-fn bridge_notes(mut conn: crate::cli::monitor::Conn, grace: Duration) -> std::io::Result<Notes> {
+pub(crate) fn bridge_notes(
+    mut conn: crate::cli::monitor::Conn,
+    grace: Duration,
+) -> std::io::Result<Notes> {
     let socket = conn.cancellation_socket()?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -1132,13 +1191,13 @@ fn bridge_notes(mut conn: crate::cli::monitor::Conn, grace: Duration) -> std::io
     Ok(Notes { rx, socket })
 }
 
-struct Notes {
+pub(crate) struct Notes {
     rx: tokio::sync::mpsc::UnboundedReceiver<Result<crate::cli::monitor::Note, String>>,
     socket: std::os::unix::net::UnixStream,
 }
 
 impl Notes {
-    async fn recv(&mut self) -> Option<Result<crate::cli::monitor::Note, String>> {
+    pub(crate) async fn recv(&mut self) -> Option<Result<crate::cli::monitor::Note, String>> {
         self.rx.recv().await
     }
 }
@@ -3047,7 +3106,7 @@ mod shared_tests {
             .find("if args.peek {")
             .expect("peek still returns early");
         let share = src
-            .find("if let Some(conn) = share(")
+            .find("share(&repo, &author, &binding, &sources)")
             .expect("the share is still in run");
         assert!(
             peek < share,

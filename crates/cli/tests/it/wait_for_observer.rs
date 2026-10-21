@@ -40,6 +40,7 @@ fn observer_args(repo: &Path, event: WaitFor) -> WaitArgs {
         author: None,
         die_with_owner: false,
         deliver_to_session: None,
+        turn_end: false,
         json: true,
         events: Vec::new(),
         r#for: Some(event),

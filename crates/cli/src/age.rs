@@ -54,6 +54,13 @@ pub(crate) fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Now, in RFC3339.
+pub(crate) fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 /// When a record was written, in epoch seconds.
 ///
 /// Reviews carry no time of their own: a feedback file is machine-

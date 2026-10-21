@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub mod agent;
 pub(crate) mod agent_state;
 pub mod as_cmd;
-pub mod attending;
+pub mod attend;
 pub mod auto;
 pub mod block;
 mod claude_trust;
@@ -61,6 +61,7 @@ pub mod purge;
 pub(crate) mod question_state;
 pub mod queue;
 pub(crate) mod recovery;
+pub(crate) mod recovery_hook;
 pub(crate) mod remote_control;
 pub mod rereview;
 pub(crate) mod resume;
@@ -83,9 +84,13 @@ pub mod team;
 pub mod teams_config;
 pub(crate) mod term;
 pub(crate) mod timer_source;
+pub(crate) mod turn_child;
+pub(crate) mod turn_custody;
+pub(crate) mod turn_wire;
 pub mod unfinish;
 pub mod wait;
 mod wake_receipt;
+pub(crate) mod wake_render;
 pub(crate) mod wake_repeat;
 pub(crate) mod web;
 
@@ -589,6 +594,11 @@ pub struct WaitArgs {
     /// The hook's actual session, passed to its owned child.
     #[arg(long, hide = true, requires = "die_with_owner")]
     pub deliver_to_session: Option<String>,
+    /// Carry the hook's report, read from the first line of stdin, to the
+    /// monitor; print each verdict as a JSON line; and forward the one
+    /// delivery result the hook writes on stdin after it.
+    #[arg(long, hide = true, requires = "die_with_owner")]
+    pub turn_end: bool,
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
@@ -1943,12 +1953,11 @@ pub struct TuiArgs {
 pub struct RunArgs {
     /// TWO WORDS for what you are waiting on — `--desc "test run"`.
     ///
-    /// Required, and load-bearing twice over: it is what
-    /// `clank tui` shows, AND it is how the Stop hook
-    /// recognises this run among the tool's live background tasks.
-    /// The hook reads the command line the harness recorded, so the
-    /// description has to be ON it — which is why clank cannot just
-    /// generate an id for you.
+    /// Required, and load-bearing twice over: it is what `clank tui`
+    /// shows, AND it is how clank recognises this run among the tool's
+    /// live background tasks. The monitor reads the command line the
+    /// harness reported, so the description has to be ON it — which is
+    /// why clank cannot just generate an id for you.
     #[arg(long, value_name = "TEXT")]
     pub desc: String,
     /// How long you expect this to take (`30s`, `5m`, `1h`; default
@@ -1956,7 +1965,7 @@ pub struct RunArgs {
     /// running past it you are woken once with a check-in, so a hang
     /// cannot hold you asleep for hours.
     #[arg(long, value_name = "DURATION", default_value = "5m",
-          value_parser = crate::cli::attending::parse_expect)]
+          value_parser = crate::cli::attend::parse_expect)]
     pub expect: std::time::Duration,
     /// Agent label. Resolved from env when omitted.
     #[arg(long, value_name = "AGENT")]
@@ -1969,33 +1978,30 @@ pub struct RunArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct AttendingArgs {
-    /// The background task id you are waiting on, as the tool reports
-    /// it. Omit with `--clear` to stop attending.
-    pub task_id: Option<String>,
-    /// PID of the process you are waiting on, so `clank status` can
-    /// tell a live wait from one that already ended. A task handle
-    /// carries no pid: have the backgrounded command record its own
-    /// (`echo $$ > .clank/agents/<label>/attending.pid`) and pass it
-    /// here. Optional — without it the wait is recorded but cannot be
-    /// shown as live or ended.
+pub struct AttendArgs {
+    /// What you are waiting on: a subagent's name, or with `--pid` a
+    /// shell task's id as the tool reports it. Omit with `--clear` to
+    /// stop attending.
+    #[arg(value_name = "NAME")]
+    pub selector: Option<String>,
+    /// PID of the shell work you are waiting on, which makes NAME its
+    /// task id. Its identity is recorded now, so a reused pid proves
+    /// nothing. Easier: launch the work through `clank run`.
     #[arg(long, value_name = "PID")]
     pub pid: Option<i32>,
-    /// TWO WORDS for what you are waiting on — `--desc "test run"`.
-    /// Required: this is what `clank tui` shows, and a wait
-    /// nobody can identify is worse than no wait at all. Longer text
-    /// is truncated to fit, never rejected.
-    #[arg(long, value_name = "TEXT", required_unless_present = "clear")]
+    /// TWO WORDS for what you are waiting on — `--desc "test run"`. What
+    /// `clank tui` shows; required with `--pid`, and a subagent's name
+    /// otherwise.
+    #[arg(long, value_name = "TEXT")]
     pub desc: Option<String>,
     /// How long you expect this to take (`30s`, `5m`, `1h`; default
     /// 5m). Not a timeout — nothing is cancelled. If the work is still
     /// running past it you are woken once with a check-in, so a hang
     /// cannot hold you asleep for hours. The clock starts now.
     #[arg(long, value_name = "DURATION", default_value = "5m",
-          value_parser = crate::cli::attending::parse_expect)]
+          value_parser = crate::cli::attend::parse_expect)]
     pub expect: std::time::Duration,
-    /// Forget the recorded task, and cancel its check-in if one is
-    /// armed.
+    /// Stop attending, and cancel the check-in it owes.
     #[arg(long)]
     pub clear: bool,
     /// Agent label. Resolved from env when omitted.

@@ -398,7 +398,7 @@ pub fn migrate(repo: &Path, label: &AgentLabel) -> anyhow::Result<usize> {
                 .as_deref()
                 .and_then(parse_rfc3339_secs)
                 .or(at)
-                .or_else(|| parse_rfc3339_secs(&crate::cli::stop_hook::now_rfc3339()));
+                .or_else(|| parse_rfc3339_secs(&crate::age::now_rfc3339()));
             log_message_with_key(
                 repo,
                 label,

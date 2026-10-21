@@ -21,7 +21,7 @@ pub async fn run(args: SendArgs) -> anyhow::Result<()> {
         &repo,
         &to,
         from.as_ref(),
-        &crate::cli::stop_hook::now_rfc3339(),
+        &crate::age::now_rfc3339(),
         &body,
         args.interrupt,
         route.as_ref(),

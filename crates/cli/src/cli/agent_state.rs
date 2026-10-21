@@ -28,6 +28,17 @@ pub(crate) struct AgentState {
     /// Why clank cannot nudge this agent itself, when it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cannot_resume: Option<String>,
+    /// The background work the agent attends, as the monitor holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attending: Option<Attended>,
+    /// The header of the question the agent is waiting on a person to
+    /// answer, while one is pending in its bound session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) asking: Option<String>,
+    /// How many times in a row the same items have been delivered, once
+    /// that reaches the escalation threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repeated: Option<u32>,
 }
 
 /// The monitor that published a state.
@@ -92,6 +103,188 @@ pub(crate) enum Nudge {
 
 pub(crate) fn path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("state.json")
+}
+
+/// How long attended work was expected to take, from the moment its
+/// attendance was accepted.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Expectation {
+    /// RFC3339.
+    pub(crate) since: String,
+    pub(crate) secs: u64,
+}
+
+impl Expectation {
+    fn since(&self) -> Option<time::OffsetDateTime> {
+        time::OffsetDateTime::parse(&self.since, &time::format_description::well_known::Rfc3339)
+            .ok()
+    }
+
+    fn elapsed(&self, now: time::OffsetDateTime) -> time::Duration {
+        now - self.since().unwrap_or(now)
+    }
+
+    fn short(&self) -> String {
+        short_duration(time::Duration::seconds(self.secs as i64))
+    }
+}
+
+/// An attendance, as status and the TUI show it.
+///
+/// A projection of the monitor's state and never authority: an
+/// inaccurate one misinforms a status line, and nothing quiets an agent
+/// on it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attended {
+    /// The task id it resolved to, or what it names before it has.
+    pub(crate) task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expect: Option<Expectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pid: Option<i32>,
+    /// WHO the pid was when it was recorded: a pid alone is reused, so
+    /// anything that would signal this process compares the token first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<crate::proc_identity::ProcToken>,
+    /// RFC3339, when the attendance was accepted.
+    pub(crate) at: String,
+    /// The provider's own agent: its listing is its liveness, and it has
+    /// no process of its own to check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) subagent: bool,
+    /// Accepted, and not yet seen in a turn-end's listing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) pending: bool,
+    /// What became of its check-in, once it was due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) check_in: Option<String>,
+}
+
+impl Attended {
+    /// Whether the recorded process still exists, or `None` when there is
+    /// no pid to ask about.
+    pub(crate) fn process_alive(&self) -> Option<bool> {
+        self.pid.map(crate::signal::alive)
+    }
+
+    /// How the attendance reads on a status surface: the pid a human can
+    /// find in `ps` when there is one, the handle that names it, and
+    /// either how long it has run against its bound or the fact that its
+    /// process has since ended.
+    pub(crate) fn summary(&self, now: time::OffsetDateTime) -> String {
+        let mut out = match self.pid {
+            Some(pid) => format!("{pid} ({})", self.task),
+            None => self.task.clone(),
+        };
+        if self.pending {
+            out.push_str(" · from the next turn-end");
+        }
+        match (self.process_alive(), self.age(now)) {
+            (Some(false), _) => out.push_str(" · stale, ended"),
+            (_, Some(age)) => {
+                out.push_str(" · ");
+                out.push_str(&age);
+            }
+            _ => {}
+        }
+        if let Some(check_in) = &self.check_in {
+            out.push_str(" · ");
+            out.push_str(check_in);
+        }
+        out
+    }
+
+    /// What the wait IS: the description, else the task. Never empty.
+    pub(crate) fn subject(&self) -> &str {
+        self.desc
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .unwrap_or(&self.task)
+    }
+
+    /// The pid this wait may be signalled at, or `None` when the process
+    /// cannot be identified: a reused pid can belong to a stranger.
+    pub(crate) fn killable_pid(&self) -> Option<crate::signal::Pid> {
+        let pid = crate::signal::Pid::new(self.pid?)?;
+        let token = self.token.as_ref()?;
+        token.still_holds(pid.get()).then_some(pid)
+    }
+
+    /// Why this wait cannot be killed, phrased for the page. `None` when
+    /// it can be.
+    pub(crate) fn kill_blocker(&self) -> Option<&'static str> {
+        let Some(pid) = self.pid else {
+            return Some("no pid was recorded for this wait, so there is nothing to signal");
+        };
+        let Some(token) = self.token.as_ref() else {
+            return Some(
+                "this wait was recorded before clank identified processes, \
+                 so the pid cannot be trusted to still be the same process",
+            );
+        };
+        if !crate::signal::alive(pid) {
+            return Some("that process has already ended");
+        }
+        (!token.still_holds(pid)).then_some(
+            "the pid is in use by a DIFFERENT process now — the recorded one has ended \
+             and its number was reused",
+        )
+    }
+
+    /// The row marker's fields in priority order: subject, then age, then
+    /// pid. Callers drop from the RIGHT to fit. `None` for a wait the row
+    /// cannot show as ongoing: a process not positively alive, which a
+    /// subagent, having none, never is asked for.
+    pub(crate) fn marker_fields(&self, now: time::OffsetDateTime) -> Option<MarkerFields<'_>> {
+        if !self.subagent && self.process_alive() != Some(true) {
+            return None;
+        }
+        Some(MarkerFields {
+            subject: self.subject(),
+            age: self.age(now),
+            pid: self.pid,
+        })
+    }
+
+    /// The work's age against its bound — `3m/5m`, and `12m/5m` once
+    /// overdue. Without an expectation it ages from `at`.
+    pub(crate) fn age(&self, now: time::OffsetDateTime) -> Option<String> {
+        let Some(expect) = self.expect.as_ref() else {
+            let at = time::OffsetDateTime::parse(
+                &self.at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()?;
+            return Some(short_duration(now - at));
+        };
+        Some(format!(
+            "{}/{}",
+            short_duration(expect.elapsed(now)),
+            expect.short()
+        ))
+    }
+}
+
+/// The attendance marker's parts, most important first. Assembling
+/// and fitting them belongs to the renderer.
+pub(crate) struct MarkerFields<'a> {
+    pub(crate) subject: &'a str,
+    pub(crate) age: Option<String>,
+    pub(crate) pid: Option<i32>,
+}
+
+/// An expectation is a BUDGET (`45s/5m`), so seconds are kept.
+fn short_duration(d: time::Duration) -> String {
+    crate::age::short(d.whole_seconds())
+}
+
+/// `label`'s attendance as its monitor last published it, read from disk
+/// now: for a decision that must not run against a lagging snapshot.
+pub(crate) fn attended_now(repo: &Path, label: &str) -> Option<Attended> {
+    load(&crate::agent_store::agents_root(repo).join(label))?.attending
 }
 
 pub(crate) fn load(agent_dir: &Path) -> Option<AgentState> {
@@ -260,6 +453,9 @@ mod tests {
             nudge: Nudge::Nothing,
             resumes: None,
             cannot_resume: None,
+            attending: None,
+            asking: None,
+            repeated: None,
         }
     }
 
@@ -355,6 +551,90 @@ mod tests {
             !brief(&s, 1000).contains("no evidence"),
             "a brief has no reasons"
         );
+    }
+
+    /// Records written before a description existed keep loading, with
+    /// the task as the subject; a blank description is not one.
+    #[test]
+    fn an_attended_record_without_a_description_still_loads_and_names_itself() {
+        let raw = r#"{"task":"br9711ewy","at":"2026-08-20T14:51:09Z"}"#;
+        let rec: Attended = serde_json::from_str(raw).expect("pre-desc record still parses");
+        assert_eq!(rec.desc, None);
+        assert_eq!(rec.subject(), "br9711ewy", "the id is the subject");
+        let blank = r#"{"task":"br9711ewy","desc":"   ","at":"2026-08-20T14:51:09Z"}"#;
+        let rec: Attended = serde_json::from_str(blank).unwrap();
+        assert_eq!(rec.subject(), "br9711ewy", "whitespace never names a wait");
+        let full = r#"{"task":"br9711ewy","desc":"test run","at":"2026-08-20T14:51:09Z"}"#;
+        let rec: Attended = serde_json::from_str(full).unwrap();
+        assert_eq!(rec.subject(), "test run");
+        let rec: Attended =
+            serde_json::from_str(r#"{"task":"t","pid":1,"at":"2026-08-20T14:51:09Z"}"#).unwrap();
+        assert!(rec.expect.is_none());
+    }
+
+    #[test]
+    fn the_projection_ages_the_work_against_its_bound() {
+        let now = time::OffsetDateTime::now_utc();
+        let at = |secs_ago: i64| {
+            (now - time::Duration::seconds(secs_ago))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let mut rec = Attended {
+            task: "t".into(),
+            expect: Some(Expectation {
+                since: at(180),
+                secs: 300,
+            }),
+            desc: None,
+            pid: None,
+            token: None,
+            at: at(10),
+            subagent: false,
+            pending: false,
+            check_in: None,
+        };
+        assert_eq!(rec.age(now).as_deref(), Some("3m/5m"));
+        rec.expect.as_mut().unwrap().since = at(720);
+        assert_eq!(
+            rec.age(now).as_deref(),
+            Some("12m/5m"),
+            "overdue says so by itself"
+        );
+        rec.expect = None;
+        assert_eq!(
+            rec.age(now).as_deref(),
+            Some("10s"),
+            "without one: from `at`"
+        );
+    }
+
+    /// A subagent has no process of its own, so the row shows it on the
+    /// monitor's word; shell work is shown only while its process lives.
+    #[test]
+    fn a_subagent_is_drawn_without_a_process_and_shell_work_only_with_one() {
+        let now = time::OffsetDateTime::now_utc();
+        let mut rec = Attended {
+            task: "a25eee2eef81caf3e".into(),
+            expect: None,
+            desc: Some("capture-probe sleeper".into()),
+            pid: None,
+            token: None,
+            at: "2026-08-20T14:51:09Z".into(),
+            subagent: true,
+            pending: false,
+            check_in: Some("check-in undeliverable: no pane".into()),
+        };
+        assert_eq!(
+            rec.marker_fields(now).map(|f| f.subject),
+            Some("capture-probe sleeper")
+        );
+        assert!(
+            rec.summary(now)
+                .ends_with("check-in undeliverable: no pane")
+        );
+        rec.subagent = false;
+        assert!(rec.marker_fields(now).is_none());
     }
 
     /// A stale view says so and claims no activity.

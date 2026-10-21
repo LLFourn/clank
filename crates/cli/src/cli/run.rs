@@ -1,129 +1,117 @@
 //! `clank run --desc "two words" -- <cmd>` — run a command under clank
-//! so the Stop hook knows exactly when the work ends.
+//! so it knows exactly when the work ends.
 //!
-//! Clank writes the attendance marker and then `exec`s the command,
-//! replacing itself. One process does both jobs, which is what keeps
-//! every property aligned: the pid in the marker is the pid the work
-//! runs under, the harness's background task ends exactly when the
+//! Clank asks the monitor to attend this run, and then `exec`s the
+//! command, replacing itself. One process does both jobs, which is what
+//! keeps every property aligned: the pid in the request is the pid the
+//! work runs under, the harness's background task ends exactly when the
 //! work ends, and stdio, exit status and signals are the command's own
 //! because nothing is wrapping them.
 //!
-//! A spawn-and-wait supervisor would break the middle one. Killed
-//! while its child kept running, the harness task would end with the
-//! work still going — liveness lying in the direction that puts an
-//! agent to sleep.
+//! A spawn-and-wait supervisor would break the middle one. Killed while
+//! its child kept running, the harness task would end with the work still
+//! going — liveness lying in the direction that puts an agent to sleep.
 
 use super::{RunArgs, resolve_repo};
-use crate::agent_store::agents_root;
+use crate::cli::monitor::Control;
 
-/// `exec` is the whole design — same pid, same stdio, same exit
-/// status — and it has no portable equivalent. Rather than silently
-/// degrading to a supervisor with different lifetime semantics on a
-/// platform we do not run on, say so.
+/// `exec` is the whole design — same pid, same stdio, same exit status —
+/// and it has no portable equivalent.
 #[cfg(not(unix))]
-pub fn run(_args: RunArgs) -> anyhow::Result<()> {
+pub async fn run(_args: RunArgs) -> anyhow::Result<()> {
     anyhow::bail!(
         "`clank run` needs `exec` to replace itself with the command, which this platform does \
-         not provide. Use `clank attending <task-id> --desc \"two words\" --pid <pid>` instead."
+         not provide. Use `clank attend <task-id> --desc \"two words\" --pid <pid>` instead."
     )
 }
 
 #[cfg(unix)]
-pub fn run(args: RunArgs) -> anyhow::Result<()> {
+pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
-
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let (attend, clear) = requests(&args, &repo)?;
     let (program, rest) = args
         .command
         .split_first()
         .expect("clap requires at least one");
-    let program = program.clone();
-    let rest = rest.to_vec();
-
-    // The marker exists BEFORE the exec, so it covers the whole life
-    // of the work rather than starting some moment after it began.
-    let marker = write_run_marker(&args)?;
-
-    let err = std::process::Command::new(&program).args(&rest).exec();
-
-    // Only reachable if the exec FAILED, so nothing is running and
-    // nothing may claim to be attended.
-    let _ = std::fs::remove_file(&marker);
+    let submit = |control: Control| -> Submitted<'_> {
+        Box::pin(crate::cli::attend::submit(&repo, control))
+    };
+    let err = launch(attend, clear, &submit, || {
+        std::process::Command::new(program).args(rest).exec()
+    })
+    .await;
     Err(anyhow::anyhow!("cannot run `{program}`: {err}"))
 }
 
-/// Write the attendance marker for this run and return its path.
+/// A request on its way to the monitor, and its answer.
+type Submitted<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + 'a>>;
+
+/// Ask for the attendance, then become the command. Only a FAILED exec
+/// returns, and then nothing is running: an attendance that was accepted
+/// is cleared, so nothing claims to be attended. An attendance the monitor
+/// would not take does not stop the work; the turn-ends are only noisier.
+async fn launch<'a>(
+    attend: Control,
+    clear: Control,
+    submit: &'a dyn Fn(Control) -> Submitted<'a>,
+    exec: impl FnOnce() -> std::io::Error,
+) -> std::io::Error {
+    let attended = submit(attend).await;
+    if let Err(why) = &attended {
+        eprintln!("clank: this run is not attended ({why}); it runs anyway");
+    }
+    let err = exec();
+    if attended.is_ok()
+        && let Err(why) = submit(clear).await
+    {
+        eprintln!("clank: the failed run's attendance could not be cleared: {why}");
+    }
+    err
+}
+
+/// The requests a run makes: to attend it, and to take that back.
 ///
-/// The recorded pid is the pid the COMMAND runs under, because `exec`
-/// replaces this process image without changing the process. That is
-/// an OS guarantee and is documented here rather than tested: proving
-/// it would need a child running clank's own code, which means
-/// spawning the clank binary, which this repo bans. An earlier attempt
-/// to dodge that with `pre_exec` was unsafe (post-`fork` allocation in
-/// a threaded process), and its replacement was worse — it claimed to
-/// distinguish exec from spawn while asserting something `spawn` does
-/// identically. Confirmed by hand instead: a `clank run` of this
-/// repo's suite recorded pid 80866, which `ps` showed as the cargo
-/// process.
-///
-/// Split out so the lifecycle can be tested without spawning anything:
-/// the exec that follows is a one-line tail with no branches of its
-/// own, and everything worth asserting — that a marker exists before
-/// the command starts, and that it records THIS process — happens
-/// here (codex on 2f5a495).
-fn write_run_marker(args: &RunArgs) -> anyhow::Result<std::path::PathBuf> {
-    let repo = resolve_repo(args.repo.as_deref())?;
+/// The process identity is THIS process's, and it stays correct across
+/// the exec: `exec` replaces the process image, not the process. The
+/// description is the correlator, since the tool assigns a task id only
+/// after launching the command.
+fn requests(args: &RunArgs, repo: &std::path::Path) -> anyhow::Result<(Control, Control)> {
     let label = match args.author.as_deref() {
         Some(raw) => clank_core::ids::AgentLabel::parse(raw)
             .map_err(|e| anyhow::anyhow!("invalid --author `{raw}`: {e}"))?,
-        None => crate::agent_env::resolve_identity_from_env(&repo)?,
+        None => crate::agent_env::resolve_identity_from_env(repo)?,
     };
-
-    let desc = crate::cli::attending::normalise_desc(&args.desc);
+    let desc = crate::cli::attend::normalise_desc(&args.desc);
     if desc.is_empty() {
         anyhow::bail!(
             "--desc is empty; give TWO WORDS for what you are running, e.g. \
              `--desc \"test run\"`"
         );
     }
-
-    // The identity comes FIRST. A marker clank cannot prove is worse
-    // than no marker, so nothing is created — no directory, no file,
-    // no exec — until the token exists (codex on c566eea).
-    //
-    // The pid recorded is OUR pid, and it stays correct across the
-    // exec: `exec` replaces the process image, not the process. So
-    // this is the pid the command itself will run under.
     let pid = std::process::id() as i32;
     let Some(token) = crate::proc_identity::token_for(pid) else {
         anyhow::bail!(
-            "cannot take a process identity for pid {pid} on this platform, so the marker could \
-             not be trusted and nothing has been recorded"
+            "cannot take a process identity for pid {pid} on this platform, so nothing could \
+             prove this run is still going"
         );
     };
-
-    let record = crate::cli::stop_hook::Attending {
-        // The clock starts here, the instant before the exec: the
-        // expectation is about the work, and this is its start.
-        expect: Some(crate::cli::stop_hook::Expectation::starting_now(
-            args.expect.as_secs(),
-        )),
-        // The description is the correlator. There is no harness task
-        // id to record — the tool assigns one only after launching
-        // this command, so it cannot exist yet.
-        task: desc.clone(),
-        desc: Some(desc),
-        pid: Some(pid),
-        token: Some(token),
-        // This marker names a DESCRIPTION, so only a live `clank run`
-        // carrying it may satisfy it — never a task id that happens to
-        // read the same.
-        correlation: crate::cli::stop_hook::Correlation::RunDesc,
-    };
-    let dir = agents_root(&repo).join(label.as_str());
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("attending");
-    std::fs::write(&path, serde_json::to_string(&record)?)?;
-    Ok(path)
+    let session = crate::cli::attend::session_of(repo, &label)?;
+    Ok((
+        Control::Attend {
+            author: label.to_string(),
+            session: session.clone(),
+            selector: clank_core::turn_policy::Selector::RunDesc(desc.clone()),
+            desc: Some(desc),
+            expect_ms: args.expect.as_millis() as u64,
+            shell: Some(crate::cli::turn_custody::shell_proof(pid, &token)),
+        },
+        Control::Clear {
+            author: label.to_string(),
+            session,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -142,7 +130,7 @@ mod tests {
         let t = T::try_parse_from(["t", "--desc", "test run", "--", "echo", "hi"]).unwrap();
         assert_eq!(
             t.a.expect.as_secs(),
-            crate::cli::stop_hook::DEFAULT_EXPECT_SECS,
+            300,
             "five minutes unless the caller says otherwise"
         );
         let t = T::try_parse_from(["t", "--desc", "test run", "--expect", "45m", "--", "make"])
@@ -187,142 +175,105 @@ mod tests {
         );
     }
 
-    fn repo_with_agent() -> tempfile::TempDir {
+    fn bound_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".clank/agents/claude")).unwrap();
+        crate::agent_store::bind_session_to_agent(
+            dir.path(),
+            &clank_core::ids::AgentLabel::parse("claude").unwrap(),
+            clank_core::Tool::Claude,
+            &clank_core::SessionId::parse("sess-run").unwrap(),
+        )
+        .unwrap();
         dir
     }
 
-    fn run_args(desc: &str, cmd: &[&str], repo: &std::path::Path) -> RunArgs {
+    fn run_args(desc: &str, repo: &std::path::Path) -> RunArgs {
         RunArgs {
             desc: desc.to_string(),
             expect: std::time::Duration::from_secs(300),
             author: Some("claude".into()),
             repo: Some(repo.to_path_buf()),
-            command: cmd.iter().map(|s| s.to_string()).collect(),
+            command: vec!["echo".into()],
         }
     }
 
-    /// The marker is on disk BEFORE the command starts, and it records
-    /// THIS process — which is the pid the command will run under,
-    /// because `exec` replaces the image and not the process. That
-    /// identity is the whole reason to launch work this way rather
-    /// than asking an agent to find a pid for it.
+    /// The request names THIS process — the pid the command will run
+    /// under, because `exec` replaces the image and not the process — with
+    /// the identity that proves it, and the description as the correlator.
     #[test]
-    fn the_marker_exists_before_the_command_and_records_this_process() {
-        let dir = repo_with_agent();
-        let path = write_run_marker(&run_args("test run", &["echo", "hi"], dir.path()))
-            .expect("marker written");
-        assert!(path.exists(), "written before anything is exec'd");
-
-        let rec: crate::cli::stop_hook::Attending =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            rec.pid,
-            Some(std::process::id() as i32),
-            "the recorded pid is ours, and stays ours across the exec"
-        );
-        assert!(
-            rec.token.is_some(),
-            "with the identity that makes it usable"
-        );
-        assert_eq!(rec.correlation, crate::cli::stop_hook::Correlation::RunDesc);
-        assert_eq!(
-            rec.provably_live(&launched("bq1", "test run")).as_deref(),
-            Some("bq1"),
-            "so the hook can prove it without the caller supplying anything"
-        );
-        let expect = rec.expect.expect("the expectation rides along");
-        assert_eq!(expect.secs, 300);
-        let since = time::OffsetDateTime::parse(
-            &expect.since,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .unwrap();
-        assert!(
-            (time::OffsetDateTime::now_utc() - since).abs() < time::Duration::seconds(5),
-            "and its clock started at the marker, the instant before the exec"
-        );
-    }
-
-    /// A command that cannot start leaves nothing claiming to be
-    /// attended. `run` reaches its tail ONLY when the exec failed, so
-    /// this exercises the real failure path rather than a simulation
-    /// of it.
-    #[cfg(unix)]
-    #[test]
-    fn a_command_that_cannot_start_returns_nonzero_and_leaves_no_marker() {
-        let dir = repo_with_agent();
-        let marker = dir.path().join(".clank/agents/claude/attending");
-        let err = run(run_args(
-            "bad command",
-            &["/nonexistent/binary-clank-test"],
-            dir.path(),
-        ))
-        .expect_err("a missing program cannot be exec'd");
-        assert!(
-            err.to_string().contains("/nonexistent/binary-clank-test"),
-            "names what could not be run: {err}"
-        );
-        assert!(
-            !marker.exists(),
-            "and nothing is left claiming to attend work that never started"
-        );
-    }
-
-    /// An unusable description is refused before any directory or file
-    /// is created — the marker must never exist in a state clank
-    /// cannot later prove.
-    #[test]
-    fn a_blank_description_creates_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(write_run_marker(&run_args("   ", &["echo"], dir.path())).is_err());
-        assert!(
-            !dir.path().join(".clank/agents/claude/attending").exists(),
-            "no marker"
-        );
-    }
-
-    /// The marker records the description as its TASK, not a harness
-    /// id, because no id exists yet: the tool assigns one only after
-    /// launching this command. The description is what the hook can
-    /// recognise on the recorded command line (codex on d172ced).
-    #[test]
-    fn the_task_is_the_description_because_no_harness_id_exists_yet() {
-        let desc = crate::cli::attending::normalise_desc("  test run  ");
-        let pid = std::process::id() as i32;
-        let rec = crate::cli::stop_hook::Attending {
-            expect: None,
-            task: desc.clone(),
-            desc: Some(desc),
-            pid: Some(pid),
-            token: crate::proc_identity::token_for(pid),
-            correlation: crate::cli::stop_hook::Correlation::RunDesc,
+    fn the_request_names_this_process_and_its_description() {
+        let dir = bound_repo();
+        let (attend, clear) = requests(&run_args("  test run  ", dir.path()), dir.path()).unwrap();
+        let Control::Attend {
+            selector,
+            desc,
+            expect_ms,
+            shell,
+            session,
+            ..
+        } = attend
+        else {
+            panic!("{attend:?}");
         };
-        assert_eq!(rec.task, "test run");
-        assert_eq!(rec.desc.as_deref(), Some("test run"));
-        // Provable on the spot from ONE live run carrying it — which
-        // is the whole point of clank supplying the pid rather than
-        // asking for it. A task id reading the same does NOT satisfy
-        // it: this marker names a description.
-        assert!(rec.provably_live(&launched("bq1", "test run")).is_some());
-        let as_id: clank_core::HookInput = serde_json::from_value(serde_json::json!({
-            "session_id": "sess-evidence", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [{"id": "test run", "command": "sleep 60"}],
-        }))
-        .unwrap();
-        assert!(rec.provably_live(&as_id).is_none());
+        assert_eq!(
+            selector,
+            clank_core::turn_policy::Selector::RunDesc("test run".into())
+        );
+        assert_eq!(desc.as_deref(), Some("test run"));
+        assert_eq!(expect_ms, 300_000);
+        assert_eq!(session.as_str(), "sess-run");
+        let shell = shell.expect("its process proof");
+        assert_eq!(shell.pid, std::process::id() as i32);
+        assert!(matches!(clear, Control::Clear { .. }));
     }
 
-    /// The turn as the harness reports it after backgrounding this
-    /// run: the command line it captured, now with an id.
-    fn launched(id: &str, desc: &str) -> clank_core::HookInput {
-        serde_json::from_value(serde_json::json!({
-            "session_id": "sess-evidence", "cwd": "/tmp", "stop_hook_active": false,
-            "background_tasks": [
-                {"id": id, "command": format!("clank run --desc \"{desc}\" -- cargo test")}
-            ],
-        }))
-        .unwrap()
+    #[test]
+    fn a_blank_description_asks_for_nothing() {
+        let dir = bound_repo();
+        assert!(requests(&run_args("   ", dir.path()), dir.path()).is_err());
+    }
+
+    /// A command that cannot start leaves no intent: the attendance it
+    /// asked for first is taken back, and the error names the command.
+    #[tokio::test]
+    async fn a_failed_exec_clears_the_attendance_it_asked_for() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let submit = |c: Control| -> Submitted<'_> {
+            sent.borrow_mut().push(c);
+            Box::pin(async { Ok("ok".to_string()) })
+        };
+        let attend = Control::Attend {
+            author: "claude".into(),
+            session: clank_core::SessionId::parse("sess-run").unwrap(),
+            selector: clank_core::turn_policy::Selector::RunDesc("x".into()),
+            desc: None,
+            expect_ms: 1,
+            shell: None,
+        };
+        let clear = Control::Clear {
+            author: "claude".into(),
+            session: clank_core::SessionId::parse("sess-run").unwrap(),
+        };
+        let err = launch(attend.clone(), clear.clone(), &submit, || {
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        })
+        .await;
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(*sent.borrow(), vec![attend.clone(), clear]);
+
+        let refused = |c: Control| -> Submitted<'_> {
+            sent.borrow_mut().push(c);
+            Box::pin(async { Err("no monitor".to_string()) })
+        };
+        sent.borrow_mut().clear();
+        launch(attend.clone(), attend.clone(), &refused, || {
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        })
+        .await;
+        assert_eq!(
+            sent.borrow().len(),
+            1,
+            "an attendance never accepted has nothing to clear"
+        );
     }
 }

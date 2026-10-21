@@ -45,6 +45,7 @@ fn wait_args(repo: &Path, author: &str, peek: bool, events: Vec<String>) -> Wait
         author: Some(author.into()),
         die_with_owner: false,
         deliver_to_session: None,
+        turn_end: false,
         json: true,
         events,
         r#for: None,

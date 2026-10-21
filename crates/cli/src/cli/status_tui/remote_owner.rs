@@ -103,7 +103,7 @@ impl Served {
             return;
         }
         let mut written = status.clone();
-        written.updated = crate::cli::stop_hook::now_rfc3339();
+        written.updated = crate::age::now_rfc3339();
         if rc::write_atomic(&rc::status_path(&self.repo), &written).is_ok() {
             self.published = Some(status);
         }

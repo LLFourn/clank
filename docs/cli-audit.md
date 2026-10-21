@@ -131,11 +131,13 @@ follow-up finds any external caller.
   full-screen pane) and `status --tui` (an alias). The README table credits
   `status --watch` with "Enter on a github row opens the event page", which is
   the TUI's behaviour (`README.md:366`).
-- **Waiting on background work.** `run` (wrap the command) and `attending`
-  (declare a task already running) are one concept, and that is correct:
-  `run` is the default and `attending` the fallback where `exec` is
-  unavailable. But they are taught only by the text the Stop hook prints at
-  runtime (`stop_hook.rs:2222`). Neither appears in the README or any skill.
+- **Waiting on background work.** `run` (wrap the command) and `attend`
+  (declare work already running: a subagent by name, a shell task by id
+  and pid; the old spelling `attending` still parses, hidden) are one
+  concept, and that is correct: `run` is the default for shell work and
+  `attend` the fallback where `exec` is unavailable. But they are taught
+  only by the text the Stop hook prints at runtime (`stop_hook.rs:2222`).
+  Neither appears in the README or any skill.
 - **Messaging.** `send`, `send --interrupt` and `nudge` are three deliberate
   levels: a durable inbox row the agent must handle; the same row plus a
   best-effort interrupt; and raw terminal input that bypasses the inbox.
@@ -151,7 +153,7 @@ means this repo's roster only, and `agent add` has one mode. Give blocking one
 group (`block ask` / `block answer` / `block clean`, or top-level
 `block`/`unblock` as plain actions with the cleanup automatic). Make `open`
 one action. Keep `export`: `agent list -j` is not a substitute, because its rows are
-resolved rather than raw. Keep `run`/`attending` and the three
+resolved rather than raw. Keep `run`/`attend` and the three
 messaging levels, and document them (F8).
 
 ### F3. Group help lists its children by hand, and the lists are stale
@@ -212,7 +214,7 @@ comments, or delete them.
   group-level ones are a trap. `html_open_argv` has a test pinning the
   flags-before-subcommand order, which is a symptom of the same trap.
 - `feedback write --author` is required. Every other command that records an
-  author (`events ack`, `block create`, `run`, `attending`) defaults it from
+  author (`events ack`, `block create`, `run`, `attend`) defaults it from
   the session binding. No rationale for the difference was found in the
   source. The follow-up must establish whether the explicit author is
   deliberate before changing it.
@@ -283,7 +285,7 @@ grouping is a poor trade.
 - A **top-level verb** acts on the repo or its active plan, and a person or
   agent types it: `init`, `setup`, `doctor`, `status`, `tui`, `log`,
   `finish`, `unfinish`, `pick`, `purge`, `rereview`, `diff`, `html`, `open`,
-  `send`, `nudge`, `run`, `attending`, `as`, `auto`, `wait`.
+  `send`, `nudge`, `run`, `attend`, `as`, `auto`, `wait`.
 - **Plumbing** (hook adapters, the daemon, migrations, aliases) is hidden,
   and still runnable.
 - `--help` renders the top level in the source's sections. clap 4 cannot
@@ -297,7 +299,7 @@ applied):
 
 ```
 getting set up    init  setup  doctor
-the daily flow    status  tui  log  wait  as  auto  run  attending
+the daily flow    status  tui  log  wait  as  auto  run  attend
 plans             queue {add promote remove unqueue reprioritise}
                   finish  unfinish  stash {push pop show drop list}
                   pick  purge  rereview  diff  html {open}
@@ -314,9 +316,9 @@ settings          config <key> [value]  export
 ### F8. The README reference does not cover the surface
 
 The README table (`README.md:354-389`) has no row for `remote`, `monitor`,
-`nudge`, `attending`, `run` or `rereview`. Inside groups it omits
+`nudge`, `attend`, `run` or `rereview`. Inside groups it omits
 `agent swap`, `agent launch`, `events reply`, `events read` and
-`queue unqueue`. `run` and `attending` are absent from every skill as well;
+`queue unqueue`. `run` and `attend` are absent from every skill as well;
 an agent learns them only from a stop-hook message. The existing test
 `the_readme_names_only_real_subcommands` checks one direction only: every
 command the README names exists. Nothing checks the other direction, that
@@ -422,7 +424,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `block clean` | tidying answered questions | agent | S | keep | |
 | `block migrate` | once, on a repo with the old layout | legacy | R | keep | hidden; kept, since legacy layouts can exist on other machines |
 | `unblock` | the human answering | legacy | R | keep | hidden old spelling of `block answer` |
-| `attending` | an agent waiting on a task it started some other way | agent | R S | keep |  |
+| `attend` | an agent waiting on a subagent, or on a task it started some other way | agent | R S | keep | renamed from `attending`, which stays a hidden alias |
 | `tui` | to drive a running team | human | R | keep | |
 | `run` | an agent backgrounding a long command | agent | R S | keep |  |
 | `config` | to see every setting | human | S | keep | `config <key> [value]`; `--repo`, `-j`, `--global` after the key |
@@ -469,7 +471,7 @@ Generated. Do not edit by hand.
 | `setup` | action |  |  | Install skills and hooks into ~/.claude, ~/.codex, ~/.grok |  | --grok-agent --repo --force --dry-run |
 | `doctor` | action |  |  | Check the clank setup across repo, user, and session |  | --repo -j/--json |
 | `status` | action |  |  | Show the repo's clank state |  | --repo -j/--json --no-cache --plan --watch --tui |
-| `wait` | action |  |  | Block until this agent has actionable work |  | --repo --author --die-with-owner --deliver-to-session (hidden) -j/--json --event --for --peek --no-cache --poll --no-poll |
+| `wait` | action |  |  | Block until this agent has actionable work |  | --repo --author --die-with-owner --deliver-to-session (hidden) --turn-end (hidden) -j/--json --event --for --peek --no-cache --poll --no-poll |
 | `queue` | group, bare runs |  |  | Manage the plan queue |  | --repo |
 | `queue add` | action |  |  | Queue a drafted plan | <NAME> | --priority -m/--message |
 | `queue remove` | action |  |  | Remove an item from the queue | <NAME> |  |
@@ -548,7 +550,7 @@ Generated. Do not edit by hand.
 | `block clean` | action |  |  | Remove answered block+unblock pairs for this agent |  | --repo |
 | `block migrate` | action | hidden |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry-run --repo |
 | `unblock` | action | hidden |  | The old spelling of `block answer` | <AGENT> <NAME> | -m (required) --repo |
-| `attending` | action |  |  | Tell clank which background task you are waiting on | [TASK_ID] | --pid --desc --expect --clear --author --repo |
+| `attend` | action |  | attending | Tell clank which background work you are waiting on | [NAME] | --pid --desc --expect --clear --author --repo |
 | `tui` | action |  |  | The full-screen pane for driving a running team |  | --repo --no-cache |
 | `run` | action |  |  | Run a command under clank, so it knows exactly when the work ends | <CMD> | --desc (required) --expect --author --repo |
 | `config` | group, bare runs |  |  | Read or write clank config values |  | --repo -j/--json --global |

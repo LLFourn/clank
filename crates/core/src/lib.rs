@@ -40,6 +40,9 @@
 //! - [`hook_io`] — typed Stop-hook stdin (`HookInput`) and the
 //!   adapter's decision (`HookOutcome`); plus the codex
 //!   `{decision:"block",reason:...}` wire shape.
+//! - [`turn_policy`] — the turn-end state machine: what each Stop,
+//!   attendance request, check-in, delivery result and recovery question
+//!   means for one agent's session. Inert until the monitor calls it.
 //!
 //! Every type derives both `Serialize` and `Deserialize` so
 //! producers and consumers round-trip through identical
@@ -55,6 +58,7 @@ pub mod identity;
 pub mod ids;
 pub mod plan_view;
 pub mod repo_state;
+pub mod turn_policy;
 pub mod vocab;
 pub mod wait;
 

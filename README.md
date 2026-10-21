@@ -365,8 +365,8 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `tui` | The full-screen pane: the way you drive a running team (Enter on a github row opens the event page: preview, ack, open-in-browser) |
 | `status` | Repo state; `--watch` re-prints it as it changes, `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
-| `run` | Run a long command under clank, so the Stop hook knows it is in hand (see below) |
-| `attending` | Record a background task that is already running, by task id and `--pid` (see below) |
+| `run` | Run a long command under clank, so clank knows it is in hand (see below) |
+| `attend` | Tell clank which background work you are waiting on: a subagent by name, or a running task by id and `--pid` (see below) |
 | `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
@@ -406,8 +406,8 @@ itself or they exist for one-off upgrades. They still work:
 Older spellings still work, hidden: `block create` is `block ask`, `unblock`
 is `block answer`, `agent add --global --tool` and `agent remove --global`
 are `team agent add` and `team agent remove`, `open zellij` is `open`, `agent promote` is `agent make-master`, `team
-delete` is `team remove`, `--dry` is `--dry-run` and `html open
---print-path` is `--print`.
+delete` is `team remove`, `attending` is `attend`, `--dry` is `--dry-run`
+and `html open --print-path` is `--print`.
 
 ### Messages: send, interrupt, nudge
 
@@ -424,23 +424,28 @@ Three levels, for three situations:
   reading no inbox and no binding. Nothing waits to be acknowledged, but
   each attempt and its outcome is kept in the agent's nudge history.
 
-### Background work: run and attending
+### Background work: run and attend
 
-An agent that starts long work in the background (a test suite, a build)
-would otherwise be woken by the Stop hook with work it is already doing.
+An agent that starts long work in the background (a test suite, a build,
+a subagent) would otherwise be woken at each turn-end with work it is
+already doing. To attend the work keeps those turn-ends quiet while it is
+listed running, and only where the harness wakes the agent itself when the
+work completes (Claude).
 
-- `clank run --desc "two words" -- <command>` is the usual way. Clank
-  records what the agent is attending, then becomes the command (same pid,
-  stdio and exit status), so the task's lifetime is the work's lifetime.
-- `clank attending <task-id> --desc "two words" --pid <pid>` records a task
-  that is already running. The task id is the harness's own, and the live
-  `--pid` is required: without a pid clank cannot prove the work is still
-  running, and refuses.
+- `clank attend "<name>"` attends a subagent by its name.
+- `clank run --desc "two words" -- <command>` is the way for shell work.
+  Clank asks to attend the run, then becomes the command (same pid, stdio
+  and exit status), so the task's lifetime is the work's lifetime.
+- `clank attend <task-id> --desc "two words" --pid <pid>` attends shell
+  work that is already running. The task id is the harness's own, and the
+  live `--pid` is what lets clank tell the work is still running.
 
-Either takes `--expect` (default 5m): if the work is still running past
-that, the agent is checked in on once. Nothing is cancelled and nothing
-times out. The harness's own notification that the task finished is still
-what wakes the agent when it ends.
+The request takes effect from the next turn-end, whose list of running
+work must show exactly one match. Each takes `--expect` (default 5m): if
+the work is still running past that, the agent is checked in on once,
+typed into its pane. Nothing is cancelled and nothing times out. The
+harness's own notification that the task finished is still what wakes the
+agent when it ends. `clank attend --clear` withdraws it.
 
 Status shows a commit warning only when it belongs to HEAD and amending that
 commit can repair it, such as introducing another plan while one is active or

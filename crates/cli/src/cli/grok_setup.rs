@@ -23,6 +23,16 @@ pub(super) const RETIRED_EVENTS: [&str; 6] = [
     "StopFailure",
 ];
 
+/// The HOME a Grok agent runs under. A custom launch HOME can have a
+/// different global auto default from the monitor's own, so it is derived
+/// from the roster, not from a protocol field.
+pub(crate) fn launch_home(repo: &Path, label: &AgentLabel) -> Option<std::path::PathBuf> {
+    profile(repo, label)
+        .ok()
+        .and_then(|provider| provider.env.get("HOME").map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+}
+
 pub(super) fn profile(repo: &Path, label: &AgentLabel) -> Result<Provider> {
     let set = crate::agent_store::try_resolve_via_team(repo)?
         .context("this repo has no operating roster")?;

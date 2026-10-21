@@ -25,14 +25,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
     (
         "The daily flow",
         &[
-            "status",
-            "tui",
-            "log",
-            "wait",
-            "as",
-            "auto",
-            "run",
-            "attending",
+            "status", "tui", "log", "wait", "as", "auto", "run", "attend",
         ],
     ),
     (
@@ -366,13 +359,16 @@ pub enum Command {
     /// The old spelling of `block answer`.
     #[command(hide = true)]
     Unblock(crate::cli::UnblockArgs),
-    /// Tell clank which background task you are waiting on
+    /// Tell clank which background work you are waiting on
     ///
-    /// The Stop hook then stops waking you with work you are already
-    /// doing. Say how long you expect it to take (`--expect`, default 5m): if
-    /// it is still running past that you are checked in on once, so a
-    /// hang cannot hold you asleep. Nothing is cancelled.
-    Attending(crate::cli::AttendingArgs),
+    /// A subagent by its name (`clank attend "<name>"`); shell work is
+    /// best launched through `clank run`. While the work is listed running
+    /// your turn-ends stay quiet. Say how long you expect it to take
+    /// (`--expect`, default 5m): if it is still running past that you are
+    /// checked in on once, so a hang cannot hold you asleep. Nothing is
+    /// cancelled.
+    #[command(alias = "attending")]
+    Attend(crate::cli::AttendArgs),
     /// The full-screen pane for driving a running team
     ///
     /// The repo's state live: the agents, the plan and its gate, and the
@@ -479,9 +475,9 @@ pub async fn dispatch_with(
         Command::Config(args) => crate::cli::config::run(args).await,
         Command::Block(args) => crate::cli::block::run(args).await,
         Command::Unblock(args) => crate::cli::block::run_unblock(args).await,
-        Command::Attending(args) => crate::cli::attending::run(args).await,
+        Command::Attend(args) => crate::cli::attend::run(args).await,
         Command::Tui(args) => crate::cli::status_tui::run(args).await,
-        Command::Run(args) => crate::cli::run::run(args),
+        Command::Run(args) => crate::cli::run::run(args).await,
     }
 }
 

@@ -184,17 +184,9 @@ pub(crate) struct AgentAutoRow {
     /// unbound — surfaced as a problem on the detail page, since an
     /// unbound agent can't receive work.
     pub(crate) session: Option<clank_core::Session>,
-    /// The last attendance DECISION the Stop hook made, or `None` if
-    /// its most recent turn-end was not an attending silence.
-    ///
-    /// Not the marker: that is consumed within the turn that writes it
-    /// and is never visible here. This is the observation left behind,
-    /// which is why it can be shown at all.
-    ///
-    /// Reported, never acted on. Status must not write or clear it —
-    /// the hook rewrites it at every turn-end, so there is nothing
-    /// here to maintain.
-    pub(crate) attending: Option<crate::cli::stop_hook::Attended>,
+    /// The background work the agent attends, as its monitor last
+    /// published it. Reported, never acted on.
+    pub(crate) attending: Option<crate::cli::agent_state::Attended>,
     /// Why this agent's pending work is waiting for a person: its turn
     /// failed and the monitor will not, or can no longer, retry it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,23 +301,17 @@ fn roster_auto_rows(
             .flatten();
         let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
         let session = cfg.as_ref().and_then(|c| c.session.clone());
-        let asking = session.as_ref().and_then(|s| {
-            crate::cli::question_state::asking(
-                &crate::agent_store::agents_root(repo).join(label.as_str()),
-                s.id.as_str(),
-            )
-            .map(|q| q.header)
-        });
-        let repeated = crate::cli::wake_repeat::load(
-            &crate::agent_store::agents_root(repo).join(label.as_str()),
-        )
-        .filter(|r| {
-            r.count >= crate::cli::wake_repeat::ESCALATE_AT
-                && session.as_ref().is_some_and(|s| s.id.as_str() == r.session)
-        })
-        .map(|r| r.count);
         let state =
             crate::cli::agent_state::view(repo, label, session.as_ref().map(|s| s.id.as_str()));
+        // What the monitor holds of the agent's turns, only while what it
+        // published still describes this binding.
+        let current = state
+            .as_ref()
+            .filter(|v| v.stale.is_none())
+            .map(|v| &v.state);
+        let asking = current.and_then(|s| s.asking.clone());
+        let repeated = current.and_then(|s| s.repeated);
+        let attending = current.and_then(|s| s.attending.clone());
         rows.push(AgentAutoRow {
             label: label.as_str().to_string(),
             role,
@@ -334,9 +320,7 @@ fn roster_auto_rows(
             tool: desc.tool.as_str().to_string(),
             invocation: agent_invocation(desc),
             session,
-            attending: crate::cli::stop_hook::read_attended(
-                &crate::agent_store::agents_root(repo).join(label.as_str()),
-            ),
+            attending,
             waiting_for_you: crate::cli::recovery::waiting_for_you(
                 &crate::agent_store::agents_root(repo).join(label.as_str()),
             ),
@@ -1386,9 +1370,10 @@ pub(crate) fn attendance_fingerprint(repo: &Path) -> u64 {
         .collect();
     labels.sort();
     for name in labels {
-        let Some(attended) = crate::cli::stop_hook::read_attended(
-            &crate::agent_store::agents_root(repo).join(&name),
-        ) else {
+        let Some(attended) =
+            crate::cli::agent_state::load(&crate::agent_store::agents_root(repo).join(&name))
+                .and_then(|s| s.attending)
+        else {
             continue;
         };
         name.hash(&mut h);
@@ -2652,7 +2637,10 @@ mod dirty_and_wake_tests {
         PlanKey::parse(s).unwrap()
     }
 
-    fn agent_row(label: &str, attending: Option<crate::cli::stop_hook::Attended>) -> AgentAutoRow {
+    fn agent_row(
+        label: &str,
+        attending: Option<crate::cli::agent_state::Attended>,
+    ) -> AgentAutoRow {
         AgentAutoRow {
             label: label.to_string(),
             role: crate::cli::teams_config::RosterRole::Master,
@@ -2669,14 +2657,17 @@ mod dirty_and_wake_tests {
         }
     }
 
-    fn marker(task: &str, pid: Option<i32>, at: Option<&str>) -> crate::cli::stop_hook::Attended {
-        crate::cli::stop_hook::Attended {
+    fn marker(task: &str, pid: Option<i32>, at: Option<&str>) -> crate::cli::agent_state::Attended {
+        crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
             task: task.to_string(),
             pid,
             at: at.unwrap_or("2026-08-20T14:51:09Z").to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         }
     }
 
@@ -2768,9 +2759,9 @@ mod dirty_and_wake_tests {
         );
     }
 
-    /// The status reports the count it measured, never a verdict on the
-    /// agent; a recorded repeat below the threshold, or for a session that
-    /// is no longer bound, is not shown.
+    /// The status reports the count the monitor published, never a
+    /// verdict on the agent; a count published for a session that is no
+    /// longer bound is not shown.
     #[test]
     fn a_repeating_agent_is_reported_by_its_count() {
         let mut snap = minimal_snapshot();
@@ -2792,7 +2783,7 @@ mod dirty_and_wake_tests {
             "{text}"
         );
 
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::cli::monitor::TempRepo::new();
         let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
         crate::agent_store::bind_session_to_agent(
             repo.path(),
@@ -2802,21 +2793,35 @@ mod dirty_and_wake_tests {
         )
         .unwrap();
         let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+        let me = std::process::id() as i32;
+        let role = crate::agent_store::resolve_role(repo.path(), &label)
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+        crate::cli::monitor::publish(
+            repo.path(),
+            &crate::cli::monitor::describe(repo.path(), me, std::path::Path::new("socket")),
+        )
+        .unwrap();
         let shown = |count: u32, session: &str| {
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                crate::cli::wake_repeat::path(&dir),
-                serde_json::to_vec(&crate::cli::wake_repeat::Repeat {
+            crate::cli::agent_state::store(
+                &dir,
+                &crate::cli::agent_state::AgentState {
+                    role: role.clone(),
                     session: session.into(),
-                    items: vec!["a".into()],
-                    count,
-                    turn: None,
-                    high: None,
-                    at_ns: 0,
-                })
-                .unwrap(),
-            )
-            .unwrap();
+                    tool: clank_core::Tool::Claude,
+                    monitor: crate::cli::agent_state::Observer::me(),
+                    activity: crate::cli::agent_state::Activity::Idle,
+                    since: 0,
+                    suppressors: Vec::new(),
+                    nudge: crate::cli::agent_state::Nudge::Nothing,
+                    resumes: None,
+                    cannot_resume: None,
+                    attending: None,
+                    asking: Some("Life monitor".into()),
+                    repeated: Some(count),
+                },
+            );
 
             let set = crate::cli::teams_config::RegisteredSet {
                 master: label.clone(),
@@ -2827,11 +2832,18 @@ mod dirty_and_wake_tests {
                 },
                 members: Vec::new(),
             };
-            roster_auto_rows(repo.path(), None, &set)[0].repeated
+            let row = roster_auto_rows(repo.path(), None, &set).remove(0);
+            (row.repeated, row.asking)
         };
-        assert_eq!(shown(5, "session-one"), Some(5));
-        assert_eq!(shown(3, "session-one"), None, "below the threshold");
-        assert_eq!(shown(5, "session-old"), None, "another session's count");
+        assert_eq!(
+            shown(5, "session-one"),
+            (Some(5), Some("Life monitor".into()))
+        );
+        assert_eq!(
+            shown(5, "session-old"),
+            (None, None),
+            "another session's count and question"
+        );
     }
 
     #[test]
@@ -2869,6 +2881,9 @@ mod dirty_and_wake_tests {
                 nudge: Nudge::WaitingForYou("this kind of failure needs a person".into()),
                 resumes: None,
                 cannot_resume: Some("no evidence".into()),
+                attending: None,
+                asking: None,
+                repeated: None,
             },
             stale,
         };

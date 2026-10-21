@@ -41,7 +41,7 @@ impl Holder {
             pid: std::process::id() as i32,
             session: std::env::var("ZELLIJ_SESSION_NAME").ok(),
             pane: std::env::var("ZELLIJ_PANE_ID").ok(),
-            at: crate::cli::stop_hook::now_rfc3339(),
+            at: crate::age::now_rfc3339(),
             birth: crate::proc_identity::token_for(std::process::id() as i32),
             remote_protocol: Some(crate::cli::remote_control::PROTOCOL),
         }

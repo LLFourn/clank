@@ -47,6 +47,7 @@ async fn connecting(
                 session: session.to_string(),
             }),
             has_cli_sources: false,
+            turn_end: None,
         },
     };
     peer.write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())

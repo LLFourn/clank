@@ -949,6 +949,8 @@ mod tests {
                             blind_nudge: None,
                             attending: false,
                             asking: asking().is_some(),
+                            identify: false,
+                            projection: Default::default(),
                         }],
                         0,
                     );
@@ -1103,11 +1105,13 @@ mod tests {
 
     /// What the hook records is what the remote status frame says, to a
     /// viewer who connects at any time after: the frame is derived from
-    /// the record, with no broker or viewer present when it was asked.
+    /// what the monitor publishes of the record at its next fold, with no
+    /// broker or viewer present when it was asked.
     #[tokio::test]
     async fn the_status_frame_says_a_recorded_question_is_waiting() {
         let (repo, _registry, hook) = fixture();
         let frame = || async {
+            crate::cli::monitor::publish_one_fold(repo.path()).await;
             let snap = crate::cli::status::snapshot(repo.path(), None)
                 .await
                 .unwrap();

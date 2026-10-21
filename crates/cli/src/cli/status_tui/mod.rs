@@ -244,7 +244,7 @@ fn resolve_kill_target(
         }
         Err(e) => return Err(format!("cannot read the roster: {e}")),
     }
-    let Some(att) = crate::cli::stop_hook::read_attended_now(repo, &page.label) else {
+    let Some(att) = crate::cli::agent_state::attended_now(repo, &page.label) else {
         return Err(format!("`{}` is no longer attending anything", page.label));
     };
     if !page.matches(&page.label, &att) {
@@ -10855,8 +10855,8 @@ pub(crate) mod tests {
         at: &str,
         pid: Option<i32>,
         token: bool,
-    ) -> crate::cli::stop_hook::Attended {
-        crate::cli::stop_hook::Attended {
+    ) -> crate::cli::agent_state::Attended {
+        crate::cli::agent_state::Attended {
             expect: None,
             task: task.to_string(),
             desc: Some("test run".to_string()),
@@ -10865,6 +10865,9 @@ pub(crate) mod tests {
                 .then(|| pid.and_then(crate::proc_identity::token_for))
                 .flatten(),
             at: at.to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         }
     }
 
@@ -10875,15 +10878,37 @@ pub(crate) mod tests {
         )
     }
 
-    /// Put an attendance record where the resolver will look for it.
-    fn write_attended(repo: &std::path::Path, label: &str, att: &crate::cli::stop_hook::Attended) {
+    /// Publish an attendance where the resolver will look for it: the
+    /// agent's state as its monitor writes it.
+    fn write_attended(
+        repo: &std::path::Path,
+        label: &str,
+        att: &crate::cli::agent_state::Attended,
+    ) {
         let dir = repo.join(".clank/agents").join(label);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("attended"), serde_json::to_string(att).unwrap()).unwrap();
+        crate::cli::agent_state::store(
+            &dir,
+            &crate::cli::agent_state::AgentState {
+                role: "master".into(),
+                session: "s".into(),
+                tool: clank_core::Tool::Claude,
+                monitor: crate::cli::agent_state::Observer::me(),
+                activity: crate::cli::agent_state::Activity::Idle,
+                since: 0,
+                suppressors: Vec::new(),
+                nudge: crate::cli::agent_state::Nudge::Nothing,
+                resumes: None,
+                cannot_resume: None,
+                attending: Some(att.clone()),
+                asking: None,
+                repeated: None,
+            },
+        );
     }
 
     fn snap_attending(
-        att: Option<crate::cli::stop_hook::Attended>,
+        att: Option<crate::cli::agent_state::Attended>,
     ) -> crate::cli::status::StatusSnapshot {
         let mut s = two_agent_snap();
         s.agents[0].attending = att;
@@ -11234,7 +11259,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(
-            repo.path().join(".clank/agents/claude/attended").exists(),
+            repo.path().join(".clank/agents/claude/state.json").exists(),
             "the file is still there — that is the point"
         );
         let err = resolve_kill_target(&p, repo.path())
@@ -11291,7 +11316,7 @@ pub(crate) mod tests {
         assert!(err.contains("replaced"), "{err}");
 
         // Or stops attending altogether.
-        std::fs::remove_file(repo.path().join(".clank/agents/claude/attended")).unwrap();
+        std::fs::remove_file(repo.path().join(".clank/agents/claude/state.json")).unwrap();
         assert!(
             resolve_kill_target(&p, repo.path()).is_err(),
             "nothing to signal"
@@ -11380,7 +11405,7 @@ pub(crate) mod tests {
         );
         let _ = resolve_kill_target(&page("claude", "t1", "2026-08-20T14:51:09Z"), repo.path());
         assert!(
-            repo.path().join(".clank/agents/claude/attended").exists(),
+            repo.path().join(".clank/agents/claude/state.json").exists(),
             "the record survives"
         );
     }

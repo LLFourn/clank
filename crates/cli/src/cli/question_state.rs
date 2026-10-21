@@ -44,7 +44,8 @@ pub(crate) struct State {
     pub(crate) returned: Vec<Key>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "seen", rename_all = "snake_case")]
 pub(crate) enum Observation {
     /// `PreToolUse`: the question is being asked.
     Asked {

@@ -2606,8 +2606,8 @@ mod tests {
     }
 
     /// Every role on every tool is taught to hand long background work to
-    /// clank: `run` for new work, `attending` with a real task id and pid
-    /// for work already running, and no polling while it runs.
+    /// clank: `run` for shell work, `attend` by name for a subagent, and no
+    /// polling while it runs.
     #[test]
     fn every_skill_teaches_background_attendance() {
         for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
@@ -2615,8 +2615,7 @@ mod tests {
                 let skill = compose_skill(role, tool);
                 for needle in [
                     "clank run --desc",
-                    "clank attending <task-id>",
-                    "--pid <pid>",
+                    "clank attend \"<name>\"",
                     "never poll it",
                 ] {
                     assert!(

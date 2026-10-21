@@ -1479,7 +1479,7 @@ const ATTENDING_INDENT: &str = "  ";
 /// than an ellipsis naming nothing: `⌛ t…` is the bare hourglass in
 /// disguise. A pane too narrow to say what a wait is says nothing,
 /// and the agent row above it is still there.
-fn fit_marker(fields: &crate::cli::stop_hook::MarkerFields<'_>, budget: usize) -> Option<String> {
+fn fit_marker(fields: &crate::cli::agent_state::MarkerFields<'_>, budget: usize) -> Option<String> {
     /// Fewer columns than this names nothing worth reading.
     const MIN_SUBJECT: usize = 6;
     const GLYPH: &str = "⌛ ";
@@ -2291,7 +2291,7 @@ pub(super) fn render_candidate_screen(
 /// answer that "cannot check" is not "ended".
 pub(super) fn render_wait_page(
     label: &str,
-    att: &crate::cli::stop_hook::Attended,
+    att: &crate::cli::agent_state::Attended,
     process: Option<&super::wait_process::State>,
     command: Option<&super::wait_detail::Command>,
     scroll: usize,
@@ -2511,7 +2511,7 @@ pub(super) fn render_wait_command(
 
 /// Fixed-time observations only; this never performs process inspection.
 fn wait_process_summary(
-    att: &crate::cli::stop_hook::Attended,
+    att: &crate::cli::agent_state::Attended,
     process: Option<&super::wait_process::State>,
 ) -> String {
     use super::wait_process::State;
@@ -2961,7 +2961,7 @@ pub(super) fn render_link_doc(
 /// kill would be a lie.
 pub(super) fn render_kill_confirm(
     label: &str,
-    att: &crate::cli::stop_hook::Attended,
+    att: &crate::cli::agent_state::Attended,
     rows: usize,
     cols: usize,
 ) -> (Vec<String>, usize) {
@@ -10622,7 +10622,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        s.agents[1].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[1].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: Some("cargo test".to_string()),
             token: None,
@@ -10630,6 +10630,9 @@ mod tests {
             // A live pid, so the marker reads as a real wait.
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         let out = render(&s, 40, 80);
         let codex_row = visible(line_with(&out, "codex"));
@@ -11074,6 +11077,9 @@ mod tests {
                 nudge: Nudge::WaitingForYou("resuming this harness is not enabled".into()),
                 resumes: None,
                 cannot_resume: Some("no evidence".into()),
+                attending: None,
+                asking: None,
+                repeated: None,
             },
             stale,
         }
@@ -11163,13 +11169,16 @@ mod tests {
     fn an_attending_agent_row_shows_the_hourglass_instead_of_a_verb() {
         let mut s = two_agent_snap();
         s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         let lines = render(&s, 40, 80);
         let agent = visible(line_with(&lines, "claude"));
@@ -11190,7 +11199,7 @@ mod tests {
     #[test]
     fn an_ended_wait_renders_no_marker_and_keeps_the_record() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11198,6 +11207,9 @@ mod tests {
             // Above every platform's pid_max, so it cannot be running.
             pid: Some(i32::MAX),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         let joined = render(&s, 40, 80).join("\n");
         assert!(
@@ -11226,13 +11238,16 @@ mod tests {
     #[test]
     fn a_wait_that_cannot_be_checked_is_not_drawn() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
             pid: None,
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         assert!(
             !render(&s, 40, 80).join("\n").contains("⌛"),
@@ -11242,13 +11257,16 @@ mod tests {
         // The control: give it a pid that IS alive and the wait draws,
         // so the assertion above is about checkability and not about a
         // snapshot that never drew a marker at all.
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         let wait = visible(line_with(&render(&s, 40, 80), "⌛"));
         assert!(
@@ -11277,13 +11295,16 @@ mod tests {
 
     #[test]
     fn the_marker_names_its_subject_description_first_then_the_id() {
-        let att = |desc: Option<&str>| crate::cli::stop_hook::Attended {
+        let att = |desc: Option<&str>| crate::cli::agent_state::Attended {
             expect: None,
             desc: desc.map(str::to_string),
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         };
 
         let mut s = two_agent_snap();
@@ -11327,13 +11348,16 @@ mod tests {
             // (and pid) alone — still never subjectless.
             (None, Some(live), "not-a-timestamp"),
         ] {
-            let att = crate::cli::stop_hook::Attended {
+            let att = crate::cli::agent_state::Attended {
                 expect: None,
                 desc: desc.map(str::to_string),
                 token: None,
                 task: "b72qah60w".to_string(),
                 pid,
                 at: at.to_string(),
+                subagent: false,
+                pending: false,
+                check_in: None,
             };
             let fields = att.marker_fields(now).expect("a live wait is drawn");
             let marker = fit_marker(&fields, 80).expect("80 columns is ample");
@@ -11352,13 +11376,16 @@ mod tests {
         let since = (now - time::Duration::minutes(3))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        let att = crate::cli::stop_hook::Attended {
-            expect: Some(crate::cli::stop_hook::Expectation { since, secs: 300 }),
+        let att = crate::cli::agent_state::Attended {
+            expect: Some(crate::cli::agent_state::Expectation { since, secs: 300 }),
             desc: Some("cargo build".into()),
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         };
         let fields = att.marker_fields(now).expect("a live wait is drawn");
         let marker = fit_marker(&fields, 80).unwrap();
@@ -11373,7 +11400,7 @@ mod tests {
         // Built directly: this exercises the FITTER, and routing it
         // through a record would make the test depend on whether a
         // fabricated pid happens to be alive.
-        let f = crate::cli::stop_hook::MarkerFields {
+        let f = crate::cli::agent_state::MarkerFields {
             subject: "test run",
             age: Some("2m".to_string()),
             pid: Some(41293),
@@ -11398,7 +11425,7 @@ mod tests {
     /// invariant applied, never an exception to it.
     #[test]
     fn a_pane_too_narrow_to_name_the_wait_draws_no_marker() {
-        let f = crate::cli::stop_hook::MarkerFields {
+        let f = crate::cli::agent_state::MarkerFields {
             subject: "running the whole test suite",
             age: Some("2m".to_string()),
             pid: Some(41293),
@@ -11437,7 +11464,7 @@ mod tests {
     fn an_undrawable_wait_still_stops_the_agent_claiming_it_is_working() {
         let mut s = two_agent_snap();
         s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11445,6 +11472,9 @@ mod tests {
             task: String::new(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         let lines = render(&s, 40, 80);
         let agent = visible(line_with(&lines, "claude"));
@@ -11473,13 +11503,16 @@ mod tests {
     #[test]
     fn a_narrow_pane_draws_no_marker_line_at_all() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: Some("running the whole test suite".to_string()),
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         // 11 columns: two to the indent, three to the glyph, leaving
         // six for the subject — one short of the floor once the
@@ -11503,7 +11536,7 @@ mod tests {
     /// task was empty all along names nothing, so it draws nothing.
     #[test]
     fn a_subject_is_one_safe_line_or_there_is_no_marker() {
-        let f = |subject: &'static str| crate::cli::stop_hook::MarkerFields {
+        let f = |subject: &'static str| crate::cli::agent_state::MarkerFields {
             subject,
             age: Some("2m".to_string()),
             pid: None,
@@ -11538,13 +11571,16 @@ mod tests {
     #[test]
     fn the_wait_gets_an_indented_line_under_a_flush_agent_row() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: Some("test run".to_string()),
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         let lines = render(&s, 40, 80);
         let agent_at = lines
@@ -11575,17 +11611,20 @@ mod tests {
     #[test]
     fn the_wait_page_explains_every_reason_it_cannot_stop_a_process() {
         let att = |pid: Option<i32>, token: Option<crate::proc_identity::ProcToken>| {
-            crate::cli::stop_hook::Attended {
+            crate::cli::agent_state::Attended {
                 expect: None,
                 task: "b72qah60w".to_string(),
                 desc: Some("test run".to_string()),
                 pid,
                 token,
                 at: "2026-08-20T14:51:09Z".to_string(),
+                subagent: false,
+                pending: false,
+                check_in: None,
             }
         };
         let me = std::process::id() as i32;
-        let body = |a: &crate::cli::stop_hook::Attended| {
+        let body = |a: &crate::cli::agent_state::Attended| {
             let actions = wait_actions(a.killable_pid().is_some());
             render_wait_page("claude", a, None, None, 0, &actions, 0, 40, 80)
                 .0
@@ -11637,13 +11676,16 @@ mod tests {
         };
         let pid = std::process::id() as i32;
         let birth = crate::proc_identity::token_for(pid).unwrap();
-        let att = crate::cli::stop_hook::Attended {
+        let att = crate::cli::agent_state::Attended {
             expect: None,
             task: "task".into(),
             desc: Some("test run".into()),
             pid: Some(pid),
             token: Some(birth.clone()),
             at: "2026-10-03T00:00:00Z".into(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         };
         let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
         let details = ProcessDetails {
@@ -11693,13 +11735,16 @@ mod tests {
         use crate::proc_identity::inspect::{Inspection, ProcessDetails, ProcessState};
         let pid = std::process::id() as i32;
         let token = crate::proc_identity::token_for(pid).unwrap();
-        let att = crate::cli::stop_hook::Attended {
+        let att = crate::cli::agent_state::Attended {
             expect: None,
             task: "task".into(),
             desc: Some("wait\x1b]52;unsafe\x07".into()),
             pid: Some(pid),
             token: Some(token.clone()),
             at: "2026-10-03T00:00:00Z".into(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         };
         let args = vec![
             format!("/{}界/tool", "directory/".repeat(30)).into(),
@@ -11795,13 +11840,16 @@ mod tests {
         };
         let pid = std::process::id() as i32;
         let token = crate::proc_identity::token_for(pid).unwrap();
-        let att = crate::cli::stop_hook::Attended {
+        let att = crate::cli::agent_state::Attended {
             expect: None,
             task: "task".into(),
             desc: None,
             pid: Some(pid),
             token: Some(token.clone()),
             at: "bad".into(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         };
         let command = Command::encode(&["tool".into(), "two  spaces".into(), "".into()]);
         let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
@@ -11847,13 +11895,16 @@ mod tests {
     #[test]
     fn the_kill_confirm_says_what_it_does_not_reach() {
         let me = std::process::id() as i32;
-        let att = crate::cli::stop_hook::Attended {
+        let att = crate::cli::agent_state::Attended {
             expect: None,
             task: "b72qah60w".to_string(),
             desc: Some("test run".to_string()),
             pid: Some(me),
             token: crate::proc_identity::token_for(me),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         };
         let body = render_kill_confirm("claude", &att, 40, 80)
             .0
@@ -11892,13 +11943,16 @@ mod tests {
     #[test]
     fn an_attending_row_is_built_to_fit_its_pane() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::stop_hook::Attended {
+        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
+            subagent: false,
+            pending: false,
+            check_in: None,
         });
         for cols in [18u16, 24, 40, 80] {
             for line in &render(&s, 40, cols) {

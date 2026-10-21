@@ -474,7 +474,7 @@ pub(crate) enum Transport {
     /// turn is the failed one.
     CodexStart,
     /// A recovery helper parked on the monitor, which hands the wake to the
-    /// harness and answers through [`reply_path`].
+    /// harness and answers with a [`Reply`] on the monitor's connection.
     Helper,
     /// The wake typed into the agent's pane and submitted, with no
     /// interrupt, after a last look at its input line.
@@ -1260,6 +1260,20 @@ pub(crate) struct Facts {
     /// what ends it, whether or not the agent owes anything. A cancelled
     /// question has no hook and no Stop, only its result in the record.
     pub(crate) asking: bool,
+    /// The monitor holds an attendance for it, whose check-in route turns
+    /// on the harness it runs.
+    pub(crate) identify: bool,
+    pub(crate) projection: Projection,
+}
+
+/// What the monitor's turn custody publishes of an agent, beside what
+/// recovery knows of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Projection {
+    pub(crate) attended: Option<crate::cli::agent_state::Attended>,
+    /// The pending question's header.
+    pub(crate) asking: Option<String>,
+    pub(crate) repeated: Option<u32>,
 }
 
 /// What the monitor must do for an agent.
@@ -1335,6 +1349,10 @@ struct Watched {
     role: String,
     attending: bool,
     asking: bool,
+    /// Its harness is worth identifying whether or not it owes anything:
+    /// the route an attendance's check-in needs depends on it.
+    identify: bool,
+    projection: Projection,
     delivering: bool,
     fallback: Option<Fallback>,
     /// The activity last published, and since when.
@@ -1702,6 +1720,8 @@ impl Driver {
                     role: String::new(),
                     attending: false,
                     asking: false,
+                    identify: false,
+                    projection: Default::default(),
                     delivering: false,
                     fallback: None,
                     activity: None,
@@ -1722,6 +1742,8 @@ impl Driver {
             }
             w.attending = f.attending;
             w.asking = f.asking;
+            w.identify = f.identify;
+            w.projection = f.projection.clone();
             w.delivering = f.delivering;
             w.fallback = f.blind_nudge.map(|every| Fallback {
                 identity: fallback_identity(&f.work),
@@ -1840,11 +1862,9 @@ impl Driver {
     pub(crate) fn due(
         &mut self,
         now: u64,
-        gate: impl Fn(&clank_core::ids::AgentLabel, &str) -> Gate,
+        mut gate: impl FnMut(&clank_core::ids::AgentLabel, &str) -> Gate,
     ) -> Vec<Act> {
-        // An answer already on disk is the attempt's evidence: read it
-        // before concluding that none came.
-        let mut acts = self.replies(now);
+        let mut acts = Vec::new();
         self.settle_expired(now);
         for (author, w) in self.agents.iter_mut() {
             let due = w
@@ -1967,7 +1987,7 @@ impl Driver {
             .iter_mut()
             .filter(|(_, w)| {
                 w.running == Identity::Unasked
-                    && w.obligated
+                    && (w.obligated || w.identify)
                     && matches!(w.tool, Tool::Claude | Tool::Codex)
             })
             .filter_map(|(author, w)| {
@@ -2005,6 +2025,68 @@ impl Driver {
         self.accounted(acts, now)
     }
 
+    /// Where each agent's check-in could be typed: its resume route, as
+    /// the evidence for the harness it runs grants it.
+    pub(crate) fn check_in_routes(
+        &self,
+    ) -> std::collections::BTreeMap<clank_core::ids::AgentLabel, Result<(), String>> {
+        self.agents
+            .iter()
+            .map(|(author, w)| {
+                let route = match transport_for(w.tool, Action::Nudge, w.running.version()) {
+                    Ok(Transport::Typed) => Ok(()),
+                    Ok(_) => Err("this harness is resumed through a helper, not typed".into()),
+                    Err(why) => Err(match &w.running {
+                        Identity::Unknown(found) => {
+                            format!("its running version could not be established: {found}")
+                        }
+                        _ => why.to_string(),
+                    }),
+                };
+                (author.clone(), route)
+            })
+            .collect()
+    }
+
+    /// Whether a check-in may be typed into `process` now: still the very
+    /// process identified for `author`'s binding, and still granted.
+    pub(crate) fn may_type_check_in(
+        &self,
+        author: &clank_core::ids::AgentLabel,
+        process: &crate::cli::pane_target::Process,
+    ) -> bool {
+        self.agents.get(author).is_some_and(|w| match &w.running {
+            Identity::Known(running) => {
+                running.process == *process
+                    && process.birth.still_holds(process.pid)
+                    && transport_for(w.tool, Action::Nudge, Some(&running.version))
+                        == Ok(Transport::Typed)
+            }
+            _ => false,
+        })
+    }
+
+    /// `author` holds an attendance now, so the harness it runs is worth
+    /// identifying before the next fold says so.
+    pub(crate) fn wants_identity(&mut self, author: &clank_core::ids::AgentLabel) {
+        if let Some(w) = self.agents.get_mut(author) {
+            w.identify = true;
+        }
+    }
+
+    /// Publish `author`'s turn projection as it is now.
+    pub(crate) fn project(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        projection: Projection,
+        now: u64,
+    ) {
+        if let Some(w) = self.agents.get_mut(author) {
+            w.projection = projection;
+            self.publish(now);
+        }
+    }
+
     /// Publish each agent's state that changed in meaning.
     fn publish(&mut self, now: u64) {
         for w in self.agents.values_mut() {
@@ -2034,6 +2116,9 @@ impl Driver {
                     )),
                     (_, Err(why)) => Some(why.to_string()),
                 },
+                attending: w.projection.attended.clone(),
+                asking: w.projection.asking.clone(),
+                repeated: w.projection.repeated,
             };
             if w.published.as_ref() != Some(&state) {
                 crate::cli::agent_state::store(&w.agent_dir, &state);
@@ -2042,39 +2127,21 @@ impl Driver {
         }
     }
 
-    /// Answers helpers left beside their agents, and beside any agent that
-    /// still has an attempt pending though it is no longer on the roster.
-    pub(crate) fn replies(&mut self, now: u64) -> Vec<Act> {
-        let mut acts = Vec::new();
-        let mut answered = Vec::new();
-        let away: std::collections::BTreeMap<clank_core::ids::AgentLabel, PathBuf> = self
-            .pending
-            .iter()
-            .filter(|((author, _), _)| !self.agents.contains_key(author))
-            .map(|((author, _), (dir, _))| (author.clone(), dir.clone()))
-            .collect();
-        for (author, dir) in away {
-            if let Some(reply) = take_reply(&dir) {
-                answered.push((author, reply.attempt(), reply.answer()));
-            }
-        }
-        for (author, w) in self.agents.iter_mut() {
-            let Some(reply) = take_reply(&w.agent_dir) else {
-                continue;
-            };
-            let attempt = reply.attempt();
-            answered.push((author.clone(), attempt.clone(), reply.answer()));
-            acts.extend(decision(
-                author,
-                w,
-                now,
-                None,
-                Some((&attempt, reply.answer())),
-            ));
-        }
-        for (author, attempt, answer) in &answered {
-            self.settle(author, attempt, |p| p.outcome(answer), now);
-        }
+    /// A helper's answer to one of `author`'s attempts, whether or not
+    /// `author` is still on the roster: its attempt's report.
+    pub(crate) fn answered(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        reply: Reply,
+        now: u64,
+    ) -> Vec<Act> {
+        let attempt = reply.attempt();
+        let answer = reply.answer();
+        let acts = match self.agents.get_mut(author) {
+            Some(w) => decision(author, w, now, None, Some((&attempt, answer.clone()))),
+            None => Vec::new(),
+        };
+        self.settle(author, &attempt, |p| p.outcome(&answer), now);
         self.publish(now);
         self.accounted(acts, now)
     }
@@ -2528,12 +2595,6 @@ pub(crate) fn episode_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("recovery.json")
 }
 
-/// Where a recovery helper answers an attempt. The monitor reads it and
-/// stays the only writer of the episode.
-pub(crate) fn reply_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("recovery-reply.json")
-}
-
 /// What the agent was told when its episode escalated, while it still
 /// stands: the reason its pending work is waiting for a person.
 pub(crate) fn waiting_for_you(agent_dir: &Path) -> Option<String> {
@@ -2603,22 +2664,17 @@ impl Reply {
     }
 }
 
-/// Take the helper's reply, so it is applied once.
-pub(crate) fn take_reply(agent_dir: &Path) -> Option<Reply> {
-    let path = reply_path(agent_dir);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    serde_json::from_str(&raw).ok()
+/// How an agent of `tool` hears that recovery will retry its failed turn:
+/// a helper hands it the wake, or the turn's own notice says so.
+pub(crate) fn retry_announcement(tool: Tool) -> &'static str {
+    match transport_for(tool, Action::Retry, None) {
+        Ok(Transport::Helper) => "helper",
+        _ => "notice",
+    }
 }
 
-pub(crate) fn write_reply(agent_dir: &Path, reply: &Reply) -> std::io::Result<()> {
-    let path = reply_path(agent_dir);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(reply)?)?;
-    std::fs::rename(&tmp, &path)
-}
-
-/// Append one turn a harness reported for itself, for its session.
+/// Append one turn a harness reported for itself, for its session. The
+/// monitor is the record's only writer.
 pub(crate) fn observe(agent_dir: &Path, line: &serde_json::Value) -> std::io::Result<()> {
     use std::io::Write as _;
     std::fs::create_dir_all(agent_dir)?;
@@ -2643,7 +2699,8 @@ pub(crate) fn wake_text(tag: &str) -> String {
 pub(crate) fn nudge_text(tag: &str) -> String {
     format!(
         "Clank sees you stopped with pending work ({tag}): check it with \
-         `clank status` and carry on."
+         `clank status` and carry on. If you are waiting on background work, attend it \
+         instead: `clank attend <name>` for a subagent, `clank run` for shell work."
     )
 }
 
@@ -3431,6 +3488,8 @@ pub(crate) mod tests {
             blind_nudge: None,
             attending: false,
             asking: false,
+            identify: false,
+            projection: Default::default(),
         }
     }
 
@@ -3861,6 +3920,8 @@ pub(crate) mod tests {
             blind_nudge: None,
             attending: false,
             asking: false,
+            identify: false,
+            projection: Default::default(),
         };
         let watch = WatchKey {
             dir: root.clone(),
@@ -4031,37 +4092,36 @@ pub(crate) mod tests {
             0,
         );
         d.due(60, |_, _| Gate::Go);
+        let codex = label();
         for (session, opened_by) in [("session-other", "t1"), ("session-one", "t0")] {
-            write_reply(
-                dir.path(),
-                &Reply {
+            d.answered(
+                &codex,
+                Reply {
                     session: session.into(),
                     opened_by: opened_by.into(),
                     n: 1,
                     answer: ReplyAnswer::Submitted,
                     started: None,
                 },
-            )
-            .unwrap();
-            d.replies(61);
+                61,
+            );
             assert_eq!(
                 load(dir.path()).unwrap().attempts[0].disposition,
                 Disposition::Claimed,
                 "{session} {opened_by}"
             );
         }
-        write_reply(
-            dir.path(),
-            &Reply {
+        d.answered(
+            &codex,
+            Reply {
                 session: "session-one".into(),
                 opened_by: "t1".into(),
                 n: 1,
                 answer: ReplyAnswer::Submitted,
                 started: None,
             },
-        )
-        .unwrap();
-        d.replies(62);
+            62,
+        );
         assert_eq!(
             load(dir.path()).unwrap().attempts[0].disposition,
             Disposition::Submitted
@@ -4217,7 +4277,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_episode_survives_the_disk_and_a_reply_is_taken_once() {
+    fn an_episode_survives_the_disk() {
         let dir = tempfile::tempdir().unwrap();
         let s = snap([started("t1"), failed("t1", "server_error")]);
         let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
@@ -4226,17 +4286,6 @@ pub(crate) mod tests {
         store(dir.path(), None).unwrap();
         assert_eq!(load(dir.path()), None);
         store(dir.path(), None).unwrap();
-
-        let reply = Reply {
-            session: "s1".into(),
-            opened_by: "t1".into(),
-            n: 1,
-            answer: ReplyAnswer::Submitted,
-            started: Some("m1".into()),
-        };
-        write_reply(dir.path(), &reply).unwrap();
-        assert_eq!(take_reply(dir.path()), Some(reply));
-        assert_eq!(take_reply(dir.path()), None);
     }
 
     fn poll_backend(
@@ -4486,6 +4535,8 @@ pub(crate) mod tests {
             blind_nudge: None,
             attending: false,
             asking: false,
+            identify: false,
+            projection: Default::default(),
         };
         let acts = d.reconcile(vec![f], 0);
         forward(&watch, &acts);
@@ -4650,24 +4701,13 @@ pub(crate) mod tests {
     }
 
     /// A monitor that restarts before the deadline reloads the attempt, and
-    /// a helper's reply that survived the restart is recorded as that
-    /// attempt's report, with its original failure and text.
+    /// a helper's reply that reaches it after the restart is recorded as
+    /// that attempt's report, with its original failure and text.
     #[test]
-    fn a_restart_keeps_the_attempt_for_a_reply_that_survived_it() {
+    fn a_restart_keeps_the_attempt_for_a_reply_that_comes_after_it() {
         let (d, dir, record, attempt, tag) =
             dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
         drop(d);
-        write_reply(
-            dir.path(),
-            &Reply {
-                session: attempt.session.clone(),
-                opened_by: attempt.opened_by.clone(),
-                n: attempt.n,
-                answer: ReplyAnswer::Submitted,
-                started: None,
-            },
-        )
-        .unwrap();
         let mut d = driver();
         d.reconcile(
             vec![facts(
@@ -4680,7 +4720,17 @@ pub(crate) mod tests {
             )],
             70,
         );
-        let acts = d.replies(71);
+        let acts = d.answered(
+            &label(),
+            Reply {
+                session: attempt.session.clone(),
+                opened_by: attempt.opened_by.clone(),
+                n: attempt.n,
+                answer: ReplyAnswer::Submitted,
+                started: None,
+            },
+            71,
+        );
         let recorded = nudged(dir.path());
         assert_eq!(recorded.len(), 1, "{acts:?}");
         assert_eq!(
@@ -4729,18 +4779,17 @@ pub(crate) mod tests {
         let (mut d, dir, _, attempt, _) =
             dispatched_attempt(Tool::Claude, Transport::Helper, &claude_failed());
         d.reconcile(Vec::new(), 61);
-        write_reply(
-            dir.path(),
-            &Reply {
+        let acts = d.answered(
+            &label(),
+            Reply {
                 session: attempt.session.clone(),
                 opened_by: attempt.opened_by.clone(),
                 n: attempt.n,
                 answer: ReplyAnswer::Submitted,
                 started: None,
             },
-        )
-        .unwrap();
-        let acts = d.replies(62);
+            62,
+        );
         assert!(dispatches(&acts).is_empty());
         assert!(matches!(
             &nudged(dir.path())[..],
@@ -4794,14 +4843,14 @@ pub(crate) mod tests {
         assert!(!pending_path(&away).exists());
     }
 
-    /// A monitor that restarts past an attempt's deadline reads any reply
-    /// that survived before deciding none came, in either order the timer
-    /// and the reply pass may run, for an agent on the roster or off it:
-    /// the reply's own outcome is recorded, once. With no reply, the
+    /// A monitor that restarts past an attempt's deadline settles it once,
+    /// for an agent on the roster or off it: a reply that reaches it before
+    /// its timer runs is the attempt's report, with the reply's own
+    /// outcome; with none, or one that comes only after the timer, the
     /// attempt is settled as unanswered. Nothing is sent again, and nothing
     /// is left pending.
     #[test]
-    fn an_overdue_restart_reads_the_reply_before_deciding_none_came() {
+    fn an_overdue_restart_settles_the_attempt_once() {
         use crate::cli::nudge_log::Outcome;
         for on_roster in [true, false] {
             for timer_first in [true, false] {
@@ -4818,19 +4867,20 @@ pub(crate) mod tests {
                     let agent = root.path().join(label().as_str());
                     std::fs::create_dir_all(&agent).unwrap();
                     std::fs::copy(pending_path(dir.path()), pending_path(&agent)).unwrap();
-                    if let Some(answer) = reply {
-                        write_reply(
-                            &agent,
-                            &Reply {
+                    let answer = |d: &mut Driver| match reply {
+                        Some(answer) => d.answered(
+                            &label(),
+                            Reply {
                                 session: attempt.session.clone(),
                                 opened_by: attempt.opened_by.clone(),
                                 n: attempt.n,
                                 answer,
                                 started: None,
                             },
-                        )
-                        .unwrap();
-                    }
+                            500,
+                        ),
+                        None => Vec::new(),
+                    };
                     let mut d = driver();
                     d.discover_pending(root.path());
                     let facts = match on_roster {
@@ -4841,9 +4891,9 @@ pub(crate) mod tests {
                     let mut acts = Vec::new();
                     if timer_first {
                         acts.extend(d.due(500, |_, _| Gate::Go));
-                        acts.extend(d.replies(500));
+                        acts.extend(answer(&mut d));
                     } else {
-                        acts.extend(d.replies(500));
+                        acts.extend(answer(&mut d));
                         acts.extend(d.due(500, |_, _| Gate::Go));
                     }
                     let case = format!("roster {on_roster} timer first {timer_first} {reply:?}");
@@ -4851,7 +4901,7 @@ pub(crate) mod tests {
                     assert_eq!(recorded.len(), 1, "{case}: {recorded:?}");
                     let want_unanswered = matches!(&recorded[0].outcome,
                         Outcome::Indeterminate { reason } if reason == "no answer came");
-                    match reply {
+                    match reply.filter(|_| !timer_first) {
                         Some(ReplyAnswer::Submitted) => {
                             assert_eq!(recorded[0].outcome, Outcome::Reported, "{case}")
                         }
@@ -4868,7 +4918,6 @@ pub(crate) mod tests {
                     }
                     assert!(dispatches(&acts).is_empty(), "{case}: nothing sent again");
                     assert!(!pending_path(&agent).exists(), "{case}");
-                    assert!(!reply_path(&agent).exists(), "{case}: the reply was read");
                 }
             }
         }
@@ -5617,7 +5666,6 @@ pub(crate) mod tests {
     }
 
     /// Claim an idle Codex agent's first nudge, with a typed transport.
-
     fn claimed_codex() -> (tempfile::TempDir, PathBuf, Driver, AttemptRef) {
         enable(Tool::Codex, Some(Transport::Typed));
         let (dir, record, mut d) = idle_codex();

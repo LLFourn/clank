@@ -201,8 +201,71 @@ impl Fixture {
         self.gate.write_all(b"\n").unwrap();
         self.gate.flush().unwrap();
     }
-    fn receipt(&self) -> Value {
-        serde_json::from_slice(&std::fs::read(&self.output).unwrap()).unwrap()
+    /// The receipt the source was handed. The monitor commits it once the
+    /// hook reports its emit delivered, after the hook has exited, so it
+    /// is waited for.
+    async fn receipt(&self) -> Value {
+        tokio::time::timeout(LIMIT, async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&self.output)
+                    && let Ok(value) = serde_json::from_slice(&bytes)
+                {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the monitor commits the receipt")
+    }
+    /// This repo's monitor, started in `cwd`, once it is listening.
+    async fn monitor(
+        &self,
+        cwd: &Path,
+    ) -> (
+        Child,
+        tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    ) {
+        let mut monitor = self
+            .command()
+            .args(["monitor", "start", "--repo", self.repo.to_str().unwrap()])
+            .current_dir(cwd)
+            .env("RUST_LOG", "clank::cli::monitor=debug")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(monitor.stdout.take().unwrap()).lines();
+        let listening = tokio::time::timeout(LIMIT, stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(listening.contains("listening on"));
+        let stderr = BufReader::new(monitor.stderr.take().unwrap()).lines();
+        (monitor, stderr)
+    }
+    /// A newer protocol's greeting: the monitor's ordinary retirement.
+    async fn retire(&self, mut monitor: Child) {
+        let descriptor: Value = serde_json::from_slice(
+            &std::fs::read(runtime_dir().join(format!("{}.json", repo_tag(&self.repo)))).unwrap(),
+        )
+        .unwrap();
+        let mut socket = tokio::net::UnixStream::connect(descriptor["socket"].as_str().unwrap())
+            .await
+            .unwrap();
+        let greeting = json!({"proto":u32::MAX,"repo":self.repo,"who":{"as":"observer"}});
+        socket
+            .write_all(format!("{greeting}\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(LIMIT, monitor.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
     }
     async fn run(&self, args: &[&str]) -> std::process::Output {
         tokio::time::timeout(LIMIT, self.command().args(args).output())
@@ -254,8 +317,8 @@ impl Fixture {
         );
         file
     }
-    fn assert_receipt(&self, producer: &Value) {
-        let value = self.receipt();
+    async fn assert_receipt(&self, producer: &Value) {
+        let value = self.receipt().await;
         assert_eq!(
             value["receipt"],
             json!({"version":1,"kind":"wake","source":self.source.name,"author":self.author.as_str(),"ids":[ID]})
@@ -295,8 +358,12 @@ impl Drop for Fixture {
     }
 }
 
+/// With no monitor, the hook's child watches for itself — running the
+/// interrupting producer without zellij, whatever its icon or message —
+/// and owed work wakes the agent with a notice, never the work: nothing
+/// is presented, no receipt is earned, and the reply stays owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wide_icon_hook_receives_interrupting_producer_without_zellij_and_keeps_reply_owed() {
+async fn wide_icon_hook_alone_wakes_without_zellij_presents_nothing_and_keeps_reply_owed() {
     let mut fixture = Fixture::new(Tool::Codex, true);
     fixture.source.interrupt = true;
     fixture.source.glyph = Some("💬".into()); // Cosmetic width must not kill the native wait.
@@ -319,13 +386,18 @@ async fn wide_icon_hook_receives_interrupting_producer_without_zellij_and_keeps_
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["decision"], "block");
-    assert!(payload["reason"].as_str().unwrap().contains("do the task"));
+    let reason = payload["reason"].as_str().unwrap();
+    assert!(reason.contains("monitor is unavailable"), "{reason}");
+    assert!(
+        !reason.contains("do the task"),
+        "the work is not presented: {reason}"
+    );
     assert!(
         output.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fixture.assert_receipt(&ready);
+    assert!(!fixture.output.exists(), "a notice earns no receipt");
     let selector = fixture.assert_owed().await;
     let shown = fixture
         .run(&[
@@ -341,8 +413,8 @@ async fn wide_icon_hook_receives_interrupting_producer_without_zellij_and_keeps_
     let row: Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(row["interrupt"], true);
     assert!(
-        row["woken_at"].is_u64(),
-        "real Codex output records delivery evidence"
+        row.get("woken_at").is_none_or(Value::is_null),
+        "a notice is not delivery evidence"
     );
     assert!(
         row.get("interrupt_attempt").is_none_or(Value::is_null),
@@ -372,7 +444,7 @@ async fn wide_icon_hook_receives_interrupting_producer_without_zellij_and_keeps_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_start_notifies_legacy_backlog_only_after_actual_context_emission() {
     let mut fixture = Fixture::new(Tool::Claude, false);
-    let _lease = fixture.monitor_lease();
+    let lease = fixture.monitor_lease();
     let wait = fixture
         .command()
         .args([
@@ -448,6 +520,10 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
         std::io::ErrorKind::WouldBlock,
         "inspection must not start another producer"
     );
+    // The monitor presents what a session start is owed. Started where the
+    // producer ran, it hosts the same source with the same context.
+    drop(lease);
+    let (monitor, _stderr) = fixture.monitor(&fixture.hook_cwd).await;
     let hook = fixture.hook_child(true).await;
     let output = tokio::time::timeout(LIMIT, hook.wait_with_output())
         .await
@@ -466,6 +542,7 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
             .contains("do the task")
     );
     assert!(output.stderr.is_empty());
+    fixture.assert_receipt(&ready).await;
     let shown = fixture
         .run(&[
             "events",
@@ -482,8 +559,8 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
         delivered["woken_at"].is_u64(),
         "Claude SessionStart context records wake evidence"
     );
-    fixture.assert_receipt(&ready);
     fixture.assert_owed().await;
+    fixture.retire(monitor).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -667,7 +744,7 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shared_monitor_delivery_preserves_monitor_cwd_and_does_not_own_receipts() {
+async fn shared_monitor_delivery_preserves_monitor_cwd_and_commits_its_receipt_on_delivered() {
     let mut fixture = Fixture::new(Tool::Codex, true);
     let mut monitor = fixture
         .command()
@@ -721,7 +798,7 @@ async fn shared_monitor_delivery_preserves_monitor_cwd_and_does_not_own_receipts
     assert!(output.stderr.is_empty());
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(payload["reason"].as_str().unwrap().contains("do the task"));
-    fixture.assert_receipt(&ready);
+    fixture.assert_receipt(&ready).await;
     let selector = fixture.assert_owed().await;
     let shown = fixture
         .run(&[
@@ -737,7 +814,7 @@ async fn shared_monitor_delivery_preserves_monitor_cwd_and_does_not_own_receipts
     let delivered: Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert!(
         delivered["woken_at"].is_u64(),
-        "monitor custody alone is insufficient; successful hook output stamps its exact copy"
+        "the hook's successful output, reported on its connection, stamps its exact copy"
     );
 
     // A newer protocol greeting exercises normal owned-source retirement.
@@ -767,16 +844,17 @@ async fn shared_monitor_delivery_preserves_monitor_cwd_and_does_not_own_receipts
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receipt_does_not_retire_work_or_redirect_a_successor_masters_subscription() {
     let mut fixture = Fixture::new(Tool::Codex, true);
-    let _lease = fixture.monitor_lease();
-    let hook = fixture.hook_child(false).await;
+    let (monitor, _stderr) = fixture.monitor(&fixture.host_cwd.clone()).await;
     let first = fixture.producer_ready().await;
+    let hook = fixture.hook_child(false).await;
     fixture.emit_event();
     let output = tokio::time::timeout(LIMIT, hook.wait_with_output())
         .await
         .unwrap()
         .unwrap();
     assert!(output.status.success());
-    fixture.assert_receipt(&first);
+    fixture.assert_receipt(&first).await;
+    std::fs::remove_file(&fixture.output).unwrap();
     fixture.assert_owed().await;
     let previous_author = fixture.author.clone();
     let previous_state = first["state"].clone();
@@ -816,7 +894,7 @@ async fn receipt_does_not_retire_work_or_redirect_a_successor_masters_subscripti
         .unwrap()
         .unwrap();
     assert!(output.status.success());
-    fixture.assert_receipt(&second);
+    fixture.assert_receipt(&second).await;
     fixture.assert_owed().await;
     let previous = fixture
         .run(&[
@@ -834,6 +912,7 @@ async fn receipt_does_not_retire_work_or_redirect_a_successor_masters_subscripti
     assert_eq!(rows[0]["item"]["id"], ID);
     assert_eq!(rows[0]["acked"], false);
     assert!(rows[0].get("reply").is_none());
+    fixture.retire(monitor).await;
 }
 
 #[tokio::test]
@@ -988,7 +1067,7 @@ async fn explicit_read_earns_receipt_without_ack_and_inspection_hides_content() 
     );
     let full: Value = serde_json::from_slice(&read.stdout).unwrap();
     assert_eq!(full["item"]["content"], "do the task");
-    fixture.assert_receipt(&ready);
+    fixture.assert_receipt(&ready).await;
     fixture.assert_owed().await;
     let metadata = fixture
         .run(&[
