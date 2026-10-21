@@ -233,74 +233,57 @@ async fn run_automatic_grok(
         args.events.is_empty(),
         "automatic Grok wait uses monitor-hosted sources; configure wait_events or use auto off for invocation-only --event sources"
     );
-    // Keep the existing PR draft producer only while this master is parked.
-    // Its remote review cadence is unrelated to wait ownership or registration.
-    let inputs = derive_wait_inputs(repo, author)?;
-    let drafts = WakeSources::derive(repo, inputs.role, vec![]).drafts;
-    let (draft_tx, mut draft_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut producers = None;
-    let result = async {
-        loop {
-            binding.ensure_current(repo, author)?;
-            let attached = crate::cli::monitor::attach_or_spawn_with(
-                repo,
-                crate::cli::monitor::Who::Agent {
-                    author: author.to_string(),
-                    holder: binding.holder(),
-                    has_cli_sources: false,
-                },
-                crate::cli::monitor::spawn_monitor,
-            )
-            .await;
-            let crate::cli::monitor::Attached::Shared(conn) = attached else {
-                anyhow::bail!(
-                    "automatic Grok wait could not subscribe to its repository monitor: {attached:?}"
-                );
-            };
-            tracing::debug!(%author, "monitor subscription registered");
-            let wake = tokio::select! {
-                wake = shared_wait_within_on_idle(conn, repo, author, binding,
-                    crate::cli::monitor::BEAT_GRACE, || {
-                        if producers.is_none() && !drafts.is_empty() {
-                            producers = Some(EventSources::spawn(&[], None, repo, author,
-                                &drafts, None, draft_tx.clone().into()));
-                        }
-                    }) => wake?,
-                Some((item, _)) = draft_rx.recv() => {
-                    binding.ensure_current(repo, author)?;
-                    let inputs = derive_wait_inputs(repo, author)?;
-                    let state = crate::rebuild::rebuild_repo(repo).await?;
-                    let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
-                    let head = crate::git_io::head_commit_at(repo, &state);
-                    let status = state.fold.derive_status(&reviews, &inputs.work_policy, head.as_ref());
-                    let items = owed_for(repo, author, &inputs, &status, &state.fold, &mut vec![item]);
-                    if items.is_empty() { continue; }
-                    Shared::Woke(items, std::env::current_dir().ok())
-                }
-            };
-            match wake {
-                Shared::Woke(items, cwd) => {
-                    binding.ensure_current(repo, author)?;
-                    emit_checked(&items, args.json, cwd.as_deref(), &mut std::io::stdout())?;
-                    let selected = items
-                        .iter()
-                        .filter_map(|item| item.presentation().cloned())
-                        .collect::<Vec<_>>();
-                    super::presentation::record(repo, author, &selected, || {
-                        binding.ensure_current(repo, author).is_ok()
-                    });
-                    return Ok(());
-                }
-                // Reattach only after a real disconnect or the existing monitor
-                // liveness deadline. No polling, helper or Grok registration timer.
-                Shared::Alone(why) => tracing::debug!(%why, "reconnecting Grok wait"),
+    loop {
+        binding.ensure_current(repo, author)?;
+        let attached = crate::cli::monitor::attach_or_spawn_with(
+            repo,
+            crate::cli::monitor::Who::Agent {
+                author: author.to_string(),
+                holder: binding.holder(),
+                has_cli_sources: false,
+            },
+            crate::cli::monitor::spawn_monitor,
+        )
+        .await;
+        let crate::cli::monitor::Attached::Shared(conn) = attached else {
+            anyhow::bail!(
+                "automatic Grok wait could not subscribe to its repository monitor: {attached:?}"
+            );
+        };
+        tracing::debug!(%author, "monitor subscription registered");
+        let wake = shared_wait_within(conn, repo, author, binding, crate::cli::monitor::BEAT_GRACE)
+            .await?;
+        match wake {
+            Shared::Woke(items, cwd) => {
+                binding.ensure_current(repo, author)?;
+                emit_checked(&items, args.json, cwd.as_deref(), &mut std::io::stdout())?;
+                let selected = items
+                    .iter()
+                    .filter_map(|item| item.presentation().cloned())
+                    .collect::<Vec<_>>();
+                super::presentation::record(repo, author, &selected, || {
+                    binding.ensure_current(repo, author).is_ok()
+                });
+                return Ok(());
             }
+            // Reattach only after a real disconnect or the existing monitor
+            // liveness deadline. No polling, helper or Grok registration timer.
+            Shared::Alone(why) => tracing::debug!(%why, "reconnecting Grok wait"),
         }
-    }.await;
-    if let Some(producers) = producers {
-        producers.shutdown().await;
     }
-    result
+}
+
+/// A token for one wait invocation. Monotonic within a process and
+/// time-seeded across them: it only has to differ from every other
+/// invocation's.
+fn new_invocation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    nanos ^ (NEXT.fetch_add(1, Ordering::Relaxed) << 48)
 }
 
 fn superseded_error(error: anyhow::Error, json: bool) -> anyhow::Result<()> {
@@ -418,8 +401,7 @@ async fn items_with_policy(
         .join(author.as_str())
         .join("events");
     // Mint once before native acceptance; preserve it through shared fallback.
-    let invocation =
-        (!args.peek).then(|| clank_core::pr_review::PrReviewState::new_instance().to_string());
+    let invocation = (!args.peek).then(|| new_invocation().to_string());
     let (source_tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut timers = if args.peek {
         None
@@ -506,9 +488,9 @@ async fn items_with_policy(
     // every parked wait used to attach its own watcher and refold on
     // every change, measured at 98 of them for 71 agents.
     //
-    // The monitor hosts configured sources. Invocation sources and derived
-    // draft watches remain local, so share only when that host covers this
-    // wait's complete source scope.
+    // The monitor hosts configured sources. Invocation sources remain
+    // local, so share only when that host covers this wait's complete
+    // source scope.
     //
     // Derived BEFORE the decision, and the same value is what the park
     // below spawns: a source the decision cannot see is a source
@@ -522,7 +504,9 @@ async fn items_with_policy(
     // rather than back to the hook empty-handed. Returning the failure
     // here would have been a LOST WAKE — the hook sees a failed wait,
     // does not re-arm, and the agent is never woken again.
-    let sources = WakeSources::derive(&repo, inputs.role, event_sources);
+    let sources = WakeSources {
+        events: event_sources,
+    };
     if let Some(conn) = share(&repo, &author, &binding, &sources).await {
         match shared_wait(conn, &repo, &author, &binding).await? {
             Shared::Woke(items, cwd) => {
@@ -576,9 +560,6 @@ async fn items_with_policy(
     let spawned = EventSources::spawn(
         &sources.events,
         Some(&events_dir),
-        &repo,
-        &author,
-        &sources.drafts,
         invocation.as_deref(),
         source_tx.into(),
     );
@@ -942,65 +923,32 @@ pub(crate) fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Re
 /// Everything besides the repo's own state that can wake this wait.
 ///
 /// One value, because two decisions consume it: whether this wait may
-/// share the monitor's watch, and what the park spawns. Assembling it
-/// in two places is how an open PR review's derived draft watch came
-/// to be invisible to the share decision — the monitor does not run
-/// draft sources, so sharing dropped the draft's wake and its inbox
-/// row outright (codex on 90985a6).
+/// share the monitor's watch, and what the park spawns. A source the
+/// share decision cannot see is a source nobody runs once the wait
+/// shares.
 struct WakeSources {
     events: Vec<(
         clank_core::agent_config::WaitEventSource,
         crate::cli::event_source::SourceOrigin,
     )>,
-    drafts: Vec<(u32, String)>,
 }
 
 impl WakeSources {
-    fn derive(
-        repo: &Path,
-        role: Role,
-        events: Vec<(
-            clank_core::agent_config::WaitEventSource,
-            crate::cli::event_source::SourceOrigin,
-        )>,
-    ) -> Self {
-        // Master's open PR reviews get a draft watch each, derived from
-        // the review rather than configured: it exists only while
-        // master is parked with a review open, and dies with the wait.
-        let drafts = if role == Role::Master {
-            crate::cli::pr_review::pr_review_inputs(repo)
-                .into_iter()
-                .map(|i| (i.pr, i.repo))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Self { events, drafts }
-    }
-
     /// Whether the monitor can cover everything that wakes this wait.
     ///
     /// Destructured on purpose: a source kind added later cannot be
     /// forgotten here, because the pattern stops compiling until it is
     /// named. That is the invariant this type exists to hold.
     fn may_share(&self) -> bool {
-        let Self { events, drafts } = self;
-        // Master's draft watch is derived from an open review rather
-        // than configured, and the monitor hosts no drafts.
-        drafts.is_empty()
-            // An author's CONFIG sources the monitor runs, once per
-            // repo, and routes back to that author. A `--event` source
-            // belongs to ONE INVOCATION and is never pooled — a monitor
-            // that ran one would deliver this invocation's events to
-            // whoever else happened to be this author.
-            && events
-                .iter()
-                .all(|(_, origin)| {
-                    matches!(
-                        origin,
-                        crate::cli::event_source::SourceOrigin::Config
-                    )
-                })
+        let Self { events } = self;
+        // An author's CONFIG sources the monitor runs, once per
+        // repo, and routes back to that author. A `--event` source
+        // belongs to ONE INVOCATION and is never pooled — a monitor
+        // that ran one would deliver this invocation's events to
+        // whoever else happened to be this author.
+        events
+            .iter()
+            .all(|(_, origin)| matches!(origin, crate::cli::event_source::SourceOrigin::Config))
     }
 }
 
@@ -1108,17 +1056,6 @@ async fn shared_wait_within(
     binding: &WaitBinding,
     grace: Duration,
 ) -> anyhow::Result<Shared> {
-    shared_wait_within_on_idle(conn, repo, author, binding, grace, || {}).await
-}
-
-async fn shared_wait_within_on_idle(
-    conn: crate::cli::monitor::Conn,
-    repo: &Path,
-    author: &AgentLabel,
-    binding: &WaitBinding,
-    grace: Duration,
-    mut idle: impl FnMut(),
-) -> anyhow::Result<Shared> {
     let mut notes = bridge_notes(conn, grace)?;
     // The sharing ends exactly one way: the reader is gone. A failed
     // read is the REASON, not a second ending — giving it an arm of
@@ -1155,7 +1092,6 @@ async fn shared_wait_within_on_idle(
                         )
                         .into());
                     }
-                    crate::cli::monitor::Note::Beat => idle(),
                     _ => {}
                 }
             }
@@ -1232,7 +1168,6 @@ pub(crate) fn owed_for(
     fold: &clank_core::repo_state::RepoState,
     external: &mut Vec<WaitItem>,
 ) -> Vec<WaitItem> {
-    drop_items_not_for(repo, inputs.role, external);
     // Deciding BEFORE the merge left the channel route outside the
     // decision: a blocked park returned a source item with no `Blocked`
     // context to explain the silence around it, and an answered one
@@ -1351,22 +1286,6 @@ pub(crate) fn resolve_wait_event_sources(
     Ok(sources)
 }
 
-/// Drop what this role must not be handed.
-///
-/// A draft change belongs to MASTER. The role is re-derived every
-/// wake, so a demotion mid-wait drops what the old watch queued rather
-/// than returning it — returning it would ACK it, settling a debt owed
-/// to the agent that is master now (codex edf3a63).
-fn drop_items_not_for(repo: &Path, role: Role, external: &mut Vec<WaitItem>) {
-    external.retain(|item| match item {
-        WaitItem::DraftChanged { pr, instance, .. } => {
-            role == Role::Master
-                && crate::cli::pr_review::owning_instance(repo, *pr) == Some(*instance)
-        }
-        _ => true,
-    });
-}
-
 /// One beat's items from BOTH routes, merged before anything decides.
 ///
 /// Named so the composition can be asserted without a watcher, and so
@@ -1423,9 +1342,6 @@ fn spawn_local(
         crate::cli::event_source::SourceOrigin,
     )],
     events_dir: Option<&std::path::Path>,
-    repo: &std::path::Path,
-    author: &AgentLabel,
-    drafts: &[(u32, String)],
     invocation: Option<&str>,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<crate::cli::event_source::Emission>,
@@ -1434,15 +1350,7 @@ fn spawn_local(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (
         rx,
-        EventSources::spawn(
-            sources,
-            events_dir,
-            repo,
-            author,
-            drafts,
-            invocation,
-            tx.into(),
-        ),
+        EventSources::spawn(sources, events_dir, invocation, tx.into()),
     )
 }
 
@@ -1480,9 +1388,6 @@ impl EventSources {
             crate::cli::event_source::SourceOrigin,
         )],
         events_dir: Option<&std::path::Path>,
-        repo: &std::path::Path,
-        author: &AgentLabel,
-        drafts: &[(u32, String)],
         invocation: Option<&str>,
         tx: crate::cli::event_source::EmissionSink,
     ) -> Self {
@@ -1540,19 +1445,6 @@ impl EventSources {
                     ));
                 }
             }
-        }
-        for (pr, slug) in drafts {
-            tasks.push((
-                format!("draft-{pr}-{slug}"),
-                tokio::spawn(crate::cli::pr_review::run_draft_source(
-                    repo.to_path_buf(),
-                    slug.clone(),
-                    *pr,
-                    author.clone(),
-                    tx.clone(),
-                    crate::cli::pr_review::DRAFT_POLL,
-                )),
-            ));
         }
         Self { tasks }
     }
@@ -2568,23 +2460,6 @@ pub(crate) enum WaitJsonItem<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         selector: Option<&'a str>,
     },
-    #[serde(rename = "draft_changed")]
-    DraftChanged {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        presentation: Option<&'a clank_core::wait::EventPresentation>,
-        pr: u32,
-        /// Opaque: which run of that PR's review. It exists so an ack
-        /// cannot cross runs, and means nothing to a reader.
-        instance: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        comment: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        path: Option<&'a str>,
-        change: &'a str,
-        revision: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        selector: Option<&'a str>,
-    },
     #[serde(rename = "for_commit")]
     ForCommit { sha: &'a str, subject: &'a str },
     #[serde(rename = "for_finished")]
@@ -2603,14 +2478,6 @@ pub(crate) enum WaitJsonItem<'a> {
     },
     #[serde(rename = "unblocked")]
     Unblocked { name: &'a str, answer: &'a str },
-    #[serde(rename = "pr_reviewer")]
-    PrReviewer { pr: u32, round: u64 },
-    #[serde(rename = "pr_master")]
-    PrMaster {
-        pr: u32,
-        round: u64,
-        next: &'a clank_core::wait::PrMasterNext,
-    },
 }
 
 fn plan_path(plan: &PlanKey) -> String {
@@ -2706,25 +2573,6 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             url: url.as_deref(),
             instructions: instructions.as_deref(),
         },
-        WaitItem::DraftChanged {
-            presentation: _,
-            pr,
-            instance,
-            comment,
-            path,
-            change,
-            revision,
-            selector,
-        } => WaitJsonItem::DraftChanged {
-            presentation: item.presentation(),
-            pr: *pr,
-            instance: *instance,
-            comment: *comment,
-            path: path.as_deref(),
-            change: change.wire(),
-            revision: *revision,
-            selector: selector.as_deref(),
-        },
         WaitItem::TimerEvent {
             presentation: _,
             name,
@@ -2783,15 +2631,6 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             question,
         },
         WaitItem::Unblocked { name, answer } => WaitJsonItem::Unblocked { name, answer },
-        WaitItem::PrReviewer { pr, round } => WaitJsonItem::PrReviewer {
-            pr: *pr,
-            round: *round,
-        },
-        WaitItem::PrMaster { pr, round, next } => WaitJsonItem::PrMaster {
-            pr: *pr,
-            round: *round,
-            next,
-        },
     }
 }
 
@@ -2863,28 +2702,6 @@ fn render_human(item: &WaitItem) -> String {
             "message  {handle}  {}  {subject}",
             crate::inbox::sender_words(from.as_deref(), repo.as_deref())
         ),
-        WaitItem::DraftChanged {
-            pr,
-            comment,
-            path,
-            change,
-            revision,
-            selector,
-            ..
-        } => {
-            let about = match (comment, path.as_deref()) {
-                (Some(c), Some(p)) => format!("  {p}  comment {c}"),
-                _ => String::new(),
-            };
-            let ack = selector
-                .as_deref()
-                .map(|s| format!("  (ack {s})"))
-                .unwrap_or_default();
-            format!(
-                "draft    #{pr}  {}{about}  (r{revision}){ack}",
-                change.wire()
-            )
-        }
         // ONE arm for every event source. The github and command
         // variants had separate arms building the same line from
         // differently-named fields; a third backend needed a third
@@ -3003,12 +2820,6 @@ fn render_human(item: &WaitItem) -> String {
             question: _,
         } => format!("blocked  {agent}/{name}  (awaiting human)"),
         WaitItem::Unblocked { name, answer } => format!("answer   {name}  {answer}"),
-        WaitItem::PrReviewer { pr, round } => {
-            format!("pr-review  #{pr}  round {round}  review the pending comments")
-        }
-        WaitItem::PrMaster { pr, round, next } => {
-            format!("pr-review  #{pr}  round {round}  master: {next:?}")
-        }
     }
 }
 
@@ -3127,54 +2938,6 @@ mod shared_tests {
             matches!(got.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
             "{got:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn local_producers_start_only_after_an_admitted_idle_note() {
-        let repo = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("grok").unwrap();
-        let binding = WaitBinding(None, WaitPolicy::Manual);
-        for (notes, expected, refused) in [
-            (
-                vec![Note::Items {
-                    items: vec![promote()],
-                    source_cwd: None,
-                }],
-                0,
-                false,
-            ),
-            (
-                vec![Note::Refused {
-                    why: "duplicate".into(),
-                }],
-                0,
-                true,
-            ),
-            (
-                vec![
-                    Note::Beat,
-                    Note::Items {
-                        items: vec![promote()],
-                        source_cwd: None,
-                    },
-                ],
-                1,
-                false,
-            ),
-        ] {
-            let mut starts = 0;
-            let result = shared_wait_within_on_idle(
-                monitor_saying(notes),
-                repo.path(),
-                &author,
-                &binding,
-                Duration::from_secs(1),
-                || starts += 1,
-            )
-            .await;
-            assert_eq!(result.is_err(), refused);
-            assert_eq!(starts, expected);
-        }
     }
 
     #[tokio::test]
@@ -3344,7 +3107,7 @@ mod shared_tests {
         let author = AgentLabel::parse("claude").unwrap();
         let binding = WaitBinding(None, WaitPolicy::Manual);
 
-        let nothing = WakeSources::derive(repo.path(), Role::Reviewer, Vec::new());
+        let nothing = WakeSources { events: Vec::new() };
         assert!(nothing.may_share());
         assert!(
             share_without_starting(repo.path(), &author, &binding, &nothing)
@@ -3363,11 +3126,9 @@ mod shared_tests {
             r#"{"wait_events":[{"kind":"command","name":"deploys","command":["true"]}]}"#,
         )
         .unwrap();
-        let configured = WakeSources::derive(
-            repo.path(),
-            Role::Reviewer,
-            resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
-        );
+        let configured = WakeSources {
+            events: resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
+        };
         assert!(
             !configured.events.is_empty(),
             "the fixture declares a config source"
@@ -3383,16 +3144,14 @@ mod shared_tests {
         // A `--event` source belongs to ONE INVOCATION. The monitor
         // never pools it, or this invocation's events would reach
         // whoever else happened to be this author.
-        let invoked = WakeSources::derive(
-            repo.path(),
-            Role::Reviewer,
-            resolve_wait_event_sources(
+        let invoked = WakeSources {
+            events: resolve_wait_event_sources(
                 repo.path(),
                 &author,
                 &[r#"{"kind":"command","name":"ticker","command":["true"]}"#.to_string()],
             )
             .unwrap(),
-        );
+        };
         assert!(!invoked.may_share());
         assert!(
             share_without_starting(repo.path(), &author, &binding, &invoked)
@@ -3450,14 +3209,7 @@ mod shared_tests {
         .unwrap();
         assert_eq!(both.len(), 2, "one configured and one invocation's");
 
-        let (mut rx, spawned) = spawn_local(
-            &both,
-            Some(&events),
-            dir.path(),
-            &author,
-            &[],
-            Some("inv-7"),
-        );
+        let (mut rx, spawned) = spawn_local(&both, Some(&events), Some("inv-7"));
         let tasks = spawned.into_tasks();
         let mut seen: Vec<String> = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
@@ -3579,19 +3331,14 @@ mod shared_tests {
             &[emits("ticker", "codex-invocation").to_string()],
         )
         .unwrap();
-        let sources = WakeSources::derive(dir.path(), Role::Reviewer, mine.clone());
+        let sources = WakeSources {
+            events: mine.clone(),
+        };
         assert!(
             !sources.may_share(),
             "an invocation's source keeps this wait watching for itself"
         );
-        let (mut rx, spawned) = spawn_local(
-            &mine,
-            Some(&codex_dir.join("events")),
-            dir.path(),
-            &codex,
-            &[],
-            Some("inv-3"),
-        );
+        let (mut rx, spawned) = spawn_local(&mine, Some(&codex_dir.join("events")), Some("inv-3"));
 
         // Its own channel receives BOTH: the configured event and the
         // invocation's.
@@ -3621,17 +3368,14 @@ mod shared_tests {
         // the emission are both real for the same author.
         let theirs = resolve_wait_event_sources(dir.path(), &claude, &[]).unwrap();
         assert!(
-            WakeSources::derive(dir.path(), Role::Master, theirs.clone()).may_share(),
+            WakeSources {
+                events: theirs.clone()
+            }
+            .may_share(),
             "config only, so the monitor covers everything that wakes it"
         );
-        let (mut claude_rx, claude_spawned) = spawn_local(
-            &theirs,
-            Some(&claude_dir.join("events")),
-            dir.path(),
-            &claude,
-            &[],
-            None,
-        );
+        let (mut claude_rx, claude_spawned) =
+            spawn_local(&theirs, Some(&claude_dir.join("events")), None);
         let claude_tasks = claude_spawned.into_tasks();
         let claude_heard = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -3685,14 +3429,7 @@ mod shared_tests {
 
         let arm = |body: String, scope: &'static str| {
             let declared = resolve_wait_event_sources(dir.path(), &author, &[body]).unwrap();
-            spawn_local(
-                &declared,
-                Some(&events),
-                dir.path(),
-                &author,
-                &[],
-                Some(scope),
-            )
+            spawn_local(&declared, Some(&events), Some(scope))
         };
         let (first_rx, first) = arm(emits("one"), "inv-1");
         let (second_rx, second) = arm(emits("two"), "inv-2");
@@ -3782,14 +3519,14 @@ mod shared_tests {
         assert_eq!(cli.len(), 1);
 
         // No invocation to give: what the monitor passes.
-        let (_rx, spawned) = spawn_local(&cli, None, dir.path(), &author, &[], None);
+        let (_rx, spawned) = spawn_local(&cli, None, None);
         assert!(
             spawned.tasks.is_empty(),
             "an invocation's source is refused, not pooled under the author"
         );
 
         // With one, it runs.
-        let (_rx, spawned) = spawn_local(&cli, None, dir.path(), &author, &[], Some("inv-1"));
+        let (_rx, spawned) = spawn_local(&cli, None, Some("inv-1"));
         assert_eq!(spawned.tasks.len(), 1);
         spawned.shutdown().await;
     }
@@ -3813,11 +3550,9 @@ mod shared_tests {
             r#"{"wait_events":[{"kind":"command","name":"deploys","command":["true"]}]}"#,
         )
         .unwrap();
-        let configured = WakeSources::derive(
-            repo.path(),
-            Role::Reviewer,
-            resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
-        );
+        let configured = WakeSources {
+            events: resolve_wait_event_sources(repo.path(), &author, &[]).unwrap(),
+        };
 
         // A monitor of the version that does NOT host sources, which
         // ANSWERS as that version. The descriptor alone is not enough
@@ -3866,46 +3601,6 @@ mod shared_tests {
                 .await
                 .is_none(),
             "so it watches for itself rather than losing its events"
-        );
-    }
-
-    /// Master's draft watch is DERIVED from an open PR review, not
-    /// configured — so a master with nothing in its config still has a
-    /// source the monitor does not run. Sharing then costs the draft's
-    /// wake and its inbox row, with nothing in the config to hint at
-    /// why.
-    #[tokio::test]
-    async fn an_open_pr_review_keeps_master_watching_itself() {
-        let (repo, _dir) = repo_with_a_willing_monitor();
-        let author = AgentLabel::parse("claude").unwrap();
-        let binding = WaitBinding(None, WaitPolicy::Manual);
-        std::fs::create_dir_all(repo.path().join(".clank/pr-reviews/42")).unwrap();
-        std::fs::write(
-            repo.path().join(".clank/pr-reviews/42/pr.json"),
-            r#"{"repo":"o/n","number":42,"head_sha":"deadbeef","round":1}"#,
-        )
-        .unwrap();
-
-        let master = WakeSources::derive(repo.path(), Role::Master, Vec::new());
-        assert!(
-            !master.drafts.is_empty(),
-            "the open review is a draft source"
-        );
-        assert!(
-            share_without_starting(repo.path(), &author, &binding, &master)
-                .await
-                .is_none(),
-            "an open review is a source of its own, configured or not"
-        );
-
-        // The same repo for a reviewer: the refusal above is the draft
-        // watch, not the presence of the file.
-        let reviewer = WakeSources::derive(repo.path(), Role::Reviewer, Vec::new());
-        assert!(
-            share_without_starting(repo.path(), &author, &binding, &reviewer)
-                .await
-                .is_some(),
-            "a reviewer derives no draft watch, so it may share"
         );
     }
 
@@ -4235,43 +3930,6 @@ mod tests {
         }
     }
 
-    /// A draft wake belongs to the master that opened the review.
-    ///
-    /// Covered here because it had no test at all — found while moving
-    /// the call into `owed_for` so the monitor comes through the same
-    /// door. Only the ROLE half is driven: the instance half needs an
-    /// open review on disk, and this is the half that needs none.
-    #[test]
-    fn a_draft_wake_is_not_owed_to_a_reviewer() {
-        let dir = tempfile::tempdir().unwrap();
-        let draft = || WaitItem::DraftChanged {
-            presentation: None,
-            pr: 42,
-            instance: 1,
-            comment: None,
-            path: None,
-            change: clank_core::pr_review::DraftChange::Removed,
-            revision: 1,
-            selector: None,
-        };
-        let other = || WaitItem::PromoteFromQueue {
-            name: "next".into(),
-            priority: 500,
-        };
-
-        let mut items = vec![draft(), other()];
-        drop_items_not_for(dir.path(), Role::Reviewer, &mut items);
-        assert!(
-            matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
-            "a reviewer owns no review's drafts: {items:?}"
-        );
-
-        // And nothing else is touched by it.
-        let mut untouched = vec![other()];
-        drop_items_not_for(dir.path(), Role::Master, &mut untouched);
-        assert_eq!(untouched.len(), 1);
-    }
-
     #[test]
     fn supersession_has_a_distinct_wait_wire() {
         let value = serde_json::to_value(SupersededEnvelope {
@@ -4347,7 +4005,7 @@ mod tests {
         };
         crate::agent_store::save_agent_config(repo.path(), &author, &cfg).unwrap();
         let declared = resolve_wait_event_sources(repo.path(), &author, &[]).unwrap();
-        let (mut rx, sources) = spawn_local(&declared, None, repo.path(), &author, &[], None);
+        let (mut rx, sources) = spawn_local(&declared, None, None);
         let mut received = std::collections::BTreeMap::new();
         for _ in 0..2 {
             let (item, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -4420,8 +4078,7 @@ mod tests {
             .join(author.as_str())
             .join("events");
         std::fs::create_dir_all(&events).unwrap();
-        let (mut rx, sources) =
-            spawn_local(&declared, Some(&events), repo.path(), &author, &[], None);
+        let (mut rx, sources) = spawn_local(&declared, Some(&events), None);
         let mut names = std::collections::BTreeSet::new();
         for _ in 0..2 {
             let (item, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -4479,7 +4136,7 @@ mod tests {
             clank_core::agent_config::WaitEventSource::Command(source),
             crate::cli::event_source::SourceOrigin::Config,
         )];
-        let (mut rx, sources) = spawn_local(&declared, None, repo.path(), &author, &[], None);
+        let (mut rx, sources) = spawn_local(&declared, None, None);
         let (item, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
@@ -6610,7 +6267,7 @@ mod tests {
     #[test]
     fn wait_json_items_serialize_to_the_stable_shape() {
         use clank_core::vocab::WaitingReason;
-        use clank_core::wait::{MasterNext, PrMasterNext};
+        use clank_core::wait::MasterNext;
 
         let cases = [
             (
@@ -6725,25 +6382,6 @@ mod tests {
                     "kind": "unblocked",
                     "name": "q",
                     "answer": "yes",
-                }),
-            ),
-            (
-                serde_json::to_value(render_json(&WaitItem::PrReviewer { pr: 7, round: 2 }))
-                    .unwrap(),
-                serde_json::json!({ "kind": "pr_reviewer", "pr": 7, "round": 2 }),
-            ),
-            (
-                serde_json::to_value(render_json(&WaitItem::PrMaster {
-                    pr: 7,
-                    round: 2,
-                    next: PrMasterNext::Finish,
-                }))
-                .unwrap(),
-                serde_json::json!({
-                    "kind": "pr_master",
-                    "pr": 7,
-                    "round": 2,
-                    "next": PrMasterNext::Finish,
                 }),
             ),
         ];

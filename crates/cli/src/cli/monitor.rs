@@ -32,7 +32,9 @@ use clank_core::wait::WaitItem;
 // 11 admits one automatic Grok wait per bound session and reports refusals.
 // 12 publishes its sources' lifecycle and takes a control request to
 // restart one.
-pub(crate) const PROTO: u32 = 14;
+// 15 no longer carries PR-review items, which an older monitor can still
+// send and this build cannot decode.
+pub(crate) const PROTO: u32 = 15;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -4328,9 +4330,6 @@ async fn restart_source(
     let restarted = crate::cli::wait::EventSources::spawn(
         &[(config, crate::cli::event_source::SourceOrigin::Config)],
         Some(&events_dir),
-        repo,
-        &author,
-        &[],
         None,
         host_sink(into, Some(lifecycle), &author, instance),
     )
@@ -4389,9 +4388,8 @@ impl Hosted {
 ///
 /// A `--event` source belongs to ONE INVOCATION and is never pooled:
 /// a monitor that ran one would deliver an invocation's events to
-/// whoever else happened to be that author. Master's draft watch is
-/// derived per review rather than configured, so it is not here
-/// either; both keep their wait watching for itself.
+/// whoever else happened to be that author, so it keeps its wait
+/// watching for itself.
 fn hostable(
     repo: &std::path::Path,
     author: &AgentLabel,
@@ -4574,10 +4572,6 @@ fn reconcile_hosting_reporting(
         let tasks = crate::cli::wait::EventSources::spawn(
             &spec,
             Some(&events_dir),
-            repo,
-            author,
-            // Never drafts: they are derived per review, not configured.
-            &[],
             // No invocation to give, and none needed: `hostable`
             // resolves with no CLI items, so every source here is an
             // author's config source. A `--event` source handed to a

@@ -108,8 +108,6 @@ pub(crate) enum Transport {
     /// finds it by the same directory glob, and an unacked one is
     /// never compacted away.
     Command,
-    /// A change observed by polling an open pending PR review.
-    Draft,
     /// A message one agent sent another
     /// (`a-message-is-an-event-like-any-other`). Its own transport
     /// rather than borrowing `Command`'s: nothing produced it by
@@ -125,7 +123,6 @@ impl Transport {
             Transport::Poll => "poll",
             Transport::Relay => "relay",
             Transport::Command => "command",
-            Transport::Draft => "draft",
             Transport::Message => "message",
         }
     }
@@ -1424,6 +1421,7 @@ impl EventLog {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn append_inbox(
         &mut self,
         transport: Transport,
@@ -2130,7 +2128,7 @@ impl EventLog {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     #[test]
     fn reply_required_messages_use_a_specific_v2_record_and_survive_compaction() {
         let dir = tempfile::tempdir().unwrap();
@@ -2501,6 +2499,75 @@ pub(super) mod tests {
 
     fn log_in(dir: &Path) -> EventLog {
         EventLog::open(dir, "github-o-r-abcd").unwrap()
+    }
+
+    /// Rows the retired PR-review draft watch wrote, copied VERBATIM
+    /// from a real `draft-pr-587-run-1790686177382821000.jsonl`: two
+    /// changes, then their acks.
+    pub(crate) const RETIRED_DRAFT_JSONL: &str = concat!(
+        r#"{"t":"inbox","v":1,"seq":1,"at":1790686451,"transport":"draft","action_key":"draft:587:1790686177382821000:claude:1","item":{"kind":"draft_changed","pr":587,"instance":1790686177382821000,"comment":4133674383,"path":"frostsnapp/lib/psbt.dart","change":"added","revision":1}}"#,
+        "\n",
+        r#"{"t":"inbox","v":1,"seq":2,"at":1790686451,"transport":"draft","action_key":"draft:587:1790686177382821000:claude:2","item":{"kind":"draft_changed","pr":587,"instance":1790686177382821000,"comment":4133674734,"path":"frostsnapp/rust/src/api/bitcoin.rs","change":"added","revision":2}}"#,
+        "\n",
+        r#"{"t":"ack","v":1,"seq":1,"at":1790686470}"#,
+        "\n",
+        r#"{"t":"ack","v":1,"seq":2,"at":1790686470}"#,
+        "\n",
+    );
+
+    /// A log holding a retired variant's rows still loads, takes new
+    /// events, acks and compacts them, and keeps the old bytes.
+    ///
+    /// The draft rows name a transport and an item kind this build no
+    /// longer has. Read as corruption, the log would be quarantined
+    /// and its custody lost; read as live, they could be handed out
+    /// again. Foreign is neither.
+    #[test]
+    fn retired_draft_rows_stay_foreign_through_ack_compaction_and_reload() {
+        let dir = tempdir();
+        let key = "draft-pr-587-run-1790686177382821000";
+        std::fs::write(dir.join(format!("{key}.jsonl")), RETIRED_DRAFT_JSONL).unwrap();
+        let mut log = EventLog::open(&dir, key).unwrap();
+        let loaded = log.load();
+        assert!(!loaded.log_quarantined, "foreign, not corrupt");
+        assert_eq!(loaded.foreign, 2);
+        assert!(loaded.unhandled.is_empty(), "{:?}", loaded.unhandled);
+
+        let seq = log
+            .append_inbox(Transport::Poll, Some("live"), None, None, &item(1))
+            .unwrap();
+        assert!(seq > 2, "the retired rows keep their seqs reserved: {seq}");
+        let read = log.read_rows().unwrap().expect("foreign, not corrupt");
+        assert_eq!(read.foreign, 2);
+        assert_eq!(read.rows.len(), 1, "{:?}", read.rows);
+        assert_eq!(read.rows[0].seq, seq);
+        log.append_checked_ack(seq, &read.rows[0].ident).unwrap();
+
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let text = std::fs::read_to_string(dir.join(format!("{key}.jsonl"))).unwrap();
+        for retired in RETIRED_DRAFT_JSONL
+            .lines()
+            .filter(|l| l.contains(r#""t":"inbox""#))
+        {
+            assert!(text.contains(retired), "kept byte-verbatim: {text}");
+        }
+
+        let mut restarted = EventLog::open(&dir, key).unwrap();
+        let reloaded = restarted.load();
+        assert!(!reloaded.log_quarantined);
+        assert_eq!(reloaded.foreign, 2);
+        assert!(reloaded.unhandled.is_empty(), "{:?}", reloaded.unhandled);
+        let read = restarted.read_rows().unwrap().unwrap();
+        assert!(
+            read.rows.iter().all(|r| r.seq == seq && r.acked),
+            "{:?}",
+            read.rows
+        );
+        let next = restarted
+            .append_inbox(Transport::Poll, Some("later"), None, None, &item(2))
+            .unwrap();
+        assert!(next > seq, "{next} after {seq}");
     }
 
     #[test]

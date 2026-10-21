@@ -33,7 +33,6 @@ pub const CLANK_WAKE_DIRS: &[&str] = &[
     "agents", // agents/<label>/feedback — the gate signal
     "finished",
     "config.json",
-    "pr-reviews", // pr-reviews/<pr>/ — PrReviewer/PrMaster gate state
 ];
 
 /// Under `.clank/`, what the status panel shows but no gate reads: a
@@ -378,13 +377,6 @@ mod tests {
         ));
         assert!(is_core_wake(
             &p(".clank/config.json"),
-            &git_dir,
-            &git_dir,
-            &clank
-        ));
-        // PR-review state (PrReviewer/PrMaster gate) lives here too.
-        assert!(is_core_wake(
-            &p(".clank/pr-reviews/123/pr.json"),
             &git_dir,
             &git_dir,
             &clank

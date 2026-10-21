@@ -131,10 +131,6 @@ pub struct StatusSnapshot {
     /// in `to_json`.
     #[serde(skip)]
     pub(crate) log_decorations: std::collections::BTreeMap<String, Vec<String>>,
-    /// Active GitHub PR reviews (clank-pr-review-mode), for the
-    /// `pr` gauge. Empty in the common (no-PR-review) case.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
     /// The timeline's merged github events, index-aligned with the
     /// `OnelineRow::Github` rows in `log_rows` (set together —
     /// tui-github-event-page).
@@ -740,7 +736,6 @@ impl StatusSnapshot {
             log_next,
             github_events,
             log_decorations,
-            pr_reviews: work_status.pr_reviews,
             ad_hoc: work_status.ad_hoc,
             head_correction: work_status.head_correction,
             warnings: state
@@ -822,36 +817,6 @@ impl StatusSnapshot {
             };
             let _ = writeln!(out, "stashed: {} · {} commit(s){note}", sv.stem, sv.commits);
         }
-        for pr in &self.pr_reviews {
-            let url = pr_url(&pr.repo, pr.pr);
-            if pr.round == 0 {
-                // Not opened yet: master is drafting, no reviewers.
-                let _ = writeln!(out, "pr #{}: round 0 — master drafting", pr.pr);
-            } else {
-                let waiting = if pr.handoff_stopped() {
-                    // Master was deliberately taken off this: saying
-                    // it is waiting on them shows actionable work
-                    // that nobody is coming to do.
-                    "nobody — handoff blocked, run `clank pr-review finish`".to_string()
-                } else if pr.missing_reviewers.is_empty() {
-                    "master".to_string()
-                } else {
-                    pr.missing_reviewers
-                        .iter()
-                        .map(|l| l.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let _ = writeln!(
-                    out,
-                    "pr #{}: round {} ({}) — waiting on {waiting}",
-                    pr.pr,
-                    pr.round,
-                    pr.gate.as_str(),
-                );
-            }
-            let _ = writeln!(out, "  {url}");
-        }
         for row in &self.agents {
             if let Some(old) = row.superseded() {
                 let _ = writeln!(
@@ -898,8 +863,7 @@ impl StatusSnapshot {
             }
         }
 
-        if self.active_plan.is_none() && self.last_finished.is_none() && self.pr_reviews.is_empty()
-        {
+        if self.active_plan.is_none() && self.last_finished.is_none() {
             let _ = writeln!(out);
             let _ = writeln!(out, "no active plan, nothing pending");
         }
@@ -1820,13 +1784,6 @@ fn head_info(git: &crate::git_io::Repo) -> (Option<String>, Option<String>, Opti
     (branch, sha, subject)
 }
 
-/// The PR's GitHub URL from its `owner/name` slug + number. The one
-/// place clank formats a github URL, shared by the text and TUI
-/// status surfaces (the TUI makes it a clickable OSC 8 hyperlink).
-pub(crate) fn pr_url(repo: &str, pr: u32) -> String {
-    format!("https://github.com/{repo}/pull/{pr}")
-}
-
 /// `+12 −3 · 1 binary · 2 untracked`, omitting zero parts. A dirty
 /// tree whose numbers are all zero (e.g. a mode-only change) reads
 /// `changes`.
@@ -2515,25 +2472,6 @@ mod dirty_and_wake_tests {
         assert_ne!(edited, clank_input_fingerprint(r), "a removed draft");
     }
 
-    #[test]
-    fn clank_fingerprint_flips_on_a_pr_review_write() {
-        // PR-review state (PrReviewer/PrMaster gate) is part of the
-        // snapshot, so a `.clank/pr-reviews/<pr>/` write must flip the
-        // fingerprint (and wake the core watcher) — otherwise the TUI
-        // keeps stale PR rows after propose/note/submit/abort
-        // (codex fbd3e73). pr-reviews is in CLANK_WAKE_DIRS.
-        let dir = fixture_repo();
-        let r = dir.path();
-        let before = clank_input_fingerprint(r);
-        std::fs::create_dir_all(r.join(".clank/pr-reviews/42")).unwrap();
-        std::fs::write(r.join(".clank/pr-reviews/42/pr.json"), r#"{"round":1}"#).unwrap();
-        let after = clank_input_fingerprint(r);
-        assert_ne!(
-            before, after,
-            "a pr-reviews write must flip the fingerprint (TUI PR-row refresh)"
-        );
-    }
-
     /// The agent-panel auto toggle (`clank tui` SPC, or an external
     /// `clank auto`) writes `agents/<label>/config.json`. The repaint
     /// rests on the fingerprint covering that file — which it does only
@@ -2968,69 +2906,6 @@ mod dirty_and_wake_tests {
         );
     }
 
-    /// `clank status` names the blocked handoff only where master has
-    /// actually stopped.
-    ///
-    /// The block survives `propose`, so a reopened round can carry it
-    /// while reviewers genuinely owe verdicts. Saying "waiting on
-    /// nobody" then hides real work -- and core keeps emitting those
-    /// items, so the line would contradict the wake model
-    /// (codex e70f8a9).
-    #[test]
-    fn a_blocked_handoff_only_changes_the_converged_line() {
-        use clank_core::vocab::CommitGateState;
-        let line = |gate, blocked, missing: &[&str]| {
-            let mut snap = minimal_snapshot();
-            // The shared fixture, not a literal: core's struct grows,
-            // and a second hand-built copy would need editing every
-            // time (ruthless 329d579).
-            let mut pr = crate::cli::status_tui::fixtures::pr_work(2, missing);
-            pr.pr = 7;
-            pr.repo = "o/r".to_string();
-            pr.gate = gate;
-            pr.handoff_blocked = blocked;
-            snap.pr_reviews = vec![pr];
-            snap.to_human()
-                .lines()
-                .find(|l| l.starts_with("pr #7"))
-                .expect("the PR line is rendered")
-                .to_string()
-        };
-
-        let stopped = line(CommitGateState::Finished, true, &[]);
-        assert!(
-            stopped.contains("handoff blocked"),
-            "converged and blocked: master is not coming: {stopped}",
-        );
-        assert!(
-            stopped.contains("clank pr-review finish"),
-            "with the one thing that runs it again: {stopped}",
-        );
-        assert!(
-            line(CommitGateState::Finished, false, &[]).contains("waiting on master"),
-            "converged and not blocked is master's to hand over",
-        );
-
-        // Reopened after a blocked handoff: reviewers owe verdicts,
-        // and that is what the line must say.
-        let reopened = line(CommitGateState::Unreviewed, true, &["codex"]);
-        assert!(
-            reopened.contains("waiting on codex"),
-            "a reopened round is waiting on its reviewers: {reopened}",
-        );
-        assert!(
-            !reopened.contains("handoff blocked"),
-            "and not on a handoff that is not due yet: {reopened}",
-        );
-        // Changes requested with the block still set: master's turn,
-        // and a real one.
-        let integrating = line(CommitGateState::ChangesRequested, true, &[]);
-        assert!(
-            integrating.contains("waiting on master") && !integrating.contains("handoff blocked"),
-            "master owes an integration here: {integrating}",
-        );
-    }
-
     fn minimal_snapshot() -> StatusSnapshot {
         StatusSnapshot {
             forks: Vec::new(),
@@ -3069,7 +2944,6 @@ mod dirty_and_wake_tests {
             log_next: None,
             github_events: Vec::new(),
             log_decorations: Default::default(),
-            pr_reviews: Vec::new(),
             ad_hoc: Vec::new(),
             head_correction: None,
             warnings: Vec::new(),
@@ -3201,15 +3075,6 @@ mod dirty_and_wake_tests {
             path: PathBuf::from("/r/.clank/queue/120-later.md"),
         }];
         snap.forks = vec![("spike".to_string(), "worktree")];
-        snap.pr_reviews = vec![clank_core::wait::PrReviewWorkState {
-            handoff_blocked: false,
-            pr: 7,
-            handover: Default::default(),
-            repo: "llfourn/clank".to_string(),
-            round: 2,
-            gate: CommitGateState::Unreviewed,
-            missing_reviewers: vec![clank_core::ids::AgentLabel::parse("codex").unwrap()],
-        }];
         snap.ad_hoc = vec![clank_core::wait::AdHocWorkState {
             sha: sha("deadbeef"),
             gate: CommitGateState::Unreviewed,
@@ -3236,7 +3101,6 @@ mod dirty_and_wake_tests {
             sources: _,
             sources_live: _,
             forks,
-            pr_reviews,
             ad_hoc,
             head_correction: _,
             warnings,
@@ -3320,12 +3184,6 @@ mod dirty_and_wake_tests {
             // Nothing fixed a shape for this key, so it is the pair
             // the model holds.
             serde_json::to_value(forks).unwrap()
-        );
-        assert_eq!(v["pr_reviews"].as_array().unwrap().len(), pr_reviews.len());
-        assert_eq!(v["pr_reviews"][0]["pr"], 7);
-        assert_eq!(
-            v["pr_reviews"][0]["missing_reviewers"],
-            serde_json::json!(["codex"])
         );
         assert_eq!(v["ad_hoc"].as_array().unwrap().len(), ad_hoc.len());
         assert_eq!(v["ad_hoc"][0]["sha"], "deadbeef");

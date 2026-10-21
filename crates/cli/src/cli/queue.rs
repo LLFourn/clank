@@ -1141,7 +1141,7 @@ mod tests {
     #[test]
     fn queue_add_leaves_the_allow_list_gitignore_byte_identical() {
         // Regression guard for the single-source plan (ruthless): the deleted
-        // per-dir appender means `queue add` — like fork/open/pr-review — must
+        // per-dir appender means `queue add` — like fork/open — must
         // NOT touch `.clank/.gitignore` (an append would drift the
         // order-sensitive allow-list out of Canonical).
         let dir = tempfile::tempdir().unwrap();

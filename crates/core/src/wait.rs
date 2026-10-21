@@ -36,29 +36,6 @@ pub enum MasterNext {
     Finalize,
 }
 
-/// What master should do next on a PR review (clank-pr-review-mode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrMasterNext {
-    /// Round 0: the review isn't open yet. Master drafts the initial
-    /// top-level comments, then `clank pr-review propose` opens
-    /// round 1 and summons reviewers. The reviewable artifact (the
-    /// pending-review draft) is master's output, so master always
-    /// acts first — unlike a plan, whose commit exists before review.
-    Draft,
-    /// A reviewer requested changes this round: integrate the
-    /// feedback into the pending review, delete the reply, bump the
-    /// round.
-    Integrate,
-    /// Both tiers FINISHED: hand the draft over. Nothing is
-    /// published — `clank pr-review finish` cleans the draft and
-    /// leaves it for the human to read and submit.
-    Finish,
-    /// Commit tier continued-not-finished (no milestone). Keep
-    /// refining / nudge reviewers toward FINISHED.
-    Continue,
-}
-
 /// Which GitHub object an event's BODY should be read from
 /// (tui-github-event-content).
 ///
@@ -311,48 +288,6 @@ pub enum WaitItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
     },
-    /// The open review's DRAFT changed under master
-    /// (`the-review-session-watches-its-pr`). Master only, produced by
-    /// the CLI's draft observer, never by `work_for`.
-    ///
-    /// AWARENESS, not work. Master re-reads the draft before its next
-    /// round and answers nothing — replying to the operator's edit is
-    /// the one thing this must not cause. Nothing delivers a draft
-    /// edit, so these are differences an observer noticed between two
-    /// complete reads, which is why they carry the observer's own
-    /// `revision` rather than a github identity: a comment edited
-    /// twice is two changes, and github offers no counter that says so.
-    ///
-    /// Unfiltered on purpose. One shared `gh` account and no write
-    /// path clank owns means no provenance exists to suppress the
-    /// agents' own changes with, and every stand-in for it erases the
-    /// operator's edits too (codex ce892ea).
-    DraftChanged {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        presentation: Option<EventPresentation>,
-        pr: u32,
-        /// Which RUN of that PR's review this belongs to. Revisions
-        /// restart at 1 for each run, so `(pr, revision)` is ambiguous
-        /// across a review that was aborted and started again — and an
-        /// old wait acknowledging a new run's change would delete a
-        /// change nobody has seen (codex 96dbec8).
-        instance: u64,
-        /// The draft comment that changed, and the file it sits on —
-        /// both absent when the change is the whole pending review
-        /// going away.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        comment: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
-        change: crate::pr_review::DraftChange,
-        /// The observer's count of changes it has reported for this
-        /// review. Monotonic across rounds.
-        revision: u64,
-        /// What to pass `clank events ack`. Stamped when presenting a
-        /// logged change; absent on legacy, unlogged draft wakes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<String>,
-    },
     /// Observer-mode events (`wait --for`, wait-for-observer-mode):
     /// produced only by the CLI observer path, never by `work_for`.
     /// Distinct kinds so a consumer can't mistake an observation of a
@@ -378,20 +313,6 @@ pub enum WaitItem {
         name: String,
         answer: String,
     },
-    /// A reviewer should review PR #`pr` at `round`
-    /// (clank-pr-review-mode). Routed to a reviewer in the active
-    /// tier who hasn't posted a current-round verdict.
-    PrReviewer {
-        pr: u32,
-        round: u64,
-    },
-    /// Master's turn on PR #`pr` at `round`: integrate, submit, or
-    /// keep refining (clank-pr-review-mode).
-    PrMaster {
-        pr: u32,
-        round: u64,
-        next: PrMasterNext,
-    },
 }
 
 impl WaitItem {
@@ -400,8 +321,7 @@ impl WaitItem {
             Self::Message { presentation, .. }
             | Self::GithubEvent { presentation, .. }
             | Self::TimerEvent { presentation, .. }
-            | Self::CommandEvent { presentation, .. }
-            | Self::DraftChanged { presentation, .. } => presentation.as_ref(),
+            | Self::CommandEvent { presentation, .. } => presentation.as_ref(),
             _ => None,
         }
     }
@@ -410,8 +330,7 @@ impl WaitItem {
             Self::Message { presentation, .. }
             | Self::GithubEvent { presentation, .. }
             | Self::TimerEvent { presentation, .. }
-            | Self::CommandEvent { presentation, .. }
-            | Self::DraftChanged { presentation, .. } => *presentation = Some(key),
+            | Self::CommandEvent { presentation, .. } => *presentation = Some(key),
             _ => {}
         }
     }
@@ -501,14 +420,11 @@ wake_kinds! {
     GithubEvent => "github_event",
     CommandEvent => "command_event",
     TimerEvent => "timer_event",
-    DraftChanged => "draft_changed",
     ForCommit => "for_commit",
     ForFinished => "for_finished",
     ForBlocked => "for_blocked",
     Blocked => "blocked",
     Unblocked => "unblocked",
-    PrReviewer => "pr_reviewer",
-    PrMaster => "pr_master",
 }
 
 /// One event, whatever produced it
@@ -599,14 +515,11 @@ impl WaitItem {
             WaitItem::GithubEvent { .. } => WaitKind::GithubEvent,
             WaitItem::CommandEvent { .. } => WaitKind::CommandEvent,
             WaitItem::TimerEvent { .. } => WaitKind::TimerEvent,
-            WaitItem::DraftChanged { .. } => WaitKind::DraftChanged,
             WaitItem::ForCommit { .. } => WaitKind::ForCommit,
             WaitItem::ForFinished { .. } => WaitKind::ForFinished,
             WaitItem::ForBlocked { .. } => WaitKind::ForBlocked,
             WaitItem::Blocked { .. } => WaitKind::Blocked,
             WaitItem::Unblocked { .. } => WaitKind::Unblocked,
-            WaitItem::PrReviewer { .. } => WaitKind::PrReviewer,
-            WaitItem::PrMaster { .. } => WaitKind::PrMaster,
         }
     }
 
@@ -687,24 +600,6 @@ impl WaitItem {
                 selector: selector.as_deref(),
                 failure: *failure,
                 requires_reply: *requires_reply,
-                recurrence: None,
-                github: None,
-            }),
-            WaitItem::DraftChanged {
-                path,
-                change,
-                selector,
-                ..
-            } => Some(EventView {
-                source: "PR draft",
-                kind: change.wire(),
-                content: path.as_deref(),
-                body: None,
-                at: None,
-                instructions: None,
-                selector: selector.as_deref(),
-                failure: false,
-                requires_reply: false,
                 recurrence: None,
                 github: None,
             }),
@@ -842,82 +737,6 @@ pub trait PlanStateLookup {
     /// compiling without block awareness.
     fn blocks_for(&self, _plan: &PlanKey) -> Vec<PlanBlock> {
         Vec::new()
-    }
-    /// Active PR reviews projected from `.clank/pr-reviews/`
-    /// (clank-pr-review-mode). Default empty so non-PR callers and
-    /// test mocks need no awareness; the FS adapter overrides it.
-    fn pr_reviews(&self) -> Vec<PrReviewInput> {
-        Vec::new()
-    }
-}
-
-/// One active PR review's raw inputs for the gate: its number, the
-/// current round, and the verdicts posted FOR that round (already
-/// filtered to `reviewed_round == round` and mapped to
-/// `ReviewEntry`). `derive_status` runs `compute_gate` over these.
-#[derive(Debug, Clone)]
-pub struct PrReviewInput {
-    pub pr: u32,
-    /// Whether THIS review's handoff was found impossible — the
-    /// caller resolves `handoff_blocked == Some(instance)`, so a
-    /// stale block from an earlier run never reaches here.
-    pub handoff_blocked: bool,
-    /// `owner/name` slug, for building the PR's GitHub URL.
-    pub repo: String,
-    pub round: u64,
-    /// When this round was opened (epoch seconds) — the PR analogue
-    /// of a commit's author time.
-    pub opened_at: Option<i64>,
-    pub current_verdicts: Vec<ReviewEntry>,
-}
-
-/// Per-PR-review gate + routing state, the PR analogue of
-/// `PlanWorkState`.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PrReviewWorkState {
-    pub pr: u32,
-    /// See [`PlanWorkState::handover`].
-    pub handover: Handover,
-    /// `owner/name` slug, for building the PR's GitHub URL.
-    pub repo: String,
-    pub round: u64,
-    pub gate: crate::vocab::CommitGateState,
-    /// Reviewers in the currently-active tier who still owe a
-    /// current-round verdict (the ones to wake). Empty when it's
-    /// master's turn.
-    pub missing_reviewers: Vec<AgentLabel>,
-    /// Handoff has been found IMPOSSIBLE for this review, so master
-    /// is not woken to retry it.
-    ///
-    /// A converged review otherwise emits `Finish` on every arm until
-    /// the scratch goes, and the scratch only goes on a handoff that
-    /// worked — so a handoff that CANNOT work re-fires forever. That
-    /// is the shape this suppresses, and only that shape: an ordinary
-    /// transient failure leaves this false and keeps its retry.
-    ///
-    /// Scoped to the review that hit it. `pr-review start` makes a new
-    /// instance, which does not inherit the block.
-    ///
-    /// Ask [`Self::handoff_stopped`] rather than this field: the flag
-    /// alone does not say whether anything has actually stopped.
-    #[serde(default)]
-    pub handoff_blocked: bool,
-}
-
-impl PrReviewWorkState {
-    /// Whether the block is actually STOPPING anything here.
-    ///
-    /// `handoff_blocked` survives `propose`, which reopens the round,
-    /// so a review being reviewed again can carry it while reviewers
-    /// still owe verdicts and master still owes an integration. Only
-    /// the CONVERGED stage is suppressed.
-    ///
-    /// This exists because the rule was written out separately by
-    /// every reader, and two of the three got it wrong in the same
-    /// way -- a bare bool hands each one the same coin flip
-    /// (ruthless 329d579).
-    pub fn handoff_stopped(&self) -> bool {
-        self.handoff_blocked && self.gate == crate::vocab::CommitGateState::Finished
     }
 }
 
@@ -1059,9 +878,6 @@ pub struct WorkPolicy {
 pub struct WorkStatus {
     pub active_plan: Option<PlanWorkState>,
     pub ad_hoc: Vec<AdHocWorkState>,
-    /// Active GitHub PR reviews (clank-pr-review-mode), projected
-    /// from `.clank/pr-reviews/` via `PlanStateLookup::pr_reviews`.
-    pub pr_reviews: Vec<PrReviewWorkState>,
     /// `Some` iff HEAD's `[..]` tag violates the commit-tag invariant
     /// (`commit-tag-fixup-is-first-class-state`). This is the SINGLE
     /// derived source of the master's "fix the commit tag"
@@ -1663,53 +1479,9 @@ impl RepoState {
             }
         }
 
-        // PR reviews (clank-pr-review-mode): same gate engine as
-        // plans, but keyed by PR + round instead of a sha. Feed
-        // compute_gate the current-round verdicts with
-        // latest_touched_plan=false, so the gate tier engages only
-        // once the commit tier is FINISHED (the milestone) — the
-        // plan's tier semantics, no new gate code.
-        let mut pr_reviews = Vec::new();
-        for input in reviews.pr_reviews() {
-            let gate = compute_gate(
-                &input.current_verdicts,
-                &policy.commit_reviewers,
-                &policy.plan_reviewers,
-                &policy.final_reviewers,
-                false,
-            );
-            // Round 0 = master still drafting; the review hasn't been
-            // opened (no `propose` yet), so no reviewer is summoned
-            // whatever the gate says. round is the "opened?" signal —
-            // the PR analogue of a plan's commit existing before its
-            // reviewers are summoned.
-            let missing_reviewers = if input.round == 0 {
-                Vec::new()
-            } else {
-                missing_for_gate(gate, &input.current_verdicts, policy, false)
-            };
-            pr_reviews.push(PrReviewWorkState {
-                pr: input.pr,
-                handoff_blocked: input.handoff_blocked,
-                handover: stage_closures(
-                    input.opened_at,
-                    &input.current_verdicts,
-                    &policy.commit_reviewers,
-                    &policy.plan_reviewers,
-                    &policy.final_reviewers,
-                    false,
-                ),
-                repo: input.repo,
-                round: input.round,
-                gate,
-                missing_reviewers,
-            });
-        }
-
         WorkStatus {
             active_plan,
             ad_hoc,
-            pr_reviews,
             head_correction,
         }
     }
@@ -1895,50 +1667,6 @@ impl WorkStatus {
                     out.push(WaitItem::AdHocRevise {
                         sha: ah.sha.clone(),
                     });
-                }
-                _ => {}
-            }
-        }
-        for pr in &self.pr_reviews {
-            use crate::vocab::CommitGateState;
-            match role {
-                Role::Reviewer if pr.missing_reviewers.iter().any(|l| l == author) => {
-                    out.push(WaitItem::PrReviewer {
-                        pr: pr.pr,
-                        round: pr.round,
-                    });
-                }
-                Role::Master => {
-                    let next = if pr.round == 0 {
-                        // Round 0: master drafts, then `propose` opens
-                        // the review. Always master's turn, regardless
-                        // of gate.
-                        Some(PrMasterNext::Draft)
-                    } else if pr.handoff_stopped() {
-                        // A handoff that cannot succeed is not work:
-                        // waking master to retry it is the
-                        // forever-loop, not a nudge toward it. Asked
-                        // as a question, so this is the ONE place the
-                        // rule is written.
-                        None
-                    } else {
-                        match pr.gate {
-                            CommitGateState::ChangesRequested => Some(PrMasterNext::Integrate),
-                            CommitGateState::Finished => Some(PrMasterNext::Finish),
-                            CommitGateState::Continued => Some(PrMasterNext::Continue),
-                            // Unreviewed / ContinuedPendingGate →
-                            // reviewers' turn; Blocked is unreachable
-                            // for PR reviews.
-                            _ => None,
-                        }
-                    };
-                    if let Some(next) = next {
-                        out.push(WaitItem::PrMaster {
-                            pr: pr.pr,
-                            round: pr.round,
-                            next,
-                        });
-                    }
                 }
                 _ => {}
             }
@@ -2839,7 +2567,6 @@ mod tests {
                 handover: Handover::default(),
             }),
             ad_hoc: Vec::new(),
-            pr_reviews: Vec::new(),
             head_correction: None,
         }
     }
@@ -2858,7 +2585,7 @@ mod tests {
 
     /// Standby reviews nothing: every review a reviewer in the same
     /// place is owed — a plan's commit tier, its gate, an Unreviewed
-    /// ad-hoc commit (which goes to ANY reviewer), a PR — is withheld
+    /// ad-hoc commit (which goes to ANY reviewer) — is withheld
     /// (a-standby-agent-wakes-only-for-messages).
     #[test]
     fn a_standby_agent_is_owed_no_review_of_any_kind() {
@@ -2873,7 +2600,6 @@ mod tests {
                 }],
                 ..work_status_with_one_plan(WaitingOn::MasterToContinue)
             },
-            ws_pr(CommitGateState::Unreviewed, &["sb"]),
         ];
         for ws in &owed {
             assert!(
@@ -3058,175 +2784,6 @@ mod tests {
         assert_eq!(missing, vec![label("ruthless")]);
     }
 
-    // ============ PR review wait surface ============
-
-    fn two_tier_policy() -> WorkPolicy {
-        // A `gate` reviewer (plan + final), pre-split semantics.
-        WorkPolicy {
-            plan_feedback: true,
-            adhoc_feedback: false,
-            commit_reviewers: vec![label("codex")],
-            plan_reviewers: vec![label("ruthless")],
-            final_reviewers: vec![label("ruthless")],
-        }
-    }
-
-    struct MockPrReviews(Vec<PrReviewInput>);
-    impl PlanStateLookup for MockPrReviews {
-        fn reviews_for(&self, _sha: &CommitSha) -> Vec<ReviewEntry> {
-            Vec::new()
-        }
-        fn worktree_status(&self, _plan: &PlanKey) -> PlanWorktreeStatus {
-            PlanWorktreeStatus::Clean
-        }
-        fn pr_reviews(&self) -> Vec<PrReviewInput> {
-            self.0.clone()
-        }
-    }
-
-    fn pr_input(round: u64, verdicts: &[(&str, crate::vocab::Verdict)]) -> PrReviewInput {
-        PrReviewInput {
-            handoff_blocked: false,
-            pr: 123,
-            repo: "o/r".into(),
-            round,
-            opened_at: None,
-            current_verdicts: verdicts
-                .iter()
-                .map(|(l, v)| ReviewEntry {
-                    author: label(l),
-                    verdict: *v,
-                    at: None,
-                })
-                .collect(),
-        }
-    }
-
-    fn pr_state(input: PrReviewInput) -> PrReviewWorkState {
-        let state = RepoState::default();
-        state
-            .derive_status(&MockPrReviews(vec![input]), &two_tier_policy(), None)
-            .pr_reviews
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-
-    /// A PR round is the same chain over a different work item: the
-    /// round OPENING is what a commit's landing is, and the verdicts
-    /// that close each tier are the current round's. The peer rule
-    /// holds here for the same reason it holds for a commit — the
-    /// boundary is a max over the required set.
-    #[test]
-    fn a_pr_rounds_stages_are_dated_by_the_round_and_its_verdicts() {
-        use crate::vocab::Verdict;
-        let dated = |round_at: i64, verdicts: &[(&str, Verdict, i64)]| {
-            pr_state(PrReviewInput {
-                handoff_blocked: false,
-                pr: 123,
-                repo: "o/r".into(),
-                round: 1,
-                opened_at: Some(round_at),
-                current_verdicts: verdicts
-                    .iter()
-                    .map(|(l, v, at)| ReviewEntry {
-                        author: label(l),
-                        verdict: *v,
-                        at: Some(*at),
-                    })
-                    .collect(),
-            })
-            .handover
-        };
-        // Nobody has voted: the round opening is all there is, and it
-        // is what its commit-tier reviewer has been owing since.
-        let fresh = dated(1_000, &[]);
-        assert_eq!(fresh.opened, Some(1_000));
-        assert_eq!(fresh.commit_tier_closed, None);
-        assert_eq!(fresh.since(HandoverTier::Commit), Some(1_000));
-        // The commit tier finished at 1_500 — which is when the gate
-        // tier was summoned, and when master would be handed back if
-        // the gate tier were empty.
-        let closed = dated(1_000, &[("codex", Verdict::Finished, 1_500)]);
-        assert_eq!(closed.commit_tier_closed, Some(1_500));
-        assert_eq!(closed.since(HandoverTier::Second), Some(1_500));
-        // ruthless voting does not move what ruthless has owed since
-        // — nor any other pending second-tier reviewer's clock.
-        let voted = dated(
-            1_000,
-            &[
-                ("codex", Verdict::Finished, 1_500),
-                ("ruthless", Verdict::Finished, 9_000),
-            ],
-        );
-        assert_eq!(voted.since(HandoverTier::Second), Some(1_500));
-        assert_eq!(
-            voted.since(HandoverTier::Master),
-            Some(9_000),
-            "master is handed back by the tier that closed last"
-        );
-    }
-
-    #[test]
-    fn pr_gate_tier_progression() {
-        use crate::vocab::{CommitGateState, Verdict};
-        // Round >= 1 (review opened by `propose`). No current
-        // verdicts → commit tier owes review.
-        let s = pr_state(pr_input(1, &[]));
-        assert_eq!(s.gate, CommitGateState::Unreviewed);
-        assert_eq!(s.missing_reviewers, vec![label("codex")]);
-
-        // Commit tier FINISHED is the milestone → gate tier wakes.
-        let s = pr_state(pr_input(1, &[("codex", Verdict::Finished)]));
-        assert_eq!(s.gate, CommitGateState::ContinuedPendingGate);
-        assert_eq!(s.missing_reviewers, vec![label("ruthless")]);
-
-        // Both tiers FINISHED → master submits, nobody owes review.
-        let s = pr_state(pr_input(
-            1,
-            &[
-                ("codex", Verdict::Finished),
-                ("ruthless", Verdict::Finished),
-            ],
-        ));
-        assert_eq!(s.gate, CommitGateState::Finished);
-        assert!(s.missing_reviewers.is_empty());
-
-        // A request-changes anywhere → master integrates.
-        let s = pr_state(pr_input(1, &[("codex", Verdict::RequestChanges)]));
-        assert_eq!(s.gate, CommitGateState::ChangesRequested);
-        assert!(s.missing_reviewers.is_empty());
-    }
-
-    #[test]
-    fn pr_round_zero_is_master_draft_turn() {
-        // The reported bug: a freshly-started review (round 0, no
-        // verdicts, nothing drafted) must NOT summon a reviewer — it's
-        // master's turn to draft, then `propose`. compute_gate still
-        // reads Unreviewed, but round, not gate, gates the summon.
-        let s = pr_state(pr_input(0, &[]));
-        assert_eq!(s.gate, crate::vocab::CommitGateState::Unreviewed);
-        assert!(
-            s.missing_reviewers.is_empty(),
-            "no reviewer summoned before the review is opened"
-        );
-        let ws = WorkStatus {
-            active_plan: None,
-            ad_hoc: Vec::new(),
-            pr_reviews: vec![s],
-            head_correction: None,
-        };
-        assert_eq!(
-            ws.work_for(&label("claude"), Role::Master),
-            vec![WaitItem::PrMaster {
-                pr: 123,
-                round: 0,
-                next: PrMasterNext::Draft
-            }]
-        );
-        assert!(ws.work_for(&label("codex"), Role::Reviewer).is_empty());
-    }
-
     #[test]
     fn adhoc_gate_routing_matrix_continued_gives_master_nothing() {
         // adhoc-continue-wake-investigation: TODAY'S behavior, pinned
@@ -3243,7 +2800,6 @@ mod tests {
                 gate,
                 handover: Handover::default(),
             }],
-            pr_reviews: Vec::new(),
             head_correction: None,
         };
         // The reproduction: continued/finished → master empty.
@@ -3276,148 +2832,6 @@ mod tests {
                 .work_for(&label("codex"), Role::Reviewer)
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn pr_stale_round_verdicts_are_dropped_by_the_projection() {
-        // The projection only passes CURRENT-round verdicts; a verdict
-        // for an older round must not satisfy the gate. (Here we
-        // simulate the projection's filter by passing no current
-        // verdicts — the stale ones never reach derive_status.)
-        let s = pr_state(pr_input(3, &[]));
-        assert_eq!(s.gate, crate::vocab::CommitGateState::Unreviewed);
-        assert_eq!(s.round, 3);
-    }
-
-    fn ws_pr(gate: crate::vocab::CommitGateState, missing: &[&str]) -> WorkStatus {
-        WorkStatus {
-            active_plan: None,
-            ad_hoc: Vec::new(),
-            pr_reviews: vec![PrReviewWorkState {
-                handoff_blocked: false,
-                pr: 123,
-                repo: "o/r".into(),
-                round: 2,
-                gate,
-                missing_reviewers: missing.iter().map(|l| label(l)).collect(),
-                handover: Handover::default(),
-            }],
-            head_correction: None,
-        }
-    }
-
-    /// A handoff that CANNOT succeed is not work.
-    ///
-    /// The scratch only goes on a handoff that worked, and the gate
-    /// stays Finished, so a converged review whose handoff is
-    /// impossible would otherwise emit `Finish` on every arm forever.
-    /// That is the reported bug: "finish exits 1 without recording
-    /// anything, so the wake item re-fires on every Stop, forever."
-    #[test]
-    fn a_blocked_handoff_stops_offering_finish() {
-        use crate::vocab::CommitGateState;
-        let mut ws = ws_pr(CommitGateState::Finished, &[]);
-        assert_eq!(
-            ws.work_for(&label("claude"), Role::Master),
-            vec![WaitItem::PrMaster {
-                pr: 123,
-                round: 2,
-                next: PrMasterNext::Finish,
-            }],
-            "a converged review asks master to finish",
-        );
-
-        ws.pr_reviews[0].handoff_blocked = true;
-        assert!(
-            ws.work_for(&label("claude"), Role::Master).is_empty(),
-            "a handoff that cannot work must not keep waking master",
-        );
-    }
-
-    /// Only the CONVERGED arm is suppressed: a blocked handoff says
-    /// nothing about a review that is still being reviewed, and
-    /// silencing those would strand the whole review rather than one
-    /// step of it.
-    #[test]
-    fn a_blocked_handoff_silences_nothing_else() {
-        use crate::vocab::CommitGateState;
-        for (gate, next) in [
-            (CommitGateState::ChangesRequested, PrMasterNext::Integrate),
-            (CommitGateState::Continued, PrMasterNext::Continue),
-        ] {
-            let mut ws = ws_pr(gate, &[]);
-            ws.pr_reviews[0].handoff_blocked = true;
-            assert_eq!(
-                ws.work_for(&label("claude"), Role::Master),
-                vec![WaitItem::PrMaster {
-                    pr: 123,
-                    round: 2,
-                    next,
-                }],
-                "{gate:?} is still master's turn",
-            );
-        }
-        // And reviewers are untouched: the block is master's handoff,
-        // not the review.
-        let mut ws = ws_pr(CommitGateState::Unreviewed, &["codex"]);
-        ws.pr_reviews[0].handoff_blocked = true;
-        assert_eq!(
-            ws.work_for(&label("codex"), Role::Reviewer),
-            vec![WaitItem::PrReviewer { pr: 123, round: 2 }],
-        );
-    }
-
-    #[test]
-    fn work_for_routes_pr_reviewer_only_to_the_missing() {
-        let ws = ws_pr(crate::vocab::CommitGateState::Unreviewed, &["codex"]);
-        assert_eq!(
-            ws.work_for(&label("codex"), Role::Reviewer),
-            vec![WaitItem::PrReviewer { pr: 123, round: 2 }]
-        );
-        // ruthless isn't in the missing set → no item.
-        assert!(ws.work_for(&label("ruthless"), Role::Reviewer).is_empty());
-        // master gets nothing while reviewers owe review.
-        assert!(ws.work_for(&label("claude"), Role::Master).is_empty());
-    }
-
-    #[test]
-    fn work_for_routes_pr_master_by_gate() {
-        use crate::vocab::CommitGateState;
-        let cases = [
-            (CommitGateState::ChangesRequested, PrMasterNext::Integrate),
-            (CommitGateState::Finished, PrMasterNext::Finish),
-            (CommitGateState::Continued, PrMasterNext::Continue),
-        ];
-        for (gate, next) in cases {
-            let ws = ws_pr(gate, &[]);
-            assert_eq!(
-                ws.work_for(&label("claude"), Role::Master),
-                vec![WaitItem::PrMaster {
-                    pr: 123,
-                    round: 2,
-                    next
-                }],
-                "gate {gate:?}"
-            );
-            // reviewers get nothing on a master-turn gate.
-            assert!(ws.work_for(&label("codex"), Role::Reviewer).is_empty());
-        }
-    }
-
-    #[test]
-    fn work_for_pr_master_silent_while_reviewers_owe() {
-        // ContinuedPendingGate / Unreviewed are reviewers' turns —
-        // master must not get a PrMaster item.
-        for gate in [
-            crate::vocab::CommitGateState::Unreviewed,
-            crate::vocab::CommitGateState::ContinuedPendingGate,
-        ] {
-            let ws = ws_pr(gate, &["ruthless"]);
-            assert!(
-                ws.work_for(&label("claude"), Role::Master).is_empty(),
-                "gate {gate:?}"
-            );
-        }
     }
 
     #[test]

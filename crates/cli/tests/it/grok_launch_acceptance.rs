@@ -594,7 +594,6 @@ async fn fork_launch_delivers_only_in_child_repo_and_never_rebinds_source() {
             drafts: vec![],
             prompt: None,
             no_open: true,
-            review: false,
         },
         Some(&f.home),
     )

@@ -13,9 +13,6 @@ mod ci;
 /// The emission gate every wake passes, and the tick that drives the
 /// feed and the checks on their own schedules.
 mod coordinator;
-/// A pending review's draft comments, read as state because nothing
-/// delivers an edit to one.
-pub(crate) mod draft;
 /// What an event means and which ones are new: both classifiers, the
 /// poll state machine, and the cursor a watch remembers.
 mod feed;

@@ -879,7 +879,10 @@ fn squash_dry_run_text(
         out,
         "# Squash mode is NOT pipeable to git rebase. Run the live command"
     );
-    let _ = writeln!(out, "# without --dry-run to materialize the squashed commit.");
+    let _ = writeln!(
+        out,
+        "# without --dry-run to materialize the squashed commit."
+    );
     out
 }
 

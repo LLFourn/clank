@@ -92,18 +92,11 @@ fn oldest_obligation(
             .find(|a| &a.sha == sha)
             .and_then(|a| a.handover.since(tier))
     };
-    let pr_at = |pr: u32| {
-        snap.pr_reviews
-            .iter()
-            .find(|p| p.pr == pr)
-            .and_then(|p| p.handover.since(tier))
-    };
     work.work_for(&parsed, role)
         .iter()
         .filter_map(|item| match item {
             WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => plan_at(plan),
             WaitItem::AdHocReview { sha, .. } | WaitItem::AdHocRevise { sha } => adhoc_at(sha),
-            WaitItem::PrReviewer { pr, .. } | WaitItem::PrMaster { pr, .. } => pr_at(*pr),
             // Not obligations handed over by a review stage: a
             // notification, an idle prompt, a preempt the panel
             // surfaces elsewhere (the `fix` gauge, the queue).
@@ -114,7 +107,6 @@ fn oldest_obligation(
             | WaitItem::GithubEvent { .. }
             | WaitItem::CommandEvent { .. }
             | WaitItem::TimerEvent { .. }
-            | WaitItem::DraftChanged { .. }
             | WaitItem::ForCommit { .. }
             | WaitItem::ForFinished { .. }
             | WaitItem::ForBlocked { .. }
@@ -695,28 +687,6 @@ mod tests {
         assert_eq!(since_of(&in_progress_rows(&s), "claude"), Some(200));
     }
 
-    /// A reviewer awaited by a PR round reads its clock from that
-    /// round's stages — the same rule over a different work item.
-    #[test]
-    fn a_pr_reviewer_is_dated_by_the_rounds_stages() {
-        use crate::cli::status_tui::fixtures::{pr_awaiting, with_agents};
-        use crate::cli::teams_config::RosterRole;
-        let mut s = with_agents(
-            snap(None, vec![]),
-            &[
-                ("claude", RosterRole::Master),
-                ("codex", RosterRole::Commit),
-            ],
-        );
-        let mut pr = pr_awaiting(&["codex"]);
-        pr.handover = clank_core::wait::Handover {
-            opened: Some(4_242),
-            ..Default::default()
-        };
-        s.pr_reviews = vec![pr];
-        assert_eq!(since_of(&in_progress_rows(&s), "codex"), Some(4_242));
-    }
-
     /// An agent owing two things has been owing since the OLDER one:
     /// the elapsed answers "how long has this agent had work waiting",
     /// which the newer obligation cannot shorten.
@@ -742,9 +712,11 @@ mod tests {
                 ("codex", RosterRole::Commit),
             ],
         );
-        let mut pr = crate::cli::status_tui::fixtures::pr_awaiting(&["codex"]);
-        pr.handover = old;
-        s.pr_reviews.push(pr);
+        s.ad_hoc.push(clank_core::wait::AdHocWorkState {
+            sha: crate::lifecycle::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+            handover: old,
+        });
         assert_eq!(since_of(&in_progress_rows(&s), "codex"), Some(100));
     }
 

@@ -249,5 +249,5 @@ mod tests {
 // `ensure_clank_gitignore_entry` (the per-dir appender) is DELETED: under the
 // allow-list every `.clank/` subdir is ignored by `/*`, so there is nothing
 // to append — and an append would drift the order-sensitive body out of
-// `Canonical`. Its former callers (fork/open-zellij/queue/pr-review) no
+// `Canonical`. Its former callers (fork/open-zellij/queue) no
 // longer touch the gitignore.

@@ -54,7 +54,6 @@ pub mod hook_io;
 pub mod identity;
 pub mod ids;
 pub mod plan_view;
-pub mod pr_review;
 pub mod repo_state;
 pub mod vocab;
 pub mod wait;

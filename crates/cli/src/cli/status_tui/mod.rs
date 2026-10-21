@@ -2674,13 +2674,6 @@ fn object_of(item: &clank_core::wait::WaitItem) -> String {
         WaitItem::AdHocReview { sha, .. } | WaitItem::AdHocRevise { sha } => {
             format!("{} (ad-hoc)", short(sha))
         }
-        WaitItem::PrReviewer { pr, round } | WaitItem::PrMaster { pr, round, .. } => {
-            format!("PR #{pr}, round {round}")
-        }
-        WaitItem::DraftChanged { pr, path, .. } => match path {
-            Some(p) => format!("PR #{pr} draft, {p}"),
-            None => format!("PR #{pr} draft"),
-        },
         _ => String::new(),
     }
 }

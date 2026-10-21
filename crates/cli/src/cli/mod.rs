@@ -56,7 +56,6 @@ pub(crate) mod pane_target;
 pub mod pick;
 pub(crate) mod plan_mutation;
 pub mod plan_resolve;
-pub mod pr_review;
 mod presentation;
 pub mod purge;
 pub(crate) mod question_state;
@@ -298,10 +297,6 @@ pub struct ForkCreateArgs {
     /// Outside zellij fork never auto-spawns a session.
     #[arg(long)]
     pub no_open: bool,
-    /// Also scaffold the PR review in the new worktree (requires
-    /// `--pr`). Same as `clank pr-review start <N> --fork`.
-    #[arg(long, requires = "pr")]
-    pub review: bool,
 }
 
 #[derive(Args, Debug)]
@@ -996,99 +991,6 @@ impl From<VerdictArg> for clank_core::Verdict {
             VerdictArg::RequestChanges => clank_core::Verdict::RequestChanges,
         }
     }
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewArgs {
-    #[command(subcommand)]
-    pub command: PrReviewCmd,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH", global = true)]
-    pub repo: Option<PathBuf>,
-}
-
-#[derive(clap::Subcommand, Debug)]
-pub enum PrReviewCmd {
-    /// Start reviewing a GitHub PR
-    ///
-    /// Pins its head sha and scaffolds `.clank/pr-reviews/<pr>/`.
-    Start(PrReviewStartArgs),
-    /// Record your reviewer verdict for the current round.
-    Note(PrReviewNoteArgs),
-    /// Ask the reviewers for another round (master only)
-    ///
-    /// Opens or re-opens the review of the current draft: bumps the
-    /// round and summons the reviewers.
-    Propose(PrReviewProposeArgs),
-    /// Discard a PR review's local scratch (master-only).
-    Abort(PrReviewAbortArgs),
-    /// Hand the agreed review over as a draft (master only)
-    ///
-    /// Nothing is submitted: the pending review stays yours to read,
-    /// edit and submit on GitHub.
-    Finish(PrReviewFinishArgs),
-    /// Round + per-reviewer verdicts + who we're waiting on.
-    Status(PrReviewStatusArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewFinishArgs {
-    /// PR number. Defaults to the single active review.
-    #[arg(long)]
-    pub pr: Option<u32>,
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewStartArgs {
-    /// PR number.
-    pub pr: u32,
-    /// Create a linked worktree on the PR head + seed the team, then
-    /// scaffold the review there (same as `clank fork create --pr <N>
-    /// --review`). Mutually exclusive with `--checkout`.
-    #[arg(long, conflicts_with = "checkout")]
-    pub fork: bool,
-    /// Check out the PR head in the CURRENT worktree (branch
-    /// `pr-<N>`), then scaffold the review here. Refuses on a dirty
-    /// worktree. Mutually exclusive with `--fork`.
-    #[arg(long)]
-    pub checkout: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewProposeArgs {
-    /// PR number. Defaults to the single active review.
-    #[arg(long)]
-    pub pr: Option<u32>,
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewNoteArgs {
-    /// Your verdict for the current round.
-    #[arg(long, value_enum)]
-    pub verdict: VerdictArg,
-    /// Review summary (like `git commit -m`). `-m -` reads stdin.
-    #[arg(short = 'm', value_name = "MSG")]
-    pub message: String,
-    /// PR number. Defaults to the single active review.
-    #[arg(long)]
-    pub pr: Option<u32>,
-    /// Agent label. Defaults to the session-bound identity.
-    #[arg(long, value_name = "AGENT")]
-    pub author: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewAbortArgs {
-    /// PR number. Defaults to the single active review.
-    #[arg(long)]
-    pub pr: Option<u32>,
-}
-
-#[derive(Args, Debug)]
-pub struct PrReviewStatusArgs {
-    /// PR number. Defaults to the single active review.
-    #[arg(long)]
-    pub pr: Option<u32>,
 }
 
 #[derive(Args, Debug)]

@@ -142,7 +142,6 @@ pub(crate) fn snap(active_plan: Option<PlanWorkState>, queue: Vec<&str>) -> Stat
         log_next: None,
         github_events: Vec::new(),
         log_decorations: Default::default(),
-        pr_reviews: Vec::new(),
         ad_hoc: Vec::new(),
         head_correction: None,
         warnings: Vec::new(),
@@ -220,36 +219,6 @@ pub(crate) fn visible_untrimmed(line: &str) -> String {
         }
     }
     out
-}
-
-pub(crate) fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
-    clank_core::wait::PrReviewWorkState {
-        handoff_blocked: false,
-        handover: Default::default(),
-        pr: 5,
-        repo: "LLFourn/clank".into(),
-        round,
-        gate: clank_core::vocab::CommitGateState::Unreviewed,
-        missing_reviewers: missing
-            .iter()
-            .map(|l| AgentLabel::parse(l).unwrap())
-            .collect(),
-    }
-}
-
-pub(crate) fn pr_awaiting(missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
-    clank_core::wait::PrReviewWorkState {
-        handoff_blocked: false,
-        handover: Default::default(),
-        pr: 1,
-        repo: "o/r".into(),
-        round: 1,
-        gate: clank_core::vocab::CommitGateState::Unreviewed,
-        missing_reviewers: missing
-            .iter()
-            .map(|l| AgentLabel::parse(l).unwrap())
-            .collect(),
-    }
 }
 
 /// A repo whose roster is claude(master) + codex(commit), matching

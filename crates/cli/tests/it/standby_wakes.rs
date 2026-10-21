@@ -98,10 +98,7 @@ async fn team_with_standby() -> TestEnv {
 }
 
 fn is_review(i: &WaitItem) -> bool {
-    matches!(
-        i,
-        WaitItem::Reviewer { .. } | WaitItem::AdHocReview { .. } | WaitItem::PrReviewer { .. }
-    )
+    matches!(i, WaitItem::Reviewer { .. } | WaitItem::AdHocReview { .. })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

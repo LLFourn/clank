@@ -18,12 +18,6 @@ pub(super) enum Style {
     /// Fixed ANSI color (the log tier's verdict ticks — green ✓ /
     /// cyan ✓✓ / red ✗; lloyd asked for the marks to pop).
     Color(&'static str),
-    /// An OSC 8 terminal hyperlink wrapping the visible text; the
-    /// String is the (dynamic) target URL — which is why `Style`
-    /// isn't `Copy`. `emit` owns the escape, so the width math
-    /// counts only the visible text, and the target stays the full
-    /// URL even when that text truncates on a narrow pane.
-    Link(String),
     /// Background-highlighted (the commit-log plan umbrellas): a
     /// fixed bold + dark-grey-background SGR so a plan name reads as
     /// a section divider (tui-log-plan-highlight-align).
@@ -61,11 +55,6 @@ pub(super) fn highlight(s: impl Into<String>) -> Span {
 /// `color` state-hue local in the renderers.
 pub(super) fn colored(code: &'static str, s: impl Into<String>) -> Span {
     Span(Style::Color(code), s.into())
-}
-/// An OSC 8 hyperlink span: `url` is the (dynamic) target, `text` the
-/// visible label.
-pub(super) fn link(url: String, text: impl Into<String>) -> Span {
-    Span(Style::Link(url), text.into())
 }
 
 /// Right-aligned label gutter: 5 columns + 2 spaces, dim. The
@@ -232,8 +221,6 @@ pub(super) fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             Style::Dim => out.push_str(&format!("\x1b[2m{piece}\x1b[0m")),
             Style::Accent => out.push_str(&format!("\x1b[{color}m{piece}\x1b[0m")),
             Style::Color(c) => out.push_str(&format!("\x1b[{c}m{piece}\x1b[0m")),
-            // OSC 8 hyperlink: ESC ] 8 ; ; <url> ST <text> ESC ] 8 ; ; ST
-            Style::Link(url) => out.push_str(&format!("\x1b]8;;{url}\x1b\\{piece}\x1b]8;;\x1b\\")),
             Style::Highlight => out.push_str(&format!("\x1b[1;48;5;238m{piece}\x1b[0m")),
             Style::Italic => out.push_str(&format!("\x1b[3m{piece}\x1b[0m")),
             Style::Bold => out.push_str(&format!("\x1b[1m{piece}\x1b[0m")),
@@ -747,28 +734,6 @@ mod tests {
             "a cut row must say so even when its text ends in an ellipsis: {cut:?}",
         );
         assert_ne!(cut, "wait m", "which is what sniffing the text produces");
-    }
-
-    /// A cut inside a link keeps the link whole around what is left.
-    #[test]
-    fn a_cut_link_keeps_its_target_and_closes_itself() {
-        use super::Style;
-        let url = "https://example.invalid/a/very/long/target";
-        let spans = vec![
-            super::Span(Style::Link(url.to_string()), "a long label".into()),
-            super::Span(Style::Plain, " after".into()),
-        ];
-        let drawn = super::emit(&spans, "32", 6);
-        assert!(
-            drawn.contains(url),
-            "the target is not the thing being clipped"
-        );
-        assert_eq!(
-            drawn.matches("\x1b]8;;").count(),
-            2,
-            "one open and one close: {drawn:?}",
-        );
-        assert_eq!(strip(&drawn), "a lon…", "only the visible label is cut");
     }
 
     /// ANSI/OSC stripped, for comparing what the eye sees.

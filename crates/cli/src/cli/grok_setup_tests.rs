@@ -193,7 +193,7 @@ fn custom_home_projects_every_grok_asset_and_keeps_default_manifest_provenance()
             assert_eq!(projected.rel, original);
         }
     }
-    assert_eq!(grok_assets, 4);
+    assert_eq!(grok_assets, 3);
     let asset = super::super::setup::user_asset_inventory(false)
         .into_iter()
         .find(|a| a.rel.starts_with(".grok/"))

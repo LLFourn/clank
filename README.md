@@ -81,7 +81,7 @@ clank doctor      # verify
 ```
 
 `setup` installs the role-split skills (`clank-master`,
-`clank-reviewer`, plus `clank-pr-review`) into `~/.claude/`,
+`clank-reviewer`, plus `clank-github`) into `~/.claude/`,
 `~/.codex/`, `~/.grok/`, and `~/.config/opencode/`, a `/clank` slash
 command for claude, the clank opencode plugin
 (`~/.config/opencode/plugin/clank.js` — session binding + work loop),
@@ -378,7 +378,6 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `agent` | Roster: `add` / `make-master` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
 | `team` | Your saved teams (`save` / `list` / `show` / `remove`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove` |
-| `pr-review` | Multi-agent review loop against a GitHub PR: `start` / `note` / `propose` / `status` / `finish` / `abort` |
 | `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
 | `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
@@ -477,10 +476,10 @@ Only `plans/`, `finished/`, and the managed `.clank/.gitignore` are
 committed. Everything else is per-user state.
 
 ```
-~/.claude/skills/{clank-master,clank-reviewer,clank-pr-review}/
-~/.codex/skills/{clank-master,clank-reviewer,clank-pr-review}/
-~/.grok/skills/{clank-master,clank-reviewer,clank-pr-review}/
-~/.config/opencode/skills/{clank-master,clank-reviewer,clank-pr-review}/
+~/.claude/skills/{clank-master,clank-reviewer,clank-github}/
+~/.codex/skills/{clank-master,clank-reviewer,clank-github}/
+~/.grok/skills/{clank-master,clank-reviewer,clank-github}/
+~/.config/opencode/skills/{clank-master,clank-reviewer,clank-github}/
 ~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
 ~/.claude/settings.json             # claude Stop + SessionStart hooks merged in
 ~/.codex/hooks.json                 # codex Stop + SessionStart hooks merged in
@@ -737,8 +736,8 @@ repository watcher uses `notify::PollWatcher`, and its cadence is unchanged.
     When any of that is missing the source falls back to polling with
     one diagnostic naming the reason — nothing is lost, wakes are
     just poll-speed.
-  - The rest of clank's GitHub surface (`pr-review`, `fork create --pr`)
-    still shells `gh` directly.
+  - The rest of clank's GitHub surface (`fork create --pr`) still
+    shells `gh` directly.
 
   Every ingested github event lands in a per-agent **inbox**
   (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes

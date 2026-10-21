@@ -118,10 +118,6 @@ impl PlanStateLookup for FsPlanStateLookup<'_> {
             .collect()
     }
 
-    fn pr_reviews(&self) -> Vec<clank_core::wait::PrReviewInput> {
-        crate::cli::pr_review::pr_review_inputs(self.repo)
-    }
-
     fn worktree_status(&self, plan: &PlanKey) -> PlanWorktreeStatus {
         let rel = crate::init_facts::plan_md_rel(plan.as_str());
         if !self.repo.join(&rel).exists() {

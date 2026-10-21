@@ -204,7 +204,7 @@ comments, or delete them.
   without it (`unfinish.rs:14`), and clap marks it optional.
 - `rewire`: `--from-stdin` is shown as an option, but the command refuses
   without it (`rewire.rs:15`).
-- `--repo` on a group: `queue`, `pr-review`, `html`, `config` and `open`
+- `--repo` on a group: `queue`, `html`, `config` and `open`
   declare `--repo` on the group without `global = true`. So
   `clank queue promote foo --repo .` fails with "unexpected argument '--repo'"
   (reproduced). `remote` declares it `global = true` and accepts it in both
@@ -279,7 +279,7 @@ grouping is a poor trade.
 - A **group** is a noun with its own lifecycle at one scope: `queue`,
   `agent` (this repo's roster), `team` (user-scope templates and agent
   descriptions), `stash`, `fork`, `events`, `feedback`, `block`, `remote`,
-  `config`, `pr-review`.
+  `config`.
 - A **top-level verb** acts on the repo or its active plan, and a person or
   agent types it: `init`, `setup`, `doctor`, `status`, `tui`, `log`,
   `finish`, `unfinish`, `pick`, `purge`, `rereview`, `diff`, `html`, `open`,
@@ -301,7 +301,7 @@ the daily flow    status  tui  log  wait  as  auto  run  attending
 plans             queue {add promote remove unqueue reprioritise}
                   finish  unfinish  stash {push pop show drop list}
                   pick  purge  rereview  diff  html {open}
-review            feedback {write read}  pr-review {start note propose abort finish status}
+review            feedback {write read}
                   block {ask answer clean}
 the team          agent {list add remove make-master set-review swap launch start}
                   team {save list show remove, agent library add/remove}
@@ -412,13 +412,6 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `unshelve` | old spelling of `stash pop` | legacy | none | keep | F1 |
 | `pick` | to bring plans over from another branch | human | R | keep |  |
 | `purge` | to remove a plan's traces from history | agent | R S | keep |  |
-| `pr-review` | (group) | agent | R S | keep | `--repo` after the subcommand fixed |
-| `pr-review start` | the master starting a review of a GitHub PR | agent | S | keep | |
-| `pr-review note` | a reviewer recording its verdict on the draft | agent | S | keep | |
-| `pr-review propose` | the master asking for another round | agent | S | keep | |
-| `pr-review abort` | to abandon the review | agent | S | keep | |
-| `pr-review finish` | to hand the agreed review over | agent | S | keep | |
-| `pr-review status` | to see who is still reviewing | agent | S | keep | |
 | `diff` | to read a plan's changes in your editor | human | R | keep | target heuristic is documented |
 | `html` | to build the static site | human | R | keep | `--repo` after the subcommand fixed |
 | `html open` | to look at it in a browser | human | R | keep |  |
@@ -531,7 +524,7 @@ Generated. Do not edit by hand.
 | `open dry` | action | hidden |  | Report what `clank open` would do for a path, without opening anything | <PATH> | -j/--json |
 | `open zellij` | action | hidden |  | Open the workspace, the same as bare `clank open` |  | --repo --fork --pr --all --print |
 | `fork` | group |  |  | Fork the team into a linked worktree |  |  |
-| `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open --review |
+| `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open |
 | `fork list` | action |  |  | List this repo's forks |  | --repo |
 | `fork remove` | action |  |  | Remove a fork's worktree or clone | <NAME> | --force --repo |
 | `stash` | group, bare runs |  |  | Set a plan's commits aside and restore them later | [PLAN] | --repo --for --to-queue --priority --dry-run |
@@ -545,13 +538,6 @@ Generated. Do not edit by hand.
 | `unshelve` | action | hidden |  | Hidden alias for `clank stash pop`. One release of back-compat | [PLAN] | --repo |
 | `pick` | action |  |  | Copy plans from another branch | <PLANS> | --from (required) --repo --squash --purge --dry-run |
 | `purge` | action |  |  | Strip a plan's `.clank/` artifacts from history | [PLAN] | --all --repo --into-branch --dry-run --squash --amend --no-cache --drop |
-| `pr-review` | group |  |  | Run the review loop against a GitHub PR |  | --repo |
-| `pr-review start` | action |  |  | Start reviewing a GitHub PR | <PR> | --fork --checkout |
-| `pr-review note` | action |  |  | Record your reviewer verdict for the current round |  | --verdict (required) -m (required) --pr --author |
-| `pr-review propose` | action |  |  | Ask the reviewers for another round (master only) |  | --pr |
-| `pr-review abort` | action |  |  | Discard a PR review's local scratch (master-only) |  | --pr |
-| `pr-review finish` | action |  |  | Hand the agreed review over as a draft (master only) |  | --pr |
-| `pr-review status` | action |  |  | Round + per-reviewer verdicts + who we're waiting on |  | --pr |
 | `diff` | action |  |  | Open a plan or commit-range diff in your editor | [TARGET] | --plan --range --prompt --focus --wait --no-wait --print --repo |
 | `html` | group, bare runs |  |  | Render the timeline + status to a static site |  | --repo --rebuild --quiet |
 | `html open` | action |  |  | Build the site and open it in your browser | [PLAN] | --commit --queue --stash --print |

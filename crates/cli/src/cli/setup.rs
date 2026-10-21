@@ -27,14 +27,9 @@ const SKILL_MASTER_BODY: &str = include_str!("setup_assets/skill_master.md");
 const SKILL_REVIEWER_BODY: &str = include_str!("setup_assets/skill_reviewer.md");
 const SKILL_SLASH_COMMAND: &str = include_str!("setup_assets/skill_slash_command.md");
 
-/// PR-review mode skill (clank-pr-review-mode). Tool-neutral — the
-/// gh incantations are identical for claude and codex — so one body
-/// installs to both skill dirs.
-pub const PR_REVIEW_SKILL_BODY: &str = include_str!("setup_assets/pr_review_skill.md");
-
-/// The github event-inbox skill (github-offline-catchup). Tool-neutral
-/// like pr-review: the events CLI and the react-then-ack loop are
-/// identical everywhere, so one body installs to all three skill dirs.
+/// The github event-inbox skill (github-offline-catchup). Tool-neutral:
+/// the events CLI and the react-then-ack loop are identical everywhere,
+/// so one body installs to every skill dir.
 pub const GITHUB_SKILL_BODY: &str = include_str!("setup_assets/github_events_skill.md");
 
 /// The opencode plugin: session BINDING via `shell.env` + the
@@ -47,6 +42,10 @@ const MASTER_SKILL: &str = "clank-master";
 const REVIEWER_SKILL: &str = "clank-reviewer";
 /// The pre-split single skill, removed on setup.
 const OBSOLETE_SKILL: &str = "clank";
+
+/// Files an earlier setup installed that this build no longer ships,
+/// relative to the provider root.
+const RETIRED_ASSETS: &[&str] = &["skills/clank-pr-review/SKILL.md"];
 
 /// `description:` frontmatter — the PRIMARY lever for role selection.
 /// Lead with the role guard ("Use ONLY when … Do NOT use …") and name
@@ -290,7 +289,7 @@ pub const TOOL_SKILL_DIRS: [(Tool, &str); 4] = [
 
 /// Every user-scope file clank owns under `$HOME`, as
 /// (home-relative path, expected content): the role skills composed
-/// per (role, tool), the tool-neutral pr-review + github skills for
+/// per (role, tool), the tool-neutral github skill for
 /// every tool dir, and the opencode plugin (binding + work loop;
 /// plugins only load from the GLOBAL dir — project-local
 /// .opencode/plugin is not scanned, M2 findings). ONE inventory,
@@ -338,10 +337,6 @@ pub(super) fn provider_asset_inventory(tool: Tool, claude_async: bool) -> Vec<Ow
             canonical_alternates,
         });
     }
-    out.push(plain(
-        format!("{tool_dir}/skills/clank-pr-review/SKILL.md"),
-        PR_REVIEW_SKILL_BODY.into(),
-    ));
     out.push(plain(
         format!("{tool_dir}/skills/clank-github/SKILL.md"),
         GITHUB_SKILL_BODY.into(),
@@ -654,6 +649,15 @@ pub(super) fn install_provider(
             summary,
         )?;
     }
+    for retired in owned_retired_assets(home, tool, provider_root, &manifest)? {
+        if !dry_run {
+            remove_retired_asset(domain, &mut manifest, &retired)?;
+        }
+        summary.push(format!(
+            "  remove {} (no longer shipped)",
+            retired.path.display()
+        ));
+    }
     remove_obsolete_skill(
         &provider_root.join(format!("skills/{OBSOLETE_SKILL}")),
         dry_run,
@@ -744,6 +748,9 @@ pub(super) fn inspect_provider(
                     .with_context(|| format!("reading setup asset {}", path.display()));
             }
         }
+    }
+    if !owned_retired_assets(home, tool, root, &manifest)?.is_empty() {
+        ready = false;
     }
     match std::fs::metadata(root.join(format!("skills/{OBSOLETE_SKILL}/SKILL.md"))) {
         Ok(_) => ready = false,
@@ -1081,6 +1088,69 @@ fn record_setup_write(
         save_manifest(home, manifest)?;
     }
     Ok(())
+}
+
+/// A retired asset whose bytes are still the ones setup recorded
+/// writing. Only these are setup's to delete: an edited copy, or one
+/// the manifest never recorded, is the user's.
+#[derive(Debug)]
+struct RetiredAsset {
+    path: PathBuf,
+    rel: String,
+}
+
+fn owned_retired_assets(
+    home: &Path,
+    tool: Tool,
+    root: &Path,
+    manifest: &SetupManifest,
+) -> anyhow::Result<Vec<RetiredAsset>> {
+    let prefix = TOOL_SKILL_DIRS.iter().find(|(t, _)| *t == tool).unwrap().1;
+    let domain = provider_domain(home, root, tool);
+    let mut owned = Vec::new();
+    for retired in RETIRED_ASSETS {
+        let rel = if domain == home {
+            format!("{prefix}/{retired}")
+        } else {
+            (*retired).to_owned()
+        };
+        let path = domain.join(&rel);
+        let content = match std::fs::read(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading retired asset {}", path.display()));
+            }
+        };
+        let recorded = manifest.get(&rel).map(String::as_str);
+        if recorded == Some(blake3::hash(&content).to_hex().as_str()) {
+            owned.push(RetiredAsset { path, rel });
+        }
+    }
+    Ok(owned)
+}
+
+fn remove_retired_asset(
+    domain: &Path,
+    manifest: &mut SetupManifest,
+    retired: &RetiredAsset,
+) -> anyhow::Result<()> {
+    std::fs::remove_file(&retired.path)
+        .with_context(|| format!("removing retired asset {}", retired.path.display()))?;
+    manifest.remove(&retired.rel);
+    save_manifest(domain, manifest)?;
+    let dir = retired
+        .path
+        .parent()
+        .context("retired asset has no parent")?;
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("removing retired skill dir {}", dir.display()))
+        }
+    }
 }
 
 /// Remove a clank-owned skill dir that the binary no longer ships
@@ -1977,6 +2047,88 @@ mod tests {
         );
     }
 
+    /// A skill clank stopped shipping goes only while setup's manifest
+    /// still vouches for its bytes, in the default home and a custom one.
+    #[test]
+    fn a_retired_skill_is_removed_only_while_setup_owns_its_bytes() {
+        const OLD: &str = "---\nname: clank-pr-review\n---\nold body\n";
+        let rel = "skills/clank-pr-review/SKILL.md";
+        for custom in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = if custom {
+                temp.path().join("profile")
+            } else {
+                home.join(".codex")
+            };
+            let domain = if custom { root.clone() } else { home.clone() };
+            let key = if custom {
+                rel.to_owned()
+            } else {
+                format!(".codex/{rel}")
+            };
+            let install = |dry_run: bool| {
+                let mut summary = Vec::new();
+                install_provider(
+                    &home,
+                    Tool::Codex,
+                    &root,
+                    false,
+                    false,
+                    dry_run,
+                    &mut summary,
+                )
+                .unwrap();
+                summary
+            };
+            install(false);
+            let path = root.join(rel);
+            let plant = |content: &str, recorded: Option<&str>| {
+                write_file(&path, content);
+                let mut manifest = load_manifest(&domain);
+                match recorded {
+                    Some(bytes) => manifest.insert(key.clone(), content_hash(bytes)),
+                    None => manifest.remove(&key),
+                };
+                save_manifest(&domain, &manifest).unwrap();
+            };
+
+            plant(OLD, Some(OLD));
+            assert!(!inspect_provider(&home, Tool::Codex, &root, false).unwrap());
+            let before = load_manifest(&domain);
+            let summary = install(true);
+            assert!(
+                summary
+                    .iter()
+                    .any(|l| l.contains("remove") && l.contains("clank-pr-review")),
+                "{summary:?}"
+            );
+            assert!(path.is_file(), "a dry run removes nothing");
+            assert_eq!(load_manifest(&domain), before, "nor touches the manifest");
+
+            install(false);
+            assert!(!path.exists());
+            assert!(!path.parent().unwrap().exists(), "its emptied dir goes too");
+            assert!(!load_manifest(&domain).contains_key(&key));
+            assert!(inspect_provider(&home, Tool::Codex, &root, false).unwrap());
+
+            plant(OLD, Some(OLD));
+            let sibling = path.with_file_name("notes.md");
+            write_file(&sibling, "mine");
+            install(false);
+            assert!(!path.exists());
+            assert_eq!(std::fs::read_to_string(&sibling).unwrap(), "mine");
+            std::fs::remove_file(&sibling).unwrap();
+
+            for (content, recorded) in [("edited", Some(OLD)), (OLD, None)] {
+                plant(content, recorded);
+                assert!(inspect_provider(&home, Tool::Codex, &root, false).unwrap());
+                install(false);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            }
+        }
+    }
+
     #[test]
     fn scoped_custom_homes_keep_assets_and_manifest_in_the_selected_domain() {
         for (tool, _) in TOOL_SKILL_DIRS {
@@ -2715,116 +2867,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn the_pr_review_skill_says_a_draft_wake_is_not_a_conversation() {
-        let s = PR_REVIEW_SKILL_BODY;
-        assert!(s.contains("Do not answer it"), "the one rule this wake has");
-        assert!(
-            s.contains("clank events ack <selector>"),
-            "draft changes remain pending until explicitly acked"
-        );
-        assert!(
-            s.contains("your OWN writes"),
-            "master must not read its own edit as the operator's"
-        );
-    }
-
-    /// The creating call sends a body, because a review that has none
-    /// can never be given one.
-    ///
-    /// Probed against the live API (LLFourn/clank#3, since deleted):
-    /// a pending review created without a body refuses the summary
-    /// from BOTH update routes — REST `PUT .../reviews/<id>` and
-    /// GraphQL `updatePullRequestReview` — with "Could not edit a
-    /// review with a missing body", while the same PUT succeeds and
-    /// stays PENDING on a review created with one. So `finish` cannot
-    /// hand over a review this call made bodyless, and the failure
-    /// only appears at the END of a converged review.
-    ///
-    /// Read out of the SKILL TEXT rather than restated here: a
-    /// handwritten fixture carrying a body would still pass if this
-    /// command lost its own (codex 61a135e).
-    #[test]
-    fn the_skill_creates_the_pending_review_with_a_body() {
-        let body = PR_REVIEW_SKILL_BODY;
-        let at = body
-            .find("first comment (creates the pending review)")
-            .expect("the skill names the creating call");
-        let fence = body[at..]
-            .find("```")
-            .map(|i| at + i + 3)
-            .expect("the creating call is in a fence");
-        let end = body[fence..]
-            .find("```")
-            .map(|i| fence + i)
-            .expect("the fence closes");
-        let call = &body[fence..end];
-        assert!(
-            call.contains("/reviews"),
-            "found the wrong block: {call:.120}"
-        );
-        assert!(
-            call.contains("-f body="),
-            "the creating call must send a review body, or `finish` can never \
-             set the summary on what it makes: {call}"
-        );
-        // A body that is only whitespace is a missing body to GitHub,
-        // so the placeholder has to carry text.
-        let after = call.split("-f body=").nth(1).unwrap_or_default();
-        let quoted = after
-            .split('\'')
-            .nth(1)
-            .expect("the body is single-quoted in the call");
-        assert!(
-            !quoted.trim().is_empty(),
-            "the placeholder body must not be empty: {quoted:?}"
-        );
-        // `event` would submit it, which is the one thing the whole
-        // handoff model forbids.
-        assert!(
-            !call.contains("-f event="),
-            "the creating call must leave the review PENDING: {call}"
-        );
-    }
-
-    #[test]
-    fn pr_review_skill_carries_verbs_and_verified_incantations() {
-        let body = PR_REVIEW_SKILL_BODY;
-        assert!(
-            body.starts_with("---\nname: clank-pr-review\n"),
-            "skill needs the clank-pr-review frontmatter"
-        );
-        for verb in [
-            "clank pr-review start",
-            "clank pr-review propose",
-            "clank pr-review note",
-            "clank pr-review finish",
-        ] {
-            assert!(body.contains(verb), "skill must document `{verb}`");
-        }
-        // The terminal verb submits nothing, so the skill must not
-        // teach an outcome to publish with.
-        assert!(
-            !body.contains("--event"),
-            "the skill still teaches a review outcome"
-        );
-        // The verified gh paths (top-level add, threaded reply).
-        assert!(
-            body.contains("addPullRequestReviewThread"),
-            "skill must give the verified top-level-add path"
-        );
-        assert!(
-            body.contains("addPullRequestReviewComment") && body.contains("inReplyTo"),
-            "skill must give the verified threaded-reply path"
-        );
-        // Guard the footgun: resolves use --paginate --jq, never
-        // `--slurp --jq` (gh rejects that combination).
-        assert!(
-            !body.contains("--slurp --jq") && !body.contains("--jq --slurp"),
-            "skill must not pair --slurp with --jq (gh rejects it)"
-        );
     }
 
     fn write_file(path: &Path, contents: &str) {
@@ -3635,12 +3677,7 @@ mod tests {
         // impossible — this test just pins the expected shape.
         let inv = user_asset_inventory(false);
         for (_, dir) in TOOL_SKILL_DIRS {
-            for skill in [
-                "clank-master",
-                "clank-reviewer",
-                "clank-pr-review",
-                "clank-github",
-            ] {
+            for skill in ["clank-master", "clank-reviewer", "clank-github"] {
                 let rel = format!("{dir}/skills/{skill}/SKILL.md");
                 assert!(inv.iter().any(|a| a.rel == rel), "missing {rel}");
             }
@@ -3650,7 +3687,7 @@ mod tests {
                 .any(|a| a.rel == ".config/opencode/plugin/clank.js"
                     && a.expected == OPENCODE_PLUGIN)
         );
-        assert_eq!(inv.len(), TOOL_SKILL_DIRS.len() * 4 + 1);
+        assert_eq!(inv.len(), TOOL_SKILL_DIRS.len() * 3 + 1);
     }
 
     #[test]

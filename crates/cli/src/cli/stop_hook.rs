@@ -2544,8 +2544,6 @@ pub(crate) struct WaitItem {
     priority: Option<u64>,
     agent: Option<String>,
     answer: Option<String>,
-    pr: Option<u64>,
-    round: Option<u64>,
     // External wake payloads (external-wake-hints-carry-payload):
     // github_event / command_event fields, all optional like the rest.
     repo: Option<String>,
@@ -2567,12 +2565,6 @@ pub(crate) struct WaitItem {
     requires_reply: Option<bool>,
     /// What `clank events ack` takes for this one.
     selector: Option<String>,
-    /// A draft change's payload (the-review-session-watches-its-pr).
-    /// `pr` is shared with the pr-review items above.
-    comment: Option<u64>,
-    path: Option<String>,
-    change: Option<String>,
-    revision: Option<u64>,
     // An inbox message's payload.
     handle: Option<String>,
     from: Option<String>,
@@ -2588,14 +2580,13 @@ impl WaitItem {
         }
         let opt = |v: &Option<String>| v.clone().unwrap_or_default();
         format!(
-            "{} plan={} sha={} next={} reason={} name={} pr={} handle={}",
+            "{} plan={} sha={} next={} reason={} name={} handle={}",
             self.raw_kind(),
             opt(&self.plan),
             opt(&self.sha),
             opt(&self.next),
             self.reason.as_ref().map_or("", Tag::raw),
             opt(&self.name),
-            self.pr.map(|n| n.to_string()).unwrap_or_default(),
             opt(&self.handle),
         )
     }
@@ -2755,11 +2746,6 @@ pub(crate) fn classify(
             Duty::Step,
         ),
         K::AdHocRevise => (Until("fires until you commit the revision"), Duty::Step),
-        K::PrReviewer => (
-            Until("fires until your review for that round is written"),
-            Duty::Step,
-        ),
-        K::PrMaster => (Until("fires until you act on that round"), Duty::Step),
         K::Unblocked => (
             Until("fires until you acknowledge it — `clank block clean`"),
             Duty::Unblocked,
@@ -2774,10 +2760,6 @@ pub(crate) fn classify(
         K::Idle => (
             Until("fires while there is nothing else to do"),
             Duty::Nothing,
-        ),
-        K::DraftChanged => (
-            Until("read the draft, do not reply to the edit, then ack the event"),
-            Duty::Event,
         ),
         // Same discharge as a github event, because it is the same
         // WAL: a command source's event is durable, re-presented on
@@ -2839,12 +2821,6 @@ impl WaitItem {
         if let Some(name) = &self.name {
             out.push_str(&format!(" {name}"));
         }
-        if let Some(pr) = self.pr {
-            out.push_str(&format!(" PR #{pr}"));
-        }
-        if let Some(round) = self.round {
-            out.push_str(&format!(" round {round}"));
-        }
         if let Some(sha) = &self.sha {
             out.push_str(&format!(" @ {}", short_sha(sha)));
         }
@@ -2858,7 +2834,6 @@ impl WaitItem {
 /// One escalation line: what discharges `item`, or nothing when nothing
 /// the agent does would.
 fn duty_line(item: &WaitItem) -> Option<String> {
-    use clank_core::wait::WaitKind as K;
     let kind = item.wake_kind()?;
     let (discharge, duty) = classify(kind, item.wake_reason());
     let what = item.identified();
@@ -2870,12 +2845,7 @@ fn duty_line(item: &WaitItem) -> Option<String> {
                 };
                 return Some(format!("- {what}: {until}"));
             };
-            let finish = if kind == K::DraftChanged {
-                format!(
-                    "read the draft (`clank events read {s}`), do not reply to the edit, then \
-                     `clank events ack {s}`"
-                )
-            } else if item.requires_reply.unwrap_or(false) {
+            let finish = if item.requires_reply.unwrap_or(false) {
                 format!(
                     "read it (`clank events read {s}`), then `clank events ack {s} --reply <text>`. \
                      A reply is required, and waiting on anyone or anything does not waive it: \
@@ -3080,19 +3050,6 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                 let answer = item.answer.as_deref().unwrap_or("");
                 out.push_str(&format!("  - unblocked: {name}: {answer}\n"));
             }
-            K::PrReviewer => {
-                let pr = item.pr.unwrap_or(0);
-                let round = item.round.unwrap_or(0);
-                out.push_str(&format!("  - pr-review: review #{pr} round {round}\n"));
-            }
-            K::PrMaster => {
-                let pr = item.pr.unwrap_or(0);
-                let round = item.round.unwrap_or(0);
-                let next = item.next.as_deref().unwrap_or("?");
-                out.push_str(&format!(
-                    "  - pr-review: master {next} #{pr} round {round}\n"
-                ));
-            }
             // External wakes carry their payload — a bare `? @ ?`
             // fallback hint is unactionable
             // (external-wake-hints-carry-payload).
@@ -3182,26 +3139,6 @@ fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, role: Role) ->
                     .unwrap_or_default();
                 let body = body_and_ack(item.content.as_deref(), &ack);
                 out.push_str(&format!("  - {lead}: {name} {event}{body}\n"));
-            }
-            K::DraftChanged => {
-                let pr = item.pr.map(|n| format!("#{n}")).unwrap_or("?".into());
-                let change = item.change.as_deref().unwrap_or("?");
-                // The revision rides along because two edits of ONE
-                // comment are two changes: without it the second
-                // line reads as a duplicate of the first.
-                let r = item.revision.map(|r| format!(" r{r}")).unwrap_or_default();
-                let ack = item
-                    .selector
-                    .as_deref()
-                    .map(|s| format!(" — ack `clank events ack {s}`"))
-                    .unwrap_or_default();
-                match (item.comment, item.path.as_deref()) {
-                    (Some(c), Some(p)) => out.push_str(&format!(
-                        "  - draft {pr}: {change} {p} (comment {c}){r}{ack}\n"
-                    )),
-                    // `gone` is about the review, not a comment in it.
-                    _ => out.push_str(&format!("  - draft {pr}: {change}{r}{ack}\n")),
-                }
             }
             // Its OWN variant, not a `master` reason — `work_for`
             // emits it directly. It rendered through the catchall
@@ -3359,7 +3296,6 @@ fn selected_presentations(items: &[WaitItem]) -> Vec<clank_core::wait::EventPres
                         | clank_core::wait::WaitKind::GithubEvent
                         | clank_core::wait::WaitKind::CommandEvent
                         | clank_core::wait::WaitKind::TimerEvent
-                        | clank_core::wait::WaitKind::DraftChanged
                 )
             )
         })
@@ -5407,7 +5343,6 @@ mod tests {
         assert!(t.contains("CANNOT") && t.contains("human"), "{t}");
         assert!(t.contains("not answer it yourself"), "{t}");
 
-        assert!(matches!(discharge_of(K::DraftChanged, None), Until(_)));
         for k in [K::ForCommit, K::ForFinished, K::ForBlocked] {
             assert_eq!(discharge_of(k, None), ObserverOnly, "{k:?}");
         }
@@ -6634,43 +6569,6 @@ mod tests {
         assert!(matches!(outcome, HookOutcome::Diagnostic { .. }));
     }
 
-    #[test]
-    fn a_draft_change_says_what_moved_and_how_to_ack_it() {
-        // Built from wait's ACTUAL --json field names, the same wire
-        // the hook consumes.
-        let raw = serde_json::json!({
-            "items": [{
-                "kind": "draft_changed",
-                "pr": 12,
-                "comment": 4088032661u64,
-                "path": "crates/cli/src/lib.rs",
-                "change": "edited",
-                "revision": 3,
-                "selector": "draft-pr-12-run-1:3"
-            }]
-        });
-        let items = parse_wait_json(raw.to_string().as_bytes()).unwrap();
-        let label = AgentLabel::parse("claude").unwrap();
-        let out = render_wait_items(&items, &label, Role::Master);
-        assert!(
-            out.contains("  - draft #12: edited crates/cli/src/lib.rs (comment 4088032661) r3"),
-            "the hint says what moved rather than `? @ ?`: {out}"
-        );
-        assert!(
-            out.contains("read the draft"),
-            "and what to do with it: {out}"
-        );
-        assert!(
-            out.contains("do not reply to the edit")
-                && out.contains("clank events ack draft-pr-12-run-1:3"),
-            "the draft is read, then explicitly acked: {out}"
-        );
-        assert!(
-            out.contains("then ack the event"),
-            "the debt remains until ack: {out}"
-        );
-    }
-
     /// A source reporting ITSELF broken does not read as news about
     /// the world.
     ///
@@ -7893,10 +7791,6 @@ mod tests {
         assert!(event.contains("answer or ack it now saying so"), "{event}");
         assert!(!event.contains("clank block"), "{event}");
 
-        let draft = one(serde_json::json!({"kind":"draft_changed","pr":12,
-            "selector":"draft-pr-12-run-1:3"}));
-        assert!(draft.contains("do not reply to the edit"), "{draft}");
-
         let review = one(serde_json::json!({"kind":"adhoc_review","sha":FULL_SHA}));
         assert!(review.contains(&FULL_SHA[..12]), "{review}");
         assert!(review.contains("feedback exists for that sha"), "{review}");
@@ -7989,10 +7883,10 @@ mod tests {
 
     /// Through the real projection, every item is addressed by what
     /// identifies it: a GitHub event by its presentation's selector, an
-    /// ad hoc commit by its sha, a PR item by its number and round.
+    /// ad hoc commit by its sha.
     #[test]
     fn a_projected_item_is_addressed_by_its_own_identity() {
-        use clank_core::wait::{EventPresentation, PrMasterNext, WaitItem as I};
+        use clank_core::wait::{EventPresentation, WaitItem as I};
         let github = projected(I::GithubEvent {
             presentation: Some(EventPresentation {
                 source: "github-fixture".into(),
@@ -8027,14 +7921,5 @@ mod tests {
         assert!(review.contains(&FULL_SHA[..12]), "{review}");
         let revise = projected(I::AdHocRevise { sha });
         assert!(revise.contains(&FULL_SHA[..12]), "{revise}");
-
-        let reviewer = projected(I::PrReviewer { pr: 12, round: 3 });
-        assert!(reviewer.contains("PR #12 round 3"), "{reviewer}");
-        let master = projected(I::PrMaster {
-            pr: 12,
-            round: 0,
-            next: PrMasterNext::Draft,
-        });
-        assert!(master.contains("PR #12 round 0"), "{master}");
     }
 }

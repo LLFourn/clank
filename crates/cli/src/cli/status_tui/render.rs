@@ -611,14 +611,6 @@ pub(super) fn scrollable_header(
         body.push(vec![label("stash"), plain(sv.stem.clone()), dim(note)]);
     }
 
-    // `pr` — active PR review(s): the full GitHub URL on its own
-    // line, a clickable OSC 8 hyperlink. The bar carries the
-    // actor/verb + `pr #n`; this is the addressable link.
-    for pr in &snap.pr_reviews {
-        let url = crate::cli::status::pr_url(&pr.repo, pr.pr);
-        body.push(vec![label("pr"), link(url.clone(), url)]);
-    }
-
     // `git` — branch + head, dim: PANEL-LESS renders only. A panel
     // render carries the branch on the LOG rule and the head as the
     // log's newest row — this line would echo both
@@ -2030,13 +2022,6 @@ pub(super) fn remote_row(
 /// names WHO must act; `idle` only when nothing and nobody waits.
 pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
     match snap.active_plan.as_ref() {
-        // An active PR review is in-flight work — never idle. Plans
-        // take precedence (handled below); among the plan-less
-        // states, PR review beats a queue promote.
-        None if !snap.pr_reviews.is_empty() => match snap.pr_reviews.as_slice() {
-            [pr] => pr_bar_text(pr, snap.master.as_deref().unwrap_or("master")),
-            many => (format!("🔀 {} PR REVIEWS", many.len()), String::new()),
-        },
         // Ad-hoc ChangesRequested is an actionable MASTER item
         // (AdHocRevise) that wait returns BEFORE scanning the queue —
         // revising beats promote (codex 0c31c92). Head correction
@@ -2120,48 +2105,6 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
             v.plan.as_str().to_string(),
         ),
     }
-}
-
-/// PR-review signal-lamp text: `{emoji} {ACTOR} {verb}` + `pr #n`,
-/// mirroring the plan bar. Reviewers' turn when any tier member
-/// still owes a verdict; otherwise master's turn, by gate.
-pub(super) fn pr_bar_text(
-    pr: &clank_core::wait::PrReviewWorkState,
-    master: &str,
-) -> (String, String) {
-    use clank_core::vocab::CommitGateState;
-    let right = format!("pr #{}", pr.pr);
-    // Round 0: the review isn't open yet — master is drafting the
-    // initial comments, then `propose` summons reviewers.
-    if pr.round == 0 {
-        return (format!("🔨 {} drafting", master.to_uppercase()), right);
-    }
-    let (emoji, actor, verb) = if let Some(reviewer) = pr.missing_reviewers.first() {
-        let emoji = match pr.gate {
-            CommitGateState::ContinuedPendingGate => "🔍",
-            _ => "👀",
-        };
-        (emoji, reviewer.as_str().to_string(), "reviewing")
-    } else {
-        if pr.handoff_stopped() {
-            return (
-                format!("🚫 {} handoff blocked", master.to_uppercase()),
-                right,
-            );
-        }
-        let verb = match pr.gate {
-            CommitGateState::Finished => "submitting",
-            CommitGateState::ChangesRequested => "integrating",
-            _ => "refining",
-        };
-        let emoji = if pr.gate == CommitGateState::Finished {
-            "🏁"
-        } else {
-            "🔨"
-        };
-        (emoji, master.to_string(), verb)
-    };
-    (format!("{emoji} {} {verb}", actor.to_uppercase()), right)
 }
 
 /// The bar's leading emoji — the single signal-lamp glyph. Taken
@@ -5044,52 +4987,6 @@ mod tests {
         );
     }
 
-    /// A blocked handoff names only the stage that stopped.
-    ///
-    /// The block survives `propose`, so a reopened round can carry it
-    /// while master is genuinely integrating or refining. Saying
-    /// "handoff blocked" there names the wrong thing, and core only
-    /// suppresses the Finished arm — the bar must agree with the wake
-    /// model, not with the flag (codex e70f8a9).
-    #[test]
-    fn a_blocked_handoff_only_renames_the_converged_stage() {
-        use clank_core::vocab::CommitGateState;
-        let bar = |gate, blocked| {
-            let mut pr = crate::cli::status_tui::fixtures::pr_work(2, &[]);
-            pr.gate = gate;
-            pr.handoff_blocked = blocked;
-            super::pr_bar_text(&pr, "claude").0
-        };
-        assert!(
-            bar(CommitGateState::Finished, true).contains("handoff blocked"),
-            "the converged stage is the one that stopped",
-        );
-        assert!(
-            bar(CommitGateState::Finished, false).contains("submitting"),
-            "and without a block it is master's to hand over",
-        );
-        for still_working in [
-            CommitGateState::ChangesRequested,
-            CommitGateState::Continued,
-            CommitGateState::Unreviewed,
-            // Reachable for PR reviews -- core pairs it with
-            // Unreviewed as a reviewers'-turn state, and it is what
-            // this repo's own gate sits in (ruthless 329d579).
-            CommitGateState::ContinuedPendingGate,
-        ] {
-            let said = bar(still_working, true);
-            assert!(
-                !said.contains("handoff blocked"),
-                "{still_working:?} is master still working, not a dead handoff: {said}",
-            );
-            assert_eq!(
-                said,
-                bar(still_working, false),
-                "{still_working:?} reads the same with or without the block",
-            );
-        }
-    }
-
     /// One renderer means the two row kinds cannot disagree about
     /// shape. They differ in what sits after the key and nowhere else.
     #[test]
@@ -5184,8 +5081,8 @@ mod tests {
 
     use super::*;
     use crate::cli::status_tui::fixtures::{
-        REVERSE, agent_row, cand, line_with, plan_state, pr_work, reviewer_missing, snap,
-        two_agent_snap, visible, visible_untrimmed,
+        REVERSE, agent_row, cand, line_with, plan_state, reviewer_missing, snap, two_agent_snap,
+        visible, visible_untrimmed,
     };
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use clank_core::plan_view::WaitingOn;
@@ -12051,75 +11948,6 @@ mod tests {
             row.contains(SPINNER[0]) && row.contains("finalizing"),
             "finalizing verb shown: {row}"
         );
-    }
-
-    #[test]
-    fn active_pr_review_is_not_idle() {
-        // codex c04c324: a repo with an active PR review and no plans
-        // must NOT render idle, in the TUI bar OR `clank status`.
-        let mut s = snap(None, vec![]);
-        s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
-            handoff_blocked: false,
-            handover: Default::default(),
-            pr: 123,
-            repo: "o/r".into(),
-            round: 1,
-            gate: clank_core::vocab::CommitGateState::Unreviewed,
-            missing_reviewers: vec![AgentLabel::parse("codex").unwrap()],
-        });
-        let bar = visible(&render(&s, 1, 80)[0]);
-        assert!(
-            bar.contains("CODEX") && bar.contains("pr #123"),
-            "bar: {bar}"
-        );
-        assert!(!bar.contains("idle"), "bar: {bar}");
-
-        let human = s.to_human();
-        assert!(human.contains("pr #123"), "to_human: {human}");
-        assert!(
-            !human.contains("nothing pending"),
-            "to_human must not read idle: {human}"
-        );
-    }
-
-    #[test]
-    fn pr_url_renders_as_a_clickable_link_line() {
-        let mut s = snap(None, vec![]);
-        s.pr_reviews.push(pr_work(1, &["codex"]));
-        let lines = render(&s, 40, 80);
-        let pr = lines
-            .iter()
-            .find(|l| visible(l).trim_start().starts_with("pr "))
-            .expect("a pr url line");
-        // Visible text is the bare URL (the `com`/`m` must NOT cut it
-        // short — visible() has to skip OSC 8).
-        assert_eq!(
-            visible(pr).trim_start(),
-            "pr  https://github.com/LLFourn/clank/pull/5"
-        );
-        // The OSC 8 hyperlink wraps it with the full URL as target.
-        assert!(
-            pr.contains("\x1b]8;;https://github.com/LLFourn/clank/pull/5\x1b\\"),
-            "OSC 8 link target: {pr:?}"
-        );
-    }
-
-    #[test]
-    fn round_zero_pr_bar_says_master_drafting_not_reviewing() {
-        // The reported bug: at round 0 the bar must show master
-        // drafting, NOT a reviewer "reviewing".
-        let mut s = snap(None, vec![]);
-        s.master = Some("claude".into());
-        s.pr_reviews.push(pr_work(0, &[]));
-        let bar = visible(&render(&s, 1, 80)[0]);
-        assert!(
-            bar.contains("CLAUDE") && bar.contains("drafting"),
-            "bar: {bar}"
-        );
-        assert!(!bar.contains("reviewing"), "bar: {bar}");
-        // And the text surface agrees.
-        let human = s.to_human();
-        assert!(human.contains("master drafting"), "to_human: {human}");
     }
 
     #[test]

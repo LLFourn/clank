@@ -71,7 +71,6 @@ const DECLARED: &[&str] = &[
     "blocks",
     "stash",
     "shelved",
-    "pr-reviews",
     "cache",
     "html",
     "zellij",

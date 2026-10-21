@@ -349,7 +349,7 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
 
 async fn run_create(args: super::ForkCreateArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let dest = run_fork_with_review(&args, home.as_deref()).await?;
+    let dest = run_fork(&args, home.as_deref()).await?;
     // SOLE stdout line: the worktree path (composition contract).
     println!("{}", dest.display());
 
@@ -492,60 +492,12 @@ async fn run_remove(args: super::ForkRemoveArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `run_fork` plus, when `--review` is set, scaffolding the PR
-/// review in the new worktree. The SINGLE implementation behind both
-/// `clank fork create --pr --review` and `clank pr-review start --fork`, so
-/// the two doorways can't diverge. Returns the worktree path.
-///
-/// The review scaffold lands in the worktree's gitignored `.clank/`
-/// (where the forked team's wait surface reads it); the slug comes
-/// from the SOURCE repo's origin, not the worktree cwd.
-pub async fn run_fork_with_review(
-    args: &ForkCreateArgs,
-    home: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
-    // Resolve the review precondition (PR + a parseable origin slug)
-    // BEFORE creating the worktree — fail-closed, so an unparseable
-    // origin doesn't leave a half-made worktree behind (codex
-    // b944c58).
-    let review = if args.review {
-        let pr = args
-            .pr
-            .ok_or_else(|| anyhow::anyhow!("--review requires --pr"))?;
-        let source = super::resolve_repo(args.source.as_deref())?;
-        let slug = super::pr_review::repo_slug(&source)?;
-        Some((pr, slug, source))
-    } else {
-        None
-    };
-    // Fetch + pin the PR head ONCE here; `run_fork` bases the
-    // worktree on it and `start_with` anchors the review to the SAME
-    // sha — worktree-base == review-pin by construction (ruthless
-    // b88ae34).
-    let (dest, pinned_head) = run_fork_pinned(args, home).await?;
-    if let Some((pr, slug, source)) = review {
-        super::pr_review::start_with(&dest, &slug, pr, Some(&source), pinned_head.as_deref())?;
-    }
-    Ok(dest)
-}
-
 /// The fork core: worktree + seed. Returns the worktree path.
 /// `home` is explicit (dogfood pattern) so tests control the
 /// user-scope config. Everything before the `git worktree add` is
 /// read-only validation (fail-closed: no mutation until all
 /// checks pass).
 pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
-    Ok(run_fork_pinned(args, home).await?.0)
-}
-
-/// `run_fork`, additionally returning the pinned PR head sha
-/// (`Some` iff `--pr`) so a composing caller can anchor downstream
-/// state to the SAME commit the worktree is based on without a
-/// second fetch (ruthless b88ae34).
-pub async fn run_fork_pinned(
-    args: &ForkCreateArgs,
-    home: Option<&Path>,
-) -> anyhow::Result<(PathBuf, Option<String>)> {
     let name = derived_name(args.name.as_deref(), args.pr)?;
     let name = name.as_str();
     if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
@@ -655,7 +607,7 @@ pub async fn run_fork_pinned(
                         seeded.join(", ")
                     );
                 }
-                Ok((dest, None))
+                Ok(dest)
             }
             _ => anyhow::bail!(
                 "`{}` already exists but is not the clank clone fork `{name}` \
@@ -685,7 +637,7 @@ pub async fn run_fork_pinned(
                         seeded.join(", ")
                     );
                 }
-                Ok((dest, None))
+                Ok(dest)
             }
             Some(branch) => anyhow::bail!(
                 "`{}` is a worktree on branch `{branch}`, not the clank fork `{name}` — \
@@ -954,7 +906,7 @@ pub async fn run_fork_pinned(
     } else {
         eprintln!("  teardown: git worktree remove {}", dest.display());
     }
-    Ok((dest, pinned_pr_base))
+    Ok(dest)
 }
 
 /// Normalize `--draft` names: strip an optional `.md` suffix, validate
@@ -1244,9 +1196,6 @@ mod tests {
         // --pr + --branch: loud conflict, not silent precedence
         // (ruthless 91ecaf2 edge 2).
         assert!(T::try_parse_from(["t", "--pr", "1", "--branch", "main"]).is_err());
-        // --review needs --pr (a branch fork has no PR to review).
-        assert!(T::try_parse_from(["t", "myname", "--review"]).is_err());
-        assert!(T::try_parse_from(["t", "--pr", "1", "--review"]).is_ok());
         // --clone: plain shape ok; --path and --pr are loud
         // conflicts (fork-clone-option — clones are never relocated
         // and a fetched PR head can't ride a local clone).
@@ -1354,7 +1303,6 @@ detached
             drafts: Vec::new(),
             prompt: None,
             no_open: true,
-            review: false,
         }
     }
 
@@ -1376,7 +1324,7 @@ detached
             .unwrap();
         let mut args = fork_args("open-fails", source.path());
         args.fresh = true;
-        let dest = run_fork_with_review(&args, None).await.unwrap();
+        let dest = run_fork(&args, None).await.unwrap();
         let error = open_created_fork(&dest, true, false, |open_args| {
             assert_eq!(open_args.repo.as_deref(), Some(dest.as_path()));
             assert!(!open_args.all && !open_args.print);

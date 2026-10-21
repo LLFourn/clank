@@ -8,7 +8,7 @@
 //! noticed — silently, because "-" is a valid message to an inbox.
 //!
 //! ONE pass, before dispatch, rather than a call in each command's
-//! `run`. Nine commands take a free-text `-m` and they disagree about
+//! `run`. Several commands take a free-text `-m` and they disagree about
 //! emptiness — `block create` writes the text with no check at all,
 //! while `feedback write` accepts an empty body as a verdict-only
 //! note. Substitution is therefore all that happens here; what a
@@ -16,8 +16,7 @@
 
 use crate::cli::command::Command;
 use crate::cli::{
-    BlockArgs, BlockCmd, EventsArgs, EventsCmd, FeedbackArgs, FeedbackCmd, PrReviewArgs,
-    PrReviewCmd, QueueArgs, QueueCmd,
+    BlockArgs, BlockCmd, EventsArgs, EventsCmd, FeedbackArgs, FeedbackCmd, QueueArgs, QueueCmd,
 };
 
 /// The `-m` of the command being run, in the three shapes clap parses
@@ -47,10 +46,6 @@ fn field_of(cmd: &mut Command) -> Option<Field<'_>> {
         }) => Field::Maybe(&mut a.message),
         Command::Feedback(FeedbackArgs {
             command: FeedbackCmd::Write(a),
-        }) => Field::One(&mut a.message),
-        Command::PrReview(PrReviewArgs {
-            command: PrReviewCmd::Note(a),
-            ..
         }) => Field::One(&mut a.message),
         Command::Block(BlockArgs {
             command: BlockCmd::Ask(a) | BlockCmd::Create(a),
@@ -161,7 +156,6 @@ mod tests {
                 "-m",
                 "-",
             ],
-            vec!["pr-review", "note", "--verdict", "continue", "-m", "-"],
             vec!["block", "create", "q", "-m", "-"],
             vec!["unblock", "rev", "q", "-m", "-"],
         ] {
@@ -180,7 +174,7 @@ mod tests {
     fn every_free_text_m_is_wired() {
         let declared = include_str!("mod.rs").matches("short = 'm'").count();
         assert_eq!(
-            declared, 9,
+            declared, 8,
             "a `-m` was added or removed in mod.rs; route it in `field_of` and list it in \
              `every_command_with_a_free_text_m_reads_stdin_for_a_dash`, then update this count"
         );

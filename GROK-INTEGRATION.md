@@ -31,9 +31,6 @@ are historical descriptions, not requirements of the current integration.
 6. The monitor routes pending work or parks the connection until work arrives.
    Configured event sources are hosted once by the monitor. Automatic Grok waits
    use these sources; invocation-only `--event` sources require manual operation.
-   An open PR review retains its existing draft producer after the monitor first
-   reports idle; immediately pending work starts no draft polling. Draft wakes
-   use the common role/block projection and cancel their socket before returning.
    A real disconnect/liveness failure causes normal monitor reattachment, not
    periodic retries or a local watcher that bypasses admission.
 7. Immediately before output the wait verifies the session still owns the agent

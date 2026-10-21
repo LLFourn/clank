@@ -31,7 +31,6 @@ mod no_orphan_doc_comments;
 mod open_integration;
 mod pick_integration;
 mod plan_admission;
-mod pr_review_integration;
 mod rereview_integration;
 mod signal_boundary;
 mod standby_wakes;

@@ -17,8 +17,7 @@ use clank_core::wait::PlanWorkState;
 ///   files it touched (commit-tag-fixup-is-first-class-state) — a
 ///   self-correctable warning that dominates ordinary work but yields
 ///   to a human block.
-/// - `Idle`: nothing in flight (no active plans, PR reviews, or
-///   queued work) — the "asleep" state.
+/// - `Idle`: nothing in flight (no active plans or queued work) — the "asleep" state.
 /// - `Active`: anything else (work progressing).
 ///
 /// `state_color` derives ALL its hues from this, so the bar lamp and
@@ -58,7 +57,6 @@ pub(super) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
     // work (codex 923a679) — a positively reviewed ad-hoc commit
     // (Continued/Finished) is terminal, not active.
     let nothing_in_flight = snap.active_plan.is_none()
-        && snap.pr_reviews.is_empty()
         && snap.queue.is_empty()
         && !snap.ad_hoc.iter().any(|a| a.is_open());
     if nothing_in_flight {
@@ -72,8 +70,8 @@ pub(super) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
 /// behind both the bar's green/cyan hue and the per-pane `🔨`
 /// (tui-agent-pane-status-emoji). Spelled with `state_color`'s exact
 /// BRANCH PRECEDENCE (codex fbdb27b): plans dominate, so a
-/// queue-ready / clean-PR state must NOT count as master-active while
-/// a plan still awaits reviewers.
+/// queue-ready state must NOT count as master-active while a plan
+/// still awaits reviewers.
 pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
     match attention_state(snap) {
         // A broken HEAD tag is master's to fix — master is the active
@@ -83,14 +81,6 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
         AttentionState::Active => {}
     }
     match snap.active_plan.as_ref() {
-        // No plans: PR reviews take precedence over the queue.
-        None if !snap.pr_reviews.is_empty() => {
-            // Master's turn iff no PR still owes a reviewer.
-            !snap
-                .pr_reviews
-                .iter()
-                .any(|p| !p.missing_reviewers.is_empty())
-        }
         // Plan-less precedence mirrors wait's routing exactly (codex
         // 0c31c92): an ad-hoc ChangesRequested is an actionable
         // MASTER item (AdHocRevise) wait returns BEFORE scanning the
@@ -107,7 +97,7 @@ pub(super) fn master_is_active(snap: &StatusSnapshot) -> bool {
         None if !snap.queue.is_empty() => true, // promote
         None if snap.ad_hoc.iter().any(|a| a.is_open()) => false, // reviewers' turn
         None => false,                          // unreachable (Idle covers it)
-        // The active plan dominates queue/PR work.
+        // The active plan dominates queue work.
         Some(v) => {
             matches!(
                 v.waiting_on,
@@ -227,10 +217,9 @@ pub(super) fn state_color(snap: &StatusSnapshot) -> Hue {
         AttentionState::Active => {
             if master_is_active(snap) {
                 // cyan for the queue-promote branch (no plans, no
-                // PRs, no ad-hoc revision), green for master working
-                // on a plan, PR, or ad-hoc revision (codex 4a4be39).
+                // ad-hoc revision), green for master working on a
+                // plan or ad-hoc revision (codex 4a4be39).
                 if snap.active_plan.is_none()
-                    && snap.pr_reviews.is_empty()
                     && !snap
                         .ad_hoc
                         .iter()
@@ -254,7 +243,6 @@ pub(super) fn work_projection(snap: &StatusSnapshot) -> clank_core::wait::WorkSt
     clank_core::wait::WorkStatus {
         active_plan: snap.active_plan.clone(),
         ad_hoc: snap.ad_hoc.clone(),
-        pr_reviews: snap.pr_reviews.clone(),
         head_correction: snap.head_correction.clone(),
     }
 }
@@ -347,9 +335,7 @@ pub(super) fn verb_of(w: &WaitingOn) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::fixtures::{
-        plan_state, pr_awaiting, reviewer_missing, snap, with_agents,
-    };
+    use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap, with_agents};
     use crate::lifecycle::AgentLabel;
 
     #[test]
@@ -372,12 +358,6 @@ mod tests {
         );
         // No plans + queue only → master promotes.
         assert!(master_is_active(&snap(None, vec!["queued"])));
-        // No plans + PR: master's turn iff no reviewer is owed.
-        let mut s = snap(None, vec![]);
-        s.pr_reviews.push(pr_awaiting(&["codex"]));
-        assert!(!master_is_active(&s), "PR still owes a reviewer");
-        s.pr_reviews[0].missing_reviewers.clear();
-        assert!(master_is_active(&s), "PR fully reviewed → master's turn");
     }
 
     #[test]
@@ -491,9 +471,9 @@ mod tests {
     }
 
     #[test]
-    fn awaited_reviewers_unions_plans_and_prs() {
+    fn awaited_reviewers_are_the_plans_missing() {
         use crate::cli::teams_config::RosterRole;
-        let mut s = with_agents(
+        let s = with_agents(
             snap(Some(plan_state("p", reviewer_missing("codex"))), vec![]),
             &[
                 ("claude", RosterRole::Master),
@@ -501,10 +481,9 @@ mod tests {
                 ("ruthless", RosterRole::Gate),
             ],
         );
-        s.pr_reviews.push(pr_awaiting(&["ruthless"]));
         let got = awaited_reviewers(&s);
         assert!(
-            got.iter().any(|l| l == "codex") && got.iter().any(|l| l == "ruthless"),
+            got.iter().any(|l| l == "codex") && !got.iter().any(|l| l == "ruthless"),
             "got: {got:?}"
         );
         // Master's turn → nobody awaited.
@@ -555,7 +534,7 @@ mod tests {
         // Idle: nothing in flight.
         assert_eq!(attention_state(&snap(None, vec![])), AttentionState::Idle);
 
-        // Active: an in-flight plan, OR queued work, OR a PR review.
+        // Active: an in-flight plan, OR queued work.
         assert_eq!(
             attention_state(&snap(
                 Some(plan_state("foo", reviewer_missing("codex"))),
@@ -568,18 +547,6 @@ mod tests {
             AttentionState::Active,
             "queued work is not idle — master owes a promote"
         );
-        let mut s = snap(None, vec![]);
-        s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
-            handoff_blocked: false,
-            handover: Default::default(),
-            pr: 1,
-            repo: "o/r".into(),
-            round: 1,
-            gate: clank_core::vocab::CommitGateState::Unreviewed,
-            missing_reviewers: vec![AgentLabel::parse("codex").unwrap()],
-        });
-        assert_eq!(attention_state(&s), AttentionState::Active);
-
         // Blocked: an unanswered block dominates even with no plans.
         let mut s = snap(None, vec!["queued"]);
         s.blocks = vec![crate::cli::block::BlockEntry {

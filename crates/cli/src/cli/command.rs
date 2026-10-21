@@ -41,7 +41,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
             "queue", "finish", "unfinish", "stash", "pick", "purge", "rereview", "diff", "html",
         ],
     ),
-    ("Review", &["feedback", "pr-review", "block"]),
+    ("Review", &["feedback", "block"]),
     ("The team", &["agent", "team", "open", "fork"]),
     ("Talking", &["send", "nudge", "events"]),
     ("Remote", &["remote"]),
@@ -349,11 +349,6 @@ pub enum Command {
     ///
     /// `--drop` removes the plan entirely (commits included).
     Purge(crate::cli::PurgeArgs),
-    /// Run the review loop against a GitHub PR
-    ///
-    /// The team iterates on a shared pending review until it agrees,
-    /// then submits it as one published review.
-    PrReview(crate::cli::PrReviewArgs),
 
     // ── odds & ends ──
     /// Open a plan or commit-range diff in your editor
@@ -462,7 +457,6 @@ pub async fn dispatch_with(
         Command::Shelve(args) => crate::cli::stash::run_shelve_alias(args).await,
         Command::Unshelve(args) => crate::cli::stash::run_unshelve_alias(args).await,
         Command::Fork(args) => crate::cli::fork::run(args).await,
-        Command::PrReview(args) => crate::cli::pr_review::run(args).await,
         Command::Log(args) => crate::cli::log::run(args).await,
         Command::Html(args) => crate::cli::html::run(args).await,
         Command::Open(args) => crate::cli::open::run(args).await,
@@ -1403,15 +1397,6 @@ mod tests {
                 panic!()
             };
             assert_eq!(q.repo.as_deref(), r, "{argv:?}");
-        }
-        for argv in [
-            &["clank", "pr-review", "--repo", "/r", "status"][..],
-            &["clank", "pr-review", "status", "--repo", "/r"],
-        ] {
-            let Command::PrReview(a) = parse(argv) else {
-                panic!()
-            };
-            assert_eq!(a.repo.as_deref(), r, "{argv:?}");
         }
         for argv in [
             &["clank", "html", "--repo", "/r", "open"][..],

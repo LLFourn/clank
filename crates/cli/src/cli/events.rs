@@ -354,21 +354,6 @@ fn display_id(rows: &[Sourced], s: &Sourced) -> Selector {
 /// has rides `github`, which is the carve-out.
 fn describe(item: &WaitItem) -> String {
     let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
-    if let WaitItem::DraftChanged {
-        pr,
-        comment,
-        path,
-        change,
-        revision,
-        ..
-    } = item
-    {
-        let about = match (comment, path.as_deref()) {
-            (Some(id), Some(path)) => format!("  {}  comment {id}", clean(path)),
-            _ => String::new(),
-        };
-        return format!("draft/{}  PR #{pr}{about}  (r{revision})", change.wire());
-    }
     let Some(v) = item.event_view() else {
         return format!("{item:?}");
     };
@@ -508,15 +493,6 @@ fn metadata_row(rows: &[Sourced], s: &Sourced) -> serde_json::Value {
             ..
         } => json!({"kind":"github_event", "repo":repo, "event":event, "detail":detail,
                 "number":number, "actor":actor, "url":url}),
-        WaitItem::DraftChanged {
-            pr,
-            comment,
-            path,
-            change,
-            revision,
-            ..
-        } => json!({"kind":"draft_changed", "pr":pr, "comment":comment, "path":path,
-                "change":change, "revision":revision}),
         other => json!({"kind":other.kind().as_str()}),
     };
     let mut value = json!({"id":display_id(rows,s).to_string(), "source":s.source,
@@ -1092,36 +1068,24 @@ mod tests {
         assert_eq!(rows[0].source, "github-o-r-aaaa");
     }
 
+    /// The retired PR-review draft watch's rows neither list nor
+    /// poison the directory they sit in.
     #[test]
-    fn a_draft_change_uses_the_same_inbox_and_ack_as_other_events() {
+    fn retired_draft_rows_do_not_list() {
         let dir = tempdir();
-        let key = "draft-pr-7-run-11";
-        let mut log = EventLog::open(&dir, key).unwrap();
-        log.load();
-        let draft = WaitItem::DraftChanged {
-            presentation: None,
-            pr: 7,
-            instance: 11,
-            comment: Some(42),
-            path: Some("src/lib.rs".into()),
-            change: clank_core::pr_review::DraftChange::Added,
-            revision: 1,
-            selector: None,
-        };
-        let seq = log
-            .append_inbox(Transport::Draft, None, Some("draft:7:11:1"), None, &draft)
+        std::fs::write(
+            dir.join("draft-pr-587-run-1790686177382821000.jsonl"),
+            crate::cli::github::log::tests::RETIRED_DRAFT_JSONL,
+        )
+        .unwrap();
+        let mut live = EventLog::open(&dir, "github-o-r-aaaa").unwrap();
+        live.load();
+        live.append_inbox(Transport::Poll, None, Some("k"), None, &item(1))
             .unwrap();
-        let rows = read_all(&dir).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0].row.acked);
-        assert_eq!(rows[0].row.item, draft);
-        assert!(describe(&rows[0].row.item).contains("PR #7"));
-        let target = resolve_ack_target(&dir, &rows, key, seq, &rows[0].row.ident)
-            .unwrap()
-            .unwrap();
-        append_ack_target(&target).unwrap();
-        let rows = read_all(&dir).unwrap();
-        assert!(rows[0].row.acked);
+
+        let rows = read_all(&dir).expect("a retired log must not fail the listing");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].source, "github-o-r-aaaa");
     }
 
     /// The selector grammar round-trips, and it is ONE grammar.
