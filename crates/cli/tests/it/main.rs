@@ -40,6 +40,7 @@ mod standby_wakes;
 mod stash_dwim;
 mod stash_integration;
 mod status_log_integration;
+mod tls_trust;
 mod tui_is_the_command;
 mod wait_config_reload;
 mod wait_event_sources;
