@@ -366,7 +366,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `doctor` | Diagnose repo / user / session setup; exits 1 on FAIL |
 | `as` | Bind this agent session to a roster label |
 | `auto` | Per-agent auto-mode: `on` / `off` / `status` |
-| `tui` | The full-screen pane: the way you drive a running team (Enter on a github row opens the event page: preview, ack, open-in-browser) |
+| `tui` | The full-screen pane: the way you drive a running team (Enter on a github row opens the event page: preview, ack, open-in-browser; Enter on a block's question or its agent's row opens the block page to answer it) |
 | `status` | Repo state; `--watch` re-prints it as it changes, `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
 | `run` | Run a long command under clank, so clank knows it is in hand (see below) |

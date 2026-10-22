@@ -42,6 +42,7 @@ mod wait_process;
 // view modules do.)
 pub(crate) use text::strip_leading_emoji;
 
+mod block_page;
 mod derive;
 
 mod markdown;
@@ -707,7 +708,7 @@ async fn submit_pause_question(
     // so there is exactly one.
     let res = crate::cli::block::run(crate::cli::BlockArgs {
         command: crate::cli::BlockCmd::Create(crate::cli::BlockCreateArgs {
-            name: "pause".to_string(),
+            name: block_page::PAUSE.to_string(),
             message: text.to_string(),
             author: Some(master.label.clone()),
             repo: Some(repo.to_path_buf()),
@@ -720,37 +721,83 @@ async fn submit_pause_question(
     }
 }
 
-/// Answer ONE pending block with the human's typed message.
-///
-/// Takes the block by index rather than sweeping a name: each block is
-/// a distinct agent's distinct question, and the answer written here is
-/// the human's own words, never a canned string.
-async fn submit_block_answer(
-    block: usize,
-    buf: &str,
+/// What one key on the block page leaves the loop to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageStep {
+    To(Mode),
+    /// The answer was recorded; the page is closed and the blocks are
+    /// stale.
+    Answered(Mode),
+    Quit,
+}
+
+/// One key on the open block page. The page answers the ask it holds,
+/// through `answer`, judged against the live `snapshot.blocks`; leaving
+/// closes it and returns to where it was opened.
+fn drive_block_page(
+    slot: &mut Option<block_page::BlockPage>,
+    key: AnyKey,
     snapshot: &StatusSnapshot,
-    repo: &std::path::Path,
-) -> InputSubmit {
-    let text = buf.trim();
-    if text.is_empty() {
-        return InputSubmit::Stay;
-    }
-    let Some(b) = snapshot.blocks.get(block) else {
-        return InputSubmit::Failed(
-            "unblock failed".into(),
-            "the block is no longer pending".into(),
-        );
+    rows: usize,
+    cols: usize,
+    answer: impl FnOnce(&block_page::Ask, &str) -> anyhow::Result<()>,
+) -> PageStep {
+    let Some(page) = slot.as_mut() else {
+        return PageStep::To(Mode::LogScroll);
     };
-    match crate::cli::block::run_unblock(crate::cli::UnblockArgs {
-        agent: b.agent.clone(),
-        name: b.name.clone(),
-        message: text.to_string(),
-        repo: Some(repo.to_path_buf()),
-    })
-    .await
+    let standing = block_page::standing(&page.ask, &snapshot.blocks);
+    let layout = block_page_layout(page, standing, rows, cols);
+    let nav = page.key(
+        key,
+        &snapshot.blocks,
+        layout.max_scroll(),
+        layout.viewport.max(1),
+        answer,
+    );
+    let back = |slot: &mut Option<block_page::BlockPage>| {
+        let origin = slot.take().map(|p| p.origin);
+        origin_mode(origin.as_ref(), snapshot, cols)
+    };
+    match nav {
+        block_page::Nav::Stay => PageStep::To(Mode::BlockPage),
+        block_page::Nav::Quit => PageStep::Quit,
+        block_page::Nav::Leave => PageStep::To(back(slot)),
+        block_page::Nav::Answered => PageStep::Answered(back(slot)),
+    }
+}
+
+/// The surface a block page was opened from, as it stands now.
+fn origin_mode(
+    origin: Option<&block_page::Origin>,
+    snapshot: &StatusSnapshot,
+    cols: usize,
+) -> Mode {
+    match origin {
+        Some(block_page::Origin::Agent(label)) if !snapshot.agents.is_empty() => {
+            let rows = panel_row_list(snapshot, cols);
+            let sel = rows
+                .iter()
+                .position(|r| {
+                    matches!(r, PanelRow::Agent(i)
+                        if snapshot.agents.get(*i).is_some_and(|a| &a.label == label))
+                })
+                .unwrap_or(0);
+            Mode::AgentPanel { sel }
+        }
+        _ => Mode::LogScroll,
+    }
+}
+
+/// What Enter on agent `idx`'s panel row opens: its question while it
+/// is asking one, its own page otherwise.
+fn agent_row_enter(idx: usize, snapshot: &StatusSnapshot) -> (Mode, Option<block_page::BlockPage>) {
+    match snapshot
+        .agents
+        .get(idx)
+        .and_then(|a| block_page::from_agent(&a.label, &snapshot.blocks))
     {
-        Ok(()) => InputSubmit::Done,
-        Err(e) => InputSubmit::Failed("unblock failed".into(), format!("{e:?}")),
+        Some(page) => (Mode::BlockPage, Some(page)),
+        None => (Mode::AgentDetail { idx, sel: 0 }, None),
     }
 }
 
@@ -768,7 +815,7 @@ async fn resume_from_pause(
     for b in snapshot
         .blocks
         .iter()
-        .filter(|b| b.answer.is_none() && b.name == "pause")
+        .filter(|b| b.answer.is_none() && b.name == block_page::PAUSE)
     {
         crate::cli::block::run_unblock(crate::cli::UnblockArgs {
             agent: b.agent.clone(),
@@ -867,10 +914,7 @@ async fn plan_page_facts(
         .as_ref()
         .is_some_and(|p| p.plan.as_str() == stem)
     {
-        let repo_paused = snapshot
-            .blocks
-            .iter()
-            .any(|b| b.answer.is_none() && b.name == "pause");
+        let repo_paused = block_page::repo_paused(&snapshot.blocks);
         return Some((input::PlanPageState::Active { repo_paused }, None));
     }
     Some((
@@ -3353,6 +3397,8 @@ pub(crate) async fn run_tui(
     // The open plan-page text input's buffer (Mode::PlanInput carries
     // only the KIND — same Copy-preserving split as `plan_page`).
     let mut plan_input: Option<TextInput> = None;
+    // INVARIANT: `Some` ⟺ mode is `BlockPage`.
+    let mut block_page: Option<block_page::BlockPage> = None;
     // Spinner animation frame. The ONLY state an animation tick mutates.
     let mut frame: usize = 0;
     // Debounce: a watcher wake only FLAGS a refresh; the trailing-edge
@@ -3648,6 +3694,7 @@ pub(crate) async fn run_tui(
             commit_page: commit_page.as_ref(),
             event_page: event_page.as_ref(),
             plan_input: plan_input.as_ref(),
+            block_page: block_page.as_ref(),
             picker: &picker,
             log_cursor: log.cursor,
             lift: 0,
@@ -3797,10 +3844,11 @@ pub(crate) async fn run_tui(
                 // not be pre-parsed as commands.
                 let mut inbuf = batch.input.as_slice();
                 loop {
-                    let text_mode = matches!(
-                        mode,
-                        Mode::PlanInput { .. } | Mode::PauseInput | Mode::BlockAnswer { .. }
-                    );
+                    let text_mode = match mode {
+                        Mode::PlanInput { .. } | Mode::PauseInput => true,
+                        Mode::BlockPage => block_page.as_ref().is_some_and(|p| p.typing),
+                        _ => false,
+                    };
                     let Some((anykey, used)) = parse_one(inbuf, text_mode) else {
                         if inbuf.is_empty() {
                             break;
@@ -3809,6 +3857,26 @@ pub(crate) async fn run_tui(
                         continue;
                     };
                     inbuf = &inbuf[used..];
+                    // The page owns both its buttons and its input, so
+                    // every key goes to it whichever way it parsed.
+                    if let Mode::BlockPage = mode {
+                        match drive_block_page(
+                            &mut block_page,
+                            anykey,
+                            &snapshot,
+                            rows as usize,
+                            cols as usize,
+                            |ask, text| block_page::answer_in_store(&repo, ask, text),
+                        ) {
+                            PageStep::To(m) => mode = m,
+                            PageStep::Answered(m) => {
+                                mode = m;
+                                refresh_pending = true;
+                            }
+                            PageStep::Quit => break 'evloop,
+                        }
+                        continue;
+                    }
                     // Text keys route to the ONE input arm; command keys
                     // to the per-mode match below.
                     let k = match anykey {
@@ -3843,40 +3911,6 @@ pub(crate) async fn run_tui(
                                                 plan_input = None;
                                                 detail = Some(Overlay::error(title, msg));
                                                 mode = Mode::PlanDetail { sel: 0 };
-                                                refresh_pending = true;
-                                            }
-                                        }
-                                    }
-                                    InputNav::None => {}
-                                }
-                            } else if let Mode::BlockAnswer { block } = mode {
-                                let outcome = plan_input
-                                    .as_mut()
-                                    .map(|ti| text_input_nav(ti, tk))
-                                    .unwrap_or(InputNav::Cancel);
-                                match outcome {
-                                    InputNav::Cancel => {
-                                        plan_input = None;
-                                        mode = Mode::LogScroll;
-                                    }
-                                    InputNav::Submit => {
-                                        let buf = plan_input
-                                            .as_ref()
-                                            .map(|ti| ti.buf.clone())
-                                            .unwrap_or_default();
-                                        match submit_block_answer(block, &buf, &snapshot, &repo)
-                                            .await
-                                        {
-                                            InputSubmit::Stay => {}
-                                            InputSubmit::Done => {
-                                                plan_input = None;
-                                                mode = Mode::LogScroll;
-                                                refresh_pending = true;
-                                            }
-                                            InputSubmit::Failed(title, msg) => {
-                                                plan_input = None;
-                                                detail = Some(Overlay::error(title, msg));
-                                                mode = Mode::LogScroll;
                                                 refresh_pending = true;
                                             }
                                         }
@@ -4378,7 +4412,7 @@ pub(crate) async fn run_tui(
                                     mode = Mode::AddPicker { sel: 0 };
                                 }
                                 PanelAction::OpenDetail(i) => {
-                                    mode = Mode::AgentDetail { idx: i, sel: 0 };
+                                    (mode, block_page) = agent_row_enter(i, &snapshot);
                                 }
                                 PanelAction::OpenQueueItem(q) => {
                                     if let Some(item) = snapshot.queue.get(q) {
@@ -4773,7 +4807,7 @@ pub(crate) async fn run_tui(
                         // with text_mode=true, so every key routed here
                         // is a TextKey handled above — but the match
                         // must stay exhaustive.
-                        Mode::PlanInput { .. } | Mode::PauseInput | Mode::BlockAnswer { .. } => {}
+                        Mode::PlanInput { .. } | Mode::PauseInput | Mode::BlockPage => {}
                         // The plan-actions page (tui-plan-actions-page).
                         Mode::EventDetail { sel } => {
                             let Some(ep) = event_page.clone() else {
@@ -5143,23 +5177,8 @@ pub(crate) async fn run_tui(
                             // even with no plans and an empty queue —
                             // an idle repo the human wants kept idle is
                             // exactly when pausing matters.
-                            // One question, one typed answer: the
-                            // cursor picks WHICH block, so no keystroke
-                            // can answer several at once.
-                            Key::Char(b'u') => {
-                                let seq = build_scroll(&snapshot, &ask_lines);
-                                if let Some(Seg::Ask(a)) = seq.get(log.cursor)
-                                    && let Some(block) = a.block
-                                {
-                                    plan_input = Some(TextInput::default());
-                                    mode = Mode::BlockAnswer { block };
-                                }
-                            }
                             Key::Char(b'b') => {
-                                let paused = snapshot
-                                    .blocks
-                                    .iter()
-                                    .any(|b| b.answer.is_none() && b.name == "pause");
+                                let paused = block_page::repo_paused(&snapshot.blocks);
                                 if paused {
                                     if let Err(e) = resume_from_pause(&repo, &snapshot).await {
                                         detail = Some(Overlay::error(
@@ -5198,10 +5217,15 @@ pub(crate) async fn run_tui(
                             // build the same scroll sequence the cursor indexes
                             // and open the entry's page. A commit/review opens the
                             // commit page (a review scrolled to that reviewer's
-                            // feedback); a plan header opens the plan page. Ask /
-                            // in-progress / ad-hoc rows resolve to None.
+                            // feedback); a plan header opens the plan page; any
+                            // line of a question opens its block page.
                             Key::Enter => {
                                 let seq = build_scroll(&snapshot, &ask_lines);
+                                if let Some(page) = block_page::from_log(&seq, log.cursor) {
+                                    block_page = Some(page);
+                                    mode = Mode::BlockPage;
+                                    continue;
+                                }
                                 if let Some(Seg::Log(
                                     row @ crate::cli::log::OnelineRow::Nudge { .. },
                                 )) = seq.get(log.cursor)
@@ -5531,12 +5555,9 @@ pub(crate) async fn run_tui(
                                 .saturating_sub(1),
                         ),
                     },
-                    // The answered block may be gone after a refresh;
-                    // an out-of-range index must not answer a
-                    // DIFFERENT agent's question, so drop to the log.
-                    Mode::BlockAnswer { block } if block < snapshot.blocks.len() => {
-                        Mode::BlockAnswer { block }
-                    }
+                    // The page holds its ask, not a place in the list,
+                    // and judges it against the fresh blocks when drawn.
+                    Mode::BlockPage => Mode::BlockPage,
                     // Both identities are re-LOCATED by label, never
                     // trusted as indices: a roster or library edit can
                     // reorder either list, and a stale index would swap
@@ -5572,10 +5593,6 @@ pub(crate) async fn run_tui(
                                 Mode::AgentPanel { sel: 0 }
                             }
                         }
-                    }
-                    Mode::BlockAnswer { .. } => {
-                        plan_input = None;
-                        Mode::LogScroll
                     }
                     // The plan page doesn't depend on the roster — it
                     // must survive an empty-roster refresh (its arms are
@@ -9013,6 +9030,7 @@ pub(crate) mod tests {
             seen_session: None,
             clear_target: None,
             plan_input: None,
+            block_page: None,
             mode,
             picker: &[],
             log_cursor: 0,

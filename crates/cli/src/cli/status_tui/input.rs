@@ -138,10 +138,9 @@ pub(super) enum Mode {
     /// `PlanInput`: a pause is repo state, so this mode must work
     /// with no plan page open (and with no plans at all).
     PauseInput,
-    /// Typing the answer to ONE agent-authored block, indexed into
-    /// `snapshot.blocks`. Per-block by construction: a shared answer
-    /// box would put one string under several distinct questions.
-    BlockAnswer { block: usize },
+    /// A pending block's page. WHICH ask, and the answer being typed,
+    /// live in the loop's `block_page`, set and cleared with this mode.
+    BlockPage,
     /// The github event page (tui-github-event-page); `sel` is the
     /// cursor over its action menu. The event's IDENTITY (retained
     /// member keys) lives in the loop's `event_page` — same
@@ -2365,6 +2364,7 @@ pub(super) struct PanelView<'a> {
     pub(super) seen_session: Option<&'a SeenSession>,
     pub(super) clear_target: Option<&'a ClearTarget>,
     pub(super) plan_input: Option<&'a TextInput>,
+    pub(super) block_page: Option<&'a super::block_page::BlockPage>,
     pub(super) picker: &'a [crate::cli::status::AvailableAgent],
     /// The selected log ENTRY (index into the scroll sequence) — drawn
     /// with the unified selection band when the log is focused.
@@ -2414,6 +2414,7 @@ impl<'a> PanelView<'a> {
             seen_session: None,
             clear_target: None,
             plan_input: None,
+            block_page: None,
             picker: &[],
             log_cursor: 0,
             lift: 0,

@@ -259,6 +259,17 @@ pub(super) fn render_at(
             cols,
         );
     }
+    // Each at the top level: under another mode's arm a screen never
+    // draws, and its keys type into a buffer nobody can see.
+    if let Mode::BlockPage = mode
+        && let Some(page) = view.block_page
+    {
+        let standing = super::block_page::standing(&page.ask, &snap.blocks);
+        return render_block_page(page, standing, rows, cols);
+    }
+    if let Mode::PauseInput = mode {
+        return render_pause_input(view.plan_input.unwrap_or(&TextInput::default()), rows, cols);
+    }
     if let Mode::Confirm { action } = mode {
         match action {
             ConfirmAction::AddCandidate { .. } | ConfirmAction::RemoveAgent { .. } => {
@@ -305,25 +316,6 @@ pub(super) fn render_at(
             | ConfirmAction::DropStashedPlan { .. }
             | ConfirmAction::PurgeArtifacts
             | ConfirmAction::PurgeDrop { .. } => {
-                if let Mode::BlockAnswer { block } = mode {
-                    if let Some(b) = snap.blocks.get(block) {
-                        return render_block_answer(
-                            &b.agent,
-                            &b.name,
-                            &b.question,
-                            view.plan_input.unwrap_or(&TextInput::default()),
-                            rows,
-                            cols,
-                        );
-                    }
-                }
-                if matches!(mode, Mode::PauseInput) {
-                    return render_pause_input(
-                        view.plan_input.unwrap_or(&TextInput::default()),
-                        rows,
-                        cols,
-                    );
-                }
                 if let Some(pp) = view.plan_page {
                     return render_plan_confirm(snap, &pp.stem, action, rows, cols);
                 }
@@ -1795,15 +1787,14 @@ pub(super) fn elapsed_text(at: i64) -> String {
     crate::age::coarse(crate::age::elapsed(at))
 }
 
-/// One rendered line of a pending block's question, tagged with the
-/// block it came from so the cursor can answer THAT block. A question
-/// wraps to several lines; every one carries the same index.
+/// One rendered line of a pending block's question, carrying the ask
+/// it shows, so Enter on any of its wrapped lines opens THAT ask.
 #[derive(Clone)]
 pub(super) struct AskLine {
-    /// The block this line belongs to, or `None` for the trailing key
-    /// hint — which must not be answerable, or `u` on it would answer
-    /// whichever block happened to be last.
-    pub block: Option<usize>,
+    /// `None` for the trailing key hint, which belongs to no question.
+    /// Shared by every line of its question: a copy per wrapped line
+    /// would hold the question once per line it wraps to.
+    pub block: Option<std::sync::Arc<super::block_page::Ask>>,
     pub spans: Vec<Span>,
 }
 
@@ -1816,15 +1807,11 @@ pub(super) struct AskLine {
 pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine> {
     let width = cols.max(1);
     let mut lines = Vec::new();
-    for (block, b) in snap
-        .blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.answer.is_none())
-    {
+    for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
+        let ask = std::sync::Arc::new(super::block_page::Ask::of(b));
         for line in wrap(b.question.trim(), width) {
             lines.push(AskLine {
-                block: Some(block),
+                block: Some(std::sync::Arc::clone(&ask)),
                 spans: vec![accent(line)],
             });
         }
@@ -1832,7 +1819,7 @@ pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine
     if !lines.is_empty() {
         lines.push(AskLine {
             block: None,
-            spans: vec![dim("  ↑↓ select · u answer".to_string())],
+            spans: vec![dim("  ↑↓ select · ⏎ open to answer".to_string())],
         });
     }
     lines
@@ -4633,41 +4620,113 @@ fn push_input_line(out: &mut Vec<String>, input: &TextInput, cols: usize) {
     ));
 }
 
-/// The answer screen for ONE pending block: the asking agent, its
-/// question in full, and the input. Showing the question while the
-/// human types is the point — an answer written blind is a guess.
-pub(super) fn render_block_answer(
-    agent: &str,
-    name: &str,
-    question: &str,
-    input: &TextInput,
+/// A pending block's page, laid out for `rows` × `cols`: the question,
+/// windowed by the page's scroll, and beneath it the controls, which are
+/// placed first so no question is long enough to push them off the pane.
+pub(super) struct BlockPageLayout {
+    pub(super) question: Vec<String>,
+    pub(super) viewport: usize,
+    pub(super) controls: Vec<String>,
+}
+
+impl BlockPageLayout {
+    pub(super) fn max_scroll(&self) -> usize {
+        self.question.len().saturating_sub(self.viewport)
+    }
+}
+
+pub(super) fn block_page_layout(
+    page: &super::block_page::BlockPage,
+    standing: super::block_page::Standing,
     rows: usize,
     cols: usize,
-) -> (Vec<String>, usize) {
-    let mut out: Vec<String> = Vec::new();
-    out.push(region_rule(
-        &format!("answer · {agent}/{name}"),
-        "",
-        true,
-        cols,
-    ));
-    out.push(String::new());
-    for line in wrap(question.trim(), cols.saturating_sub(4).max(1)) {
-        out.push(emit(&[accent(format!("  {line}"))], "", cols));
+) -> BlockPageLayout {
+    use super::block_page::Button;
+    let question: Vec<String> = wrap(page.ask.question.trim(), cols.saturating_sub(4).max(1))
+        .into_iter()
+        .map(|line| emit(&[accent(format!("  {line}"))], "", cols))
+        .collect();
+    let mut controls = vec![String::new()];
+    if let Some(why) = page.failure.as_deref().or_else(|| standing.reason()) {
+        for line in wrap(why, cols.saturating_sub(4).max(1)) {
+            controls.push(emit(&[colored("31", format!("  {line}"))], "", cols));
+        }
     }
-    out.push(String::new());
-    push_input_line(&mut out, input, cols);
-    if out.len() < rows {
-        out.push(String::new());
-    }
-    if out.len() < rows {
-        out.push(emit(
-            &[dim("  ⏎ answer · esc cancel".to_string())],
+    if page.typing {
+        push_input_line(&mut controls, &page.draft, cols);
+        controls.push(emit(
+            &[dim("  ⏎ send · esc back to the buttons".to_string())],
+            "",
+            cols,
+        ));
+    } else {
+        let menu: Vec<MenuRow<'_>> = super::block_page::BUTTONS
+            .iter()
+            .map(|b| match b {
+                Button::Answer => MenuRow::Action {
+                    key: "⏎",
+                    label: "answer",
+                    value: None,
+                    desc: "",
+                    danger: false,
+                },
+                Button::Back => MenuRow::Action {
+                    key: "esc",
+                    label: "back",
+                    value: None,
+                    desc: "",
+                    danger: false,
+                },
+            })
+            .collect();
+        controls.extend(menu_lines(&menu, page.sel, cols).0);
+        controls.push(emit(
+            &[dim(
+                "  ↑↓ move · ⏎ select · pgup/pgdn scroll · esc back".to_string()
+            )],
             "",
             cols,
         ));
     }
-    out.truncate(rows);
+    let viewport = rows.saturating_sub(2 + controls.len()).max(1);
+    BlockPageLayout {
+        question,
+        viewport,
+        controls,
+    }
+}
+
+pub(super) fn render_block_page(
+    page: &super::block_page::BlockPage,
+    standing: super::block_page::Standing,
+    rows: usize,
+    cols: usize,
+) -> (Vec<String>, usize) {
+    let layout = block_page_layout(page, standing, rows, cols);
+    let mut out = vec![
+        region_rule_with_note(
+            "block",
+            &format!("{}/{}", page.ask.agent, page.ask.name),
+            "",
+            true,
+            cols,
+        ),
+        String::new(),
+    ];
+    let off = page.scroll.min(layout.max_scroll());
+    out.extend(
+        layout
+            .question
+            .iter()
+            .skip(off)
+            .take(layout.viewport)
+            .cloned(),
+    );
+    out.extend(layout.controls);
+    // A pane too short for even one question line keeps the controls:
+    // they are what the human came to use.
+    let excess = out.len().saturating_sub(rows);
+    out.drain(..excess);
     (out, 0)
 }
 
@@ -5559,12 +5618,37 @@ mod tests {
             },
         ];
         let lines = block_ask_spans(&s, 60);
-        let owners: Vec<Option<usize>> = lines.iter().map(|l| l.block).collect();
+        let owners: Vec<Option<&str>> = lines
+            .iter()
+            .map(|l| l.block.as_ref().map(|a| a.name.as_str()))
+            .collect();
         assert_eq!(
             owners,
-            vec![Some(0), Some(1), None],
+            vec![Some("a"), Some("b"), None],
             "each question tags its own block; the trailing hint tags none"
         );
+    }
+
+    /// Every wrapped line of a question points at one shared ask, so the
+    /// rows hold its body once however many lines it wraps to.
+    #[test]
+    fn a_long_question_is_held_once_across_its_wrapped_lines() {
+        let mut s = snap(None, vec![]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "long".into(),
+            question: "word ".repeat(13_000),
+            answer: None,
+            occurrence: Some("ask-1".into()),
+        }];
+        let lines = block_ask_spans(&s, 80);
+        let asks: Vec<_> = lines.iter().filter_map(|l| l.block.as_ref()).collect();
+        assert!(asks.len() > 100, "the question wraps to many lines");
+        assert!(
+            asks.iter().all(|a| std::sync::Arc::ptr_eq(a, asks[0])),
+            "every line shares one ask"
+        );
+        assert_eq!(std::sync::Arc::strong_count(asks[0]), asks.len());
     }
 
     #[test]
@@ -5580,47 +5664,102 @@ mod tests {
         assert!(block_ask_spans(&s, 60).is_empty());
     }
 
-    #[test]
-    fn ask_line_indices_address_the_snapshot_not_the_pending_subset() {
-        // The index answers `snapshot.blocks[i]`, so it must count
-        // answered blocks too — indexing the filtered subset would
-        // write the answer under the WRONG agent's question.
+    fn block_page_frame(
+        question: &str,
+        page: impl FnOnce(&mut crate::cli::status_tui::block_page::BlockPage),
+        rows: u16,
+        cols: u16,
+    ) -> Vec<String> {
+        use crate::cli::status_tui::block_page::{Ask, BlockPage, Origin};
         let mut s = snap(None, vec![]);
-        s.blocks = vec![
-            crate::cli::block::BlockEntry {
-                agent: "claude".into(),
-                name: "done".into(),
-                question: "answered".into(),
-                answer: Some("yes".into()),
-                occurrence: None,
-            },
-            crate::cli::block::BlockEntry {
-                agent: "codex".into(),
-                name: "open".into(),
-                question: "still open".into(),
-                answer: None,
-                occurrence: None,
-            },
-        ];
-        let lines = block_ask_spans(&s, 60);
-        assert_eq!(lines[0].block, Some(1), "must point at the OPEN block");
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "codex".into(),
+            name: "scope".into(),
+            question: question.into(),
+            answer: None,
+            occurrence: Some("02".into()),
+        }];
+        let mut open = BlockPage::open(Ask::of(&s.blocks[0]), Origin::Log);
+        page(&mut open);
+        let mut view = PanelView::just(Mode::BlockPage);
+        view.block_page = Some(&open);
+        render_at(&s, rows, cols, 0, 0, &view)
+            .0
+            .iter()
+            .map(|l| visible(l))
+            .collect()
+    }
+
+    fn line_of(lines: &[String], needle: &str) -> Option<usize> {
+        lines.iter().position(|l| l.contains(needle))
     }
 
     #[test]
-    fn block_answer_screen_shows_the_question_being_answered() {
-        use crate::cli::status_tui::input::TextInput;
-        let (lines, _) = render_block_answer(
-            "codex",
-            "scope",
+    fn the_block_page_shows_the_question_and_an_answer_button() {
+        let lines = block_page_frame("should this ship?", |_| {}, 24, 80);
+        let text = lines.join("\n");
+        assert!(text.contains("BLOCK"), "{text}");
+        assert!(text.contains("codex/scope"), "{text}");
+        let question = line_of(&lines, "should this ship?").expect("the question");
+        let answer = line_of(&lines, "answer").expect("the answer button");
+        assert!(line_of(&lines, "back").is_some(), "{text}");
+        assert!(question < answer, "{text}");
+        assert!(
+            line_of(&lines, "> ").is_none(),
+            "no input before Answer: {text}"
+        );
+    }
+
+    #[test]
+    fn answer_opens_the_input_beneath_the_question() {
+        let lines = block_page_frame(
             "should this ship?",
-            &TextInput::default(),
+            |p| {
+                p.typing = true;
+                p.draft = TextInput::prefilled("yes");
+            },
             24,
             80,
         );
         let text = lines.join("\n");
-        assert!(text.to_uppercase().contains("CODEX/SCOPE"), "{text}");
-        assert!(text.contains("should this ship?"), "{text}");
-        assert!(text.contains("esc cancel"), "{text}");
+        let question = line_of(&lines, "should this ship?").expect("the question stays");
+        let input = line_of(&lines, "> yes").expect("the input");
+        assert!(question < input, "{text}");
+    }
+
+    /// However long the question and however small the pane, the control
+    /// in focus is on screen and the question scrolls behind it.
+    #[test]
+    fn a_long_question_in_a_short_narrow_pane_keeps_the_controls_reachable() {
+        let long = (0..80)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let top = block_page_frame(&long, |_| {}, 9, 24);
+        assert_eq!(top.len(), 9);
+        assert!(line_of(&top, "answer").is_some(), "{top:?}");
+        assert!(line_of(&top, "w0 ").is_some(), "{top:?}");
+        let scrolled = block_page_frame(&long, |p| p.scroll = 10, 9, 24);
+        assert!(line_of(&scrolled, "w0 ").is_none(), "{scrolled:?}");
+        assert!(line_of(&scrolled, "answer").is_some(), "{scrolled:?}");
+        let typing = block_page_frame(
+            &long,
+            |p| {
+                p.typing = true;
+                p.draft = TextInput::prefilled("ok");
+            },
+            6,
+            24,
+        );
+        assert!(line_of(&typing, "> ok").is_some(), "{typing:?}");
+    }
+
+    #[test]
+    fn the_pause_input_draws_when_its_mode_is_up() {
+        let s = snap(None, vec![]);
+        let lines = render_at(&s, 24, 80, 0, 0, &PanelView::just(Mode::PauseInput)).0;
+        let text = visible(&lines.join("\n"));
+        assert!(text.contains("PAUSE REPO"), "{text}");
     }
 
     #[test]
@@ -5988,6 +6127,7 @@ mod tests {
                             seen_session: None,
                             clear_target: None,
                             plan_input: None,
+                            block_page: None,
                             picker: &[],
                             log_cursor: 0,
                             reach: crate::cli::status_tui::zellij::ZellijReach::NotInSession,
@@ -6037,6 +6177,7 @@ mod tests {
             seen_session: None,
             clear_target: None,
             plan_input: None,
+            block_page: None,
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: cursor,
@@ -6269,6 +6410,7 @@ mod tests {
             seen_session: None,
             clear_target: None,
             plan_input: None,
+            block_page: None,
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: 6,
@@ -7979,6 +8121,7 @@ mod tests {
                 seen_session: None,
                 clear_target: None,
                 plan_input: None,
+                block_page: None,
                 mode: Mode::AddPicker { sel: 0 },
                 picker: &picker,
                 log_cursor: 0,
@@ -8036,6 +8179,7 @@ mod tests {
             seen_session: None,
             clear_target: None,
             plan_input: None,
+            block_page: None,
             mode: Mode::AddPicker { sel: 0 },
             picker: &picker,
             log_cursor: 0,
@@ -8143,6 +8287,7 @@ mod tests {
                 seen_session: None,
                 clear_target: None,
                 plan_input: None,
+                block_page: None,
                 mode: Mode::Confirm {
                     action: ConfirmAction::AddCandidate {
                         idx: 0,
@@ -9621,6 +9766,7 @@ mod tests {
             seen_session: None,
             clear_target: None,
             plan_input: None,
+            block_page: None,
             mode: Mode::LogScroll,
             picker: &[],
             log_cursor: 1,
