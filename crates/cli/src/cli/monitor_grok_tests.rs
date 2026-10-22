@@ -131,3 +131,122 @@ async fn native_session_rebinding_rejects_old_wait_and_allows_new_wait() {
     }
     drop((old_peer, new_peer, clients));
 }
+
+/// Attendance never quiets Grok: its handoff still asks for the one
+/// background wait, and an event logged while that wait is held is
+/// delivered on it.
+#[tokio::test]
+async fn an_attending_groks_background_wait_delivers_a_new_event() {
+    use crate::cli::github::log::{EventLog, Transport as Wal};
+    use crate::cli::turn_custody::{Gathered, Turns};
+    use crate::cli::turn_wire::{Report, WireVerdict};
+    use clank_core::turn_policy::{AttendRequest, Handoff, Selector};
+
+    let repo = TempRepo::new();
+    let author = AgentLabel::parse("grok").unwrap();
+    crate::cli::agent::add_repo_roster_agent(
+        repo.path(),
+        &author,
+        AgentDescription {
+            tool: Tool::Grok,
+            launch: None,
+            initial_prompt: None,
+        },
+        RosterRole::Master,
+    )
+    .unwrap();
+    let timer = clank_core::agent_config::TimerSource {
+        interrupt: false,
+        interrupt_message: None,
+        name: "check".into(),
+        repeat_every: None,
+        due_at: "1970-01-01T00:01:40Z".into(),
+        content: Some("grok scheduled work".into()),
+    };
+    crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+        config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
+            timer.clone(),
+        )];
+    })
+    .unwrap();
+    crate::agent_store::set_auto_mode(repo.path(), &author, AutoMode::On).unwrap();
+    let session = SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+    crate::agent_store::bind_session_to_agent(repo.path(), &author, Tool::Grok, &session).unwrap();
+
+    let g = Gathered::of(repo.path(), &author, Some((&[], None)), Ok(()));
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    turns
+        .attend(
+            &author,
+            AttendRequest::Attend {
+                session: session.clone(),
+                selector: Selector::Name("sleeper".into()),
+                desc: None,
+                expect: 600_000,
+                shell: None,
+            },
+            &g,
+        )
+        .unwrap();
+    let handoff = Report::Handoff {
+        handoff: Handoff {
+            session: session.clone(),
+            wait_running: false,
+            continued: false,
+        },
+        deadline: u64::MAX,
+    };
+    let frame = turns.answer(&author, 1, &handoff, true, &g).unwrap();
+    assert_eq!(
+        frame.verdict,
+        WireVerdict::Notify,
+        "the handoff asks for its wait"
+    );
+
+    let (wait, mut peer) = connecting(repo.path(), &author, &session).await;
+    let mut clients = vec![];
+    let _ = joining(repo.path(), &mut clients, wait);
+    let events = crate::agent_store::agents_root(repo.path()).join("grok/events");
+    std::fs::create_dir_all(&events).unwrap();
+    EventLog::open(&events, &timer.source_key(None))
+        .unwrap()
+        .append_inbox(
+            Wal::Timer,
+            Some("timer/100"),
+            None,
+            Some(100),
+            &WaitItem::TimerEvent {
+                presentation: None,
+                name: "check".into(),
+                recurrence: None,
+                id: "timer/100".into(),
+                due_at: 100,
+                content: "grok scheduled work".into(),
+                selector: None,
+            },
+        )
+        .unwrap();
+    let state = folded(repo.path()).await.unwrap();
+    serve(repo.path(), &mut clients, &state);
+    let items = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut line = String::new();
+            assert!(
+                peer.read_line(&mut line).await.unwrap() > 0,
+                "the wait closed"
+            );
+            if let Note::Items { items, .. } = serde_json::from_str::<Note>(&line).unwrap() {
+                return items;
+            }
+        }
+    })
+    .await
+    .expect("the wait is woken");
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            WaitItem::TimerEvent { content, .. } if content == "grok scheduled work"
+        )),
+        "{items:?}"
+    );
+}

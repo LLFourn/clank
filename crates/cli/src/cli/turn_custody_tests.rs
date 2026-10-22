@@ -161,7 +161,7 @@ fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
             &g,
         )
         .unwrap();
-    assert_eq!(frame.verdict, silent(SilentReason::AttendingBackgroundTask));
+    assert_eq!(frame.verdict, WireVerdict::Park);
     let (shown, _) = turns.projection(&label("claude"), &g);
     let shown = shown.expect("attending");
     assert!(shown.subagent && !shown.pending, "{shown:?}");
@@ -207,7 +207,7 @@ fn a_restart_keeps_the_deadline_and_proves_nothing_until_the_next_stop() {
             &g,
         )
         .unwrap();
-    assert_eq!(frame.verdict, silent(SilentReason::AttendingBackgroundTask));
+    assert_eq!(frame.verdict, WireVerdict::Park);
     assert_eq!(back.recovery_quiet(&author, &g), Some(Quiet::Attending));
 }
 
@@ -533,7 +533,7 @@ fn a_silence_needs_a_route_and_a_lost_one_is_recorded() {
 
     let g = gathered(repo.path(), "claude", &[], Ok(()));
     let frame = turns.answer(&author, 2, &report, true, &g).unwrap();
-    assert_eq!(frame.verdict, silent(SilentReason::AttendingBackgroundTask));
+    assert_eq!(frame.verdict, WireVerdict::Park);
     let due = turns.next_deadline().expect("armed");
     let at_due = gathered(repo.path(), "claude", &[], Ok(())).at(due);
     let check_in = turns.check_in(&author, &at_due).expect("owed");
@@ -1241,4 +1241,32 @@ async fn a_late_receipt_after_identical_reuse_receives_nothing() {
             "{interleave}"
         );
     }
+}
+
+/// While attending, a delivery renders only the work this session has not
+/// received, and what it received survives a monitor restart in turn.json.
+#[test]
+fn an_attending_delivery_renders_only_unreceived_work_across_a_restart() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let report = stop(Tool::Claude, "session-one", running_subagent(), None);
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let one = gathered(repo.path(), "claude", &[message("1")], Ok(()));
+    attend_name(&mut turns, "claude", "session-one", &one);
+    let frame = turns.answer(&author, 1, &report, true, &one).unwrap();
+    let presentation = frame.presentation().expect("never received").clone();
+    turns
+        .result(&author, 1, TurnResult::Delivered { presentation }, &one)
+        .unwrap();
+
+    let mut back = Turns::new(repo.path().to_path_buf());
+    let frame = back.answer(&author, 2, &report, true, &one).unwrap();
+    assert_eq!(frame.verdict, WireVerdict::Park);
+    let both = gathered(repo.path(), "claude", &[message("1"), message("2")], Ok(()));
+    let frame = back.answer(&author, 3, &report, true, &both).unwrap();
+    let text = frame.rendered.unwrap_or_default();
+    assert!(
+        text.contains("messages@2") && !text.contains("messages@1"),
+        "{text}"
+    );
 }

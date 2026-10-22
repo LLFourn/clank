@@ -362,8 +362,9 @@ pub enum Command {
     /// Tell clank which background work you are waiting on
     ///
     /// A subagent by its name (`clank attend "<name>"`); shell work is
-    /// best launched through `clank run`. While the work is listed running
-    /// your turn-ends stay quiet. Say how long you expect it to take
+    /// best launched through `clank run`. While the work is listed running,
+    /// work you have already been shown does not wake you again; new work
+    /// still does. Say how long you expect it to take
     /// (`--expect`, default 5m): if it is still running past that you are
     /// checked in on once, so a hang cannot hold you asleep. Nothing is
     /// cancelled.

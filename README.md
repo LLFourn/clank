@@ -432,9 +432,10 @@ Three levels, for three situations:
 
 An agent that starts long work in the background (a test suite, a build,
 a subagent) would otherwise be woken at each turn-end with work it is
-already doing. To attend the work keeps those turn-ends quiet while it is
-listed running, and only where the harness wakes the agent itself when the
-work completes (Claude).
+already doing. To attend the work keeps work the agent has already been
+shown from waking it again while the work is listed running, and only where
+the harness wakes the agent itself when the work completes (Claude). New
+work still wakes it.
 
 - `clank attend "<name>"` attends a subagent by its name.
 - `clank run --desc "two words" -- <command>` is the way for shell work.

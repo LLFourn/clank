@@ -48,7 +48,7 @@
 <p>A controller agent may deliberately start an observer wait, such as <code>clank wait --repo ../app --for finished</code>, to watch another repo. It counts only events after it starts, needs no binding there, and its completion is the signal you asked for. It does not replace your automatic subscription in your own repo, and it is not a way to poll for your own work. <a href="controller.html#observe">A controller repo</a> teaches the same distinction.</p>
 
 <h2 id="background">Long work in the background</h2>
-<p>When you start something long in the background, tell clank, so your turn-ends stay quiet while it runs instead of waking you with work you are already doing.</p>
+<p>When you start something long in the background, tell clank, so it does not wake you again while it runs for work you have already been shown. New work still wakes you.</p>
 <pre><code>clank run --desc "test run" --expect 20m -- cargo test
 clank attend "<var>subagent-name</var>"</code></pre>
 <p><code>clank run</code> is for shell work. clank records what it is attending and then becomes the command, with the same pid, stdio and exit status. Give it two words in <code>--desc</code>, because that is what <code>clank tui</code> shows and how clank recognises the run among your background tasks. <code>clank attend</code> is for a subagent, by its name. Past <code>--expect</code> (5 minutes by default) you get one check-in. Nothing is cancelled. The work’s own completion still wakes you, so never poll it or start a wait for it. <code>clank attend --clear</code> withdraws the request.</p>

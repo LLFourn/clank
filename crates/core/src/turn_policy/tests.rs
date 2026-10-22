@@ -110,10 +110,10 @@ fn committed(out: Output) -> Vec<Effect> {
     }
 }
 
+/// A qualifying Stop with nothing deliverable parks, so later work can
+/// still wake the agent.
 fn attending() -> Verdict {
-    Verdict::Silent(SilentWhy::Attending {
-        task_id: SUBAGENT_ID.into(),
-    })
+    Verdict::Park
 }
 
 /// A session attending the captured subagent, proven by one Stop.
@@ -577,9 +577,7 @@ fn t15_a_listing_without_the_shell_ends_it_even_while_its_pid_lives() {
             )),
             &facts(T0, &s, &[])
         )),
-        Verdict::Silent(SilentWhy::Attending {
-            task_id: "b1".into()
-        })
+        Verdict::Park
     );
     st.step(
         Event::TurnEnd(report(Tool::Claude, TaskSnapshot::Known(vec![]))),
@@ -726,10 +724,7 @@ fn alone_mode_is_never_quiet_on_attendance() {
         alone_verdict(&s, &facts(T0, &s, &owed)),
         alone_verdict(&s, &facts(T0, &s, &[])),
     ] {
-        assert!(
-            !matches!(v, Verdict::Silent(SilentWhy::Attending { .. })),
-            "{v:?}"
-        );
+        assert!(!matches!(v, Verdict::Silent(_)), "{v:?}");
     }
 }
 
@@ -1415,12 +1410,7 @@ fn a_run_is_resolved_by_exactly_one_live_run_carrying_its_description() {
         (v, st.attendance)
     };
     let (v, standing) = outcome(vec![run("t", "running", ours)]);
-    assert_eq!(
-        v,
-        Verdict::Silent(SilentWhy::Attending {
-            task_id: "t".into()
-        })
-    );
+    assert_eq!(v, Verdict::Park);
     assert!(matches!(standing, Attendance::Standing { task_id, .. } if task_id == "t"));
     assert!(matches!(
         outcome(vec![run("t", "completed", ours)]).0,
@@ -1645,5 +1635,403 @@ fn a_native_handoff_asks_for_one_wait_through_the_drive_gate() {
     assert_eq!(
         handoff_verdict(&handoff(false, false), &facts(T0, &other, &[])),
         Verdict::Silent(SilentWhy::StaleBinding)
+    );
+}
+
+fn presented(v: Verdict) -> (PresentationId, Vec<String>) {
+    match v {
+        Verdict::Deliver {
+            presentation,
+            identities,
+            ..
+        } => (presentation, identities),
+        other => panic!("not a delivery: {other:?}"),
+    }
+}
+
+fn running_stop() -> Event {
+    Event::TurnEnd(report(Tool::Claude, tasks(RUNNING)))
+}
+
+fn attend_subagent() -> Event {
+    attend(Selector::Name(SUBAGENT_NAME.into()), None)
+}
+
+/// `item` delivered and received, then the captured subagent attended and
+/// proven by a Stop that parks.
+fn received_then_attending(s: &SessionId, item: &[OwedItem]) -> SessionState {
+    let mut st = SessionState::new(s.clone());
+    let (p, _) = deliver(&mut st, &facts(T0, s, item));
+    committed(st.step(Event::Delivered(p), &facts(T0, s, item)));
+    st.step(attend_subagent(), &facts(T0, s, item));
+    assert_eq!(
+        verdict(st.step(running_stop(), &facts(T0 + MINUTE, s, item))),
+        Verdict::Park,
+        "received work is quiet"
+    );
+    st
+}
+
+#[test]
+fn work_that_arrived_before_the_first_qualifying_stop_is_delivered() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = SessionState::new(s.clone());
+    st.step(attend_subagent(), &facts(T0, &s, &[]));
+    let (_, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + MINUTE, &s, &a)),
+    ));
+    assert_eq!(identities, ["event:a"]);
+    assert!(matches!(
+        &st.attendance,
+        Attendance::Standing {
+            check_in: CheckIn::Armed,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn received_work_stays_quiet_and_new_work_still_wakes() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    assert_eq!(
+        verdict(st.step(running_stop(), &facts(T0 + 2 * MINUTE, &s, &a))),
+        Verdict::Park
+    );
+
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let (pb, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &ab)),
+    ));
+    assert_eq!(identities, ["event:b"], "only what was not received");
+    assert_eq!(
+        committed(st.step(Event::Delivered(pb), &facts(T0 + 3 * MINUTE, &s, &ab)))[0],
+        Effect::CommitReceipts(vec!["read:b".into()])
+    );
+    assert_eq!(
+        verdict(st.step(running_stop(), &facts(T0 + 4 * MINUTE, &s, &ab))),
+        Verdict::Park,
+        "work delivered while attending is received too"
+    );
+}
+
+#[test]
+fn work_whose_delivery_failed_or_was_lost_stays_deliverable() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let mut st = received_then_attending(&s, &a);
+
+    let (failed, _) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 2 * MINUTE, &s, &ab)),
+    ));
+    st.step(Event::EmitFailed(failed), &facts(T0 + 2 * MINUTE, &s, &ab));
+    let (lost, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &ab)),
+    ));
+    assert_eq!(identities, ["event:b"], "a failed emit received nothing");
+
+    let restarted: Persisted =
+        serde_json::from_str(&serde_json::to_string(&st.persisted()).unwrap()).unwrap();
+    let mut st = SessionState::restored(restarted);
+    let (_, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 4 * MINUTE, &s, &ab)),
+    ));
+    assert_eq!(identities, ["event:b"], "a lost result received nothing");
+    assert!(matches!(
+        settled(st.step(Event::Delivered(lost), &facts(T0 + 4 * MINUTE, &s, &ab))),
+        ResultOutcome::ProtocolViolation(_)
+    ));
+    assert_eq!(st.received, ["event:a"]);
+}
+
+#[test]
+fn a_result_for_another_binding_receives_nothing() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = SessionState::new(s.clone());
+    st.step(attend_subagent(), &facts(T0, &s, &[]));
+    let (p, _) = presented(verdict(st.step(running_stop(), &facts(T0, &s, &a))));
+    let other = other_session();
+    assert!(matches!(
+        settled(st.step(Event::Delivered(p), &facts(T0, &other, &a))),
+        ResultOutcome::ProtocolViolation(_)
+    ));
+    assert!(st.received.is_empty());
+}
+
+#[test]
+fn a_parked_report_with_only_received_work_keeps_parking() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    let parked = report(Tool::Claude, tasks(RUNNING));
+    for at in 2..5 {
+        assert_eq!(
+            verdict(st.step(
+                Event::Parked(parked.clone()),
+                &facts(T0 + at * MINUTE, &s, &a)
+            )),
+            Verdict::Park
+        );
+    }
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let (_, identities) = presented(verdict(
+        st.step(Event::Parked(parked), &facts(T0 + 5 * MINUTE, &s, &ab)),
+    ));
+    assert_eq!(identities, ["event:b"]);
+}
+
+#[test]
+fn a_session_start_presents_only_unreceived_work_while_attending() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    assert_eq!(
+        verdict(st.step(
+            Event::SessionStart(s.clone()),
+            &facts(T0 + 2 * MINUTE, &s, &a)
+        )),
+        Verdict::Park
+    );
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let (_, identities) = presented(verdict(st.step(
+        Event::SessionStart(s.clone()),
+        &facts(T0 + 2 * MINUTE, &s, &ab),
+    )));
+    assert_eq!(identities, ["event:b"]);
+}
+
+#[test]
+fn clearing_the_attendance_presents_received_work_again() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let clear = || Event::Attend(AttendRequest::Clear { session: session() });
+
+    let mut st = received_then_attending(&s, &a);
+    st.step(clear(), &facts(T0 + 2 * MINUTE, &s, &a));
+    let (_, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &a)),
+    ));
+    assert_eq!(identities, ["event:a"]);
+
+    let mut again = received_then_attending(&s, &a);
+    again.step(clear(), &facts(T0 + 2 * MINUTE, &s, &a));
+    again.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &a));
+    let (_, identities) = presented(verdict(
+        again.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &a)),
+    ));
+    assert_eq!(
+        identities,
+        ["event:a"],
+        "a cleared attendance's quiet is not inherited by the next"
+    );
+}
+
+#[test]
+fn a_replacement_attendance_presents_received_work_again() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    st.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &a));
+    let (_, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &a)),
+    ));
+    assert_eq!(identities, ["event:a"]);
+    assert!(
+        matches!(&st.attendance, Attendance::Standing { since, .. } if *since == T0 + 2 * MINUTE)
+    );
+}
+
+#[test]
+fn an_ended_task_presents_received_work_and_releases_it() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    let (p, identities) = presented(verdict(st.step(
+        Event::TurnEnd(report(Tool::Claude, tasks(FINISHED))),
+        &facts(T0 + 2 * MINUTE, &s, &a),
+    )));
+    assert_eq!(identities, ["event:a"]);
+    assert_eq!(st.attendance, Attendance::None);
+    st.step(Event::EmitFailed(p), &facts(T0 + 2 * MINUTE, &s, &a));
+    st.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &a));
+    let (_, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &a)),
+    ));
+    assert_eq!(
+        identities,
+        ["event:a"],
+        "an ended attendance's quiet is not inherited by the next"
+    );
+}
+
+#[test]
+fn past_the_deadline_or_unqualified_received_work_is_deliverable() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let deadline = T0 + 10 * MINUTE;
+
+    let mut st = received_then_attending(&s, &a);
+    let (_, identities) = presented(verdict(st.step(
+        Event::Parked(report(Tool::Claude, tasks(RUNNING))),
+        &facts(deadline, &s, &a),
+    )));
+    assert_eq!(
+        identities,
+        ["event:a"],
+        "a parked re-evaluation at the deadline"
+    );
+
+    let mut st = received_then_attending(&s, &a);
+    let (_, identities) = presented(verdict(st.step(running_stop(), &facts(deadline, &s, &a))));
+    assert_eq!(identities, ["event:a"]);
+    assert_eq!(
+        st.next_deadline(),
+        Some(deadline),
+        "the deadline is unchanged"
+    );
+
+    let mut st = received_then_attending(&s, &a);
+    let mut no_route = facts(T0 + 2 * MINUTE, &s, &a);
+    no_route.check_in_route = Err("no harness".into());
+    let (_, identities) = presented(verdict(st.step(running_stop(), &no_route)));
+    assert_eq!(identities, ["event:a"]);
+}
+
+#[test]
+fn received_work_is_scoped_to_the_binding_and_survives_a_restart() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let st = received_then_attending(&s, &a);
+    assert_eq!(st.received, ["event:a"]);
+
+    let mut moved = st.clone();
+    moved.rebind(other_session());
+    assert!(moved.received.is_empty());
+
+    let wire = serde_json::to_value(st.persisted()).unwrap();
+    let mut back = SessionState::restored(serde_json::from_value(wire.clone()).unwrap());
+    assert_eq!(back.received, ["event:a"]);
+    assert_eq!(
+        verdict(back.step(running_stop(), &facts(T0 + 2 * MINUTE, &s, &a))),
+        Verdict::Park
+    );
+
+    let mut old = wire;
+    old.as_object_mut().unwrap().remove("received").unwrap();
+    let mut old = SessionState::restored(serde_json::from_value(old).unwrap());
+    assert!(old.received.is_empty());
+    let (_, identities) = presented(verdict(
+        old.step(running_stop(), &facts(T0 + 2 * MINUTE, &s, &a)),
+    ));
+    assert_eq!(identities, ["event:a"], "no evidence is never deaf");
+}
+
+#[test]
+fn received_work_no_longer_owed_is_forgotten() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    st.step(Event::Observed, &facts(T0 + 2 * MINUTE, &s, &[]));
+    assert!(st.received.is_empty());
+}
+
+#[test]
+fn quieted_work_is_neither_presented_nor_counted() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let mut st = received_then_attending(&s, &a);
+    let at = |position| {
+        let mut r = report(Tool::Claude, tasks(RUNNING));
+        r.place = TurnPlace {
+            turn: Some(format!("turn-{position}")),
+            position: Some(position),
+            human_turn: false,
+        };
+        Event::TurnEnd(r)
+    };
+    assert_eq!(
+        verdict(st.step(at(1), &facts(T0 + 2 * MINUTE, &s, &a))),
+        Verdict::Park
+    );
+    let Verdict::Deliver {
+        presentation,
+        identities,
+        repeat,
+        ..
+    } = verdict(st.step(at(2), &facts(T0 + 3 * MINUTE, &s, &ab)))
+    else {
+        panic!("b is delivered");
+    };
+    assert_eq!(
+        (identities.as_slice(), repeat),
+        (&["event:b".to_string()][..], 1)
+    );
+    st.step(
+        Event::EmitFailed(presentation),
+        &facts(T0 + 3 * MINUTE, &s, &ab),
+    );
+    let Verdict::Deliver { repeat, .. } = verdict(st.step(at(3), &facts(T0 + 4 * MINUTE, &s, &ab)))
+    else {
+        panic!("b is delivered again");
+    };
+    assert_eq!(repeat, 1, "the received item never ticks the count");
+}
+
+#[test]
+fn attendance_changes_no_verdict_for_codex_or_opencode() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    for tool in [Tool::Codex, Tool::OpenCode] {
+        let stop = || Event::TurnEnd(report(tool, TaskSnapshot::Known(vec![shell_task("b1")])));
+        let run = |attending: bool| {
+            let mut st = SessionState::new(s.clone());
+            let (p, _) = presented(verdict(st.step(stop(), &facts(T0, &s, &a))));
+            committed(st.step(Event::Delivered(p), &facts(T0, &s, &a)));
+            if attending {
+                st.step(
+                    attend(Selector::RunDesc("long build".into()), proof()),
+                    &facts(T0, &s, &a),
+                );
+            }
+            let v = verdict(st.step(stop(), &facts(T0 + MINUTE, &s, &a)));
+            (v, st)
+        };
+        let (attended, st) = run(true);
+        assert!(
+            matches!(&st.attendance, Attendance::Standing { .. }),
+            "{tool:?}"
+        );
+        assert_eq!(attended, run(false).0, "{tool:?}");
+        assert!(
+            matches!(&attended, Verdict::Deliver { identities, .. } if identities == &["event:a"]),
+            "{tool:?}: {attended:?}"
+        );
+    }
+}
+
+#[test]
+fn attendance_holds_recovery_only_while_everything_owed_was_received() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let st = received_then_attending(&s, &a);
+    let at = T0 + 2 * MINUTE;
+    assert_eq!(
+        st.recovery_quiet(&facts(at, &s, &a)),
+        Some(Quiet::Attending)
+    );
+    assert_eq!(
+        st.recovery_quiet(&facts(at, &s, &[])),
+        Some(Quiet::Attending)
+    );
+    assert_eq!(
+        st.recovery_quiet(&facts(at, &s, &ab)),
+        None,
+        "work never received stays recoverable"
     );
 }

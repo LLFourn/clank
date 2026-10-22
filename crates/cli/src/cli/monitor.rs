@@ -39,7 +39,9 @@ use clank_core::wait::WaitItem;
 // and control requests attend and clear.
 // 17 carries the exact answer an `unblocked` item delivers and receives it
 // on delivery; a 16 monitor sends neither and still teaches `block clean`.
-pub(crate) const PROTO: u32 = 17;
+// 18 parks an attending agent's turn-end instead of silencing it; a 17
+// monitor would leave it deaf to new work until its attendance ends.
+pub(crate) const PROTO: u32 = 18;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -3081,7 +3083,18 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 if owner {
                     let routes = recovery.check_in_routes();
                     let acts = recovery.due(crate::cli::recovery::unix_now(), |author, session| {
-                        recovery_gate(&repo, &clients, &mut turns, &routes, author, session)
+                        due_gate(
+                            &repo,
+                            &clients,
+                            &mut turns,
+                            &routes,
+                            folded_state.as_ref(),
+                            &hosted,
+                            &mut timer_backlogs,
+                            &pending,
+                            author,
+                            session,
+                        )
                     });
                     act_on_recovery(
                         &repo,
@@ -3098,7 +3111,15 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             // a veto.
             Wake::Authorize(a) => {
                 if owner {
-                    authorize(&repo, &clients, &hosted, &mut recovery, &mut turns, a);
+                    authorize(
+                        &repo,
+                        &clients,
+                        &hosted,
+                        &pending,
+                        &mut recovery,
+                        &mut turns,
+                        a,
+                    );
                 }
             }
             Wake::TurnsDue => {
@@ -3704,6 +3725,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                     &clients,
                                     &hosted,
                                     &mut timer_backlogs,
+                                    &pending,
                                     &mut turns,
                                     &routes,
                                 ),
@@ -3784,6 +3806,7 @@ fn recovery_facts(
     clients: &[Client],
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    pending: &[(AgentLabel, WaitItem)],
     turns: &mut crate::cli::turn_custody::Turns,
     routes: &Routes,
 ) -> Vec<crate::cli::recovery::Facts> {
@@ -3823,6 +3846,7 @@ fn recovery_facts(
                 &author,
                 hosted,
                 timer_backlogs,
+                pending,
                 &reviews,
                 head.as_ref(),
             )
@@ -3877,12 +3901,17 @@ fn identities(owed: &[WaitItem]) -> Vec<String> {
         .collect()
 }
 
+/// Everything `author` is owed: the repo's work, its sources' unshown rows
+/// and what `pending` holds for it from a source no log keeps, all through
+/// the one block-aware selection a waiting client is served by.
+#[allow(clippy::too_many_arguments)]
 fn owed_items(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
     author: &AgentLabel,
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    pending: &[(AgentLabel, WaitItem)],
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
 ) -> Vec<WaitItem> {
@@ -3914,6 +3943,12 @@ fn owed_items(
             })
             .owed(&mut shown),
     );
+    external.extend(
+        pending
+            .iter()
+            .filter(|(whose, _)| whose == author)
+            .map(|(_, item)| item.clone()),
+    );
     crate::cli::wait::owed_for(repo, author, &inputs, &status, &state.fold, &mut external)
 }
 
@@ -3944,10 +3979,34 @@ type RecoveryAnswer = (
     crate::cli::recovery::Answer,
 );
 
+/// [`recovery_gate`] for an attempt falling due, against the work the
+/// latest fold says is owed. Recovery reconciles only after a fold, so with
+/// none yet there is nothing it may act on.
+#[allow(clippy::too_many_arguments)]
+fn due_gate(
+    repo: &std::path::Path,
+    clients: &[Client],
+    turns: &mut crate::cli::turn_custody::Turns,
+    routes: &Routes,
+    state: Option<&crate::repo_state::RepoState>,
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    pending: &[(AgentLabel, WaitItem)],
+    author: &AgentLabel,
+    session: &str,
+) -> crate::cli::recovery::Gate {
+    let Some(state) = state else {
+        return crate::cli::recovery::Gate::Hold;
+    };
+    let owed = owed_now(repo, state, author, hosted, timer_backlogs, pending);
+    recovery_gate(repo, clients, turns, routes, author, session, &owed)
+}
+
 /// Whether a due recovery attempt may go ahead now, from the agent as it
 /// is at this moment rather than at the last fold: never over a pending
-/// question or a live attendance, and never once a deliverer, a new
-/// binding or auto mode turned off has made it someone else's call.
+/// question or an attendance that quiets all of `owed`, and never once a
+/// deliverer, a new binding or auto mode turned off has made it someone
+/// else's call. `owed` is what the agent is owed now, never a stand-in.
 fn recovery_gate(
     repo: &std::path::Path,
     clients: &[Client],
@@ -3955,6 +4014,7 @@ fn recovery_gate(
     routes: &Routes,
     author: &AgentLabel,
     session: &str,
+    owed: &[WaitItem],
 ) -> crate::cli::recovery::Gate {
     use crate::cli::recovery::Gate;
     let Ok(Some(cfg)) = crate::agent_store::load_agent_config(repo, author) else {
@@ -3979,7 +4039,13 @@ fn recovery_gate(
     {
         return Gate::AutoOff;
     }
-    let g = crate::cli::turn_custody::Gathered::of(repo, author, None, route_of(routes, author));
+    let cwd = std::env::current_dir().ok();
+    let g = crate::cli::turn_custody::Gathered::of(
+        repo,
+        author,
+        Some((owed, cwd.as_deref())),
+        route_of(routes, author),
+    );
     match turns.recovery_quiet(author, &g) {
         Some(_) => Gate::Hold,
         None => Gate::Go,
@@ -4035,11 +4101,12 @@ fn authorize(
     repo: &std::path::Path,
     clients: &[Client],
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    pending: &[(AgentLabel, WaitItem)],
     recovery: &mut crate::cli::recovery::Driver,
     turns: &mut crate::cli::turn_custody::Turns,
     a: Authorize,
 ) {
-    let allowed = may_send_now(repo, clients, hosted, recovery, turns, &a);
+    let allowed = may_send_now(repo, clients, hosted, pending, recovery, turns, &a);
     let _ = a.reply.send(allowed);
 }
 
@@ -4056,16 +4123,17 @@ fn may_send_now(
     repo: &std::path::Path,
     clients: &[Client],
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    pending: &[(AgentLabel, WaitItem)],
     recovery: &mut crate::cli::recovery::Driver,
     turns: &mut crate::cli::turn_custody::Turns,
     a: &Authorize,
 ) -> bool {
     let routes = recovery.check_in_routes();
-    if recovery_gate(repo, clients, turns, &routes, &a.author, &a.attempt.session)
-        != crate::cli::recovery::Gate::Go
-    {
+    let Some((crate::cli::recovery::Gate::Go, owed)) =
+        last_look(repo, clients, hosted, pending, turns, &routes, a)
+    else {
         return false;
-    }
+    };
     if let Some((tool, screen)) = &a.screen
         && screen
             .as_deref()
@@ -4074,12 +4142,37 @@ fn may_send_now(
     {
         return false;
     }
-    let (Ok(role), Some(state)) = (
-        crate::agent_store::resolve_role(repo, &a.author),
-        a.state.as_ref(),
-    ) else {
+    let Ok(role) = crate::agent_store::resolve_role(repo, &a.author) else {
         return false;
     };
+    let live = crate::cli::recovery::Live {
+        role: role.to_string(),
+        work: identities(&owed),
+        bound: crate::agent_store::load_agent_config(repo, &a.author)
+            .ok()
+            .flatten()
+            .and_then(|c| c.session)
+            .as_ref()
+            .map(crate::cli::recovery::Bound::of),
+        transport: a.transport,
+        process: a.process.clone(),
+    };
+    recovery.may_send(&a.author, &a.attempt, &live)
+}
+
+/// The deadline's gate asked again at the last look, against the work
+/// derived from the repo as folded for this send, and that work. `None`
+/// when the send carries no fold.
+fn last_look(
+    repo: &std::path::Path,
+    clients: &[Client],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    pending: &[(AgentLabel, WaitItem)],
+    turns: &mut crate::cli::turn_custody::Turns,
+    routes: &Routes,
+    a: &Authorize,
+) -> Option<(crate::cli::recovery::Gate, Vec<WaitItem>)> {
+    let state = a.state.as_ref()?;
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     // Read afresh, never the loop's cached backlog: a recurring occurrence
@@ -4097,22 +4190,20 @@ fn may_send_now(
         &a.author,
         hosted,
         &mut [(a.author.clone(), backlog)].into_iter().collect(),
+        pending,
         &reviews,
         head.as_ref(),
     );
-    let live = crate::cli::recovery::Live {
-        role: role.to_string(),
-        work: identities(&owed),
-        bound: crate::agent_store::load_agent_config(repo, &a.author)
-            .ok()
-            .flatten()
-            .and_then(|c| c.session)
-            .as_ref()
-            .map(crate::cli::recovery::Bound::of),
-        transport: a.transport,
-        process: a.process.clone(),
-    };
-    recovery.may_send(&a.author, &a.attempt, &live)
+    let gate = recovery_gate(
+        repo,
+        clients,
+        turns,
+        routes,
+        &a.author,
+        &a.attempt.session,
+        &owed,
+    );
+    Some((gate, owed))
 }
 
 /// A check-in's typing, prepared off the loop, asking the loop whether it
@@ -5562,6 +5653,7 @@ pub(crate) async fn publish_one_fold(repo: &std::path::Path) {
         &[],
         &Default::default(),
         &mut Default::default(),
+        &[],
         &mut turns,
         &Routes::new(),
     );
@@ -6609,22 +6701,16 @@ fn owed_now(
 ) -> Vec<WaitItem> {
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
-    let mut owed = owed_items(
+    owed_items(
         repo,
         state,
         author,
         hosted,
         timer_backlogs,
+        pending,
         &reviews,
         head.as_ref(),
-    );
-    owed.extend(
-        pending
-            .iter()
-            .filter(|(whose, _)| whose == author)
-            .map(|(_, item)| item.clone()),
-    );
-    owed
+    )
 }
 
 /// `author`'s facts now: owing what `state` says, when there is a state.
@@ -7155,6 +7241,7 @@ mod recovery_tests {
                 self.repo.path(),
                 clients,
                 &Default::default(),
+                &[],
                 &mut self.driver,
                 &mut crate::cli::turn_custody::Turns::new(self.repo.path().to_path_buf()),
                 a,
@@ -7567,6 +7654,7 @@ mod recovery_tests {
                 clients,
                 &Default::default(),
                 &mut Default::default(),
+                &[],
                 &mut turns.borrow_mut(),
                 &routes.borrow(),
             )
@@ -7628,6 +7716,7 @@ mod recovery_tests {
                 &codex,
                 &Default::default(),
                 &mut Default::default(),
+                &[],
                 &crate::fs_plan_state_lookup::FsPlanStateLookup::new(
                     repo.path(),
                     state.head.as_ref(),
@@ -7752,15 +7841,26 @@ mod recovery_tests {
             .borrow_mut()
             .answer(&codex, 99, &stop, true, &g)
             .unwrap();
-        assert_eq!(
-            frame.verdict,
-            crate::cli::turn_wire::WireVerdict::Silent {
-                why: clank_core::SilentReason::AttendingBackgroundTask
-            }
+        let presentation = frame
+            .presentation()
+            .unwrap_or_else(|| panic!("work never delivered is not quieted: {frame:?}"))
+            .clone();
+        assert!(
+            !facts(&[])[0].attending,
+            "nor does it hold recovery back before it is received"
         );
+        turns
+            .borrow_mut()
+            .result(
+                &codex,
+                99,
+                crate::cli::turn_wire::TurnResult::Delivered { presentation },
+                &g,
+            )
+            .unwrap();
         assert!(
             facts(&[])[0].attending,
-            "a qualifying attendance holds recovery back"
+            "a qualifying attendance holds recovery back over received work"
         );
         assert!(facts(&[])[0].projection.attended.is_some(), "and is shown");
         bind(clank_core::Tool::Codex, "session-three");
@@ -7800,6 +7900,7 @@ mod recovery_tests {
             &[],
             &Default::default(),
             &mut Default::default(),
+            &[],
             &mut turns.borrow_mut(),
             &routes.borrow(),
         );
@@ -7819,7 +7920,7 @@ mod recovery_tests {
             repo.path().to_path_buf(),
         ));
         let routes: Routes = [(codex.clone(), Ok(()))].into_iter().collect();
-        let gate_for = |clients: &[Client], session: &str| {
+        let gate_owing = |clients: &[Client], session: &str, owed: &[WaitItem]| {
             recovery_gate(
                 repo.path(),
                 clients,
@@ -7827,8 +7928,10 @@ mod recovery_tests {
                 &routes,
                 &codex,
                 session,
+                owed,
             )
         };
+        let gate_for = |clients: &[Client], session: &str| gate_owing(clients, session, &[]);
         let gate = |clients: &[Client]| gate_for(clients, "session-one");
         assert_eq!(gate(&[]), Gate::SessionChanged, "never bound");
         crate::agent_store::bind_session_to_agent(

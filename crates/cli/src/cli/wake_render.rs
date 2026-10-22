@@ -788,8 +788,8 @@ pub(crate) fn live_work_recipe(tasks: &clank_core::turn_policy::TaskSnapshot) ->
         .collect();
     (!live.is_empty()).then(|| {
         format!(
-            "\n\nYou have live background work ({}). To wait on it WITHOUT being woken, attend \
-             it and end your turn: {ATTEND_RECIPE}. Either takes `--expect 30m` when the work will \
+            "\n\nYou have live background work ({}). To wait on it without being woken again \
+             for what you have been shown, attend it and end your turn: {ATTEND_RECIPE}. Either takes `--expect 30m` when the work will \
              outlast the five-minute default; past that you are checked in on once, and nothing \
              is cancelled. Do not end your turn to poll it.",
             live.join(", ")

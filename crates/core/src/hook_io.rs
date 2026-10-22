@@ -341,9 +341,6 @@ silent_reasons! {
     /// The codex client that spawned this hook has exited; nobody is
     /// left to deliver to.
     OwnerGone,
-    /// The agent attends background work whose completion wakes it, and
-    /// the monitor can check in on it at its deadline.
-    AttendingBackgroundTask,
     /// A native handoff's `clank wait` already carries the next wake.
     WaitArmed,
 }

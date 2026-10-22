@@ -260,7 +260,7 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
 async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
     let (repo, author, state) = owed_repo().await;
     let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
-    let (mut turns, due_at) = silenced(repo.path(), &author, &state, &routes);
+    let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
     assert_eq!(turns.next_deadline(), Some(due_at));
     crate::agent_store::release_binding(
         repo.path(),
@@ -274,6 +274,7 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
         &[],
         &Default::default(),
         &mut Default::default(),
+        &[],
         &mut turns,
         &routes,
     );
@@ -293,7 +294,7 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
 async fn a_due_check_in_of_an_unbound_agent_is_not_due_again() {
     let (repo, author, state) = owed_repo().await;
     let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
-    let (mut turns, due_at) = silenced(repo.path(), &author, &state, &routes);
+    let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
     crate::agent_store::release_binding(
         repo.path(),
         &author,
@@ -382,9 +383,9 @@ fn listing_the_sleeper() -> Report {
     }
 }
 
-/// Attend the sleeper and prove it with a quiet Stop, from no turn state
-/// at all: the custody, and when its check-in is due.
-fn silenced(
+/// Attend the sleeper and prove it with a qualifying Stop, from no turn
+/// state at all: the custody, and when its check-in is due.
+fn attended(
     repo: &std::path::Path,
     author: &AgentLabel,
     state: &crate::repo_state::RepoState,
@@ -406,15 +407,9 @@ fn silenced(
         routes,
     );
     attend_sleeper(&mut turns, author, &g);
-    let frame = turns
+    turns
         .answer(author, 1, &listing_the_sleeper(), true, &g)
         .unwrap();
-    assert_eq!(
-        frame.verdict,
-        WireVerdict::Silent {
-            why: clank_core::SilentReason::AttendingBackgroundTask
-        }
-    );
     let due = turns.next_deadline().expect("a check-in is owed");
     (turns, due)
 }
@@ -486,7 +481,7 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
         ),
     ];
     for (change, refused) in cases {
-        let (mut turns, due_at) = silenced(repo.path(), &author, &state, &routes);
+        let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
         let due = turns
             .check_in(&author, &now().at(due_at))
             .expect("it fires");
@@ -551,7 +546,7 @@ async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
     let (repo, author, state) = owed_repo().await;
     let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let (recovery, _) = identified(repo.path(), &author);
-    let (mut turns, due_at) = silenced(repo.path(), &author, &state, &routes);
+    let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
     let now = |at: u64| {
         gather(
             repo.path(),
@@ -594,7 +589,15 @@ async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
 /// A repo whose master `claude` is bound to [`SESSION`] and owed one timer
 /// event, folded.
 async fn owed_repo() -> (TempRepo, AgentLabel, crate::repo_state::RepoState) {
-    use crate::cli::github::log::{EventLog, Transport as Wal};
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    (repo, author, state)
+}
+
+/// A repo whose master `claude` is bound to [`SESSION`] with a timer source
+/// whose event is not logged yet.
+fn timer_repo() -> (TempRepo, AgentLabel, clank_core::agent_config::TimerSource) {
     let repo = TempRepo::new();
     let author = AgentLabel::parse("claude").unwrap();
     crate::cli::agent::add_repo_roster_agent(
@@ -631,28 +634,41 @@ async fn owed_repo() -> (TempRepo, AgentLabel, crate::repo_state::RepoState) {
     )
     .unwrap();
     crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::On).unwrap();
-    let events = crate::agent_store::agents_root(repo.path()).join("claude/events");
+    (repo, author, timer)
+}
+
+fn log_timer_event(repo: &std::path::Path, timer: &clank_core::agent_config::TimerSource) {
+    log_timer_occurrence(repo, timer, 100, "scheduled work");
+}
+
+fn log_timer_occurrence(
+    repo: &std::path::Path,
+    timer: &clank_core::agent_config::TimerSource,
+    due_at: u64,
+    content: &str,
+) {
+    use crate::cli::github::log::{EventLog, Transport as Wal};
+    let events = crate::agent_store::agents_root(repo).join("claude/events");
     std::fs::create_dir_all(&events).unwrap();
+    let id = format!("timer/{due_at}");
     EventLog::open(&events, &timer.source_key(None))
         .unwrap()
         .append_inbox(
             Wal::Timer,
-            Some("timer/100"),
+            Some(&id),
             None,
-            Some(100),
+            Some(due_at),
             &WaitItem::TimerEvent {
                 presentation: None,
                 name: "check".into(),
                 recurrence: None,
-                id: "timer/100".into(),
-                due_at: 100,
-                content: "scheduled work".into(),
+                id: id.clone(),
+                due_at,
+                content: content.into(),
                 selector: None,
             },
         )
         .unwrap();
-    let state = folded(repo.path()).await.unwrap();
-    (repo, author, state)
 }
 
 fn stop_report() -> Report {
@@ -874,6 +890,245 @@ async fn a_verdict_and_its_result_travel_on_one_connection() {
     for writer in leaving {
         let _ = writer.await;
     }
+}
+
+/// An attending Claude agent's turn-end parks its hook's wait rather than
+/// ending it silently, so an event logged afterwards still wakes it, on
+/// the same parked connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attending_agents_turn_end_parks_and_a_later_event_wakes_it() {
+    let (repo, author, timer) = timer_repo();
+    let state = folded(repo.path()).await.unwrap();
+    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gather(
+        repo.path(),
+        Some(&state),
+        &author,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+        &routes,
+    );
+    attend_sleeper(&mut turns, &author, &g);
+    let serve_now = |clients: &mut Vec<Client>, state, turns: &mut Turns| {
+        serve_reports(
+            repo.path(),
+            clients,
+            Some(state),
+            None,
+            &[],
+            &mut Default::default(),
+            &Default::default(),
+            turns,
+            &routes,
+        )
+    };
+
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut hook = Hook::carrying(repo.path(), &author, &listing_the_sleeper(), ours);
+    let client = admitted(theirs, repo.path(), &heard_tx).await;
+    let conn = client.conn;
+    let mut clients = vec![client];
+    let _ = serve_now(&mut clients, &state, &mut turns);
+    let (parked, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
+        .await
+        .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park);
+    assert_eq!(clients.len(), 1, "the parked report is held");
+    assert!(turns.next_deadline().is_some(), "the attendance qualified");
+
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let leaving = serve_now(&mut clients, &state, &mut turns);
+    assert!(clients.is_empty(), "the wake retires the report");
+    let (woke, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
+        .await
+        .unwrap();
+    let presentation = woke.presentation().expect("the event is presented").clone();
+    assert!(
+        woke.rendered
+            .as_deref()
+            .is_some_and(|t| t.contains("scheduled work")),
+        "{woke:?}"
+    );
+    hook.answer(&TurnResult::Delivered { presentation });
+    let (from, _) = next_heard(&mut heard).await;
+    assert_eq!(from, conn);
+    hook.child.join().unwrap();
+    for writer in leaving {
+        let _ = writer.await;
+    }
+}
+
+/// Where work arriving after the park comes from.
+#[derive(Clone, Copy, Debug)]
+enum Later {
+    /// An event appended to the agent's log.
+    Logged,
+    /// An emission no log keeps, held by the monitor until delivered.
+    Pending,
+}
+
+/// Attendance holds recovery only over work the session received, from
+/// either source of later work. Work it received stays held; a healthy
+/// parked hook still owns the wake of work arriving after it parked; and
+/// once that hook is lost, the new work leaves the agent obligated and
+/// unquieted, so recovery's facts, the deadline's gate and the last look
+/// before a send all let recovery wake it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attendance_holds_recovery_only_over_work_the_session_received() {
+    recovery_after_a_lost_park(Later::Logged).await;
+    recovery_after_a_lost_park(Later::Pending).await;
+}
+
+async fn recovery_after_a_lost_park(later: Later) {
+    use crate::cli::recovery::Gate;
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gather(
+        repo.path(),
+        Some(&state),
+        &author,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+        &routes,
+    );
+    let shown = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
+    let presentation = shown.presentation().expect("presented").clone();
+    turns
+        .result(&author, 1, TurnResult::Delivered { presentation }, &g)
+        .unwrap();
+    attend_sleeper(&mut turns, &author, &g);
+    let parked = turns
+        .answer(&author, 2, &listing_the_sleeper(), true, &g)
+        .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park);
+
+    type Pending = [(AgentLabel, WaitItem)];
+    let facts = |state: &crate::repo_state::RepoState,
+                 pending: &Pending,
+                 clients: &[Client],
+                 turns: &mut Turns| {
+        let [facts] = recovery_facts(
+            repo.path(),
+            state,
+            clients,
+            &Default::default(),
+            &mut Default::default(),
+            pending,
+            turns,
+            &routes,
+        )
+        .try_into()
+        .unwrap();
+        facts
+    };
+    let look = |state: &crate::repo_state::RepoState,
+                pending: &Pending,
+                clients: &[Client],
+                turns: &mut Turns| {
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let ask = Authorize {
+            author: author.clone(),
+            attempt: crate::cli::recovery::AttemptRef {
+                session: SESSION.into(),
+                opened_by: "t1".into(),
+                n: 1,
+            },
+            screen: None,
+            process: None,
+            transport: crate::cli::recovery::Transport::Typed,
+            state: Some(state.clone()),
+            reply,
+        };
+        let last = last_look(
+            repo.path(),
+            clients,
+            &Default::default(),
+            pending,
+            turns,
+            &routes,
+            &ask,
+        )
+        .map(|(gate, _)| gate);
+        let due = due_gate(
+            repo.path(),
+            clients,
+            turns,
+            &routes,
+            Some(state),
+            &Default::default(),
+            &mut Default::default(),
+            pending,
+            &author,
+            SESSION,
+        );
+        assert_eq!(
+            last,
+            Some(due),
+            "{later:?}: the last look agrees with the deadline's gate"
+        );
+        last
+    };
+    let held = facts(&state, &[], &[], &mut turns);
+    assert!(held.obligated && held.attending, "received work: {held:?}");
+    assert_eq!(look(&state, &[], &[], &mut turns), Some(Gate::Hold));
+
+    let (heard_tx, _heard) = tokio::sync::mpsc::unbounded_channel();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let hook = Hook::carrying(repo.path(), &author, &listing_the_sleeper(), ours);
+    let mut clients = vec![admitted(theirs, repo.path(), &heard_tx).await];
+    let _ = serve_reports(
+        repo.path(),
+        &mut clients,
+        Some(&state),
+        None,
+        &[],
+        &mut Default::default(),
+        &Default::default(),
+        &mut turns,
+        &routes,
+    );
+    let (frame, hook) = tokio::task::spawn_blocking(move || {
+        let mut hook = hook;
+        (hook.frame(), hook)
+    })
+    .await
+    .unwrap();
+    assert_eq!(frame.verdict, WireVerdict::Park);
+
+    let (now, pending) = match later {
+        Later::Logged => {
+            log_timer_occurrence(repo.path(), &timer, 200, "later work");
+            (folded(repo.path()).await.unwrap(), Vec::new())
+        }
+        Later::Pending => (state.clone(), transient(&author)),
+    };
+    let owned = facts(&now, &pending, &clients, &mut turns);
+    assert!(
+        owned.delivering && !owned.obligated,
+        "{later:?}: the parked hook owns it: {owned:?}"
+    );
+    assert_eq!(
+        look(&now, &pending, &clients, &mut turns),
+        Some(Gate::Deliverer)
+    );
+
+    clients.clear();
+    drop(hook.stdin);
+    hook.child.join().unwrap();
+    let lost = facts(&now, &pending, &[], &mut turns);
+    assert!(
+        lost.obligated && !lost.attending,
+        "{later:?}: unseen work is recoverable: {lost:?}"
+    );
+    assert_eq!(look(&now, &pending, &[], &mut turns), Some(Gate::Go));
 }
 
 /// EOF on the hook's pipe before a result is a failed emit: the child
@@ -1140,11 +1395,11 @@ async fn check_in_through(
     finished.recv().await.unwrap()
 }
 
-/// A qualifying Claude attendance goes through a terminal silence to one
-/// typed check-in at its deadline; with the route lost by then, the
-/// check-in is recorded undeliverable and recovery takes the agent back.
+/// A qualifying Claude attendance owes one typed check-in at its deadline;
+/// with the route lost by then, the check-in is recorded undeliverable and
+/// recovery takes the agent back.
 #[tokio::test]
-async fn a_silenced_attendance_is_checked_in_on_by_typing_once() {
+async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
     let (repo, author, state) = owed_repo().await;
     let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let mut turns = Turns::new(repo.path().to_path_buf());
@@ -1186,12 +1441,9 @@ async fn a_silenced_attendance_is_checked_in_on_by_typing_once() {
         questions: Vec::new(),
     };
     let frame = turns.answer(&author, 1, &listed, true, &g).unwrap();
-    assert_eq!(
-        frame.verdict,
-        WireVerdict::Silent {
-            why: clank_core::SilentReason::AttendingBackgroundTask
-        },
-        "owed work and all, the attendance quiets the Stop"
+    assert!(
+        frame.presentation().is_some(),
+        "owed work it never received is delivered, attending or not: {frame:?}"
     );
     let due_at = turns.next_deadline().expect("a check-in is owed");
 

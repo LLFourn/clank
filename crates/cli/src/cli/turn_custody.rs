@@ -430,12 +430,18 @@ impl Turns {
         let frame = match verdict {
             Verdict::Deliver {
                 presentation,
+                identities,
                 repeat,
                 escalated,
                 notice,
-                ..
             } => {
-                let items: Vec<&WaitItem> = g.owed.iter().flatten().map(|(_, item)| item).collect();
+                let items: Vec<&WaitItem> = g
+                    .owed
+                    .iter()
+                    .flatten()
+                    .filter(|(owed, _)| identities.contains(&owed.identity))
+                    .map(|(_, item)| item)
+                    .collect();
                 let role = g.role.clone().unwrap_or(Role::Reviewer);
                 let mut text = super::wake_render::render_wait_items_ref(&items, author, role);
                 if let Report::TurnEnd { stop, .. } = report
@@ -600,9 +606,9 @@ impl Turns {
             Some(Output::Attend(AttendReply::Accepted)) => {
                 let (selector, expect) = said.expect("an accepted attend names its selector");
                 Ok(format!(
-                    "attending {} from your next turn-end: while it is listed running, that \
-                     turn-end stays quiet; if it is still going after {} you are checked in on \
-                     once",
+                    "attending {} from your next turn-end: while it is listed running, work \
+                     you have already been shown stays quiet and new work still wakes you; if \
+                     it is still going after {} you are checked in on once",
                     selector_words(&selector),
                     super::attend::duration_arg(expect / 1000),
                 ))
@@ -769,7 +775,6 @@ pub(crate) fn frame_of(verdict: Verdict) -> Frame {
             why: match why {
                 SilentWhy::StaleBinding => SilentReason::StaleBinding,
                 SilentWhy::AutoOff => SilentReason::AutoOff,
-                SilentWhy::Attending { .. } => SilentReason::AttendingBackgroundTask,
                 SilentWhy::WaitArmed => SilentReason::WaitArmed,
             },
         }),

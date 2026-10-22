@@ -168,8 +168,8 @@ impl TaskKind {
     }
 }
 
-/// The one check-in an attendance can owe. It is owed only once the
-/// attendance has quieted a turn-end: one that never qualified silenced
+/// The one check-in an attendance can owe. It is armed only once the
+/// attendance has qualified at a turn-end: one that never qualified quieted
 /// nothing, so no wake was handed to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckIn {
@@ -448,9 +448,6 @@ impl From<&BackgroundTask> for TaskSummary {
 pub enum SilentWhy {
     StaleBinding,
     AutoOff,
-    Attending {
-        task_id: String,
-    },
     /// A native handoff's wait already carries the agent's next wake.
     WaitArmed,
 }
@@ -608,6 +605,10 @@ pub struct Persisted {
     pub outstanding_episode_broken: bool,
     pub resolved: Option<(PresentationId, Resolution)>,
     pub next_seq: u64,
+    /// State saved before receipt evidence was kept has none, so nothing
+    /// it owes is quiet.
+    #[serde(default)]
+    pub received: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,6 +632,10 @@ pub struct SessionState {
     /// result is told apart from a result no connection could send.
     pub resolved: Option<(PresentationId, Resolution)>,
     pub next_seq: u64,
+    /// The identities of owed work a presentation on this binding was
+    /// `Delivered` with, sorted: the only work a qualifying attendance may
+    /// quiet. Never wider than what is still owed.
+    pub received: Vec<String>,
 }
 
 impl SessionState {
@@ -645,6 +650,7 @@ impl SessionState {
             outstanding_episode_broken: false,
             resolved: None,
             next_seq: 0,
+            received: Vec::new(),
         }
     }
 
@@ -657,6 +663,7 @@ impl SessionState {
             outstanding_episode_broken: self.outstanding_episode_broken,
             resolved: self.resolved.clone(),
             next_seq: self.next_seq,
+            received: self.received.clone(),
         }
     }
 
@@ -668,6 +675,9 @@ impl SessionState {
             Some(lost) => Some((lost.id.clone(), Resolution::Failed)),
             None => p.resolved,
         };
+        let mut received = p.received;
+        received.sort();
+        received.dedup();
         Self {
             binding: p.binding,
             attendance: p.attendance,
@@ -678,12 +688,13 @@ impl SessionState {
             outstanding_episode_broken: false,
             resolved,
             next_seq: p.next_seq,
+            received,
         }
     }
 
     /// A new binding owns nothing of the old one's: its attendance,
-    /// outstanding presentation and repeat count all described another
-    /// session.
+    /// outstanding presentation, repeat count and received work all
+    /// described another session.
     pub fn rebind(&mut self, binding: SessionId) {
         if self.binding != binding {
             *self = Self::new(binding);
@@ -710,6 +721,7 @@ impl SessionState {
     }
 
     pub fn step(&mut self, event: Event, facts: &Facts<'_>) -> Output {
+        self.prune_received(facts);
         self.forget_stale_repeat(facts);
         let out = match event {
             Event::TurnEnd(report) => Output::Verdict(self.turn_end(report, facts)),
@@ -725,19 +737,57 @@ impl SessionState {
             Event::SessionStart(session) => Output::Verdict(self.session_start(session, facts)),
             Event::Observed => Output::Effects(Vec::new()),
         };
+        self.prune_received(facts);
         self.forget_stale_repeat(facts);
         out
     }
 
-    /// Today's `forget_if_stale`: a count describes one unbroken run of the
-    /// same owed items, so any observed change, including nothing owed,
-    /// ends it. Every step's facts are read when it is evaluated, so a
-    /// result arriving late is judged by the work owed when it arrives.
-    fn forget_stale_repeat(&mut self, facts: &Facts<'_>) {
+    /// Evidence for work no longer owed can quiet nothing.
+    fn prune_received(&mut self, facts: &Facts<'_>) {
         if !self.bound(facts) {
             return;
         }
         let owed = owed_identities(facts.owed);
+        self.received.retain(|identity| owed.contains(identity));
+    }
+
+    /// The owed work any presentation may carry now. While the attendance
+    /// qualifies that is what this binding has not received; otherwise it
+    /// is everything owed. Every presenting path and the repeat episode
+    /// read this and nothing else, so quieted work is never presented and
+    /// never counted.
+    fn deliverable(&self, facts: &Facts<'_>) -> Vec<OwedItem> {
+        let quieting = self.quieting(facts);
+        facts
+            .owed
+            .iter()
+            .filter(|o| !quieting || self.received.binary_search(&o.identity).is_err())
+            .cloned()
+            .collect()
+    }
+
+    fn quieting(&self, facts: &Facts<'_>) -> bool {
+        self.tool.is_some_and(|tool| {
+            qualifies(&self.attendance, tool, self.snapshot.as_ref(), facts) == Qualifies::Yes
+        })
+    }
+
+    /// Ending an attendance releases what it quieted: that work is
+    /// presented again before any later attendance can quiet it.
+    fn release_received(&mut self) {
+        self.received.clear();
+    }
+
+    /// Today's `forget_if_stale`: a count describes one unbroken run of the
+    /// same deliverable items, so any observed change, including nothing
+    /// deliverable, ends it. Every step's facts are read when it is
+    /// evaluated, so a result arriving late is judged by the work owed when
+    /// it arrives.
+    fn forget_stale_repeat(&mut self, facts: &Facts<'_>) {
+        if !self.bound(facts) {
+            return;
+        }
+        let owed = owed_identities(&self.deliverable(facts));
         if self
             .outstanding
             .as_ref()
@@ -764,19 +814,16 @@ impl SessionState {
 
         match qualifies(&self.attendance, report.tool, self.snapshot.as_ref(), facts) {
             Qualifies::Yes => {
-                if let Attendance::Standing {
-                    task_id, check_in, ..
-                } = &mut self.attendance
+                if let Attendance::Standing { check_in, .. } = &mut self.attendance
+                    && *check_in == CheckIn::Unarmed
                 {
-                    if *check_in == CheckIn::Unarmed {
-                        *check_in = CheckIn::Armed;
-                    }
-                    return Verdict::Silent(SilentWhy::Attending {
-                        task_id: task_id.clone(),
-                    });
+                    *check_in = CheckIn::Armed;
                 }
             }
-            Qualifies::Ended => self.attendance = Attendance::None,
+            Qualifies::Ended => {
+                self.attendance = Attendance::None;
+                self.release_received();
+            }
             Qualifies::No(_) => {}
         }
 
@@ -809,22 +856,25 @@ impl SessionState {
         self.deliver_or_park(facts, None, None)
     }
 
-    /// The owed work as one new presentation, or Park when nothing is owed
-    /// or another presentation is in flight. `place` is the Stop it counts
-    /// against; without one it is not counted.
+    /// The [`deliverable`](Self::deliverable) work as one new
+    /// presentation, or Park when none is or another presentation is in
+    /// flight. A park keeps the hook's wait armed, so work that arrives
+    /// later still wakes the agent. `place` is the Stop it counts against;
+    /// without one it is not counted.
     fn deliver_or_park(
         &mut self,
         facts: &Facts<'_>,
         place: Option<&TurnPlace>,
         mut notice: Option<Notice>,
     ) -> Verdict {
-        if facts.owed.is_empty() || self.outstanding.is_some() {
+        let deliverable = self.deliverable(facts);
+        if deliverable.is_empty() || self.outstanding.is_some() {
             return match notice.take() {
                 Some(n) => Verdict::Notify(n),
                 None => Verdict::Park,
             };
         }
-        let p = self.present(facts.owed, place);
+        let p = self.present(&deliverable, place);
         let repeat = p.repeat.count();
         let verdict = Verdict::Deliver {
             presentation: p.id.clone(),
@@ -937,6 +987,9 @@ impl SessionState {
                 shell,
                 ..
             } => {
+                if self.attendance != Attendance::None {
+                    self.release_received();
+                }
                 self.attendance = Attendance::Intent {
                     selector,
                     desc,
@@ -948,6 +1001,9 @@ impl SessionState {
             }
             AttendRequest::Clear { .. } => {
                 let had = self.attendance != Attendance::None;
+                if had {
+                    self.release_received();
+                }
                 self.attendance = Attendance::None;
                 AttendReply::Cleared { had }
             }
@@ -956,7 +1012,8 @@ impl SessionState {
 
     /// Settle the in-flight presentation with its one result. A success
     /// commits its receipts and its repeat decision, which was made
-    /// against the record nothing could replace while it was in flight.
+    /// against the record nothing could replace while it was in flight,
+    /// and is the only evidence that its work was received.
     fn settle(&mut self, id: PresentationId, how: Resolution, facts: &Facts<'_>) -> ResultOutcome {
         if !self.bound(facts) {
             return ResultOutcome::ProtocolViolation(id);
@@ -972,6 +1029,11 @@ impl SessionState {
         let broken = std::mem::take(&mut self.outstanding_episode_broken);
         if how == Resolution::Failed {
             return ResultOutcome::Resolved(Vec::new());
+        }
+        for identity in p.identities {
+            if let Err(at) = self.received.binary_search(&identity) {
+                self.received.insert(at, identity);
+            }
         }
         let mut effects = vec![Effect::CommitReceipts(p.receipts)];
         if let RepeatDecision::Counted(next) = p.repeat {
@@ -1071,8 +1133,10 @@ impl SessionState {
     }
 
     /// Why recovery must leave this agent alone, if it must. Recovery has
-    /// no rule of its own: attendance is [`qualifies`] on the latest
-    /// listing.
+    /// no rule of its own: attendance holds it only while it quiets every
+    /// owed item, by the same deliverable projection a turn-end presents
+    /// from, so work the session never received stays recoverable.
+    /// `facts.owed` must be the work actually owed: none owed is quiet.
     pub fn recovery_quiet(&self, facts: &Facts<'_>) -> Option<Quiet> {
         if !self.bound(facts) {
             return None;
@@ -1083,9 +1147,7 @@ impl SessionState {
         if facts.asking {
             return Some(Quiet::Asking);
         }
-        let tool = self.tool?;
-        (qualifies(&self.attendance, tool, self.snapshot.as_ref(), facts) == Qualifies::Yes)
-            .then_some(Quiet::Attending)
+        (self.quieting(facts) && self.deliverable(facts).is_empty()).then_some(Quiet::Attending)
     }
 }
 

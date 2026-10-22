@@ -1,5 +1,6 @@
 //! `clank attend <name>` — tell the monitor which background work this
-//! agent is waiting on, so its turn-ends stay quiet while that work runs.
+//! agent is waiting on, so work it has already been shown does not wake it
+//! again while that work runs. New work still wakes it.
 //!
 //! The request is an INTENT. The monitor resolves it against the next
 //! turn-end's listing of live background work: a subagent by its name, or
