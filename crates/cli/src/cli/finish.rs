@@ -475,7 +475,7 @@ async fn rewrite_or_assess(
 ///
 /// `force` waives ONLY review-gate blockers — `NotFinished` in any
 /// state except `Blocked` (an open human block is a pending question,
-/// not a review verdict; answer or clean it first). Safety blockers
+/// not a review verdict; it must be answered first). Safety blockers
 /// (dirty/missing plan file, no reviewable commit) always stand, and
 /// EVERY reason must be waivable or the whole finish refuses — force
 /// never partially applies (tui-plan-actions-page).
@@ -557,7 +557,7 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
             }
         },
         FinalizeBlockReason::OpenBlock => {
-            "plan has an open block — answer it (or `clank block clean`) before finalize; \
+            "plan has an unanswered block — the human must answer it before finalize; \
              `--force` does not bypass blocks"
                 .into()
         }

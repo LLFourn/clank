@@ -97,7 +97,8 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   always repo-wide: while one is pending the review cycle pauses (no
   promote, review or finish work), though messages and events still
   wake you. Raise one only when you genuinely cannot proceed.
-  `clank block clean` acknowledges answered blocks.
+  The human's answer arrives in your next wake, and that wake is its
+  receipt: there is nothing to acknowledge or clean.
 
 ### Extra wake sources (controller repos)
 

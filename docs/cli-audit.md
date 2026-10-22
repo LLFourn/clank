@@ -547,7 +547,7 @@ Generated. Do not edit by hand.
 | `block ask` | action |  |  | Ask the human a question, and wait for the answer | <NAME> | -m (required) --author --repo |
 | `block create` | action | hidden |  | The old spelling of `block ask` | <NAME> | -m (required) --author --repo |
 | `block answer` | action |  |  | Answer an agent's question | <AGENT> <NAME> | -m (required) --repo |
-| `block clean` | action |  |  | Remove answered block+unblock pairs for this agent |  | --repo |
+| `block clean` | action |  |  | Tidy away this agent's received answers and leftover answer files |  | --repo |
 | `block migrate` | action | hidden |  | Flatten legacy plan-scoped blocks to the repo-wide layout |  | --dry-run --repo |
 | `unblock` | action | hidden |  | The old spelling of `block answer` | <AGENT> <NAME> | -m (required) --repo |
 | `attend` | action |  | attending | Tell clank which background work you are waiting on | [NAME] | --pid --desc --expect --clear --author --repo |

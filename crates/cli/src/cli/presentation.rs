@@ -1,7 +1,41 @@
 //! Persist only successful model-delivery boundaries, independently of callbacks.
 //! Selection metadata travels with work; viewing the inbox never calls this.
-use clank_core::{AgentLabel, wait::EventPresentation};
+use clank_core::{
+    AgentLabel,
+    wait::{AnswerRef, EventPresentation},
+};
 use std::{collections::BTreeMap, path::Path};
+
+/// What one presentation carried to the model.
+#[derive(Debug, Default)]
+pub(crate) struct Carried {
+    pub(crate) events: Vec<EventPresentation>,
+    pub(crate) answers: Vec<AnswerRef>,
+}
+
+/// The one record of a wake that reached the model: its events are
+/// presented and its answers received, each only while `current` holds.
+pub(crate) fn record_delivered(
+    repo: &Path,
+    author: &AgentLabel,
+    carried: &Carried,
+    current: impl Fn() -> bool,
+) {
+    record(repo, author, &carried.events, &current);
+    for answer in &carried.answers {
+        // A presentation speaks for its own agent's blocks only.
+        if &answer.agent != author {
+            continue;
+        }
+        if let Err(e) = super::block::receive(repo, answer, &current) {
+            eprintln!(
+                "clank: wake delivered; could not receive the answer to `{}/{}`, so it stays \
+                 owed: {e:#}",
+                answer.agent, answer.name
+            );
+        }
+    }
+}
 
 pub(crate) fn record(
     repo: &Path,

@@ -513,12 +513,14 @@ impl serde::Serialize for Answerable<'_> {
         let crate::cli::block::BlockEntry {
             agent,
             name,
+            occurrence,
             question,
             answer,
         } = self.0;
-        let mut m = s.serialize_map(Some(5))?;
+        let mut m = s.serialize_map(Some(6))?;
         m.serialize_entry("agent", agent)?;
         m.serialize_entry("name", name)?;
+        m.serialize_entry("occurrence", occurrence)?;
         m.serialize_entry("question", question)?;
         m.serialize_entry("answer", answer)?;
         m.serialize_entry("pending", &answer.is_none())?;
@@ -2945,6 +2947,7 @@ mod dirty_and_wake_tests {
                 name: "q".to_string(),
                 question: "why?".to_string(),
                 answer: None,
+                occurrence: None,
             }],
             queue: Vec::new(),
             drafts: Vec::new(),
@@ -3028,6 +3031,7 @@ mod dirty_and_wake_tests {
             "blocks": [{
                 "agent": "codex",
                 "name": "q",
+                "occurrence": null,
                 "question": "why?",
                 "answer": null,
                 "pending": true,

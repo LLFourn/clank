@@ -1903,7 +1903,7 @@ pub enum BlockCmd {
     Create(BlockCreateArgs),
     /// Answer an agent's question
     Answer(UnblockArgs),
-    /// Remove answered block+unblock pairs for this agent.
+    /// Tidy away this agent's received answers and leftover answer files.
     Clean(BlockCleanArgs),
     /// Flatten legacy plan-scoped blocks to the repo-wide layout.
     #[command(hide = true)]

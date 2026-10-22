@@ -554,6 +554,7 @@ mod tests {
             name: "q".into(),
             question: "halt?".into(),
             answer: None,
+            occurrence: None,
         }];
         assert_eq!(
             attention_state(&s),
@@ -573,6 +574,7 @@ mod tests {
             name: "q".into(),
             question: "halt?".into(),
             answer: None,
+            occurrence: None,
         }];
         vec![
             ("blocked", blocked),
@@ -699,6 +701,7 @@ mod tests {
             name: "q".into(),
             question: "halt?".into(),
             answer: None,
+            occurrence: None,
         }];
         assert_eq!(
             attention_state(&blocked),

@@ -263,3 +263,59 @@ async fn a_source_item_reaching_a_blocked_park_arrives_with_its_context() {
         "one row, however many routes carried it: {items:?}"
     );
 }
+
+/// Inspection never receives or stamps. A peek and a status snapshot
+/// read an answered pair, legacy and current alike, and leave every
+/// byte where it was: still owed, with no receipt.
+#[tokio::test]
+async fn inspecting_an_answer_receives_nothing() {
+    let env = idle_env();
+    let repo = env.repo();
+    block(repo, "master", "legacy", "should I?");
+    write(repo, ".clank/agents/master/unblocks/legacy.md", "yes");
+    clank::cli::block::run(clank::cli::BlockArgs {
+        command: clank::cli::BlockCmd::Ask(clank::cli::BlockCreateArgs {
+            name: "current".into(),
+            message: "and this?".into(),
+            author: Some("master".into()),
+            repo: Some(repo.to_path_buf()),
+        }),
+    })
+    .await
+    .unwrap();
+    clank::cli::block::run_unblock(clank::cli::UnblockArgs {
+        agent: "master".into(),
+        name: "current".into(),
+        message: "no".into(),
+        repo: Some(repo.to_path_buf()),
+    })
+    .await
+    .unwrap();
+    let snapshot = || {
+        let mut files: Vec<(std::path::PathBuf, Vec<u8>)> = ["blocks", "unblocks"]
+            .iter()
+            .flat_map(|d| std::fs::read_dir(repo.join(".clank/agents/master").join(d)).unwrap())
+            .flatten()
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap()))
+            .collect();
+        files.sort();
+        files
+    };
+    let before = snapshot();
+
+    for _ in 0..2 {
+        let items = peek(repo, "master").await;
+        assert_eq!(kinds(&items), vec!["unblocked"], "{items:?}");
+    }
+    let status =
+        serde_json::to_value(clank::cli::status::snapshot(repo, None).await.unwrap()).unwrap();
+    let answered = status["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["pending"] == false)
+        .count();
+    assert_eq!(answered, 2, "{status}");
+
+    assert_eq!(snapshot(), before, "inspection wrote nothing");
+}

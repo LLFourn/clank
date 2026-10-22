@@ -626,10 +626,12 @@ async fn feature_parity() {
         ),
         (
             "blocks/answer",
-            serde_json::json!({"agent":"grok","name":"question","question":"expected?","answer":"yes"}),
+            serde_json::json!({"agent":"grok","name":"question",
+                "occurrence":"0123456789abcdef0123456789abcdef","question":"expected?","answer":"yes"}),
             BrowserRequest::BlockAnswer {
                 agent: "grok".into(),
                 name: "question".into(),
+                occurrence: Some("0123456789abcdef0123456789abcdef".into()),
                 question: "expected?".into(),
                 answer: "yes".into(),
             },

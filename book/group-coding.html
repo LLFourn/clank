@@ -104,8 +104,8 @@ clank feedback read --plan</code></pre>
 <p>An agent that needs a decision it must not make itself asks for one:</p>
 <pre><code>clank block ask schema-choice -m "Keep the v1 config readable, or migrate it on first load?"</code></pre>
 <p>A block is repo-wide. While it is unanswered, the review cycle pauses for the whole team. Messages and events are still delivered. You answer it, naming the agent and the block, and the answer wakes the agent:</p>
-<pre><code>clank block answer alice schema-choice -m "Migrate on first load, and keep a backup."
-clank block clean</code></pre>
+<pre><code>clank block answer alice schema-choice -m "Migrate on first load, and keep a backup."</code></pre>
+<p>The wake that carries the answer is its receipt. Once it reaches the agent, the block is over, and nobody has to acknowledge it.</p>
 <p>Blocks are for real dependencies on you, such as contested reviews, a plan drifting from what you asked for, or work that looks unwise. A queued plan is an instruction, not a question, so the master never blocks to ask permission to do queued work. Set <code>hooks.blocked</code> to a command, such as a desktop notification, and clank runs it whenever an agent blocks.</p>
 
 <h2 id="watching">Watching it happen</h2>

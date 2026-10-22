@@ -234,6 +234,36 @@ const clickUnavailableChat = async (page) => {
     await browser.close();
   }
 
+  // ---- an answer landing late clears only the ask it answered, never a re-ask of its name
+  {
+    const { browser, page, errors } = await open();
+    await page.evaluate(() => {
+      window.fetch = (url, opts) => {
+        window.__frames.push([url, opts && opts.body]);
+        return new Promise((resolve) => { window.__finish = () => resolve({ ok: true, status: 204 }); });
+      };
+    });
+    const frame = (occurrence) => facts([agent('claude', 'reviewer')], {
+      ledger: { plan: 'foo', gate: 'unreviewed', dirty: null, queue: [], stash: 0,
+        blocks: [{ agent: 'claude', name: 'which-option', occurrence, question: 'Which option?' }], rows: [] },
+    });
+    await page.evaluate((d) => window.__send('status', d), frame('ask-a'));
+    await page.fill('#strip textarea', 'The first.');
+    await page.click('#strip button[type=submit]');
+    await page.waitForFunction(() => typeof window.__finish === 'function');
+    await page.evaluate((d) => window.__send('status', d), frame('ask-b'));
+    await page.evaluate(() => window.__finish());
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    const sent = await page.evaluate(() => JSON.parse(window.__frames.find((f) => f[0] === '/blocks/answer')[1]));
+    const form = page.locator('#strip form.block');
+    ok('a late answer for one ask leaves its re-ask pending and answerable',
+       sent.occurrence === 'ask-a' && await form.count() === 1
+       && await form.getAttribute('data-occurrence') === 'ask-b'
+       && await page.locator('#strip textarea').count() === 1 && !(await page.locator('#strip').isHidden()));
+    ok('late answer has no script errors', errors.length === 0, errors.join('; '));
+    await browser.close();
+  }
+
   // ---- Timeline is a peer of Chat and terminal on a phone
   {
     const { browser, page, errors } = await open();

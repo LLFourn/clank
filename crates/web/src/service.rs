@@ -445,6 +445,7 @@ struct ReopenInput {
 struct BlockInput {
     agent: String,
     name: String,
+    occurrence: Option<String>,
     question: String,
     answer: String,
 }
@@ -494,6 +495,7 @@ fn parse_action(path: &str, bytes: &[u8]) -> anyhow::Result<BrowserRequest> {
             BrowserRequest::BlockAnswer {
                 agent: input.agent,
                 name: input.name,
+                occurrence: input.occurrence,
                 question: input.question,
                 answer: input.answer,
             }
@@ -758,6 +760,32 @@ mod tests {
         wrong["id"] = serde_json::json!(7);
         assert!(
             super::parse_action("questions/answer", &serde_json::to_vec(&wrong).unwrap()).is_err()
+        );
+    }
+
+    /// The form returns the ask it showed, so the backend can refuse it
+    /// once that ask is replaced; a page from before occurrences sends none.
+    #[test]
+    fn a_block_answer_carries_the_ask_its_form_showed() {
+        let parse = |body: serde_json::Value| match super::parse_action(
+            "blocks/answer",
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+        {
+            crate::request::BrowserRequest::BlockAnswer { occurrence, .. } => occurrence,
+            other => panic!("block answer: {other:?}"),
+        };
+        assert_eq!(
+            parse(
+                serde_json::json!({"agent":"a","name":"q","occurrence":"abc",
+                "question":"?","answer":"yes"})
+            ),
+            Some("abc".into())
+        );
+        assert_eq!(
+            parse(serde_json::json!({"agent":"a","name":"q","question":"?","answer":"yes"})),
+            None
         );
     }
     use std::convert::Infallible;

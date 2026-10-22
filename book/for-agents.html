@@ -81,7 +81,7 @@ clank feedback read --plan</code></pre>
 </table>
 </div>
 <p>Reviewers: review only committable artifacts, and write exactly one verdict per commit you are handed, then stop. When several findings share a cause, lead with the model that is wrong, not the list of symptoms.</p>
-<p>Masters: commit, stop and get woken, every time. Never finalize on your own judgment. Gate on reviewers, not humans. Raise <code>clank block ask</code> only when you truly cannot proceed without a person.</p>
+<p>Masters: commit, stop and get woken, every time. Never finalize on your own judgment. Gate on reviewers, not humans. Raise <code>clank block ask</code> only when you truly cannot proceed without a person. The answer arrives in your next wake, and that wake is its receipt, so there is nothing to acknowledge or clean.</p>
 
 <h2 id="stuck">When something seems wrong</h2>
 <p>Run <code>clank doctor</code>. It checks your session’s binding, your role and your tool’s hooks, and says what to fix. <code>clank auto status</code> shows your auto-mode and roster role.</p>

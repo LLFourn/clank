@@ -264,22 +264,45 @@ async fn run_automatic_grok(
             .await?;
         match wake {
             Shared::Woke(items, cwd) => {
-                binding.ensure_current(repo, author)?;
-                emit_checked(&items, args.json, cwd.as_deref(), &mut std::io::stdout())?;
-                let selected = items
-                    .iter()
-                    .filter_map(|item| item.presentation().cloned())
-                    .collect::<Vec<_>>();
-                super::presentation::record(repo, author, &selected, || {
-                    binding.ensure_current(repo, author).is_ok()
-                });
-                return Ok(());
+                return deliver_grok_wake(
+                    repo,
+                    author,
+                    binding,
+                    &items,
+                    args.json,
+                    cwd.as_deref(),
+                    &mut std::io::stdout(),
+                );
             }
             // Reattach only after a real disconnect or the existing monitor
             // liveness deadline. No polling, helper or Grok registration timer.
             Shared::Alone(why) => tracing::debug!(%why, "reconnecting Grok wait"),
         }
     }
+}
+
+/// Grok's delivery boundary: the wake is printed, and only once the
+/// output landed, while this session still holds the label, is what it
+/// carried recorded as delivered.
+fn deliver_grok_wake(
+    repo: &Path,
+    author: &AgentLabel,
+    binding: &WaitBinding,
+    items: &[WaitItem],
+    json: bool,
+    cwd: Option<&Path>,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    binding.ensure_current(repo, author)?;
+    emit_checked(items, json, cwd, out)?;
+    let mirrored = super::wake_render::mirror(items, cwd);
+    super::presentation::record_delivered(
+        repo,
+        author,
+        &super::wake_render::carried(&mirrored),
+        || binding.ensure_current(repo, author).is_ok(),
+    );
+    Ok(())
 }
 
 /// A token for one wait invocation. Monotonic within a process and
@@ -2190,6 +2213,12 @@ struct BlockResult {
     suppress_all: bool,
 }
 
+/// What `author`'s blocks contribute to a wake, as the monitor derives it.
+#[cfg(test)]
+pub(crate) fn block_items(repo: &Path, author: &AgentLabel) -> Vec<WaitItem> {
+    check_blocks(repo, author).items
+}
+
 /// Whether a block is pending for this agent: a question for a person
 /// that no automatic action may talk over.
 pub(crate) fn blocked(repo: &Path, author: &AgentLabel) -> bool {
@@ -2197,26 +2226,24 @@ pub(crate) fn blocked(repo: &Path, author: &AgentLabel) -> bool {
 }
 
 fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
-    let blocks = scan_blocks(repo);
+    if let Some(owed) = crate::cli::block::owed_answers(repo, author)
+        .into_iter()
+        .next()
+    {
+        return BlockResult {
+            items: vec![WaitItem::Unblocked {
+                answer: owed.answer,
+                carries: owed.carries,
+            }],
+            suppress_all: true,
+        };
+    }
     let mut result = BlockResult {
         items: Vec::new(),
         suppress_all: false,
     };
 
-    for b in &blocks {
-        if b.agent == author.as_str() {
-            if let Some(ref answer) = b.answer {
-                result.items = vec![WaitItem::Unblocked {
-                    name: b.name.clone(),
-                    answer: answer.clone(),
-                }];
-                result.suppress_all = true;
-                return result;
-            }
-        }
-    }
-
-    for b in &blocks {
+    for b in &scan_blocks(repo) {
         if b.answer.is_some() {
             continue;
         }
@@ -2536,7 +2563,11 @@ pub(crate) enum WaitJsonItem<'a> {
         question: &'a str,
     },
     #[serde(rename = "unblocked")]
-    Unblocked { name: &'a str, answer: &'a str },
+    Unblocked {
+        name: &'a str,
+        answer: &'a str,
+        carries: &'a clank_core::wait::AnswerRef,
+    },
 }
 
 fn plan_path(plan: &PlanKey) -> String {
@@ -2689,7 +2720,11 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             name,
             question,
         },
-        WaitItem::Unblocked { name, answer } => WaitJsonItem::Unblocked { name, answer },
+        WaitItem::Unblocked { answer, carries } => WaitJsonItem::Unblocked {
+            name: &carries.name,
+            answer,
+            carries,
+        },
     }
 }
 
@@ -2878,7 +2913,9 @@ fn render_human(item: &WaitItem) -> String {
             // move". It stays a json field.
             question: _,
         } => format!("blocked  {agent}/{name}  (awaiting human)"),
-        WaitItem::Unblocked { name, answer } => format!("answer   {name}  {answer}"),
+        WaitItem::Unblocked { answer, carries } => {
+            format!("answer   {}  {answer}", carries.name)
+        }
     }
 }
 
@@ -3901,6 +3938,19 @@ mod shared_tests {
 
 #[cfg(test)]
 mod tests {
+    fn unblocked(name: &str, answer: &str) -> clank_core::wait::WaitItem {
+        clank_core::wait::WaitItem::Unblocked {
+            answer: answer.into(),
+            carries: clank_core::wait::AnswerRef {
+                agent: clank_core::AgentLabel::parse("claude").unwrap(),
+                name: name.into(),
+                occurrence: Some("0123456789abcdef0123456789abcdef".into()),
+                question_digest: "qd".into(),
+                answer_digest: "ad".into(),
+            },
+        }
+    }
+
     #[test]
     fn recurring_timer_human_hint_is_terminal_safe_and_carries_the_whole_body() {
         let r = crate::cli::timer_source::recurrence::Recurrence::from_generation(
@@ -5794,12 +5844,9 @@ mod tests {
 
         // An ANSWER leads, and unlike a pending block it wakes on its
         // own — it is news, and it is what the agent has been waiting
-        // for. The review cycle stays paused until it is acknowledged.
+        // for. The review cycle stays paused until it is received.
         let answered = || BlockResult {
-            items: vec![WaitItem::Unblocked {
-                name: "q".into(),
-                answer: "yes".into(),
-            }],
+            items: vec![unblocked("q", "yes")],
             suppress_all: true,
         };
         let out = present_with_blocks(answered(), || Owed {
@@ -5936,10 +5983,7 @@ mod tests {
         // no WAL to re-read its item from.
         let out = decide(
             BlockResult {
-                items: vec![WaitItem::Unblocked {
-                    name: "q".into(),
-                    answer: "yes".into(),
-                }],
+                items: vec![unblocked("q", "yes")],
                 suppress_all: true,
             },
             vec![cmd_row()],
@@ -6123,11 +6167,145 @@ mod tests {
         assert!(
             matches!(
                 br.items.as_slice(),
-                [WaitItem::Unblocked { name, answer }] if name == "q" && answer == "because"
+                [WaitItem::Unblocked { answer, carries }]
+                    if carries.name == "q" && answer == "because"
             ),
             "expected the answer delivered, got {:?}",
             br.items
         );
+    }
+
+    fn grok_repo() -> (tempfile::TempDir, AgentLabel, WaitBinding) {
+        let dir = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("grok").unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            dir.path(),
+            &author,
+            crate::cli::teams_config::AgentDescription {
+                tool: clank_core::Tool::Grok,
+                launch: None,
+                initial_prompt: None,
+            },
+            crate::cli::teams_config::RosterRole::Commit,
+        )
+        .unwrap();
+        crate::cli::agent::set_repo_master(dir.path(), &author).unwrap();
+        let session = clank_core::SessionId::parse("grok-session").unwrap();
+        crate::agent_store::bind_session_to_agent(
+            dir.path(),
+            &author,
+            clank_core::Tool::Grok,
+            &session,
+        )
+        .unwrap();
+        crate::agent_store::set_auto_mode(dir.path(), &author, clank_core::AutoMode::On).unwrap();
+        crate::cli::block::ask(dir.path(), &author, "q", "Proceed?").unwrap();
+        crate::cli::block::answer_block(dir.path(), "grok", "q", "yes", None).unwrap();
+        let binding = WaitBinding(
+            Some((clank_core::Tool::Grok, session)),
+            WaitPolicy::AutomaticGrok { home: None },
+        );
+        (dir, author, binding)
+    }
+
+    fn received(repo: &Path) -> bool {
+        repo.join(".clank/agents/grok/unblocks/q.received").exists()
+    }
+
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lands every byte, then hands the label to another session before
+    /// the wait records anything.
+    struct Rebinds<'a>(&'a Path, Vec<u8>);
+    impl std::io::Write for Rebinds<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.1.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            crate::agent_store::bind_session_to_agent(
+                self.0,
+                &AgentLabel::parse("grok").unwrap(),
+                clank_core::Tool::Grok,
+                &clank_core::SessionId::parse("another-session").unwrap(),
+            )
+            .unwrap();
+            Ok(())
+        }
+    }
+
+    /// Grok's wait is a delivery boundary: the answer its wake prints is
+    /// received once the print lands, and only then.
+    #[test]
+    fn a_grok_wake_receives_the_answer_it_printed() {
+        let (dir, author, binding) = grok_repo();
+        let items = block_items(dir.path(), &author);
+        assert!(matches!(items.as_slice(), [WaitItem::Unblocked { .. }]));
+        let mut out = Vec::new();
+        deliver_grok_wake(dir.path(), &author, &binding, &items, true, None, &mut out).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("\"answer\":\"yes\"")
+        );
+        assert!(received(dir.path()));
+        assert!(block_items(dir.path(), &author).is_empty());
+    }
+
+    #[test]
+    fn a_grok_wake_that_failed_to_print_receives_nothing() {
+        let (dir, author, binding) = grok_repo();
+        let items = block_items(dir.path(), &author);
+        assert!(
+            deliver_grok_wake(
+                dir.path(),
+                &author,
+                &binding,
+                &items,
+                true,
+                None,
+                &mut Broken
+            )
+            .is_err()
+        );
+        assert!(!received(dir.path()));
+        assert_eq!(block_items(dir.path(), &author), items, "owed again");
+    }
+
+    #[test]
+    fn a_grok_wake_whose_binding_went_stale_receives_nothing() {
+        let (dir, author, binding) = grok_repo();
+        let items = block_items(dir.path(), &author);
+        let mut out = Rebinds(dir.path(), Vec::new());
+        deliver_grok_wake(dir.path(), &author, &binding, &items, true, None, &mut out).unwrap();
+        assert!(!out.1.is_empty(), "the wake printed");
+        assert!(
+            !received(dir.path()),
+            "but its session no longer holds the label"
+        );
+
+        let mut never = Vec::new();
+        assert!(
+            deliver_grok_wake(
+                dir.path(),
+                &author,
+                &binding,
+                &items,
+                true,
+                None,
+                &mut never
+            )
+            .is_err()
+        );
+        assert!(never.is_empty() && !received(dir.path()));
     }
 
     #[test]
@@ -6434,15 +6612,18 @@ mod tests {
                 }),
             ),
             (
-                serde_json::to_value(render_json(&WaitItem::Unblocked {
-                    name: "q".into(),
-                    answer: "yes".into(),
-                }))
-                .unwrap(),
+                serde_json::to_value(render_json(&unblocked("q", "yes"))).unwrap(),
                 serde_json::json!({
                     "kind": "unblocked",
                     "name": "q",
                     "answer": "yes",
+                    "carries": {
+                        "agent": "claude",
+                        "name": "q",
+                        "occurrence": "0123456789abcdef0123456789abcdef",
+                        "question_digest": "qd",
+                        "answer_digest": "ad",
+                    },
                 }),
             ),
         ];

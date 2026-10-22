@@ -219,7 +219,7 @@ pub(crate) struct Carried {
     id: PresentationId,
     tool: Tool,
     session: SessionId,
-    selected: Vec<clank_core::wait::EventPresentation>,
+    delivered: super::presentation::Carried,
     prepared: super::wake_receipt::Prepared,
     /// The identity of every item it presents, which a delivery discharges
     /// from whatever the monitor holds for it in memory alone.
@@ -254,7 +254,7 @@ impl Commit {
         if !current() {
             return;
         }
-        super::presentation::record(repo, &author, &carried.selected, current);
+        super::presentation::record_delivered(repo, &author, &carried.delivered, current);
         super::wake_receipt::dispatch(repo, &author, carried.prepared, carried.tool, current).await;
     }
 }
@@ -460,9 +460,9 @@ impl Turns {
                 // reaches the model: Claude's.
                 let commits =
                     !matches!(report, Report::SessionStart { .. }) || tool == Tool::Claude;
-                let (selected, prepared, presented) = if commits {
+                let (delivered, prepared, presented) = if commits {
                     (
-                        super::wake_render::selected_presentations(items.iter().copied()),
+                        super::wake_render::carried(items.iter().copied()),
                         super::wake_receipt::prepare(
                             &self.repo,
                             author,
@@ -479,7 +479,7 @@ impl Turns {
                         id: presentation.clone(),
                         tool,
                         session: report.session().clone(),
-                        selected,
+                        delivered,
                         prepared,
                         presented,
                     });

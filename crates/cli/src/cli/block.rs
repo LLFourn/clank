@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::{BlockArgs, BlockCmd, BlockCreateArgs, BlockMigrateArgs, UnblockArgs, resolve_repo};
 use crate::agent_store::agents_root;
+use clank_core::wait::AnswerRef;
 
 pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
     match args.command {
@@ -185,10 +186,7 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
         "BLOCK: this parks every wait item for `{}` until the block is answered",
         author.as_str()
     );
-    let dir = agents_root(&repo).join(author.as_str()).join("blocks");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.md", args.name));
-    std::fs::write(&path, &args.message)?;
+    let path = ask(&repo, &author, &args.name, &args.message)?;
 
     let config = crate::cli::config::load(&repo);
     if let Some(Some(cmd)) = config.hooks.get(&clank_core::HookEvent::Blocked) {
@@ -225,92 +223,391 @@ pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The one unblock write for CLI and web. `expected_question` is
-/// captured by a web form, so an edited question is not answered under
-/// the reader's feet. Hard-linking a complete staged file publishes at
-/// most one answer, even if two browsers submit together.
+const STAMP: &str = "occurrence: ";
+
+fn is_occurrence(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A stored question or answer split into the ask occurrence it names
+/// and the text a reader sees. Files from before occurrences name none.
+fn unstamp(raw: &str) -> (Option<&str>, &str) {
+    if let Some(rest) = raw.strip_prefix(STAMP)
+        && let Some((id, body)) = rest.split_once('\n')
+        && is_occurrence(id)
+    {
+        return (Some(id), body);
+    }
+    (None, raw)
+}
+
+fn stamp(occurrence: &str, body: &str) -> String {
+    format!("{STAMP}{occurrence}\n{body}")
+}
+
+/// A fresh ask identity. Random rather than counted, so no store has
+/// to survive `block clean` for an identity never to come back.
+fn mint_occurrence() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("minting a block occurrence: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn digest(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
+/// Whether an answer naming `answer` belongs to the ask naming
+/// `question`. An unstamped question was written by a binary that paired
+/// by name alone, so it keeps that rule until it is first stamped.
+fn belongs(question: Option<&str>, answer: Option<&str>) -> bool {
+    match question {
+        Some(q) => answer == Some(q),
+        None => true,
+    }
+}
+
+fn validate_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        anyhow::bail!("invalid block name `{name}`");
+    }
+    Ok(())
+}
+
+struct Files {
+    question: PathBuf,
+    answer: PathBuf,
+    marker: PathBuf,
+}
+
+fn files(agent_dir: &Path, name: &str) -> Files {
+    Files {
+        question: agent_dir.join("blocks").join(format!("{name}.md")),
+        answer: agent_dir.join("unblocks").join(format!("{name}.md")),
+        marker: agent_dir.join("unblocks").join(format!("{name}.received")),
+    }
+}
+
+/// The durable receipt: present and matching the current pair, it is
+/// what retires that pair.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct Marker {
+    occurrence: String,
+    question_digest: String,
+    answer_digest: String,
+}
+
+/// One block name's files as they stand.
+struct Pair {
+    occurrence: Option<String>,
+    question: String,
+    /// The answer belonging to this ask, never a leftover from another.
+    answer: Option<String>,
+    received: bool,
+}
+
+impl Pair {
+    fn read(agent_dir: &Path, name: &str) -> Option<Pair> {
+        let f = files(agent_dir, name);
+        if !std::fs::symlink_metadata(&f.question).is_ok_and(|m| m.file_type().is_file()) {
+            return None;
+        }
+        let raw = std::fs::read_to_string(&f.question).unwrap_or_default();
+        let (occurrence, question) = unstamp(&raw);
+        let answer = std::fs::read_to_string(&f.answer).ok().and_then(|raw| {
+            let (named, body) = unstamp(&raw);
+            belongs(occurrence, named).then(|| body.to_string())
+        });
+        let received = match (occurrence, &answer) {
+            (Some(occurrence), Some(answer)) => std::fs::read(&f.marker)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Marker>(&bytes).ok())
+                .is_some_and(|m| {
+                    m == Marker {
+                        occurrence: occurrence.to_string(),
+                        question_digest: digest(question),
+                        answer_digest: digest(answer),
+                    }
+                }),
+            _ => false,
+        };
+        Some(Pair {
+            occurrence: occurrence.map(str::to_owned),
+            question: question.to_string(),
+            answer,
+            received,
+        })
+    }
+
+    fn carries(&self, agent: &clank_core::AgentLabel, name: &str) -> Option<AnswerRef> {
+        Some(AnswerRef {
+            agent: agent.clone(),
+            name: name.to_string(),
+            occurrence: self.occurrence.clone(),
+            question_digest: digest(&self.question),
+            answer_digest: digest(self.answer.as_deref()?),
+        })
+    }
+}
+
+/// The names of the questions in `agent_dir`, sorted.
+fn question_names(agent_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(agent_dir.join("blocks"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| s.strip_suffix(".md"))
+                .map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Serializes every read-compare-write of `agent`'s blocks: ask, answer,
+/// clean and receive.
+pub(crate) fn lock(repo: &Path, agent: &clank_core::AgentLabel) -> anyhow::Result<std::fs::File> {
+    let dir = agents_root(repo).join(agent.as_str());
+    std::fs::create_dir_all(&dir)?;
+    crate::agent_store::exclusive_lock(&dir.join("blocks.lock"))
+}
+
+fn publish(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let dir = path.parent().context("a block file has a directory")?;
+    std::fs::create_dir_all(dir)?;
+    let mut staged = tempfile::NamedTempFile::new_in(dir)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(path)
+        .with_context(|| format!("publishing `{}`", path.display()))?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Ask `question` as a new occurrence of `name`. Whatever answer or
+/// receipt an earlier ask of the name left is discarded, never inherited.
+pub(crate) fn ask(
+    repo: &Path,
+    author: &clank_core::AgentLabel,
+    name: &str,
+    question: &str,
+) -> anyhow::Result<PathBuf> {
+    validate_name(name)?;
+    let _lock = lock(repo, author)?;
+    let f = files(&agents_root(repo).join(author.as_str()), name);
+    remove_if_present(&f.answer)?;
+    remove_if_present(&f.marker)?;
+    publish(&f.question, stamp(&mint_occurrence()?, question).as_bytes())?;
+    Ok(f.question)
+}
+
+/// The ask a form was showing when its answer was written.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Shown<'a> {
+    pub(crate) occurrence: Option<&'a str>,
+    pub(crate) question: &'a str,
+}
+
+/// The one unblock write for CLI and web. `shown` is captured by a web
+/// form, so an answer is recorded only for the ask the reader saw, never
+/// for a re-ask that replaced it, even with the same text. Without it the
+/// current ask of `name` is answered. At most one answer is recorded per
+/// ask.
 pub(crate) fn answer_block(
     repo: &Path,
     agent: &str,
     name: &str,
     message: &str,
-    expected_question: Option<&str>,
+    shown: Option<Shown<'_>>,
 ) -> anyhow::Result<PathBuf> {
     use anyhow::Context as _;
     let agent = clank_core::ids::AgentLabel::parse(agent)
         .map_err(|e| anyhow::anyhow!("invalid agent label: {e}"))?;
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-        anyhow::bail!("invalid block name `{name}`");
-    }
+    validate_name(name)?;
     let answer = message.trim();
     if answer.is_empty() {
         anyhow::bail!("write an answer before submitting");
     }
-    let agent_root = agents_root(repo).join(agent.as_str());
-    let question_path = agent_root.join("blocks").join(format!("{name}.md"));
-    if !std::fs::symlink_metadata(&question_path).is_ok_and(|meta| meta.file_type().is_file()) {
+    let _lock = lock(repo, &agent)?;
+    let f = files(&agents_root(repo).join(agent.as_str()), name);
+    if !std::fs::symlink_metadata(&f.question).is_ok_and(|meta| meta.file_type().is_file()) {
         anyhow::bail!("`{agent}` has no pending block named `{name}`");
     }
-    let question = std::fs::read_to_string(&question_path)
+    let raw = std::fs::read_to_string(&f.question)
         .with_context(|| format!("reading block `{agent}/{name}`"))?;
-    if expected_question.is_some_and(|expected| expected != question) {
+    let (occurrence, question) = unstamp(&raw);
+    if shown.is_some_and(|s| s.question != question || s.occurrence != occurrence) {
         anyhow::bail!("the question for `{agent}/{name}` changed; read it again before answering");
     }
-
-    let dir = agent_root.join("unblocks");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{name}.md"));
-    let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
-    staged.write_all(answer.as_bytes())?;
-    staged.as_file().sync_all()?;
-    match std::fs::hard_link(staged.path(), &path) {
-        Ok(()) => Ok(path),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            anyhow::bail!("`{agent}/{name}` was already answered")
-        }
-        Err(e) => Err(e).with_context(|| format!("recording answer for `{agent}/{name}`")),
+    if let Ok(existing) = std::fs::read_to_string(&f.answer)
+        && belongs(occurrence, unstamp(&existing).0)
+    {
+        anyhow::bail!("`{agent}/{name}` was already answered");
     }
+    let occurrence = match occurrence {
+        Some(o) => o.to_string(),
+        None => {
+            let o = mint_occurrence()?;
+            publish(&f.question, stamp(&o, question).as_bytes())?;
+            o
+        }
+    };
+    publish(&f.answer, stamp(&occurrence, answer).as_bytes())
+        .with_context(|| format!("recording answer for `{agent}/{name}`"))?;
+    Ok(f.answer)
+}
+
+/// What one receipt did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Receipt {
+    /// The carried pair is received; it will not be presented again.
+    Retired,
+    /// The name was re-asked, re-answered or cleaned since it was
+    /// presented, so nothing was received.
+    Stale,
+    /// The delivering session no longer holds the label.
+    Unauthorized,
+}
+
+/// Receive the exact answer `carries` names, once a wake carrying it has
+/// reached the model. Retires the pair only while it still matches, and
+/// only if `current` — the delivery's authorization — holds once the
+/// receipt has the block and binding locks; the binding cannot change
+/// until the marker is published.
+pub(crate) fn receive(
+    repo: &Path,
+    carries: &AnswerRef,
+    current: impl Fn() -> bool,
+) -> anyhow::Result<Receipt> {
+    validate_name(&carries.name)?;
+    let _lock = lock(repo, &carries.agent)?;
+    let _binding = crate::agent_store::hold_binding(repo, &carries.agent)?;
+    if !current() {
+        return Ok(Receipt::Unauthorized);
+    }
+    let dir = agents_root(repo).join(carries.agent.as_str());
+    let pair = Pair::read(&dir, &carries.name);
+    let now = pair
+        .as_ref()
+        .and_then(|p| p.carries(&carries.agent, &carries.name));
+    let Some(pair) = pair.filter(|_| now.as_ref() == Some(carries)) else {
+        eprintln!(
+            "clank: received nothing for block `{}/{}`: it carried occurrence {} (question {}, \
+             answer {}), and the block now holds {}",
+            carries.agent,
+            carries.name,
+            carries.occurrence.as_deref().unwrap_or("none"),
+            carries.question_digest,
+            carries.answer_digest,
+            now.map_or("no answer".to_string(), |n| format!(
+                "occurrence {} (question {}, answer {})",
+                n.occurrence.as_deref().unwrap_or("none"),
+                n.question_digest,
+                n.answer_digest
+            )),
+        );
+        return Ok(Receipt::Stale);
+    };
+    if pair.received {
+        return Ok(Receipt::Retired);
+    }
+    let f = files(&dir, &carries.name);
+    let answer = pair.answer.as_deref().unwrap_or_default();
+    let occurrence = match pair.occurrence {
+        Some(o) => o,
+        None => {
+            // Answer first: an unstamped question still pairs with it, so
+            // a crash between the two leaves the pair answered and owed.
+            let o = mint_occurrence()?;
+            publish(&f.answer, stamp(&o, answer).as_bytes())?;
+            publish(&f.question, stamp(&o, &pair.question).as_bytes())?;
+            o
+        }
+    };
+    let marker = Marker {
+        occurrence,
+        question_digest: carries.question_digest.clone(),
+        answer_digest: carries.answer_digest.clone(),
+    };
+    publish(&f.marker, &serde_json::to_vec(&marker)?)?;
+    Ok(Receipt::Retired)
 }
 
 async fn run_clean(args: super::BlockCleanArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
     let author = crate::agent_env::resolve_identity_from_env(&repo)?;
-    let entries = scan_blocks(&repo);
-    let agents = agents_root(&repo);
-    let mut removed = 0;
-    for entry in &entries {
-        if entry.agent != author.as_str() || entry.answer.is_none() {
-            continue;
-        }
-        let block_path = agents
-            .join(&entry.agent)
-            .join("blocks")
-            .join(format!("{}.md", entry.name));
-        let unblock_path = agents
-            .join(&entry.agent)
-            .join("unblocks")
-            .join(format!("{}.md", entry.name));
-        if block_path.exists() {
-            std::fs::remove_file(&block_path)?;
-            removed += 1;
-        }
-        if unblock_path.exists() {
-            std::fs::remove_file(&unblock_path)?;
-            removed += 1;
-        }
-    }
+    let removed = clean(&repo, &author)?;
     println!("cleaned {removed} file(s)");
     Ok(())
+}
+
+/// Remove `author`'s received pairs and every answer or receipt no
+/// current ask owns. Housekeeping only: it never decides what is owed.
+pub(crate) fn clean(repo: &Path, author: &clank_core::AgentLabel) -> anyhow::Result<usize> {
+    let _lock = lock(repo, author)?;
+    let dir = agents_root(repo).join(author.as_str());
+    let mut removed = 0;
+    let mut live = std::collections::BTreeSet::new();
+    for name in question_names(&dir) {
+        let Some(pair) = Pair::read(&dir, &name) else {
+            continue;
+        };
+        let f = files(&dir, &name);
+        if pair.received {
+            // The question first: a leftover answer or marker names a
+            // dead occurrence, which no reader takes for a live one.
+            for path in [&f.question, &f.answer, &f.marker] {
+                removed += usize::from(remove_if_present(path)?);
+            }
+            continue;
+        }
+        if pair.answer.is_some() {
+            live.insert(f.answer);
+        }
+    }
+    for entry in std::fs::read_dir(dir.join("unblocks"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let leftover = path
+            .extension()
+            .is_some_and(|e| e == "md" || e == "received")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+            && !live.contains(&path.with_extension("md"));
+        if leftover {
+            removed += usize::from(remove_if_present(&path)?);
+        }
+    }
+    Ok(removed)
 }
 
 #[derive(Debug, Clone)]
 pub struct BlockEntry {
     pub agent: String,
     pub name: String,
+    /// The ask this question is; `None` before asks carried one.
+    pub occurrence: Option<String>,
     pub question: String,
     pub answer: Option<String>,
 }
 
+/// Every block not yet received, pending or answered. Read-only: it
+/// never stamps, receives or removes anything.
 pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
     let root = agents_root(repo);
     let Ok(agents) = std::fs::read_dir(&root) else {
@@ -324,43 +621,43 @@ pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
         let Some(agent) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let blocks_dir = entry.path().join("blocks");
-        let unblocks_dir = entry.path().join("unblocks");
-
-        scan_blocks_in_dir(&blocks_dir, &unblocks_dir, &agent, &mut out);
+        let dir = entry.path();
+        for name in question_names(&dir) {
+            let Some(pair) = Pair::read(&dir, &name).filter(|p| !p.received) else {
+                continue;
+            };
+            out.push(BlockEntry {
+                agent: agent.clone(),
+                name,
+                occurrence: pair.occurrence,
+                question: pair.question,
+                answer: pair.answer,
+            });
+        }
     }
     out.sort_by(|a, b| a.agent.cmp(&b.agent).then(a.name.cmp(&b.name)));
     out
 }
 
-fn scan_blocks_in_dir(
-    blocks_dir: &Path,
-    unblocks_dir: &Path,
-    agent: &str,
-    out: &mut Vec<BlockEntry>,
-) {
-    let Ok(files) = std::fs::read_dir(blocks_dir) else {
-        return;
-    };
-    for file in files.flatten() {
-        let fname = file.file_name();
-        let Some(s) = fname.to_str() else { continue };
-        let Some(name) = s.strip_suffix(".md") else {
-            continue;
-        };
-        if file.file_type().map_or(true, |t| !t.is_file()) {
-            continue;
-        }
-        let question = std::fs::read_to_string(file.path()).unwrap_or_default();
-        let unblock_path = unblocks_dir.join(s);
-        let answer = std::fs::read_to_string(&unblock_path).ok();
-        out.push(BlockEntry {
-            agent: agent.to_string(),
-            name: name.to_string(),
-            question,
-            answer,
-        });
-    }
+/// An answer `agent` is owed: answered and not yet received.
+pub(crate) struct OwedAnswer {
+    pub(crate) answer: String,
+    pub(crate) carries: AnswerRef,
+}
+
+/// `agent`'s owed answers, by name. Read-only, like [`scan_blocks`].
+pub(crate) fn owed_answers(repo: &Path, agent: &clank_core::AgentLabel) -> Vec<OwedAnswer> {
+    let dir = agents_root(repo).join(agent.as_str());
+    question_names(&dir)
+        .into_iter()
+        .filter_map(|name| {
+            let pair = Pair::read(&dir, &name).filter(|p| !p.received)?;
+            Some(OwedAnswer {
+                carries: pair.carries(agent, &name)?,
+                answer: pair.answer?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -434,7 +731,7 @@ mod tests {
         assert!(answer_block(repo, "alice", "../why", "yes", None).is_err());
         assert!(answer_block(repo, "alice", "missing", "yes", None).is_err());
         assert!(
-            answer_block(repo, "alice", "why", "yes", Some("Old question"))
+            answer_block(repo, "alice", "why", "yes", Some(legacy("Old question")))
                 .unwrap_err()
                 .to_string()
                 .contains("changed")
@@ -445,11 +742,11 @@ mod tests {
             "alice",
             "why",
             "  first answer  ",
-            Some("Which option?"),
+            Some(legacy("Which option?")),
         )
         .unwrap();
         assert!(
-            answer_block(repo, "alice", "why", "second answer", Some("Which option?"))
+            answer_block(repo, "alice", "why", "second answer", None)
                 .unwrap_err()
                 .to_string()
                 .contains("already answered")
@@ -491,13 +788,22 @@ mod tests {
         .await
         .unwrap();
         run_unblock(answer(old.path())).await.unwrap();
-        for rel in [
-            ".clank/agents/claude/blocks/q.md",
-            ".clank/agents/claude/unblocks/q.md",
-        ] {
-            let read = |root: &std::path::Path| std::fs::read_to_string(root.join(rel)).unwrap();
-            assert_eq!(read(new.path()), read(old.path()), "{rel}");
-        }
+        let read = |root: &std::path::Path| {
+            scan_blocks(root)
+                .into_iter()
+                .map(|b| (b.agent, b.name, b.question, b.answer))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(new.path()), read(old.path()));
+        assert_eq!(
+            read(new.path()),
+            [(
+                "claude".into(),
+                "q".into(),
+                "why?".into(),
+                Some("yes".into())
+            )]
+        );
     }
 
     #[tokio::test]
@@ -789,6 +1095,323 @@ mod tests {
                 .exists(),
             "--dry must not delete the question it reports"
         );
+    }
+
+    fn legacy(question: &str) -> Shown<'_> {
+        Shown {
+            occurrence: None,
+            question,
+        }
+    }
+
+    fn alice() -> clank_core::AgentLabel {
+        clank_core::AgentLabel::parse("alice").unwrap()
+    }
+
+    fn owed(repo: &Path) -> Vec<AnswerRef> {
+        owed_answers(repo, &alice())
+            .into_iter()
+            .map(|o| o.carries)
+            .collect()
+    }
+
+    fn marker(repo: &Path, name: &str) -> PathBuf {
+        repo.join(format!(".clank/agents/alice/unblocks/{name}.received"))
+    }
+
+    fn asked_and_answered(repo: &Path, name: &str, q: &str, a: &str) -> AnswerRef {
+        ask(repo, &alice(), name, q).unwrap();
+        answer_block(repo, "alice", name, a, None).unwrap();
+        let carries = owed(repo);
+        assert_eq!(carries.len(), 1, "{carries:?}");
+        carries[0].clone()
+    }
+
+    #[test]
+    fn a_received_answer_is_retired_by_its_marker_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("yes"));
+        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        assert!(marker(repo, "q").exists());
+        assert!(
+            repo.join(".clank/agents/alice/blocks/q.md").exists()
+                && repo.join(".clank/agents/alice/unblocks/q.md").exists(),
+            "receipt deletes nothing"
+        );
+        assert!(owed(repo).is_empty(), "not presented again");
+        assert!(scan_blocks(repo).is_empty(), "neither pending nor owed");
+    }
+
+    /// A delivery whose binding is revoked while it waits for the block
+    /// lock receives nothing: its authorization is read inside the receipt
+    /// transaction, never carried in from before the wait.
+    #[test]
+    fn a_rebind_while_a_receipt_waits_for_the_lock_receives_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for revoke in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+            let carried = crate::cli::presentation::Carried {
+                events: Vec::new(),
+                answers: vec![a.clone()],
+            };
+            let authorized = AtomicBool::new(true);
+            let (observed, seen) = std::sync::mpsc::channel();
+            let held = lock(repo, &alice()).unwrap();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    crate::cli::presentation::record_delivered(repo, &alice(), &carried, || {
+                        let _ = observed.send(());
+                        authorized.load(Ordering::SeqCst)
+                    })
+                });
+                // A pre-lock check reports in at once; one read under the
+                // lock cannot until the lock is released below.
+                let _ = seen.recv_timeout(std::time::Duration::from_secs(2));
+                if revoke {
+                    authorized.store(false, Ordering::SeqCst);
+                }
+                drop(held);
+            });
+            assert_eq!(marker(repo, "q").exists(), !revoke, "revoked: {revoke}");
+            assert_eq!(owed(repo).is_empty(), !revoke, "revoked: {revoke}");
+        }
+    }
+
+    /// The authorization a receipt read stays true until its marker is
+    /// published: a rebind that starts after the check lands after it.
+    #[test]
+    fn a_rebind_after_the_check_waits_for_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        let landed_after_marker = std::thread::scope(|s| {
+            let rebind = std::cell::OnceCell::new();
+            receive(repo, &a, || {
+                rebind.get_or_init(|| {
+                    s.spawn(|| {
+                        crate::agent_store::update_agent_config(repo, &alice(), |_| {}).unwrap();
+                        marker(repo, "q").exists()
+                    })
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                true
+            })
+            .unwrap();
+            rebind.into_inner().unwrap().join().unwrap()
+        });
+        assert!(landed_after_marker);
+    }
+
+    #[test]
+    fn duplicate_receipts_write_one_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        let first = std::fs::read(marker(repo, "q")).unwrap();
+        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        assert_eq!(std::fs::read(marker(repo, "q")).unwrap(), first);
+        let markers = std::fs::read_dir(repo.join(".clank/agents/alice/unblocks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "received"))
+            .count();
+        assert_eq!(markers, 1);
+    }
+
+    #[test]
+    fn files_without_a_matching_marker_stay_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        write(
+            &marker(repo, "q"),
+            &serde_json::to_string(&serde_json::json!({
+                "occurrence": a.occurrence,
+                "question_digest": a.question_digest,
+                "answer_digest": digest("no"),
+            }))
+            .unwrap(),
+        );
+        assert_eq!(owed(repo), [a], "a marker for other bytes is stale");
+    }
+
+    /// The same question asked again and given the same answer is a new
+    /// occurrence: a receipt carried for the first is a no-op, whether it
+    /// arrives at once, after a clean, or from a process that started
+    /// after the reuse.
+    #[test]
+    fn a_late_receipt_after_identical_reuse_receives_nothing() {
+        for interleave in ["direct", "clean", "restart"] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let first = asked_and_answered(repo, "q", "Proceed?", "yes");
+            if interleave == "clean" {
+                clean(repo, &alice()).unwrap();
+            }
+            let second = asked_and_answered(repo, "q", "Proceed?", "yes");
+            if interleave == "clean" {
+                clean(repo, &alice()).unwrap();
+            }
+            let late: AnswerRef = match interleave {
+                "restart" => serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap(),
+                _ => first.clone(),
+            };
+            assert_eq!(
+                (&first.question_digest, &first.answer_digest),
+                (&second.question_digest, &second.answer_digest),
+                "{interleave}: identical bytes"
+            );
+            assert_ne!(first.occurrence, second.occurrence, "{interleave}");
+            assert_eq!(
+                receive(repo, &late, || true).unwrap(),
+                Receipt::Stale,
+                "{interleave}"
+            );
+            assert!(!marker(repo, "q").exists(), "{interleave}");
+            assert_eq!(owed(repo), [second], "{interleave}: the new ask stays owed");
+        }
+    }
+
+    #[test]
+    fn re_asking_inherits_neither_the_old_answer_nor_its_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        receive(repo, &a, || true).unwrap();
+        ask(repo, &alice(), "q", "Proceed?").unwrap();
+        assert!(!repo.join(".clank/agents/alice/unblocks/q.md").exists());
+        assert!(!marker(repo, "q").exists());
+        let blocks = scan_blocks(repo);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].answer, None, "owed to the human again");
+        assert!(owed(repo).is_empty(), "no old answer is rendered for it");
+        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Stale);
+        answer_block(repo, "alice", "q", "no", None).unwrap();
+        assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("no"));
+    }
+
+    /// Whatever an interrupted clean leaves behind names a dead
+    /// occurrence, so a new ask ignores it even where nothing removed it.
+    #[test]
+    fn a_leftover_from_another_occurrence_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        receive(repo, &a, || true).unwrap();
+        let answer = std::fs::read(repo.join(".clank/agents/alice/unblocks/q.md")).unwrap();
+        let receipt = std::fs::read(marker(repo, "q")).unwrap();
+        ask(repo, &alice(), "q", "Proceed?").unwrap();
+        write(
+            &repo.join(".clank/agents/alice/unblocks/q.md"),
+            std::str::from_utf8(&answer).unwrap(),
+        );
+        write(&marker(repo, "q"), std::str::from_utf8(&receipt).unwrap());
+        assert_eq!(scan_blocks(repo)[0].answer, None);
+        assert!(owed(repo).is_empty());
+        answer_block(repo, "alice", "q", "no", None).unwrap();
+        assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("no"));
+    }
+
+    /// A pair asked and answered before occurrences existed is owed once
+    /// more, and reading it changes nothing; receiving it stamps both
+    /// halves with one occurrence and keeps the human's answer.
+    #[test]
+    fn a_legacy_pair_is_owed_until_received_and_keeps_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let q = repo.join(".clank/agents/alice/blocks/q.md");
+        let a = repo.join(".clank/agents/alice/unblocks/q.md");
+        write(&q, "Proceed?");
+        write(&a, "yes");
+        let carries = owed(repo);
+        scan_blocks(repo);
+        assert_eq!(
+            std::fs::read_to_string(&q).unwrap(),
+            "Proceed?",
+            "reads never stamp"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "yes");
+        assert_eq!(carries.len(), 1);
+        assert_eq!(carries[0].occurrence, None);
+
+        assert_eq!(
+            receive(repo, &carries[0], || true).unwrap(),
+            Receipt::Retired
+        );
+        let (qo, ao) = (
+            std::fs::read_to_string(&q).unwrap(),
+            std::fs::read_to_string(&a).unwrap(),
+        );
+        let ((stamped_q, body_q), (stamped_a, body_a)) = (unstamp(&qo), unstamp(&ao));
+        assert!(stamped_q.is_some() && stamped_q == stamped_a);
+        assert_eq!((body_q, body_a), ("Proceed?", "yes"));
+        assert!(owed(repo).is_empty(), "received");
+    }
+
+    /// A crash between stamping the answer and the question leaves the
+    /// pair answered, and owed.
+    #[test]
+    fn a_half_stamped_legacy_pair_stays_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        write(&repo.join(".clank/agents/alice/blocks/q.md"), "Proceed?");
+        write(
+            &repo.join(".clank/agents/alice/unblocks/q.md"),
+            &stamp("0123456789abcdef0123456789abcdef", "yes"),
+        );
+        let carries = owed(repo);
+        assert_eq!(carries.len(), 1);
+        assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("yes"));
+        assert_eq!(
+            receive(repo, &carries[0], || true).unwrap(),
+            Receipt::Retired
+        );
+        assert!(owed(repo).is_empty());
+    }
+
+    #[test]
+    fn answering_a_legacy_question_stamps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let q = repo.join(".clank/agents/alice/blocks/q.md");
+        write(&q, "Proceed?");
+        answer_block(repo, "alice", "q", "yes", Some(legacy("Proceed?"))).unwrap();
+        let raw = std::fs::read_to_string(&q).unwrap();
+        assert!(unstamp(&raw).0.is_some(), "{raw}");
+        let carries = owed(repo);
+        assert_eq!(carries.len(), 1);
+        assert_eq!(carries[0].occurrence.as_deref(), unstamp(&raw).0);
+    }
+
+    #[test]
+    fn clean_removes_received_pairs_and_leftovers_and_keeps_what_is_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let done = asked_and_answered(repo, "done", "Proceed?", "yes");
+        receive(repo, &done, || true).unwrap();
+        let owed_now = asked_and_answered(repo, "owed", "Which?", "B");
+        ask(repo, &alice(), "pending", "Why?").unwrap();
+        write(
+            &repo.join(".clank/agents/alice/unblocks/orphan.md"),
+            &stamp("0123456789abcdef0123456789abcdef", "stale"),
+        );
+        assert_eq!(clean(repo, &alice()).unwrap(), 4);
+        let left: Vec<_> = scan_blocks(repo)
+            .into_iter()
+            .map(|b| (b.name, b.answer))
+            .collect();
+        assert_eq!(
+            left,
+            [("owed".into(), Some("B".into())), ("pending".into(), None)]
+        );
+        assert_eq!(owed(repo), [owed_now]);
+        assert!(!repo.join(".clank/agents/alice/blocks/done.md").exists());
+        assert!(!repo.join(".clank/agents/alice/unblocks/orphan.md").exists());
     }
 
     #[test]

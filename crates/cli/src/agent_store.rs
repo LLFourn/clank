@@ -634,7 +634,7 @@ pub fn release_binding(
 /// choosing whether to drive, it is performing a short file write it
 /// must not do concurrently. Held for one label only, and never
 /// across another label's, so there is no lock order to get wrong.
-struct BindingGuard<'a> {
+pub(crate) struct BindingGuard<'a> {
     repo: &'a Path,
     label: &'a AgentLabel,
     _lock: std::fs::File,
@@ -650,6 +650,16 @@ impl<'a> BindingGuard<'a> {
             _lock: exclusive_lock(&dir.join("binding.lock"))?,
         })
     }
+}
+
+/// Hold `label`'s binding lock: no bind, rebind or release of the label
+/// commits until the guard is dropped, so a binding checked under it stays
+/// the binding until then.
+pub(crate) fn hold_binding<'a>(
+    repo: &'a Path,
+    label: &'a AgentLabel,
+) -> anyhow::Result<BindingGuard<'a>> {
+    BindingGuard::acquire(repo, label)
 }
 
 /// Block until this process holds `path`'s exclusive flock, creating

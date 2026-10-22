@@ -2476,6 +2476,8 @@ pub(crate) struct Stashed {
 pub(crate) struct PendingBlock {
     pub(crate) agent: String,
     pub(crate) name: String,
+    /// Returned with an answer, so it lands only on the ask shown.
+    pub(crate) occurrence: Option<String>,
     pub(crate) question: String,
 }
 
@@ -2641,6 +2643,7 @@ pub(crate) fn web_facts(
             .map(|b| PendingBlock {
                 agent: b.agent.clone(),
                 name: b.name.clone(),
+                occurrence: b.occurrence.clone(),
                 question: b.question.clone(),
             })
             .collect(),
@@ -7580,12 +7583,14 @@ pub(crate) mod tests {
                 name: "which".into(),
                 question: "Which option?".into(),
                 answer: None,
+                occurrence: None,
             },
             crate::cli::block::BlockEntry {
                 agent: "codex".into(),
                 name: "done".into(),
                 question: "Why?".into(),
                 answer: Some("Because".into()),
+                occurrence: None,
             },
         ];
         let facts = web_facts(&snap, &Default::default());
@@ -7594,6 +7599,7 @@ pub(crate) mod tests {
             vec![PendingBlock {
                 agent: "claude".into(),
                 name: "which".into(),
+                occurrence: None,
                 question: "Which option?".into(),
             }]
         );

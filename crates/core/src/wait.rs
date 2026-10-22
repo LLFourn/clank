@@ -118,6 +118,19 @@ impl EventPresentation {
     }
 }
 
+/// The exact answered ask a wake carries: the asking agent, the block
+/// name, the ask occurrence and digests of the question and answer bytes
+/// it rendered. Receipt retires only a pair that still matches all of it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AnswerRef {
+    pub agent: AgentLabel,
+    pub name: String,
+    /// `None` for a pair asked before asks carried an occurrence.
+    pub occurrence: Option<String>,
+    pub question_digest: String,
+    pub answer_digest: String,
+}
+
 /// Flat tagged list `wait` returns from one refold round.
 /// Empty list at the call site means "no outcome, keep blocking."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,9 +322,11 @@ pub enum WaitItem {
         name: String,
         question: String,
     },
+    /// A human's answer to one of this agent's blocks. Delivering it is
+    /// what receives it; there is nothing to acknowledge.
     Unblocked {
-        name: String,
         answer: String,
+        carries: AnswerRef,
     },
 }
 

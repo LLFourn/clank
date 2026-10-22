@@ -37,7 +37,9 @@ use clank_core::wait::WaitItem;
 // 16 owns turn-end policy: an agent's hello may carry its hook's report,
 // answered with verdicts and then one delivery result on that connection,
 // and control requests attend and clear.
-pub(crate) const PROTO: u32 = 16;
+// 17 carries the exact answer an `unblocked` item delivers and receives it
+// on delivery; a 16 monitor sends neither and still teaches `block clean`.
+pub(crate) const PROTO: u32 = 17;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -10697,6 +10699,68 @@ mod tests {
             look_at(repo.path(), agent("codex"), ATTACH_BUDGET, connect_within),
             Seen::OlderPeer { .. }
         ));
+    }
+
+    /// A proto-16 monitor is retired, never served. Its `unblocked` work
+    /// carries no answer identity, which this build can neither decode nor
+    /// receive on delivery, so the handshake must turn it away before any
+    /// of its frames is read and treat it as an older peer to replace.
+    #[test]
+    fn a_proto_16_monitor_is_an_older_peer_to_replace() {
+        const OLD: u32 = 16;
+        assert!(!admits(PROTO, OLD));
+        let old_items = r#"{"t":"items","items":[{"kind":"unblocked","name":"q","answer":"yes"}]}"#;
+        assert!(
+            serde_json::from_str::<Note>(old_items).is_err(),
+            "a 16 monitor's answer is not one this build could deliver"
+        );
+
+        let repo = repo_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_path(dir.path(), 4616).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        publish(
+            repo.path(),
+            &Descriptor {
+                proto: OLD,
+                pid: 4616,
+                repo: repo.path().to_string_lossy().to_string(),
+                socket: path.to_string_lossy().to_string(),
+                build: None,
+            },
+        )
+        .unwrap();
+        let served = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let open: Opening = serde_json::from_str(line.trim_end()).unwrap();
+            let decline = Welcome::Decline {
+                proto: OLD,
+                why: obsolete_why(OLD, open.proto),
+            };
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::to_string(&decline).unwrap()
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            open.proto
+        });
+        match look_at(repo.path(), agent("codex"), ATTACH_BUDGET, connect_within) {
+            Seen::OlderPeer { obsolete, .. } => {
+                assert!(obsolete, "it agreed it is obsolete, so it is replaced")
+            }
+            other => panic!("a proto-16 monitor must not be shared: {other:?}"),
+        }
+        assert_eq!(
+            served.join().unwrap(),
+            PROTO,
+            "greeted with this build's version"
+        );
     }
 
     /// ONE repair per repo: a second client does not also start one.

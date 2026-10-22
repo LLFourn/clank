@@ -83,6 +83,7 @@ pub(crate) struct WaitItem {
     priority: Option<u64>,
     agent: Option<String>,
     answer: Option<String>,
+    carries: Option<clank_core::wait::AnswerRef>,
     // External wake payloads (external-wake-hints-carry-payload):
     // github_event / command_event fields, all optional like the rest.
     repo: Option<String>,
@@ -118,7 +119,7 @@ impl WaitItem {
             return format!("event {}@{} {}", p.source, p.seq, p.ident);
         }
         let opt = |v: &Option<String>| v.clone().unwrap_or_default();
-        format!(
+        let mut identity = format!(
             "{} plan={} sha={} next={} reason={} name={} handle={}",
             self.raw_kind(),
             opt(&self.plan),
@@ -127,7 +128,16 @@ impl WaitItem {
             self.reason.as_ref().map_or("", Tag::raw),
             opt(&self.name),
             opt(&self.handle),
-        )
+        );
+        if let Some(c) = &self.carries {
+            identity.push_str(&format!(
+                " occurrence={} question={} answer={}",
+                c.occurrence.as_deref().unwrap_or(""),
+                c.question_digest,
+                c.answer_digest,
+            ));
+        }
+        identity
     }
 
     /// The wake's kind, already typed by the parse. `None` for a tag
@@ -270,8 +280,8 @@ pub(crate) fn classify(
         ),
         K::AdHocRevise => (Until("fires until you commit the revision"), Duty::Step),
         K::Unblocked => (
-            Until("fires until you acknowledge it — `clank block clean`"),
-            Duty::Unblocked,
+            Until("this wake delivers it; there is nothing to acknowledge"),
+            Duty::Nothing,
         ),
         K::Blocked => (
             Until(
@@ -315,8 +325,6 @@ pub(crate) enum Duty {
     Event,
     /// A workflow step, named by its condition.
     Step,
-    /// Acknowledged with `clank block clean`.
-    Unblocked,
     /// Only the human can clear it.
     HumanOnly,
     /// Nothing the agent can do discharges it.
@@ -397,7 +405,6 @@ pub(crate) fn duty_line(item: &WaitItem) -> Option<String> {
             };
             format!("- {what}: {until}.{block}")
         }
-        Duty::Unblocked => format!("- {what}: acknowledge it with `clank block clean`."),
         Duty::HumanOnly => format!(
             "- {what}: only the human can clear this. Do not act on it, and do not answer it \
              yourself; it does not excuse the other items."
@@ -714,6 +721,20 @@ pub(crate) fn selected_presentations<'a>(
         })
         .filter_map(|item| item.presentation.clone())
         .collect()
+}
+
+/// Everything a presentation of `items` carries to the model.
+pub(crate) fn carried<'a>(
+    items: impl IntoIterator<Item = &'a WaitItem> + Clone,
+) -> crate::cli::presentation::Carried {
+    crate::cli::presentation::Carried {
+        events: selected_presentations(items.clone()),
+        answers: items
+            .into_iter()
+            .filter(|item| item.wake_kind() == Some(clank_core::wait::WaitKind::Unblocked))
+            .filter_map(|item| item.carries.clone())
+            .collect(),
+    }
 }
 
 /// The command events in `items` whose source may be told they were
@@ -1644,6 +1665,8 @@ mod tests {
             out.contains("  - unblocked: q: yes, proceed with B\n"),
             "the human's answer is the action payload; got:\n{out}"
         );
+        assert!(out.contains("nothing to acknowledge"), "{out}");
+        assert!(!out.contains("block clean"), "{out}");
     }
 
     #[test]
@@ -1762,8 +1785,10 @@ mod tests {
             one(serde_json::json!({"kind":"promote_from_queue","name":"n","priority":500}));
         assert!(!promote.contains("clank block"), "{promote}");
 
-        let unblocked = one(serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"}));
-        assert!(unblocked.contains("`clank block clean`"), "{unblocked}");
+        assert!(
+            duties(&[serde_json::json!({"kind":"unblocked","name":"q","answer":"yes"})]).is_empty(),
+            "an answer is received by its delivery and owes no duty"
+        );
         let blocked = one(
             serde_json::json!({"kind":"blocked","agent":"claude","name":"q",
             "plan":"p","question":"?"}),

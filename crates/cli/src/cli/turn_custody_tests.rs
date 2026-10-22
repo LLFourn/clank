@@ -1046,3 +1046,199 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     assert_eq!(frame.verdict, silent(SilentReason::WaitArmed));
     assert!(turns.state(&author).is_none_or(|s| s.outstanding.is_none()));
 }
+
+fn ask_and_answer(repo: &Path, who: &str, name: &str, question: &str, answer: &str) {
+    crate::cli::block::ask(repo, &label(who), name, question).unwrap();
+    crate::cli::block::answer_block(repo, who, name, answer, None).unwrap();
+}
+
+/// What the monitor would owe `who` from its blocks right now.
+fn owed_blocks(repo: &Path, who: &str) -> Vec<clank_core::wait::WaitItem> {
+    crate::cli::wait::block_items(repo, &label(who))
+}
+
+fn receipt_marker(repo: &Path, who: &str, name: &str) -> PathBuf {
+    crate::agent_store::agents_root(repo).join(format!("{who}/unblocks/{name}.received"))
+}
+
+fn idle_stop() -> Report {
+    stop(
+        Tool::Claude,
+        "session-one",
+        TaskSnapshot::Known(Vec::new()),
+        None,
+    )
+}
+
+/// Present what is owed now on connection `conn`, and return the frame
+/// with the commit its `Delivered` makes.
+fn present_owed(turns: &mut Turns, repo: &Path, conn: u64) -> (Frame, Option<Commit>) {
+    let author = label("claude");
+    let g = gathered(repo, "claude", &owed_blocks(repo, "claude"), Ok(()));
+    let frame = turns.answer(&author, conn, &idle_stop(), true, &g).unwrap();
+    let presentation = frame.presentation().expect("presented").clone();
+    let commit = turns
+        .result(&author, conn, TurnResult::Delivered { presentation }, &g)
+        .unwrap();
+    (frame, commit)
+}
+
+/// A delivered answer is received: its marker names that exact pair and
+/// the next turn end carries no `unblocked` item.
+#[tokio::test]
+async fn a_delivered_answer_is_received_and_not_presented_again() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let (frame, commit) = present_owed(&mut turns, repo.path(), 1);
+    let text = frame.rendered.expect("rendered");
+    assert!(text.contains("unblocked: q: yes"), "{text}");
+    assert!(!text.contains("block clean"), "{text}");
+    commit.expect("a delivery commits").run(repo.path()).await;
+    assert!(receipt_marker(repo.path(), "claude", "q").exists());
+    assert!(owed_blocks(repo.path(), "claude").is_empty());
+
+    let mut restarted = Turns::new(repo.path().to_path_buf());
+    let g = gathered(
+        repo.path(),
+        "claude",
+        &owed_blocks(repo.path(), "claude"),
+        Ok(()),
+    );
+    let frame = restarted
+        .answer(&label("claude"), 2, &idle_stop(), true, &g)
+        .unwrap();
+    assert!(
+        frame
+            .rendered
+            .as_deref()
+            .is_none_or(|t| !t.contains("unblocked")),
+        "a restarted monitor does not present a received answer: {frame:?}"
+    );
+}
+
+/// A presentation that never landed receives nothing: the answer is
+/// presented again.
+#[tokio::test]
+async fn an_answer_whose_presentation_failed_stays_owed() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(
+        repo.path(),
+        "claude",
+        &owed_blocks(repo.path(), "claude"),
+        Ok(()),
+    );
+    let failed = turns.answer(&author, 1, &idle_stop(), true, &g).unwrap();
+    let presentation = failed.presentation().unwrap().clone();
+    let emit_failed = TurnResult::EmitFailed {
+        presentation,
+        why: "broken pipe".into(),
+    };
+    assert!(turns.result(&author, 1, emit_failed, &g).unwrap().is_none());
+    let unanswered = turns.answer(&author, 2, &idle_stop(), true, &g).unwrap();
+    assert!(unanswered.presentation().is_some());
+    turns.closed(&author, 2, &g);
+    assert!(!receipt_marker(repo.path(), "claude", "q").exists());
+    let again = owed_blocks(repo.path(), "claude");
+    assert!(
+        matches!(
+            again.as_slice(),
+            [clank_core::wait::WaitItem::Unblocked { .. }]
+        ),
+        "{again:?}"
+    );
+    let (frame, _) = present_owed(&mut turns, repo.path(), 3);
+    assert!(frame.rendered.unwrap().contains("unblocked: q: yes"));
+}
+
+/// The binding moved on between delivery and commit: nothing is received.
+#[tokio::test]
+async fn an_answer_delivered_to_a_replaced_session_stays_owed() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let (_, commit) = present_owed(&mut turns, repo.path(), 1);
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &label("claude"),
+        Tool::Claude,
+        &sid("session-two"),
+    )
+    .unwrap();
+    commit.unwrap().run(repo.path()).await;
+    assert!(!receipt_marker(repo.path(), "claude", "q").exists());
+    assert_eq!(owed_blocks(repo.path(), "claude").len(), 1);
+}
+
+/// Two answered blocks, one presented: only that one is received.
+#[tokio::test]
+async fn only_the_presented_answer_is_received() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    ask_and_answer(repo.path(), "claude", "first", "One?", "yes");
+    ask_and_answer(repo.path(), "claude", "second", "Two?", "no");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let (frame, commit) = present_owed(&mut turns, repo.path(), 1);
+    let text = frame.rendered.unwrap();
+    assert!(
+        text.contains("unblocked: first: yes") && !text.contains("second"),
+        "{text}"
+    );
+    commit.unwrap().run(repo.path()).await;
+    assert!(receipt_marker(repo.path(), "claude", "first").exists());
+    assert!(!receipt_marker(repo.path(), "claude", "second").exists());
+    let (frame, _) = present_owed(&mut turns, repo.path(), 2);
+    assert!(frame.rendered.unwrap().contains("unblocked: second: no"));
+}
+
+/// Present answer A, then ask the same question again and give it the
+/// same answer. A's late receipt is a no-op whether it lands at once,
+/// after a clean, or after the monitor restarted: the new occurrence is
+/// a different item and stays owed.
+#[tokio::test]
+async fn a_late_receipt_after_identical_reuse_receives_nothing() {
+    for interleave in ["direct", "clean", "restart"] {
+        let repo = repo_with("claude", Tool::Claude, "session-one");
+        ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let first_owed = owed_blocks(repo.path(), "claude");
+        let (_, commit) = present_owed(&mut turns, repo.path(), 1);
+        let late = commit.expect("delivered");
+
+        ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
+        match interleave {
+            "clean" => {
+                crate::cli::block::clean(repo.path(), &label("claude")).unwrap();
+            }
+            "restart" => turns = Turns::new(repo.path().to_path_buf()),
+            _ => {}
+        }
+        let second_owed = owed_blocks(repo.path(), "claude");
+        let identity = |items: &[clank_core::wait::WaitItem]| {
+            super::super::wake_render::mirror(items, None)[0].identity()
+        };
+        assert_ne!(
+            identity(&first_owed),
+            identity(&second_owed),
+            "{interleave}: identical text, a different occurrence"
+        );
+
+        late.run(repo.path()).await;
+        assert!(
+            !receipt_marker(repo.path(), "claude", "q").exists(),
+            "{interleave}"
+        );
+        assert_eq!(
+            owed_blocks(repo.path(), "claude"),
+            second_owed,
+            "{interleave}: the new occurrence stays owed"
+        );
+        let (frame, _) = present_owed(&mut turns, repo.path(), 2);
+        assert!(
+            frame.rendered.unwrap().contains("unblocked: q: yes"),
+            "{interleave}"
+        );
+    }
+}

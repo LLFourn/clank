@@ -1366,3 +1366,55 @@ fn a_root_plans_foreign_commit_that_cannot_move_rewrites_nothing() {
     assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head);
     assert!(repo.join(".clank/plans/foo.md").exists());
 }
+
+/// Finalization waits on the human, never on the agent: an answered
+/// block refuses nothing, received or not, while an unanswered one
+/// still does.
+#[test]
+fn an_answered_block_never_holds_finish() {
+    let env = TestEnv::init();
+    env.register_team("claude", &[], &[]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit(repo, "[foo] intro");
+    let ask = |name: &str| {
+        block_on(clank::cli::block::run(clank::cli::BlockArgs {
+            command: clank::cli::BlockCmd::Ask(clank::cli::BlockCreateArgs {
+                name: name.into(),
+                message: "Which API shape?".into(),
+                author: Some("claude".into()),
+                repo: Some(repo.to_path_buf()),
+            }),
+        }))
+        .unwrap();
+    };
+    let answer = |name: &str| {
+        block_on(clank::cli::block::run_unblock(clank::cli::UnblockArgs {
+            agent: "claude".into(),
+            name: name.into(),
+            message: "the second".into(),
+            repo: Some(repo.to_path_buf()),
+        }))
+        .unwrap();
+    };
+    ask("answered");
+    answer("answered");
+    ask("open");
+
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    let err = block_on(clank::cli::finish::run(args)).expect_err("the open one refuses");
+    assert!(err.to_string().contains("unanswered block"), "{err}");
+
+    answer("open");
+    let mut args = finish_args(repo, "foo", None);
+    args.message = vec!["finish foo now".into(), "it is wanted regardless".into()];
+    block_on(clank::cli::finish::run(args)).expect("answered blocks hold nothing");
+    assert!(repo.join(".clank/finished/foo.md").exists());
+    assert!(
+        !repo
+            .join(".clank/agents/claude/unblocks/answered.received")
+            .exists(),
+        "finish went ahead without a receipt"
+    );
+}

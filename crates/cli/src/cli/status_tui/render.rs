@@ -5548,12 +5548,14 @@ mod tests {
                 name: "a".into(),
                 question: "first question".into(),
                 answer: None,
+                occurrence: None,
             },
             crate::cli::block::BlockEntry {
                 agent: "codex".into(),
                 name: "b".into(),
                 question: "second question".into(),
                 answer: None,
+                occurrence: None,
             },
         ];
         let lines = block_ask_spans(&s, 60);
@@ -5573,6 +5575,7 @@ mod tests {
             name: "a".into(),
             question: "already answered".into(),
             answer: Some("yes".into()),
+            occurrence: None,
         }];
         assert!(block_ask_spans(&s, 60).is_empty());
     }
@@ -5589,12 +5592,14 @@ mod tests {
                 name: "done".into(),
                 question: "answered".into(),
                 answer: Some("yes".into()),
+                occurrence: None,
             },
             crate::cli::block::BlockEntry {
                 agent: "codex".into(),
                 name: "open".into(),
                 question: "still open".into(),
                 answer: None,
+                occurrence: None,
             },
         ];
         let lines = block_ask_spans(&s, 60);
@@ -6535,6 +6540,7 @@ mod tests {
                     name: "decision".into(),
                     question: "choose".into(),
                     answer: None,
+                    occurrence: None,
                 }),
                 _ => {}
             }
@@ -7513,6 +7519,7 @@ mod tests {
             name: "simctl-up-design-decisions".into(),
             question: "which sims?".into(),
             answer: None,
+            occurrence: None,
         }];
         let v = visible(&render(&s, 1, 60)[0]);
         assert!(v.starts_with("🙋 CLAUDE blocked"), "got `{v}`");
@@ -7530,6 +7537,7 @@ mod tests {
             name: "q".into(),
             question: "?".into(),
             answer: None,
+            occurrence: None,
         }];
         let v = visible(&render(&s, 1, 60)[0]);
         assert!(v.contains("blocked"), "expected the block lamp, got `{v}`");
@@ -7656,6 +7664,7 @@ mod tests {
             name: "q".into(),
             question: "is this right?\nmore detail".into(),
             answer: None,
+            occurrence: None,
         }];
         // Tall pane so the (now scrollable) ask is fully on screen.
         let texts: Vec<String> = render(&s, 12, 60).iter().map(|l| visible(l)).collect();
@@ -7696,6 +7705,7 @@ mod tests {
             name: "q".into(),
             question: q.into(),
             answer: None,
+            occurrence: None,
         }];
         // Narrow + short so the ask wraps to many lines and overflows.
         let top = render_at(&s, 8, 24, 0, 0, &PanelView::just(Mode::LogScroll))
@@ -12012,6 +12022,7 @@ mod tests {
             name: "q".into(),
             question: "the first line is long enough to wrap\nsecond paragraph".into(),
             answer: None,
+            occurrence: None,
         }];
         let cols = 24;
         let lines = render(&s, 20, cols as u16);

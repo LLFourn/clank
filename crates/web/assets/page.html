@@ -1006,7 +1006,7 @@
     if (!asks.length && !fix) { stripEl.hidden = true; stripEl.innerHTML = ''; return; }
     stripEl.hidden = false;
     stripEl.innerHTML = [
-      ...asks.map((b) => `<form class="block" data-agent="${esc(b.agent)}" data-name="${esc(b.name)}"><div class="block-context">${esc(b.agent)} · ${esc(b.name)}</div><div class="block-question">${esc(b.question)}</div><textarea name="answer" aria-label="Answer ${esc(b.agent)}'s block ${esc(b.name)}" required></textarea><button type="submit">Answer block</button><span class="block-error" role="alert"></span></form>`),
+      ...asks.map((b) => `<form class="block" data-agent="${esc(b.agent)}" data-name="${esc(b.name)}" data-occurrence="${esc(b.occurrence ?? '')}"><div class="block-context">${esc(b.agent)} · ${esc(b.name)}</div><div class="block-question">${esc(b.question)}</div><textarea name="answer" aria-label="Answer ${esc(b.agent)}'s block ${esc(b.name)}" required></textarea><button type="submit">Answer block</button><span class="block-error" role="alert"></span></form>`),
       fix ? `${esc(fix)}<span class="how">${esc(masterLabel() || 'master')}'s to repair.</span>` : '',
     ].filter(Boolean).join('');
   }
@@ -1016,18 +1016,21 @@
     const answer = form.elements.answer.value.trim();
     const error = form.querySelector('.block-error');
     if (!answer) { error.textContent = 'Write an answer before submitting.'; return; }
-    const { agent, name } = form.dataset;
-    const block = facts?.ledger.blocks.find((b) => b.agent === agent && b.name === name);
+    const { agent, name, occurrence } = form.dataset;
+    // The form answers the ask it was drawn for. Matching on name alone
+    // would let a newer use of the name be answered, or cleared, by it.
+    const asked = (b) => b.agent === agent && b.name === name && (b.occurrence ?? '') === occurrence;
+    const block = facts?.ledger.blocks.find(asked);
     if (!block) { error.textContent = 'This block is no longer pending.'; return; }
     const button = form.querySelector('button'); button.disabled = true;
     error.textContent = '';
     try {
-      const reply = await fetch(route('/blocks/answer'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent, name, question: block.question, answer }) });
+      const reply = await fetch(route('/blocks/answer'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agent, name, occurrence: block.occurrence, question: block.question, answer }) });
       if (!reply.ok) {
         const body = await reply.json().catch(() => ({}));
         throw new Error(body.why || `Answer refused (${reply.status})`);
       }
-      facts.ledger.blocks = facts.ledger.blocks.filter((b) => b.agent !== agent || b.name !== name);
+      facts.ledger.blocks = facts.ledger.blocks.filter((b) => !asked(b));
       stripDrawn = null;
       paintStrip();
     } catch (err) {

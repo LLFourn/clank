@@ -170,6 +170,7 @@ impl RepoSession {
             BrowserRequest::BlockAnswer {
                 agent,
                 name,
+                occurrence,
                 question,
                 answer,
             } => {
@@ -182,7 +183,10 @@ impl RepoSession {
                                 &agent,
                                 &name,
                                 &answer,
-                                Some(&question),
+                                Some(crate::cli::block::Shown {
+                                    occurrence: occurrence.as_deref(),
+                                    question: &question,
+                                }),
                             )
                             .map(|_| ())
                         })
@@ -727,6 +731,7 @@ mod tests {
         let answer = |question: &str, answer: &str| BrowserRequest::BlockAnswer {
             agent: "claude".into(),
             name: "why".into(),
+            occurrence: None,
             question: question.into(),
             answer: answer.into(),
         };
@@ -746,6 +751,53 @@ mod tests {
             ask(&backend, answer("Which option?", "no")).await.status,
             409
         );
+        assert_eq!(
+            crate::cli::block::scan_blocks(repo.path())[0]
+                .answer
+                .as_deref(),
+            Some("yes")
+        );
+    }
+
+    /// A form shows one ask. Once the agent re-asks the name, even with
+    /// the very same question, the old form's answer is refused and the
+    /// new ask stays owed to the human.
+    #[tokio::test]
+    async fn a_stale_form_cannot_answer_an_identical_re_ask() {
+        let repo = git_repo();
+        let claude = AgentLabel::parse("claude").unwrap();
+        let backend = backend(repo.path(), None);
+        let shown = || {
+            let blocks = crate::cli::block::scan_blocks(repo.path());
+            let crate::cli::block::BlockEntry {
+                occurrence,
+                question,
+                ..
+            } = blocks.into_iter().next().expect("one block");
+            (occurrence, question)
+        };
+        let answer =
+            |(occurrence, question): (Option<String>, String)| BrowserRequest::BlockAnswer {
+                agent: "claude".into(),
+                name: "why".into(),
+                occurrence,
+                question,
+                answer: "yes".into(),
+            };
+        crate::cli::block::ask(repo.path(), &claude, "why", "Which option?").unwrap();
+        let first = shown();
+        crate::cli::block::ask(repo.path(), &claude, "why", "Which option?").unwrap();
+        let second = shown();
+        assert_eq!(first.1, second.1, "the same question text");
+
+        let stale = ask(&backend, answer(first)).await;
+        assert_eq!(stale.status, 409, "{}", stale.body);
+        assert_eq!(
+            crate::cli::block::scan_blocks(repo.path())[0].answer,
+            None,
+            "the re-ask is still owed to the human"
+        );
+        assert_eq!(ask(&backend, answer(second)).await.status, 204);
         assert_eq!(
             crate::cli::block::scan_blocks(repo.path())[0]
                 .answer
