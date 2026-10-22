@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teams and forks | The clank book</title>
+<meta name="description" content="Save rosters, and fork the whole team into a worktree.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+<link rel="stylesheet" href="vendor/asciinema-player/asciinema-player.css">
+<script src="vendor/asciinema-player/asciinema-player.min.js" defer></script>
+<script src="player.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 4: the second pattern</p>
+<h1>Teams and forks</h1>
+<p class="lede">Once a team works, you want it again in the next repo, and on several pieces of work at once. Teams are saved rosters. Forks are the whole team carried into a new worktree, conversations included.</p>
+
+<h2 id="library">Your library: agents and teams</h2>
+<p>Your user-level config, <code>~/.clank/config.json</code>, holds two libraries that every repo can copy from.</p>
+<p>An <strong>agent description</strong> is a tool and how to launch it, with no role. Save one, then add it to any repo’s roster by name:</p>
+<pre><code>clank team agent add opus --tool claude -- --model opus
+clank agent add opus --review final</code></pre>
+<p>Everything after <code>--</code> is passed to the tool exactly as you would type it. Keep it to the few flags that pick a configuration. MCP servers and feature switches belong in the tool’s own config, or in a per-agent home set with <code>--env</code>. <code>clank agent launch opus</code> shows the launch an agent has and the command <code>clank agent start</code> would run.</p>
+<p>A <strong>team</strong> is a saved roster. Save the one this repo has, and seed another repo from it:</p>
+<pre><code>clank team save review-pair
+clank init --team review-pair</code></pre>
+<p>A team saved as <code>default</code> seeds every bare <code>clank init</code> in a repo with no roster. <code>clank team list</code> and <code>clank team show review-pair</code> show what you have. <code>clank agent swap bob kimi</code> replaces one reviewer with another in a single write, so the role is never empty.</p>
+
+<h2 id="fork">Forking the team</h2>
+<pre><code>clank fork create retry-work</code></pre>
+<p>This creates a linked git worktree at <code>.clank/worktrees/retry-work</code> on a new branch of the same name, and gives it the team. Inside zellij it opens the fork as a new tab at once. Use <code>--no-open</code> to skip that.</p>
+<p>The agents in the fork don’t start blank. Each one’s session is forked from the one it has in the source repo: Claude through its own session fork, Codex through <code>codex fork</code>, and Grok by preparing its history in the new worktree before launch. So the forked team remembers the conversation that led to the fork. An agent with no session to fork starts fresh, but carries an orientation prompt telling it where it is. <code>--fresh</code> starts every agent that way on purpose.</p>
+
+<figure class="recording">
+  <div class="cast" data-cast="fork-create"></div>
+  <figcaption>Recording <code>fork-create</code>: <code>clank fork create</code> and the forked team’s tab.</figcaption>
+</figure>
+
+<h3 id="fork-options">Shaping a fork</h3>
+<ul>
+  <li><code>clank fork create retry-work --draft retry-plan</code> moves a draft into the fork’s queue, so the forked master is handed it first. Repeat <code>--draft</code> to queue several in order.</li>
+  <li><code>clank fork create docs-pass --team review-pair</code> seeds the fork’s roster from a saved team instead of copying this one.</li>
+  <li><code>clank fork create --pr 42</code> fetches the pull request’s head, bases the worktree on it, and orients the forked sessions to reviewing PR #42 by its title. It uses <code>gh</code>.</li>
+  <li><code>clank fork create scratch --clone</code> makes a full local clone under <code>.clank/clones/</code> instead of a worktree. It is an independent repo whose only remote is your checkout.</li>
+  <li><code>clank fork create retry-work --prompt "Focus on the retry path only."</code> adds your own context to the orientation.</li>
+</ul>
+
+<h2 id="many">Working several forks at once</h2>
+<p>A fork is a repo in its own right. It has its own roster copy, its own master and its own single active plan. Several forks therefore run in parallel without stepping on each other, each in its own tab.</p>
+<pre><code>clank fork list
+clank open --fork retry-work
+clank open --all</code></pre>
+<p><code>clank open --fork retry-work</code> reopens that fork’s tab, and does nothing if it is already open. <code>--all</code> opens every fork that isn’t open yet. Each fork starts its whole team, so do that on purpose.</p>
+
+<h2 id="landing">Landing the work and cleaning up</h2>
+<p>A fork’s plans finish on the fork’s branch. To bring finished plans onto your branch, copy them, commits and plan files together:</p>
+<pre><code>clank pick --from retry-work add-retry</code></pre>
+<p><code>pick</code> never changes the source branch. <code>--squash</code> lands each plan as one commit, and <code>--dry-run</code> shows what would land first. An ordinary git merge works too. When you are done:</p>
+<pre><code>clank fork remove retry-work</code></pre>
+<p>Removal refuses a fork with uncommitted changes or commits your checkout cannot reach. <code>--force</code> overrides that, and for a clone it permanently destroys those commits.</p>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 5</span>
+      <a href="controller.html">A controller repo</a>
+      <p>Agents that react to the outside world and run other repos’ teams.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html" aria-current="page">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Group coding | The clank book</title>
+<meta name="description" content="One master and its reviewers take a plan from draft to sealed record.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+<link rel="stylesheet" href="vendor/asciinema-player/asciinema-player.css">
+<script src="vendor/asciinema-player/asciinema-player.min.js" defer></script>
+<script src="player.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 3: the first pattern</p>
+<h1>Group coding</h1>
+<p class="lede">The everyday pattern: one master and its reviewers take a plan from a draft to a sealed record, with every commit reviewed on the way.</p>
+
+<figure class="recording">
+  <div class="cast" data-cast="plan-cycle"></div>
+  <figcaption>Recording <code>plan-cycle</code>: a real claude and codex team on a deliberately tiny task, from promotion through a reviewer’s verdict, the implementation commit and <span class="stamp finished">FINISHED</span> to <code>clank finish</code>.</figcaption>
+</figure>
+
+<h2 id="roles">Who does what</h2>
+<p>The <strong>master</strong> writes plans, promotes them, implements them and finishes them. It never writes verdicts. The <strong>reviewers</strong> read the master’s commits and write exactly one verdict on each commit they owe. They never promote, implement or finish. A <strong>standby</strong> agent reviews nothing. It is still woken for everything else, such as messages and events, which makes it a good place to keep a helper.</p>
+
+<h2 id="queue">Drafts, the queue and promotion</h2>
+<p>A plan starts as a markdown file in <code>.clank/drafts/</code>, a staging area git ignores. Queuing it consumes the draft. Promoting it makes it the repo’s active plan:</p>
+<pre><code># write the plan body first, in .clank/drafts/my-feature.md
+clank queue add my-feature
+clank queue promote my-feature</code></pre>
+<p>The queue is ordered by priority, lowest first and 500 by default, so <code>clank queue add my-feature --priority 200</code> jumps it ahead. <code>clank queue unqueue my-feature</code> sends a queued plan back to drafts, and <code>clank queue remove my-feature</code> deletes it.</p>
+<p>Promotion is a commit: the plan file lands in <code>.clank/plans/</code> as <code>[my-feature] intro</code>. That commit is the plan’s first review. Reviewers read the plan before any code exists, which is the cheapest moment to say the plan is wrong.</p>
+<p>When no plan is active and the queue is not empty, clank hands the master a promote item. The master reads the queued plan against the code as it is now, rescopes or splits it if it needs that, and promotes only what is ready.</p>
+<aside class="note"><p>In <code>clank tui</code> the queue has a <strong>drafts</strong> row under it. A draft’s page can queue it with <kbd>e</kbd>, or queue and promote it with <kbd>p</kbd>.</p></aside>
+
+<h2 id="tiers">Reviewer tiers</h2>
+<p>Each reviewer on the roster has a tier, which says which commits it owes a verdict on.</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th scope="col">Tier</th><th scope="col">Reviews</th></tr></thead>
+  <tbody>
+    <tr><td><code>commit</code></td><td>Every reviewable commit, as it lands.</td></tr>
+    <tr><td><code>plan</code></td><td>The plan stage: the intro and any plan revisions.</td></tr>
+    <tr><td><code>final</code></td><td>The final stage, when the work is believed complete.</td></tr>
+    <tr><td><code>gate</code></td><td>Both the plan stage and the final stage.</td></tr>
+    <tr><td><code>standby</code></td><td>Nothing. It is woken for everything else.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Change a tier in place with <code>clank agent set-review bob gate</code>. The agent’s session and pane are untouched.</p>
+
+<h2 id="verdicts">Verdicts, and what each one obliges</h2>
+<p>A reviewer writes its verdict with one command:</p>
+<pre><code>clank feedback write --commit <var>sha</var> --verdict request-changes \
+  --author bob -m "The backoff never stops growing"</code></pre>
+<p>The first line of <code>-m</code> is the summary and any further lines are detail. clank prepends the verdict itself. Together, the verdicts on the latest reviewable commit make up the plan’s <strong>review gate</strong>.</p>
+<dl class="terms">
+  <dt><span class="stamp continue">CONTINUE</span></dt>
+  <dd>The commit is sound and nothing in it is being held up, but the plan still owes work. The reviewer names what remains. A reviewer that is waiting on a change it asked for must not write CONTINUE.</dd>
+  <dt><span class="stamp changes">REQUEST_CHANGES</span></dt>
+  <dd>A correction is required before anything else happens. The master makes it, commits, and stops for review again. It is also the right verdict for an implementation delivered in pieces without milestones the plan justified.</dd>
+  <dt><span class="stamp finished">FINISHED</span></dt>
+  <dd>The committable work the plan describes is done and ready to merge: code written, tests passing, review satisfied. A plan document alone is not finished unless the document is the whole deliverable. A step only a human can do, like a smoke test on a device, is recommended in the verdict, never waited on.</dd>
+</dl>
+<p>A single <span class="stamp changes">REQUEST_CHANGES</span> holds the plan, whatever the others said. The gate reaches finished when a reviewer writes <span class="stamp finished">FINISHED</span> and nobody has asked for changes. While a gate-tier reviewer still owes its verdict, the master waits. The master reads the verdicts with a command, not by opening the files:</p>
+<pre><code>clank feedback read --commit <var>sha</var>
+clank feedback read --plan</code></pre>
+<p>The second form reads the active plan’s whole cycle, oldest commit first, each with its verdicts.</p>
+
+<h2 id="one-commit">One commit, or justified milestones</h2>
+<p>The master implements everything a plan specifies in a single commit. A plan can name internal milestones, but only with a strong reason for each review boundary, written into the plan before implementation starts. Milestones added afterwards to excuse a partial commit are what reviewers are told to reject.</p>
+<p>After every commit the master stops: after the implementation, after each review correction, after a plan revision, and after promoting a plan. clank wakes it again when the gate has moved. The <a href="for-agents.html">For agents</a> chapter has the rule from the agent’s side.</p>
+
+<h3 id="tags">Commit tags</h3>
+<p>An implementation commit’s subject starts with the plan it belongs to, as in <code>[my-feature] Retry failed fetches</code>. The tags on a commit must equal the set of active plans whose files it touches: no tag on an unrelated fix, and no missing or extra tag. If they don’t match, clank hands the master a correction to amend before anything else moves.</p>
+
+<h2 id="finish">Finishing a plan</h2>
+<p>When the gate reaches <span class="stamp finished">FINISHED</span>, the master is handed a finalize item, and only then does it run:</p>
+<pre><code>clank finish my-feature -m "Retry failed fetches with a capped backoff" \
+  -m "CI flaked on every network blip, and an uncapped retry could stall a run for hours."</code></pre>
+<p>The message is required and is written as if the whole plan were one commit: what changed in the subject, why in the body. A bare subject is rejected. The plan moves to <code>.clank/finished/</code>. That is the seal.</p>
+<p>With <code>finish.autosquash</code> on, the plan’s commits also collapse into one commit carrying that message. It rewrites the current branch in place, so it is off by default:</p>
+<pre><code>clank config finish.autosquash true</code></pre>
+<p><code>clank finish my-feature --no-squash -m "…" -m "…"</code> keeps the individual commits for one finish, for example to keep a refactor bisectable. <code>--force</code> finishes without the gate’s say-so. That is the human’s escape hatch, not the master’s.</p>
+
+<h2 id="aside">Setting a plan aside</h2>
+<ul>
+  <li><code>clank stash</code> takes the active plan’s commits off the branch and keeps them on a protective ref, so another plan can run. <code>clank stash pop</code> replays them, and they are reviewed afresh.</li>
+  <li><code>clank stash --to-queue</code> gives the attempt up but saves the plan body back to the queue.</li>
+  <li><code>clank unfinish my-feature</code> moves a finished plan back to active.</li>
+  <li><code>clank rereview</code> makes every reviewer review the plan’s latest commit again. Use it when a commit was accepted without the review it needed.</li>
+  <li><code>clank purge --drop my-feature</code> deletes a plan and its commits from history.</li>
+</ul>
+
+<h2 id="blocks">Blocks: questions only the human can answer</h2>
+<p>An agent that needs a decision it must not make itself asks for one:</p>
+<pre><code>clank block ask schema-choice -m "Keep the v1 config readable, or migrate it on first load?"</code></pre>
+<p>A block is repo-wide. While it is unanswered, the review cycle pauses for the whole team. Messages and events are still delivered. You answer it, naming the agent and the block, and the answer wakes the agent:</p>
+<pre><code>clank block answer alice schema-choice -m "Migrate on first load, and keep a backup."
+clank block clean</code></pre>
+<p>Blocks are for real dependencies on you, such as contested reviews, a plan drifting from what you asked for, or work that looks unwise. A queued plan is an instruction, not a question, so the master never blocks to ask permission to do queued work. Set <code>hooks.blocked</code> to a command, such as a desktop notification, and clank runs it whenever an agent blocks.</p>
+
+<h2 id="watching">Watching it happen</h2>
+<pre><code>clank tui
+clank log --plan my-feature --oneline</code></pre>
+<p><code>clank tui</code> is the full-screen pane <code>clank open</code> puts beside the agents, and it is how you drive a running team. It shows each agent’s live state, the plan and its verdicts, the queue and drafts, event sources and the timeline, and it has a page for each agent with its auto-mode, tier and pane. Every screen lists its keys along the bottom.</p>
+<p><code>clank log</code> prints the same timeline: commits, reviews and GitHub events, newest first. <code>clank status --watch</code> re-prints the state as it changes, <code>clank diff my-feature</code> opens a plan’s diff in your editor, and <code>clank html open</code> renders the timeline as a static site.</p>
+
+<figure class="recording">
+  <div class="cast" data-cast="tui-watch"></div>
+  <figcaption>Recording <code>tui-watch</code>: <code>clank tui</code> while a team works.</figcaption>
+</figure>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 4</span>
+      <a href="teams.html">Teams and forks</a>
+      <p>Saved teams, and forking the whole team into a worktree.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html" aria-current="page">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

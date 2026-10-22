@@ -1,0 +1,50 @@
+# Banned in every recording. The one definition: scripts/book/record.py
+# refuses to write a cast that matches any line, and the book_is_true
+# gate fails on any committed cast that does.
+#
+# One regex per line; blank lines and lines starting with `#` are ignored.
+# Use only syntax that Rust `regex` and Python `re` read identically: no
+# lookaround, no backreferences. A leading `(?i)` is fine in both.
+#
+# record.py rewrites the user's home (and the demo home) to `~` BEFORE
+# checking, so any home path that survives is a leak.
+
+# Home and temp paths that name a user or a machine.
+/Users/[A-Za-z0-9._-]+
+/home/[A-Za-z0-9._-]+
+-Users-[A-Za-z0-9._-]+
+/var/folders/
+/tmp/claude-[0-9]+
+
+# Email addresses.
+[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}
+
+# GitHub tokens.
+\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}
+github_pat_[A-Za-z0-9_]{16,}
+
+# API keys: sk- style (OpenAI, Anthropic), Slack, AWS, bearer headers, PEM keys.
+\bsk-[A-Za-z0-9_-]{16,}
+\bxox[abprs]-[A-Za-z0-9-]{10,}
+\bAKIA[0-9A-Z]{16}\b
+(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}
+-----BEGIN [A-Z ]*PRIVATE KEY-----
+
+# Tunnel hosts.
+(?i)trycloudflare\.com
+(?i)\bngrok(-free)?\.(app|io|dev)\b
+(?i)\blocalhost\.run\b
+(?i)\blhr\.life\b
+(?i)\bloca\.lt\b
+(?i)\bserveo\.net\b
+(?i)\btunnelmole\.net\b
+(?i)\bbore\.pub\b
+(?i)\bdevtunnels\.ms\b
+
+# Login, one-time and device-code URLs.
+(?i)https?://[^\s"'<>]*(login|signin|sign-in|oauth|authorize|one-time|onetime|magic-link|device|activate)
+(?i)https?://[^\s"'<>]*[?&#](token|code|key|otp|ticket|auth)=
+
+# QR codes: the finder square drawn in half blocks or in full blocks.
+█▀▀▀▀▀█
+██ {10}██

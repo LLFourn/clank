@@ -336,6 +336,7 @@ dependencies = [
  "clap",
  "cloudflare-quick-tunnel",
  "dunce",
+ "fancy-regex",
  "filetime",
  "flate2",
  "futures-util",

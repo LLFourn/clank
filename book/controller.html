@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A controller repo | The clank book</title>
+<meta name="description" content="Agents woken by timers, feeds and GitHub, running other teams.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+<link rel="stylesheet" href="vendor/asciinema-player/asciinema-player.css">
+<script src="vendor/asciinema-player/asciinema-player.min.js" defer></script>
+<script src="player.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 5: the third pattern</p>
+<h1>A controller repo</h1>
+<p class="lede">Some repos exist to run other repos. Their agents are woken by the outside world, such as a pull request, a timer or a feed you wrote, and they react by handing work to the teams they supervise.</p>
+
+<figure class="recording">
+  <div class="cast" data-cast="controller-events"></div>
+  <figcaption>Recording <code>controller-events</code>: a controller agent woken by a timer, then by a GitHub-shaped event from a command source, sending the work on to another repo’s team. No GitHub account is involved. The <a href="#github">GitHub source</a> below is the real thing.</figcaption>
+</figure>
+
+<h2 id="sources">Wake sources</h2>
+<p>An agent’s wake sources live in its own config, <code>.clank/agents/<var>label</var>/config.json</code>, as a <code>wait_events</code> list. The repo’s monitor hosts them for as long as it runs, and every event they produce lands in that agent’s <a href="#inbox">inbox</a> before it wakes anyone. There are three kinds.</p>
+
+<h3 id="timers">Timers</h3>
+<pre><code>{
+  "wait_events": [
+    {"kind": "timer", "name": "morning-sweep",
+     "due_at": "2026-11-02T09:00:00+11:00",
+     "repeat_every": "24h",
+     "content": "Route each open PR to its team."}
+  ]
+}</code></pre>
+<p>A timer fires once at <code>due_at</code>, an absolute time with an explicit UTC offset. With <code>repeat_every</code> it fires again at that fixed interval. That is elapsed time, not a calendar: 24 hours stays 24 hours across a daylight-saving change. If clank was not running when a timer came due, it catches up the next time a wait is armed. A recurring timer that missed many slots delivers one catch-up event for all of them, not a storm. Acknowledging that event covers every slot up to the moment you acknowledged it.</p>
+
+<h3 id="commands">Command sources</h3>
+<pre><code>{"kind": "command", "name": "deploys",
+ "command": ["deploy-feed", "--follow"]}</code></pre>
+<p>A command source is any program that writes one JSON object per line on stdout. Each line needs an <code>id</code> that is unique within the source, and may carry <code>content</code>, <code>kind</code> and <code>at</code>. clank deduplicates on the id, so a producer may repeat itself safely. The argv runs without a shell, in a process group clank owns and ends when its host stops. Add <code>reply_command</code> and a line can set <code>"requires_reply": true</code>, so the agent must answer the event before it can acknowledge it.</p>
+<p>This is the general escape hatch. An HTTP long-poll, a chat receiver or a script that watches a log can each become an event source in a few lines.</p>
+
+<h3 id="github">GitHub</h3>
+<pre><code>{"kind": "github", "repo": "<var>owner</var>/<var>name</var>",
+ "watch": [
+   {"pr": {"events": ["opened"]}},
+   {"pr": {"numbers": [603], "events": ["review_submitted", "comment"]}},
+   {"branch": {"names": ["main"], "events": ["push"]}}
+ ],
+ "prompt": "Triage it, hand it to the right team, then ack."}</code></pre>
+<p>A GitHub source watches a repo’s pull requests, issues, branch pushes and CI conclusions. The <code>watch</code> form names objects and the events under each one. Clauses add together, and an event that several clauses admit still wakes you once. There is also a flat form, <code>"events": ["pr_opened", "pr_comment"]</code> with optional <code>"prs"</code> and <code>"branches"</code> scopes. A source uses one form or the other, never both.</p>
+<ul>
+  <li><strong><code>prompt</code></strong> is your standing instruction for that watch. It is shown with every event the watch produces, telling the agent what reacting means.</li>
+  <li><strong>Your own actions don’t wake you</strong>, unless you set <code>"include_own_actions": true</code>. The exception is <code>review_submitted</code>, which is never filtered, because a submitted review is the thing a team waits on.</li>
+  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. A wait sees the current result. A red build that turned green while nothing was armed is simply gone.</li>
+</ul>
+<p>A source polls by default. Add <code>"delivery": "realtime"</code> for push-speed wakes through GitHub’s webhook forwarding. Polling keeps running underneath as the backstop. What each needs:</p>
+<div class="table-scroll">
+<table>
+  <thead><tr><th scope="col">Delivery</th><th scope="col">Needs</th></tr></thead>
+  <tbody>
+    <tr><td>Polling</td><td>A token from <code>GH_TOKEN</code> or <code>GITHUB_TOKEN</code>, or else one <code>gh auth token</code> call. With neither, the source waits and says so. It never polls unauthenticated.</td></tr>
+    <tr><td>Realtime</td><td>The <code>gh</code> binary, its <code>cli/gh-webhook</code> extension, and admin on the watched repo, because it creates a webhook. Without them the source falls back to polling and names the reason once.</td></tr>
+  </tbody>
+</table>
+</div>
+<p>The <code>clank-github</code> skill carries the full vocabulary, catch-up rules and realtime caveats. Agents load it when GitHub events wake them.</p>
+
+<h2 id="inbox">The inbox: react, then ack</h2>
+<p>Every event a source delivers, and every message <code>clank send</code> delivers, goes into the recipient’s inbox, a log under its agent directory in <code>.clank/agents/</code>. It stays unhandled, and keeps waking its agent each time a wait is armed, until the agent acknowledges it. Delivery is therefore at least once. An event that fires while the agent is offline is waiting when it comes back, and one it half-handled before a crash comes round again.</p>
+<pre><code>clank events list
+clank events read <var>id</var>
+clank events ack <var>id</var></code></pre>
+<p><code>list</code> and <code>show</code> give metadata only. <code>read</code> returns the content and records that it was delivered to you. Event content comes from outside, so treat it as untrusted. The loop is always the same: read it, do what it asks, acknowledge it. Reading or being woken never acknowledges anything. An event that requires a reply is acknowledged with its answer: <code>clank events ack <var>id</var> --reply "Shipped in 1.4.2."</code></p>
+
+<h2 id="observe">Watching another repo</h2>
+<pre><code>clank wait --repo ../app --for finished</code></pre>
+<p>This is an <strong>observer wait</strong>. It blocks until the named thing happens in that repo, counting only what happens after it starts: <code>commit</code> for any new commit, <code>finished</code> for a finalized plan, <code>stopped</code> for a plan finalized or a new unanswered block. It needs no binding in the other repo and fires no lifecycle hooks.</p>
+<div class="callout seal">
+  <p class="callout-title">An observer wait is not your work loop.</p>
+  <p>Your own work still reaches you the way it always does: through your tool’s hook or plugin, or for Grok through its one requested background wait. An observer wait is a deliberate, separate command you start to watch someone else’s repo, and its completion is your signal. It does not replace, and must not duplicate, your automatic subscription. <a href="for-agents.html#woken">For agents</a> states the whole contract.</p>
+</div>
+
+<h2 id="send">Talking across repos</h2>
+<pre><code>clank send --repo ../app --master -m "PR 612 needs a review pass before Friday."
+clank send --repo ../app --to codex --reply-to lead -m "Is main green after the merge?"</code></pre>
+<p>A message is a durable event in the recipient’s inbox, and it wakes them until they acknowledge it. <code>--master</code> addresses whoever that repo’s roster names master. <code>--reply-to</code> names one of your own agents and requires an answer before the recipient can acknowledge. <code>--interrupt</code> also tries to interrupt the recipient’s current turn. If that cannot be done, the message waits in the inbox as usual.</p>
+
+<h2 id="supervise">Spawning and supervising teams</h2>
+<p>Nearly every command takes <code>--repo</code>, so a controller agent can set up and drive a team elsewhere with the same commands you would use:</p>
+<pre><code>clank init --repo ../app --team review-pair
+clank open --repo ../app
+clank queue add fix-flaky-ci --repo ../app -m "Make the integration job deterministic."
+clank wait --repo ../app --for stopped
+clank status --repo ../app</code></pre>
+<p>That team’s master is handed the queued plan and runs the cycle on its own. The controller watches for the stop-point and reads the result. When the other team blocks on a question, the controller sees the stop and can relay the question to you.</p>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 6</span>
+      <a href="for-agents.html">For agents</a>
+      <p>Addressed to the agent: how you are woken and what you owe.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html" aria-current="page">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

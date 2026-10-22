@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started | The clank book</title>
+<meta name="description" content="Install clank, set up your agents, and open a team.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+<link rel="stylesheet" href="vendor/asciinema-player/asciinema-player.css">
+<script src="vendor/asciinema-player/asciinema-player.min.js" defer></script>
+<script src="player.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 2</p>
+<h1>Getting started</h1>
+<p class="lede">Install clank, wire it into your agent CLIs, give a repo a roster of two agents, and open the team.</p>
+
+<h2 id="needs">What you need</h2>
+<ul>
+  <li>git and a Rust toolchain, to build clank.</li>
+  <li><a href="https://zellij.dev">zellij</a>, the terminal workspace <code>clank open</code> lays the team out in.</li>
+  <li>At least one agent CLI: Claude Code, Codex CLI, Grok CLI or opencode. Two different ones make a better team, because each reviews the other.</li>
+</ul>
+
+<h2 id="install">Install</h2>
+<pre><code>git clone https://github.com/LLFourn/clank
+cd clank
+cargo install --path crates/cli --locked</code></pre>
+<p>That puts two programs on your <code>$PATH</code>: <code>clank</code>, and <code>clank-web-cloudflare</code>, the host process the <a href="remote.html">remote</a> starts. Keep <code>--locked</code>, so cargo builds against the committed <code>Cargo.lock</code> instead of re-resolving every dependency.</p>
+
+<h2 id="setup">Wire it into your agents</h2>
+<pre><code>clank setup
+clank doctor</code></pre>
+<p><code>clank setup</code> installs, at user level:</p>
+<ul>
+  <li>the role skills <code>clank-master</code> and <code>clank-reviewer</code>, plus <code>clank-github</code>, for each tool;</li>
+  <li>clank’s Stop and SessionStart hooks, merged into Claude Code’s <code>settings.json</code> and Codex’s <code>hooks.json</code>;</li>
+  <li>Grok’s native hooks, in <code>~/.grok/hooks/clank.json</code>;</li>
+  <li>the opencode plugin, which binds the session and carries its work loop.</li>
+</ul>
+<p>The hooks are how an agent gets woken, and the skills are how it learns its job. Run <code>clank setup</code> again after every upgrade. <code>clank setup --dry-run</code> shows what would change first, and <code>clank setup --force</code> overwrites skill files you have edited.</p>
+<p><code>clank doctor</code> checks the repo, your user-level install and the current session, and prints OK, WARN or FAIL with what to do about each. It exits non-zero on any FAIL. It is the first thing to run whenever something seems off.</p>
+
+<h2 id="init">Give a repo a roster</h2>
+<pre><code>cd <var>your-project</var>
+clank init
+clank agent add alice --tool claude
+clank agent add bob --tool codex</code></pre>
+<p><code>clank init</code> creates <code>.clank/</code>, with its <code>plans/</code> directory and a managed <code>.gitignore</code>. It also installs a git <code>post-rewrite</code> hook, so verdicts follow their commits through a rebase or an amend.</p>
+<p>The first agent you add becomes the master, because the roster has none yet. Each later one becomes a reviewer of every commit. To choose a different tier, say so:</p>
+<pre><code>clank agent add carol --tool grok --review gate
+clank agent list</code></pre>
+<p>The tiers are explained in <a href="group-coding.html#tiers">Group coding</a>. A label is just a name. Use something short, because you will type it.</p>
+
+<figure class="recording">
+  <div class="cast" data-cast="install-init"></div>
+  <figcaption>Recording <code>install-init</code>: a real <code>cargo install</code> into a demo-owned root, fast-forwarded through the build, then <code>clank init</code> and a two-agent roster run with that binary.</figcaption>
+</figure>
+
+<h2 id="open">Open the team</h2>
+<pre><code>clank open</code></pre>
+<p>This is the step that makes the agents exist. Outside zellij, it starts a session for the repo. Inside one, it adds a tab. Either way you get the master on the large pane, the reviewers stacked beside it, and a <code>clank tui</code> pane. Each agent pane runs <code>clank agent start <var>label</var></code>, which starts the agent’s CLI in the repo, or resumes its session if it has one.</p>
+<p>Each pane starts its tool with its label in the environment, and clank’s SessionStart hook binds that label to the new session. There is nothing to type. Only a session you start yourself, outside <code>clank open</code>, needs binding by hand:</p>
+<pre><code>clank as <var>label</var></code></pre>
+<p>Inside the session, move between panes with <kbd>Alt</kbd>+<kbd>h</kbd>/<kbd>j</kbd>/<kbd>k</kbd>/<kbd>l</kbd>. clank leaves <kbd>Alt</kbd> with the arrow keys to the agents, because Codex uses <kbd>Alt</kbd>+<kbd>↑</kbd> to edit its last message.</p>
+<aside class="note"><p>If the repo is already open in some zellij session on this machine, <code>clank open</code> tells you where and opens nothing, rather than starting a second copy of every agent.</p></aside>
+
+<figure class="recording">
+  <div class="cast" data-cast="open-team"></div>
+  <figcaption>Recording <code>open-team</code>: <code>clank open</code> bringing up a real team in zellij.</figcaption>
+</figure>
+
+<h2 id="check">Check it</h2>
+<pre><code>clank status
+clank doctor</code></pre>
+<p><code>clank status</code> shows HEAD, the active plan and where its review stands, and the roster. <code>clank agent list</code> adds each agent’s binding. When every agent is bound and doctor is clean, the team is ready for its first plan.</p>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 3</span>
+      <a href="group-coding.html">Group coding</a>
+      <p>The everyday pattern: plans, the master and its reviewers.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html" aria-current="page">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

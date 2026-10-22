@@ -94,8 +94,9 @@ must amend BEFORE anything else proceeds. Three ways to break it:
 - `clank send (--to <agent> | --master) [--repo <path>] -m "…"` —
   message an agent, here or in another repo (see Messages).
 - `clank block ask <name> -m "question"` — ask the human. A block is
-  always repo-wide: one pending block parks you entirely until it is
-  answered, so raise one only when you genuinely cannot proceed.
+  always repo-wide: while one is pending the review cycle pauses (no
+  promote, review or finish work), though messages and events still
+  wake you. Raise one only when you genuinely cannot proceed.
   `clank block clean` acknowledges answered blocks.
 
 ### Extra wake sources (controller repos)
@@ -151,11 +152,13 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
   ADMIN on the watched repo (it creates a webhook) and the
   `cli/gh-webhook` extension; GitHub bills the relay as dev tooling.
 - `{"kind":"command","name":"label","command":["prog","arg",…]}` — a
-  command whose COMPLETION is the wake (an HTTP long-poll, a custom
-  poller, a Signal receiver — anything). Its argv runs with no shell
-  (write `["sh","-c","…"]` for one); a `command_event` item carries the
-  exit code and the last 1 KiB of output. Have it BLOCK until the event
-  — a command that exits instantly re-fires every re-arm.
+  long-running producer that streams events as JSONL on stdout, one
+  object per line (`id` unique within the source; optional `content`,
+  `kind`, `at`, `requires_reply`): an HTTP long-poll, a
+  custom poller, a Signal receiver, anything. Its argv runs with no
+  shell (write `["sh","-c","…"]` for one). Each event lands in your
+  inbox like a github event and re-wakes you until acked; re-emitting
+  an id is harmless. Keep any cursor in `$CLANK_SOURCE_STATE_DIR`.
 
 React to a `github_event` / `command_event` like any other work item:
 do the triage (`gh` for PRs/issues, your own tools for command events),

@@ -4,6 +4,10 @@ Multi-agent peer review around plans. One agent (the **master**) writes
 a plan; reviewers weigh in; the master implements the complete plan in one
 commit by default; reviewers sign off; the plan finalizes into a sealed record.
 
+**New here? Read [the clank book](book/index.html)**: the ideas, the three ways to
+use clank, and real recordings. Open `book/index.html` in a browser; it works
+offline. This README is the reference.
+
 Everything lives in `.clank/` and `git`. No daemon, no server, no
 database — the review history IS the commit history.
 

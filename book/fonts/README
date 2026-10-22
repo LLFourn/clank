@@ -1,0 +1,20 @@
+Fonts for the clank book, self-hosted so the book renders offline.
+
+All three are under the SIL Open Font License 1.1 (OFL-*.txt beside them,
+none with a Reserved Font Name). Each woff2 was converted from the variable
+TTF in the google/fonts repository with fontTools' pyftsubset; Literata and
+Martian Mono are subset to Latin, punctuation and arrows, JetBrains Mono is
+kept whole because terminal recordings need its box-drawing glyphs.
+
+literata-roman.woff2   https://github.com/google/fonts/raw/main/ofl/literata/Literata%5Bopsz,wght%5D.ttf
+literata-italic.woff2  https://github.com/google/fonts/raw/main/ofl/literata/Literata-Italic%5Bopsz,wght%5D.ttf
+martian-mono.woff2     https://github.com/google/fonts/raw/main/ofl/martianmono/MartianMono%5Bwdth,wght%5D.ttf
+jetbrains-mono.woff2   https://github.com/google/fonts/raw/main/ofl/jetbrainsmono/JetBrainsMono%5Bwght%5D.ttf
+
+Licences: the OFL.txt in each of those directories, copied as
+OFL-Literata.txt, OFL-MartianMono.txt and OFL-JetBrainsMono.txt.
+
+Subset command (Literata and Martian Mono):
+  pyftsubset <ttf> --flavor=woff2 --layout-features='*' \
+    --unicodes='U+0000-00FF,U+0131,U+0152-0153,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2190-21FF,U+2212,U+2215,U+2713,U+2717,U+25B6,U+FEFF,U+FFFD'
+JetBrains Mono: the same with --unicodes='*'.

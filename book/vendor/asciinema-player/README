@@ -1,0 +1,5 @@
+asciinema-player 3.15.1 (Apache-2.0, LICENSE beside this file).
+
+From the npm package: `npm pack asciinema-player@3.15.1`, files
+dist/bundle/asciinema-player.min.js and dist/bundle/asciinema-player.css,
+unmodified. Source: https://github.com/asciinema/asciinema-player

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works | The clank book</title>
+<meta name="description" content="The monitor, the turn-end decision and the .clank/ layout.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 8</p>
+<h1>How it works</h1>
+<p class="lede">A short tour of the machinery underneath, for anyone who wants to know why they can trust it.</p>
+
+<h2 id="monitor">The monitor</h2>
+<p>Each repo has one monitor, a background process the first <code>clank wait</code> or <code>clank tui</code> starts when none is running. It exists because watching is per repo, while delivery is per agent. Before it, every parked wait and every TUI watched and re-read the whole repo for itself, so one commit was folded many times over. Now the monitor watches once and serves everyone. It:</p>
+<ul>
+  <li>folds the repo’s state, meaning commits, plans, verdicts and the roster, into the work each agent is owed;</li>
+  <li>routes that work to each connected wait, which then speaks its own tool’s protocol;</li>
+  <li>hosts the event sources agents have configured: one producer per source, not one per wait;</li>
+  <li>admits one automatic wait per bound session and refuses a duplicate;</li>
+  <li>makes the <a href="#turn-end">turn-end decision</a> for every agent.</li>
+</ul>
+<p>Clients speak a versioned protocol to it. A monitor routinely outlives a <code>cargo install</code>, so a fresh client that meets an older monitor negotiates for it to stand down rather than being served by a build that cannot do what it needs.</p>
+<p>The monitor is not a service. Nobody installs, starts or configures it, and it keeps nothing durable of its own. Plans, the roster, verdicts and the event inbox are files, so a monitor that goes away loses nothing that the next one cannot rebuild.</p>
+
+<h2 id="messenger">The stop hook is a messenger</h2>
+<p>When an agent ends a turn, its tool runs clank’s hook: the Stop hook for Claude Code, Codex and Grok, and the plugin for opencode. The hook decides nothing. It carries evidence to the monitor in one report on its <code>clank wait</code> connection: which background tasks are running, where this stop sits in the agent’s own transcript, and the session it belongs to. The monitor answers with a verdict. The hook renders that verdict in the form its tool understands, then writes back whether delivery succeeded.</p>
+<p>Keeping the decision in one place is the point. When the hook and the monitor each decided about the same agent, linked by files one wrote and the other inferred from, the monitor could read a correctly waiting agent as idle and type a recovery prompt into it. Now there is one decider, and each tool’s hook only frames its answer.</p>
+
+<h2 id="turn-end">The turn-end decision</h2>
+<p>The policy is one state machine per repo, agent and session binding. Each stop resolves to one of these:</p>
+<dl class="terms">
+  <dt>Stay silent</dt>
+  <dd>Auto-mode is off; the session is no longer this agent’s; the agent is attending background work that is still running; or, for Grok, its one background wait is already armed and will carry the next wake.</dd>
+  <dt>Park</dt>
+  <dd>Nothing is owed yet. Hold the wait open until something is.</dd>
+  <dt>Deliver</dt>
+  <dd>Hand the agent its items. If the same items go out unchanged a fourth time in a row, the message escalates: ending a turn does not discharge pending work, and a real dependency on the person belongs in a block. Every item is still delivered.</dd>
+  <dt>Notify</dt>
+  <dd>Wake the agent with text that is not work, such as the one check-in owed when attended work runs past its <code>--expect</code>.</dd>
+</dl>
+<p>Every fact a decision rests on is re-checked when it is used, never cached. A Claude agent with a question open to you is recorded as asking until you answer it, and stall notices hold off while it waits.</p>
+
+<h2 id="layout">The <code>.clank/</code> layout</h2>
+<pre class="diagram"><code>&lt;repo&gt;/.clank/
+├── plans/           the active plan        committed
+├── finished/        sealed plan records    committed
+├── .gitignore       allows only those two  committed
+├── queue/           queued plans
+├── drafts/          what queue add consumes
+├── config.json      roster and repo config
+├── agents/&lt;label&gt;/
+│   ├── config.json  binding, auto-mode, wait_events
+│   ├── feedback/    a reviewer’s verdicts
+│   └── events/      the inbox
+├── blocks/ stash/ cache/ zellij/ html/
+└── worktrees/ clones/   forks</code></pre>
+
+<h2 id="local">What is committed and what stays local</h2>
+<p>Only <code>plans/</code>, <code>finished/</code> and the managed <code>.clank/.gitignore</code> are committed. Those are the record. Everything else is per-checkout working state: the roster, each agent’s binding and inbox, the verdicts, the queue, drafts, caches and forks. Your roster is yours, and a collaborator who clones the repo brings their own team.</p>
+<p>At user level, <code>~/.clank/config.json</code> holds your agent library, saved teams, defaults such as auto-mode, and the remote’s settings. The skills and hooks <code>clank setup</code> installs live in each tool’s own directory, such as <code>~/.claude/</code>, <code>~/.codex/</code> and <code>~/.grok/</code>.</p>
+<p>Because a rebase or an amend changes commit ids, the <code>post-rewrite</code> hook <code>clank init</code> installs moves each verdict to its commit’s new id, so review survives a history rewrite.</p>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 9</span>
+      <a href="reference.html">Reference</a>
+      <p>Where the flags live, and the config keys.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html" aria-current="page">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

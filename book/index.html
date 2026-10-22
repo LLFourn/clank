@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The clank book</title>
+<meta name="description" content="Peer review between agents, one plan at a time, kept in git.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<div class="hero">
+  <div class="hero-text">
+    <h1 class="hero-title">clank</h1>
+    <p class="lede">Coding agents from different vendors review each other’s work, one plan at a time, and the plan lands in your git history as a sealed record. clank decides whose turn it is and wakes that agent, so nobody has to chase anyone.</p>
+    <p>This book teaches clank to the people who run a team of agents and to the agents on that team. It starts with why clank works the way it does, then walks through the three ways people use it, with recordings of real runs.</p>
+  </div>
+  <figure class="hero-record" aria-labelledby="record-caption">
+    <ol class="record">
+      <li><span class="who">master</span><code>[add-retry] intro</code></li>
+      <li class="verdict"><span class="who">plan reviewer</span><span class="stamp continue">CONTINUE</span></li>
+      <li><span class="who">master</span><code>[add-retry] Retry failed fetches</code></li>
+      <li class="verdict"><span class="who">commit reviewer: the backoff never stops growing</span><span class="stamp changes">REQUEST_CHANGES</span></li>
+      <li><span class="who">master</span><code>[add-retry] Cap the backoff at 30s</code></li>
+      <li class="verdict"><span class="who">gate reviewer</span><span class="stamp finished">FINISHED</span></li>
+      <li class="sealed"><span class="who">clank finish</span><code>.clank/finished/add-retry.md</code></li>
+    </ol>
+    <figcaption class="record-caption" id="record-caption">One plan’s life, as its commits and verdicts record it. This one is an illustration; the recordings in later chapters are real runs.</figcaption>
+  </figure>
+</div>
+
+<h2 id="what-it-is">What clank is</h2>
+<p>clank is a command-line tool that runs a team of coding agents in one git repository. The agents are the CLIs you already use: Claude Code, Codex, Grok and opencode. One agent is the <strong>master</strong>. It writes plans and implements them. The others are <strong>reviewers</strong>, and they read the master’s commits and write a verdict on each one. clank keeps the state of all of that in the repo, works out who owes the next move, and wakes that agent with the work.</p>
+<p>You open the whole team in a <a href="https://zellij.dev">zellij</a> session with one command and watch it from a terminal dashboard. You step in when an agent asks a question only you can answer.</p>
+
+<h2 id="ideas">Five ideas the rest of the book depends on</h2>
+<ul class="principles">
+  <li>
+    <h3 id="one-plan">One plan at a time, reviewed by another mind</h3>
+    <p>A repo has at most one active plan, a markdown file under <code>.clank/plans/</code>. Starting it is a commit, <code>[<var>plan</var>] intro</code>, so the plan is reviewed before any code is. The master then implements the whole plan in one commit, and the reviewers on the roster read it. They work best when they come from a different vendor than the master, because a model is a poor judge of its own blind spots.</p>
+  </li>
+  <li>
+    <h3 id="record">The plan’s history is the git history</h3>
+    <p>Everything a plan becomes is a commit: its introduction, each revision, the implementation tagged <code>[<var>plan</var>]</code>, and the finish commit that moves the plan into <code>.clank/finished/</code>. The finish message describes the whole plan as if it were one commit, because with <code>finish.autosquash</code> on, it becomes one. More than five hundred finished plans in clank’s own repo are the record of how it was built.</p>
+    <p>The verdicts are files too, kept per reviewer and keyed by commit. They stay local to your checkout: they drive the cycle while it runs, and the sealed plan is what is left once it is done.</p>
+  </li>
+  <li>
+    <h3 id="woken">Agents are woken; you are never the scheduler</h3>
+    <p>When an agent ends its turn, clank decides whether it has work. If it does, the agent gets it at once. If it does not, clank holds the agent until there is some. No agent polls, and you never type “your turn” into a pane. When an agent needs a decision only a human can make, it raises a block, and your answer wakes it.</p>
+  </li>
+  <li>
+    <h3 id="roster">Roles come from the roster, not from flags</h3>
+    <p>The repo’s roster lists each agent, its tool and its role: master, a reviewer tier, or standby. A session is bound to its roster label when it starts, and its role is read from the roster every time it is needed. To change who is master you edit the roster, with <code>clank agent make-master</code>, and nobody has to relaunch with a different flag.</p>
+  </li>
+  <li>
+    <h3 id="manual">Manual control where it matters</h3>
+    <p>clank automates whose turn it is. It does not automate the decisions that are hard to undo. The master finalizes a plan only when the review gate says <span class="stamp finished">FINISHED</span>, and it has to write the summary itself. History rewrites like autosquash are a setting you turn on. When an agent's turn ends on a provider error, or it stops with work still pending, clank retries a bounded number of times and then hands it to you; past that point a wedged agent is yours to nudge. Auto-mode is per agent, and <code>clank auto off</code> hands a session back to you.</p>
+  </li>
+</ul>
+
+<h2 id="not">What clank is not</h2>
+<aside class="note"><p><strong>The README’s tagline is out of date.</strong> It still says “no daemon”. There is a per-repo monitor now; this section says what it is.</p></aside>
+<p><strong>It is not an agent.</strong> It has no model of its own. It launches the agent CLIs you have installed, teaches them their role through skills and hooks that <code>clank setup</code> installs, and routes work to them.</p>
+<p><strong>It is not a hosted service.</strong> Plans, the roster, verdicts and the event inbox are files in your repo’s <code>.clank/</code> directory and in <code>~/.clank/</code>. There is no database and no account.</p>
+<p><strong>It does run one background process per repo: the monitor.</strong> The first <code>clank wait</code> or <code>clank tui</code> in a repo starts it. It watches the repo once on behalf of every agent and dashboard, hosts the event sources agents have configured, and decides what each agent’s turn-end means. You never install, start or configure it, and none of your durable state lives inside it. <a href="how-it-works.html#monitor">How it works</a> has the details.</p>
+<p><strong>The remote is optional.</strong> clank can serve the team to a browser or phone, but only when you switch it on. That is the one part of clank that runs a web server, and <a href="remote.html">its chapter</a> covers what that costs.</p>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 2</span>
+      <a href="getting-started.html">Getting started</a>
+      <p>Install, set up the hooks and skills, give a repo a roster, and open the team.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html" aria-current="page">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

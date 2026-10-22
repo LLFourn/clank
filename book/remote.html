@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The remote | The clank book</title>
+<meta name="description" content="Drive a team from a browser or phone, and what that exposes.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 7</p>
+<h1>The remote</h1>
+<p class="lede">Drive a running team from a browser or a phone: watch every agent’s terminal, type to one, answer its question, queue the next plan. It is experimental, and it is very powerful.</p>
+
+<div class="callout">
+  <p class="callout-title">Experimental, and as powerful as your terminal.</p>
+  <p>A remote session can type into your agents, and your agents can run commands on your machine. Treat the token, the one-time links and the browser session as keys to your shell. Its behaviour and setup may still change between releases.</p>
+</div>
+
+<h2 id="what">What it gives you</h2>
+<p>The remote page shows the team as <code>clank tui</code> sees it: each agent’s pane, terminal and transcript, live. From it you can send an agent a message or stop its turn, queue or stash plans, manage the roster, answer blocks, reopen a closed pane, and upload a file to the repo’s machine.</p>
+
+<h2 id="switch">Switching it on and off</h2>
+<p>The remote belongs to the repo’s running <code>clank tui</code>. In the TUI, the <strong>remote</strong> row under the agent list is the switch: <kbd>Space</kbd> on the row, or <kbd>r</kbd> from the log view. From a shell, ask the TUI to do the same:</p>
+<pre><code>clank remote on
+clank remote status
+clank remote off</code></pre>
+<p>On while already on, or off while already off, changes nothing. Switching off, or closing the TUI, stops the host the TUI started.</p>
+
+<h2 id="door">The default host and its door</h2>
+<p>By default the TUI starts its own host process, <code>clank-web-cloudflare</code>, on a port the repo remembers, and sends your browser in. The page sits behind a door, and the key is one token. Press <kbd>Enter</kbd> on the remote row to open the remote page, which prints the token. Paste it into the door once on each device.</p>
+<ul>
+  <li><strong>The token</strong> is minted on first use and kept at user level, in <code>~/.clank/config.json</code> under <code>remote.token</code>. It is the same for every repo’s remote on this machine and survives restarts. <kbd>t</kbd> opens the token page, where <kbd>Enter</kbd> or <kbd>x</kbd> rotates it, which ends every session it opened.</li>
+  <li><strong>One-time links</strong> make pasting unnecessary. <kbd>o</kbd> on the row opens your browser through one. <kbd>p</kbd> shows one as a QR code for a phone’s camera. Each link works once, within five minutes.</li>
+  <li><strong>Sessions</strong> last thirty days and are stored hashed in <code>~/.clank/remote-sessions.json</code>. <kbd>s</kbd> opens the sessions page, which lists them. <kbd>Backspace</kbd> revokes the selected one, and its stream ends at once.</li>
+</ul>
+
+<h2 id="tunnel">Reaching it from a phone: tunnels</h2>
+<p>A phone reaches the default host through a tunnel. With no tunnel and no existing host configured, the row reads <em>not configured</em> and the switch refuses. Configure the tunnel once, in <code>~/.clank/config.json</code> under <code>remote.tunnel</code>:</p>
+<dl class="terms">
+  <dt><code>{"provider": "quick"}</code></dt>
+  <dd>No account, no domain, nothing to install. You get an ephemeral Cloudflare quick-tunnel hostname, handed out each time the tunnel starts. Start here, and read the <a href="#security">security note</a> first.</dd>
+  <dt><code>{"provider": "command", "run": […]}</code></dt>
+  <dd>Any program that forwards the port, with <code>{port}</code> substituted into its argv. clank reads the public hostname from what the program prints, and <code>"url_contains"</code> picks the right line when it prints others first. Give a <code>"url"</code> when the hostname is yours, such as a named tunnel on your own domain. clank then claims it before the program starts.</dd>
+</dl>
+<pre><code>"remote": {
+  "tunnel": {
+    "provider": "command",
+    "run": ["<var>your-tunnel</var>", "--to", "localhost:{port}"],
+    "url": "https://clank.example.com"
+  }
+}</code></pre>
+<p>One TUI holds a hostname at a time, and a second is told whose it is. The address reaches the remote row only after the TUI has reached its own remote through it.</p>
+
+<h2 id="attach">Attaching to a host you run</h2>
+<p>Instead of the default host, a repo can attach to a host operated separately, for example on a server you control. Put this in the repo’s gitignored <code>.clank/config.json</code>:</p>
+<pre><code>"web": {
+  "attach": {
+    "endpoint": "wss://host.example/connector",
+    "session": "team",
+    "credential": "<var>connector-credential-from-your-host</var>",
+    "browser_url": "https://host.example/team"
+  }
+}</code></pre>
+<p>Turning the remote on then connects outward to that host and publishes this repo’s session. The host never receives a repo path. Turning it off detaches the repo and leaves the host running. The host owns browser login, so the token and session controls above don’t apply. Plain <code>ws</code> and <code>http</code> are accepted only for loopback. clank’s repo includes a <a href="https://github.com/LLFourn/clank/blob/master/crates/web/examples/README.md">runnable custom host</a> with its own login and connector credential, and an <a href="https://github.com/LLFourn/clank/blob/master/crates/web/README.md">embedding guide</a> for the protocol and routes.</p>
+
+<h2 id="security">The security limit</h2>
+<pre class="diagram" aria-label="Path of a remote session through a Cloudflare tunnel"><code>phone or browser
+      │  HTTPS
+      ▼
+Cloudflare edge      ◀── TLS ends here: Cloudflare reads all of it
+      │  quick tunnel
+      ▼
+clank-web-cloudflare, on your machine
+      │  loopback
+      ▼
+your clank tui  ──▶  your agents’ panes</code></pre>
+<div class="callout">
+  <p class="callout-title">Through a Cloudflare tunnel, Cloudflare can see everything.</p>
+  <p>Cloudflare’s edge terminates TLS. Everything that crosses it is readable there: the terminal stream, your keystrokes, the one-time links and the session cookie. That is exactly the access a session has. The remote is therefore only as private as your trust in the tunnel provider.</p>
+  <p>A tunnel or host you operate yourself avoids this. Use your own TLS reverse proxy or encrypted tunnel to a host you run, with the <code>command</code> provider or <code>web.attach</code>.</p>
+</div>
+<p>The same reasoning applies to any tunnel provider: whoever terminates TLS sees the session. Never put a token, a link or a QR code in a screenshot you share.</p>
+
+    <nav class="next" aria-label="Next chapter">
+      <span class="next-label">Next, chapter 8</span>
+      <a href="how-it-works.html">How it works</a>
+      <p>The monitor, the turn-end decision, and what is committed.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html" aria-current="page">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

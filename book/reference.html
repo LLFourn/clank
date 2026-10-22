@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference | The clank book</title>
+<meta name="description" content="Where the flags live, and the config keys.">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="index.html">clank</a>
+  <a class="bar-link" href="#chapters">Chapters</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no">Chapter 9</p>
+<h1>Reference</h1>
+<p class="lede">The flags live with the commands. This book does not copy them, because a copy is the first thing to go stale.</p>
+
+<pre><code>clank --help
+clank fork create --help</code></pre>
+<p>Every command and subcommand has its own <code>--help</code>, which comes from the binary you are running and so is always current. The README keeps a <a href="https://github.com/LLFourn/clank#command-reference">command reference table</a> and the long-form detail on wake sources, replies and interruption.</p>
+
+<h2 id="commands">The commands, by job</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th scope="col">Job</th><th scope="col">Commands</th><th scope="col">In this book</th></tr></thead>
+  <tbody>
+    <tr><td>Getting set up</td><td><code>clank init</code>, <code>clank setup</code>, <code>clank doctor</code></td><td><a href="getting-started.html">Getting started</a></td></tr>
+    <tr><td>The daily flow</td><td><code>clank status</code>, <code>clank tui</code>, <code>clank log</code>, <code>clank wait</code>, <code>clank as</code>, <code>clank auto</code>, <code>clank run</code>, <code>clank attend</code></td><td><a href="group-coding.html#watching">Group coding</a>, <a href="for-agents.html">For agents</a></td></tr>
+    <tr><td>Plans</td><td><code>clank queue</code>, <code>clank finish</code>, <code>clank unfinish</code>, <code>clank stash</code>, <code>clank pick</code>, <code>clank purge</code>, <code>clank rereview</code>, <code>clank diff</code>, <code>clank html</code></td><td><a href="group-coding.html#queue">Group coding</a>, <a href="teams.html#landing">Teams</a></td></tr>
+    <tr><td>Review</td><td><code>clank feedback</code>, <code>clank block</code></td><td><a href="group-coding.html#verdicts">Verdicts</a>, <a href="group-coding.html#blocks">Blocks</a></td></tr>
+    <tr><td>The team</td><td><code>clank agent</code>, <code>clank team</code>, <code>clank open</code>, <code>clank fork</code></td><td><a href="teams.html">Teams and forks</a></td></tr>
+    <tr><td>Talking</td><td><code>clank send</code>, <code>clank nudge</code>, <code>clank events</code></td><td><a href="controller.html#inbox">A controller repo</a></td></tr>
+    <tr><td>Remote</td><td><code>clank remote</code></td><td><a href="remote.html">The remote</a></td></tr>
+    <tr><td>Settings</td><td><code>clank config</code>, <code>clank export</code></td><td><a href="#config">Below</a></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="config">Config keys</h2>
+<p><code>clank config</code> on its own lists every key with its value and where the value came from. Give a key and a value, as in <code>clank config diff.wait true</code>, to write the repo’s config. Add <code>--global</code> to write yours.</p>
+<dl class="terms">
+  <dt><code>finish.autosquash</code></dt><dd>Collapse a plan into one commit when it finishes. It rewrites the current branch in place, so it is off by default.</dd>
+  <dt><code>review.plan_feedback</code></dt><dd>Require review of a plan’s commits. On by default.</dd>
+  <dt><code>review.adhoc_feedback</code></dt><dd>Also review commits outside any plan. Off by default.</dd>
+  <dt><code>review.require_commit_prefix</code></dt><dd>Require a <code>[<var>plan</var>]</code> or <code>[misc]</code> prefix on every commit subject.</dd>
+  <dt><code>hooks.blocked</code></dt><dd>A command to run when an agent raises a block.</dd>
+  <dt><code>diff.editor.command</code>, <code>diff.wait</code></dt><dd>The editor <code>clank diff</code> opens, and whether it waits for it.</dd>
+  <dt><code>recovery.blind_nudge</code></dt><dd>Nudge an agent that owes work when clank cannot read its state. Off by default, which leaves such an agent to a person.</dd>
+</dl>
+
+<h2 id="nudge">When a message cannot get through</h2>
+<p><code>clank send</code> is the normal route, and <code>--interrupt</code> asks for the recipient’s turn to be interrupted as well. <code>clank nudge</code> is the recovery route for a wedged hook, a stale binding, or a wake that never fires. It interrupts the agent’s pane and types the message straight into its terminal, reading no inbox and no binding. Nothing waits to be acknowledged, but every attempt is kept in the agent’s nudge history.</p>
+
+<h2 id="source">Source and skills</h2>
+<ul>
+  <li><a href="https://github.com/LLFourn/clank">The clank repository</a></li>
+  <li><a href="https://github.com/LLFourn/clank/tree/master/crates/cli/src/cli/setup_assets">The shipped skills</a>, as <code>clank setup</code> installs them</li>
+  <li><a href="https://github.com/LLFourn/clank/blob/master/GROK-INTEGRATION.md">The Grok integration contract</a></li>
+</ul>
+
+    <nav class="next" aria-label="Start again">
+      <span class="next-label">That is the whole book</span>
+      <a href="index.html">Back to the beginning</a>
+      <p>Or open a repo and run your first plan.</p>
+    </nav>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Chapters">
+  <div class="rail-inner">
+    <a class="brand" href="index.html">clank</a>
+    <span class="brand-sub">The clank book</span>
+    <ol class="chapters">
+        <li><a href="index.html">Why clank</a></li>
+        <li><a href="getting-started.html">Getting started</a></li>
+        <li><a href="group-coding.html">Group coding</a></li>
+        <li><a href="teams.html">Teams and forks</a></li>
+        <li><a href="controller.html">A controller repo</a></li>
+        <li><a href="for-agents.html">For agents</a></li>
+        <li><a href="remote.html">The remote</a></li>
+        <li><a href="how-it-works.html">How it works</a></li>
+        <li><a href="reference.html" aria-current="page">Reference</a></li>
+    </ol>
+    <p class="rail-foot"><a href="https://github.com/LLFourn/clank">clank on GitHub</a></p>
+  </div>
+</nav>
+</body>
+</html>

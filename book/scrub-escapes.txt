@@ -1,0 +1,8 @@
+# Terminal escape sequences, one alternative per line. The recorder and the
+# book_is_true gate both delete every match before a second scrub pass, so a
+# banned value a TUI drew with a colour change or cursor move inside it is
+# whole again for that pass.
+\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)
+\x1b[P^_][^\x1b]*\x1b\\
+\x1b\[[0-?]*[ -/]*[@-~]
+\x1b[ -/]*[0-~]
