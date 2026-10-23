@@ -582,6 +582,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         }
     }
 
@@ -1716,6 +1717,9 @@ pub(crate) trait Os {
     /// its group, so a host verifying its own group empty has to reap
     /// first; for an inherited group, init already does.
     fn collect(&self);
+    /// Whether anything but the anchor `anchor` leads is left in its
+    /// group: `None` when that cannot be told.
+    fn working(&self, anchor: crate::signal::Pgid) -> Option<bool>;
     fn pause(&self, d: std::time::Duration);
     fn now(&self) -> std::time::Instant;
 }
@@ -1740,6 +1744,10 @@ impl Os for Native<'_> {
             crate::signal::collect_exited_child(*child);
         }
     }
+    fn working(&self, anchor: crate::signal::Pgid) -> Option<bool> {
+        crate::signal::group_members(anchor)
+            .map(|members| members.iter().any(|pid| *pid != anchor.get()))
+    }
     fn pause(&self, d: std::time::Duration) {
         std::thread::sleep(d)
     }
@@ -1748,8 +1756,86 @@ impl Os for Native<'_> {
     }
 }
 
-/// How long a group is given to end on a `SIGTERM` before `SIGKILL`.
+/// How long a group is given to end on a `SIGTERM` before `SIGKILL`
+/// when nobody asked it to end first: what its root left behind when it
+/// exited, or a dead host's orphan.
 pub(crate) const ESCALATE_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long a stopped producer has to end after TERM, unless its source
+/// sets `stop_grace`. Long enough to finish a send in flight.
+pub(crate) const DEFAULT_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The most a source may ask for: a stopped source's replacement waits
+/// out its grace before it may start.
+pub(crate) const MAX_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The grace `src` is given to end once its host stops it.
+pub(crate) fn stop_grace(
+    src: &clank_core::agent_config::CommandSource,
+) -> anyhow::Result<std::time::Duration> {
+    let Some(raw) = src.stop_grace.as_deref() else {
+        return Ok(DEFAULT_STOP_GRACE);
+    };
+    anyhow::ensure!(
+        !raw.trim().is_empty(),
+        "command source `{}` has an empty stop_grace",
+        src.name
+    );
+    let grace = crate::cli::wait::parse_duration_str(raw)
+        .map_err(|e| anyhow::anyhow!("invalid stop_grace for command source `{}`: {e}", src.name))?
+        .unwrap_or_default();
+    anyhow::ensure!(
+        grace <= MAX_STOP_GRACE,
+        "command source `{}` stop_grace `{raw}` is longer than the {}s maximum",
+        src.name,
+        MAX_STOP_GRACE.as_secs()
+    );
+    Ok(grace)
+}
+
+/// How often a group asked to end is looked at again while its work
+/// may still be finishing.
+const WORK_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Wait for every member of `record`'s group but its anchor to end, or
+/// for `deadline`, which is read again on every look because a drain
+/// can bring it forward. `None` is a deadline already passed.
+pub(crate) fn await_work(
+    record: &Producer,
+    os: &impl Os,
+    deadline: impl Fn() -> Option<std::time::Instant>,
+) -> crate::cli::source_group::Drained {
+    use crate::cli::source_group::Drained;
+    let anchor = crate::signal::Pgid::new(record.pgid());
+    loop {
+        os.collect();
+        if anchor.and_then(|anchor| os.working(anchor)) == Some(false) {
+            return Drained::WithinGrace;
+        }
+        let now = os.now();
+        match deadline() {
+            Some(by) if now < by => os.pause(WORK_LOOK.min(by - now)),
+            _ => return Drained::KilledAtGrace,
+        }
+    }
+}
+
+/// End a group already asked to end: its work is given until
+/// `deadline` to finish, and only then is what remains killed, so work
+/// that ends in time is never sent `SIGKILL`.
+pub(crate) fn end_by(
+    path: &std::path::Path,
+    record: &Producer,
+    os: &impl Os,
+    whose: Whose,
+    deadline: impl Fn() -> Option<std::time::Instant>,
+) -> (Retired, crate::cli::source_group::Drained) {
+    let how = await_work(record, os, deadline);
+    (
+        retire_after(path, record, os, whose, std::time::Duration::ZERO),
+        how,
+    )
+}
 
 /// How often, and how many times, a retirement looks again for a
 /// group in transition to settle.
@@ -2480,6 +2566,9 @@ mod producer_tests {
             self.sent.borrow_mut().push((pgid.get(), sig));
         }
         fn collect(&self) {}
+        fn working(&self, _: crate::signal::Pgid) -> Option<bool> {
+            Some(false)
+        }
         fn pause(&self, _: Duration) {}
         // Injected, because the hazard is precisely that `sleep`
         // reports a minimum and the world supplies the maximum. The
@@ -2492,6 +2581,144 @@ mod producer_tests {
             } else {
                 self.started + self.took
             }
+        }
+    }
+
+    /// A group asked to end, whose work ends `ends_after` into the
+    /// stop or never. Time passes only by `pause`, so a grace of seconds
+    /// runs in none, and nothing real is ever signalled.
+    struct Stopping {
+        started: std::time::Instant,
+        elapsed: std::cell::Cell<Duration>,
+        ends_after: Option<Duration>,
+        killed: std::cell::Cell<bool>,
+        /// Each signal, whether the work was still running then, and when.
+        sent: std::cell::RefCell<Vec<(libc::c_int, bool, Duration)>>,
+    }
+
+    impl Stopping {
+        fn working_now(&self) -> bool {
+            !self.killed.get() && self.ends_after.is_none_or(|end| self.elapsed.get() < end)
+        }
+    }
+
+    impl Os for Stopping {
+        fn leader(&self, _: &Producer) -> Leader {
+            match self.killed.get() {
+                true => Leader::Gone,
+                false => Leader::Same,
+            }
+        }
+        fn group(&self, _: crate::signal::Pgid) -> Group {
+            match self.killed.get() {
+                true => Group::Empty,
+                false => Group::Occupied,
+            }
+        }
+        fn signal(&self, _: crate::signal::Pgid, sig: libc::c_int) {
+            self.sent
+                .borrow_mut()
+                .push((sig, self.working_now(), self.elapsed.get()));
+            if sig == libc::SIGKILL {
+                self.killed.set(true);
+            }
+        }
+        fn collect(&self) {}
+        fn working(&self, _: crate::signal::Pgid) -> Option<bool> {
+            Some(self.working_now())
+        }
+        fn pause(&self, d: Duration) {
+            self.elapsed.set(self.elapsed.get() + d);
+        }
+        fn now(&self) -> std::time::Instant {
+            self.started + self.elapsed.get()
+        }
+    }
+
+    fn stopped_with(
+        grace: Duration,
+        ends_after: Option<Duration>,
+    ) -> (
+        Retired,
+        crate::cli::source_group::Drained,
+        Vec<(libc::c_int, bool, Duration)>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        recorded(dir.path());
+        let os = Stopping {
+            started: std::time::Instant::now(),
+            elapsed: Default::default(),
+            ends_after,
+            killed: Default::default(),
+            sent: Default::default(),
+        };
+        let by = os.started + grace;
+        let (out, how) = end_by(
+            &producer_path(dir.path(), "src-1"),
+            &Producer::Anchored {
+                pgid: 4242,
+                birth: birth(),
+            },
+            &os,
+            Whose::Own,
+            || Some(by),
+        );
+        (out, how, os.sent.into_inner())
+    }
+
+    /// Work that ends within its grace is waited for, and only the
+    /// anchor it leaves is killed: the producer is never sent `SIGKILL`,
+    /// and the group is not held for the rest of its grace.
+    #[test]
+    fn work_that_ends_within_its_grace_is_never_killed() {
+        let (out, how, sent) = stopped_with(Duration::from_secs(10), Some(Duration::from_secs(3)));
+        assert_eq!(out, Retired::Clear);
+        assert_eq!(how, crate::cli::source_group::Drained::WithinGrace);
+        assert!(
+            !sent
+                .iter()
+                .any(|(sig, working, _)| *sig == libc::SIGKILL && *working),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().all(|(_, _, at)| *at < Duration::from_secs(4)),
+            "{sent:?}"
+        );
+    }
+
+    /// Work still running when its grace is out is killed then, and not
+    /// before.
+    #[test]
+    fn work_still_running_when_its_grace_is_out_is_killed_then() {
+        let grace = Duration::from_secs(10);
+        let (out, how, sent) = stopped_with(grace, None);
+        assert_eq!(out, Retired::Clear);
+        assert_eq!(how, crate::cli::source_group::Drained::KilledAtGrace);
+        let kills: Vec<_> = sent
+            .iter()
+            .filter(|(sig, _, _)| *sig == libc::SIGKILL)
+            .collect();
+        assert_eq!(kills.len(), 1, "{sent:?}");
+        assert!(kills[0].1 && kills[0].2 >= grace, "{sent:?}");
+    }
+
+    #[test]
+    fn a_stop_grace_is_a_bounded_duration() {
+        let with = |grace: Option<&str>| {
+            stop_grace(
+                &serde_json::from_value(serde_json::json!({
+                    "name": "s", "command": ["true"], "stop_grace": grace
+                }))
+                .unwrap(),
+            )
+        };
+        assert_eq!(with(None).unwrap(), DEFAULT_STOP_GRACE);
+        assert_eq!(with(Some("30s")).unwrap(), Duration::from_secs(30));
+        assert_eq!(with(Some("2m")).unwrap(), Duration::from_secs(120));
+        assert_eq!(with(Some("0")).unwrap(), Duration::ZERO);
+        assert_eq!(with(Some("1h")).unwrap(), MAX_STOP_GRACE);
+        for refused in ["", "soon", "10x", "2h"] {
+            assert!(with(Some(refused)).is_err(), "{refused:?}");
         }
     }
 
@@ -3004,6 +3231,9 @@ mod producer_tests {
                 self.sent.borrow_mut().push(sig);
             }
             fn collect(&self) {}
+            fn working(&self, _: crate::signal::Pgid) -> Option<bool> {
+                Some(false)
+            }
             fn pause(&self, _: Duration) {}
             fn now(&self) -> std::time::Instant {
                 std::time::Instant::now()

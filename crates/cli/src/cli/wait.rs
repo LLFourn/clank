@@ -1356,6 +1356,7 @@ pub(crate) fn resolve_wait_event_sources(
                 if let Some(why) = c.receipt_refusal() {
                     anyhow::bail!("{why}");
                 }
+                crate::cli::command_source::stop_grace(c)?;
                 if c.receipt_command.is_some() && *origin == SourceOrigin::Cli {
                     anyhow::bail!(
                         "command source `{}` receipt_command is supported only for configured sources, not invocation-only --event sources",
@@ -1446,6 +1447,7 @@ pub(crate) struct EventSources {
 }
 
 impl EventSources {
+    #[cfg(test)]
     pub(crate) fn into_tasks(
         mut self,
     ) -> std::collections::BTreeMap<String, tokio::task::JoinHandle<()>> {
@@ -1474,7 +1476,6 @@ impl EventSources {
         tx: crate::cli::event_source::EmissionSink,
     ) -> Self {
         use crate::cli::event_source::SourceOrigin;
-        use clank_core::agent_config::WaitEventSource;
         let mut tasks = Vec::new();
         for (source, origin) in sources {
             // A `--event` source is ONE INVOCATION's, so it needs that
@@ -1493,39 +1494,9 @@ impl EventSources {
                 }
                 (_, scope) => scope.unwrap_or_default(),
             };
-            match source {
-                // Native deadlines belong to the owner's select loop.
-                WaitEventSource::Timer(_) => {}
-                WaitEventSource::Command(c) => {
-                    let key =
-                        crate::cli::command_source::storage_key(c.source_key(), *origin, scope);
-                    tasks.push((
-                        key.clone(),
-                        tokio::spawn(run_command_source(
-                            c.clone(),
-                            tx.clone(),
-                            events_dir.map(std::path::Path::to_path_buf),
-                            key,
-                        )),
-                    ));
-                }
-                WaitEventSource::Github(g) => {
-                    let key = crate::cli::command_source::storage_key(
-                        crate::cli::github::supervisor::source_key(g),
-                        *origin,
-                        scope,
-                    );
-                    tasks.push((
-                        key.clone(),
-                        tokio::spawn(crate::cli::github::supervisor::run_github_source(
-                            g.clone(),
-                            tx.clone(),
-                            events_dir.map(std::path::Path::to_path_buf),
-                            *origin,
-                            key,
-                        )),
-                    ));
-                }
+            if let Some(task) = spawn_source(source, *origin, events_dir, scope, tx.clone(), false)
+            {
+                tasks.push((task.key, task.handle));
             }
         }
         Self { tasks }
@@ -1550,6 +1521,79 @@ impl Drop for EventSources {
             task.abort();
         }
     }
+}
+
+/// The storage key of the log `source` writes; a timer writes none
+/// that a task owns.
+pub(crate) fn task_key(
+    source: &clank_core::agent_config::WaitEventSource,
+    origin: crate::cli::event_source::SourceOrigin,
+    scope: &str,
+) -> Option<String> {
+    use clank_core::agent_config::WaitEventSource;
+    let key = match source {
+        WaitEventSource::Timer(_) => return None,
+        WaitEventSource::Command(c) => c.source_key(),
+        WaitEventSource::Github(g) => crate::cli::github::supervisor::source_key(g),
+    };
+    Some(crate::cli::command_source::storage_key(key, origin, scope))
+}
+
+/// One source's running task.
+pub(crate) struct SourceTask {
+    pub(crate) key: String,
+    pub(crate) handle: tokio::task::JoinHandle<()>,
+    /// Asks the source to end gracefully; one without it is cancelled.
+    pub(crate) stop: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Start `source`'s task. A `stoppable` command source ends on request,
+/// draining its producer within its grace; anything else only by
+/// cancellation. Timers run no task.
+pub(crate) fn spawn_source(
+    source: &clank_core::agent_config::WaitEventSource,
+    origin: crate::cli::event_source::SourceOrigin,
+    events_dir: Option<&std::path::Path>,
+    scope: &str,
+    tx: crate::cli::event_source::EmissionSink,
+    stoppable: bool,
+) -> Option<SourceTask> {
+    use clank_core::agent_config::WaitEventSource;
+    let key = task_key(source, origin, scope)?;
+    let events_dir = events_dir.map(std::path::Path::to_path_buf);
+    let (handle, stop) = match source {
+        WaitEventSource::Timer(_) => return None,
+        WaitEventSource::Command(c) => {
+            let (stop, request) = match stoppable {
+                true => {
+                    let (stop, request) = StopRequest::channel();
+                    (Some(stop), request)
+                }
+                false => (None, StopRequest::never()),
+            };
+            (
+                tokio::spawn(run_command_source(
+                    c.clone(),
+                    tx,
+                    events_dir,
+                    key.clone(),
+                    request,
+                )),
+                stop,
+            )
+        }
+        WaitEventSource::Github(g) => (
+            tokio::spawn(crate::cli::github::supervisor::run_github_source(
+                g.clone(),
+                tx,
+                events_dir,
+                origin,
+                key.clone(),
+            )),
+            None,
+        ),
+    };
+    Some(SourceTask { key, handle, stop })
 }
 
 /// Kill the child's PROCESS GROUP on drop — grandchildren included.
@@ -1628,6 +1672,7 @@ async fn run_command_source(
     tx: crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
     key: String,
+    stop: StopRequest,
 ) {
     run_command_source_with(
         src,
@@ -1636,6 +1681,7 @@ async fn run_command_source(
         key,
         crate::cli::command_source::reap_previous_producer,
         &crate::cli::source_group::OWNERS,
+        stop,
     )
     .await
 }
@@ -1655,6 +1701,7 @@ pub(crate) async fn run_command_source_with(
     key: String,
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
     owners: &'static crate::cli::source_group::Owners,
+    mut stop: StopRequest,
 ) {
     use crate::cli::command_source as cs;
 
@@ -1712,6 +1759,7 @@ pub(crate) async fn run_command_source_with(
                     &retire,
                     std::sync::Arc::new(lease),
                     owners,
+                    &mut stop,
                 )
                 .await;
                 return;
@@ -1753,7 +1801,9 @@ pub(crate) async fn run_command_source_with(
                         }
                     }
                 }
-                tokio::time::sleep(cs::TAIL_INTERVAL).await;
+                if pause_unless_stopped(&mut stop, cs::TAIL_INTERVAL).await {
+                    return;
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -1773,13 +1823,112 @@ pub(crate) async fn run_command_source_with(
 }
 
 /// A retirement blocks for as long as its group's policy says, which
-/// during a drain is up to its cutoff: not on a runtime worker.
+/// for a group asked to end is up to its grace: not on a runtime worker.
 async fn retire_off_the_runtime(
     owned: crate::cli::source_group::Owned,
 ) -> Result<(), (crate::cli::source_group::Owned, String)> {
-    tokio::task::spawn_blocking(move || owned.retire())
+    settled(tokio::task::spawn_blocking(move || owned.retire())).await
+}
+
+async fn settled(
+    retiring: tokio::task::JoinHandle<Result<(), (crate::cli::source_group::Owned, String)>>,
+) -> Result<(), (crate::cli::source_group::Owned, String)> {
+    retiring
         .await
         .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
+/// A host's request that a command source end: its producer is asked
+/// to end and given its grace while its output is still read, and the
+/// source starts nothing more.
+pub(crate) struct StopRequest(Option<tokio::sync::watch::Receiver<bool>>);
+
+impl StopRequest {
+    /// For a host that only ever cancels its sources outright.
+    pub(crate) fn never() -> Self {
+        Self(None)
+    }
+
+    /// The sender asks for the stop; dropping it asks too, since nobody
+    /// is left to stop the source otherwise.
+    pub(crate) fn channel() -> (tokio::sync::watch::Sender<bool>, Self) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (tx, Self(Some(rx)))
+    }
+
+    fn is_requested(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().is_err() || *rx.borrow())
+    }
+
+    async fn requested(&mut self) {
+        match &mut self.0 {
+            None => std::future::pending().await,
+            Some(rx) => {
+                let _ = rx.wait_for(|stop| *stop).await;
+            }
+        }
+    }
+}
+
+/// Sleep for `d`, unless a stop is asked for first. Whether one was.
+async fn pause_unless_stopped(stop: &mut StopRequest, d: Duration) -> bool {
+    tokio::select! {
+        _ = stop.requested() => true,
+        _ = tokio::time::sleep(d) => stop.is_requested(),
+    }
+}
+
+/// A launched producer's group, until its retirement settles.
+enum Run {
+    Owned(crate::cli::source_group::Owned),
+    /// Asked to end, and retiring beside the reader, which keeps taking
+    /// the group's output until the group is gone or its grace is out.
+    Stopping {
+        retiring: tokio::task::JoinHandle<Result<(), (crate::cli::source_group::Owned, String)>>,
+        by: tokio::time::Instant,
+    },
+}
+
+impl Run {
+    fn stopped(self, grace: Duration) -> Self {
+        match self {
+            Run::Owned(owned) => {
+                owned.ask_to_end();
+                Run::Stopping {
+                    retiring: tokio::task::spawn_blocking(move || owned.retire()),
+                    by: tokio::time::Instant::now() + grace,
+                }
+            }
+            stopping => stopping,
+        }
+    }
+
+    fn is_stopping(&self) -> bool {
+        matches!(self, Run::Stopping { .. })
+    }
+
+    fn stopping_by(&self) -> Option<tokio::time::Instant> {
+        match self {
+            Run::Owned(_) => None,
+            Run::Stopping { by, .. } => Some(*by),
+        }
+    }
+
+    async fn settle(self) -> Result<(), (crate::cli::source_group::Owned, String)> {
+        match self {
+            Run::Owned(owned) => retire_off_the_runtime(owned).await,
+            Run::Stopping { retiring, .. } => settled(retiring).await,
+        }
+    }
+}
+
+/// Give up a group whose retirement could not confirm it ended, after
+/// one more attempt: if that defers too, the registry keeps it, lease
+/// and all, for whoever takes the source next.
+async fn leave_unended(owned: crate::cli::source_group::Owned) {
+    let _ = tokio::task::spawn_blocking(move || drop(owned)).await;
 }
 
 /// The LEASE HOLDER's runtime: it alone spawns the producer and
@@ -1795,12 +1944,14 @@ async fn run_leased_command_source(
     retire: impl Fn(&std::path::Path, &str) -> crate::cli::command_source::Retired,
     lease: std::sync::Arc<crate::cli::github::log::IngestLease>,
     owners: &'static crate::cli::source_group::Owners,
+    stop: &mut StopRequest,
 ) {
     use crate::cli::command_source as cs;
     use crate::cli::source_group;
     use tokio::io::AsyncBufReadExt;
 
     let src = src.clone();
+    let grace = cs::stop_grace(&src).unwrap_or(cs::DEFAULT_STOP_GRACE);
     let store_dir = store_dir.to_path_buf();
     let key = key.to_string();
     let mut seen = cs::Seen::at(&store_dir, &key);
@@ -1931,6 +2082,12 @@ async fn run_leased_command_source(
         if owners.closing() {
             return;
         }
+        if stop.is_requested() {
+            if let Some(owned) = unended.take() {
+                leave_unended(owned).await;
+            }
+            return;
+        }
         if let Some(owned) = unended.take()
             && let Err((owned, why)) = retire_off_the_runtime(owned).await
         {
@@ -1943,7 +2100,7 @@ async fn run_leased_command_source(
                 deferral_warned = true;
             }
             unended = Some(owned);
-            tokio::time::sleep(cs::TAIL_INTERVAL).await;
+            pause_unless_stopped(stop, cs::TAIL_INTERVAL).await;
             continue;
         }
         // Holding the lease means the previous owner is GONE — a lease
@@ -1969,7 +2126,7 @@ async fn run_leased_command_source(
                 );
                 deferral_warned = true;
             }
-            tokio::time::sleep(cs::TAIL_INTERVAL).await;
+            pause_unless_stopped(stop, cs::TAIL_INTERVAL).await;
             continue;
         }
         deferral_warned = false;
@@ -1992,6 +2149,7 @@ async fn run_leased_command_source(
             &store_dir,
             &key,
             lease.clone(),
+            grace,
             &mut cmd,
         )
         .await
@@ -2015,6 +2173,7 @@ async fn run_leased_command_source(
             crate::cli::source_diagnostic::Tail::default(),
         ));
         if let Some((owned, mut child)) = launched {
+            let mut run = Run::Owned(owned);
             if let Some(pid) = child.id() {
                 tx.report(
                     &key,
@@ -2059,6 +2218,10 @@ async fn run_leased_command_source(
                 // caught this the second time round).
                 loop {
                     let raw = tokio::select! {
+                        _ = stop.requested(), if !run.is_stopping() => {
+                            run = run.stopped(grace);
+                            continue;
+                        }
                         line = lines.next_line() => match line {
                             Ok(Some(raw)) => raw,
                             _ => break,
@@ -2071,11 +2234,7 @@ async fn run_leased_command_source(
                             // descendant still at work is owed its
                             // grace, output included, and the group
                             // is ended at the cutoff anyway.
-                            let read_for = owners
-                                .drain_cutoff()
-                                .map(|cutoff| cutoff.saturating_duration_since(std::time::Instant::now()))
-                                .unwrap_or(Duration::from_millis(100));
-                            let by = tokio::time::Instant::now() + read_for;
+                            let by = output_cutoff(owners, run.stopping_by());
                             cutoff = Some(by);
                             let _ = tokio::time::timeout_at(
                                 by,
@@ -2125,28 +2284,38 @@ async fn run_leased_command_source(
                 }
             }
             drop(reading);
-            let status = child.wait().await.ok();
+            // A producer can close its stdout and live on: the stop still
+            // has to reach it.
+            let status = loop {
+                tokio::select! {
+                    _ = stop.requested(), if !run.is_stopping() => run = run.stopped(grace),
+                    status = child.wait() => break status.ok(),
+                }
+            };
             exit = status.and_then(|status| status.code());
             ended = crate::cli::source_diagnostic::Ended::of(status);
             if let Some(reader) = stderr_reader {
-                let by = cutoff.unwrap_or_else(|| {
-                    tokio::time::Instant::now()
-                        + owners
-                            .drain_cutoff()
-                            .map(|c| c.saturating_duration_since(std::time::Instant::now()))
-                            .unwrap_or(Duration::from_millis(100))
-                });
+                let by = cutoff.unwrap_or_else(|| output_cutoff(owners, run.stopping_by()));
                 reader.finish_by(by).await;
+            }
+            if stop.is_requested() {
+                run = run.stopped(grace);
             }
             // The command's end is not its group's: a descendant it
             // left, and the anchor, are still there.
-            if let Err((owned, why)) = retire_off_the_runtime(owned).await {
+            if let Err((owned, why)) = run.settle().await {
                 eprintln!(
                     "wait: command source `{}` — {why}; not starting another until it is settled",
                     src.name
                 );
                 unended = Some(owned);
             }
+        }
+        if stop.is_requested() {
+            if let Some(owned) = unended.take() {
+                leave_unended(owned).await;
+            }
+            return;
         }
         // A run, or a launch, that the registry's closing interrupted did
         // not fail, and there is nothing to restart it into.
@@ -2195,8 +2364,26 @@ async fn run_leased_command_source(
                 error: launch_error,
             },
         );
-        tokio::time::sleep(backoff).await;
+        pause_unless_stopped(stop, backoff).await;
     }
+}
+
+/// How long a run's output is still read once its root has exited: a
+/// moment, unless its group was asked to end, when work it left may
+/// still finish and print within its grace or a drain's cutoff.
+fn output_cutoff(
+    owners: &crate::cli::source_group::Owners,
+    stopping_by: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    let drain = owners
+        .drain_cutoff()
+        .map(|cutoff| now + cutoff.saturating_duration_since(std::time::Instant::now()));
+    drain
+        .into_iter()
+        .chain(stopping_by)
+        .min()
+        .unwrap_or(now + Duration::from_millis(100))
 }
 
 /// Check blocks for the calling agent. An `Unblocked` answer is
@@ -3574,6 +3761,7 @@ mod shared_tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let agent_dir = std::path::Path::new("/a/.clank/agents/claude");
 
@@ -4060,6 +4248,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         }
     }
 
@@ -4287,7 +4476,7 @@ mod tests {
         let key = src.source_key();
         tokio::time::timeout(
             Duration::from_secs(10),
-            run_command_source(src, sink, Some(not_a_dir), key),
+            run_command_source(src, sink, Some(not_a_dir), key, StopRequest::never()),
         )
         .await
         .expect("it ends rather than retrying a lease it cannot take");
@@ -4324,6 +4513,7 @@ mod tests {
             sink,
             Some(events.clone()),
             key.clone(),
+            StopRequest::never(),
         ));
         let mut states = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
@@ -4362,7 +4552,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let key = src.source_key();
-        let task = tokio::spawn(run_command_source(src, tx, dir, key));
+        let task = tokio::spawn(run_command_source(src, tx, dir, key, StopRequest::never()));
         let mut out = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), async {
             while out.len() < want {
@@ -4418,6 +4608,7 @@ mod tests {
             tx,
             Some(dir.clone()),
             key.clone(),
+            StopRequest::never(),
         ));
         let (item, _) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -4567,6 +4758,7 @@ mod tests {
                     }
                 },
                 &crate::cli::source_group::OWNERS,
+                StopRequest::never(),
             ))
         };
 
@@ -4635,6 +4827,7 @@ mod tests {
             tx,
             Some(events.clone()),
             key.clone(),
+            StopRequest::never(),
         ));
         tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await
@@ -4704,14 +4897,26 @@ mod tests {
                 );
                 let _recorded = source_group::Spawned::spawn(&source_group::anchor_program())
                     .unwrap()
-                    .record(&source_group::OWNERS, &dir, &key, lease)
+                    .record(
+                        &source_group::OWNERS,
+                        &dir,
+                        &key,
+                        lease,
+                        crate::cli::command_source::DEFAULT_STOP_GRACE,
+                    )
                     .unwrap();
                 std::fs::write(dir.join("ready"), "").unwrap();
                 std::future::pending::<()>().await;
             }
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let tx = crate::cli::event_source::EmissionSink::from(tx);
-            let _task = tokio::spawn(run_command_source(src, tx, Some(dir.clone()), key));
+            let _task = tokio::spawn(run_command_source(
+                src,
+                tx,
+                Some(dir.clone()),
+                key,
+                StopRequest::never(),
+            ));
             while !dir.join("producer").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -4923,6 +5128,7 @@ mod tests {
                 &events,
                 &key,
                 lease,
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
                 &mut host::sh(&format!(
                     "echo $$ > '{}'; exec sleep 300",
                     oldfile.display()
@@ -4951,6 +5157,7 @@ mod tests {
                 tx,
                 Some(events.clone()),
                 key.clone(),
+                StopRequest::never(),
             ));
             let (item, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
                 .await
@@ -5386,6 +5593,7 @@ mod tests {
             tx_a,
             Some(events.clone()),
             key.clone(),
+            StopRequest::never(),
         ));
         assert!(
             tokio::time::timeout(Duration::from_secs(20), rx_a.recv())
@@ -5401,6 +5609,7 @@ mod tests {
             tx_b,
             Some(events.clone()),
             key.clone(),
+            StopRequest::never(),
         ));
         let (tailed, _) = tokio::time::timeout(Duration::from_secs(20), rx_b.recv())
             .await
@@ -6742,6 +6951,7 @@ mod tests {
             key.clone(),
             crate::cli::command_source::reap_previous_producer,
             owners,
+            crate::cli::wait::StopRequest::never(),
         ));
         for _ in 0..500 {
             if ready.exists() {
@@ -6787,6 +6997,142 @@ mod tests {
         );
     }
 
+    /// Through the real host, asked to stop as a config edit asks: a
+    /// producer that takes a second after TERM to finish what it was
+    /// sending has that line read, logged and sent, and the source then
+    /// ends, starting nothing more, with its lease free for whatever
+    /// replaces it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_source_finishes_what_it_was_sending() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let ready = root.path().join("ready");
+        let runs = root.path().join("runs");
+        let mut src = command_source(
+            "sending",
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "echo run >> '{}'; trap 'sleep 1; printf \"%s\\n\" \"{{\\\"id\\\":\\\"late\\\",\\\"content\\\":\\\"finished-after-term\\\"}}\"; exit 0' TERM; touch '{}'; while :; do sleep 0.1; done",
+                    runs.display(),
+                    ready.display()
+                ),
+            ],
+        );
+        src.stop_grace = Some("8s".into());
+        let key = src.source_key();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop, request) = StopRequest::channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events.clone()),
+            key.clone(),
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+            request,
+        ));
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists());
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .expect("a stopped source kept running")
+            .unwrap();
+        let mut sent = Vec::new();
+        while let Ok((item, _)) = rx.try_recv() {
+            sent.push(format!("{item:?}"));
+        }
+        assert!(
+            sent.iter().any(|item| item.contains("finished-after-term")),
+            "never sent: {sent:?}"
+        );
+        let rows = crate::cli::github::log::EventLog::open(&events, &key)
+            .unwrap()
+            .read_rows()
+            .unwrap()
+            .unwrap()
+            .rows;
+        assert!(
+            rows.iter()
+                .any(|row| format!("{:?}", row.item).contains("finished-after-term")),
+            "never logged"
+        );
+        assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
+        assert!(
+            crate::cli::github::log::IngestLease::try_acquire(&events, &key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Through the real host: a producer that has closed its stdout and
+    /// lives on is still sent TERM when its source is stopped, and ends
+    /// on it rather than holding its lease past its grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_reaches_a_producer_that_closed_its_stdout() {
+        let owners = crate::cli::source_group::tests::owners();
+        let root = tempfile::tempdir().unwrap();
+        let events = root.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let ready = root.path().join("ready");
+        let mut src = command_source(
+            "silent",
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "exec 1>&-; trap 'exit 0' TERM; touch '{}'; while :; do sleep 0.1; done",
+                    ready.display()
+                ),
+            ],
+        );
+        src.stop_grace = Some("30s".into());
+        let key = src.source_key();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop, request) = StopRequest::channel();
+        let task = tokio::spawn(run_command_source_with(
+            src,
+            crate::cli::event_source::EmissionSink::from(tx),
+            Some(events.clone()),
+            key.clone(),
+            crate::cli::command_source::reap_previous_producer,
+            owners,
+            request,
+        ));
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        stop.send(true).unwrap();
+        let mut task = task;
+        let ended = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        if ended.is_err() {
+            task.abort();
+            let _ = task.await;
+            panic!("a stopped source with no stdout kept running");
+        }
+        assert!(
+            crate::cli::github::log::IngestLease::try_acquire(&events, &key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// Through the real host: the failure event raised after three
     /// failed runs says how the LAST run ended and carries its stderr
     /// tail, sanitized. A run that flooded stderr is drained without
@@ -6825,6 +7171,7 @@ mod tests {
             key,
             crate::cli::command_source::reap_previous_producer,
             owners,
+            crate::cli::wait::StopRequest::never(),
         ));
         let failure = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -6892,6 +7239,7 @@ mod tests {
             key,
             crate::cli::command_source::reap_previous_producer,
             owners,
+            crate::cli::wait::StopRequest::never(),
         ));
         for _ in 0..500 {
             if runs.exists() {
@@ -6945,6 +7293,7 @@ mod tests {
             key,
             crate::cli::command_source::reap_previous_producer,
             owners,
+            crate::cli::wait::StopRequest::never(),
         ));
         for _ in 0..500 {
             if ready.exists() {
@@ -6992,6 +7341,7 @@ mod tests {
                 crate::cli::command_source::Retired::Deferred("still settling".into())
             },
             owners,
+            StopRequest::never(),
         ));
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -7025,6 +7375,7 @@ mod tests {
             key,
             crate::cli::command_source::reap_previous_producer,
             owners,
+            crate::cli::wait::StopRequest::never(),
         ));
         let count = || {
             std::fs::read_to_string(&runs)

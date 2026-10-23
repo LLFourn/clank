@@ -282,6 +282,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: Some("🛰".into()),
+            stop_grace: None,
         })
     }
 

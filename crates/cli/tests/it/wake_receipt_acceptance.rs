@@ -89,7 +89,7 @@ impl Fixture {
             command: vec!["/usr/bin/python3".into(), "-c".into(),
                 "import json,os,socket,sys,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(json.dumps({'pid':os.getpid(),'parent':os.getppid(),'cwd':os.getcwd(),'state':os.environ['CLANK_SOURCE_STATE_DIR'],'argv':sys.argv[1:3]}).encode(),sys.argv[3]); g=open(sys.argv[4]); data=json.loads(g.readline()); print(json.dumps(data),flush=True); time.sleep(300)".into(),
                 "events".into(), "--flag".into(), ready_path.to_str().unwrap().into(), gate_path.to_str().unwrap().into()],
-            reply_command: Some(vec!["/bin/false".into()]), receipt_command: None, glyph: None,
+            reply_command: Some(vec!["/bin/false".into()]), receipt_command: None, glyph: None, stop_grace: None,
         };
         let cfg = AgentConfig {
             auto_mode: Some(AutoMode::On),

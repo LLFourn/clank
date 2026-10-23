@@ -1762,6 +1762,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let cfg = clank_core::agent_config::AgentConfig {
             wait_events: vec![clank_core::agent_config::WaitEventSource::Command(source)],

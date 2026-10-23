@@ -769,8 +769,27 @@ Replaying an ID preserves its original event. Clank runs each producer in a
 process group it owns, and ends that whole group — TERM, a short grace, then
 KILL — when its host stops, including on SIGTERM or SIGINT. If the host was
 SIGKILLed instead, the next host to take the source ends the old group before
-starting its own. A producer need not watch for its parent's death. To ask for
-an answer, configure the source with a separate reply handler:
+starting its own. A producer need not watch for its parent's death.
+
+The monitor restarts a source only when its own entry changes: editing,
+adding or removing another source or a timer leaves it running. A source it
+stops — edited, removed, restarted from the TUI, or its agent off the roster —
+gets TERM and then its `stop_grace` to finish, with its output still read and
+logged, before KILL. A group whose work ends in time is never sent KILL, and
+its replacement starts only once it has ended. `stop_grace` is a duration
+(`"30s"`, `"2m"`, at most `"1h"`, `"0"` for none) and defaults to `"10s"`:
+
+```json
+{"kind": "command", "name": "signal", "command": ["signal-feed"], "stop_grace": "30s"}
+```
+
+When the host itself goes, every source's grace runs inside one drain
+shared by all of them and is cut short by it: 10 seconds when a monitor loses
+its lease, retires a stale build, or is sent SIGTERM or SIGINT, and the same
+for a `clank wait` sent either; 1 second when a newer clank asks a monitor to
+hand over.
+
+To ask for an answer, configure the source with a separate reply handler:
 
 ```json
 {

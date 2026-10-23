@@ -233,6 +233,45 @@ impl TimerSet {
     pub(crate) fn invocation_keys(&self) -> &BTreeSet<String> {
         &self.invocation_keys
     }
+
+    /// Take over from `previous` each timer this set defines the same
+    /// way, with its deadline and any retry it awaits, so editing one
+    /// timer re-arms only that one. Call before [`TimerSet::arm`].
+    pub(crate) fn keep_unchanged(&mut self, previous: TimerSet) {
+        let fresh: BTreeMap<String, (Instant, String)> = self
+            .entries
+            .keys()
+            .map(|slot| (slot.1.clone(), slot.clone()))
+            .collect();
+        let mut unchanged = |entry: &Entry| match fresh.get(&entry.key) {
+            Some(slot) if self.entries[slot].source == entry.source => {
+                self.entries.remove(slot);
+                true
+            }
+            _ => false,
+        };
+        let mut kept = Vec::new();
+        for (slot, entry) in previous.entries {
+            if unchanged(&entry) {
+                kept.push((slot, entry));
+            }
+        }
+        let mut recovery = Vec::new();
+        for entry in previous.recovery {
+            if unchanged(&entry) {
+                recovery.push(entry);
+            }
+        }
+        let mut pending = Vec::new();
+        for (key, entry) in previous.pending {
+            if unchanged(&entry) {
+                pending.push((key, entry));
+            }
+        }
+        self.entries.extend(kept);
+        self.recovery.extend(recovery);
+        self.pending.extend(pending);
+    }
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.entries.first_key_value().map(|(key, _)| key.0)
     }

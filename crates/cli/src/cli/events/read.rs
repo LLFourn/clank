@@ -248,6 +248,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let raw = "Para one.\n\n  indented\n\tTabbed\tcols\nüñí 中文 ✓\n\
                    Colour \u{1b}[31mred\u{1b}[0m done\r\nlast";

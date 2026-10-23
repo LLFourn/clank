@@ -1162,6 +1162,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let key = src.source_key();
         let mut log = EventLog::open(&dir, &key).unwrap();
@@ -1319,6 +1320,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let key = src.source_key();
         let mut log = EventLog::open(&dir, &key).unwrap();
@@ -1420,6 +1422,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let key = src.source_key();
 
@@ -1479,6 +1482,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let key = src.source_key();
         let raw = r#"{"id":"A","content":"once"}"#;

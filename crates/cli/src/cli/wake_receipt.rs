@@ -508,7 +508,7 @@ pub(super) mod fixtures {
             let author = AgentLabel::parse("codex").unwrap();
             let source = CommandSource { interrupt_message: None, interrupt: false,
                 name: "voice/a".into(), command: vec!["producer".into(), "events".into(), "--flag".into()],
-                reply_command: Some(vec!["answer-backend".into()]), glyph: None,
+                reply_command: Some(vec!["answer-backend".into()]), glyph: None, stop_grace: None,
                 receipt_command: Some(vec!["/usr/bin/python3".into(), "-c".into(),
                     "import json,os,pathlib,sys; p=pathlib.Path(sys.argv[1]); assert pathlib.Path(str(p)+'.flushed').exists(); data=json.load(sys.stdin); data['cwd']=os.getcwd(); data['state']=os.environ['CLANK_SOURCE_STATE_DIR']; p.write_text(json.dumps(data)); print('callback stdout'); print('callback stderr',file=sys.stderr)".into(),
                     output.to_str().unwrap().into()]),
@@ -650,6 +650,7 @@ mod tests {
             reply_command: None,
             receipt_command: Some(vec!["receipt".into(), "--verbatim".into()]),
             glyph: None,
+            stop_grace: None,
         }
     }
     fn route(name: &str) -> Route {

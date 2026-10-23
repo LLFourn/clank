@@ -303,6 +303,7 @@ mod tests {
             reply_command: route.map(|r| r.command.clone()),
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let mut log = EventLog::open(&dir, KEY).unwrap();
         log.load();

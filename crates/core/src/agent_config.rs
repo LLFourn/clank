@@ -618,6 +618,11 @@ pub struct CommandSource {
     /// unsupported display input. Config, not producer-supplied event text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glyph: Option<String>,
+    /// How long the producer's group has, after TERM, to end before KILL
+    /// when its host stops it: a duration string (`"30s"`, `"2m"`). The
+    /// CLI validates it and supplies the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_grace: Option<String>,
 }
 
 impl CommandSource {
@@ -952,6 +957,7 @@ mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         }
     }
 

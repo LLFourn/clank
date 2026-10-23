@@ -1432,6 +1432,7 @@ pub(crate) mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: Some("*".into()),
+            stop_grace: None,
         };
         let plain = clank_core::agent_config::CommandSource {
             interrupt: false,
@@ -1441,6 +1442,7 @@ pub(crate) mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: None,
+            stop_grace: None,
         };
         let cfg = clank_core::agent_config::AgentConfig {
             wait_events: vec![
@@ -1542,6 +1544,7 @@ pub(crate) mod tests {
             reply_command: None,
             receipt_command: None,
             glyph: Some("*".into()),
+            stop_grace: None,
         };
         EventLog::open(&events, &src.source_key())
             .unwrap()
@@ -1573,6 +1576,7 @@ pub(crate) mod tests {
                         reply_command: None,
                         receipt_command: None,
                         glyph: Some(g.to_string()),
+                        stop_grace: None,
                         ..src.clone()
                     },
                 )],
@@ -2322,6 +2326,7 @@ pub(crate) mod tests {
             reply_command: Some(vec!["speak".into()]),
             receipt_command: None,
             glyph: Some("🎙".into()),
+            stop_grace: None,
         };
         let stem = config.source_key();
         let route = clank_core::wait::CommandReplyRoute {

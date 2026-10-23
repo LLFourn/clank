@@ -88,8 +88,15 @@ pub(crate) fn activation() -> Vec<u8> {
 pub(crate) struct Owners {
     table: Mutex<Table>,
     settled: Condvar,
-    /// Ends a group, escalating to KILL after the given grace.
-    retirement: fn(&Entry, Duration) -> Retired,
+    retirement: fn(&Entry, Ending<'_>) -> (Retired, Option<Drained>),
+}
+
+/// How a retirement ends its group.
+pub(crate) enum Ending<'a> {
+    /// Nobody asked it to end first: TERM, [`cs::ESCALATE_AFTER`], KILL.
+    Promptly,
+    /// It has been asked to end, and its work has until this deadline.
+    By(&'a dyn Fn() -> Option<std::time::Instant>),
 }
 
 struct Table {
@@ -128,28 +135,46 @@ pub(crate) struct Entry {
     /// these are anybody else's to retry: an entry without it is a
     /// running producer some host is serving.
     deferred: bool,
+    /// How long its work has to end once it is asked to.
+    grace: Duration,
+    /// When it was asked to end, its grace's end.
+    asked: Option<std::time::Instant>,
 }
 
-fn retire_natively(entry: &Entry, escalate_after: Duration) -> Retired {
-    cs::retire_after(
-        &entry.path,
-        &entry.record,
-        &cs::Native {
-            children: &entry.children,
-        },
-        cs::Whose::Own,
-        escalate_after,
-    )
+fn retire_natively(entry: &Entry, ending: Ending<'_>) -> (Retired, Option<Drained>) {
+    let os = cs::Native {
+        children: &entry.children,
+    };
+    match ending {
+        Ending::Promptly => (
+            cs::retire_after(
+                &entry.path,
+                &entry.record,
+                &os,
+                cs::Whose::Own,
+                cs::ESCALATE_AFTER,
+            ),
+            None,
+        ),
+        Ending::By(deadline) => {
+            let (out, how) = cs::end_by(&entry.path, &entry.record, &os, cs::Whose::Own, deadline);
+            (out, Some(how))
+        }
+    }
 }
 
 pub(crate) static OWNERS: Owners = Owners::new();
+
+/// How long a process that is going gives its producers, together:
+/// each source's own stop grace runs inside it and is clipped to it.
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 impl Owners {
     pub(crate) const fn new() -> Self {
         Self::retiring_by(retire_natively)
     }
 
-    const fn retiring_by(retirement: fn(&Entry, Duration) -> Retired) -> Self {
+    const fn retiring_by(retirement: fn(&Entry, Ending<'_>) -> (Retired, Option<Drained>)) -> Self {
         Self {
             table: Mutex::new(Table {
                 closing: false,
@@ -226,6 +251,29 @@ impl Owners {
             entry.children.push(pid);
         }
         Ok(child)
+    }
+
+    /// Ask a group still running to end, and start its grace. Once only:
+    /// a second ask neither signals again nor moves the deadline.
+    fn ask_to_end(&self, id: u64) {
+        let mut table = self.table();
+        if let Some(entry) = table
+            .live
+            .get_mut(&id)
+            .filter(|entry| !entry.deferred && entry.asked.is_none())
+        {
+            Self::begin_grace(entry, std::time::Instant::now());
+        }
+    }
+
+    fn begin_grace(entry: &mut Entry, now: std::time::Instant) {
+        entry.asked = Some(now.checked_add(entry.grace).unwrap_or(now));
+        cs::ask_to_end(
+            &entry.record,
+            &cs::Native {
+                children: &entry.children,
+            },
+        );
     }
 
     /// `None` when this process no longer owns the group — it was
@@ -332,25 +380,12 @@ impl Owners {
     /// its group's work to end or the cutoff, whichever is first, and
     /// keeps the group and its source's lease until it is confirmed
     /// ended.
+    ///
+    /// A group's own grace still applies inside the cutoff, and is
+    /// clipped by it: no group outlives the drain's one deadline. One
+    /// already asked to end keeps the grace it was given then.
     pub(crate) fn drain(&'static self, grace: Duration) -> Draining {
-        {
-            let mut table = self.table();
-            table.closing = true;
-            table.drain = Some(DrainPhase {
-                cutoff: std::time::Instant::now() + grace,
-                outcomes: Vec::new(),
-                retired: false,
-                wake: Arc::new(tokio::sync::Notify::new()),
-            });
-            for entry in table.live.values().filter(|entry| !entry.deferred) {
-                cs::ask_to_end(
-                    &entry.record,
-                    &cs::Native {
-                        children: &entry.children,
-                    },
-                );
-            }
-        }
+        self.begin_drain(grace);
         // A thread of its own, not the blocking pool: whether it runs
         // must not depend on that pool having room.
         std::thread::spawn(move || {
@@ -361,6 +396,64 @@ impl Owners {
             }
         });
         Draining { owners: self }
+    }
+
+    /// Close admission and ask every running group to end, under one
+    /// cutoff `grace` from now. A drain already under way keeps its
+    /// outcomes, and the earlier of the two cutoffs.
+    fn begin_drain(&self, grace: Duration) {
+        let mut table = self.table();
+        let now = std::time::Instant::now();
+        let cutoff = now + grace;
+        table.closing = true;
+        match &mut table.drain {
+            Some(drain) => drain.cutoff = drain.cutoff.min(cutoff),
+            None => {
+                table.drain = Some(DrainPhase {
+                    cutoff,
+                    outcomes: Vec::new(),
+                    retired: false,
+                    wake: Arc::new(tokio::sync::Notify::new()),
+                })
+            }
+        }
+        for entry in table
+            .live
+            .values_mut()
+            .filter(|entry| !entry.deferred && entry.asked.is_none())
+        {
+            Self::begin_grace(entry, now);
+        }
+    }
+
+    /// Retire every group for a process told to stop, as a drain does:
+    /// each is asked to end and given its own grace, clipped to one
+    /// [`DRAIN_GRACE`] for them all, and its host's reading of its output
+    /// is waited for. Returns once every group is accounted for and read,
+    /// or the cutoff has passed.
+    pub(crate) fn terminate(&self) {
+        self.begin_drain(DRAIN_GRACE);
+        self.retire_all();
+        let mut table = self.table();
+        while table.readers.values().sum::<usize>() > 0 {
+            let left = table
+                .drain
+                .as_ref()
+                .map(|drain| {
+                    drain
+                        .cutoff
+                        .saturating_duration_since(std::time::Instant::now())
+                })
+                .unwrap_or_default();
+            if left.is_zero() {
+                break;
+            }
+            table = self
+                .settled
+                .wait_timeout(table, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
     }
 
     /// The cutoff of a drain under way.
@@ -406,47 +499,24 @@ impl Owners {
         }
     }
 
-    /// End `entry`'s group: by this registry's ordinary retirement, or,
-    /// during a drain, once its work has ended or the cutoff has come,
-    /// recording which.
+    /// End `entry`'s group: promptly when nobody asked it to end, or
+    /// else once its work has ended or its deadline has come — the
+    /// earlier of its own grace and a drain's cutoff — and, during a
+    /// drain, recording which.
     fn retire_entry(&self, entry: &Entry) -> Retired {
-        if self.table().drain.is_none() {
-            return (self.retirement)(entry, cs::ESCALATE_AFTER);
+        if entry.asked.is_none() && self.table().drain.is_none() {
+            return (self.retirement)(entry, Ending::Promptly).0;
         }
-        let how = self.await_work(entry);
-        let out = (self.retirement)(entry, Duration::ZERO);
-        let how = match out {
-            Retired::Deferred(_) => Drained::Unconfirmed,
-            _ => how,
-        };
+        let deadline = || entry.asked.into_iter().chain(self.drain_cutoff()).min();
+        let (out, how) = (self.retirement)(entry, Ending::By(&deadline));
         if let Some(drain) = &mut self.table().drain {
+            let how = match out {
+                Retired::Deferred(_) => Drained::Unconfirmed,
+                _ => how.unwrap_or(Drained::KilledAtGrace),
+            };
             drain.outcomes.push((entry.path.clone(), how));
         }
         out
-    }
-
-    /// Wait for every member of `entry`'s group but its anchor to end,
-    /// or for the drain's cutoff.
-    fn await_work(&self, entry: &Entry) -> Drained {
-        use cs::Os;
-        let os = cs::Native {
-            children: &entry.children,
-        };
-        let anchor = entry.record.pgid();
-        loop {
-            os.collect();
-            let working = Pgid::new(anchor)
-                .and_then(crate::signal::group_members)
-                .map(|members| members.iter().any(|pid| *pid != anchor));
-            if working == Some(false) {
-                return Drained::WithinGrace;
-            }
-            let now = std::time::Instant::now();
-            match self.drain_cutoff() {
-                Some(cutoff) if now < cutoff => std::thread::sleep(DRAIN_POLL.min(cutoff - now)),
-                _ => return Drained::KilledAtGrace,
-            }
-        }
     }
 
     #[cfg(test)]
@@ -465,8 +535,6 @@ impl Owners {
         self.table().live.contains_key(&id)
     }
 }
-
-const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 /// How a group asked to end by a drain did end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -557,6 +625,8 @@ impl Drop for Reading {
         if let Some(drain) = &table.drain {
             drain.wake.notify_one();
         }
+        drop(table);
+        self.owners.settled.notify_all();
     }
 }
 
@@ -584,6 +654,13 @@ impl Owned {
         self.pgid
     }
 
+    /// Ask the group to end, starting its grace: from here its
+    /// retirement waits for its work, until the grace is out, before it
+    /// kills what is left.
+    pub(crate) fn ask_to_end(&self) {
+        self.owners.ask_to_end(self.id);
+    }
+
     /// End the group. A deferral hands the claim back: the group is
     /// still this process's, lease and all, until a later attempt
     /// confirms it ended.
@@ -600,6 +677,13 @@ impl Owned {
     #[cfg(test)]
     pub(crate) fn abandon(mut self) {
         self.owners.forget(self.id);
+        self.done = true;
+    }
+
+    /// Leave the group to the registry, as a host that is cancelled
+    /// without unwinding does.
+    #[cfg(test)]
+    fn leave_to_the_registry(mut self) {
         self.done = true;
     }
 }
@@ -662,6 +746,7 @@ impl Spawned {
         store_dir: &Path,
         key: &str,
         lease: Arc<IngestLease>,
+        grace: Duration,
     ) -> std::io::Result<Recorded> {
         let birth = crate::proc_identity::token_for(self.pgid.get()).ok_or_else(|| {
             std::io::Error::other("the system would not say when the anchor started")
@@ -677,6 +762,8 @@ impl Spawned {
                 children: Pid::new(self.pgid.get()).into_iter().collect(),
                 _lease: lease,
                 deferred: false,
+                grace,
+                asked: None,
             },
             self.pgid,
             store_dir,
@@ -798,13 +885,14 @@ impl Armed {
 }
 
 /// Start `command` as a source's producer, in a group recorded and
-/// armed before it runs.
+/// armed before it runs, given `grace` to end once asked to.
 pub(crate) async fn launch(
     owners: &'static Owners,
     arming: &Arming,
     store_dir: &Path,
     key: &str,
     lease: Arc<IngestLease>,
+    grace: Duration,
     command: &mut tokio::process::Command,
 ) -> Result<(Owned, tokio::process::Child), LaunchError> {
     if owners.closing() {
@@ -818,13 +906,12 @@ pub(crate) async fn launch(
     };
     let spawned = Spawned::spawn(&arming.program)
         .map_err(|e| failed(format!("its anchor could not start ({e})")))?;
-    let recorded =
-        spawned
-            .record(owners, store_dir, key, lease)
-            .map_err(|e| match refused(&e) {
-                true => LaunchError::Closed,
-                false => failed(format!("its group could not be recorded ({e})")),
-            })?;
+    let recorded = spawned
+        .record(owners, store_dir, key, lease, grace)
+        .map_err(|e| match refused(&e) {
+            true => LaunchError::Closed,
+            false => failed(format!("its group could not be recorded ({e})")),
+        })?;
     let armed = recorded
         .arm(&arming.token, arming.deadline)
         .await
@@ -883,7 +970,7 @@ pub(crate) fn retire_on_termination() {
             Ok(mut signals) => {
                 std::thread::spawn(move || {
                     if let Some(sig) = signals.forever().next() {
-                        OWNERS.retire_all();
+                        OWNERS.terminate();
                         let _ = signal_hook::low_level::emulate_default_handler(sig);
                         std::process::exit(128 + sig);
                     }
@@ -920,10 +1007,14 @@ pub(crate) mod tests {
     /// Owners whose drain retirements end the group but cannot confirm
     /// it.
     pub(crate) fn owners_unconfirmed_in_a_drain() -> &'static Owners {
-        fn ends_but_cannot_confirm(entry: &Entry, escalate_after: Duration) -> Retired {
-            let out = retire_natively(entry, escalate_after);
-            if escalate_after.is_zero() {
-                return Retired::Deferred("cannot confirm it ended".into());
+        fn ends_but_cannot_confirm(
+            entry: &Entry,
+            ending: Ending<'_>,
+        ) -> (Retired, Option<Drained>) {
+            let awaited = matches!(ending, Ending::By(_));
+            let out = retire_natively(entry, ending);
+            if awaited {
+                return (Retired::Deferred("cannot confirm it ended".into()), out.1);
             }
             out
         }
@@ -1009,7 +1100,13 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recorded = Spawned::spawn(&anchor_program())
             .unwrap()
-            .record(owners(), dir.path(), "src", lease(dir.path(), "src"))
+            .record(
+                owners(),
+                dir.path(),
+                "src",
+                lease(dir.path(), "src"),
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
+            )
             .unwrap();
         let mut anchor = recorded.abandon();
         tokio::time::timeout(Duration::from_secs(10), anchor.wait())
@@ -1030,7 +1127,13 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recorded = Spawned::spawn(&anchor_program())
             .unwrap()
-            .record(owners(), dir.path(), "src", lease(dir.path(), "src"))
+            .record(
+                owners(),
+                dir.path(),
+                "src",
+                lease(dir.path(), "src"),
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
+            )
             .unwrap();
         let pgid = recorded.owned.pgid();
         drop(recorded.abandon_after_activating(&activation()));
@@ -1046,7 +1149,13 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let armed = Spawned::spawn(&anchor_program())
             .unwrap()
-            .record(owners(), dir.path(), "src", lease(dir.path(), "src"))
+            .record(
+                owners(),
+                dir.path(),
+                "src",
+                lease(dir.path(), "src"),
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
+            )
             .unwrap()
             .arm(&activation(), ARM_DEADLINE)
             .await
@@ -1112,6 +1221,7 @@ pub(crate) mod tests {
                 dir.path(),
                 "src",
                 lease(dir.path(), "src"),
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
                 &mut command,
             )
             .await;
@@ -1154,6 +1264,7 @@ pub(crate) mod tests {
                     &dir,
                     "src",
                     lease(&dir, "src"),
+                    crate::cli::command_source::DEFAULT_STOP_GRACE,
                     &mut command,
                 )
                 .await
@@ -1211,7 +1322,13 @@ pub(crate) mod tests {
             let dir = dir.path().to_path_buf();
             move || {
                 spawned
-                    .record(owners(), &dir, "src", lease(&dir, "src"))
+                    .record(
+                        owners(),
+                        &dir,
+                        "src",
+                        lease(&dir, "src"),
+                        crate::cli::command_source::DEFAULT_STOP_GRACE,
+                    )
                     .map(drop)
             }
         })
@@ -1240,6 +1357,7 @@ pub(crate) mod tests {
             dir,
             "src",
             lease(dir, "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut command,
         )
         .await
@@ -1342,13 +1460,13 @@ pub(crate) mod tests {
     static RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    fn held_open_until_released(entry: &Entry, _: Duration) -> Retired {
+    fn held_open_until_released(entry: &Entry, _: Ending<'_>) -> (Retired, Option<Drained>) {
         use std::sync::atomic::Ordering;
         RETIRING.store(true, Ordering::Release);
         while !RELEASED.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        retire_natively(entry, cs::ESCALATE_AFTER)
+        retire_natively(entry, Ending::Promptly)
     }
 
     /// Shutdown takes an armed, acknowledged group, and its anchor is
@@ -1363,7 +1481,13 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let armed = Spawned::spawn(&anchor_program())
             .unwrap()
-            .record(owners, dir.path(), "src", lease(dir.path(), "src"))
+            .record(
+                owners,
+                dir.path(),
+                "src",
+                lease(dir.path(), "src"),
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
+            )
             .unwrap()
             .arm(&activation(), ARM_DEADLINE)
             .await
@@ -1402,6 +1526,7 @@ pub(crate) mod tests {
             late.path(),
             "src",
             lease(late.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
         );
         assert!(refused.is_err());
         assert!(
@@ -1412,11 +1537,11 @@ pub(crate) mod tests {
 
     static DEFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-    fn deferring_while_asked(entry: &Entry, _: Duration) -> Retired {
+    fn deferring_while_asked(entry: &Entry, _: Ending<'_>) -> (Retired, Option<Drained>) {
         if DEFER.load(std::sync::atomic::Ordering::Acquire) {
-            Retired::Deferred("held for the test".into())
+            (Retired::Deferred("held for the test".into()), None)
         } else {
-            retire_natively(entry, cs::ESCALATE_AFTER)
+            retire_natively(entry, Ending::Promptly)
         }
     }
 
@@ -1512,19 +1637,19 @@ pub(crate) mod tests {
 
     /// The first attempt is held until released and then defers; the
     /// next succeeds, or defers too when `FINAL_DEFERS` is set.
-    fn first_held_then_deferred(entry: &Entry, _: Duration) -> Retired {
+    fn first_held_then_deferred(entry: &Entry, _: Ending<'_>) -> (Retired, Option<Drained>) {
         use std::sync::atomic::Ordering;
         if ATTEMPTS.fetch_add(1, Ordering::AcqRel) == 0 {
             FIRST_ENTERED.store(true, Ordering::Release);
             while !FIRST_RELEASED.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            return Retired::Deferred("the first look failed".into());
+            return (Retired::Deferred("the first look failed".into()), None);
         }
         if FINAL_DEFERS.load(Ordering::Acquire) {
-            Retired::Deferred("still cannot tell".into())
+            (Retired::Deferred("still cannot tell".into()), None)
         } else {
-            retire_natively(entry, cs::ESCALATE_AFTER)
+            retire_natively(entry, Ending::Promptly)
         }
     }
 
@@ -1653,6 +1778,7 @@ pub(crate) mod tests {
             late.path(),
             "src",
             lease(late.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut command,
         )
         .await;
@@ -1698,6 +1824,7 @@ pub(crate) mod tests {
                 dir.path(),
                 "src",
                 lease(dir.path(), "src"),
+                crate::cli::command_source::DEFAULT_STOP_GRACE,
                 &mut command,
             )
             .await
@@ -1728,6 +1855,7 @@ pub(crate) mod tests {
             late.path(),
             "src",
             lease(late.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut sh("exec sleep 300"),
         )
         .await;
@@ -1790,6 +1918,7 @@ pub(crate) mod tests {
             dir.path(),
             "src",
             lease(dir.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut command,
         )
         .await
@@ -1828,6 +1957,7 @@ pub(crate) mod tests {
             dir.path(),
             "src",
             lease(dir.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut command,
         )
         .await
@@ -1847,6 +1977,133 @@ pub(crate) mod tests {
             drained,
             vec![(cs::producer_path(dir.path(), "src"), Drained::KilledAtGrace)]
         );
+    }
+
+    /// A group asked to end is retired by its own grace, not the prompt
+    /// one: work that takes a second to finish after TERM finishes, and
+    /// is not held for the rest of its grace; and work that ignores TERM
+    /// is ended once a short grace is out. Each keeps its lease until it
+    /// has ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_asked_to_end_has_its_own_grace() {
+        let owners = owners();
+        let grace = |script: &str, grace: Duration| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut command = sh(script);
+            command.current_dir(dir.path());
+            async move {
+                let (owned, child) = launch(
+                    owners,
+                    &Arming::standard(),
+                    dir.path(),
+                    "src",
+                    lease(dir.path(), "src"),
+                    grace,
+                    &mut command,
+                )
+                .await
+                .unwrap();
+                let pid = pid_in(&dir.path().join("pid")).await;
+                owned.ask_to_end();
+                let started = std::time::Instant::now();
+                let retiring = tokio::task::spawn_blocking(move || owned.retire());
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    IngestLease::try_acquire(dir.path(), "src")
+                        .unwrap()
+                        .is_none(),
+                    "a source's lease was let go while its producer still ran"
+                );
+                assert!(retiring.await.unwrap().is_ok());
+                drop(child);
+                (dir, pid, started.elapsed())
+            }
+        };
+        let (drained, _, took) = grace(
+            "trap 'sleep 1; touch done; exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done",
+            Duration::from_secs(8),
+        )
+        .await;
+        assert!(drained.path().join("done").exists(), "its work was cut off");
+        assert!(took < Duration::from_secs(4), "{took:?}");
+
+        let (_dir, stubborn, took) = grace(
+            "trap '' TERM; echo $$ > pid; while :; do sleep 0.1; done",
+            Duration::from_millis(600),
+        )
+        .await;
+        assert!(gone(stubborn).await);
+        assert!(took >= Duration::from_millis(600), "killed early: {took:?}");
+    }
+
+    static TERMINATION_ENDINGS: Mutex<Vec<(Duration, Option<Duration>)>> = Mutex::new(Vec::new());
+
+    /// Notes what each retirement was given, by its group's grace, then
+    /// ends the group as an ordinary retirement would.
+    fn noting_its_deadline(entry: &Entry, ending: Ending<'_>) -> (Retired, Option<Drained>) {
+        let given = match &ending {
+            Ending::Promptly => None,
+            Ending::By(deadline) => Some(
+                deadline()
+                    .unwrap()
+                    .saturating_duration_since(std::time::Instant::now()),
+            ),
+        };
+        TERMINATION_ENDINGS
+            .lock()
+            .unwrap()
+            .push((entry.grace, given));
+        (
+            retire_natively(entry, Ending::Promptly).0,
+            Some(Drained::WithinGrace),
+        )
+    }
+
+    /// A process told to stop retires its groups as a drain does: each is
+    /// given its own grace, clipped to the one shared cutoff, and none is
+    /// retired promptly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn termination_gives_each_group_its_own_grace_within_one_cutoff() {
+        let owners: &'static Owners = Box::leak(Box::new(Owners::retiring_by(noting_its_deadline)));
+        let mut dirs = Vec::new();
+        for grace in [Duration::from_millis(300), Duration::from_secs(30)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut command = sh("exec sleep 300");
+            launch(
+                owners,
+                &Arming::standard(),
+                dir.path(),
+                "src",
+                lease(dir.path(), "src"),
+                grace,
+                &mut command,
+            )
+            .await
+            .unwrap()
+            .0
+            .leave_to_the_registry();
+            dirs.push(dir);
+        }
+        tokio::task::spawn_blocking(move || owners.terminate())
+            .await
+            .unwrap();
+        let mut given = TERMINATION_ENDINGS.lock().unwrap().clone();
+        given.sort();
+        assert_eq!(given.len(), 2, "{given:?}");
+        let short = given[0].1.expect("a short grace was retired promptly");
+        let long = given[1].1.expect("a long grace was retired promptly");
+        assert!(short <= Duration::from_millis(300), "{given:?}");
+        assert!(
+            long <= DRAIN_GRACE && long > DRAIN_GRACE - Duration::from_secs(2),
+            "{given:?}"
+        );
+        for dir in &dirs {
+            assert!(
+                IngestLease::try_acquire(dir.path(), "src")
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     /// A drain is not over while a host is still reading its producer's
@@ -1882,6 +2139,7 @@ pub(crate) mod tests {
             dir.path(),
             "src",
             lease(dir.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut missing,
         )
         .await;
@@ -1902,6 +2160,7 @@ pub(crate) mod tests {
             other.path(),
             "src",
             lease(other.path(), "src"),
+            crate::cli::command_source::DEFAULT_STOP_GRACE,
             &mut sh("exec sleep 300"),
         )
         .await;
@@ -1916,7 +2175,13 @@ pub(crate) mod tests {
             let dir = other.path().to_path_buf();
             move || {
                 spawned
-                    .record(closed, &dir, "src", lease(&dir, "src"))
+                    .record(
+                        closed,
+                        &dir,
+                        "src",
+                        lease(&dir, "src"),
+                        crate::cli::command_source::DEFAULT_STOP_GRACE,
+                    )
                     .map(drop)
             }
         })
@@ -1947,6 +2212,7 @@ pub(crate) mod tests {
                     &dir,
                     "src",
                     lease(&dir, "src"),
+                    crate::cli::command_source::DEFAULT_STOP_GRACE,
                     &mut sh("exec sleep 300"),
                 )
                 .await

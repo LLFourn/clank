@@ -8688,6 +8688,7 @@ mod tests {
                     reply_command: None,
                     receipt_command: None,
                     glyph: Some("🛰".into()),
+                    stop_grace: None,
                 },
             ),
         )
@@ -8767,6 +8768,7 @@ mod tests {
                     reply_command: None,
                     receipt_command: None,
                     glyph: Some("🎙".into()),
+                    stop_grace: None,
                 },
             ),
         )
@@ -9351,6 +9353,7 @@ mod tests {
                     reply_command: Some(vec!["reply".into(), "--answer".into()]),
                     receipt_command: Some(vec!["receipt".into()]),
                     glyph: Some("🛰".into()),
+                    stop_grace: None,
                 },
             ),
         );
