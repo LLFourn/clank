@@ -1364,6 +1364,9 @@ struct Watched {
     /// The binding `running` was identified for: a new one, even of the
     /// same session, is a new launch to identify.
     binding: Option<clank_core::agent_config::Session>,
+    /// A verified user command waits for its turn to end, so its record is
+    /// read whether or not it owes anything.
+    user_command: bool,
 }
 
 struct Reading {
@@ -1728,6 +1731,7 @@ impl Driver {
                     published: crate::cli::agent_state::load(&f.agent_dir),
                     running: Identity::Unasked,
                     binding: None,
+                    user_command: false,
                 });
             w.auto = f.auto;
             w.obligated = f.obligated && !f.delivering;
@@ -1770,7 +1774,7 @@ impl Driver {
                     Gate::ObligationCleared
                 };
                 acts.extend(decision(&f.author, w, now, Some(gate), None));
-                if f.asking {
+                if f.asking || w.user_command {
                     watch_record(w, &f.session, &self.cwd, &self.home);
                 } else {
                     disarm(w);
@@ -1787,6 +1791,63 @@ impl Driver {
         acts.extend(self.sync_watches());
         self.publish(now);
         self.accounted(acts, now)
+    }
+
+    /// Read the records of exactly `wanted`'s agents whether or not they owe
+    /// anything, for the user commands waiting on their turns: the watches
+    /// to install and release.
+    pub(crate) fn want_records(
+        &mut self,
+        wanted: &std::collections::BTreeSet<clank_core::ids::AgentLabel>,
+    ) -> Vec<Act> {
+        for (author, w) in self.agents.iter_mut() {
+            let want = wanted.contains(author);
+            if want == w.user_command {
+                continue;
+            }
+            w.user_command = want;
+            match (want, w.binding.clone()) {
+                (true, Some(binding)) => {
+                    watch_record(w, &binding, &self.cwd, &self.home);
+                }
+                (false, _) if !w.obligated && !w.asking => disarm(w),
+                _ => {}
+            }
+        }
+        self.sync_watches()
+    }
+
+    /// Whether `author`'s record, read afresh, shows `session`'s latest
+    /// turn completed, or why not.
+    pub(crate) fn turn_completed(
+        &mut self,
+        author: &clank_core::ids::AgentLabel,
+        session: &str,
+    ) -> Result<(), String> {
+        use crate::cli::agent_state::Activity;
+        let w = self
+            .agents
+            .get_mut(author)
+            .ok_or("the monitor does not follow it yet")?;
+        if w.session != session {
+            return Err("the monitor follows another of its sessions".into());
+        }
+        if w.read.is_none() {
+            if let Some(binding) = w.binding.clone() {
+                watch_record(w, &binding, &self.cwd, &self.home);
+            }
+        } else {
+            refresh(w);
+        }
+        match activity(w) {
+            Activity::Idle => Ok(()),
+            Activity::Working => Err("its turn is running".into()),
+            Activity::Asking => Err("a question to the user is pending".into()),
+            Activity::Failed(class) => Err(format!("its latest turn failed ({class})")),
+            Activity::Interrupted => Err("its latest turn was interrupted".into()),
+            Activity::Unknown(why) => Err(why),
+            Activity::Unobserved => Err("its record is not being read yet".into()),
+        }
     }
 
     /// Install the watches agents need and release the rest. One watch per

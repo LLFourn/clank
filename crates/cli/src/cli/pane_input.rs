@@ -1,5 +1,23 @@
-//! Provider-aware terminal input shared by nudges, events and remote controls.
+//! Provider-aware terminal input shared by nudges, events, recovery, check-ins,
+//! the web bridge and user commands: the one boundary every pane write crosses.
 //! Callers resolve target identity; accepted terminal bytes do not prove a stopped turn.
+//!
+//! Three rules hold here and nowhere else:
+//!
+//! - Ordinary text is an [`Admitted`]: structural control bytes are made
+//!   inert and a leading `!` cannot reach a harness's shell-mode trigger.
+//! - An ordinary terminal write proceeds only when the pane's input is
+//!   positively read as not in shell mode, or when the sequence opens with
+//!   a key committed evidence shows leaves it ([`EXIT_KEY_EVIDENCE`]).
+//! - Every write sequence holds the pane's one cross-process lock
+//!   ([`lock_pane`]) from its look through its last byte.
+//!
+//! The user-command writer ([`type_user_command`]) is the only pane writer
+//! that takes a raw line, and it takes only a verified one.
+
+use super::composer::Composer;
+use super::open_zellij::PaneWrite;
+use clank_core::Tool;
 
 /// The two actions that say `text` to a pane and press Enter, as
 /// argv after the session prefix; nothing for empty text. The text
@@ -63,13 +81,355 @@ pub(crate) fn stop_argv(pane: &str, tool: clank_core::vocab::Tool) -> Vec<String
         .collect()
 }
 
-pub(crate) fn stop_pane(
+/// Interrupt `pane`'s turn with its tool's key, under the pane's lock.
+/// Writes no text, so it needs no reading of the input.
+pub(crate) fn stop_pane(session: &str, pane: &str, tool: Tool) -> anyhow::Result<()> {
+    run_sync(async {
+        let _lock = lock_pane(session, pane)?;
+        Zellij { session, pane }
+            .write(stop_argv(pane, tool))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    })
+}
+
+/// Text an ordinary path may type into, or hand natively to, a harness:
+/// built only by [`Admitted::new`], so a caller cannot pass raw text.
+///
+/// - CRLF and lone CR become LF: a CR would submit mid-message and start
+///   the rest on an empty prompt. LF stays, as the multi-line mechanism.
+/// - Tab becomes a space: Tab is Codex's submit and queue key.
+/// - Every other control character, ESC, DEL and C1 included, becomes
+///   U+FFFD, so the change is visible: Esc interrupts, and a CSI sequence
+///   can be a key such as the kitty Enter.
+/// - A `!` opening the text after its leading whitespace is encoded for its
+///   tool so no harness reads it as the shell-mode trigger: U+00B7 `·`
+///   before it, or for a Claude version with a committed row in
+///   [`SPACE_BEFORE_BANG`], the leading whitespace as one ASCII space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admitted(String);
+
+impl Admitted {
+    /// `raw`, admitted for `tool` at `version` (`None` when unknown).
+    pub(crate) fn new(tool: Tool, version: Option<&str>, raw: &str) -> Self {
+        Self::by(SPACE_BEFORE_BANG, tool, version, raw)
+    }
+
+    fn by(evidence: &[BangEvidence], tool: Tool, version: Option<&str>, raw: &str) -> Self {
+        let mut text = neutralised(raw);
+        let lead = text.len() - text.trim_start().len();
+        if text[lead..].starts_with('!') {
+            let spaced =
+                version.is_some_and(|v| evidence.iter().any(|e| e.tool == tool && e.version == v));
+            if spaced {
+                text.replace_range(..lead, " ");
+            } else {
+                text.insert(lead, BANG_GUARD);
+            }
+        }
+        Admitted(text)
+    }
+
+    /// The admitted text.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The fixed non-whitespace character put before a leading `!`: every
+/// harness's trigger is a `!` as the input's first character, and nothing
+/// trims a non-whitespace character away.
+const BANG_GUARD: char = '\u{b7}';
+
+fn neutralised(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push(' '),
+            c if c.is_control() => out.push('\u{fffd}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A live observation that a harness version, given a leading `!` after a
+/// single space, keeps the line as a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BangEvidence {
+    pub(crate) tool: Tool,
+    /// Exactly the version observed: no later version is assumed.
+    pub(crate) version: &'static str,
+    pub(crate) how: &'static str,
+}
+
+/// Committed observations for the space encoding. Empty until a human
+/// records one from a throwaway pane (README, "User commands"): until then
+/// every tool gets the `·` encoding.
+pub(crate) const SPACE_BEFORE_BANG: &[BangEvidence] = &[];
+
+/// A live observation that the key an interrupt-first path already sends
+/// first (`stop_argv`) leaves the harness's shell mode at a version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExitKeyEvidence {
+    pub(crate) tool: Tool,
+    /// Exactly the version observed.
+    pub(crate) version: &'static str,
+    /// For Grok, that Ctrl+C clears a bare `!` with nothing after it; for
+    /// OpenCode, that Esc in shell mode leaves it, and whether it also
+    /// interrupts.
+    pub(crate) how: &'static str,
+}
+
+/// Committed observations for Grok's and OpenCode's exit keys. Empty until
+/// a human records one, so both are refused on every terminal path.
+pub(crate) const EXIT_KEY_EVIDENCE: &[ExitKeyEvidence] = &[];
+
+/// A live observation that Claude Code at a version runs a user command
+/// typed as `!<line>` into its empty input followed by Enter as one bash
+/// command, for lines up to `max_command` characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UserCommandEvidence {
+    /// Exactly the Claude Code version observed.
+    pub(crate) version: &'static str,
+    /// The longest line observed to run whole.
+    pub(crate) max_command: usize,
+    /// What was typed and seen: quotes, `$`, a line at the bound, how the
+    /// shell mode drew in an `--ansi` dump, and whether a Stop hook fired.
+    pub(crate) how: &'static str,
+}
+
+/// Committed observations for the user-command keystrokes. Empty until a
+/// human records one, so every user command is refused at dispatch.
+pub(crate) const USER_COMMAND_EVIDENCE: &[UserCommandEvidence] = &[];
+
+/// Which kind of sequence an ordinary write is: whether it opens with the
+/// tool's interrupt key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    InterruptFirst,
+    TextFirst,
+}
+
+/// What lets an ordinary terminal write proceed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proof {
+    /// A dump under the lock must read the input as taking ordinary text.
+    Reading,
+    /// The interrupt key sent first is proven to leave shell mode.
+    ExitKey,
+}
+
+fn proof_for(
+    evidence: &[ExitKeyEvidence],
+    tool: Tool,
+    opening: Opening,
+    version: Option<&str>,
+) -> Result<Proof, String> {
+    match tool {
+        Tool::Claude | Tool::Codex => Ok(Proof::Reading),
+        Tool::Grok | Tool::OpenCode => {
+            let proven = opening == Opening::InterruptFirst
+                && version
+                    .is_some_and(|v| evidence.iter().any(|e| e.tool == tool && e.version == v));
+            if proven {
+                Ok(Proof::ExitKey)
+            } else {
+                Err(format!(
+                    "{tool}'s input cannot be read, and no committed evidence shows the key this \
+                     path sends first leaves its shell mode at {}; nothing was typed",
+                    version.unwrap_or("its unknown version")
+                ))
+            }
+        }
+    }
+}
+
+/// Whether this sequence may type into the pane now: by its proof, and for
+/// a reading, by one dump taken under the lock the caller holds.
+async fn admit_write(
+    term: &impl Terminal,
+    evidence: &[ExitKeyEvidence],
+    tool: Tool,
+    opening: Opening,
+    version: Option<&str>,
+) -> Result<(), String> {
+    match proof_for(evidence, tool, opening, version)? {
+        Proof::ExitKey => Ok(()),
+        Proof::Reading => {
+            let read = term
+                .dump()
+                .await
+                .map(|screen| super::composer::composer(tool, &screen))
+                .unwrap_or(Composer::Unreadable);
+            if read.takes_ordinary_text() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "its input reads as {}, not as a prompt that takes ordinary text; nothing \
+                     was typed",
+                    match read {
+                        Composer::Shell => "shell mode",
+                        _ => "unreadable",
+                    }
+                ))
+            }
+        }
+    }
+}
+
+/// One pane's terminal, as the write sequences reach it.
+pub(crate) trait Terminal {
+    /// The pane's screen with its colours kept, or `None` when it could not
+    /// be read within its budget.
+    async fn dump(&self) -> Option<String>;
+    /// One bounded write action; a failure says whether anything ran.
+    async fn write(&self, argv: Vec<String>) -> Result<(), PaneWrite>;
+}
+
+/// A zellij pane.
+pub(crate) struct Zellij<'a> {
+    pub(crate) session: &'a str,
+    pub(crate) pane: &'a str,
+}
+
+impl Terminal for Zellij<'_> {
+    async fn dump(&self) -> Option<String> {
+        super::open_zellij::dump_pane_screen(self.session, self.pane).await
+    }
+
+    async fn write(&self, argv: Vec<String>) -> Result<(), PaneWrite> {
+        super::open_zellij::write_pane_action_classified(self.session, self.pane, &argv).await
+    }
+}
+
+/// The one write lock of a pane, held from a sequence's look through its
+/// last byte, across processes. Released when dropped.
+pub(crate) struct PaneLock {
+    _file: std::fs::File,
+}
+
+/// Block until this process holds the lock of `pane` in `session`. Async
+/// callers take it through `event_interrupt::blocking`, off the executor.
+pub(crate) fn lock_pane(session: &str, pane: &str) -> anyhow::Result<PaneLock> {
+    super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
+    let dir = super::monitor::runtime_dir(unsafe { libc::getuid() });
+    lock_pane_in(&dir, session, pane)
+}
+
+fn lock_pane_in(dir: &std::path::Path, session: &str, pane: &str) -> anyhow::Result<PaneLock> {
+    Ok(reserve_in(dir, session, pane, Reserve::Wait)?.expect("a waiting lock is taken"))
+}
+
+/// How a writer takes a pane's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reserve {
+    /// Block until it is free.
+    Wait,
+    /// Take it only if it is free now: for the monitor's own writers, whose
+    /// authorisation would be stale behind a user command typed meanwhile.
+    Defer,
+}
+
+/// The lock of `pane` in `session`, or `None` when `how` is `Defer` and
+/// another writer holds it.
+fn reserve_in(
+    dir: &std::path::Path,
     session: &str,
     pane: &str,
-    tool: clank_core::vocab::Tool,
-) -> anyhow::Result<()> {
-    let argv = stop_argv(pane, tool);
-    super::open_zellij::write_pane_action(session, pane, &argv)
+    how: Reserve,
+) -> anyhow::Result<Option<PaneLock>> {
+    use anyhow::Context;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = pane_lock_path(dir, session, pane);
+    // Never unlinked: replacing a locked inode would admit a second holder.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("opening pane lock `{}`", path.display()))?;
+    let op = match how {
+        Reserve::Wait => libc::LOCK_EX,
+        Reserve::Defer => libc::LOCK_EX | libc::LOCK_NB,
+    };
+    loop {
+        // SAFETY: valid owned fd; flock has no memory effects.
+        if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+            return Ok(Some(PaneLock { _file: file }));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) if how == Reserve::Defer => return Ok(None),
+            _ => return Err(error).with_context(|| format!("locking `{}`", path.display())),
+        }
+    }
+}
+
+fn pane_lock_path(dir: &std::path::Path, session: &str, pane: &str) -> std::path::PathBuf {
+    // Length-delimited, so no two (session, pane) pairs share a name.
+    let mut hash = blake3::Hasher::new();
+    for field in [session, pane] {
+        hash.update(&(field.len() as u64).to_le_bytes());
+        hash.update(field.as_bytes());
+    }
+    dir.join(format!("pane-{}.lock", &hash.finalize().to_hex()[..32]))
+}
+
+async fn lock_pane_async(session: &str, pane: &str, how: Reserve) -> Result<PaneLock, String> {
+    let taken = super::event_interrupt::blocking(|| {
+        super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
+        let dir = super::monitor::runtime_dir(unsafe { libc::getuid() });
+        reserve_in(&dir, session, pane, how)
+    });
+    match taken {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(RESERVED.to_string()),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// Why a deferring writer typed nothing.
+const RESERVED: &str = "its pane is reserved by another clank writer; nothing was typed";
+
+/// Run `work` to completion from synchronous code that is off the async
+/// executor: on the runtime it belongs to, or a small one of its own.
+fn run_sync<F: std::future::Future>(work: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(work),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(work),
+    }
+}
+
+/// Where an ordinary write goes: the pane, its tool, and the harness
+/// version its launch recorded, when known.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Target<'a> {
+    pub(crate) session: &'a str,
+    pub(crate) pane: &'a str,
+    pub(crate) tool: Tool,
+    pub(crate) version: Option<&'a str>,
 }
 
 /// Interrupt the agent's current turn, then submit `text`.
@@ -136,42 +496,63 @@ pub(crate) fn stop_pane(
 /// under way, which for Grok escalates toward quit. A submission that was
 /// not confirmed may already be partly typed.
 pub(crate) async fn interrupt_and_submit_async(
-    session: &str,
-    pane: &str,
-    tool: clank_core::Tool,
-    text: &str,
+    target: Target<'_>,
+    text: &Admitted,
 ) -> Result<(), Unconfirmed> {
-    interrupt_and_submit_with(pane, tool, text, |argv| async move {
-        super::open_zellij::write_pane_action_async(session, pane, &argv).await
-    })
-    .await
+    interrupt_and_submit_reserving(target, text, Reserve::Wait).await
 }
 
-/// [`interrupt_and_submit_async`] with the terminal write supplied.
+async fn interrupt_and_submit_reserving(
+    target: Target<'_>,
+    text: &Admitted,
+    how: Reserve,
+) -> Result<(), Unconfirmed> {
+    let _lock = lock_pane_async(target.session, target.pane, how)
+        .await
+        .map_err(Unconfirmed::Refused)?;
+    let term = Zellij {
+        session: target.session,
+        pane: target.pane,
+    };
+    interrupt_and_submit_on(&term, EXIT_KEY_EVIDENCE, target, text).await
+}
+
+/// [`interrupt_and_submit_async`] on a supplied terminal and evidence, the
+/// lock already held.
 ///
 /// So the REAL bytes, per provider, can be recorded in order without a
 /// terminal. The order is also asserted on [`interrupt_then_submit`]
 /// alone, but that cannot see which operation is handed in as which: a
 /// production path that passed the submit as the interrupt would satisfy
 /// it. This is the seam that sees the keys themselves.
-async fn interrupt_and_submit_with<W, F>(
-    pane: &str,
-    tool: clank_core::Tool,
-    text: &str,
-    write: W,
-) -> Result<(), Unconfirmed>
-where
-    W: Fn(Vec<String>) -> F,
-    F: std::future::Future<Output = anyhow::Result<()>>,
-{
+async fn interrupt_and_submit_on(
+    term: &impl Terminal,
+    evidence: &[ExitKeyEvidence],
+    target: Target<'_>,
+    text: &Admitted,
+) -> Result<(), Unconfirmed> {
+    if text.is_empty() {
+        return Err(Unconfirmed::Empty);
+    }
+    admit_write(
+        term,
+        evidence,
+        target.tool,
+        Opening::InterruptFirst,
+        target.version,
+    )
+    .await
+    .map_err(Unconfirmed::Refused)?;
+    let (pane, tool) = (target.pane, target.tool);
+    let write = |argv| async { term.write(argv).await.map_err(|e| anyhow::anyhow!("{e}")) };
     interrupt_then_submit(
         || write(stop_argv(pane, tool)),
         || async {
-            let Some(argvs) = say_argvs(pane, text) else {
+            let Some(argvs) = say_argvs(pane, text.as_str()) else {
                 return Ok(());
             };
             for (index, mut argv) in argvs.into_iter().enumerate() {
-                if index == 1 && tool == clank_core::Tool::Codex {
+                if index == 1 && tool == Tool::Codex {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     argv = codex_submit_argv(pane);
                 }
@@ -179,51 +560,55 @@ where
             }
             Ok(())
         },
-        text.is_empty(),
+        false,
     )
     .await
 }
 
-/// Type `text` into `pane` and submit it the way `tool` expects, and
+/// Type `text` into the pane and submit it the way its tool expects, and
 /// nothing else: never an interrupt key. Bounded; a failure says whether
-/// nothing was written or some of it may have been.
-pub(crate) async fn submit_async(
-    session: &str,
-    pane: &str,
-    tool: clank_core::Tool,
-    text: &str,
-) -> Result<(), super::open_zellij::PaneWrite> {
-    submit_with(pane, tool, text, |argv| async move {
-        super::open_zellij::write_pane_action_classified(session, pane, &argv).await
-    })
-    .await
+/// nothing was written or some of it may have been. A refusal by the
+/// admission rule, or a pane another writer holds, is `NotStarted`: the
+/// monitor's typed sends defer rather than wait.
+pub(crate) async fn submit_async(target: Target<'_>, text: &Admitted) -> Result<(), PaneWrite> {
+    let _lock = lock_pane_async(target.session, target.pane, Reserve::Defer)
+        .await
+        .map_err(PaneWrite::NotStarted)?;
+    let term = Zellij {
+        session: target.session,
+        pane: target.pane,
+    };
+    submit_on(&term, target, text).await
 }
 
-/// [`submit_async`] with the terminal write supplied, so the keys it sends
-/// can be recorded.
-async fn submit_with<W, F>(
-    pane: &str,
-    tool: clank_core::Tool,
-    text: &str,
-    write: W,
-) -> Result<(), super::open_zellij::PaneWrite>
-where
-    W: Fn(Vec<String>) -> F,
-    F: std::future::Future<Output = Result<(), super::open_zellij::PaneWrite>>,
-{
-    use super::open_zellij::PaneWrite;
-    let Some(argvs) = say_argvs(pane, text) else {
+/// [`submit_async`] on a supplied terminal, the lock already held, so the
+/// keys it sends can be recorded.
+async fn submit_on(
+    term: &impl Terminal,
+    target: Target<'_>,
+    text: &Admitted,
+) -> Result<(), PaneWrite> {
+    let Some(argvs) = say_argvs(target.pane, text.as_str()) else {
         return Err(PaneWrite::NotStarted("there was nothing to say".into()));
     };
+    admit_write(
+        term,
+        EXIT_KEY_EVIDENCE,
+        target.tool,
+        Opening::TextFirst,
+        target.version,
+    )
+    .await
+    .map_err(PaneWrite::NotStarted)?;
     for (index, mut argv) in argvs.into_iter().enumerate() {
-        if index == 1 && tool == clank_core::Tool::Codex {
+        if index == 1 && target.tool == Tool::Codex {
             // Past Codex's paste window, so the key is a key: Tab, which
             // Codex queues behind a running turn, where Enter would steer
             // into it (`resume::EVIDENCE`).
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            argv = codex_queue_argv(pane);
+            argv = codex_queue_argv(target.pane);
         }
-        match write(argv).await {
+        match term.write(argv).await {
             Ok(()) => {}
             // Only before anything was written is a failure a no-send.
             Err(PaneWrite::NotStarted(e)) if index == 0 => return Err(PaneWrite::NotStarted(e)),
@@ -237,13 +622,14 @@ where
 /// stays in its durable inbox: `hint` only names the pending events to read.
 /// Role is deliberately resolved by Clank when the target reads, never captured
 /// in terminal text before interruption. No receipt or acknowledgement is forged.
+///
+/// A pane another writer holds is `Refused`, leaving delivery pending: the
+/// monitor runs these, and must not wait on a user command's reservation.
 pub(crate) async fn wake_for_events_async(
-    session: &str,
-    pane: &str,
-    tool: clank_core::Tool,
-    hint: &str,
-) -> anyhow::Result<()> {
-    Ok(interrupt_and_submit_async(session, pane, tool, hint).await?)
+    target: Target<'_>,
+    hint: &Admitted,
+) -> Result<(), Unconfirmed> {
+    interrupt_and_submit_reserving(target, hint, Reserve::Defer).await
 }
 
 /// The order, separated from the terminal so it can be asserted.
@@ -272,6 +658,9 @@ where
 pub(crate) enum Unconfirmed {
     /// Nothing was sent: there was no message.
     Empty,
+    /// Nothing was sent: the admission rule could not establish that the
+    /// pane takes ordinary text, or its lock could not be taken.
+    Refused(String),
     /// The interrupt's delivery was not confirmed. No message was
     /// submitted, but the turn may have been interrupted.
     Interrupt(anyhow::Error),
@@ -284,6 +673,7 @@ impl std::fmt::Display for Unconfirmed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Unconfirmed::Empty => write!(f, "an empty nudge must not interrupt the agent"),
+            Unconfirmed::Refused(why) => write!(f, "refused: {why}"),
             Unconfirmed::Interrupt(e) => write!(
                 f,
                 "the interrupt key's delivery was not confirmed, so no message was submitted; \
@@ -301,53 +691,69 @@ impl std::fmt::Display for Unconfirmed {
 
 impl std::error::Error for Unconfirmed {}
 
-/// Type `text` into `pane` and submit it the way `tool` expects.
+/// Type `text` into `pane` and submit it the way `tool` expects, with no
+/// interrupt, from synchronous code off the executor.
 ///
-/// PANE ONLY: nothing here reads a stored session binding, which is
-/// what lets `clank nudge` use it when the binding is the suspect
-/// thing. The web bridge wraps this with the app-server attempt it is
-/// willing to trust; the submit-sequence knowledge lives here once.
+/// PANE ONLY: nothing here reads a stored session binding. The web bridge
+/// wraps this with the app-server attempt it is willing to trust; the
+/// submit-sequence knowledge lives here once. Codex's terminal fallback
+/// waits past its paste-burst window, then sends a kitty-protocol Enter.
 pub(crate) fn say_to_pane_for_tool(
     session: &str,
     pane: &str,
-    tool: clank_core::vocab::Tool,
-    text: &str,
+    tool: Tool,
+    text: &Admitted,
 ) -> anyhow::Result<()> {
-    if tool == clank_core::vocab::Tool::Codex {
-        say_to_codex_pane(session, pane, text)
-    } else {
-        say_to_pane(session, pane, text)
-    }
+    run_sync(async {
+        let _lock = lock_pane(session, pane)?;
+        say_on(&Zellij { session, pane }, pane, tool, text).await
+    })
 }
 
-/// Say `text` to `pane` in `session` and press Enter.
-pub(crate) fn say_to_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
-    say_to_pane_with_delay(session, pane, text, false)
-}
-
-/// Codex can treat Enter immediately after injected text as a pasted
-/// newline. Its terminal fallback waits past the paste-burst window,
-/// then sends a kitty-protocol Enter press. A held Stop hook may still
-/// queue the prompt; `codex_chat` handles that when available.
-pub(crate) fn say_to_codex_pane(session: &str, pane: &str, text: &str) -> anyhow::Result<()> {
-    say_to_pane_with_delay(session, pane, text, true)
-}
-
-fn say_to_pane_with_delay(
-    session: &str,
+async fn say_on(
+    term: &impl Terminal,
     pane: &str,
-    text: &str,
-    delay: bool,
+    tool: Tool,
+    text: &Admitted,
 ) -> anyhow::Result<()> {
-    let Some(argvs) = say_argvs(pane, text) else {
+    let Some(argvs) = say_argvs(pane, text.as_str()) else {
         return Ok(());
     };
+    admit_write(term, EXIT_KEY_EVIDENCE, tool, Opening::TextFirst, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
     for (i, mut argv) in argvs.into_iter().enumerate() {
-        if i == 1 && delay {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        if i == 1 && tool == Tool::Codex {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             argv = codex_submit_argv(pane);
         }
-        super::open_zellij::write_pane_action(session, pane, &argv)?;
+        term.write(argv).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
+/// Type a verified user command into the pane: `!` and the line as one
+/// `write-chars`, which Claude's empty input consumes as the switch to bash
+/// mode, then Enter as byte 13.
+///
+/// The caller holds the pane's lock and has read the input as empty under
+/// it; this checks nothing itself. `NotStarted` only when the first write
+/// never ran.
+pub(crate) async fn type_user_command(
+    term: &impl Terminal,
+    pane: &str,
+    command: &super::user_command::envelope::Command,
+) -> Result<(), PaneWrite> {
+    let line = format!("!{}", command.line());
+    let Some(argvs) = say_argvs(pane, &line) else {
+        return Err(PaneWrite::NotStarted("there was nothing to type".into()));
+    };
+    for (index, argv) in argvs.into_iter().enumerate() {
+        match term.write(argv).await {
+            Ok(()) => {}
+            Err(PaneWrite::NotStarted(e)) if index == 0 => return Err(PaneWrite::NotStarted(e)),
+            Err(e) => return Err(PaneWrite::Unknown(e.to_string())),
+        }
     }
     Ok(())
 }
@@ -355,7 +761,79 @@ fn say_to_pane_with_delay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::composer::fixtures::{claude, codex};
     use std::cell::RefCell;
+
+    /// A pane that answers dumps with `screen` and writes with `answer`,
+    /// recording every write in order.
+    struct Fake<A: Fn(usize) -> Result<(), PaneWrite>> {
+        screen: Option<String>,
+        answer: A,
+        written: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl<A: Fn(usize) -> Result<(), PaneWrite>> Terminal for Fake<A> {
+        async fn dump(&self) -> Option<String> {
+            self.screen.clone()
+        }
+        async fn write(&self, argv: Vec<String>) -> Result<(), PaneWrite> {
+            let n = self.written.borrow().len();
+            self.written.borrow_mut().push(argv);
+            (self.answer)(n)
+        }
+    }
+
+    fn fake(screen: Option<String>) -> Fake<impl Fn(usize) -> Result<(), PaneWrite>> {
+        Fake {
+            screen,
+            answer: |_| Ok(()),
+            written: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The screen each tool shows with an empty, ordinary input. Grok and
+    /// OpenCode have no readable input, so theirs is never consulted.
+    fn idle(tool: Tool) -> Option<String> {
+        match tool {
+            Tool::Claude => Some(claude(&["❯ "])),
+            Tool::Codex => Some(codex(&["› "])),
+            Tool::Grok | Tool::OpenCode => None,
+        }
+    }
+
+    fn target(tool: Tool, version: Option<&str>) -> Target<'_> {
+        Target {
+            session: "s",
+            pane: "7",
+            tool,
+            version,
+        }
+    }
+
+    const ROWS: &[ExitKeyEvidence] = &[
+        ExitKeyEvidence {
+            tool: Tool::Grok,
+            version: "1.0.62",
+            how: "test row",
+        },
+        ExitKeyEvidence {
+            tool: Tool::OpenCode,
+            version: "1.18.30",
+            how: "test row",
+        },
+    ];
+
+    fn version_of(tool: Tool) -> Option<&'static str> {
+        match tool {
+            Tool::Grok => Some("1.0.62"),
+            Tool::OpenCode => Some("1.18.30"),
+            _ => None,
+        }
+    }
+
+    fn admitted(tool: Tool, raw: &str) -> Admitted {
+        Admitted::new(tool, None, raw)
+    }
 
     /// Interrupt, then submit — once each, in that order.
     ///
@@ -460,13 +938,10 @@ mod tests {
     ///
     /// The interrupt key is FIRST and is the provider's own (Ctrl+C for
     /// Grok, Esc for the rest); the message and its submit follow, Codex's
-    /// paste-safe Enter included. There is no shared pause between the
-    /// interrupt and the message: nothing establishes how long a provider
-    /// needs, so the busy case is best-effort and the doc says so rather
-    /// than a timer pretending otherwise.
+    /// paste-safe Enter included. Grok and OpenCode get there only with an
+    /// exit-key row for their version.
     #[tokio::test(start_paused = true)]
     async fn every_provider_is_interrupted_with_its_own_key_before_the_message() {
-        use clank_core::Tool;
         let key = |argv: &Vec<String>| argv[4..].join(" ");
         for (tool, interrupt, submit) in [
             (Tool::Claude, "27", "13"),
@@ -474,14 +949,16 @@ mod tests {
             (Tool::OpenCode, "27", "13"),
             (Tool::Codex, "27", "27 91 49 51 59 49 58 49 117"),
         ] {
-            let written = RefCell::new(Vec::<Vec<String>>::new());
-            interrupt_and_submit_with("7", tool, "hello", |argv| {
-                written.borrow_mut().push(argv);
-                async { Ok(()) }
-            })
+            let term = fake(idle(tool));
+            interrupt_and_submit_on(
+                &term,
+                ROWS,
+                target(tool, version_of(tool)),
+                &admitted(tool, "hello"),
+            )
             .await
             .unwrap();
-            let written = written.into_inner();
+            let written = term.written.into_inner();
             assert_eq!(written.len(), 3, "{tool:?}: {written:?}");
             assert_eq!(key(&written[0]), interrupt, "{tool:?} is interrupted first");
             assert_eq!(written[1][1], "write-chars", "{tool:?}: then the message");
@@ -500,14 +977,24 @@ mod tests {
     /// the way that matters — it invites a resend.
     #[tokio::test]
     async fn a_failed_interrupt_write_is_an_interrupt_failure_and_types_nothing() {
-        let written = RefCell::new(0);
-        let error = interrupt_and_submit_with("7", clank_core::Tool::Grok, "hello", |_| {
-            *written.borrow_mut() += 1;
-            async { anyhow::bail!("terminal input transport timed out; acceptance is unknown") }
-        })
+        let term = Fake {
+            screen: None,
+            answer: |_| {
+                Err(PaneWrite::Unknown(
+                    "terminal input transport timed out; acceptance is unknown".into(),
+                ))
+            },
+            written: RefCell::new(Vec::new()),
+        };
+        let error = interrupt_and_submit_on(
+            &term,
+            ROWS,
+            target(Tool::Grok, version_of(Tool::Grok)),
+            &admitted(Tool::Grok, "hello"),
+        )
         .await
         .unwrap_err();
-        assert_eq!(*written.borrow(), 1, "only the interrupt was attempted");
+        assert_eq!(term.written.borrow().len(), 1, "only the interrupt");
         let said = format!("{error:#}");
         assert!(
             said.contains("interrupt key's delivery was not confirmed"),
@@ -520,16 +1007,12 @@ mod tests {
     /// queues on, and no interrupt key: Codex's Tab, never its Enter.
     #[tokio::test(start_paused = true)]
     async fn a_submit_only_send_writes_no_interrupt() {
-        use clank_core::Tool;
         for (tool, submit) in [(Tool::Claude, "13"), (Tool::Codex, "9")] {
-            let written = RefCell::new(Vec::<Vec<String>>::new());
-            submit_with("7", tool, "hello", |argv| {
-                written.borrow_mut().push(argv);
-                async { Ok(()) }
-            })
-            .await
-            .unwrap();
-            let written = written.into_inner();
+            let term = fake(idle(tool));
+            submit_on(&term, target(tool, None), &admitted(tool, "hello"))
+                .await
+                .unwrap();
+            let written = term.written.into_inner();
             assert_eq!(written.len(), 2, "{tool:?}: {written:?}");
             assert_eq!(written[0][1], "write-chars", "{tool:?}");
             assert_eq!(written[1][4..].join(" "), submit, "{tool:?}");
@@ -540,26 +1023,34 @@ mod tests {
     /// anything was written may have typed it.
     #[tokio::test(start_paused = true)]
     async fn a_failed_submit_says_whether_anything_was_written() {
-        use super::super::open_zellij::PaneWrite;
-        let first = submit_with("7", clank_core::Tool::Claude, "hello", |_| async {
-            Err(PaneWrite::NotStarted("no zellij".into()))
-        })
+        let first = Fake {
+            screen: idle(Tool::Claude),
+            answer: |_| Err(PaneWrite::NotStarted("no zellij".into())),
+            written: RefCell::new(Vec::new()),
+        };
+        let tried = submit_on(
+            &first,
+            target(Tool::Claude, None),
+            &admitted(Tool::Claude, "hi"),
+        )
         .await;
-        assert!(matches!(first, Err(PaneWrite::NotStarted(_))));
-        let calls = RefCell::new(0);
-        let second = submit_with("7", clank_core::Tool::Claude, "hello", |_| {
-            *calls.borrow_mut() += 1;
-            let n = *calls.borrow();
-            async move {
-                match n {
-                    1 => Ok(()),
-                    _ => Err(PaneWrite::NotStarted("gone".into())),
-                }
-            }
-        })
+        assert!(matches!(tried, Err(PaneWrite::NotStarted(_))));
+        let second = Fake {
+            screen: idle(Tool::Claude),
+            answer: |n| match n {
+                0 => Ok(()),
+                _ => Err(PaneWrite::NotStarted("gone".into())),
+            },
+            written: RefCell::new(Vec::new()),
+        };
+        let tried = submit_on(
+            &second,
+            target(Tool::Claude, None),
+            &admitted(Tool::Claude, "hi"),
+        )
         .await;
         assert!(
-            matches!(second, Err(PaneWrite::Unknown(_))),
+            matches!(tried, Err(PaneWrite::Unknown(_))),
             "the text was typed"
         );
     }
@@ -575,5 +1066,380 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// The structural bytes: CR and CRLF become LF and LF stays; Tab becomes
+    /// a space; ESC, other C0, DEL and C1 become U+FFFD.
+    #[test]
+    fn structural_bytes_are_neutralised_and_lines_kept() {
+        let said = admitted(
+            Tool::Claude,
+            "a\r\nb\rc\nd\te\u{1b}[13;1:1uf\u{7}\u{7f}\u{85}g",
+        );
+        assert_eq!(
+            said.as_str(),
+            "a\nb\nc\nd e\u{fffd}[13;1:1uf\u{fffd}\u{fffd}\u{fffd}g"
+        );
+        assert!(!said.as_str().contains('\r'));
+    }
+
+    /// A leading `!`, after any leading whitespace, gets `·` before it for
+    /// every tool without a space row; a `!` anywhere else, or after an LF
+    /// inside the message, is left as text. A neutralised control byte
+    /// before a `!` is not whitespace, so nothing is added there.
+    #[test]
+    fn a_leading_bang_is_encoded_for_every_tool() {
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
+            assert_eq!(admitted(tool, "!git push").as_str(), "\u{b7}!git push");
+            assert_eq!(admitted(tool, "  \n\t!rm").as_str(), "  \n \u{b7}!rm");
+            assert_eq!(admitted(tool, "\r!x").as_str(), "\n\u{b7}!x", "{tool:?}");
+            assert_eq!(admitted(tool, "say !this").as_str(), "say !this");
+            assert_eq!(admitted(tool, "line\n!two").as_str(), "line\n!two");
+            assert_eq!(admitted(tool, "\u{1b}!x").as_str(), "\u{fffd}!x");
+        }
+    }
+
+    /// The space encoding is used only for the tool and exact version a
+    /// committed row names; the shipped table names none.
+    #[test]
+    fn the_space_encoding_needs_its_row() {
+        const ROW: &[BangEvidence] = &[BangEvidence {
+            tool: Tool::Claude,
+            version: "2.1.308",
+            how: "test row",
+        }];
+        let by = |tool, version| Admitted::by(ROW, tool, version, "  \t!git push").0;
+        assert_eq!(by(Tool::Claude, Some("2.1.308")), " !git push");
+        assert_eq!(by(Tool::Claude, Some("2.1.309")), "   \u{b7}!git push");
+        assert_eq!(by(Tool::Claude, None), "   \u{b7}!git push");
+        assert_eq!(by(Tool::Codex, Some("2.1.308")), "   \u{b7}!git push");
+        assert!(SPACE_BEFORE_BANG.is_empty());
+        assert_eq!(
+            Admitted::new(Tool::Claude, Some("2.1.308"), "!x").as_str(),
+            "\u{b7}!x"
+        );
+    }
+
+    /// Every ordinary sequence types the ADMITTED text: a raw `!` line and
+    /// a CR handed in arrive encoded, LF kept.
+    #[tokio::test(start_paused = true)]
+    async fn every_ordinary_sequence_types_the_admitted_text() {
+        let raw = "!git push\rnext\nline";
+        let expect = "\u{b7}!git push\nnext\nline";
+        let interrupt = fake(idle(Tool::Claude));
+        interrupt_and_submit_on(
+            &interrupt,
+            ROWS,
+            target(Tool::Claude, None),
+            &admitted(Tool::Claude, raw),
+        )
+        .await
+        .unwrap();
+        assert_eq!(interrupt.written.borrow()[1].last().unwrap(), expect);
+        let submit = fake(idle(Tool::Codex));
+        submit_on(
+            &submit,
+            target(Tool::Codex, None),
+            &admitted(Tool::Codex, raw),
+        )
+        .await
+        .unwrap();
+        assert_eq!(submit.written.borrow()[0].last().unwrap(), expect);
+        let say = fake(idle(Tool::Claude));
+        say_on(&say, "7", Tool::Claude, &admitted(Tool::Claude, raw))
+            .await
+            .unwrap();
+        assert_eq!(say.written.borrow()[0].last().unwrap(), expect);
+    }
+
+    /// Claude and Codex: every path class is refused, writing nothing, on a
+    /// shell composer, an unreadable dump, a dump that never came, and for
+    /// Codex a `!` draft. A draft on an ordinary prompt still takes text.
+    #[tokio::test(start_paused = true)]
+    async fn claude_and_codex_refuse_a_pane_not_read_as_ordinary() {
+        let refused = [
+            (Tool::Claude, Some(claude(&["! git push"]))),
+            (Tool::Claude, Some(claude(&["! "]))),
+            (Tool::Claude, Some("❯ old\n╭ Allow? ╮".to_string())),
+            (Tool::Claude, None),
+            (Tool::Codex, Some(codex(&["› !git"]))),
+            (Tool::Codex, Some("› \n never ends".to_string())),
+            (Tool::Codex, None),
+        ];
+        for (tool, screen) in refused {
+            let interrupt = fake(screen.clone());
+            let tried =
+                interrupt_and_submit_on(&interrupt, ROWS, target(tool, None), &admitted(tool, "x"))
+                    .await;
+            assert!(
+                matches!(tried, Err(Unconfirmed::Refused(_))),
+                "{tool:?} {screen:?}"
+            );
+            assert!(interrupt.written.borrow().is_empty());
+            let submit = fake(screen.clone());
+            let tried = submit_on(&submit, target(tool, None), &admitted(tool, "x")).await;
+            assert!(matches!(tried, Err(PaneWrite::NotStarted(_))), "{tool:?}");
+            assert!(submit.written.borrow().is_empty());
+            let say = fake(screen.clone());
+            assert!(say_on(&say, "7", tool, &admitted(tool, "x")).await.is_err());
+            assert!(say.written.borrow().is_empty());
+        }
+        for (tool, screen) in [
+            (Tool::Claude, claude(&["❯ half a thought"])),
+            (Tool::Codex, codex(&["› half a thought"])),
+        ] {
+            let submit = fake(Some(screen));
+            submit_on(&submit, target(tool, None), &admitted(tool, "x"))
+                .await
+                .unwrap();
+            assert_eq!(submit.written.borrow().len(), 2, "{tool:?}");
+        }
+    }
+
+    /// Grok and OpenCode: the interrupt-first path sends the exit key first
+    /// only behind a row for the exact version, and is refused without one;
+    /// the text-first paths are refused even with a row. Every refusal
+    /// writes nothing and never asks for a dump it could not read.
+    #[tokio::test(start_paused = true)]
+    async fn grok_and_opencode_need_a_proven_exit_key() {
+        for tool in [Tool::Grok, Tool::OpenCode] {
+            for version in [None, Some("0.0.1")] {
+                let term = fake(None);
+                let tried = interrupt_and_submit_on(
+                    &term,
+                    ROWS,
+                    target(tool, version),
+                    &admitted(tool, "x"),
+                )
+                .await;
+                assert!(matches!(tried, Err(Unconfirmed::Refused(_))), "{tool:?}");
+                assert!(term.written.borrow().is_empty());
+            }
+            let term = fake(None);
+            let tried = interrupt_and_submit_on(
+                &term,
+                EXIT_KEY_EVIDENCE,
+                target(tool, version_of(tool)),
+                &admitted(tool, "x"),
+            )
+            .await;
+            assert!(
+                matches!(tried, Err(Unconfirmed::Refused(_))),
+                "the shipped table proves no exit key: {tool:?}"
+            );
+            let term = fake(None);
+            let tried =
+                submit_on(&term, target(tool, version_of(tool)), &admitted(tool, "x")).await;
+            assert!(matches!(tried, Err(PaneWrite::NotStarted(_))));
+            let term = fake(None);
+            assert!(
+                say_on(&term, "7", tool, &admitted(tool, "x"))
+                    .await
+                    .is_err()
+            );
+            assert!(term.written.borrow().is_empty());
+        }
+        assert_eq!(
+            proof_for(ROWS, Tool::Grok, Opening::TextFirst, Some("1.0.62")).map_err(|_| ()),
+            Err(()),
+            "a text-first path never rests on an exit key"
+        );
+    }
+
+    /// The user-command writer types `!` and the line as one write, then
+    /// Enter as byte 13; a failure before anything ran is `NotStarted`,
+    /// one after the text is `Unknown`.
+    #[tokio::test]
+    async fn the_user_command_keystrokes() {
+        let command = crate::cli::user_command::envelope::Command::for_test("echo \"$HOME\"");
+        let term = fake(None);
+        type_user_command(&term, "7", &command).await.unwrap();
+        let written = term.written.into_inner();
+        assert_eq!(
+            written,
+            vec![
+                say_argvs("7", "!echo \"$HOME\"").unwrap()[0].clone(),
+                vec![
+                    "action".into(),
+                    "write".into(),
+                    "-p".into(),
+                    "7".into(),
+                    "13".into()
+                ],
+            ]
+        );
+        let never = Fake {
+            screen: None,
+            answer: |_| Err(PaneWrite::NotStarted("no zellij".into())),
+            written: RefCell::new(Vec::new()),
+        };
+        assert!(matches!(
+            type_user_command(&never, "7", &command).await,
+            Err(PaneWrite::NotStarted(_))
+        ));
+        let half = Fake {
+            screen: None,
+            answer: |n| match n {
+                0 => Ok(()),
+                _ => Err(PaneWrite::NotStarted("gone".into())),
+            },
+            written: RefCell::new(Vec::new()),
+        };
+        assert!(matches!(
+            type_user_command(&half, "7", &command).await,
+            Err(PaneWrite::Unknown(_))
+        ));
+    }
+
+    /// Two sequences on one pane, one ordinary and one a user command, each
+    /// under the pane's lock from different threads, never interleave; a
+    /// different pane's lock is a different lock.
+    #[test]
+    fn one_panes_writers_never_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        struct Logged(std::sync::Arc<std::sync::Mutex<Vec<String>>>, &'static str);
+        impl Terminal for Logged {
+            async fn dump(&self) -> Option<String> {
+                Some(claude(&["❯ "]))
+            }
+            async fn write(&self, argv: Vec<String>) -> Result<(), PaneWrite> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:{}", self.1, argv[1]));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(())
+            }
+        }
+        let held = lock_pane_in(dir.path(), "s", "7").unwrap();
+        let threads: Vec<_> = ["ordinary", "command"]
+            .into_iter()
+            .map(|who| {
+                let (dir, log) = (dir.path().to_path_buf(), log.clone());
+                std::thread::spawn(move || {
+                    let _lock = lock_pane_in(&dir, "s", "7").unwrap();
+                    let term = Logged(log, who);
+                    run_sync(async {
+                        if who == "ordinary" {
+                            submit_on(
+                                &term,
+                                target(Tool::Claude, None),
+                                &admitted(Tool::Claude, "x"),
+                            )
+                            .await
+                            .unwrap();
+                        } else {
+                            let c = crate::cli::user_command::envelope::Command::for_test("ls");
+                            type_user_command(&term, "7", &c).await.unwrap();
+                        }
+                    });
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(log.lock().unwrap().is_empty(), "both wait for the holder");
+        let other = lock_pane_in(dir.path(), "s", "8");
+        assert!(other.is_ok(), "another pane is not blocked");
+        drop(held);
+        for t in threads {
+            t.join().unwrap();
+        }
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert_eq!(
+            log[0].split(':').next(),
+            log[1].split(':').next(),
+            "{log:?}"
+        );
+        assert_eq!(
+            log[2].split(':').next(),
+            log[3].split(':').next(),
+            "{log:?}"
+        );
+        assert_ne!(
+            log[0].split(':').next(),
+            log[2].split(':').next(),
+            "{log:?}"
+        );
+    }
+
+    /// A deferring writer takes a free pane and gives way to a held one,
+    /// never waiting: the monitor's own writers must not block behind a user
+    /// command's reservation, nor type on an authorisation made before it.
+    #[test]
+    fn a_deferring_writer_gives_way_to_a_held_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_pane_in(dir.path(), "s", "7").unwrap();
+        assert!(
+            reserve_in(dir.path(), "s", "7", Reserve::Defer)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reserve_in(dir.path(), "s", "8", Reserve::Defer)
+                .unwrap()
+                .is_some()
+        );
+        drop(held);
+        assert!(
+            reserve_in(dir.path(), "s", "7", Reserve::Defer)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The monitor's own writers, recovery's typed sends and check-ins
+    /// (`submit_async`) and event wakes (`wake_for_events_async`), give way
+    /// to a pane another writer holds, typing nothing, rather than wait.
+    /// Driven through those entry points with the real runtime lock held on
+    /// a test-only pane, so they return before any terminal is reached.
+    #[test]
+    fn the_monitors_writers_defer_on_a_reserved_pane() {
+        let session = format!("clank-test-{}", std::process::id());
+        let pane = "reserved-pane";
+        let held = lock_pane(&session, pane).unwrap();
+        let (done, answers) = std::sync::mpsc::channel();
+        let (s, p) = (session.clone(), pane.to_string());
+        std::thread::spawn(move || {
+            run_sync(async {
+                let target = Target {
+                    session: &s,
+                    pane: &p,
+                    tool: Tool::Claude,
+                    version: None,
+                };
+                let text = Admitted::new(Tool::Claude, None, "x");
+                let submitted = submit_async(target, &text).await;
+                let woke = wake_for_events_async(target, &text).await;
+                let _ = done.send((submitted, woke));
+            })
+        });
+        let Ok((submitted, woke)) = answers.recv_timeout(std::time::Duration::from_secs(10)) else {
+            std::mem::forget(held);
+            panic!("a monitor writer waited on a reserved pane");
+        };
+        assert!(
+            matches!(&submitted, Err(PaneWrite::NotStarted(why)) if why == RESERVED),
+            "{submitted:?}"
+        );
+        assert!(
+            matches!(&woke, Err(Unconfirmed::Refused(why)) if why == RESERVED),
+            "{woke:?}"
+        );
+        drop(held);
+        let dir = super::super::monitor::runtime_dir(unsafe { libc::getuid() });
+        let _ = std::fs::remove_file(pane_lock_path(&dir, &session, pane));
+    }
+
+    /// Lock names are length-delimited: no two (session, pane) pairs alias.
+    #[test]
+    fn pane_lock_names_do_not_alias() {
+        let dir = std::path::Path::new("/nowhere");
+        assert_ne!(
+            pane_lock_path(dir, "ab", "c"),
+            pane_lock_path(dir, "a", "bc")
+        );
+        assert_eq!(pane_lock_path(dir, "s", "7"), pane_lock_path(dir, "s", "7"));
     }
 }

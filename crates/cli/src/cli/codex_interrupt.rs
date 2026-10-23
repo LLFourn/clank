@@ -12,7 +12,12 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 /// False permits terminal fallback only before any native mutation. After an
 /// interrupt/start may have been sent, errors forbid another transport attempt.
-pub(crate) async fn try_wake(repo: &Path, label: &AgentLabel, hint: &str) -> anyhow::Result<bool> {
+pub(crate) async fn try_wake(
+    repo: &Path,
+    label: &AgentLabel,
+    hint: &super::pane_input::Admitted,
+) -> anyhow::Result<bool> {
+    let hint = hint.as_str();
     let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
         return Ok(false);
     };
@@ -201,10 +206,11 @@ pub(crate) async fn start_if_failed(
     repo: &Path,
     label: &AgentLabel,
     failed_turn: &str,
-    wake: &str,
+    wake: &super::pane_input::Admitted,
     authorize: impl std::future::Future<Output = bool>,
 ) -> crate::cli::recovery::Answer {
     use crate::cli::recovery::Answer;
+    let wake = wake.as_str();
     let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
         return Answer::Unavailable;
     };
@@ -816,7 +822,8 @@ mod tests {
         // A refused target never connects, and the script would wait for
         // it forever.
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(try_wake(repo.path(), &label, HINT), script)
+            let hint = crate::cli::pane_input::Admitted::new(Tool::Codex, None, HINT);
+            tokio::join!(try_wake(repo.path(), &label, &hint), script)
         })
         .await
         .unwrap_or_else(|_| panic!("the wake never reached the socket (linked: {linked})"));

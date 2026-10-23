@@ -74,11 +74,21 @@ pub struct UserConfigFile {
     /// token (the-way-in-is-a-token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<crate::cli::web::door::RemoteSection>,
+    /// The story site's trusted public key for `clank user-command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_command: Option<UserCommandSection>,
     /// Forward-compat catchall. A leftover legacy `default_agents`
     /// key (from a pre-hard-cut config) lands here and is ignored
     /// — there is no migration that reads it.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// `clank user-command`'s trust: the site's Ed25519 public key, standard
+/// base64, written only by `clank user-command trust-key`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UserCommandSection {
+    pub site_key: String,
 }
 
 /// User-scope zellij preferences

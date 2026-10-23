@@ -374,6 +374,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
+| `user-command` | Deliver a person's site-signed command into the asking agent's terminal as `! <command>`: `trust-key` / `submit` / `status` (see below) |
 | `feedback` | `write` / `read` review feedback via a typed surface |
 | `queue` | `add` / `promote` / `remove` / `unqueue` (back to drafts) / `reprioritise` queued plans |
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |
@@ -427,6 +428,138 @@ Three levels, for three situations:
   interrupts the agent's pane and types the message into its terminal,
   reading no inbox and no binding. Nothing waits to be acknowledged, but
   each attempt and its outcome is kept in the agent's nudge history.
+
+### User commands
+
+Agents reach actions their permission checks deny but you are happy to do
+yourself: pushing a branch, opening a PR. The story site shows such a
+command with a Run button. Pressing it does not run anything in the site:
+clank types `!<command>` into the terminal of the agent that asked, Claude
+Code's bash mode runs it as your own input, and the output lands in that
+agent's conversation. Bash mode skips the agent's permission checks, so a
+`!` line reaches a prompt only because a person chose it.
+
+**Interface.** The site holds an Ed25519 private key; clank holds only the
+public key and verifies, never signs.
+
+- `clank user-command trust-key [--replace]` reads the public key (standard
+  base64 of the 32 raw bytes) from stdin, stores it as
+  `user_command.site_key` in `~/.clank/config.json`, and prints its blake3
+  fingerprint. Replacing a different key needs `--replace`.
+- `clank user-command submit` reads one JSON envelope from stdin, never
+  argv: `{"request": <base64 of the payload bytes>, "sig": <base64
+  signature>}`. The signature is over the bytes `clank user-command v1\n`
+  followed by exactly the payload bytes, and is verified before anything is
+  parsed from them. The payload is
+  `{v: 1, repo, agent, session, tool, id, command, issued_at, expires_at}`:
+  `repo` the repo's canonical path, `agent` a roster label, `session` and
+  `tool` the agent's current binding (`tool` must be `claude`), `id` 1 to
+  64 of `[A-Za-z0-9_-]`, `command` one non-empty line with no control
+  characters, and the times unix seconds at most 600 apart (30 s of clock
+  skew either side). Every field is signed.
+- `clank user-command status --repo <r> --agent <a> --id <id>`.
+
+Both `submit` and `status` print `{id, state, reason, admitted_at,
+updated_at, key}` (`key` is the fingerprint it was admitted under), never
+the envelope, the signature or the command. A refused `submit` prints
+`{"state": "refused", "reason": …}` and exits 1, and files nothing.
+
+**States.** `admitted` → `waiting-for-idle` (with a reason) → `dispatching`
+→ `delivered` | `unconfirmed` | `refused` | `failed-not-started`. The last
+four are terminal and are never rewritten, whatever later happens to the
+key or the clock. `delivered` means the terminal accepted the `!` line and
+Enter, not that the command succeeded. `unconfirmed` means something may
+have been typed; it is never retried. Every terminal outcome is added to
+the agent's nudge history.
+
+**At most once.** The same id with byte-identical payload returns the
+existing state (and has the monitor look again at a waiting one); the same
+id with any other payload is refused and changes nothing. `dispatching` is
+synced to disk before the first byte is written, under the request's lock;
+a reader that later finds it with the lock free records `unconfirmed`.
+
+**Where it is typed.** Only the repo's monitor dispatches, on its existing
+wakes (turn-ends, record reads, the store's own files changing, a waiting
+request's expiry), never by polling a pane. Before any use it verifies the
+stored envelope again under the current key and window, and checks it
+names the repo, agent and id it is filed under. It types only when the
+agent's latest turn completed, no question, block or presentation is
+pending, no hook is held, the session binding still matches, the pane's
+launch is the one first found, and one dump reads Claude's input as an
+empty prompt. An agent parked in its Stop hook is released first (the turn
+ends instead of parking) and looked at again a moment later. Each attempt
+holds the request lock, then the pane's write lock, reads the input, and
+only then asks the monitor whether the agent is still idle, takes the
+label's `binding.lock` and verifies the envelope, key, clock, binding and
+launch again before it records `dispatching` and types. The monitor's own
+pane writers give way to a reserved pane rather than wait. A person typing between that dump and the write can mix with
+the command; the outcome is then `delivered` or `unconfirmed`, never
+retried.
+
+**Tools.** Claude Code only. Codex has a shell mode but no verified
+rendering of it, and Grok and OpenCode have shell modes but no readable
+input line; all three are refused with that reason.
+
+**What it does not protect.** The site and every agent run as the same
+Unix user, so this is not an OS boundary. An agent cannot forge a request,
+and a captured envelope authorises exactly one command, to one target,
+under one id, once. Any of these defeats it:
+
+- reading the site's private key file;
+- writing `~/.clank/config.json`, or running `trust-key --replace` with a
+  key of its own;
+- modifying or deleting the ledger under `~/.clank/user-commands/`, which
+  defeats replay prevention: a genuine envelope whose entry is gone or reset
+  can be dispatched again until it expires.
+
+Add deny rules for these to every agent (Claude Code's `permissions.deny`
+in `~/.claude/settings.json`, adjusting the key's path to the site's):
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.config/clankstack/site-key*)",
+      "Edit(~/.config/clankstack/site-key*)",
+      "Edit(~/.clank/config.json)",
+      "Write(~/.clank/config.json)",
+      "Edit(~/.clank/user-commands/**)",
+      "Write(~/.clank/user-commands/**)",
+      "Bash(clank user-command trust-key:*)",
+      "Bash(rm ~/.clank/user-commands:*)"
+    ]
+  }
+}
+```
+
+Deny rules match tool calls, so they cover `Read`/`Edit`/`Write` of those
+paths and the obvious Bash spellings, not every Bash path to the same
+bytes.
+
+**Ordinary text cannot reach a shell mode.** Every other pane write (nudge,
+`send --interrupt`, recovery, check-ins, the web chat) goes through one
+admission rule: CR becomes LF, Tab a space, other control characters
+U+FFFD, and a leading `!` gets `·` before it. It then types only when one
+dump reads the input as an ordinary prompt (Claude, Codex), or when it
+opens with a key committed evidence shows leaves the tool's shell mode
+(Grok's Ctrl+C, OpenCode's Esc, on the interrupt-first paths). Otherwise
+it is refused and an event wake stays pending. Codex's app-server and
+OpenCode's plugin take the same admitted text.
+
+**Evidence a human records.** These are gated on rows observed in throwaway
+panes against the installed harnesses, and stay refused until a row is
+committed in `crates/cli/src/cli/pane_input.rs`:
+
+- `USER_COMMAND_EVIDENCE`: Claude Code at an exact version runs a typed
+  `!<line>` plus Enter as one bash command (quotes, `$`, a line at the
+  chosen `max_command`), what its bash mode looks like in a `zellij action
+  dump-screen --ansi` dump, and whether a bash-mode command fires a Stop
+  hook. Without a row every request is refused at dispatch.
+- `SPACE_BEFORE_BANG`: Claude Code at a version keeps ` !x` (one leading
+  space) and a `!` after an LF as prompt text. Without a row, `·` is used.
+- `EXIT_KEY_EVIDENCE`: Grok's Ctrl+C clears a bare `!`, and OpenCode's Esc
+  leaves shell mode (and whether it also interrupts). Without a row, `clank
+  nudge` and the event-wake fallback refuse those tools' panes.
 
 ### Background work: run and attend
 

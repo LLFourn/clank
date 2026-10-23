@@ -118,6 +118,9 @@ pub struct Facts<'a> {
     /// Whether the agent's resume route could carry a check-in now, or
     /// why not. A silence with no way to check in is an unwakeable one.
     pub check_in_route: Result<(), String>,
+    /// A person's signed command, verified just now, waits for this agent
+    /// to sit idle and only a park stands in its way.
+    pub user_command: bool,
 }
 
 /// What an attendance names before it is resolved to a task.
@@ -450,6 +453,9 @@ pub enum SilentWhy {
     AutoOff,
     /// A native handoff's wait already carries the agent's next wake.
     WaitArmed,
+    /// A person's command waits for an idle prompt, so the turn ends
+    /// instead of parking.
+    UserCommand,
 }
 
 /// What the hook is told to do with one Stop.
@@ -830,7 +836,10 @@ impl SessionState {
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        self.deliver_or_park(facts, Some(&report.place), notice)
+        release_for_user_command(
+            self.deliver_or_park(facts, Some(&report.place), notice),
+            facts,
+        )
     }
 
     fn parked(&mut self, report: TurnEndReport, facts: &Facts<'_>) -> Verdict {
@@ -843,7 +852,10 @@ impl SessionState {
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        self.deliver_or_park(facts, Some(&report.place), None)
+        release_for_user_command(
+            self.deliver_or_park(facts, Some(&report.place), None),
+            facts,
+        )
     }
 
     fn session_start(&mut self, session: SessionId, facts: &Facts<'_>) -> Verdict {
@@ -1164,6 +1176,16 @@ fn drive_gate(facts: &Facts<'_>) -> Option<Verdict> {
         .as_ref()
         .err()
         .map(|e| Verdict::Failed(e.clone()))
+}
+
+/// A Stop that would park ends instead while a person's command waits:
+/// the command needs an idle prompt, and a held hook is not one. Work to
+/// deliver still wins, since the command waits for that turn's end too.
+fn release_for_user_command(verdict: Verdict, facts: &Facts<'_>) -> Verdict {
+    match verdict {
+        Verdict::Park if facts.user_command => Verdict::Silent(SilentWhy::UserCommand),
+        other => other,
+    }
 }
 
 fn grok_verdict() -> Verdict {

@@ -1270,3 +1270,23 @@ fn an_attending_delivery_renders_only_unreceived_work_across_a_restart() {
         "{text}"
     );
 }
+
+/// The monitor's set of agents a user command waits on reaches the model:
+/// a parked Claude report stepped again ends silently with the reason, and
+/// clearing the set parks it again.
+#[test]
+fn a_parked_report_ends_while_a_user_command_waits_for_its_agent() {
+    let repo = repo_with("claude", Tool::Claude, "session-uc");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[], Ok(()));
+    let report = stop(Tool::Claude, "session-uc", TaskSnapshot::Unavailable, None);
+    let first = turns.answer(&author, 1, &report, true, &g).unwrap();
+    assert_eq!(first.verdict, WireVerdict::Park);
+    turns.set_user_commands([author.clone()].into_iter().collect());
+    let released = turns.answer(&author, 1, &report, false, &g).unwrap();
+    assert_eq!(released.verdict, silent(SilentReason::UserCommand));
+    turns.set_user_commands(Default::default());
+    let parked = turns.answer(&author, 1, &report, false, &g).unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park);
+}

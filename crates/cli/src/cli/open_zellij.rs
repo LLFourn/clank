@@ -1948,24 +1948,6 @@ pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<Subscri
 // Terminal transport and provider key knowledge live in one module.
 #[cfg(test)]
 use super::pane_input::{codex_submit_argv, say_argvs, stop_argv};
-pub(crate) use super::pane_input::{stop_pane, submit_async};
-
-/// Execute one typed terminal-input action. Provider policy belongs to pane_input;
-/// this remains the sole module that starts Zellij subprocesses.
-pub(crate) fn write_pane_action(session: &str, pane: &str, argv: &[String]) -> anyhow::Result<()> {
-    let out = std::process::Command::new("zellij")
-        .args(["--session", session])
-        .args(argv)
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "zellij refused `{}` for {pane}: {}",
-            argv.get(1).map(String::as_str).unwrap_or("?"),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
 
 /// `pane`'s screen in `session`, its colours kept, or `None` when zellij
 /// does not answer within its budget.
@@ -1987,18 +1969,6 @@ pub(crate) async fn dump_pane_screen(session: &str, pane: &str) -> Option<String
     out.status.success().then_some(out.stdout)
 }
 
-/// Event-loop-safe input with bounded I/O. A timeout is an uncertain mutation,
-/// not evidence that the server ignored the bytes: callers must not resend it.
-pub(crate) async fn write_pane_action_async(
-    session: &str,
-    pane: &str,
-    argv: &[String],
-) -> anyhow::Result<()> {
-    write_pane_action_classified(session, pane, argv)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
 /// Why a terminal write did not complete, as what it may have done.
 #[derive(Debug)]
 pub(crate) enum PaneWrite {
@@ -2016,7 +1986,10 @@ impl std::fmt::Display for PaneWrite {
     }
 }
 
-/// [`write_pane_action_async`], saying whether a failure wrote nothing.
+/// Execute one typed terminal-input action, bounded. Provider policy and the
+/// admission rule belong to pane_input, its one caller; a timeout is an
+/// uncertain mutation, not evidence that the server ignored the bytes, so
+/// callers must not resend it. Says whether a failure wrote nothing.
 pub(crate) async fn write_pane_action_classified(
     session: &str,
     pane: &str,

@@ -13,9 +13,24 @@ pub(crate) enum Composer {
     Empty,
     /// Something a person typed.
     Draft,
+    /// The input is in the harness's shell mode, where ordinary text runs
+    /// as a command: Claude's bounded input line opens with `!` in place
+    /// of its prompt, Codex's typed text opens with `!`.
+    Shell,
     /// The input could not be found, bounded or read.
     Unreadable,
 }
+
+impl Composer {
+    /// Whether ordinary text typed now is positively known to land as a
+    /// prompt rather than a shell command.
+    pub(crate) fn takes_ordinary_text(self) -> bool {
+        matches!(self, Composer::Empty | Composer::Draft)
+    }
+}
+
+/// What opens an input in shell mode.
+const SHELL: char = '!';
 
 /// The glyph each harness draws at the start of its input.
 fn prompt(tool: Tool) -> Option<char> {
@@ -69,14 +84,22 @@ pub(crate) fn composer(tool: Tool, screen: &str) -> Composer {
         return Composer::Unreadable;
     };
     let text = |l: &[Cell]| l.iter().map(|c| c.c).collect::<String>();
-    let Some(start) = lines
-        .iter()
-        .rposition(|l| text(l).trim_start().starts_with(glyph))
-    else {
+    // Claude draws `!` where its prompt glyph was while in bash mode, so a
+    // line opening with either may be the input.
+    let opens = |l: &[Cell]| {
+        let t = text(l);
+        let t = t.trim_start();
+        t.starts_with(glyph) || (tool == Tool::Claude && t.starts_with(SHELL))
+    };
+    let Some(start) = lines.iter().rposition(|l| opens(l)) else {
         return Composer::Unreadable;
     };
     let first = &lines[start];
-    let at = first.iter().position(|c| c.c == glyph).expect("found");
+    let at = first
+        .iter()
+        .position(|c| c.c == glyph || c.c == SHELL)
+        .expect("found");
+    let shell = first[at].c == SHELL;
     let rule = |l: &[Cell]| text(l).trim().starts_with("───");
     let band = first[at].bg.clone();
     let on_band = |l: &[Cell]| !l.is_empty() && band.is_some() && l.iter().all(|c| c.bg == band);
@@ -98,6 +121,9 @@ pub(crate) fn composer(tool: Tool, screen: &str) -> Composer {
     let Some(spans) = spans.filter(|_| above) else {
         return Composer::Unreadable;
     };
+    if shell {
+        return Composer::Shell;
+    }
     let rest = &lines[start + 1..start + 1 + spans];
     let typed: Vec<&Cell> = first[at + 1..]
         .iter()
@@ -108,6 +134,11 @@ pub(crate) fn composer(tool: Tool, screen: &str) -> Composer {
         return Composer::Empty;
     }
     if typed.iter().any(|c| !c.dim) {
+        // Codex runs a line opening with `!` as a local shell command, so
+        // text appended to such a draft would run with it.
+        if tool == Tool::Codex && typed.first().is_some_and(|c| c.c == SHELL) {
+            return Composer::Shell;
+        }
         return Composer::Draft;
     }
     let continued = rest.iter().any(|l| !text(l).trim().is_empty());
@@ -178,28 +209,27 @@ fn cells(line: &str) -> Option<Vec<Cell>> {
     Some(out)
 }
 
+/// Screens drawn the way each harness draws its input, for tests here and
+/// at the write boundary.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const DIM: &str = "\u{1b}[2m";
-    const RESET: &str = "\u{1b}[0m";
-    const RULE: &str = "────────────────────────────────";
+pub(crate) mod fixtures {
+    pub(crate) const DIM: &str = "\u{1b}[2m";
+    pub(crate) const RESET: &str = "\u{1b}[0m";
+    pub(crate) const RULE: &str = "────────────────────────────────";
+    pub(crate) const BAND: &str = "\u{1b}[48;2;65;69;76m";
 
     /// Claude's input between its two rules, under some history that
     /// echoes earlier prompts with the same glyph.
-    fn claude(input: &[&str]) -> String {
+    pub(crate) fn claude(input: &[&str]) -> String {
         format!(
             "❯ an old prompt\n● done\n\n{RULE}\n{}\n{RULE}\n  {DIM}? for shortcuts{RESET}",
             input.join("\n")
         )
     }
 
-    const BAND: &str = "\u{1b}[48;2;65;69;76m";
-
     /// Codex's input on its band, a blank band row above and below it,
     /// under some history, and its footer off the band.
-    fn codex(input: &[&str]) -> String {
+    pub(crate) fn codex(input: &[&str]) -> String {
         let banded = |l: &str| format!("{BAND}{l}{BAND}   \u{1b}[49m");
         let rows: Vec<String> = std::iter::once("")
             .chain(input.iter().copied())
@@ -211,6 +241,12 @@ mod tests {
             rows.join("\n")
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
 
     #[test]
     fn an_empty_input_or_a_known_placeholder_is_empty() {
@@ -377,6 +413,50 @@ mod tests {
         assert_eq!(composer(Tool::Codex, history_only), Composer::Unreadable);
         let cut = format!("{BAND}   \n{BAND}› \n{BAND}  more");
         assert_eq!(composer(Tool::Codex, &cut), Composer::Unreadable);
+    }
+
+    /// Claude's bash mode: the bounded input line opens with `!` where its
+    /// prompt was, with or without a command typed after it. Synthetic,
+    /// from the 2.1.308 renderer's description (`!` in place of the `❯`
+    /// pointer, between its rules); the evidence row a human records from
+    /// a live `--ansi` dump replaces it.
+    #[test]
+    fn claudes_bash_mode_is_shell() {
+        assert_eq!(composer(Tool::Claude, &claude(&["! "])), Composer::Shell);
+        assert_eq!(
+            composer(Tool::Claude, &claude(&["! git push"])),
+            Composer::Shell
+        );
+        assert_eq!(
+            composer(Tool::Claude, &claude(&["  ! ", "  more"])),
+            Composer::Shell
+        );
+        assert_eq!(
+            composer(Tool::Claude, &claude(&["❯ a ! in the middle"])),
+            Composer::Draft,
+            "only the line's opening marks the mode"
+        );
+        let unbounded = format!("{RULE}\n! git push\n  still going");
+        assert_eq!(composer(Tool::Claude, &unbounded), Composer::Unreadable);
+        assert!(!Composer::Shell.takes_ordinary_text());
+        assert!(!Composer::Unreadable.takes_ordinary_text());
+        assert!(Composer::Empty.takes_ordinary_text());
+        assert!(Composer::Draft.takes_ordinary_text());
+    }
+
+    /// A Codex draft opening with `!` is its shell command, so it reads as
+    /// shell; a `!` later in a draft does not.
+    #[test]
+    fn a_codex_bang_draft_is_shell() {
+        assert_eq!(composer(Tool::Codex, &codex(&["› !git"])), Composer::Shell);
+        assert_eq!(
+            composer(Tool::Codex, &codex(&["›   !git push"])),
+            Composer::Shell
+        );
+        assert_eq!(
+            composer(Tool::Codex, &codex(&["› hello !"])),
+            Composer::Draft
+        );
     }
 
     /// An input that cannot be placed or bounded is left alone: covered by

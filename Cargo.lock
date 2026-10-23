@@ -363,6 +363,7 @@ dependencies = [
  "qrcode",
  "quote",
  "reqwest",
+ "ring",
  "rquickjs",
  "serde",
  "serde_json",

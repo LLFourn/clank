@@ -36,7 +36,7 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
     ),
     ("Review", &["feedback", "block"]),
     ("The team", &["agent", "team", "open", "fork"]),
-    ("Talking", &["send", "nudge", "events"]),
+    ("Talking", &["send", "nudge", "user-command", "events"]),
     ("Remote", &["remote"]),
     ("Settings", &["config", "export"]),
 ];
@@ -253,6 +253,14 @@ pub enum Command {
     /// waiting to be acknowledged; each attempt and its outcome is
     /// added to the agent's nudge history.
     Nudge(crate::cli::NudgeArgs),
+    /// Type a person's signed command into an agent's pane
+    ///
+    /// For the story site's Run button: the site signs one command for one
+    /// agent's session, `submit` admits it, and the repo's monitor types
+    /// `!<command>` into that agent's idle, empty Claude Code prompt at most
+    /// once. `trust-key` installs the site's public key; `status` reports a
+    /// request's state.
+    UserCommand(crate::cli::user_command::UserCommandArgs),
     /// Watch a repo once, for every waiter
     ///
     /// One process per repo watches it and hands every waiting agent
@@ -376,7 +384,7 @@ pub enum Command {
     /// remote switch. One per repo. The `--tui` flag it grew out of still opens it,
     /// and says so.
     Tui(crate::cli::TuiArgs),
-    /// Run a command under clank, so it knows exactly when the work ends
+    /// Run a command under clank, so it knows when the work ends
     ///
     /// Background this instead of the bare command:
     /// `clank run --desc "test run" -- cargo test`. Clank records what
@@ -465,6 +473,7 @@ pub async fn dispatch_with(
         Command::Events(args) => crate::cli::events::run(args).await,
         Command::Send(args) => crate::cli::send::run(args).await,
         Command::Nudge(args) => crate::cli::nudge::run(args).await,
+        Command::UserCommand(args) => crate::cli::user_command::run(args).await,
         Command::Monitor(args) => crate::cli::monitor::run(args).await,
         Command::Remote(args) => crate::cli::remote_control::run(args).await,
         Command::As(args) => crate::cli::as_cmd::run(args).await,

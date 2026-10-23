@@ -194,3 +194,63 @@ fn stop_hook_has_no_zellij_or_pane_dependency() {
         );
     }
 }
+
+/// The ONLY files that may name the raw terminal transports: the spawner
+/// that implements them, and the write boundary that holds the pane lock,
+/// applies the admission rule and owns the user-command writer.
+const TRANSPORT_OWNERS: &[&str] = &[SPAWNER, "cli/pane_input.rs"];
+
+/// Whether a line names a raw terminal transport.
+fn transport_violation(line: &str) -> Option<String> {
+    let code = line.split("//").next().unwrap_or("");
+    code.contains("write_pane_action")
+        .then(|| "raw terminal transport `write_pane_action*`".to_string())
+}
+
+/// Every pane write crosses `pane_input`: a caller that reached the raw
+/// transport directly would skip the pane lock, the admission rule that
+/// keeps ordinary text out of a harness's shell mode, and the shell-mode
+/// reading.
+#[test]
+fn only_the_write_boundary_names_the_raw_transports() {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(crates_dir())
+        .expect("read crates/")
+        .flatten()
+    {
+        for sub in ["src", "tests"] {
+            let dir = entry.path().join(sub);
+            if dir.is_dir() {
+                rs_files(&dir, &mut files);
+            }
+        }
+    }
+    let mut owners_named = 0;
+    let mut violations = Vec::new();
+    for f in &files {
+        let unix = f.to_string_lossy().replace('\\', "/");
+        let body = std::fs::read_to_string(f).unwrap_or_default();
+        if TRANSPORT_OWNERS.iter().any(|o| unix.ends_with(o)) {
+            owners_named += usize::from(body.lines().any(|l| transport_violation(l).is_some()));
+            continue;
+        }
+        if is_gate(&unix) {
+            continue;
+        }
+        for (i, line) in body.lines().enumerate() {
+            if let Some(what) = transport_violation(line) {
+                violations.push(format!("{}:{} — {what}", f.display(), i + 1));
+            }
+        }
+    }
+    assert_eq!(owners_named, 2, "both owners still name the transport");
+    assert!(
+        violations.is_empty(),
+        "raw terminal transport named outside open_zellij.rs and pane_input.rs:\n  {}",
+        violations.join("\n  ")
+    );
+    assert!(
+        transport_violation("    open_zellij::write_pane_action_classified(s, p, &a)").is_some()
+    );
+    assert!(transport_violation("    // not write_pane_action here").is_none());
+}

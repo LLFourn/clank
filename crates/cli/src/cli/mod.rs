@@ -88,6 +88,7 @@ pub(crate) mod turn_child;
 pub(crate) mod turn_custody;
 pub(crate) mod turn_wire;
 pub mod unfinish;
+pub mod user_command;
 pub mod wait;
 mod wake_receipt;
 pub(crate) mod wake_render;

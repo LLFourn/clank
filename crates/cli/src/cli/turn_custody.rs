@@ -210,6 +210,7 @@ fn facts<'a>(
         owed,
         liveness: live,
         check_in_route: g.route.clone(),
+        user_command: false,
     }
 }
 
@@ -279,6 +280,8 @@ struct Custody {
 pub(crate) struct Turns {
     repo: PathBuf,
     agents: BTreeMap<AgentLabel, Custody>,
+    /// The agents whose park a verified user command is waiting on.
+    user_commands: std::collections::BTreeSet<AgentLabel>,
 }
 
 fn store_path(agent_dir: &Path) -> PathBuf {
@@ -290,6 +293,7 @@ impl Turns {
         Turns {
             repo,
             agents: BTreeMap::new(),
+            user_commands: Default::default(),
         }
     }
 
@@ -386,11 +390,31 @@ impl Turns {
         tool: Option<Tool>,
         event: Event,
     ) -> Option<Output> {
+        let releasing = self.user_commands.contains(author);
         let custody = self.custody(author, g)?;
         let owed = g.owed_now(Some(&custody.state));
-        let out = custody.state.step(event, &facts(g, tool, &owed, &Process));
+        let out = custody.state.step(
+            event,
+            &Facts {
+                user_command: releasing,
+                ..facts(g, tool, &owed, &Process)
+            },
+        );
         self.persist(author);
         Some(out)
+    }
+
+    /// The agents whose next Stop, or parked report, ends rather than parks
+    /// because a verified user command waits for them. Replaces the last set.
+    pub(crate) fn set_user_commands(&mut self, waiting: std::collections::BTreeSet<AgentLabel>) {
+        self.user_commands = waiting;
+    }
+
+    /// Whether `author`'s custody holds a presentation in flight.
+    pub(crate) fn presenting(&self, author: &AgentLabel) -> bool {
+        self.agents
+            .get(author)
+            .is_some_and(|c| c.state.outstanding.is_some())
     }
 
     /// Apply what a Stop proves about the agent's questions, before its
@@ -776,6 +800,7 @@ pub(crate) fn frame_of(verdict: Verdict) -> Frame {
                 SilentWhy::StaleBinding => SilentReason::StaleBinding,
                 SilentWhy::AutoOff => SilentReason::AutoOff,
                 SilentWhy::WaitArmed => SilentReason::WaitArmed,
+                SilentWhy::UserCommand => SilentReason::UserCommand,
             },
         }),
         Verdict::Park => Frame::bare(WireVerdict::Park),

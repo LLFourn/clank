@@ -14,17 +14,6 @@ use super::open_zellij::{self, SessionPane, SessionScan};
 /// One explicit batch lookup; healthy servers respond well below this deadline.
 const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Shared nudge/event discovery. No hook, binding, inbox or role lookup, and no
-/// idle worker. The recorded running provider, including overrides, supplies keys.
-pub(crate) async fn discover(repo: PathBuf, label: AgentLabel) -> anyhow::Result<(Found, Tool)> {
-    let scan = open_zellij::panes_in_all_sessions_async(SCAN_DEADLINE).await;
-    super::event_interrupt::blocking(move || {
-        let found = locate(&scan, &repo, &label)?;
-        let tool = resolve(&repo, &label, &found.session, &found.pane)?;
-        Ok((found, tool))
-    })
-}
-
 /// The one pane a nudge may type into.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Found {
@@ -277,7 +266,10 @@ pub(crate) struct Process {
     pub(crate) harness: Result<String, String>,
 }
 
-/// [`discover`], with the provider process its launch record names.
+/// Shared nudge/event/user-command discovery: the one pane `label` runs in
+/// and the provider process its launch record names. No hook, binding, inbox
+/// or role lookup, and no idle worker. The recorded running provider,
+/// including overrides, supplies keys.
 pub(crate) async fn discover_process(
     repo: PathBuf,
     label: AgentLabel,
@@ -290,13 +282,15 @@ pub(crate) async fn discover_process(
     })
 }
 
-pub(crate) fn resolve(
+/// The tool and provider process `pane`'s launch record names, verified
+/// against the live process now: no scan, no guess.
+pub(crate) fn verify_launch(
     repo: &Path,
     label: &AgentLabel,
     session: &str,
     pane: &str,
-) -> anyhow::Result<Tool> {
-    resolve_process(repo, label, session, pane).map(|(tool, _)| tool)
+) -> anyhow::Result<(Tool, Process)> {
+    resolve_process(repo, label, session, pane)
 }
 
 fn resolve_process(

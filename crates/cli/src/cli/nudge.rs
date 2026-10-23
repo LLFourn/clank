@@ -59,10 +59,19 @@ async fn attempt(
     body: &str,
 ) -> Result<String, Failed> {
     open_zellij::require_zellij().map_err(Failed::Refused)?;
-    let (found, tool) = super::pane_target::discover(repo.to_path_buf(), to.clone())
-        .await
-        .map_err(Failed::Refused)?;
-    crate::cli::pane_input::interrupt_and_submit_async(&found.session, &found.pane, tool, body)
+    let (found, tool, process) =
+        super::pane_target::discover_process(repo.to_path_buf(), to.clone())
+            .await
+            .map_err(Failed::Refused)?;
+    let version = process.harness.as_deref().ok();
+    let target = crate::cli::pane_input::Target {
+        session: &found.session,
+        pane: &found.pane,
+        tool,
+        version,
+    };
+    let body = crate::cli::pane_input::Admitted::new(tool, version, body);
+    crate::cli::pane_input::interrupt_and_submit_async(target, &body)
         .await
         .map_err(Failed::Unconfirmed)?;
     Ok(format!("session {}, pane {}", found.session, found.pane))
@@ -77,6 +86,9 @@ fn outcome<T>(tried: &Result<T, Failed>) -> Outcome {
         },
         Err(Failed::Unconfirmed(Unconfirmed::Empty)) => Outcome::Refused {
             reason: "the message is empty".into(),
+        },
+        Err(Failed::Unconfirmed(Unconfirmed::Refused(why))) => Outcome::Refused {
+            reason: why.clone(),
         },
         Err(Failed::Unconfirmed(Unconfirmed::Interrupt(_))) => Outcome::Indeterminate {
             reason: "the interrupt was not confirmed".into(),

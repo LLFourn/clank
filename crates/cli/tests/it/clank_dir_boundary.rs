@@ -105,6 +105,13 @@ const HOME_SITES: &[(&str, &str, &str)] = &[
          read to tell its own old output from a user's edit",
     ),
     (
+        "cli/src/cli/user_command/store.rs",
+        "home",
+        "`~/.clank/user-commands/` — the user-command queue and attempt \
+         ledger, per USER and outside every repo so agents have no reason to \
+         edit it, and durable across reboots so replay state survives",
+    ),
+    (
         "cli/src/cli/setup.rs",
         "domain",
         "`<domain>/.clank/setup-install.lock` — setup's installation domain is \

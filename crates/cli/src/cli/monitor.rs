@@ -41,7 +41,10 @@ use clank_core::wait::WaitItem;
 // on delivery; a 16 monitor sends neither and still teaches `block clean`.
 // 18 parks an attending agent's turn-end instead of silencing it; a 17
 // monitor would leave it deaf to new work until its attendance ends.
-pub(crate) const PROTO: u32 = 18;
+// 19 ends a parked Stop with the `user_command` silent reason when a signed
+// command waits, which an 18 hook cannot decode; an 18 monitor never
+// releases a park for one.
+pub(crate) const PROTO: u32 = 19;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -2986,6 +2989,19 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let (check_in_asks, mut check_in_authorizations) =
         tokio::sync::mpsc::unbounded_channel::<CheckInAsk>();
     let (check_in_done, mut checked_in) = tokio::sync::mpsc::unbounded_channel::<CheckedIn>();
+    let user_home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let (mut user_commands, uc_wakes) = crate::cli::user_command::live::UserCommands::new(
+        &repo,
+        user_home.clone(),
+        crate::cli::user_command::store::Store::in_home(&user_home),
+    );
+    let crate::cli::user_command::live::Wakes {
+        changed: mut uc_changed,
+        asks: mut uc_asks,
+        done: mut uc_done,
+    } = uc_wakes;
     let ended = loop {
         if tenure.retiring() {
             tenure
@@ -3034,6 +3050,10 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 let wait = at.saturating_sub(crate::cli::turn_custody::now_ms());
                 tokio::time::Instant::now() + Duration::from_millis(wait)
             });
+        let uc_due = user_commands.next_due().map(|at| {
+            let wait = at.saturating_sub(crate::cli::recovery::unix_now());
+            tokio::time::Instant::now() + Duration::from_secs(wait)
+        });
         // Receive, then look at the lease, then act: whatever woke the
         // loop, nothing it leads to runs as owner on a lease not
         // verified since.
@@ -3056,6 +3076,13 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 Wake::Records(events)
             }
             _ = crate::cli::timer_source::deadline(timer_deadline) => Wake::TimersDue,
+            Some(()) = uc_changed.recv() => {
+                while uc_changed.try_recv().is_ok() {}
+                Wake::UserCommands
+            }
+            Some(ask) = uc_asks.recv() => Wake::UserCommandAsk(ask),
+            Some(done) = uc_done.recv() => Wake::UserCommandDone(done),
+            _ = crate::cli::timer_source::deadline(uc_due) => Wake::UserCommandsDue,
             accepted = listener.accept() => Wake::Accepted(accepted?.0),
             Some(greeted) = arrivals.recv() => Wake::Arrived(greeted),
             Some((author, emission)) = from_sources.recv() => Wake::Emitted(author, emission),
@@ -3077,8 +3104,43 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             beat = beats.recv() => Wake::Beat(beat.is_some()),
         };
         let owner = tenure.may_act(&republish);
+        // Which wakes are state changes a waiting user command is looked at
+        // again on; its own store's changes are not, since a monitor writing
+        // a record wakes itself.
+        let uc_round = match &wake {
+            Wake::Heard(..) | Wake::Arrived(..) | Wake::Records(..) | Wake::UserCommandsDue => {
+                Some(true)
+            }
+            Wake::UserCommands => Some(false),
+            _ => None,
+        };
         match wake {
             Wake::LeaseChanged | Wake::Collected => {}
+            Wake::UserCommands | Wake::UserCommandsDue => {}
+            Wake::UserCommandDone(done) => user_commands.finished(done),
+            Wake::UserCommandAsk(ask) => {
+                let answer = if owner {
+                    let settling = user_commands.settling(crate::cli::recovery::unix_now());
+                    match user_command_look(
+                        &repo,
+                        &clients,
+                        &turns,
+                        &mut recovery,
+                        &settling,
+                        &ask.label,
+                        &ask.session,
+                    ) {
+                        crate::cli::user_command::dispatch::Look::Go => Ok(()),
+                        crate::cli::user_command::dispatch::Look::Parked => {
+                            Err("its turn is parked".to_string())
+                        }
+                        crate::cli::user_command::dispatch::Look::Wait(why) => Err(why),
+                    }
+                } else {
+                    Err("this monitor no longer holds the repo's lease".to_string())
+                };
+                let _ = ask.reply.send(answer);
+            }
             Wake::RecoveryDue => {
                 if owner {
                     let routes = recovery.check_in_routes();
@@ -3765,6 +3827,30 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 }
             }
         }
+        if let Some(changed) = uc_round
+            && owner
+        {
+            if changed {
+                user_commands.state_changed();
+            }
+            let routes = recovery.check_in_routes();
+            leaving.extend(user_command_round(
+                &repo,
+                &mut user_commands,
+                &mut clients,
+                folded_state.as_ref(),
+                &pending,
+                &mut timer_backlogs,
+                &hosted,
+                &mut turns,
+                &mut recovery,
+                &routes,
+                &recovery_answers,
+                &asks,
+                &records,
+                &mut owned,
+            ));
+        }
     };
     let _ = std::fs::remove_file(observation_path(&repo, pid));
     ended
@@ -3795,6 +3881,143 @@ enum Wake {
     Collected,
     /// Whether the watcher is still there.
     Beat(bool),
+    /// A user-command record changed on disk.
+    UserCommands,
+    /// A waiting user command expires, or a released park has settled.
+    UserCommandsDue,
+    /// A user-command attempt asks for the loop's last look.
+    UserCommandAsk(crate::cli::user_command::live::Ask),
+    UserCommandDone(crate::cli::user_command::live::Done),
+}
+
+/// One evaluation of the repo's user commands against the loop's view of
+/// its agents: release the parks that alone stand in a verified request's
+/// way, have recovery read the records of agents a request waits on, and
+/// spawn the attempts the pass hands out.
+#[allow(clippy::too_many_arguments)]
+fn user_command_round(
+    repo: &std::path::Path,
+    user_commands: &mut crate::cli::user_command::live::UserCommands,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &[(AgentLabel, WaitItem)],
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+    routes: &Routes,
+    answers: &tokio::sync::mpsc::UnboundedSender<RecoveryAnswer>,
+    asks: &tokio::sync::mpsc::UnboundedSender<Authorize>,
+    records: &crate::cli::recovery::RecordWatch,
+    owned: &mut OwnedTasks,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    let settling = user_commands.settling(crate::cli::recovery::unix_now());
+    let mut spawned = Vec::new();
+    let out = {
+        let mut agents = LoopAgents {
+            repo,
+            clients,
+            turns,
+            recovery,
+            settling: &settling,
+        };
+        user_commands.pass(&mut agents, &mut spawned)
+    };
+    owned.departing.extend(spawned);
+    let acts = recovery.want_records(&out.watch);
+    act_on_recovery(repo, clients, acts, answers, asks, records, owned);
+    turns.set_user_commands(out.release.clone());
+    let mut leaving = Vec::new();
+    for author in &out.release {
+        leaving.extend(serve_reports(
+            repo,
+            clients,
+            state,
+            Some(author),
+            pending,
+            timer_backlogs,
+            hosted,
+            turns,
+            routes,
+        ));
+    }
+    leaving
+}
+
+/// The loop's agents, as a user-command pass sees them.
+struct LoopAgents<'a> {
+    repo: &'a std::path::Path,
+    clients: &'a [Client],
+    turns: &'a crate::cli::turn_custody::Turns,
+    recovery: &'a mut crate::cli::recovery::Driver,
+    settling: &'a std::collections::BTreeSet<AgentLabel>,
+}
+
+impl crate::cli::user_command::dispatch::Agents for LoopAgents<'_> {
+    fn binding(&self, label: &AgentLabel) -> Option<(clank_core::Tool, clank_core::SessionId)> {
+        crate::agent_store::load_agent_config(self.repo, label)
+            .ok()
+            .flatten()
+            .and_then(|c| c.session)
+            .map(|s| (s.tool, s.id))
+    }
+
+    fn look(
+        &mut self,
+        label: &AgentLabel,
+        session: &clank_core::SessionId,
+    ) -> crate::cli::user_command::dispatch::Look {
+        user_command_look(
+            self.repo,
+            self.clients,
+            self.turns,
+            self.recovery,
+            self.settling,
+            label,
+            session,
+        )
+    }
+}
+
+/// Whether `author` sits idle for a user command now: no question, block or
+/// presentation pending, no hook of `session` held here, no released park
+/// still settling, and its record's latest turn completed.
+fn user_command_look(
+    repo: &std::path::Path,
+    clients: &[Client],
+    turns: &crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+    settling: &std::collections::BTreeSet<AgentLabel>,
+    author: &AgentLabel,
+    session: &clank_core::SessionId,
+) -> crate::cli::user_command::dispatch::Look {
+    use crate::cli::user_command::dispatch::Look;
+    let dir = crate::agent_store::agents_root(repo).join(author.as_str());
+    if crate::cli::question_state::asking(&dir, session.as_str()).is_some() {
+        return Look::Wait("a question to the user is pending".into());
+    }
+    if crate::cli::wait::blocked(repo, author) {
+        return Look::Wait("a block is pending".into());
+    }
+    if turns.presenting(author) {
+        return Look::Wait("a wake is being presented to it".into());
+    }
+    let held = clients.iter().any(|c| {
+        matches!(&c.who, Served::Agent { author: a } if a == author)
+            && c.report
+                .as_ref()
+                .is_some_and(|r| r.report.session() == session)
+    });
+    if held {
+        return Look::Parked;
+    }
+    if settling.contains(author) {
+        return Look::Wait("its released turn is ending".into());
+    }
+    match recovery.turn_completed(author, session.as_str()) {
+        Ok(()) => Look::Go,
+        Err(why) => Look::Wait(why),
+    }
 }
 
 /// What the monitor knows about each bound roster agent, for recovery.
@@ -4284,7 +4507,14 @@ impl Typist for Panes {
         text: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
         Box::pin(async move {
-            crate::cli::open_zellij::submit_async(&found.session, &found.pane, tool, &text)
+            let target = crate::cli::pane_input::Target {
+                session: &found.session,
+                pane: &found.pane,
+                tool,
+                version: None,
+            };
+            let text = crate::cli::pane_input::Admitted::new(tool, None, &text);
+            crate::cli::pane_input::submit_async(target, &text)
                 .await
                 .map_err(|e| match e {
                     crate::cli::open_zellij::PaneWrite::NotStarted(why) => {
@@ -4470,7 +4700,13 @@ fn act_on_recovery(
                         &Note::Recover {
                             opened_by: attempt.opened_by.clone(),
                             n: attempt.n,
-                            wake: text,
+                            wake: crate::cli::pane_input::Admitted::new(
+                                clank_core::Tool::OpenCode,
+                                None,
+                                &text,
+                            )
+                            .as_str()
+                            .to_string(),
                             tag,
                         },
                     )
@@ -4497,6 +4733,7 @@ fn act_on_recovery(
                     .await
                     {
                         Ok((found, tool, process)) => {
+                            let version = process.harness.clone().ok();
                             let screen = crate::cli::open_zellij::dump_pane_screen(
                                 &found.session,
                                 &found.pane,
@@ -4514,11 +4751,18 @@ fn act_on_recovery(
                             .await;
                             match go {
                                 false => Answer::Unavailable,
-                                true => match crate::cli::open_zellij::submit_async(
-                                    &found.session,
-                                    &found.pane,
-                                    tool,
-                                    &text,
+                                true => match crate::cli::pane_input::submit_async(
+                                    crate::cli::pane_input::Target {
+                                        session: &found.session,
+                                        pane: &found.pane,
+                                        tool,
+                                        version: version.as_deref(),
+                                    },
+                                    &crate::cli::pane_input::Admitted::new(
+                                        tool,
+                                        version.as_deref(),
+                                        &text,
+                                    ),
                                 )
                                 .await
                                 {
@@ -4558,6 +4802,8 @@ fn act_on_recovery(
                         None,
                         Transport::CodexStart,
                     );
+                    let text =
+                        crate::cli::pane_input::Admitted::new(clank_core::Tool::Codex, None, &text);
                     let answer = crate::cli::codex_interrupt::start_if_failed(
                         &repo, &author, &target, &text, go,
                     )
@@ -9128,6 +9374,48 @@ mod tests {
         // this must not disturb.
         assert!(matches!(
             greeting_of(&hello(PROTO), repo.path()),
+            Greeting::Client(_)
+        ));
+    }
+
+    /// The `user_command` silent reason is protocol 19: a protocol 18 hook,
+    /// whose closed reason enum cannot decode it, is not admitted to a
+    /// verdict carrying it, and a 19 client meeting an 18 monitor replaces
+    /// it rather than relying on a release that monitor never makes.
+    #[test]
+    fn the_user_command_verdict_is_negotiated_as_protocol_19() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Proto18Reason {
+            AutoOff,
+            StaleBinding,
+            OwnerGone,
+            WaitArmed,
+        }
+        let wire = serde_json::to_string(&clank_core::SilentReason::UserCommand).unwrap();
+        assert!(serde_json::from_str::<Proto18Reason>(&wire).is_err());
+        assert_eq!(PROTO, 19);
+
+        let repo = repo_with_roster();
+        let hello = |proto: u32| {
+            serde_json::to_string(&Hello {
+                proto,
+                repo: repo.path().to_string_lossy().to_string(),
+                who: agent("codex"),
+            })
+            .unwrap()
+        };
+        assert!(
+            matches!(greeting_of(&hello(18), repo.path()), Greeting::Decline(_)),
+            "an 18 hook is not admitted"
+        );
+        assert!(
+            !admits(PROTO, 18),
+            "a 19 client does not share an 18 monitor"
+        );
+        assert!(matches!(
+            greeting_of(&hello(19), repo.path()),
             Greeting::Client(_)
         ));
     }
@@ -16054,5 +16342,242 @@ mod superseding_tests {
         let owed: Note =
             serde_json::from_str(second_queue.recv().await.unwrap().trim_end()).unwrap();
         assert!(matches!(owed, Note::Items { .. }), "{owed:?}");
+    }
+}
+
+#[cfg(test)]
+mod user_command_tests {
+    use super::*;
+    use crate::cli::user_command::envelope::testkey::{Signer, payload};
+    use crate::cli::user_command::store::{PaneSeen, State, Store};
+
+    const ROSTER: &str = r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#;
+
+    fn claude() -> AgentLabel {
+        AgentLabel::parse("claude").unwrap()
+    }
+
+    fn sid() -> clank_core::SessionId {
+        clank_core::SessionId::parse("session-one").unwrap()
+    }
+
+    /// An agent client holding a Stop of `session`, and the queue its
+    /// verdicts land in.
+    fn holding(session: &str) -> (Client, tokio::sync::mpsc::Receiver<String>) {
+        let (out, queued) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+        let client = Client {
+            who: Served::Agent { author: claude() },
+            holder: None,
+            out,
+            writer: None,
+            shown: Default::default(),
+            conn: 7,
+            report: Some(Reporting {
+                report: crate::cli::turn_wire::Report::TurnEnd {
+                    stop: clank_core::turn_policy::TurnEndReport {
+                        tool: clank_core::Tool::Claude,
+                        session: clank_core::SessionId::parse(session).unwrap(),
+                        place: Default::default(),
+                        tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+                    },
+                    deadline: u64::MAX,
+                    questions: Vec::new(),
+                },
+                stepped: false,
+                reader: None,
+            }),
+            farewell: None,
+        };
+        (client, queued)
+    }
+
+    struct World {
+        repo: std::path::PathBuf,
+        home: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        site: Signer,
+    }
+
+    fn world() -> World {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(repo.join(".clank")).unwrap();
+        std::fs::write(repo.join(".clank/config.json"), ROSTER).unwrap();
+        crate::agent_store::bind_session_to_agent(
+            &repo,
+            &claude(),
+            clank_core::Tool::Claude,
+            &sid(),
+        )
+        .unwrap();
+        crate::agent_store::set_auto_mode(&repo, &claude(), clank_core::AutoMode::On).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let site = Signer::generate();
+        crate::cli::user_command::trust_key(home.path(), &site.key().encoded(), false).unwrap();
+        World {
+            repo,
+            home,
+            _dir: dir,
+            site,
+        }
+    }
+
+    impl World {
+        fn store(&self) -> Store {
+            Store::at(self.home.path().join(".clank/user-commands"))
+        }
+
+        /// File a request signed by `signer` now, its pane already seen, so
+        /// no pass goes looking for one.
+        fn file(&self, signer: &Signer) {
+            let now = crate::cli::recovery::unix_now();
+            let mut p = payload(&self.repo);
+            p["session"] = "session-one".into();
+            p["issued_at"] = now.into();
+            p["expires_at"] = (now + 300).into();
+            let tag = repo_tag(&self.repo);
+            let id = crate::cli::user_command::envelope::Id::parse("r1").unwrap();
+            let held = self.store().lock(&tag, &claude(), &id).unwrap();
+            let mut record = crate::cli::user_command::store::Record::admitted(
+                signer.sign(&p),
+                self.site.key().fingerprint(),
+                now,
+            );
+            record.pane = Some(PaneSeen {
+                session: "zs".into(),
+                pane: "terminal_1".into(),
+                pid: 1,
+                birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 0 },
+            });
+            held.save(&record).unwrap();
+        }
+    }
+
+    /// Through the loop's own round: a parked Stop stays parked with no
+    /// request and with a forged one, and a verified request ends it with
+    /// the user-command verdict; the agent is then left settling, and the
+    /// round spawns no attempt while it does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verified_request_ends_a_park_and_a_forged_one_does_not() {
+        let w = world();
+        let state = crate::repo_state::RepoState::empty(w.repo.clone());
+        let (mut uc, _wakes) = crate::cli::user_command::live::UserCommands::new(
+            &w.repo,
+            w.home.path().to_path_buf(),
+            w.store(),
+        );
+        let (client, mut queue) = holding("session-one");
+        let mut clients = vec![client];
+        let mut turns = crate::cli::turn_custody::Turns::new(w.repo.clone());
+        let mut recovery =
+            crate::cli::recovery::Driver::new(w.repo.clone(), w.home.path().to_path_buf());
+        let routes = recovery.check_in_routes();
+        let (answers, _a) = tokio::sync::mpsc::unbounded_channel();
+        let (asks, _b) = tokio::sync::mpsc::unbounded_channel();
+        let (changes, _c) = tokio::sync::mpsc::unbounded_channel();
+        let records = crate::cli::recovery::RecordWatch::spawn(changes);
+        let mut owned = OwnedTasks::default();
+        let mut round = |clients: &mut Vec<Client>,
+                         uc: &mut crate::cli::user_command::live::UserCommands,
+                         turns: &mut crate::cli::turn_custody::Turns,
+                         owned: &mut OwnedTasks| {
+            user_command_round(
+                &w.repo,
+                uc,
+                clients,
+                Some(&state),
+                &[],
+                &mut Default::default(),
+                &Default::default(),
+                turns,
+                &mut recovery,
+                &routes,
+                &answers,
+                &asks,
+                &records,
+                owned,
+            )
+        };
+        let _ = serve_reports(
+            &w.repo,
+            &mut clients,
+            Some(&state),
+            None,
+            &[],
+            &mut Default::default(),
+            &Default::default(),
+            &mut turns,
+            &routes,
+        );
+        assert!(queue.try_recv().unwrap().contains("park"), "parked first");
+        round(&mut clients, &mut uc, &mut turns, &mut owned);
+        assert_eq!(clients.len(), 1, "no request, still parked");
+
+        w.file(&Signer::generate());
+        round(&mut clients, &mut uc, &mut turns, &mut owned);
+        assert_eq!(clients.len(), 1, "a forged request releases nothing");
+        let tag = repo_tag(&w.repo);
+        let id = crate::cli::user_command::envelope::Id::parse("r1").unwrap();
+        assert_eq!(
+            w.store().read(&tag, &claude(), &id).unwrap().unwrap().state,
+            State::Refused
+        );
+
+        std::fs::remove_file(w.store().repo_dir(&tag).join("claude/r1.json")).unwrap();
+        w.file(&w.site);
+        round(&mut clients, &mut uc, &mut turns, &mut owned);
+        assert!(clients.is_empty(), "the park was answered and retired");
+        let verdict = queue.try_recv().unwrap();
+        assert!(verdict.contains("user_command"), "{verdict}");
+        assert!(
+            uc.settling(crate::cli::recovery::unix_now())
+                .contains(&claude()),
+            "the released agent settles before it is looked at as idle"
+        );
+        round(&mut clients, &mut uc, &mut turns, &mut owned);
+        assert!(owned.departing.is_empty(), "no attempt while it settles");
+        let record = w.store().read(&tag, &claude(), &id).unwrap().unwrap();
+        assert_eq!(record.state, State::WaitingForIdle);
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("its released turn is ending")
+        );
+    }
+
+    /// The loop's look: a Stop of the bound session held here is a park; one
+    /// of another session is not; a settling release and an agent recovery
+    /// does not follow yet both wait.
+    #[test]
+    fn the_loops_look_at_an_agent() {
+        use crate::cli::user_command::dispatch::Look;
+        let w = world();
+        let turns = crate::cli::turn_custody::Turns::new(w.repo.clone());
+        let mut recovery =
+            crate::cli::recovery::Driver::new(w.repo.clone(), w.home.path().to_path_buf());
+        let none = Default::default();
+        let look = |clients: &[Client], recovery: &mut _, settling| {
+            user_command_look(
+                &w.repo,
+                clients,
+                &turns,
+                recovery,
+                settling,
+                &claude(),
+                &sid(),
+            )
+        };
+        let (mine, _q) = holding("session-one");
+        assert_eq!(look(&[mine], &mut recovery, &none), Look::Parked);
+        let (other, _q) = holding("session-two");
+        assert!(matches!(
+            look(&[other], &mut recovery, &none),
+            Look::Wait(_)
+        ));
+        let settling = [claude()].into_iter().collect();
+        assert_eq!(
+            look(&[], &mut recovery, &settling),
+            Look::Wait("its released turn is ending".into())
+        );
+        assert!(matches!(look(&[], &mut recovery, &none), Look::Wait(_)));
     }
 }

@@ -114,6 +114,42 @@ fn pane_tool(
     crate::agent_store::resolve_tool(repo, &label)
 }
 
+/// Say `text` to `pane` as the pane's own tool, resolved from the agent
+/// table as `stop` resolves it: through Codex's app-server when its bound
+/// thread takes it, else typed by `terminal`, which refuses any pane the
+/// admission rule cannot clear. The text is admitted for that tool first.
+fn say_with(
+    repo: &Path,
+    table: &[PaneMeta],
+    pane: &str,
+    text: &str,
+    native: impl FnOnce(&str, &crate::cli::pane_input::Admitted) -> anyhow::Result<bool>,
+    terminal: impl FnOnce(
+        clank_core::vocab::Tool,
+        &crate::cli::pane_input::Admitted,
+    ) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use clank_core::vocab::Tool;
+    let tool = pane_tool(repo, table, pane)?;
+    let admitted = crate::cli::pane_input::Admitted::new(tool, None, text);
+    if tool == Tool::Codex {
+        let label = table
+            .iter()
+            .find(|entry| entry.id == pane)
+            .and_then(|entry| clank_core::ids::AgentLabel::parse(&entry.label).ok());
+        if let Some(bound) = label
+            .and_then(|label| crate::agent_store::load_agent_config(repo, &label).ok())
+            .flatten()
+            .and_then(|cfg| cfg.session)
+            && bound.tool == Tool::Codex
+            && native(bound.id.as_str(), &admitted)?
+        {
+            return Ok(());
+        }
+    }
+    terminal(tool, &admitted)
+}
+
 impl Panes for Zellij {
     fn session(&self) -> &str {
         &self.session
@@ -137,39 +173,19 @@ impl Panes for Zellij {
         )
     }
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
-        if let Some(panes) = open_zellij::snapshot_panes_in(&self.session) {
-            let label = open_zellij::agent_pane_table(&panes, &self.repo)
-                .into_iter()
-                .find(|entry| entry.id == pane)
-                .and_then(|entry| clank_core::ids::AgentLabel::parse(&entry.label).ok());
-            if let Some(label) = label
-                && matches!(
-                    crate::agent_store::resolve_tool(&self.repo, &label),
-                    Ok(clank_core::vocab::Tool::Codex)
-                )
-            {
-                if let Some(bound) = crate::agent_store::load_agent_config(&self.repo, &label)
-                    .ok()
-                    .flatten()
-                    .and_then(|cfg| cfg.session)
-                    && bound.tool == clank_core::vocab::Tool::Codex
-                    && codex_chat::send(&bound.id.to_string(), text)?
-                {
-                    return Ok(());
-                }
-                return crate::cli::pane_input::say_to_pane_for_tool(
-                    &self.session,
-                    pane,
-                    clank_core::vocab::Tool::Codex,
-                    text,
-                );
-            }
-        }
-        crate::cli::pane_input::say_to_pane_for_tool(
-            &self.session,
+        let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {
+            anyhow::anyhow!("zellij did not answer for session `{}`", self.session)
+        })?;
+        let table = open_zellij::agent_pane_table(&panes, &self.repo);
+        say_with(
+            &self.repo,
+            &table,
             pane,
-            clank_core::vocab::Tool::Claude,
             text,
+            codex_chat::send,
+            |tool, text| {
+                crate::cli::pane_input::say_to_pane_for_tool(&self.session, pane, tool, text)
+            },
         )
     }
     fn stop(&self, pane: &str) -> anyhow::Result<()> {
@@ -1217,6 +1233,79 @@ fn library_candidates(home: Option<&Path>) -> anyhow::Result<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
+    /// The bridge's `say` types as the pane's OWN tool, resolved from the
+    /// agent table (it once typed every non-Codex pane as Claude), and hands
+    /// the terminal and Codex's native path the ADMITTED text: a leading `!`
+    /// encoded, a CR made an LF.
+    #[test]
+    fn say_uses_the_panes_own_tool_and_admitted_text() {
+        use clank_core::vocab::Tool;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"claude":{"tool":"claude","role":"master"},"grok":{"tool":"grok","role":"commit"},"codex":{"tool":"codex","role":"commit"}}}"#,
+        )
+        .unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &clank_core::ids::AgentLabel::parse("codex").unwrap(),
+            Tool::Codex,
+            &clank_core::SessionId::parse("thread-0001").unwrap(),
+        )
+        .unwrap();
+        let meta = |id: &str, label: &str| PaneMeta {
+            id: id.into(),
+            label: label.into(),
+            columns: 80,
+            rows: 24,
+            exited: false,
+        };
+        let table = [meta("1", "claude"), meta("2", "grok"), meta("3", "codex")];
+        for (pane, tool) in [("1", Tool::Claude), ("2", Tool::Grok)] {
+            let mut typed = None;
+            say_with(
+                repo.path(),
+                &table,
+                pane,
+                "!git push\rnow",
+                |_, _| panic!("only Codex has a native path"),
+                |tool, text| {
+                    typed = Some((tool, text.as_str().to_string()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(typed, Some((tool, "\u{b7}!git push\nnow".to_string())));
+        }
+        let mut native = None;
+        say_with(
+            repo.path(),
+            &table,
+            "3",
+            "!x",
+            |thread, text| {
+                native = Some((thread.to_string(), text.as_str().to_string()));
+                Ok(true)
+            },
+            |_, _| panic!("the app-server took it"),
+        )
+        .unwrap();
+        assert_eq!(native, Some(("thread-0001".into(), "\u{b7}!x".into())));
+        assert!(
+            say_with(
+                repo.path(),
+                &table,
+                "9",
+                "x",
+                |_, _| Ok(false),
+                |_, _| Ok(())
+            )
+            .is_err(),
+            "a pane that is not an agent here"
+        );
+    }
+
     mod supervisor {
         use super::super::*;
         use std::collections::{BTreeMap, VecDeque};

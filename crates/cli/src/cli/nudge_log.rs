@@ -26,6 +26,8 @@ pub(crate) enum Trigger {
     Idle { attempt: u32, of: u32 },
     /// `recovery.blind_nudge`: work owed and a record clank cannot read.
     Fallback { attempt: u32 },
+    /// A person's signed command (`clank user-command`), by its request id.
+    UserCommand { id: String },
 }
 
 /// What the attempt's transport could tell. Only `Submitted` means the
@@ -72,6 +74,7 @@ impl Record {
             }
             Trigger::Idle { attempt, of } => format!("{what} · idle {attempt}/{of}"),
             Trigger::Fallback { .. } => format!("{what} · blind, its record unreadable"),
+            Trigger::UserCommand { id } => format!("{what} · user command {id}"),
         }
     }
 }

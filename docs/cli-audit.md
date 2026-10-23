@@ -308,7 +308,8 @@ review            feedback {write read}
 the team          agent {list add remove make-master set-review swap launch start}
                   team {save list show remove, agent library add/remove}
                   open  fork {create list remove}
-talking           send  nudge  events {list show read ack reply}
+talking           send  nudge  user-command {trust-key submit status}
+                  events {list show read ack reply}
 running remote    remote {status on off}
 settings          config <key> [value]  export
 ```
@@ -363,6 +364,10 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `events read` | to read an event's untrusted content | agent | R S | keep |  |
 | `send` | to message another agent | both | R S | keep | |
 | `nudge` | when an agent cannot receive `send` | human | R | keep |  |
+| `user-command` | the story site's Run button, through its own scripts | site | R | keep |  |
+| `user-command trust-key` | once, to trust the site's public key | human | R | keep |  |
+| `user-command submit` | the site, on each press | site | R | keep |  |
+| `user-command status` | the site, to show a request's state | site | R | keep |  |
 | `monitor` | (group, plumbing) | hook | R | keep | hidden; README notes it |
 | `monitor start` | never by hand; clank spawns it | hook | R | keep | hidden with its group |
 | `monitor upgrade` | once, to retire monitors from old builds | legacy | R | keep | hidden; kept, since old monitors can exist on other machines |
@@ -489,6 +494,10 @@ Generated. Do not edit by hand.
 | `events read` | action |  |  | Read an event's content and record delivery to your bound agent | <ID> | --repo --author -j/--json |
 | `send` | action |  |  | Put a message in an agent's inbox |  | --reply-to --reply-repo --interrupt --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
 | `nudge` | action |  |  | Interrupt an agent and type a message into its terminal |  | --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
+| `user-command` | group |  |  | Type a person's signed command into an agent's pane |  |  |
+| `user-command trust-key` | action |  |  | Trust the site's Ed25519 public key, read as base64 from stdin |  | --replace |
+| `user-command submit` | action |  |  | Admit one signed request, read as a JSON envelope from stdin |  |  |
+| `user-command status` | action |  |  | A request's state, as JSON |  | --repo --agent (required) --id (required) |
 | `monitor` | group | hidden |  | Watch a repo once, for every waiter |  |  |
 | `monitor start` | action |  |  | Watch this repo once, for every waiter |  | --repo --installed-at (hidden) --installed-from (hidden) |
 | `monitor upgrade` | action | hidden |  | Replace monitors from older builds with this one |  |  |
@@ -552,7 +561,7 @@ Generated. Do not edit by hand.
 | `unblock` | action | hidden |  | The old spelling of `block answer` | <AGENT> <NAME> | -m (required) --repo |
 | `attend` | action |  | attending | Tell clank which background work you are waiting on | [NAME] | --pid --desc --expect --clear --author --repo |
 | `tui` | action |  |  | The full-screen pane for driving a running team |  | --repo --no-cache |
-| `run` | action |  |  | Run a command under clank, so it knows exactly when the work ends | <CMD> | --desc (required) --expect --author --repo |
+| `run` | action |  |  | Run a command under clank, so it knows when the work ends | <CMD> | --desc (required) --expect --author --repo |
 | `config` | group, bare runs |  |  | Read or write clank config values |  | --repo -j/--json --global |
 | `config review.adhoc_feedback` | action |  | review_adhoc_feedback | Review commits outside any plan | [VALUE] [THEN] (hidden) |  |
 | `config review.plan_feedback` | action |  | review_plan_feedback | Review a plan's commits | [VALUE] [THEN] (hidden) |  |

@@ -53,6 +53,7 @@ fn facts<'a>(now: Ms, binding: &'a SessionId, owed: &'a [OwedItem]) -> Facts<'a>
         owed,
         liveness: &LIVE,
         check_in_route: Ok(()),
+        user_command: false,
     }
 }
 
@@ -2034,4 +2035,37 @@ fn attendance_holds_recovery_only_while_everything_owed_was_received() {
         None,
         "work never received stays recoverable"
     );
+}
+
+/// A Stop that would park ends silently while a verified user command
+/// waits, both as a new Stop and as a parked report stepped again; work
+/// owed is still delivered first, and without the fact nothing changes.
+#[test]
+fn a_waiting_user_command_ends_a_park_and_nothing_else() {
+    let s = session();
+    fn waiting(f: Facts<'_>) -> Facts<'_> {
+        Facts {
+            user_command: true,
+            ..f
+        }
+    }
+    let mut st = SessionState::new(s.clone());
+    let stop = report(Tool::Claude, tasks(FINISHED));
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(stop.clone()), &facts(T0, &s, &[]))),
+        Verdict::Park
+    );
+    assert_eq!(
+        verdict(st.step(Event::Parked(stop.clone()), &waiting(facts(T0, &s, &[])))),
+        Verdict::Silent(SilentWhy::UserCommand)
+    );
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(stop.clone()), &waiting(facts(T0, &s, &[])))),
+        Verdict::Silent(SilentWhy::UserCommand)
+    );
+    let a = owed("event:a", "read:a");
+    assert!(matches!(
+        verdict(st.step(Event::TurnEnd(stop), &waiting(facts(T0, &s, &a)))),
+        Verdict::Deliver { .. }
+    ));
 }
