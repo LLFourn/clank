@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use clank_core::turn_policy::{
     AttendReply, AttendRequest, Attendance, CheckIn, CheckInRef, Effect, Event, Facts, Handoff,
-    Liveness, Ms, Output, OwedItem, Persisted, PresentationId, Quiet, ResultOutcome, Selector,
-    SessionState, ShellProof, SilentWhy, TaskKind, Verdict, Withheld,
+    Liveness, Ms, Output, OwedItem, Persisted, PresentationId, Quiet, Request, ResultOutcome,
+    Selector, SessionState, ShellProof, SilentWhy, TaskKind, Verdict, Withheld,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -837,13 +837,13 @@ fn attended(attendance: &Attendance) -> Option<super::agent_state::Attended> {
     };
     match attendance {
         Attendance::None => None,
-        Attendance::Intent {
+        Attendance::Intent(Request {
             selector,
             desc,
             since,
             expect,
             shell,
-        } => Some(super::agent_state::Attended {
+        }) => Some(super::agent_state::Attended {
             task: selector_text(selector),
             expect: Some(expectation(*since, *expect)),
             desc: desc.clone(),
@@ -862,6 +862,7 @@ fn attended(attendance: &Attendance) -> Option<super::agent_state::Attended> {
             expect,
             shell,
             check_in,
+            ..
         } => Some(super::agent_state::Attended {
             task: task_id.clone(),
             expect: Some(expectation(*since, *expect)),

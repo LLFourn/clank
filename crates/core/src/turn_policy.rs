@@ -220,20 +220,23 @@ pub fn wake_gate(facts: &Facts<'_>) -> Result<(), Withheld> {
     Ok(())
 }
 
-/// An agent's attendance. The clock runs from `since`, the moment the
-/// request was accepted, and nothing renews it.
+/// An accepted attendance request, not yet resolved to a task: the task
+/// it names may not exist in any report yet. Its clock runs from `since`,
+/// the moment it was accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Request {
+    pub selector: Selector,
+    pub desc: Option<String>,
+    pub since: Ms,
+    pub expect: Ms,
+    pub shell: Option<ShellProof>,
+}
+
+/// An agent's attendance. Only a new request renews its clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Attendance {
     None,
-    /// Accepted but not yet resolved: the task it names may not exist in
-    /// any report yet.
-    Intent {
-        selector: Selector,
-        desc: Option<String>,
-        since: Ms,
-        expect: Ms,
-        shell: Option<ShellProof>,
-    },
+    Intent(Request),
     /// Resolved to one task. From here its identity is the task id.
     Standing {
         task_id: String,
@@ -243,7 +246,24 @@ pub enum Attendance {
         expect: Ms,
         shell: Option<ShellProof>,
         check_in: CheckIn,
+        /// A request made while this stands. This attendance, its
+        /// expectation and its check-in stay in force until a Stop
+        /// resolves the request: to this task, it renews them; to anything
+        /// else, it ends this attendance.
+        #[serde(default)]
+        renewal: Option<Request>,
     },
+}
+
+impl Attendance {
+    /// The task whose received work this attendance holds. Work is
+    /// identified by its resolved task id, never by how it was named.
+    pub fn work(&self) -> Option<&str> {
+        match self {
+            Self::None | Self::Intent(_) => None,
+            Self::Standing { task_id, .. } => Some(task_id),
+        }
+    }
 }
 
 /// The provider wakes the agent when its background work completes.
@@ -778,10 +798,26 @@ impl SessionState {
         })
     }
 
-    /// Ending an attendance releases what it quieted: that work is
-    /// presented again before any later attendance can quiet it.
-    fn release_received(&mut self) {
-        self.received.clear();
+    /// Every change of attendance goes through here. Ending an attendance,
+    /// or replacing it with one on other work, releases what it quieted:
+    /// that work is presented again before any later attendance can quiet
+    /// it. A replacement on the same work keeps it.
+    fn set_attendance(&mut self, next: Attendance) {
+        if self.attendance.work().is_some() && self.attendance.work() != next.work() {
+            self.received.clear();
+        }
+        self.attendance = next;
+    }
+
+    /// The attended work is over, but not a request made while it stood:
+    /// that is still to be resolved by the next report. Only an explicit
+    /// clear cancels a request.
+    fn end_active(&mut self) {
+        let Attendance::Standing { renewal, .. } = &mut self.attendance else {
+            return;
+        };
+        let next = renewal.take().map_or(Attendance::None, Attendance::Intent);
+        self.set_attendance(next);
     }
 
     /// Today's `forget_if_stale`: a count describes one unbroken run of the
@@ -826,10 +862,7 @@ impl SessionState {
                     *check_in = CheckIn::Armed;
                 }
             }
-            Qualifies::Ended => {
-                self.attendance = Attendance::None;
-                self.release_received();
-            }
+            Qualifies::Ended => self.end_active(),
             Qualifies::No(_) => {}
         }
 
@@ -899,20 +932,25 @@ impl SessionState {
         verdict
     }
 
-    /// Resolve a pending intent against THIS report's listing, which is
-    /// the first that can contain work started in the turn that attended
-    /// it.
+    /// Resolve a pending request, an intent or a standing attendance's
+    /// renewal, against THIS report's listing, which is the first that can
+    /// contain work started in the turn that made it.
     fn resolve_intent(&mut self, tasks: &TaskSnapshot) -> Option<Notice> {
-        let Attendance::Intent {
+        let request = match &self.attendance {
+            Attendance::Intent(request)
+            | Attendance::Standing {
+                renewal: Some(request),
+                ..
+            } => request.clone(),
+            _ => return None,
+        };
+        let Request {
             selector,
             desc,
             since,
             expect,
             shell,
-        } = &self.attendance
-        else {
-            return None;
-        };
+        } = &request;
         let live: Vec<&BackgroundTask> = tasks.live()?.collect();
         let matches: Vec<&BackgroundTask> = live
             .iter()
@@ -926,7 +964,7 @@ impl SessionState {
                     selector: selector.clone(),
                     live: live.iter().copied().map(TaskSummary::from).collect(),
                 };
-                self.attendance = Attendance::None;
+                self.set_attendance(Attendance::None);
                 return Some(n);
             }
             many => {
@@ -934,7 +972,7 @@ impl SessionState {
                     selector: selector.clone(),
                     matches: many.iter().copied().map(TaskSummary::from).collect(),
                 };
-                self.attendance = Attendance::None;
+                self.set_attendance(Attendance::None);
                 return Some(n);
             }
         };
@@ -943,14 +981,14 @@ impl SessionState {
                 selector: selector.clone(),
                 live: live.iter().copied().map(TaskSummary::from).collect(),
             };
-            self.attendance = Attendance::None;
+            self.set_attendance(Attendance::None);
             return Some(n);
         };
         let kind = TaskKind::of(resolved);
         let notice = (kind == TaskKind::Shell && shell.is_none()).then(|| Notice::ShellNeedsRun {
             task_id: task_id.clone(),
         });
-        self.attendance = Attendance::Standing {
+        let standing = Attendance::Standing {
             task_id,
             kind,
             desc: desc.clone().or_else(|| resolved.description.clone()),
@@ -958,7 +996,9 @@ impl SessionState {
             expect: *expect,
             shell: shell.clone(),
             check_in: CheckIn::Unarmed,
+            renewal: None,
         };
+        self.set_attendance(standing);
         notice
     }
 
@@ -999,24 +1039,22 @@ impl SessionState {
                 shell,
                 ..
             } => {
-                if self.attendance != Attendance::None {
-                    self.release_received();
-                }
-                self.attendance = Attendance::Intent {
+                let request = Request {
                     selector,
                     desc,
                     since: facts.now,
                     expect,
                     shell,
                 };
+                match &mut self.attendance {
+                    Attendance::Standing { renewal, .. } => *renewal = Some(request),
+                    _ => self.set_attendance(Attendance::Intent(request)),
+                }
                 AttendReply::Accepted
             }
             AttendRequest::Clear { .. } => {
                 let had = self.attendance != Attendance::None;
-                if had {
-                    self.release_received();
-                }
-                self.attendance = Attendance::None;
+                self.set_attendance(Attendance::None);
                 AttendReply::Cleared { had }
             }
         }
@@ -1083,7 +1121,7 @@ impl SessionState {
             return Vec::new();
         }
         if shell.as_ref().is_some_and(|p| !facts.liveness.holds(p)) {
-            self.attendance = Attendance::None;
+            self.end_active();
             return Vec::new();
         }
         if let Err(why) = wake_gate(facts) {

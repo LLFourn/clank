@@ -136,7 +136,7 @@ fn standing(s: &SessionId) -> SessionState {
 
 fn since(st: &SessionState) -> Ms {
     match &st.attendance {
-        Attendance::Standing { since, .. } | Attendance::Intent { since, .. } => *since,
+        Attendance::Standing { since, .. } | Attendance::Intent(Request { since, .. }) => *since,
         Attendance::None => panic!("no attendance"),
     }
 }
@@ -291,7 +291,7 @@ fn t06_an_unavailable_listing_neither_proves_nor_ends() {
         )),
         Verdict::Park
     );
-    assert!(matches!(st.attendance, Attendance::Intent { .. }));
+    assert!(matches!(st.attendance, Attendance::Intent(_)));
 
     let mut st = SessionState::new(s.clone());
     st.step(
@@ -514,7 +514,7 @@ fn t13_codex_records_a_live_run_but_parks_on_its_own_wait() {
         )),
         Verdict::Park
     );
-    assert!(matches!(st.attendance, Attendance::Intent { .. }));
+    assert!(matches!(st.attendance, Attendance::Intent(_)));
     assert_eq!(st.recovery_quiet(&facts(T0 + MINUTE, &s, &[])), None);
 
     let mut listed = SessionState::new(s.clone());
@@ -1312,7 +1312,7 @@ fn a_parked_report_resolves_nothing_and_never_silences() {
         Verdict::Park
     );
     assert!(
-        matches!(st.attendance, Attendance::Intent { .. }),
+        matches!(st.attendance, Attendance::Intent(_)),
         "an intent waits for the next Stop, never the parked one"
     );
     let a = owed("event:a", "read:a");
@@ -1589,6 +1589,12 @@ fn the_last_look_refuses_a_check_in_whose_attendance_or_gates_changed() {
         attend(Selector::Name(SUBAGENT_NAME.into()), None),
         &facts(due + 1, &s, &[]),
     );
+    assert_eq!(
+        replaced.may_type_check_in(&ours, &facts(due + 1, &s, &[])),
+        Ok(()),
+        "an unresolved renewal has replaced nothing yet"
+    );
+    replaced.step(running_stop(), &facts(due + 2, &s, &[]));
     for st in [cleared, replaced] {
         assert_eq!(
             st.may_type_check_in(&ours, &facts(due + 1, &s, &[])),
@@ -1831,19 +1837,412 @@ fn clearing_the_attendance_presents_received_work_again() {
     );
 }
 
+fn subagent(id: &str, name: &str) -> BackgroundTask {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "type": "subagent",
+        "status": "running",
+        "description": name,
+        "agent_type": "general-purpose",
+    }))
+    .unwrap()
+}
+
+fn listing(live: Vec<BackgroundTask>) -> Event {
+    Event::TurnEnd(report(Tool::Claude, TaskSnapshot::Known(live)))
+}
+
 #[test]
-fn a_replacement_attendance_presents_received_work_again() {
+fn re_attending_the_same_task_keeps_what_it_quieted() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let renewals: [&[Selector]; 3] = [
+        &[Selector::Name(SUBAGENT_NAME.into())],
+        &[Selector::TaskId(SUBAGENT_ID.into())],
+        &[
+            Selector::TaskId(SUBAGENT_ID.into()),
+            Selector::Name(SUBAGENT_NAME.into()),
+        ],
+    ];
+    for requests in renewals {
+        let mut st = received_then_attending(&s, &a);
+        for selector in requests {
+            st.step(
+                attend(selector.clone(), None),
+                &facts(T0 + 2 * MINUTE, &s, &a),
+            );
+        }
+        assert_eq!(
+            verdict(st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &a))),
+            Verdict::Park,
+            "{requests:?}"
+        );
+        assert_eq!(st.received, ["event:a"], "{requests:?}");
+        assert!(
+            matches!(&st.attendance, Attendance::Standing {
+                task_id, since, check_in: CheckIn::Armed, ..
+            } if task_id == SUBAGENT_ID && *since == T0 + 2 * MINUTE),
+            "{requests:?}: {:?}",
+            st.attendance
+        );
+    }
+}
+
+#[test]
+fn a_pending_renewal_keeps_the_attendance_in_force() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let ab = [a[0].clone(), owed("event:b", "read:b")[0].clone()];
+    let parked = || Event::Parked(report(Tool::Claude, tasks(RUNNING)));
+    for selector in [
+        Selector::TaskId(SUBAGENT_ID.into()),
+        Selector::Name(SUBAGENT_NAME.into()),
+    ] {
+        let mut st = received_then_attending(&s, &a);
+        let deadline = st.next_deadline();
+        assert_eq!(deadline, Some(T0 + 10 * MINUTE));
+        st.step(
+            attend(selector.clone(), None),
+            &facts(T0 + 2 * MINUTE, &s, &a),
+        );
+        let gap = facts(T0 + 3 * MINUTE, &s, &a);
+        assert_eq!(
+            st.recovery_quiet(&gap),
+            Some(Quiet::Attending),
+            "{selector:?}"
+        );
+        assert_eq!(
+            verdict(st.step(parked(), &gap)),
+            Verdict::Park,
+            "{selector:?}"
+        );
+        assert_eq!(
+            verdict(st.step(Event::SessionStart(s.clone()), &gap)),
+            Verdict::Park,
+            "{selector:?}"
+        );
+        assert_eq!(st.next_deadline(), deadline, "{selector:?}");
+
+        let (_, identities) =
+            presented(verdict(st.step(parked(), &facts(T0 + 4 * MINUTE, &s, &ab))));
+        assert_eq!(
+            identities,
+            ["event:b"],
+            "{selector:?}: new work still wakes"
+        );
+    }
+}
+
+#[test]
+fn a_check_in_due_while_a_renewal_is_pending_is_the_standing_one() {
     let s = session();
     let a = owed("event:a", "read:a");
     let mut st = received_then_attending(&s, &a);
     st.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &a));
+    let due = T0 + 10 * MINUTE;
+    let old = match effects(st.step(Event::CheckInDue, &facts(due, &s, &a))).as_slice() {
+        [Effect::CheckIn { check_in, .. }] => check_in.clone(),
+        other => panic!("the standing check-in still fires: {other:?}"),
+    };
+    assert_eq!(
+        old,
+        CheckInRef {
+            task_id: SUBAGENT_ID.into(),
+            since: T0,
+        }
+    );
+    assert_eq!(st.may_type_check_in(&old, &facts(due, &s, &a)), Ok(()));
+    assert_eq!(
+        verdict(st.step(running_stop(), &facts(due + 1, &s, &a))),
+        Verdict::Park,
+        "the renewal's expectation runs from its own request"
+    );
+    assert_eq!(st.next_deadline(), Some(T0 + 12 * MINUTE));
+    assert!(st.may_type_check_in(&old, &facts(due + 1, &s, &a)).is_err());
+}
+
+#[test]
+fn state_saved_before_renewals_existed_still_loads() {
+    let old = serde_json::json!({
+        "binding": session(),
+        "attendance": {"Standing": {
+            "task_id": SUBAGENT_ID,
+            "kind": "Subagent",
+            "desc": null,
+            "since": T0,
+            "expect": 10 * MINUTE,
+            "shell": null,
+            "check_in": "Armed",
+        }},
+        "repeat": null,
+        "outstanding": null,
+        "resolved": null,
+        "next_seq": 0,
+    });
+    let p: Persisted = serde_json::from_value(old).unwrap();
+    assert!(matches!(
+        p.attendance,
+        Attendance::Standing { renewal: None, .. }
+    ));
+
+    let intent = serde_json::json!({"Intent": {
+        "selector": {"Name": SUBAGENT_NAME},
+        "desc": null,
+        "since": T0,
+        "expect": 10 * MINUTE,
+        "shell": null,
+    }});
+    let a: Attendance = serde_json::from_value(intent).unwrap();
+    assert!(matches!(a, Attendance::Intent(Request { since: T0, .. })));
+}
+
+#[test]
+fn re_attending_the_same_task_still_presents_newly_owed_work() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let revision = owed("commit_plan_revision:p", "rev:p");
+    let both = [a[0].clone(), revision[0].clone()];
+    let mut st = received_then_attending(&s, &a);
+    st.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &both));
+    let (p, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &both)),
+    ));
+    assert_eq!(identities, ["commit_plan_revision:p"]);
+    assert_eq!(st.received, ["event:a"], "presenting it received nothing");
+    st.step(Event::EmitFailed(p), &facts(T0 + 3 * MINUTE, &s, &both));
     let (_, identities) = presented(verdict(
-        st.step(running_stop(), &facts(T0 + 3 * MINUTE, &s, &a)),
+        st.step(running_stop(), &facts(T0 + 4 * MINUTE, &s, &both)),
+    ));
+    assert_eq!(identities, ["commit_plan_revision:p"]);
+}
+
+#[test]
+fn attending_different_work_presents_received_work_again() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let shell = Event::Attend(AttendRequest::Attend {
+        session: session(),
+        selector: Selector::TaskId("shell-1".into()),
+        desc: None,
+        expect: 10 * MINUTE,
+        shell: proof(),
+    });
+    let cases = [
+        (
+            "a shell beside the subagent",
+            shell,
+            vec![subagent(SUBAGENT_ID, SUBAGENT_NAME), shell_task("shell-1")],
+            Some("shell-1"),
+        ),
+        (
+            "another task with the same name",
+            attend_subagent(),
+            vec![subagent("a0ther", SUBAGENT_NAME)],
+            Some("a0ther"),
+        ),
+        (
+            "nothing the request names",
+            attend_subagent(),
+            Vec::new(),
+            None,
+        ),
+        (
+            "two tasks with the name",
+            attend_subagent(),
+            vec![
+                subagent(SUBAGENT_ID, SUBAGENT_NAME),
+                subagent("a0ther", SUBAGENT_NAME),
+            ],
+            None,
+        ),
+        (
+            "a task with the name and no id",
+            attend_subagent(),
+            vec![
+                serde_json::from_value(serde_json::json!({
+                    "type": "subagent",
+                    "status": "running",
+                    "description": SUBAGENT_NAME,
+                }))
+                .unwrap(),
+            ],
+            None,
+        ),
+    ];
+    for (case, request, live, now_on) in cases {
+        let mut st = received_then_attending(&s, &a);
+        st.step(request, &facts(T0 + 2 * MINUTE, &s, &a));
+        assert_eq!(
+            st.recovery_quiet(&facts(T0 + 2 * MINUTE, &s, &a)),
+            Some(Quiet::Attending),
+            "{case}: nothing is released before the request resolves"
+        );
+        let (_, identities) = presented(verdict(
+            st.step(listing(live), &facts(T0 + 3 * MINUTE, &s, &a)),
+        ));
+        assert_eq!(identities, ["event:a"], "{case}");
+        assert!(st.received.is_empty(), "{case}");
+        assert_eq!(st.attendance.work(), now_on, "{case}");
+    }
+}
+
+#[test]
+fn a_renewal_refreshes_the_expectation_and_its_check_in() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    let due = st.next_deadline().unwrap();
+    assert_eq!(due, T0 + 10 * MINUTE);
+    let old = match effects(st.step(Event::CheckInDue, &facts(due, &s, &a))).as_slice() {
+        [Effect::CheckIn { check_in, .. }] => check_in.clone(),
+        other => panic!("no check-in fired: {other:?}"),
+    };
+    assert_eq!(st.next_deadline(), None, "a fired check-in is spent");
+
+    st.step(attend_subagent(), &facts(due + 1, &s, &a));
+    assert_eq!(
+        verdict(st.step(running_stop(), &facts(due + 2, &s, &a))),
+        Verdict::Park,
+        "the renewal quiets what was received under its new expectation"
+    );
+    let renewed = due + 1 + 10 * MINUTE;
+    assert_eq!(st.next_deadline(), Some(renewed));
+
+    let before = st.attendance.clone();
+    st.step(
+        Event::CheckInUndeliverable {
+            check_in: old.clone(),
+            why: "typing it did not start".into(),
+        },
+        &facts(due + 3, &s, &a),
+    );
+    assert_eq!(
+        st.attendance, before,
+        "the old check-in's loss is not the renewal's"
+    );
+    assert!(st.may_type_check_in(&old, &facts(due + 3, &s, &a)).is_err());
+
+    let fresh = match effects(st.step(Event::CheckInDue, &facts(renewed, &s, &a))).as_slice() {
+        [Effect::CheckIn { check_in, .. }] => check_in.clone(),
+        other => panic!("the renewal owes its own check-in: {other:?}"),
+    };
+    assert_eq!(
+        fresh,
+        CheckInRef {
+            task_id: SUBAGENT_ID.into(),
+            since: due + 1,
+        }
+    );
+}
+
+#[test]
+fn a_request_outlives_the_attendance_it_was_made_beside() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = SessionState::new(s.clone());
+    let (p, _) = deliver(&mut st, &facts(T0, &s, &a));
+    committed(st.step(Event::Delivered(p), &facts(T0, &s, &a)));
+    st.step(
+        Event::Attend(AttendRequest::Attend {
+            session: session(),
+            selector: Selector::TaskId("shell-1".into()),
+            desc: None,
+            expect: 10 * MINUTE,
+            shell: proof(),
+        }),
+        &facts(T0, &s, &a),
+    );
+    assert_eq!(
+        verdict(st.step(
+            listing(vec![shell_task("shell-1")]),
+            &facts(T0 + MINUTE, &s, &a)
+        )),
+        Verdict::Park
+    );
+    st.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &a));
+
+    let dead = Facts {
+        liveness: &DEAD,
+        ..facts(T0 + 10 * MINUTE, &s, &a)
+    };
+    assert!(
+        effects(st.step(Event::CheckInDue, &dead)).is_empty(),
+        "the old check-in is not typed"
+    );
+    assert!(st.received.is_empty(), "the old quieting is released");
+    assert!(
+        matches!(&st.attendance, Attendance::Intent(Request { since, .. }) if *since == T0 + 2 * MINUTE),
+        "{:?}",
+        st.attendance
+    );
+    assert_eq!(st.next_deadline(), None);
+
+    let (_, identities) = presented(verdict(st.step(
+        listing(vec![subagent(SUBAGENT_ID, SUBAGENT_NAME)]),
+        &facts(T0 + 11 * MINUTE, &s, &a),
+    )));
+    assert_eq!(identities, ["event:a"]);
+    assert_eq!(st.attendance.work(), Some(SUBAGENT_ID));
+    assert_eq!(st.next_deadline(), Some(T0 + 12 * MINUTE));
+    assert!(matches!(
+        effects(st.step(Event::CheckInDue, &facts(T0 + 12 * MINUTE, &s, &[]))).as_slice(),
+        [Effect::CheckIn { check_in, .. }] if check_in.since == T0 + 2 * MINUTE
+    ));
+}
+
+#[test]
+fn clearing_cancels_a_pending_request_with_its_attendance() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    st.step(attend_subagent(), &facts(T0 + 2 * MINUTE, &s, &a));
+    st.step(
+        Event::Attend(AttendRequest::Clear { session: session() }),
+        &facts(T0 + 3 * MINUTE, &s, &a),
+    );
+    assert_eq!(st.attendance, Attendance::None);
+    let (_, identities) = presented(verdict(
+        st.step(running_stop(), &facts(T0 + 4 * MINUTE, &s, &a)),
     ));
     assert_eq!(identities, ["event:a"]);
-    assert!(
-        matches!(&st.attendance, Attendance::Standing { since, .. } if *since == T0 + 2 * MINUTE)
+    assert_eq!(
+        st.attendance,
+        Attendance::None,
+        "nothing was left to resolve"
     );
+}
+
+#[test]
+fn a_shell_found_dead_at_its_check_in_releases_what_it_quieted() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let attend_shell = || {
+        Event::Attend(AttendRequest::Attend {
+            session: session(),
+            selector: Selector::TaskId("shell-1".into()),
+            desc: None,
+            expect: 10 * MINUTE,
+            shell: proof(),
+        })
+    };
+    let mut st = SessionState::new(s.clone());
+    let (p, _) = deliver(&mut st, &facts(T0, &s, &a));
+    committed(st.step(Event::Delivered(p), &facts(T0, &s, &a)));
+    st.step(attend_shell(), &facts(T0, &s, &a));
+    assert_eq!(
+        verdict(st.step(
+            listing(vec![shell_task("shell-1")]),
+            &facts(T0 + MINUTE, &s, &a)
+        )),
+        Verdict::Park
+    );
+    let dead = Facts {
+        liveness: &DEAD,
+        ..facts(T0 + 10 * MINUTE, &s, &a)
+    };
+    assert!(effects(st.step(Event::CheckInDue, &dead)).is_empty());
+    assert_eq!(st.attendance, Attendance::None);
+    assert!(st.received.is_empty());
 }
 
 #[test]

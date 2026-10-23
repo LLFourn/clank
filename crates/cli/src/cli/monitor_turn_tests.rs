@@ -466,8 +466,9 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
             &routes,
         )
     };
-    let cases: [(&str, Option<&str>); 6] = [
+    let cases: [(&str, Option<&str>); 7] = [
         ("nothing", None),
+        ("renewal not yet resolved", None),
         ("auto off", Some("auto turned off")),
         ("question", Some("a question is pending")),
         ("block", Some("a block is pending")),
@@ -517,7 +518,21 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
                     )
                     .unwrap();
             }
-            "replace" => attend_sleeper(&mut turns, &author, &now().at(due_at + 1)),
+            "renewal not yet resolved" => {
+                attend_sleeper(&mut turns, &author, &now().at(due_at + 1))
+            }
+            "replace" => {
+                attend_sleeper(&mut turns, &author, &now().at(due_at + 1));
+                turns
+                    .answer(
+                        &author,
+                        2,
+                        &listing_the_sleeper(),
+                        true,
+                        &now().at(due_at + 2),
+                    )
+                    .unwrap();
+            }
             _ => {}
         }
         let looked = may_check_in_now(
