@@ -8,6 +8,7 @@ test-support = []
 
 [dependencies]
 clank-web = { path = "../web" }
+clank-user-config = { path = "../user-config" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

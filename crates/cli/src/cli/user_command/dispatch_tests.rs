@@ -1,7 +1,9 @@
 use super::*;
 use crate::cli::composer::fixtures::claude;
 use crate::cli::pane_target::Process;
+use crate::cli::user_command::envelope::SiteKey;
 use crate::cli::user_command::envelope::testkey::{NOW, Signer, payload};
+use crate::cli::user_command::trust::{KeyName, Pin};
 use crate::proc_identity::ProcToken;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -61,7 +63,7 @@ enum Write {
 
 struct Fake {
     now: AtomicU64,
-    key: Mutex<Option<SiteKey>>,
+    trust: Mutex<TrustSet>,
     binding: Mutex<Option<(Tool, SessionId)>>,
     discover: Mutex<Result<(PaneSeen, Tool), String>>,
     looks: Mutex<Result<(), String>>,
@@ -117,11 +119,22 @@ impl Drop for Held {
     }
 }
 
+fn one(key: &SiteKey) -> TrustSet {
+    TrustSet::from_keys([("site", key.clone())])
+}
+
+fn pin(name: &str, key: &SiteKey) -> Pin {
+    Pin {
+        name: KeyName::parse(name).unwrap(),
+        fingerprint: key.fingerprint(),
+    }
+}
+
 impl Fake {
     fn new(key: &SiteKey) -> Self {
         Fake {
             now: AtomicU64::new(NOW),
-            key: Mutex::new(Some(key.clone())),
+            trust: Mutex::new(one(key)),
             binding: Mutex::new(Some((Tool::Claude, sid("session-one")))),
             discover: Mutex::new(Ok((seen(), Tool::Claude))),
             looks: Mutex::new(Ok(())),
@@ -187,8 +200,8 @@ impl Seams for Fake {
     fn now(&self) -> u64 {
         self.now.load(Ordering::SeqCst)
     }
-    fn key(&self) -> Option<SiteKey> {
-        self.key.lock().unwrap().clone()
+    fn trust(&self) -> TrustSet {
+        self.trust.lock().unwrap().clone()
     }
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)> {
         match &self.repo {
@@ -266,10 +279,15 @@ impl World {
         let held = self.store.lock(TAG, &label(), id).unwrap();
         held.save(&Record::admitted(
             envelope,
-            self.site.key().fingerprint(),
+            pin("site", &self.site.key()),
             NOW,
         ))
         .unwrap();
+    }
+
+    fn file_as(&self, id: &Id, envelope: envelope::Envelope, pin: Pin) {
+        let held = self.store.lock(TAG, &label(), id).unwrap();
+        held.save(&Record::admitted(envelope, pin, NOW)).unwrap();
     }
 
     fn admit(&self) -> Id {
@@ -303,7 +321,7 @@ impl World {
 
     fn pass(
         &self,
-        key: Option<&SiteKey>,
+        trust: &TrustSet,
         now: u64,
         agents: &mut Agents_,
     ) -> (Pass, Vec<nudge_log::Record>) {
@@ -313,7 +331,7 @@ impl World {
             store: &self.store,
             tag: TAG,
             repo: &self.repo,
-            key,
+            trust,
             now,
             history: &note,
         };
@@ -389,7 +407,7 @@ async fn a_failed_write_is_recorded_as_what_it_may_have_done() {
         w.attempt(&seams, &r1).await;
         assert_eq!(w.record(&r1).state, state);
         w.attempt(&seams, &r1).await;
-        let (out, _) = w.pass(Some(&w.site.key()), NOW, &mut agents(Look::Go));
+        let (out, _) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
         assert!(out.jobs.is_empty());
         assert_eq!(seams.writes(), writes, "{state:?}: never retried");
     }
@@ -418,7 +436,7 @@ async fn a_crash_after_dispatching_is_unconfirmed_and_never_replayed() {
             .await;
         assert!(died.is_err(), "the fake crash ran");
         assert_eq!(w.record(&r1).state, State::Dispatching);
-        let (out, history) = w.pass(Some(&w.site.key()), NOW, &mut agents(Look::Go));
+        let (out, history) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
         assert!(out.jobs.is_empty());
         let record = w.record(&r1);
         assert_eq!(record.state, State::Unconfirmed, "{writes}");
@@ -474,7 +492,7 @@ async fn nothing_decided_before_the_dump_or_the_pane_lock_is_trusted() {
         ),
         (
             "key revoked during the dump",
-            Some(|f| *f.key.lock().unwrap() = None),
+            Some(|f| *f.trust.lock().unwrap() = TrustSet::of(None)),
             None,
             State::Refused,
         ),
@@ -510,7 +528,7 @@ async fn nothing_decided_before_the_dump_or_the_pane_lock_is_trusted() {
 async fn the_checks_under_the_locks_see_what_changed_after_the_last_look() {
     let changes: [(&str, fn(&Fake)); 3] = [
         ("key changed", |f| {
-            *f.key.lock().unwrap() = Some(Signer::generate().key())
+            *f.trust.lock().unwrap() = one(&Signer::generate().key())
         }),
         ("expired", |f| {
             f.now.store(NOW + 301 + envelope::SKEW, Ordering::SeqCst)
@@ -543,7 +561,7 @@ fn a_held_dispatching_record_is_left_alone() {
     record.moved(State::Dispatching, None, NOW);
     w.put(&r1, &record);
     let held = w.store.lock(TAG, &label(), &r1).unwrap();
-    let (out, history) = w.pass(Some(&w.site.key()), NOW, &mut agents(Look::Go));
+    let (out, history) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
     assert_eq!(out, Pass::default());
     assert!(history.is_empty());
     drop(held);
@@ -602,7 +620,7 @@ async fn stored_authority_is_judged_at_every_use() {
     for (id, envelope) in &edits {
         w.file(id, envelope.clone());
     }
-    let (out, history) = w.pass(Some(&w.site.key()), NOW, &mut agents(Look::Parked));
+    let (out, history) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Parked));
     assert_eq!(out, Pass::default(), "no release, no watch, no attempt");
     assert_eq!(history.len(), edits.len());
     for (id, _) in &edits {
@@ -637,16 +655,16 @@ async fn a_changed_or_removed_key_refuses_at_next_use_and_keeps_history() {
     assert_eq!(w.record(&delivered).state, State::Delivered);
     let before = w.record(&delivered);
 
-    for (key, reason) in [
-        (Some(Signer::generate().key()), "key changed"),
-        (None, "no trusted key"),
+    for (trust, reason) in [
+        (one(&Signer::generate().key()), "key changed"),
+        (TrustSet::of(None), "key changed"),
     ] {
         let r1 = w.admit();
         let mut record = w.record(&r1);
         record.state = State::Admitted;
         record.reason = None;
         w.put(&r1, &record);
-        let (out, _) = w.pass(key.as_ref(), NOW, &mut agents(Look::Parked));
+        let (out, _) = w.pass(&trust, NOW, &mut agents(Look::Parked));
         assert!(out.release.is_empty() && out.jobs.is_empty(), "{reason}");
         assert_eq!(w.record(&r1).state, State::Refused);
         assert_eq!(w.record(&r1).reason.as_deref(), Some(reason));
@@ -671,7 +689,7 @@ fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
     let w = World::new();
     let r1 = w.admit();
     let (out, _) = w.pass(
-        Some(&w.site.key()),
+        &one(&w.site.key()),
         NOW,
         &mut agents(Look::Wait("its turn is running".into())),
     );
@@ -691,7 +709,7 @@ fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
     assert_eq!(record.reason.as_deref(), Some("its turn is running"));
     let stamp = w.store.stamp(TAG, &label(), &r1);
     w.pass(
-        Some(&w.site.key()),
+        &one(&w.site.key()),
         NOW + 5,
         &mut agents(Look::Wait("its turn is running".into())),
     );
@@ -701,13 +719,13 @@ fn a_pass_waits_releases_or_dispatches_and_writes_only_changes() {
         "unchanged, not rewritten"
     );
 
-    let (out, _) = w.pass(Some(&w.site.key()), NOW, &mut agents(Look::Parked));
+    let (out, _) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Parked));
     assert_eq!(out.release, [label()].into_iter().collect());
     assert_eq!(
         w.record(&r1).reason.as_deref(),
         Some("releasing its parked turn")
     );
-    let (out, _) = w.pass(Some(&w.site.key()), NOW, &mut agents(Look::Go));
+    let (out, _) = w.pass(&one(&w.site.key()), NOW, &mut agents(Look::Go));
     assert!(out.release.is_empty());
     assert_eq!(
         out.jobs,
@@ -725,7 +743,7 @@ async fn an_expired_request_is_refused() {
     let w = World::new();
     let r1 = w.admit();
     let (_, history) = w.pass(
-        Some(&w.site.key()),
+        &one(&w.site.key()),
         NOW + 301 + envelope::SKEW,
         &mut agents(Look::Go),
     );
@@ -894,4 +912,111 @@ async fn a_rebind_waits_for_a_dispatch_and_one_before_it_refuses_it() {
     w.attempt(&after, &r2).await;
     assert_eq!(w.record(&r2).state, State::Refused);
     assert_eq!(after.writes(), 0);
+}
+
+/// With two sites trusted, removing one, replacing it, or trusting its key
+/// under another name refuses what it admitted, `key changed`, and nothing
+/// is typed; what the other site admitted is delivered.
+#[tokio::test]
+async fn untrusting_or_replacing_a_key_refuses_only_what_it_admitted() {
+    let other = Signer::generate();
+    let mut p = payload(&PathBuf::from("/w/proj"));
+    p["id"] = "r2".into();
+    type Change = fn(&SiteKey, &SiteKey) -> TrustSet;
+    let changes: [(&str, Change); 3] = [
+        ("untrusted", |_, b| {
+            TrustSet::from_keys([("site-b", b.clone())])
+        }),
+        ("replaced", |_, b| {
+            TrustSet::from_keys([("site-a", Signer::generate().key()), ("site-b", b.clone())])
+        }),
+        ("relabelled", |a, b| {
+            TrustSet::from_keys([("moved", a.clone()), ("site-b", b.clone())])
+        }),
+    ];
+    for (what, change) in changes {
+        let w = World::new();
+        let (r1, r2) = (id("r1"), id("r2"));
+        w.file_as(
+            &r1,
+            w.site.sign(&payload(&w.repo)),
+            pin("site-a", &w.site.key()),
+        );
+        w.file_as(&r2, other.sign(&p), pin("site-b", &other.key()));
+        let seams = Fake::new(&w.site.key());
+        *seams.trust.lock().unwrap() = change(&w.site.key(), &other.key());
+        w.attempt(&seams, &r1).await;
+        assert_eq!(w.record(&r1).state, State::Refused, "{what}");
+        assert_eq!(
+            w.record(&r1).reason.as_deref(),
+            Some("key changed"),
+            "{what}"
+        );
+        assert_eq!(seams.writes(), 0, "{what}");
+        w.attempt(&seams, &r2).await;
+        assert_eq!(w.record(&r2).state, State::Delivered, "{what}");
+    }
+}
+
+/// A record written before keys had names, waiting, and one already
+/// delivered: once the legacy key has migrated into a named set beside
+/// another site's, the waiting one is dispatched under `default` and the
+/// delivered one stays as it was.
+#[tokio::test]
+async fn an_old_format_record_dispatches_under_default_after_migration() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let w = World::new();
+    let old_format = |id: &Id, state: State| {
+        let mut p = payload(&w.repo);
+        p["id"] = id.as_str().into();
+        let mut record = Record::admitted(w.site.sign(&p), pin("default", &w.site.key()), NOW);
+        record.state = state;
+        record.reason = Some("its turn is running".into());
+        let mut json = serde_json::to_value(&record).unwrap();
+        assert!(json.as_object_mut().unwrap().remove("key_name").is_some());
+        drop(w.store.lock(TAG, &label(), id).unwrap());
+        let path = w
+            ._home
+            .path()
+            .join("uc")
+            .join(TAG)
+            .join(label().as_str())
+            .join(format!("{}.json", id.as_str()));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+            .write_all(&serde_json::to_vec(&json).unwrap())
+            .unwrap();
+    };
+    let (waiting, done) = (id("waiting"), id("done"));
+    old_format(&waiting, State::WaitingForIdle);
+    old_format(&done, State::Delivered);
+    let before = w.record(&done);
+    assert_eq!(w.record(&waiting).key_name, KeyName::legacy());
+
+    let mut section = crate::cli::teams_config::UserCommandSection {
+        site_key: Some(w.site.key().encoded()),
+        ..Default::default()
+    };
+    crate::cli::user_command::trust::trust(
+        &mut section,
+        &KeyName::parse("site-b").unwrap(),
+        &Signer::generate().key(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(section.site_key, None);
+    let seams = Fake::new(&w.site.key());
+    *seams.trust.lock().unwrap() = TrustSet::of(Some(&section));
+    let (_, history) = w.pass(&seams.trust(), NOW, &mut agents(Look::Go));
+    assert!(history.is_empty(), "{history:?}");
+    w.attempt(&seams, &waiting).await;
+    assert_eq!(w.record(&waiting).state, State::Delivered);
+    assert_eq!(seams.writes(), 2);
+    assert_eq!(w.record(&done), before, "history is not rewritten");
 }

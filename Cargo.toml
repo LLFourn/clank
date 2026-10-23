@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "crates/web", "crates/web-cloudflare"]
+members = ["crates/core", "crates/cli", "crates/web", "crates/web-cloudflare", "crates/user-config"]
 
 
 [profile.release]

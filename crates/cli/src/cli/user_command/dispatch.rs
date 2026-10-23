@@ -5,7 +5,7 @@
 //! An attempt takes the request's id lock, then the pane's write lock,
 //! and with both held reads the input from one dump. Then comes its one
 //! commit point: the loop's readiness answer, then the label's
-//! `binding.lock`, and under it the current key and clock, the envelope
+//! `binding.lock`, and under it the trusted keys and clock, the envelope
 //! verified again, the binding read under the guard and the launch checked
 //! against the pane recorded at the first look; then `dispatching` is
 //! persisted and the command typed. Locks are released in reverse.
@@ -21,8 +21,9 @@
 //! reader that takes the id lock and finds it knows its dispatcher died
 //! and records `unconfirmed`. Nothing is ever retried.
 
-use super::envelope::{self, Id, Refusal, SiteKey, Verified};
+use super::envelope::{self, Id, Verified};
 use super::store::{Held, PaneSeen, Record, Stamp, State, Store};
+use super::trust::TrustSet;
 use crate::cli::nudge_log;
 use crate::cli::open_zellij::PaneWrite;
 use crate::cli::pane_input::{Terminal, UserCommandEvidence};
@@ -35,22 +36,20 @@ use std::path::Path;
 /// its dispatcher died holding the lock, maybe after typing.
 const DIED: &str = "its dispatcher stopped before recording the outcome; it is never retried";
 
-/// Verify `record`'s envelope as it is used now: under the current key and
-/// window, and naming the repo, label and id it was found at.
+/// Verify `record`'s envelope as it is used now: under the entry it was
+/// admitted under, as `trust` holds it, within its window, and naming the
+/// repo, label and id it was found at.
 pub(crate) fn authorise(
     record: &Record,
-    key: Option<&SiteKey>,
+    trust: &TrustSet,
     now: u64,
     repo: &Path,
     label: &AgentLabel,
     id: &Id,
 ) -> Result<Verified, String> {
-    match envelope::verify(&record.envelope, key, now) {
+    match trust.pinned(&record.pin(), &record.envelope, now) {
         Ok(v) if v.names(repo, label, id) => Ok(v),
         Ok(_) => Err("its signed repo, agent or id disagree with where it was found".into()),
-        Err(Refusal::BadSignature) if key.is_some_and(|k| k.fingerprint() != record.key) => {
-            Err("key changed".into())
-        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -97,12 +96,12 @@ pub(crate) struct Pass {
     pub(crate) next_expiry: Option<u64>,
 }
 
-/// Where a pass or an attempt works, and the moment and key it judges by.
+/// Where a pass or an attempt works, and the moment and keys it judges by.
 pub(crate) struct Ctx<'a> {
     pub(crate) store: &'a Store,
     pub(crate) tag: &'a str,
     pub(crate) repo: &'a Path,
-    pub(crate) key: Option<&'a SiteKey>,
+    pub(crate) trust: &'a TrustSet,
     pub(crate) now: u64,
     pub(crate) history: &'a (dyn Fn(&AgentLabel, nudge_log::Record) + Sync),
 }
@@ -155,7 +154,7 @@ pub(crate) fn pass(
             );
             continue;
         }
-        let verified = match authorise(&record, ctx.key, ctx.now, ctx.repo, &label, &id) {
+        let verified = match authorise(&record, ctx.trust, ctx.now, ctx.repo, &label, &id) {
             Ok(v) => v,
             Err(why) => {
                 settle(
@@ -262,8 +261,8 @@ fn settle(
 /// fake terminal, a fake clock and a fake crash, never a real pane.
 pub(crate) trait Seams: Sync {
     fn now(&self) -> u64;
-    /// The trusted key as configured now.
-    fn key(&self) -> Option<SiteKey>;
+    /// The trusted keys as configured now.
+    fn trust(&self) -> TrustSet;
     /// The tool and session bound to `label` now.
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)>;
     /// The agent's one pane and the process its launch record verifies.
@@ -323,12 +322,12 @@ pub(crate) async fn attempt(
         return Ended::Done;
     };
     let history = |label: &AgentLabel, r: nudge_log::Record| seams.history(label, r);
-    let key = seams.key();
+    let trust = seams.trust();
     let ctx = Ctx {
         store,
         tag,
         repo,
-        key: key.as_ref(),
+        trust: &trust,
         now: seams.now(),
         history: &history,
     };
@@ -352,7 +351,7 @@ pub(crate) async fn attempt(
         settle(&ctx, &held, label, id, record, State::Refused, why, None);
         Ended::Done
     };
-    let verified = match authorise(&record, ctx.key, ctx.now, repo, label, id) {
+    let verified = match authorise(&record, ctx.trust, ctx.now, repo, label, id) {
         Ok(v) => v,
         Err(why) => return refuse(&mut record, why),
     };
@@ -418,7 +417,7 @@ pub(crate) async fn attempt(
             expires: verified.expires_at.saturating_add(envelope::SKEW + 1),
         };
     }
-    // The commit point: the loop's readiness, then the key, the clock,
+    // The commit point: the loop's readiness, then the keys, the clock,
     // the binding and the launch as they are now, with no await between
     // them and the first byte but taking the binding lock, whose holders
     // take no other lock.
@@ -431,8 +430,8 @@ pub(crate) async fn attempt(
         Err(why) => return refuse(&mut record, format!("its binding could not be held: {why}")),
     };
     let now = seams.now();
-    let key = seams.key();
-    let verified = match authorise(&record, key.as_ref(), now, repo, label, id) {
+    let trust = seams.trust();
+    let verified = match authorise(&record, &trust, now, repo, label, id) {
         Ok(v) => v,
         Err(why) => return refuse(&mut record, why),
     };

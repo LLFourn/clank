@@ -262,30 +262,30 @@ impl Door {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => anyhow::bail!("reading `{}`: {e}", path.display()),
         };
-        let mut cfg = read_user_config(home)?;
-        let mut store = Store {
-            sessions,
-            remote: cfg
-                .get("remote")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?
-                .unwrap_or_default(),
-        };
-        let (r, wrote) = edit(&mut store);
-        if wrote.sessions {
-            write_typed_config(
-                &path,
-                &SessionsFile {
-                    sessions: store.sessions,
-                },
-            )?;
-        }
-        if wrote.remote {
-            cfg.insert("remote".into(), serde_json::to_value(store.remote)?);
-            write_typed_config(&user_config_path(home), &cfg)?;
-        }
-        Ok(r)
+        clank_user_config::transact(home, |cfg| {
+            let mut store = Store {
+                sessions,
+                remote: cfg
+                    .get("remote")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
+            let (r, wrote) = edit(&mut store);
+            if wrote.sessions {
+                write_typed_config(
+                    &path,
+                    &SessionsFile {
+                        sessions: store.sessions,
+                    },
+                )?;
+            }
+            if wrote.remote {
+                cfg.insert("remote".into(), serde_json::to_value(store.remote)?);
+            }
+            Ok(r)
+        })
     }
 
     // ---- the token ----
@@ -693,8 +693,9 @@ fn deadline(record: &SessionRecord, now: time::OffsetDateTime) -> tokio::time::I
     tokio::time::Instant::now() + left
 }
 
+#[cfg(test)]
 fn user_config_path(home: &Path) -> PathBuf {
-    home.join(".clank/config.json")
+    clank_user_config::path(home)
 }
 
 /// Read the user document as an object so the server can update its
@@ -702,15 +703,7 @@ fn user_config_path(home: &Path) -> PathBuf {
 pub(crate) fn read_user_config(
     home: &Path,
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
-    let path = user_config_path(home);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw)? {
-            serde_json::Value::Object(map) => Ok(map),
-            _ => anyhow::bail!("`{}` is not a JSON object", path.display()),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
-        Err(e) => anyhow::bail!("reading `{}`: {e}", path.display()),
-    }
+    clank_user_config::read(home)
 }
 
 pub(crate) fn write_typed_config<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {

@@ -9,6 +9,7 @@
 //! files 0600, vetted before every read and opened without following links.
 
 use super::envelope::{Envelope, Id};
+use super::trust::{KeyName, Pin};
 use anyhow::{Context, bail, ensure};
 use clank_core::ids::AgentLabel;
 use std::path::{Path, PathBuf};
@@ -65,20 +66,33 @@ pub(crate) struct Record {
     pub(crate) pane: Option<PaneSeen>,
     /// The fingerprint of the key it was admitted under.
     pub(crate) key: String,
+    /// The name that key was trusted as. A record from before keys had
+    /// names has none, and was admitted under the key now named `default`.
+    #[serde(default = "KeyName::legacy")]
+    pub(crate) key_name: KeyName,
     pub(crate) admitted_at: u64,
     pub(crate) updated_at: u64,
 }
 
 impl Record {
-    pub(crate) fn admitted(envelope: Envelope, key: String, now: u64) -> Self {
+    pub(crate) fn admitted(envelope: Envelope, pin: Pin, now: u64) -> Self {
         Record {
             envelope,
             state: State::Admitted,
             reason: Some("the repo's monitor has not looked at it yet".into()),
             pane: None,
-            key,
+            key: pin.fingerprint,
+            key_name: pin.name,
             admitted_at: now,
             updated_at: now,
+        }
+    }
+
+    /// The entry every use after admission verifies under.
+    pub(crate) fn pin(&self) -> Pin {
+        Pin {
+            name: self.key_name.clone(),
+            fingerprint: self.key.clone(),
         }
     }
 
@@ -103,6 +117,7 @@ impl Record {
             admitted_at: self.admitted_at,
             updated_at: self.updated_at,
             key: self.key.clone(),
+            key_name: self.key_name.to_string(),
         }
     }
 }
@@ -117,6 +132,7 @@ pub(crate) struct Status {
     pub(crate) admitted_at: u64,
     pub(crate) updated_at: u64,
     pub(crate) key: String,
+    pub(crate) key_name: String,
 }
 
 /// The longest record read back.
@@ -442,7 +458,10 @@ mod tests {
                 request: "cmVx".into(),
                 sig: "c2ln".into(),
             },
-            "fp".into(),
+            Pin {
+                name: KeyName::parse("site").unwrap(),
+                fingerprint: "fp".into(),
+            },
             10,
         )
     }

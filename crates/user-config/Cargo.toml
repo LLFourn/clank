@@ -1,0 +1,16 @@
+[package]
+name = "clank-user-config"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[features]
+test-hooks = []
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde_json = "1"
+tempfile = "3"
+
+[dev-dependencies]

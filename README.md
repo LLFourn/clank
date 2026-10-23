@@ -374,7 +374,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
-| `user-command` | Deliver a person's site-signed command into the asking agent's terminal as `! <command>`: `trust-key` / `submit` / `status` (see below) |
+| `user-command` | Deliver a person's site-signed command into the asking agent's terminal as `! <command>`: `trust-key` / `untrust-key` / `keys` / `submit` / `status` (see below) |
 | `feedback` | `write` / `read` review feedback via a typed surface |
 | `queue` | `add` / `promote` / `remove` / `unqueue` (back to drafts) / `reprioritise` queued plans |
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |
@@ -439,13 +439,26 @@ Code's bash mode runs it as your own input, and the output lands in that
 agent's conversation. Bash mode skips the agent's permission checks, so a
 `!` line reaches a prompt only because a person chose it.
 
-**Interface.** The site holds an Ed25519 private key; clank holds only the
-public key and verifies, never signs.
+**Interface.** Each site holds its own Ed25519 private key; clank holds
+only the public keys, each under the site's name, and verifies, never signs.
 
-- `clank user-command trust-key [--replace]` reads the public key (standard
-  base64 of the 32 raw bytes) from stdin, stores it as
-  `user_command.site_key` in `~/.clank/config.json`, and prints its blake3
-  fingerprint. Replacing a different key needs `--replace`.
+- `clank user-command trust-key --name <site> [--replace]` reads a public
+  key (standard base64 of the 32 raw bytes) from stdin, stores it as
+  `user_command.keys.<site>` in `~/.clank/config.json`, and prints its
+  blake3 fingerprint. Replacing that name's different key needs
+  `--replace`. A key already trusted under another name is refused: one key
+  has one name, so which name admitted a request never depends on search
+  order (a hand-edited config holding one key twice trusts nothing until it
+  is fixed). A name is 1 to 64 of `[A-Za-z0-9_-]`.
+- `clank user-command untrust-key --name <site>` removes it and prints its
+  fingerprint; `clank user-command keys` lists each name and fingerprint,
+  never a key.
+- A config from before keys had names (`user_command.site_key`) is read as
+  the key named `default`, and the next `trust-key` or `untrust-key` moves
+  it into `keys` and drops `site_key`, so untrusting `default` cannot bring
+  it back. If `site_key` and a different `keys.default` are both present,
+  nothing is trusted until `trust-key --name default --replace` or
+  `untrust-key --name default` decides.
 - `clank user-command submit` reads one JSON envelope from stdin, never
   argv: `{"request": <base64 of the payload bytes>, "sig": <base64
   signature>}`. The signature is over the bytes `clank user-command v1\n`
@@ -456,12 +469,14 @@ public key and verifies, never signs.
   `tool` the agent's current binding (`tool` must be `claude`), `id` 1 to
   64 of `[A-Za-z0-9_-]`, `command` one non-empty line with no control
   characters, and the times unix seconds at most 600 apart (30 s of clock
-  skew either side). Every field is signed.
+  skew either side). Every field is signed. It is admitted under whichever
+  trusted key verifies it.
 - `clank user-command status --repo <r> --agent <a> --id <id>`.
 
 Both `submit` and `status` print `{id, state, reason, admitted_at,
-updated_at, key}` (`key` is the fingerprint it was admitted under), never
-the envelope, the signature or the command. A refused `submit` prints
+updated_at, key, key_name}` (the fingerprint and name it was admitted
+under), never the envelope, the signature or the command. A repeat submit
+keeps that name and fingerprint, even signed by another trusted key. A refused `submit` prints
 `{"state": "refused", "reason": …}` and exits 1, and files nothing.
 
 **States.** `admitted` → `waiting-for-idle` (with a reason) → `dispatching`
@@ -481,7 +496,10 @@ a reader that later finds it with the lock free records `unconfirmed`.
 **Where it is typed.** Only the repo's monitor dispatches, on its existing
 wakes (turn-ends, record reads, the store's own files changing, a waiting
 request's expiry), never by polling a pane. Before any use it verifies the
-stored envelope again under the current key and window, and checks it
+stored envelope again, within its window, under the key trusted now under
+the name it was admitted under, and no other: if that name is gone or holds
+a different key, the request is refused with `key changed`, and so is
+every admitted, undelivered request it signed. It checks the envelope
 names the repo, agent and id it is filed under. It types only when the
 agent's latest turn completed, no question, block or presentation is
 pending, no hook is held, the session binding still matches, the pane's
@@ -500,32 +518,41 @@ retried.
 rendering of it, and Grok and OpenCode have shell modes but no readable
 input line; all three are refused with that reason.
 
-**What it does not protect.** The site and every agent run as the same
+**What it does not protect.** Every site and every agent run as the same
 Unix user, so this is not an OS boundary. An agent cannot forge a request,
 and a captured envelope authorises exactly one command, to one target,
-under one id, once. Any of these defeats it:
+under one id, once. Names are labels, not isolation: each trusted key is a
+separate capability that can sign for any agent in any repo, and guarding
+one site's key does nothing for another's. Any of these defeats it:
 
-- reading the site's private key file;
-- writing `~/.clank/config.json`, or running `trust-key --replace` with a
-  key of its own;
+- reading any trusted site's private key file;
+- writing `~/.clank/config.json`, or running `trust-key` with a key of its
+  own (under a new name, or `--replace` on an existing one);
+- running `untrust-key`, which refuses that site's pending requests (a
+  denial, not a forgery);
 - modifying or deleting the ledger under `~/.clank/user-commands/`, which
   defeats replay prevention: a genuine envelope whose entry is gone or reset
   can be dispatched again until it expires.
 
 Add deny rules for these to every agent (Claude Code's `permissions.deny`
-in `~/.claude/settings.json`, adjusting the key's path to the site's):
+in `~/.claude/settings.json`), with a `Read` and an `Edit` rule for EACH
+site's private-key path; the two below are examples, adjust them to where
+each site keeps its key:
 
 ```json
 {
   "permissions": {
     "deny": [
-      "Read(~/.config/clankstack/site-key*)",
-      "Edit(~/.config/clankstack/site-key*)",
+      "Read(~/.config/clankstack/site-a/site-key*)",
+      "Edit(~/.config/clankstack/site-a/site-key*)",
+      "Read(~/.config/clankstack/site-b/site-key*)",
+      "Edit(~/.config/clankstack/site-b/site-key*)",
       "Edit(~/.clank/config.json)",
       "Write(~/.clank/config.json)",
       "Edit(~/.clank/user-commands/**)",
       "Write(~/.clank/user-commands/**)",
       "Bash(clank user-command trust-key:*)",
+      "Bash(clank user-command untrust-key:*)",
       "Bash(rm ~/.clank/user-commands:*)"
     ]
   }

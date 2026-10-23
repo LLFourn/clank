@@ -58,8 +58,8 @@ struct Payload {
     expires_at: u64,
 }
 
-/// The site's trusted Ed25519 public key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A site's trusted Ed25519 public key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SiteKey([u8; 32]);
 
 impl SiteKey {
@@ -80,7 +80,8 @@ impl SiteKey {
         base64::engine::general_purpose::STANDARD.encode(self.0)
     }
 
-    /// Its blake3 fingerprint, as `submit`, `status` and `trust-key` print it.
+    /// Its blake3 fingerprint, as `submit`, `status`, `keys` and `trust-key`
+    /// print it.
     pub(crate) fn fingerprint(&self) -> String {
         blake3::hash(&self.0).to_hex()[..32].to_string()
     }
@@ -122,7 +123,7 @@ impl Command {
     }
 }
 
-/// A request whose signature verified under the trusted key and whose
+/// A request whose signature verified under a trusted key and whose
 /// payload passed every check, with every field taken from the verified
 /// bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,10 @@ pub(crate) struct Verified {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     NoTrustedKey,
+    /// The entry it was admitted under is gone or holds another key.
+    KeyChanged,
+    /// The configured keys cannot be read, and why.
+    Untrusted(String),
     Malformed(String),
     BadSignature,
     BadPayload(String),
@@ -155,6 +160,8 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::NoTrustedKey => write!(f, "no trusted key"),
+            Refusal::KeyChanged => write!(f, "key changed"),
+            Refusal::Untrusted(why) => write!(f, "the trusted keys are unusable: {why}"),
             Refusal::Malformed(why) => write!(f, "malformed envelope: {why}"),
             Refusal::BadSignature => write!(f, "the signature does not verify"),
             Refusal::BadPayload(why) => write!(f, "invalid payload: {why}"),
@@ -173,12 +180,7 @@ impl std::fmt::Display for Refusal {
 /// Verify `envelope` under `key` at `now` (unix seconds): the signature over
 /// the transmitted bytes first, then the payload parsed from exactly those
 /// bytes, then every field and the validity window.
-pub(crate) fn verify(
-    envelope: &Envelope,
-    key: Option<&SiteKey>,
-    now: u64,
-) -> Result<Verified, Refusal> {
-    let key = key.ok_or(Refusal::NoTrustedKey)?;
+pub(crate) fn verify(envelope: &Envelope, key: &SiteKey, now: u64) -> Result<Verified, Refusal> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let bytes = b64
         .decode(&envelope.request)
@@ -322,7 +324,7 @@ mod tests {
     #[test]
     fn a_signed_request_verifies_and_carries_its_fields() {
         let site = Signer::generate();
-        let v = verify(&site.sign(&payload(&repo())), Some(&site.key()), NOW).unwrap();
+        let v = verify(&site.sign(&payload(&repo())), &site.key(), NOW).unwrap();
         assert_eq!(v.repo, repo());
         assert_eq!(v.agent.as_str(), "claude");
         assert_eq!(v.session.as_str(), "session-one");
@@ -331,10 +333,10 @@ mod tests {
         assert!(v.names(&repo(), &v.agent, &Id::parse("r1").unwrap()));
     }
 
-    /// A forged signature, another key's signature, one over the bytes
-    /// without the domain, and no key at all are each refused.
+    /// A forged signature, another key's signature and one over the bytes
+    /// without the domain are each refused.
     #[test]
-    fn a_forged_or_unkeyed_request_is_refused() {
+    fn a_forged_request_is_refused() {
         let site = Signer::generate();
         let other = Signer::generate();
         let good = site.sign(&payload(&repo()));
@@ -344,11 +346,11 @@ mod tests {
         sig[0] ^= 1;
         flipped.sig = b64.encode(sig);
         assert_eq!(
-            verify(&flipped, Some(&site.key()), NOW),
+            verify(&flipped, &site.key(), NOW),
             Err(Refusal::BadSignature)
         );
         assert_eq!(
-            verify(&other.sign(&payload(&repo())), Some(&site.key()), NOW),
+            verify(&other.sign(&payload(&repo())), &site.key(), NOW),
             Err(Refusal::BadSignature)
         );
         let bare = serde_json::to_vec(&payload(&repo())).unwrap();
@@ -357,10 +359,9 @@ mod tests {
             sig: b64.encode(other.0.sign(&bare).as_ref()),
         };
         assert_eq!(
-            verify(&undomained, Some(&other.key()), NOW),
+            verify(&undomained, &other.key(), NOW),
             Err(Refusal::BadSignature)
         );
-        assert_eq!(verify(&good, None, NOW), Err(Refusal::NoTrustedKey));
     }
 
     /// Changing any one signed field after signing is a forgery: the bytes
@@ -389,7 +390,7 @@ mod tests {
                 sig: good.sig.clone(),
             };
             assert_eq!(
-                verify(&tampered, Some(&site.key()), NOW),
+                verify(&tampered, &site.key(), NOW),
                 Err(Refusal::BadSignature),
                 "{field}"
             );
@@ -401,25 +402,16 @@ mod tests {
         let site = Signer::generate();
         let key = site.key();
         let e = site.sign(&payload(&repo()));
-        assert!(verify(&e, Some(&key), NOW + 300 + SKEW).is_ok());
-        assert_eq!(
-            verify(&e, Some(&key), NOW + 301 + SKEW),
-            Err(Refusal::Expired)
-        );
-        assert_eq!(
-            verify(&e, Some(&key), NOW - SKEW - 1),
-            Err(Refusal::NotYetValid)
-        );
+        assert!(verify(&e, &key, NOW + 300 + SKEW).is_ok());
+        assert_eq!(verify(&e, &key, NOW + 301 + SKEW), Err(Refusal::Expired));
+        assert_eq!(verify(&e, &key, NOW - SKEW - 1), Err(Refusal::NotYetValid));
         let mut long = payload(&repo());
         long["expires_at"] = (NOW + WINDOW_MAX + 1).into();
-        assert_eq!(
-            verify(&site.sign(&long), Some(&key), NOW),
-            Err(Refusal::Window)
-        );
+        assert_eq!(verify(&site.sign(&long), &key, NOW), Err(Refusal::Window));
         let mut backwards = payload(&repo());
         backwards["expires_at"] = (NOW - 1).into();
         assert_eq!(
-            verify(&site.sign(&backwards), Some(&key), NOW),
+            verify(&site.sign(&backwards), &key, NOW),
             Err(Refusal::Window)
         );
     }
@@ -442,7 +434,7 @@ mod tests {
                     request: "%%".into(),
                     sig: "AA==".into()
                 },
-                Some(&key),
+                &key,
                 NOW
             ),
             Err(Refusal::Malformed(_))
@@ -461,7 +453,7 @@ mod tests {
             p[field] = value;
             assert!(
                 matches!(
-                    verify(&site.sign(&p), Some(&key), NOW),
+                    verify(&site.sign(&p), &key, NOW),
                     Err(Refusal::BadPayload(_))
                 ),
                 "{field}"
@@ -470,10 +462,7 @@ mod tests {
         for tool in ["codex", "grok", "opencode"] {
             let mut p = payload(&repo());
             p["tool"] = tool.into();
-            assert_eq!(
-                verify(&site.sign(&p), Some(&key), NOW),
-                Err(Refusal::NotClaude)
-            );
+            assert_eq!(verify(&site.sign(&p), &key, NOW), Err(Refusal::NotClaude));
         }
     }
 

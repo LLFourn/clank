@@ -331,6 +331,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "clank-core",
+ "clank-user-config",
  "clank-web",
  "clank-web-cloudflare",
  "clap",
@@ -400,6 +401,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clank-user-config"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "clank-web"
 version = "0.0.1"
 dependencies = [
@@ -430,6 +441,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "clank-user-config",
  "clank-web",
  "cloudflare-quick-tunnel",
  "futures-util",

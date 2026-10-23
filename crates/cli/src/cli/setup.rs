@@ -577,7 +577,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // Setup may seed product behavior defaults, but never personal/team
     // composition templates. `finish.autosquash` is a behavior default:
     // absent → true; an explicit true/false is preserved.
-    if let Some(line) = seed_autosquash_default(&home.join(".clank/config.json"), args.dry_run)? {
+    if let Some(line) = seed_autosquash_default(&home, args.dry_run)? {
         summary.push(line);
     }
 
@@ -847,7 +847,7 @@ pub(super) fn installation_lock(domain: &Path) -> anyhow::Result<std::fs::File> 
 /// the summary line when it seeds (or would, under `dry_run`); `None` when the
 /// key is already set (explicit true/false is preserved) or on a dry-run of an
 /// already-set key. Split out for testing without `$HOME` mutation.
-fn seed_autosquash_default(user_config: &Path, dry_run: bool) -> anyhow::Result<Option<String>> {
+fn seed_autosquash_default(home: &Path, dry_run: bool) -> anyhow::Result<Option<String>> {
     let key = &["finish", "autosquash"][..];
     // A destructive default must disclose itself at the surface, not just in a
     // code comment (ruthless 432a82e): say plainly that finish now rewrites the
@@ -862,10 +862,10 @@ fn seed_autosquash_default(user_config: &Path, dry_run: bool) -> anyhow::Result<
     };
     if dry_run {
         Ok(
-            (!crate::cli::config::json_path_present(user_config, key))
+            (!crate::cli::config::json_path_present(&clank_user_config::path(home), key))
                 .then(|| notice("would seed")),
         )
-    } else if crate::cli::config::set_key_if_absent(user_config, key, "true", "bool")? {
+    } else if crate::cli::config::set_user_key_if_absent(home, key, "true", "bool")? {
         Ok(Some(notice("seeded")))
     } else {
         Ok(None)
@@ -2379,7 +2379,7 @@ mod tests {
         // Absent → seeds, and the notice DISCLOSES the destructive default
         // (in-place rewrite + published-history risk + both opt-outs) at the
         // surface, not just in a code comment (ruthless 432a82e).
-        let notice = seed_autosquash_default(&cfg, false).unwrap().unwrap();
+        let notice = seed_autosquash_default(tmp.path(), false).unwrap().unwrap();
         assert!(
             notice.contains("REWRITING the current branch in place"),
             "{notice}"
@@ -2392,14 +2392,18 @@ mod tests {
             &["finish", "autosquash"]
         ));
         // Already set → no-op (explicit value preserved).
-        assert!(seed_autosquash_default(&cfg, false).unwrap().is_none());
+        assert!(
+            seed_autosquash_default(tmp.path(), false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn seed_autosquash_dry_run_reports_but_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join(".clank/config.json");
-        let line = seed_autosquash_default(&cfg, true).unwrap();
+        let line = seed_autosquash_default(tmp.path(), true).unwrap();
         assert!(line.unwrap().contains("would seed"));
         assert!(!cfg.exists(), "dry-run writes nothing");
     }

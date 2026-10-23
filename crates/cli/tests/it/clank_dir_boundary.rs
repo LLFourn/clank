@@ -112,6 +112,12 @@ const HOME_SITES: &[(&str, &str, &str)] = &[
          edit it, and durable across reboots so replay state survives",
     ),
     (
+        "user-config/src/lib.rs",
+        "home",
+        "`~/.clank/config.json` and `~/.clank/config.lock` — the user's own \
+         config and the lock every writer of it holds, in no repo",
+    ),
+    (
         "cli/src/cli/setup.rs",
         "domain",
         "`<domain>/.clank/setup-install.lock` — setup's installation domain is \

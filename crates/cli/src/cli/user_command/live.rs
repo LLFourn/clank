@@ -2,8 +2,9 @@
 //! the attempts it owns, and the real seams an attempt runs on.
 
 use super::dispatch::{self, Ended, Job, Seams};
-use super::envelope::{Id, SiteKey};
+use super::envelope::Id;
 use super::store::{PaneSeen, Stamp, Store};
+use super::trust::TrustSet;
 use crate::cli::nudge_log;
 use crate::cli::pane_input::UserCommandEvidence;
 use clank_core::Tool;
@@ -134,7 +135,7 @@ impl UserCommands {
         spawn: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> dispatch::Pass {
         let now = crate::cli::recovery::unix_now();
-        let key = super::site_key(&self.home);
+        let trust = super::trust_set(&self.home);
         let repo = self.repo.clone();
         let history =
             |label: &AgentLabel, record: nudge_log::Record| record_history(&repo, label, &record);
@@ -142,7 +143,7 @@ impl UserCommands {
             store: &self.store,
             tag: &self.tag,
             repo: &self.repo,
-            key: key.as_ref(),
+            trust: &trust,
             now,
             history: &history,
         };
@@ -257,8 +258,8 @@ impl Seams for Live {
         crate::cli::recovery::unix_now()
     }
 
-    fn key(&self) -> Option<SiteKey> {
-        super::site_key(&self.home)
+    fn trust(&self) -> TrustSet {
+        super::trust_set(&self.home)
     }
 
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)> {

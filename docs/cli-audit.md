@@ -308,7 +308,7 @@ review            feedback {write read}
 the team          agent {list add remove make-master set-review swap launch start}
                   team {save list show remove, agent library add/remove}
                   open  fork {create list remove}
-talking           send  nudge  user-command {trust-key submit status}
+talking           send  nudge  user-command {trust-key untrust-key keys submit status}
                   events {list show read ack reply}
 running remote    remote {status on off}
 settings          config <key> [value]  export
@@ -365,7 +365,9 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `send` | to message another agent | both | R S | keep | |
 | `nudge` | when an agent cannot receive `send` | human | R | keep |  |
 | `user-command` | the story site's Run button, through its own scripts | site | R | keep |  |
-| `user-command trust-key` | once, to trust the site's public key | human | R | keep |  |
+| `user-command trust-key` | once per site, to trust its public key under a name | human | R | keep |  |
+| `user-command untrust-key` | to stop trusting a site's key | human | R | keep |  |
+| `user-command keys` | to see which sites are trusted, by fingerprint | human | R | keep |  |
 | `user-command submit` | the site, on each press | site | R | keep |  |
 | `user-command status` | the site, to show a request's state | site | R | keep |  |
 | `monitor` | (group, plumbing) | hook | R | keep | hidden; README notes it |
@@ -495,7 +497,9 @@ Generated. Do not edit by hand.
 | `send` | action |  |  | Put a message in an agent's inbox |  | --reply-to --reply-repo --interrupt --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
 | `nudge` | action |  |  | Interrupt an agent and type a message into its terminal |  | --repo --to --master -m/--message -F/--file one of --to/--master (required) one of --message/--file (required) |
 | `user-command` | group |  |  | Type a person's signed command into an agent's pane |  |  |
-| `user-command trust-key` | action |  |  | Trust the site's Ed25519 public key, read as base64 from stdin |  | --replace |
+| `user-command trust-key` | action |  |  | Trust a site's Ed25519 public key, read as base64 from stdin |  | --name (required) --replace |
+| `user-command untrust-key` | action |  |  | Stop trusting the key named `--name` |  | --name (required) |
+| `user-command keys` | action |  |  | The trusted keys' names and fingerprints |  |  |
 | `user-command submit` | action |  |  | Admit one signed request, read as a JSON envelope from stdin |  |  |
 | `user-command status` | action |  |  | A request's state, as JSON |  | --repo --agent (required) --id (required) |
 | `monitor` | group | hidden |  | Watch a repo once, for every waiter |  |  |

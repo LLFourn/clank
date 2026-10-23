@@ -862,15 +862,14 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             // `--global` writes the user-scope config; otherwise the repo's.
             // Reads below still show the effective merged value (repo shadows
             // user), so the reported `source` reflects where it landed.
-            let config_path = if args.global {
+            if args.global {
                 let home = std::env::var_os("HOME")
                     .map(PathBuf::from)
                     .ok_or_else(|| anyhow::anyhow!("--global needs $HOME set"))?;
-                home.join(".clank/config.json")
+                set_user_key(&home, path, value, def.type_desc)?;
             } else {
-                repo.join(".clank/config.json")
-            };
-            set_key(&config_path, path, value, def.type_desc)?;
+                set_key(&repo.join(".clank/config.json"), path, value, def.type_desc)?;
+            }
             let kvs = resolve_key_values(&repo);
             if let Some(kv) = kvs.iter().find(|kv| kv.key == key) {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
@@ -922,19 +921,45 @@ fn set_repo_key(repo: &Path, path: &[&str], value: &str, type_desc: &str) -> any
     set_key(&repo.join(".clank/config.json"), path, value, type_desc)
 }
 
-/// Read-modify-write a single key into `config_path` (repo or user scope),
-/// creating the file + parent dir if absent. Preserves unknown keys.
+/// Read-modify-write a single key into the repo-scope `config_path`,
+/// creating the file + parent dir if absent. Preserves unknown keys. The
+/// user scope goes through [`set_user_key`] instead.
 fn set_key(config_path: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
-    if path.is_empty() {
-        anyhow::bail!("empty JSON path");
-    }
     let mut root: serde_json::Value = if config_path.exists() {
         let body = std::fs::read_to_string(config_path)?;
         serde_json::from_str(&body)?
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
+    let doc = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config.json is not a JSON object"))?;
+    set_in(doc, path, value, type_desc)?;
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(&root)?;
+    std::fs::write(config_path, body)?;
+    Ok(())
+}
 
+/// Set a single key in the user-scope `~/.clank/config.json`, inside the
+/// one user-config transaction.
+fn set_user_key(home: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
+    clank_user_config::transact(home, |doc| set_in(doc, path, value, type_desc))
+}
+
+/// Set `path` in `doc` to `value` read as `type_desc`, creating
+/// intermediate objects.
+fn set_in(
+    doc: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[&str],
+    value: &str,
+    type_desc: &str,
+) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("empty JSON path");
+    }
     let json_val = match type_desc {
         "bool" => match value {
             "true" => serde_json::Value::Bool(true),
@@ -950,10 +975,7 @@ fn set_key(config_path: &Path, path: &[&str], value: &str, type_desc: &str) -> a
         }
     };
 
-    // Walk the path, creating intermediate objects as needed.
-    let mut cursor = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config.json is not a JSON object"))?;
+    let mut cursor = doc;
     for segment in &path[..path.len() - 1] {
         let entry = cursor
             .entry(*segment)
@@ -963,12 +985,6 @@ fn set_key(config_path: &Path, path: &[&str], value: &str, type_desc: &str) -> a
             .ok_or_else(|| anyhow::anyhow!("config segment `{segment}` is not an object"))?;
     }
     cursor.insert(path.last().unwrap().to_string(), json_val);
-
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::to_string_pretty(&root)?;
-    std::fs::write(config_path, body)?;
     Ok(())
 }
 
@@ -978,11 +994,22 @@ pub(crate) fn json_path_present(config_path: &Path, path: &[&str]) -> bool {
     let Ok(body) = std::fs::read_to_string(config_path) else {
         return false;
     };
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(&body) else {
+    let Ok(serde_json::Value::Object(doc)) = serde_json::from_str::<serde_json::Value>(&body)
+    else {
         return false;
     };
-    let mut cur = &root;
-    for seg in path {
+    present_in(&doc, path)
+}
+
+fn present_in(doc: &serde_json::Map<String, serde_json::Value>, path: &[&str]) -> bool {
+    let Some((first, rest)) = path.split_first() else {
+        return true;
+    };
+    let mut cur = match doc.get(*first) {
+        Some(v) => v,
+        None => return false,
+    };
+    for seg in rest {
         match cur.get(seg) {
             Some(v) => cur = v,
             None => return false,
@@ -991,20 +1018,23 @@ pub(crate) fn json_path_present(config_path: &Path, path: &[&str]) -> bool {
     true
 }
 
-/// Set `path` to `value` ONLY IF absent (an explicit value — even `false` —
-/// is preserved). Returns whether it wrote. Used by `clank setup` to seed a
-/// first-run default without clobbering a user's choice.
-pub(crate) fn set_key_if_absent(
-    config_path: &Path,
+/// Set `path` in the user-scope config to `value` ONLY IF absent (an
+/// explicit value — even `false` — is preserved), the test and the write in
+/// one user-config transaction. Returns whether it wrote. Used by `clank
+/// setup` to seed a first-run default without clobbering a user's choice.
+pub(crate) fn set_user_key_if_absent(
+    home: &Path,
     path: &[&str],
     value: &str,
     type_desc: &str,
 ) -> anyhow::Result<bool> {
-    if json_path_present(config_path, path) {
-        return Ok(false);
-    }
-    set_key(config_path, path, value, type_desc)?;
-    Ok(true)
+    clank_user_config::transact(home, |doc| {
+        if present_in(doc, path) {
+            return Ok(false);
+        }
+        set_in(doc, path, value, type_desc)?;
+        Ok(true)
+    })
 }
 
 #[cfg(test)]
@@ -1642,19 +1672,73 @@ mod tests {
     fn set_key_if_absent_seeds_only_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join(".clank/config.json");
+        let home = tmp.path();
         // Absent → writes, returns true.
-        assert!(set_key_if_absent(&p, &["finish", "autosquash"], "true", "bool").unwrap());
+        assert!(set_user_key_if_absent(home, &["finish", "autosquash"], "true", "bool").unwrap());
         assert!(json_path_present(&p, &["finish", "autosquash"]));
         assert!(load_isolated(tmp.path()).finish.autosquash);
         // Present (true) → no-op, returns false.
-        assert!(!set_key_if_absent(&p, &["finish", "autosquash"], "true", "bool").unwrap());
+        assert!(!set_user_key_if_absent(home, &["finish", "autosquash"], "true", "bool").unwrap());
         // An explicit `false` is PRESERVED (first-run seed never clobbers it).
-        set_key(&p, &["finish", "autosquash"], "false", "bool").unwrap();
+        set_user_key(home, &["finish", "autosquash"], "false", "bool").unwrap();
         assert!(
-            !set_key_if_absent(&p, &["finish", "autosquash"], "true", "bool").unwrap(),
+            !set_user_key_if_absent(home, &["finish", "autosquash"], "true", "bool").unwrap(),
             "explicit false counts as present → not re-seeded"
         );
         assert!(!load_isolated(tmp.path()).finish.autosquash);
+    }
+
+    /// A global set with a trust mutation placed between its read and its
+    /// write, an untrust and then a trust: the mutation waits for the set,
+    /// and neither the setting nor the revocation or new key is lost. The
+    /// mutation is given a moment to finish first, which it can do only if
+    /// it does not share the set's transaction.
+    #[test]
+    fn a_global_set_racing_a_trust_mutation_loses_neither() {
+        use crate::cli::user_command::{
+            envelope::testkey::Signer, trust_key, trust_set, untrust_key,
+        };
+        for revoke in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let key = Signer::generate().key();
+            if revoke {
+                trust_key(home.path(), "site-a", &key.encoded(), false).unwrap();
+            }
+            let other: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+                Default::default();
+            let slot = other.clone();
+            let (h, encoded) = (home.path().to_path_buf(), key.encoded());
+            clank_user_config::on_next_read(move || {
+                let (done, finished) = std::sync::mpsc::channel();
+                *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                    if revoke {
+                        untrust_key(&h, "site-a").unwrap();
+                    } else {
+                        trust_key(&h, "site-a", &encoded, false).unwrap();
+                    }
+                    let _ = done.send(());
+                }));
+                let _ = finished.recv_timeout(std::time::Duration::from_millis(300));
+            });
+            set_user_key(home.path(), &["finish", "autosquash"], "false", "bool").unwrap();
+            other
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the hook ran")
+                .join()
+                .unwrap();
+            assert!(
+                json_path_present(
+                    &clank_user_config::path(home.path()),
+                    &["finish", "autosquash"]
+                ),
+                "revoke={revoke}: the setting was lost"
+            );
+            let keys = trust_set(home.path());
+            let trusted = keys.keys().unwrap();
+            assert_eq!(trusted.is_empty(), revoke, "revoke={revoke}: {keys:?}");
+        }
     }
 
     #[test]
@@ -1765,18 +1849,11 @@ mod tests {
 
     #[test]
     fn global_set_writes_user_scope_reported_as_user_source() {
-        // `--global` writes the user-scope config (via set_key to the home
-        // path); the effective value reads back with source User (a repo
-        // value would shadow it).
+        // `--global` writes the user-scope config; the effective value
+        // reads back with source User (a repo value would shadow it).
         let tmp = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        set_key(
-            &home.path().join(".clank/config.json"),
-            &["finish", "autosquash"],
-            "true",
-            "bool",
-        )
-        .unwrap();
+        set_user_key(home.path(), &["finish", "autosquash"], "true", "bool").unwrap();
         let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path()));
         let kv = kvs.iter().find(|kv| kv.key == "finish.autosquash").unwrap();
         assert_eq!(kv.value, "true");

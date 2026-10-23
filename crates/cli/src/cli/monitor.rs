@@ -16413,7 +16413,8 @@ mod user_command_tests {
         crate::agent_store::set_auto_mode(&repo, &claude(), clank_core::AutoMode::On).unwrap();
         let home = tempfile::tempdir().unwrap();
         let site = Signer::generate();
-        crate::cli::user_command::trust_key(home.path(), &site.key().encoded(), false).unwrap();
+        crate::cli::user_command::trust_key(home.path(), "site", &site.key().encoded(), false)
+            .unwrap();
         World {
             repo,
             home,
@@ -16440,7 +16441,10 @@ mod user_command_tests {
             let held = self.store().lock(&tag, &claude(), &id).unwrap();
             let mut record = crate::cli::user_command::store::Record::admitted(
                 signer.sign(&p),
-                self.site.key().fingerprint(),
+                crate::cli::user_command::trust::Pin {
+                    name: crate::cli::user_command::trust::KeyName::parse("site").unwrap(),
+                    fingerprint: self.site.key().fingerprint(),
+                },
                 now,
             );
             record.pane = Some(PaneSeen {

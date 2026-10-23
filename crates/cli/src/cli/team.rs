@@ -96,11 +96,34 @@ pub(crate) fn resolve_effective_auto_mode_with_source(
     )
 }
 
-pub(crate) fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
+#[cfg(test)]
+fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
     write_typed_config(&user_config_path(home), file)
 }
 
-/// Atomic write of a typed config via tempfile + rename.
+/// Read, change with `f` and write `~/.clank/config.json` as the typed
+/// [`UserConfigFile`], inside the one user-config transaction
+/// ([`clank_user_config::transact`]). Nothing is written when `f` fails.
+pub(crate) fn mutate_user_config<T>(
+    home: &Path,
+    f: impl FnOnce(&mut UserConfigFile) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    clank_user_config::transact(home, |doc| {
+        let path = clank_user_config::path(home);
+        let mut config: UserConfigFile = serde_json::from_value(serde_json::Value::Object(
+            std::mem::take(doc),
+        ))
+        .map_err(|e| anyhow::Error::from(e).context(format!("parsing {}", path.display())))?;
+        let out = f(&mut config)?;
+        match serde_json::to_value(&config)? {
+            serde_json::Value::Object(map) => *doc = map,
+            _ => anyhow::bail!("the user config did not serialize as an object"),
+        }
+        Ok(out)
+    })
+}
+
+#[cfg(test)]
 fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     use std::io::Write;
     let parent = path
@@ -312,50 +335,52 @@ fn delete(home: &Path, args: TeamDeleteArgs) -> anyhow::Result<()> {
 ///   snapshot).
 pub fn save_team(home: &Path, repo: &Path, name: &str, force: bool) -> anyhow::Result<()> {
     let repo_cfg = crate::agent_store::load_repo_config_required(repo)?;
-    let mut user_cfg = read_user_config(home)?;
-
-    // Collision check FIRST, before any write (fail-closed).
-    if user_cfg.teams.contains_key(name) && !force {
-        anyhow::bail!("team `{name}` already exists in user-scope; pass --force to overwrite");
-    }
-
-    let mut to_insert: Vec<(AgentLabel, AgentDescription)> = Vec::new();
-    let mut already_present: Vec<AgentLabel> = Vec::new();
-    for (label, agent) in &repo_cfg.agents {
-        let repo_desc = agent.to_description();
-        match user_cfg.agents.get(label) {
-            None => to_insert.push((label.clone(), repo_desc)),
-            Some(global_desc) if *global_desc == repo_desc => already_present.push(label.clone()),
-            Some(_) => anyhow::bail!(
-                "agent `{}` already exists in user-scope `agents` with a different definition; \
-                 rename it or reconcile before saving",
-                label.as_str()
-            ),
+    let (to_insert, already_present) = mutate_user_config(home, |user_cfg| {
+        // Collision check FIRST, before any write (fail-closed).
+        if user_cfg.teams.contains_key(name) && !force {
+            anyhow::bail!("team `{name}` already exists in user-scope; pass --force to overwrite");
         }
-    }
 
-    // All checks passed — apply (single write). Every roster agent's
-    // description now lives in the library (just inserted, or already
-    // present and identical), so the team is published as REFERENCES
-    // — one source of truth, no duplicated definitions.
-    for (label, desc) in &to_insert {
-        user_cfg.agents.insert(label.clone(), desc.clone());
-    }
-    let team: TeamRoster = repo_cfg
-        .agents
-        .iter()
-        .map(|(label, agent)| {
-            (
-                label.clone(),
-                TeamMember::Ref(TeamRef {
-                    agent: None,
-                    role: agent.role,
-                }),
-            )
-        })
-        .collect();
-    user_cfg.teams.insert(name.to_string(), team);
-    write_user_config(home, &user_cfg)?;
+        let mut to_insert: Vec<(AgentLabel, AgentDescription)> = Vec::new();
+        let mut already_present: Vec<AgentLabel> = Vec::new();
+        for (label, agent) in &repo_cfg.agents {
+            let repo_desc = agent.to_description();
+            match user_cfg.agents.get(label) {
+                None => to_insert.push((label.clone(), repo_desc)),
+                Some(global_desc) if *global_desc == repo_desc => {
+                    already_present.push(label.clone())
+                }
+                Some(_) => anyhow::bail!(
+                    "agent `{}` already exists in user-scope `agents` with a different definition; \
+                 rename it or reconcile before saving",
+                    label.as_str()
+                ),
+            }
+        }
+
+        // All checks passed — apply (single write). Every roster agent's
+        // description now lives in the library (just inserted, or already
+        // present and identical), so the team is published as REFERENCES
+        // — one source of truth, no duplicated definitions.
+        for (label, desc) in &to_insert {
+            user_cfg.agents.insert(label.clone(), desc.clone());
+        }
+        let team: TeamRoster = repo_cfg
+            .agents
+            .iter()
+            .map(|(label, agent)| {
+                (
+                    label.clone(),
+                    TeamMember::Ref(TeamRef {
+                        agent: None,
+                        role: agent.role,
+                    }),
+                )
+            })
+            .collect();
+        user_cfg.teams.insert(name.to_string(), team);
+        Ok((to_insert, already_present))
+    })?;
 
     let added: Vec<&str> = to_insert.iter().map(|(l, _)| l.as_str()).collect();
     let present: Vec<&str> = already_present.iter().map(|l| l.as_str()).collect();
@@ -382,18 +407,19 @@ pub fn save_team(home: &Path, repo: &Path, name: &str, force: bool) -> anyhow::R
 /// Delete a user-scope team. Requires `force` (clank can't see
 /// which repos are seeded from it).
 pub fn delete_team(home: &Path, team: &str, force: bool) -> anyhow::Result<()> {
-    let mut cfg = read_user_config(home)?;
-    if !cfg.teams.contains_key(team) {
-        anyhow::bail!("team `{team}` not in user-scope `teams`");
-    }
-    if !force {
-        anyhow::bail!(
-            "team `{team}` may have been used to seed a repo (`clank init --team {team}`). \
+    mutate_user_config(home, |cfg| {
+        if !cfg.teams.contains_key(team) {
+            anyhow::bail!("team `{team}` not in user-scope `teams`");
+        }
+        if !force {
+            anyhow::bail!(
+                "team `{team}` may have been used to seed a repo (`clank init --team {team}`). \
              Pass `--force` to delete anyway."
-        );
-    }
-    cfg.teams.remove(team);
-    write_user_config(home, &cfg)?;
+            );
+        }
+        cfg.teams.remove(team);
+        Ok(())
+    })?;
     eprintln!("deleted team `{team}` from user-scope");
     Ok(())
 }

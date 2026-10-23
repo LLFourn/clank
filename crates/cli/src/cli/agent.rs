@@ -1617,15 +1617,16 @@ pub fn declare_global_agent(
     label: &AgentLabel,
     desc: AgentDescription,
 ) -> anyhow::Result<()> {
-    let mut file = read_user_config(home)?;
-    if file.agents.contains_key(label) {
-        anyhow::bail!(
-            "agent `{}` already declared in user-scope `agents`",
-            label.as_str()
-        );
-    }
-    file.agents.insert(label.clone(), desc);
-    write_user_config(home, &file)?;
+    crate::cli::team::mutate_user_config(home, |file| {
+        if file.agents.contains_key(label) {
+            anyhow::bail!(
+                "agent `{}` already declared in user-scope `agents`",
+                label.as_str()
+            );
+        }
+        file.agents.insert(label.clone(), desc);
+        Ok(())
+    })?;
     eprintln!("declared `{}` in user-scope `agents`", label.as_str());
     Ok(())
 }
@@ -1986,22 +1987,23 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
 /// self-contained and left untouched.
 pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()> {
     use crate::cli::teams_config::TeamMember;
-    let mut file = read_user_config(home)?;
-    if file.agents.remove(label).is_none() {
-        anyhow::bail!("agent `{}` not in user-scope `agents`", label.as_str());
-    }
-    let mut touched = Vec::new();
-    for (name, team) in file.teams.iter_mut() {
-        let before = team.len();
-        team.retain(|key, member| match member {
-            TeamMember::Ref(r) => r.agent.as_ref().unwrap_or(key) != label,
-            TeamMember::Inline(_) => true,
-        });
-        if team.len() != before {
-            touched.push(name.clone());
+    let touched = crate::cli::team::mutate_user_config(home, |file| {
+        if file.agents.remove(label).is_none() {
+            anyhow::bail!("agent `{}` not in user-scope `agents`", label.as_str());
         }
-    }
-    write_user_config(home, &file)?;
+        let mut touched = Vec::new();
+        for (name, team) in file.teams.iter_mut() {
+            let before = team.len();
+            team.retain(|key, member| match member {
+                TeamMember::Ref(r) => r.agent.as_ref().unwrap_or(key) != label,
+                TeamMember::Inline(_) => true,
+            });
+            if team.len() != before {
+                touched.push(name.clone());
+            }
+        }
+        Ok(touched)
+    })?;
     if touched.is_empty() {
         eprintln!("removed `{}` from user-scope `agents`", label.as_str());
     } else {
@@ -2358,13 +2360,6 @@ fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
         Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
     }
-}
-
-/// Atomic write of `~/.clank/config.json`. Round-trip preserves
-/// `review`, `hooks`, and any unknown fields (via the `extra`
-/// flatten catchall on [`UserConfigFile`]).
-fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
-    crate::agent_store::write_typed_config(&home.join(".clank/config.json"), file)
 }
 
 /// Read `<repo>/.clank/config.json` as the typed
@@ -4012,7 +4007,7 @@ mod tests {
         let entries: Vec<_> = walk(home.path());
         assert_eq!(
             entries,
-            vec![".clank".to_string(), ".clank/config.json".to_string()]
+            [".clank", ".clank/config.json", ".clank/config.lock"].map(String::from)
         );
 
         fn walk(root: &Path) -> Vec<String> {

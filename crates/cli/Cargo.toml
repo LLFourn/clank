@@ -48,6 +48,7 @@ dunce = "1"
 clank-core = { path = "../core", features = ["cache-encoding"] }
 clank-web = { path = "../web" }
 clank-web-cloudflare = { path = "../web-cloudflare" }
+clank-user-config = { path = "../user-config" }
 wincode = { version = "0.5", features = ["derive"] }
 
 # JSON
@@ -151,6 +152,7 @@ sha2 = "0.11"
 # tls_trust gate so an incident root cannot return unnoticed.
 webpki-roots = "1.0.10"
 clank-web-cloudflare = { path = "../web-cloudflare", features = ["test-support"] }
+clank-user-config = { path = "../user-config", features = ["test-hooks"] }
 # Only to answer a handshake by hand in the live connector test.
 sha1 = "0.11.0"
 # test-only: the vendored assets are checked against the digest their

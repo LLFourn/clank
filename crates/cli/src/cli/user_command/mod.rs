@@ -2,22 +2,25 @@
 //! `! <command>` into the terminal of the agent that asked, and nothing
 //! else can.
 //!
-//! The site signs each request with an Ed25519 key only it holds; clank
-//! holds the public key and verifies, never signs. `submit` admits a
-//! request and reports; only the monitor dispatches, at most once, into an
-//! idle, empty Claude Code prompt, and only after verifying the stored
-//! envelope again. Same-UID limits are in the README ("User commands").
+//! Each site signs its requests with an Ed25519 key only it holds; clank
+//! holds the public keys, by name, and verifies, never signs. `submit`
+//! admits a request under whichever trusted key signed it and reports;
+//! only the monitor dispatches, at most once, into an idle, empty Claude
+//! Code prompt, and only after verifying the stored envelope again under
+//! that same key. Same-UID limits are in the README ("User commands").
 
 pub(crate) mod dispatch;
 pub(crate) mod envelope;
 pub(crate) mod live;
 pub(crate) mod store;
+pub(crate) mod trust;
 
 use clap::{Args, Subcommand};
 use envelope::{Envelope, Id, SiteKey, Verified};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use store::{Record, State, Status, Store};
+use trust::{KeyName, TrustSet};
 
 /// `clank user-command`.
 #[derive(Args, Debug)]
@@ -28,15 +31,29 @@ pub struct UserCommandArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum UserCommandCmd {
-    /// Trust the site's Ed25519 public key, read as base64 from stdin
+    /// Trust a site's Ed25519 public key, read as base64 from stdin
     ///
-    /// Prints the key's fingerprint. A different key already trusted is
-    /// kept unless `--replace` is given.
+    /// Stores it as `--name` and prints its fingerprint. A different key
+    /// already trusted as that name is kept unless `--replace` is given; a
+    /// key already trusted as another name is refused.
     TrustKey {
-        /// Replace a different key already trusted.
+        /// The site's name: 1 to 64 of [A-Za-z0-9_-].
+        #[arg(long, value_name = "SITE")]
+        name: String,
+        /// Replace a different key already trusted as that name.
         #[arg(long)]
         replace: bool,
     },
+    /// Stop trusting the key named `--name`
+    ///
+    /// Prints its fingerprint. Requests it admitted and not yet delivered are
+    /// refused at their next use.
+    UntrustKey {
+        #[arg(long, value_name = "SITE")]
+        name: String,
+    },
+    /// The trusted keys' names and fingerprints
+    Keys,
     /// Admit one signed request, read as a JSON envelope from stdin
     ///
     /// Prints the request's state as JSON. Only the repo's monitor
@@ -61,9 +78,21 @@ pub async fn run(args: UserCommandArgs) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("$HOME is not set"))?;
     match args.command {
-        UserCommandCmd::TrustKey { replace } => {
-            let fingerprint = trust_key(&home, &read_stdin(4096)?, replace)?;
+        UserCommandCmd::TrustKey { name, replace } => {
+            let fingerprint = trust_key(&home, &name, &read_stdin(4096)?, replace)?;
             println!("{fingerprint}");
+            Ok(())
+        }
+        UserCommandCmd::UntrustKey { name } => {
+            for fingerprint in untrust_key(&home, &name)? {
+                println!("{fingerprint}");
+            }
+            Ok(())
+        }
+        UserCommandCmd::Keys => {
+            for (name, key) in trust_set(&home).keys().map_err(anyhow::Error::msg)? {
+                println!("{name}\t{}", key.fingerprint());
+            }
             Ok(())
         }
         UserCommandCmd::Submit => {
@@ -71,7 +100,7 @@ pub async fn run(args: UserCommandArgs) -> anyhow::Result<()> {
             let admitted = admit(
                 &Store::home()?,
                 &text,
-                site_key(&home).as_ref(),
+                &trust_set(&home),
                 crate::cli::recovery::unix_now(),
                 target_check,
             );
@@ -118,35 +147,45 @@ fn read_stdin(max: usize) -> anyhow::Result<String> {
     Ok(text)
 }
 
-/// The trusted key as `~/.clank/config.json` holds it now; `None` when
-/// there is none, or what is there is not a key.
-pub(crate) fn site_key(home: &Path) -> Option<SiteKey> {
-    let config = crate::cli::team::read_user_config(home).ok()?;
-    SiteKey::parse(&config.user_command?.site_key).ok()
+/// The trusted keys as `~/.clank/config.json` holds them now.
+pub(crate) fn trust_set(home: &Path) -> TrustSet {
+    match crate::cli::team::read_user_config(home) {
+        Ok(config) => TrustSet::of(config.user_command.as_ref()),
+        Err(e) => TrustSet::unusable(format!("{e:#}")),
+    }
 }
 
-/// Trust the key in `text`, through the typed user-config writer, and say
-/// its fingerprint. A different key already trusted needs `replace`.
-pub(crate) fn trust_key(home: &Path, text: &str, replace: bool) -> anyhow::Result<String> {
+/// Trust the key in `text` as `name` and say its fingerprint.
+pub(crate) fn trust_key(
+    home: &Path,
+    name: &str,
+    text: &str,
+    replace: bool,
+) -> anyhow::Result<String> {
+    let name = KeyName::parse(name).map_err(anyhow::Error::msg)?;
     let key = SiteKey::parse(text).map_err(anyhow::Error::msg)?;
-    let mut config = crate::cli::team::read_user_config(home)?;
-    if let Some(section) = &config.user_command
-        && SiteKey::parse(&section.site_key).as_ref() != Ok(&key)
-        && !replace
-    {
-        anyhow::bail!(
-            "a different key ({}) is already trusted; pass --replace to replace it, which \
-             refuses every request it admitted at their next use",
-            SiteKey::parse(&section.site_key)
-                .map(|k| k.fingerprint())
-                .unwrap_or_else(|_| "unreadable".into())
-        );
-    }
-    config.user_command = Some(crate::cli::teams_config::UserCommandSection {
-        site_key: key.encoded(),
-    });
-    crate::cli::team::write_user_config(home, &config)?;
-    Ok(key.fingerprint())
+    crate::cli::team::mutate_user_config(home, |config| {
+        trust::trust(
+            config.user_command.get_or_insert_default(),
+            &name,
+            &key,
+            replace,
+        )?;
+        Ok(key.fingerprint())
+    })
+}
+
+/// Stop trusting `name`: the fingerprints no longer trusted.
+pub(crate) fn untrust_key(home: &Path, name: &str) -> anyhow::Result<Vec<String>> {
+    let name = KeyName::parse(name).map_err(anyhow::Error::msg)?;
+    crate::cli::team::mutate_user_config(home, |config| {
+        let section = config.user_command.get_or_insert_default();
+        let gone = trust::untrust(section, &name)?;
+        if section.keys.is_empty() {
+            config.user_command = None;
+        }
+        Ok(gone)
+    })
 }
 
 /// Whether a verified request's target is this machine's: its repo is a
@@ -170,23 +209,24 @@ fn target_check(v: &Verified) -> Result<(), String> {
     Ok(())
 }
 
-/// Admit the envelope in `text`: verify it under `key` at `now` before
-/// anything is parsed from it, check its target, then file it under its id.
-/// The same id with byte-identical signed payload answers with the record
-/// as it stands, and rewrites a waiting one so the monitor looks again;
-/// the same id with any other payload is a collision and changes nothing.
-/// Nothing is filed for a request that fails.
+/// Admit the envelope in `text`: verify it under whichever key in `trust`
+/// signed it, at `now`, before anything is parsed from it, check its target,
+/// then file it under its id, pinned to that key's entry. The same id with
+/// byte-identical signed payload answers with the record as it stands, pin
+/// included whichever key signed the repeat, and rewrites a waiting one so
+/// the monitor looks again; the same id with any other payload is a
+/// collision and changes nothing. Nothing is filed for a request that
+/// fails.
 pub(crate) fn admit(
     store: &Store,
     text: &str,
-    key: Option<&SiteKey>,
+    trust: &TrustSet,
     now: u64,
     check: impl Fn(&Verified) -> Result<(), String>,
 ) -> Result<Status, String> {
     let envelope = Envelope::parse(text).map_err(|e| e.to_string())?;
-    let verified = envelope::verify(&envelope, key, now).map_err(|e| e.to_string())?;
+    let (pin, verified) = trust.admit(&envelope, now).map_err(|e| e.to_string())?;
     check(&verified)?;
-    let key = key.expect("verified under a key");
     let tag = crate::cli::monitor::repo_tag(&verified.repo);
     let held = store
         .lock(&tag, &verified.agent, &verified.id)
@@ -205,7 +245,7 @@ pub(crate) fn admit(
             Ok(existing.status(&verified.id))
         }
         None => {
-            let record = Record::admitted(envelope, key.fingerprint(), now);
+            let record = Record::admitted(envelope, pin, now);
             held.save(&record).map_err(|e| format!("{e:#}"))?;
             Ok(record.status(&verified.id))
         }
@@ -229,6 +269,10 @@ mod tests {
 
     fn repo() -> PathBuf {
         PathBuf::from("/w/proj")
+    }
+
+    fn one(key: &SiteKey) -> TrustSet {
+        TrustSet::from_keys([("site", key.clone())])
     }
 
     fn ok(_: &Verified) -> Result<(), String> {
@@ -258,10 +302,11 @@ mod tests {
     fn a_verified_request_is_filed_as_admitted() {
         let w = world();
         let text = serde_json::to_string(&w.site.sign(&payload(&repo()))).unwrap();
-        let status = admit(&w.store, &text, Some(&w.site.key()), NOW, ok).unwrap();
+        let status = admit(&w.store, &text, &one(&w.site.key()), NOW, ok).unwrap();
         assert_eq!(status.state, State::Admitted);
         assert_eq!(status.id, "r1");
         assert_eq!(status.key, w.site.key().fingerprint());
+        assert_eq!(status.key_name, "site");
         assert_eq!(filed(&w.store), 1);
         let shown = serde_json::to_string(&status).unwrap();
         assert!(
@@ -279,29 +324,26 @@ mod tests {
         let mut long = payload(&repo());
         long["expires_at"] = (NOW + 601).into();
         let good = serde_json::to_string(&w.site.sign(&payload(&repo()))).unwrap();
-        let cases: Vec<(String, Option<SiteKey>, u64)> = vec![
-            (String::new(), Some(w.site.key()), NOW),
-            ("{\"request\":\"x\"}".into(), Some(w.site.key()), NOW),
+        let cases: Vec<(String, TrustSet, u64)> = vec![
+            (String::new(), one(&w.site.key()), NOW),
+            ("{\"request\":\"x\"}".into(), one(&w.site.key()), NOW),
             (
                 serde_json::to_string(&forger.sign(&payload(&repo()))).unwrap(),
-                Some(w.site.key()),
+                one(&w.site.key()),
                 NOW,
             ),
-            (good.clone(), Some(w.site.key()), NOW + 10_000),
+            (good.clone(), one(&w.site.key()), NOW + 10_000),
             (
                 serde_json::to_string(&w.site.sign(&long)).unwrap(),
-                Some(w.site.key()),
+                one(&w.site.key()),
                 NOW,
             ),
-            (good.clone(), None, NOW),
+            (good.clone(), TrustSet::of(None), NOW),
         ];
         for (text, key, now) in cases {
-            assert!(
-                admit(&w.store, &text, key.as_ref(), now, ok).is_err(),
-                "{text}"
-            );
+            assert!(admit(&w.store, &text, &key, now, ok).is_err(), "{text}");
         }
-        let elsewhere = admit(&w.store, &good, Some(&w.site.key()), NOW, |_| {
+        let elsewhere = admit(&w.store, &good, &one(&w.site.key()), NOW, |_| {
             Err("the session it names does not hold the label".into())
         });
         assert!(elsewhere.is_err());
@@ -316,7 +358,7 @@ mod tests {
         let w = world();
         let key = w.site.key();
         let text = serde_json::to_string(&w.site.sign(&payload(&repo()))).unwrap();
-        admit(&w.store, &text, Some(&key), NOW, ok).unwrap();
+        admit(&w.store, &text, &one(&key), NOW, ok).unwrap();
         let tag = crate::cli::monitor::repo_tag(&repo());
         let (label, id) = w.store.list(&tag).remove(0);
         let mut record = w.store.read(&tag, &label, &id).unwrap().unwrap();
@@ -326,13 +368,13 @@ mod tests {
             .unwrap()
             .save(&record)
             .unwrap();
-        let again = admit(&w.store, &text, Some(&key), NOW + 2, ok).unwrap();
+        let again = admit(&w.store, &text, &one(&key), NOW + 2, ok).unwrap();
         assert_eq!(again.state, State::Delivered);
         let mut other = payload(&repo());
         other["command"] = "git push --force".into();
         let collision = serde_json::to_string(&w.site.sign(&other)).unwrap();
         assert!(
-            admit(&w.store, &collision, Some(&key), NOW, ok)
+            admit(&w.store, &collision, &one(&key), NOW, ok)
                 .unwrap_err()
                 .contains("already names a different request")
         );
@@ -346,29 +388,133 @@ mod tests {
         let w = world();
         let key = w.site.key();
         let text = serde_json::to_string(&w.site.sign(&payload(&repo()))).unwrap();
-        admit(&w.store, &text, Some(&key), NOW, ok).unwrap();
+        admit(&w.store, &text, &one(&key), NOW, ok).unwrap();
         let tag = crate::cli::monitor::repo_tag(&repo());
         let (label, id) = w.store.list(&tag).remove(0);
         let before = w.store.stamp(&tag, &label, &id);
-        admit(&w.store, &text, Some(&key), NOW, ok).unwrap();
+        admit(&w.store, &text, &one(&key), NOW, ok).unwrap();
         assert_ne!(w.store.stamp(&tag, &label, &id), before);
+    }
+
+    /// A repeat of an admitted payload signed by another trusted key
+    /// answers with the record as it stands: still pinned to the key that
+    /// admitted it, its envelope that key's.
+    #[test]
+    fn a_repeat_under_another_key_keeps_its_pin() {
+        let w = world();
+        let other = Signer::generate();
+        let trust = TrustSet::from_keys([("site-a", w.site.key()), ("site-b", other.key())]);
+        let first = w.site.sign(&payload(&repo()));
+        let text = |e: &Envelope| serde_json::to_string(e).unwrap();
+        admit(&w.store, &text(&first), &trust, NOW, ok).unwrap();
+        let tag = crate::cli::monitor::repo_tag(&repo());
+        let (label, id) = w.store.list(&tag).remove(0);
+        let before = w.store.read(&tag, &label, &id).unwrap().unwrap();
+        let again = admit(
+            &w.store,
+            &text(&other.sign(&payload(&repo()))),
+            &trust,
+            NOW,
+            ok,
+        )
+        .unwrap();
+        assert_eq!(
+            (again.key_name.as_str(), again.key.as_str()),
+            ("site-a", w.site.key().fingerprint().as_str())
+        );
+        assert_eq!(w.store.read(&tag, &label, &id).unwrap().unwrap(), before);
+    }
+
+    fn config(home: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(home.join(".clank/config.json")).unwrap()).unwrap()
+    }
+
+    /// A config written before keys had names: its one key reads as
+    /// `default`, the first trust mutation moves it into the named set and
+    /// keeps every unrelated field, and untrusting `default` then leaves no
+    /// copy to read back.
+    #[test]
+    fn the_legacy_key_migrates_as_default_and_is_consumed() {
+        let home = tempfile::tempdir().unwrap();
+        let (old, b) = (Signer::generate().key(), Signer::generate().key());
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "auto": "on",
+                "a_later_field": [1, 2],
+                "user_command": {"site_key": old.encoded()},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            trust_set(home.path()),
+            TrustSet::from_keys([("default", old.clone())])
+        );
+        trust_key(home.path(), "site-b", &b.encoded(), false).unwrap();
+        let written = config(home.path());
+        assert_eq!(written["auto"], "on");
+        assert_eq!(written["a_later_field"], serde_json::json!([1, 2]));
+        assert_eq!(
+            written["user_command"],
+            serde_json::json!({"keys": {"default": old.encoded(), "site-b": b.encoded()}})
+        );
+        assert_eq!(
+            untrust_key(home.path(), "default").unwrap(),
+            vec![old.fingerprint()]
+        );
+        assert_eq!(
+            trust_set(home.path()),
+            TrustSet::from_keys([("site-b", b.clone())])
+        );
+        untrust_key(home.path(), "site-b").unwrap();
+        assert_eq!(trust_set(home.path()), TrustSet::of(None));
+        assert_eq!(config(home.path())["auto"], "on");
     }
 
     #[test]
     fn trusting_a_key_needs_replace_to_change_it() {
         let home = tempfile::tempdir().unwrap();
-        let first = Signer::generate().key();
-        let second = Signer::generate().key();
+        let (first, second, third) = (
+            Signer::generate().key(),
+            Signer::generate().key(),
+            Signer::generate().key(),
+        );
         assert_eq!(
-            trust_key(home.path(), &first.encoded(), false).unwrap(),
+            trust_key(home.path(), "a", &first.encoded(), false).unwrap(),
             first.fingerprint()
         );
-        assert_eq!(site_key(home.path()), Some(first.clone()));
-        assert!(trust_key(home.path(), &first.encoded(), false).is_ok());
-        assert!(trust_key(home.path(), &second.encoded(), false).is_err());
-        assert_eq!(site_key(home.path()), Some(first));
-        trust_key(home.path(), &second.encoded(), true).unwrap();
-        assert_eq!(site_key(home.path()), Some(second));
-        assert!(trust_key(home.path(), "not a key", true).is_err());
+        trust_key(home.path(), "b", &third.encoded(), false).unwrap();
+        assert!(trust_key(home.path(), "a", &first.encoded(), false).is_ok());
+        assert!(trust_key(home.path(), "a", &second.encoded(), false).is_err());
+        trust_key(home.path(), "a", &second.encoded(), true).unwrap();
+        assert_eq!(
+            trust_set(home.path()),
+            TrustSet::from_keys([("a", second), ("b", third)])
+        );
+        assert!(trust_key(home.path(), "a", "not a key", true).is_err());
+        assert!(trust_key(home.path(), "../a", &first.encoded(), true).is_err());
+        assert!(untrust_key(home.path(), "nobody").is_err());
+    }
+
+    /// Concurrent trust mutations each land: none reads the config, waits on
+    /// another's write, and writes back a set without it.
+    #[test]
+    fn concurrent_trust_mutations_lose_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let keys: Vec<SiteKey> = (0..24).map(|_| Signer::generate().key()).collect();
+        let start = std::sync::Barrier::new(keys.len());
+        std::thread::scope(|s| {
+            for (n, key) in keys.iter().enumerate() {
+                let (home, start) = (home.path(), &start);
+                s.spawn(move || {
+                    start.wait();
+                    trust_key(home, &format!("site-{n}"), &key.encoded(), false).unwrap();
+                });
+            }
+        });
+        let trusted = trust_set(home.path());
+        assert_eq!(trusted.keys().unwrap().len(), keys.len(), "{trusted:?}");
     }
 }
