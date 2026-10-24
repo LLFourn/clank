@@ -178,7 +178,7 @@ impl Fixture {
             ])
             .await;
         assert!(String::from_utf8_lossy(&out.stdout).contains("advertised Stop=true"));
-        for role in ["clank-master", "clank-reviewer"] {
+        for role in ["clank-master", "clank-reviewer", "clank-standby"] {
             let body =
                 std::fs::read_to_string(self.grok.join("skills").join(role).join("SKILL.md"))
                     .unwrap();

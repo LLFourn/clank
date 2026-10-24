@@ -85,7 +85,7 @@ clank doctor      # verify
 ```
 
 `setup` installs the role-split skills (`clank-master`,
-`clank-reviewer`, plus `clank-github`) into `~/.claude/`,
+`clank-reviewer`, `clank-standby`, plus `clank-github`) into `~/.claude/`,
 `~/.codex/`, `~/.grok/`, and `~/.config/opencode/`, a `/clank` slash
 command for claude, the clank opencode plugin
 (`~/.config/opencode/plugin/clank.js` — session binding + work loop),
@@ -653,10 +653,10 @@ Only `plans/`, `finished/`, and the managed `.clank/.gitignore` are
 committed. Everything else is per-user state.
 
 ```
-~/.claude/skills/{clank-master,clank-reviewer,clank-github}/
-~/.codex/skills/{clank-master,clank-reviewer,clank-github}/
-~/.grok/skills/{clank-master,clank-reviewer,clank-github}/
-~/.config/opencode/skills/{clank-master,clank-reviewer,clank-github}/
+~/.claude/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
+~/.codex/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
+~/.grok/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
+~/.config/opencode/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
 ~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
 ~/.claude/settings.json             # claude Stop + SessionStart hooks merged in
 ~/.codex/hooks.json                 # codex Stop + SessionStart hooks merged in

@@ -41,7 +41,7 @@ cargo install --path crates/cli --locked</code></pre>
 clank doctor</code></pre>
 <p><code>clank setup</code> installs, at user level:</p>
 <ul>
-  <li>the role skills <code>clank-master</code> and <code>clank-reviewer</code>, plus <code>clank-github</code>, for each tool;</li>
+  <li>the role skills <code>clank-master</code>, <code>clank-reviewer</code> and <code>clank-standby</code>, plus <code>clank-github</code>, for each tool;</li>
   <li>clank’s Stop and SessionStart hooks, merged into Claude Code’s <code>settings.json</code> and Codex’s <code>hooks.json</code>;</li>
   <li>Grok’s native hooks, in <code>~/.grok/hooks/clank.json</code>;</li>
   <li>the opencode plugin, which binds the session and carries its work loop.</li>

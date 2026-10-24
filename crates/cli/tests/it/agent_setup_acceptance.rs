@@ -24,7 +24,7 @@ impl Fixture {
 if '--version' in sys.argv:
  print('2.1.0 (Claude Code)'); sys.exit(0)
 r=pathlib.Path(os.environ['EXPECTED_ROOT'])
-for name in ['clank-master','clank-reviewer','clank-github']:
+for name in ['clank-master','clank-reviewer','clank-standby','clank-github']:
  assert (r/'skills'/name/'SKILL.md').is_file(), name
 tool=os.environ['EXPECTED_TOOL']
 required={'claude':'settings.json','codex':'hooks.json','opencode':'plugin/clank.js'}[tool]

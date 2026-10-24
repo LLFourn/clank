@@ -25,6 +25,7 @@ use super::SetupArgs;
 const SKILL_SHARED_CORE: &str = include_str!("setup_assets/skill_shared_core.md");
 const SKILL_MASTER_BODY: &str = include_str!("setup_assets/skill_master.md");
 const SKILL_REVIEWER_BODY: &str = include_str!("setup_assets/skill_reviewer.md");
+const SKILL_STANDBY_BODY: &str = include_str!("setup_assets/skill_standby.md");
 const SKILL_SLASH_COMMAND: &str = include_str!("setup_assets/skill_slash_command.md");
 
 /// The github event-inbox skill (github-offline-catchup). Tool-neutral:
@@ -37,9 +38,10 @@ pub const GITHUB_SKILL_BODY: &str = include_str!("setup_assets/github_events_ski
 /// invariants pinned by tests below; installed by `clank setup`.
 pub const OPENCODE_PLUGIN: &str = include_str!("setup_assets/opencode_plugin.js");
 
-/// The two role skills, by their `~/.<tool>/skills/<name>/` dir name.
+/// The role skills, by their `~/.<tool>/skills/<name>/` dir name.
 const MASTER_SKILL: &str = "clank-master";
 const REVIEWER_SKILL: &str = "clank-reviewer";
+const STANDBY_SKILL: &str = "clank-standby";
 /// The pre-split single skill, removed on setup.
 const OBSOLETE_SKILL: &str = "clank";
 
@@ -51,8 +53,27 @@ const RETIRED_ASSETS: &[&str] = &["skills/clank-pr-review/SKILL.md"];
 /// Lead with the role guard ("Use ONLY when … Do NOT use …") and name
 /// the other skill, so an agent never loads the wrong role's skill (and
 /// runs commands it must never touch).
-const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement complete plans, promote/finish plans, manage the roster). Do NOT use as a reviewer or on standby — use clank-reviewer instead.";
-const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER and STANDBY roles. Use ONLY when you are a reviewer or on standby in a clank repo. Do NOT use as the master — use clank-master instead.";
+const MASTER_DESC: &str = "Clank multi-agent workflow, MASTER role. Use ONLY when you are the master in a clank repo (implement complete plans, promote/finish plans, manage the roster). Do NOT use as a reviewer or on standby — use clank-reviewer or clank-standby instead.";
+const REVIEWER_DESC: &str = "Clank multi-agent workflow, REVIEWER role. Use ONLY when you are a reviewer in a clank repo (you review commits and write verdicts). Do NOT use as the master or on standby — use clank-master or clank-standby instead.";
+const STANDBY_DESC: &str = "Clank multi-agent workflow, STANDBY role. Use ONLY when you are on standby in a clank repo (you review nothing; you are woken for events and messages). Do NOT use as the master or a reviewer — use clank-master or clank-reviewer instead.";
+
+/// Every role skill: its role, dir name, description and body. The one
+/// place a role is mapped to its skill.
+const ROLE_SKILLS: [(Role, &str, &str, &str); 3] = [
+    (Role::Master, MASTER_SKILL, MASTER_DESC, SKILL_MASTER_BODY),
+    (
+        Role::Reviewer,
+        REVIEWER_SKILL,
+        REVIEWER_DESC,
+        SKILL_REVIEWER_BODY,
+    ),
+    (
+        Role::Standby,
+        STANDBY_SKILL,
+        STANDBY_DESC,
+        SKILL_STANDBY_BODY,
+    ),
+];
 
 /// Claude's Stop hook owns its wait and returns the wake as a
 /// continuation. The agent ends its turn; it does not arm a task.
@@ -191,33 +212,22 @@ pub fn compose_skill(role: Role, tool: Tool) -> String {
 /// it encodes in the hook entry, and doctor verifies with the same
 /// value — the skill on disk always matches the installed loop.
 pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String {
-    // The guard belongs to the SKILL, not to one role: the reviewer
-    // skill serves standby agents too, and a guard naming only
-    // `reviewer` tells a standby agent to switch to the master's.
-    let (name, description, body, guard) = match role {
-        Role::Master => (
-            MASTER_SKILL,
-            MASTER_DESC,
-            SKILL_MASTER_BODY,
-            format!(
-                "> ROLE GUARD: this skill is for the **master** role. If your role \
-                 in this repo is not master, stop and use `{REVIEWER_SKILL}` instead — \
-                 your role is what `clank status` and your work items report.\n\n"
-            ),
-        ),
-        Role::Reviewer | Role::Standby => (
-            REVIEWER_SKILL,
-            REVIEWER_DESC,
-            SKILL_REVIEWER_BODY,
-            format!(
-                "> ROLE GUARD: this skill is for the **reviewer** and **standby** \
-                 roles. If your role in this repo is neither, stop and use \
-                 `{MASTER_SKILL}` instead — your role is what `clank status` and your \
-                 work items report. A standby agent writes no verdicts and handles \
-                 every other item as usual.\n\n"
-            ),
-        ),
-    };
+    let (_, name, description, body) = ROLE_SKILLS
+        .into_iter()
+        .find(|(r, ..)| *r == role)
+        .expect("every role has a skill");
+    let others: Vec<String> = ROLE_SKILLS
+        .iter()
+        .filter(|(r, ..)| *r != role)
+        .map(|(_, skill, ..)| format!("`{skill}`"))
+        .collect();
+    let guard = format!(
+        "> ROLE GUARD: this skill is for the **{role}** role. If your role in this \
+         repo is not {role}, stop and use {} instead — your role is what \
+         `clank status` and your work items report.\n\n",
+        others.join(" or "),
+        role = role.as_str(),
+    );
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str(&format!("name: {name}\n"));
@@ -322,10 +332,7 @@ pub(super) fn provider_asset_inventory(tool: Tool, claude_async: bool) -> Vec<Ow
         canonical_alternates: Vec::new(),
     };
     let mut out = Vec::new();
-    for (role, skill) in [
-        (Role::Master, MASTER_SKILL),
-        (Role::Reviewer, REVIEWER_SKILL),
-    ] {
+    for (role, skill, ..) in ROLE_SKILLS {
         let canonical_alternates = if tool == Tool::Claude {
             vec![compose_skill_with(role, tool, !claude_async)]
         } else {
@@ -2530,39 +2537,57 @@ mod tests {
         }
     }
 
-    /// One skill serves reviewers and standby agents, and it tells a
-    /// standby agent to write no verdicts without telling it to ignore
-    /// anything else it is woken with
-    /// (a-standby-agent-wakes-only-for-messages).
+    /// Each role has its own skill, and each skill's description and guard
+    /// name its own role and send the others to their own skills. A
+    /// standby agent is told about events and messages only: none of the
+    /// reviewer's loop or verdicts, which no longer mention standby.
     #[test]
-    fn the_reviewer_skill_serves_standby_without_narrowing_what_it_handles() {
+    fn each_role_has_its_own_skill_and_names_the_others() {
+        let skills = [
+            (Role::Master, "clank-master"),
+            (Role::Reviewer, "clank-reviewer"),
+            (Role::Standby, "clank-standby"),
+        ];
         for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
-            let reviewer = compose_skill(Role::Reviewer, tool);
-            assert_eq!(
-                compose_skill(Role::Standby, tool),
-                reviewer,
-                "{tool:?}: one skill serves both"
-            );
-            let guard = reviewer
-                .lines()
-                .find(|l| l.starts_with("> ROLE GUARD"))
-                .unwrap();
-            assert!(
-                guard.contains("**standby**") && guard.contains("writes no verdicts"),
-                "{tool:?}: {guard}"
-            );
-            for narrowing in ["messages only", "only messages", "act on messages"] {
-                assert!(!guard.contains(narrowing), "{tool:?}: {guard}");
+            for (role, name) in skills {
+                let skill = compose_skill(role, tool);
+                let line = |prefix: &str| {
+                    skill
+                        .lines()
+                        .find(|l| l.starts_with(prefix))
+                        .unwrap()
+                        .to_string()
+                };
+                assert_eq!(line("name:"), format!("name: {name}"), "{tool:?}");
+                let (description, guard) = (line("description:"), line("> ROLE GUARD"));
+                assert!(
+                    description.contains(&role.as_str().to_uppercase()),
+                    "{tool:?}: {description}"
+                );
+                assert!(
+                    guard.contains(&format!("**{}**", role.as_str())),
+                    "{tool:?}: {guard}"
+                );
+                for (other, other_name) in skills.iter().filter(|(r, _)| *r != role) {
+                    for text in [&description, &guard] {
+                        assert!(
+                            text.contains(other_name),
+                            "{tool:?} {role:?} must name {other:?}'s skill: {text}"
+                        );
+                    }
+                }
             }
-            let description = reviewer
-                .lines()
-                .find(|l| l.starts_with("description:"))
-                .unwrap();
-            assert!(description.contains("standby"), "{tool:?}: {description}");
-            assert!(
-                !compose_skill(Role::Master, tool).contains("**standby**"),
-                "{tool:?}: the master skill's guard is the master's alone"
-            );
+            let standby = compose_skill(Role::Standby, tool);
+            assert!(standby.contains("clank events read <sel>"), "{tool:?}");
+            for reviewers_only in ["You are a REVIEWER", "### Verdicts", "### The loop"] {
+                assert!(
+                    !standby.contains(reviewers_only),
+                    "{tool:?}: {reviewers_only}"
+                );
+            }
+            let reviewer = compose_skill(Role::Reviewer, tool);
+            assert!(!reviewer.contains("**standby**"), "{tool:?}");
+            assert!(!reviewer.contains("standby agent"), "{tool:?}");
         }
     }
 
@@ -2594,10 +2619,7 @@ mod tests {
         // 5,667B before the compression that introduced this test, at
         // 5,300. Raised by the 285B the inbox section costs — every role
         // must be told how a message is handled
-        // (a-message-wakes-its-agent-until-it-is-handled) — and by the
-        // 112B that let the guard and description admit standby agents,
-        // who would otherwise be told to use the master's skill
-        // (a-standby-agent-wakes-only-for-messages).
+        // (a-message-wakes-its-agent-until-it-is-handled).
         const CEILING: usize = 5_700;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
@@ -2694,14 +2716,14 @@ mod tests {
                     .contains("You never run finish / promote / roster / plan-authoring commands"),
                 "reviewer must STATE the reviewer-only command prohibition ({tool:?})"
             );
-            for body in [&master, &reviewer] {
+            for body in [&master, &reviewer, &compose_skill(Role::Standby, tool)] {
                 assert!(
                     body.contains("ROLE GUARD"),
                     "the guard is generated, not an asset — it must survive composition ({tool:?})"
                 );
                 assert!(
                     body.contains(work_loop(tool, false).prohibition),
-                    "both roles must carry the work-loop prohibition ({tool:?})"
+                    "every role must carry the work-loop prohibition ({tool:?})"
                 );
             }
         }
@@ -3680,7 +3702,12 @@ mod tests {
         // impossible — this test just pins the expected shape.
         let inv = user_asset_inventory(false);
         for (_, dir) in TOOL_SKILL_DIRS {
-            for skill in ["clank-master", "clank-reviewer", "clank-github"] {
+            for skill in [
+                "clank-master",
+                "clank-reviewer",
+                "clank-standby",
+                "clank-github",
+            ] {
                 let rel = format!("{dir}/skills/{skill}/SKILL.md");
                 assert!(inv.iter().any(|a| a.rel == rel), "missing {rel}");
             }
@@ -3690,7 +3717,7 @@ mod tests {
                 .any(|a| a.rel == ".config/opencode/plugin/clank.js"
                     && a.expected == OPENCODE_PLUGIN)
         );
-        assert_eq!(inv.len(), TOOL_SKILL_DIRS.len() * 3 + 1);
+        assert_eq!(inv.len(), TOOL_SKILL_DIRS.len() * 4 + 1);
     }
 
     #[test]
