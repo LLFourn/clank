@@ -719,6 +719,11 @@ clank agent add web --tool codex --review standby \
 nothing kept from before; `--clear` goes back to the bare tool. The agent keeps
 its role, session and pane, and the change applies from its next start.
 
+clank always starts Codex with `--no-daemon`, adding it when the launch doesn't
+already have it. Codex's shared app-server daemon runs every attached session's
+hooks and shell commands in the environment of the pane that first started it,
+so a session hosted there reads as that pane's agent.
+
 Keep the launch line to the few flags that select a configuration. Structured
 tool configuration (MCP servers, feature switches, allow-lists) belongs in the
 tool's own config file, or in a per-agent home (`--env CODEX_HOME=…`) when only

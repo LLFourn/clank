@@ -546,6 +546,21 @@ fn repo_as_given(args: &AgentStartArgs, resolved: &Path) -> String {
         .into_owned()
 }
 
+/// The profile's args, plus what every launch of `tool` must carry.
+/// Codex gets `--no-daemon`: in the shared app-server daemon its hooks
+/// and shell commands inherit the environment of whichever pane first
+/// started the daemon, `CLANK_AGENT` included, and so read as that
+/// pane's agent (an-inherited-agent-name-is-not-an-identity).
+fn launch_args(tool: Tool, launch: Option<&LaunchConfig>) -> Vec<String> {
+    let mut args = launch.map(|l| l.args.clone()).unwrap_or_default();
+    if tool == Tool::Codex && !args.iter().any(|a| a == CODEX_NO_DAEMON) {
+        args.push(CODEX_NO_DAEMON.into());
+    }
+    args
+}
+
+const CODEX_NO_DAEMON: &str = "--no-daemon";
+
 fn launch_program(tool: Tool, launch: Option<&LaunchConfig>) -> String {
     launch
         .and_then(|l| l.command.clone())
@@ -703,11 +718,7 @@ fn compose_bootstrap_launch(
         .and_then(|l| l.command.clone())
         .unwrap_or_else(|| desc.tool.as_str().to_string());
 
-    let mut args = desc
-        .launch
-        .as_ref()
-        .map(|l| l.args.clone())
-        .unwrap_or_default();
+    let mut args = launch_args(desc.tool, desc.launch.as_ref());
     if desc.tool == Tool::Grok {
         args.extend(["--cwd".to_string(), repo.to_string_lossy().into_owned()]);
     }
@@ -757,11 +768,7 @@ fn compose_fork_launch(
         .as_ref()
         .and_then(|l| l.command.clone())
         .unwrap_or_else(|| spec.tool.as_str().to_string());
-    let mut args = desc
-        .launch
-        .as_ref()
-        .map(|l| l.args.clone())
-        .unwrap_or_default();
+    let mut args = launch_args(spec.tool, desc.launch.as_ref());
     // Boundary TWO. The seed was validated when the fork was built,
     // but a transcript can be deleted in between, and `--resume` on a
     // dead one exits immediately with no pane and no error. Re-probe
@@ -1097,11 +1104,9 @@ fn compose_launch(
     let tool = session.tool;
     let program = launch_program(tool, launch);
 
-    let launch_args = launch.map(|l| l.args.clone()).unwrap_or_default();
-
     let session_restore = session_restore_args(tool, session.id.as_str(), repo);
 
-    let mut args = launch_args;
+    let mut args = launch_args(tool, launch);
     args.extend(session_restore);
     push_grok_trust(tool, &mut args);
     let name = session_display_name(repo, label);
@@ -4083,6 +4088,59 @@ mod tests {
         );
     }
 
+    /// A daemon-hosted Codex runs its hooks in another pane's
+    /// environment, so every way clank starts Codex leaves the daemon
+    /// out, once, whatever the profile says, and no other tool gets
+    /// the flag.
+    #[test]
+    fn every_codex_launch_runs_outside_the_daemon() {
+        let count = |c: &ComposedLaunch| c.args.iter().filter(|a| *a == "--no-daemon").count();
+        let profiled = LaunchConfig {
+            args: vec![
+                "--no-daemon".into(),
+                "--disable".into(),
+                "shell_snapshot".into(),
+            ],
+            ..Default::default()
+        };
+        let wt = Path::new("/repo/.clank/worktrees/w");
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+            let want = usize::from(tool == Tool::Codex);
+            for launch in [None, Some(profiled.clone())] {
+                let desc = desc_with(tool, launch.clone());
+                let profile_has = usize::from(launch.is_some());
+                let expected = want.max(profile_has);
+                let fresh = compose_bootstrap_launch(Path::new("/repo"), &lbl("p"), &desc).unwrap();
+                assert_eq!(count(&fresh), expected, "{tool:?} fresh: {:?}", fresh.args);
+                let session = Session {
+                    tool,
+                    ..codex_session()
+                };
+                let resumed = compose_launch(
+                    Path::new("/repo"),
+                    &lbl("p"),
+                    &session,
+                    launch.as_ref(),
+                    None,
+                );
+                assert_eq!(
+                    count(&resumed),
+                    expected,
+                    "{tool:?} resume: {:?}",
+                    resumed.args
+                );
+                let spec = crate::cli::fork::ForkSpec {
+                    grok: None,
+                    tool,
+                    from_session: Some("src-session".into()),
+                    prompt: "orient".into(),
+                };
+                let forked = compose_fork_launch(&lbl("p"), &spec, &desc, wt, None);
+                assert_eq!(count(&forked), expected, "{tool:?} fork: {:?}", forked.args);
+            }
+        }
+    }
+
     #[test]
     fn compose_launch_appends_initial_prompt_when_set() {
         let s = claude_session();
@@ -4564,7 +4622,10 @@ mod tests {
             composed.args,
             // No name flag for this tool, so the title is DERIVED
             // from the opening message and the name has to lead it.
-            vec!["repo · phantom — Session started.".to_string()]
+            vec![
+                "--no-daemon".to_string(),
+                "repo · phantom — Session started.".to_string()
+            ]
         );
     }
 
@@ -4990,7 +5051,7 @@ mod tests {
         assert_eq!(c.program, "codex");
         assert_eq!(
             c.args,
-            vec!["x · tester — orient"],
+            vec!["--no-daemon", "x · tester — orient"],
             "no fork/-C argv without a source session"
         );
     }
@@ -5119,6 +5180,7 @@ mod tests {
         assert_eq!(
             c.args,
             vec![
+                "--no-daemon",
                 "fork",
                 "-C",
                 "/repo/.clank/worktrees/x",
