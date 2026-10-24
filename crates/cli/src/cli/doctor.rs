@@ -1097,10 +1097,6 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     const SECTION: &str = "session";
     let mut out = Vec::<CheckResult>::new();
 
-    // Read CLANK_AGENT FIRST. The pure resolver's precedence
-    // says the explicit override wins before any session env is
-    // touched; doctor must mirror that or it'll report failures
-    // for states `clank wait` / `clank auto` happily accept.
     let explicit = match explicit_label_from_env() {
         Ok(e) => e,
         Err(e) => {
@@ -1116,15 +1112,16 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
         out.push(CheckResult::ok(
             SECTION,
             "CLANK_AGENT",
-            format!("explicit override active: `{}`", label.as_str()),
+            format!(
+                "set to `{}`: names you only outside an agent session; inside one, \
+                 the session's binding does",
+                label.as_str()
+            ),
         ));
     }
 
-    // Now report session env. Session-env errors are ALWAYS Warn
-    // (never Fail) so they can't block the identity check below
-    // when CLANK_AGENT's override would still resolve. The
-    // resolver itself is the authoritative success/failure
-    // signal for whether downstream commands will work.
+    // Session-env errors Warn here; the identity check below, through
+    // the same resolver every command uses, is the verdict on them.
     let detected: Option<(clank_core::Tool, clank_core::ids::SessionId)> =
         match detect_session_from_env() {
             Ok(d) => {
@@ -1167,11 +1164,8 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
         return out;
     };
 
-    // Identity resolution: go through the SAME resolver `clank
-    // wait` / `clank auto` use, so doctor never disagrees with
-    // what those commands would do. Critically, this honors the
-    // CLANK_AGENT > session-binding precedence — an explicit
-    // override succeeds even without a matching session config.
+    // The SAME resolver `clank wait` / `clank auto` use, so doctor
+    // never disagrees with what those commands would do.
     let resolved = match resolve_identity_from_env(repo) {
         Ok(label) => label,
         Err(e) => {
@@ -1195,17 +1189,18 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     out
 }
 
-/// Describe WHERE the resolver got the label: explicit
-/// CLANK_AGENT override vs which agent's session binding
-/// matched. Pure diagnostic — the resolved label itself is the
-/// authoritative answer.
+/// Describe WHERE the resolver got the label: the CLANK_AGENT
+/// override outside a session, or the session's binding. Pure
+/// diagnostic — the resolved label itself is the authoritative
+/// answer.
 fn describe_identity_source(
     repo: &Path,
     resolved: &clank_core::ids::AgentLabel,
     detected: &Option<(clank_core::vocab::Tool, clank_core::ids::SessionId)>,
     explicit: &Option<clank_core::ids::AgentLabel>,
 ) -> String {
-    if let Some(label) = explicit
+    if detected.is_none()
+        && let Some(label) = explicit
         && label == resolved
     {
         return format!(
@@ -1976,91 +1971,47 @@ mod tests {
         );
     }
 
+    /// Broken session variables are an identity failure even with
+    /// CLANK_AGENT set: falling back to the name would hand a
+    /// conflicting or malformed session whatever label it inherited.
     #[test]
-    fn session_checks_clank_agent_override_wins_over_both_session_envs() {
-        // Regression: codex 7108d87 — env detection was bailing
-        // on the both-set case BEFORE the resolver got a chance.
-        // With CLANK_AGENT set, resolver succeeds via override
-        // even when both session env vars are set (leaked from
-        // a parent shell). Env should Warn, identity should OK.
+    fn broken_session_env_is_not_rescued_by_clank_agent() {
         let dir = init_git_repo();
         let repo = dir.path().to_path_buf();
-
-        with_env(
-            &[
-                ("CLANK_AGENT", "alice"),
-                (
-                    "CLAUDE_CODE_SESSION_ID",
-                    "742f6a04-f174-409a-ab01-419a16c5f372",
-                ),
-                ("CODEX_THREAD_ID", "019e5385-ed97-7603-8561-dd9024328ff9"),
-            ],
-            &[],
-            || {
+        let cases: [(&[(&str, &str)], &[&str]); 2] = [
+            (
+                &[
+                    ("CLANK_AGENT", "alice"),
+                    (
+                        "CLAUDE_CODE_SESSION_ID",
+                        "742f6a04-f174-409a-ab01-419a16c5f372",
+                    ),
+                    ("CODEX_THREAD_ID", "019e5385-ed97-7603-8561-dd9024328ff9"),
+                ],
+                &[],
+            ),
+            (
+                &[
+                    ("CLANK_AGENT", "alice"),
+                    ("CLAUDE_CODE_SESSION_ID", "not/a/valid/session"),
+                ],
+                &["CODEX_THREAD_ID"],
+            ),
+        ];
+        for (set, unset) in cases {
+            with_env(set, unset, || {
                 let results = session_checks(Some(&repo));
-                let env = results
-                    .iter()
-                    .find(|r| r.name == "env")
-                    .expect("env check ran");
-                assert_eq!(
-                    env.status,
-                    CheckStatus::Warn,
-                    "both-set env should Warn (not Fail) so identity can resolve via override: {}",
-                    env.message
-                );
-                let identity = results
-                    .iter()
-                    .find(|r| r.name == "identity")
-                    .expect("identity check ran");
+                let check = |name: &str| results.iter().find(|r| r.name == name).unwrap();
+                assert_eq!(check("env").status, CheckStatus::Warn, "{set:?}");
+                let identity = check("identity");
                 assert_eq!(
                     identity.status,
-                    CheckStatus::Ok,
-                    "identity must resolve via override despite env warn; got {:?}: {}",
-                    identity.status,
+                    CheckStatus::Fail,
+                    "{set:?}: {}",
                     identity.message
                 );
-                assert!(identity.message.contains("alice"));
-            },
-        );
-    }
-
-    #[test]
-    fn session_checks_clank_agent_override_wins_over_malformed_session_env() {
-        // Same precedence: an unparseable session id env
-        // shouldn't block identity when CLANK_AGENT is set.
-        let dir = init_git_repo();
-        let repo = dir.path().to_path_buf();
-
-        with_env(
-            &[
-                ("CLANK_AGENT", "alice"),
-                ("CLAUDE_CODE_SESSION_ID", "not/a/valid/session"),
-            ],
-            &["CODEX_THREAD_ID"],
-            || {
-                let results = session_checks(Some(&repo));
-                let env = results
-                    .iter()
-                    .find(|r| r.name == "env")
-                    .expect("env check ran");
-                assert_eq!(
-                    env.status,
-                    CheckStatus::Warn,
-                    "malformed session id should Warn, not Fail: {}",
-                    env.message
-                );
-                let identity = results
-                    .iter()
-                    .find(|r| r.name == "identity")
-                    .expect("identity check ran");
-                assert_eq!(
-                    identity.status,
-                    CheckStatus::Ok,
-                    "identity must resolve via override despite malformed env: {}",
-                    identity.message
-                );
-                assert!(identity.message.contains("alice"));
-            },
-        );
+                assert!(!identity.message.contains("alice"), "{}", identity.message);
+            });
+        }
     }
 }

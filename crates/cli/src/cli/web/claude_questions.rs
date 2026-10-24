@@ -683,7 +683,7 @@ struct HookReply {
 /// the ordinary terminal flow alone; this command never starts a broker.
 /// Record what this hook says about a bound agent's question, before any
 /// broker is asked, so the question is known with no viewer attached.
-fn record(hook: &Hook, env: &dyn crate::agent_env::Ambient) {
+fn record(hook: &Hook) {
     use crate::cli::question_state::{Key, Observation, input_hash, observe};
     let Ok(repo) = crate::cli::resolve_cwd_repo(Path::new(&hook.cwd)) else {
         return;
@@ -691,8 +691,7 @@ fn record(hook: &Hook, env: &dyn crate::agent_env::Ambient) {
     let Ok(session) = clank_core::ids::SessionId::parse(&hook.session_id) else {
         return;
     };
-    let Ok(label) =
-        crate::agent_env::resolve_identity_for_hook_in(&repo, Tool::Claude, &session, env)
+    let Ok(label) = crate::agent_env::resolve_identity_for_hook_in(&repo, Tool::Claude, &session)
     else {
         return;
     };
@@ -737,7 +736,7 @@ fn header_of(input: &Value) -> String {
 pub(crate) async fn run() -> Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
     if let Ok(hook) = serde_json::from_str::<Hook>(&input) {
-        record(&hook, &crate::agent_env::Process);
+        record(&hook);
     }
     let result = async {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -1045,7 +1044,7 @@ mod tests {
         h
     }
     fn record_in(hook: &Hook) {
-        record(hook, &crate::agent_env::Stated::default());
+        record(hook);
     }
 
     /// With no broker listening, the hook still records a bound agent's
@@ -1073,15 +1072,11 @@ mod tests {
             asking(&dir, "claude-fixture").is_some(),
             "another session's result"
         );
-        // An old session of this very agent, named by its environment, is
-        // still not the bound one.
+        // An old session of this very agent is not the bound one.
         let mut stale = hook.clone();
         stale.session_id = "old-session".into();
         stale.tool_use_id = Some("tool-old".into());
-        record(
-            &stale,
-            &crate::agent_env::Stated::saying(&[("CLANK_AGENT", "claude-question-agent")]),
-        );
+        record(&stale);
         assert_eq!(
             asking(&dir, "old-session"),
             None,

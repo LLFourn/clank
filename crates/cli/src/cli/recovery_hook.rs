@@ -9,7 +9,7 @@ use std::path::Path;
 
 use super::StopHookArgs;
 use super::monitor::Control;
-use crate::agent_env::{Process, resolve_identity_for_hook_in};
+use crate::agent_env::resolve_identity_for_hook_in;
 use crate::lifecycle::AgentLabel;
 use clank_core::Tool;
 
@@ -21,7 +21,7 @@ pub(crate) async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     let input = super::stop_hook::read_hook_stdin().map_err(|e| anyhow::anyhow!(e))?;
     let repo = super::stop_hook::resolve_hook_repo(args.repo.as_deref(), &input)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let label = resolve_identity_for_hook_in(&repo, tool, &input.session_id, &Process)?;
+    let label = resolve_identity_for_hook_in(&repo, tool, &input.session_id)?;
     let session = input.session_id.as_str().to_string();
     if !crate::agent_store::binding_matches(&repo, &label, tool, &session) {
         return Ok(());

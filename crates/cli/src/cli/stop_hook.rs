@@ -81,17 +81,7 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let tool: Tool = args.tool.into();
     let turn = match read_hook_stdin() {
-        Ok(input) => {
-            stop(
-                tool,
-                args.repo.as_deref(),
-                input,
-                started,
-                &Process,
-                &Spawner,
-            )
-            .await
-        }
+        Ok(input) => stop(tool, args.repo.as_deref(), input, started, &Spawner).await,
         Err(e) => Turn::said(HookOutcome::Diagnostic { message: e }),
     };
     let code = emit_turn(turn, tool, &mut std::io::stdout(), &mut std::io::stderr()).await;
@@ -138,7 +128,6 @@ async fn stop(
     repo_override: Option<&Path>,
     input: HookInput,
     started: std::time::Instant,
-    env: &dyn Ambient,
     spawner: &dyn Spawn,
 ) -> Turn {
     // Read now, before any waiting: where in the agent's record this Stop
@@ -149,7 +138,7 @@ async fn stop(
         Ok(r) => r,
         Err(message) => return Turn::said(HookOutcome::Diagnostic { message }),
     };
-    let label = match resolve_identity_for_hook_in(&repo, tool, &input.session_id, env) {
+    let label = match resolve_identity_for_hook_in(&repo, tool, &input.session_id) {
         Ok(l) => l,
         Err(e) => {
             return Turn::said(HookOutcome::Diagnostic {
@@ -267,56 +256,60 @@ struct SessionStartInput {
     transcript_path: Option<String>,
 }
 
-/// Who this session is, and — when clank launched it — the binding that
-/// says so.
+/// Who this session is, and — when it is unbound and clank launched it —
+/// the binding that says so.
 ///
-/// A session clank launched carries `CLANK_AGENT`, and that label is bound
-/// to the id on stdin: on `startup` the first bind, on `clear` the rebind
-/// that keeps a session tracked across a new id, on `resume`/`compact` an
-/// idempotent re-assertion. A session clank did not launch is identified
-/// by its id, as `clank as` bound it.
+/// A bound session keeps its binding: on `resume`/`compact` that is the
+/// same label. An unbound one takes `launched_as`, which the caller passes
+/// only when this hook runs in its session's own launch: on `startup` the
+/// first bind, on `clear` the rebind that keeps a session tracked across a
+/// new id. Any other unbound session waits for `clank as`.
 fn session_started(
     repo: &Path,
     tool: Tool,
     input: &SessionStartInput,
     launched_as: Option<&AgentLabel>,
-    env: &dyn Ambient,
 ) -> Option<(AgentLabel, Tool)> {
+    use crate::agent_env::Start;
     let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
-    match launched_as {
-        Some(label) => {
-            let binding_tool = match crate::agent_store::resolve_tool(repo, label) {
-                Ok(tool) => tool,
-                Err(e) => {
-                    eprintln!(
-                        "clank: cannot resolve roster tool for `{label}` at session start: {e:#}"
-                    );
-                    return None;
-                }
-            };
-            // Fail-open by POLICY: a bind that fails leaves the previous
-            // binding, and the Stop hook still resolves this session by its
-            // label; the diagnostic names what did not happen.
-            if let Err(e) =
-                crate::agent_store::bind_session_to_agent(repo, label, binding_tool, &sid)
-            {
-                eprintln!(
-                    "clank: could not bind `{}` to {} session {} ({}): {e:#}",
-                    label.as_str(),
-                    binding_tool.as_str(),
-                    sid.as_str(),
-                    input.source.as_deref().unwrap_or("start"),
-                );
-            } else if let Some(path) = input.transcript_path.as_deref() {
-                let _ = crate::agent_store::record_transcript(repo, label, &sid, path);
-            }
-            Some((label.clone(), binding_tool))
+    let label = match crate::agent_env::session_start(repo, tool, &sid, launched_as) {
+        Ok(Start::Bound(label)) => return Some((label, tool)),
+        Ok(Start::Unbound | Start::HeldElsewhere) => return None,
+        Ok(Start::Bootstrap(label)) => label,
+        Err(e) => {
+            eprintln!("clank: cannot decide this session start: {e:#}");
+            return None;
         }
-        None => {
-            let label = resolve_identity_for_hook_in(repo, tool, &sid, env).ok()?;
-            Some((label, tool))
-        }
+    };
+    let binding_tool = tool;
+    // Fail-open by POLICY: a bind that fails leaves the previous binding,
+    // and this session stays unbound; the diagnostic names what did not
+    // happen.
+    if let Err(e) = crate::agent_store::bind_session_to_agent(repo, &label, binding_tool, &sid) {
+        eprintln!(
+            "clank: could not bind `{}` to {} session {} ({}): {e:#}",
+            label.as_str(),
+            binding_tool.as_str(),
+            sid.as_str(),
+            input.source.as_deref().unwrap_or("start"),
+        );
+        return None;
     }
+    if let Some(path) = input.transcript_path.as_deref() {
+        let _ = crate::agent_store::record_transcript(repo, &label, &sid, path);
+    }
+    Some((label, binding_tool))
+}
+
+/// The `CLANK_AGENT` this hook inherited, when its environment is its
+/// session's own launch.
+fn launch_label(
+    tool: Tool,
+    env: &dyn Ambient,
+    parent: &impl super::hook_owner::Parentage,
+) -> Option<AgentLabel> {
+    let named = crate::agent_env::explicit_label_in(env).ok().flatten()?;
+    super::hook_owner::runs_in_its_launch(tool, parent).then_some(named)
 }
 
 /// How long a session start may take to hear what it is owed: well under
@@ -337,9 +330,8 @@ async fn run_session_start(args: StopHookArgs) -> anyhow::Result<()> {
         return Ok(());
     };
     let tool: Tool = args.tool.into();
-    let launched_as = crate::agent_env::explicit_label_in(&Process).ok().flatten();
-    let Some((label, binding_tool)) =
-        session_started(&repo, tool, &input, launched_as.as_ref(), &Process)
+    let launched_as = launch_label(tool, &Process, &super::hook_owner::Native);
+    let Some((label, binding_tool)) = session_started(&repo, tool, &input, launched_as.as_ref())
     else {
         return Ok(());
     };

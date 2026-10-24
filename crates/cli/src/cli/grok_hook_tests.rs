@@ -100,6 +100,29 @@ fn stop_uses_native_snapshot_and_never_rewrites_a_command() {
     );
 }
 
+/// A Grok start binds its session only while it is unbound: a session
+/// already bound keeps its label whatever `CLANK_AGENT` it inherited.
+#[test]
+fn a_start_never_moves_a_bound_session() {
+    let (_temp, repo, label, session, _) = fixture();
+    let other = AgentLabel::parse("other").unwrap();
+    crate::agent_store::bind_session_to_agent(&repo, &other, Tool::Grok, &session).unwrap();
+    let env = Stated::saying(&[("CLANK_AGENT", label.as_str())]).at(&repo, &repo);
+    handle(
+        &input(&repo, &session, "session_start", json!([])),
+        &repo,
+        &env,
+    )
+    .unwrap();
+    assert!(binding_matches(&repo, &other, Tool::Grok, session.as_str()));
+    assert!(!binding_matches(
+        &repo,
+        &label,
+        Tool::Grok,
+        session.as_str()
+    ));
+}
+
 #[test]
 fn lifecycle_cannot_release_a_replacement_and_respects_manual_mode() {
     let (_temp, repo, label, session, env) = fixture();

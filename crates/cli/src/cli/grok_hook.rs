@@ -14,7 +14,7 @@ use clank_core::{AgentLabel, SessionId, Tool};
 use serde::Deserialize;
 
 use super::turn_wire::{Frame, Report, WireVerdict};
-use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
+use crate::agent_env::{Ambient, Process};
 use crate::agent_store::binding_matches;
 
 #[derive(Debug, Deserialize)]
@@ -60,24 +60,26 @@ fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<(AgentL
         super::resolve_cwd_repo(&input.cwd)? == repo,
         "native Grok cwd does not match the Clank repository"
     );
-    let label = resolve_identity_for_hook_in(repo, Tool::Grok, &input.session_id, env)?;
     if input.hook_event_name == "session_start" {
-        if env.var(crate::agent_env::ENV_CLANK_AGENT).is_some() {
-            crate::agent_store::resolve_tool(repo, &label)?;
+        let launched_as = crate::agent_env::explicit_label_in(env)?;
+        if let crate::agent_env::Start::Bootstrap(label) = crate::agent_env::session_start(
+            repo,
+            Tool::Grok,
+            &input.session_id,
+            launched_as.as_ref(),
+        )? {
             crate::agent_store::bind_session_to_agent(repo, &label, Tool::Grok, &input.session_id)?;
         }
         return Ok(None);
     }
+    let Some(label) = crate::agent_env::bound_agent(repo, Tool::Grok, &input.session_id)? else {
+        return Ok(None);
+    };
     if input.hook_event_name == "session_end" {
-        if binding_matches(repo, &label, Tool::Grok, input.session_id.as_str()) {
-            crate::agent_store::release_binding(repo, &label, &input.session_id)?;
-        }
+        crate::agent_store::release_binding(repo, &label, &input.session_id)?;
         return Ok(None);
     }
-    if input.hook_event_name != "stop"
-        || input.reason.as_deref() != Some("end_turn")
-        || !binding_matches(repo, &label, Tool::Grok, input.session_id.as_str())
-    {
+    if input.hook_event_name != "stop" || input.reason.as_deref() != Some("end_turn") {
         return Ok(None);
     }
     let tasks = input

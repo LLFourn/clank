@@ -185,6 +185,13 @@ just created — so work can be routed to it — and rebinds it when
 session you started yourself needs `clank as <label>` (claude and
 codex and native Grok; opencode binds through its plugin).
 
+From then on the session's binding is its identity, for every hook and
+every clank command it runs. `CLANK_AGENT` only binds a session that
+has no binding yet, and only from the hook of the process clank
+launched. A Codex hook under the shared app-server daemon can't count:
+it carries whatever the daemon inherited from another pane. Outside
+any agent session, `CLANK_AGENT=<label> clank …` names you directly.
+
 **4. The master — write and promote a plan.**
 
 ```sh

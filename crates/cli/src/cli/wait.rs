@@ -201,7 +201,6 @@ pub(super) fn automatic_grok(
         &bound_repo,
         clank_core::Tool::Grok,
         &session,
-        env,
     )?;
     let cfg = crate::agent_store::load_agent_config(&bound_repo, &author)?;
     if crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), env.home().as_deref())

@@ -35,7 +35,7 @@
 //!   state (`.clank/agents/<label>/config.json`): session
 //!   binding, auto-mode, and wait timeout.
 //! - [`identity`] — pure `resolve_agent_identity` function +
-//!   `IdentityInputs` / `ResolveError` types. The single
+//!   `Caller` / `ResolveError` types. The single
 //!   "who am I" resolver shared by stop-hook, auto, wait, doctor.
 //! - [`hook_io`] — typed Stop-hook stdin (`HookInput`) and the
 //!   adapter's decision (`HookOutcome`); plus the codex
@@ -80,4 +80,4 @@ pub use hook_io::{
     BackgroundTask, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
     HookOutcome, SilentReason,
 };
-pub use identity::{IdentityInputs, ResolveError, resolve_agent_identity};
+pub use identity::{Caller, ResolveError, bound_to, resolve_agent_identity};

@@ -807,7 +807,6 @@ async fn the_report_carries_the_stops_evidence() {
         Some(&repo),
         input,
         std::time::Instant::now(),
-        &stated(),
         &recorder,
     )
     .await;
@@ -842,7 +841,6 @@ async fn the_report_carries_the_stops_evidence() {
         Some(&repo),
         hook_input("sess-unlisted"),
         std::time::Instant::now(),
-        &stated(),
         &recorder,
     )
     .await;
@@ -865,51 +863,10 @@ async fn unresolved_identity_is_a_diagnostic() {
         Some(dir.path()),
         hook_input("sess-unbound"),
         std::time::Instant::now(),
-        &stated(),
         &Unreachable,
     )
     .await;
     assert!(matches!(turn.outcome, HookOutcome::Diagnostic { .. }));
-}
-
-/// The seam carries what a test SAYS: a stated `CLANK_AGENT` outranks the
-/// session binding, and a label this session does not hold cannot be
-/// reported for. With nothing stated, the binding decides, and the Stop
-/// is carried for that label.
-#[tokio::test]
-async fn a_stated_override_cannot_report_for_an_unbound_label() {
-    let dir = init_repo();
-    bind_tool(dir.path(), "codex", "sess-stated-override", Tool::Claude);
-    let elsewhere = crate::agent_env::Stated::saying(&[("CLANK_AGENT", "somebody-else")]);
-    let turn = stop(
-        Tool::Claude,
-        Some(dir.path()),
-        hook_input("sess-stated-override"),
-        std::time::Instant::now(),
-        &elsewhere,
-        &Unreachable,
-    )
-    .await;
-    match turn.outcome {
-        HookOutcome::Diagnostic { message } => {
-            assert!(message.contains("somebody-else"), "{message}")
-        }
-        HookOutcome::Silent {
-            why: SilentReason::StaleBinding,
-        } => {}
-        other => panic!("a label that is not bound cannot report: {other:?}"),
-    }
-    let recorder = Recorder::default();
-    stop(
-        Tool::Claude,
-        Some(dir.path()),
-        hook_input("sess-stated-override"),
-        std::time::Instant::now(),
-        &stated(),
-        &recorder,
-    )
-    .await;
-    assert_eq!(recorder.0.borrow()[0].1, "codex", "the binding decides");
 }
 
 /// A linked worktree under `<main>/.clank/worktrees/wt`, as clank makes
@@ -955,7 +912,6 @@ async fn a_stop_from_a_worktree_subdirectory_reports_for_that_worktree() {
         None,
         input.clone(),
         std::time::Instant::now(),
-        &stated(),
         &recorder,
     )
     .await;
@@ -1057,48 +1013,208 @@ fn roster_agent(repo: &Path, label: &AgentLabel, tool: Tool) {
     .unwrap();
 }
 
-/// A label that another agent held is cleared off it by the bind: one
-/// session, one label.
+/// A bound session keeps its binding whatever label its launch names:
+/// only an unbound session is bootstrapped.
 #[test]
-fn a_launched_session_takes_its_id_off_any_other_label() {
+fn a_bound_session_keeps_its_label_at_start() {
     let dir = init_repo();
     let repo = dir.path();
     let sid = "01a08361-f112-75d0-a49f-2e35b104e3b6";
     bind_tool(repo, "old", sid, Tool::Codex);
     let new = AgentLabel::parse("new").unwrap();
     roster_agent(repo, &new, Tool::Codex);
-    session_started(
-        repo,
-        Tool::Codex,
-        &start_input(sid, "startup"),
-        Some(&new),
-        &stated(),
-    );
+    let got = session_started(repo, Tool::Codex, &start_input(sid, "startup"), Some(&new));
+    assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("old"));
     assert_eq!(
-        bound_session(repo, "new"),
+        bound_session(repo, "old"),
         Some((Tool::Codex, sid.to_string()))
     );
-    assert_eq!(bound_session(repo, "old"), None);
+    assert_eq!(bound_session(repo, "new"), None);
 }
 
+/// story-short, 2026-10-24: `codex` is bound to the reviewer R and
+/// `painter` to P when an unbound session U starts in the shared codex
+/// daemon, which inherited `CLANK_AGENT=codex`. That hook does not run in
+/// its launch, so U binds nothing, both bindings stay, and R and P are
+/// still themselves.
 #[test]
-fn claude_compatible_grok_start_binds_the_roster_tool() {
+fn an_unbound_session_under_the_daemon_takes_no_label() {
     let dir = init_repo();
     let repo = dir.path();
-    let label = AgentLabel::parse("grok").unwrap();
-    roster_agent(repo, &label, Tool::Grok);
-    let sid = "01a0dd00-5b0f-7dc0-b418-24054b5112cf";
-    let mut input = start_input(sid, "resume");
-    input.transcript_path = Some("/tmp/.grok/updates.jsonl".into());
-    let got = session_started(repo, Tool::Claude, &input, Some(&label), &stated());
-    assert_eq!(got, Some((label.clone(), Tool::Grok)));
-    assert_eq!(bound_session(repo, "grok"), Some((Tool::Grok, sid.into())));
-    assert!(crate::agent_store::binding_matches(
+    let (r, p, u) = (
+        "01a16cdd-5f28-7bd2-b895-7122737638ce",
+        "01a16cfb-9a15-7801-a3de-671cc0308ebb",
+        "01a16cfc-2e23-7352-875f-d74f16dc1305",
+    );
+    bind_tool(repo, "codex", r, Tool::Codex);
+    bind_tool(repo, "painter", p, Tool::Codex);
+    let daemon = crate::agent_env::Stated::saying(&[("CLANK_AGENT", "codex")]);
+    let launched_as = launch_label(Tool::Codex, &daemon, &Parent::daemon());
+    assert_eq!(launched_as, None);
+    assert_eq!(
+        session_started(
+            repo,
+            Tool::Codex,
+            &start_input(u, "startup"),
+            launched_as.as_ref()
+        ),
+        None
+    );
+    assert_eq!(bound_session(repo, "codex"), Some((Tool::Codex, r.into())));
+    assert_eq!(
+        bound_session(repo, "painter"),
+        Some((Tool::Codex, p.into()))
+    );
+    for (sid, who) in [(r, "codex"), (p, "painter")] {
+        let got = session_started(
+            repo,
+            Tool::Codex,
+            &start_input(sid, "resume"),
+            launched_as.as_ref(),
+        );
+        assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some(who));
+        let id = clank_core::SessionId::parse(sid).unwrap();
+        assert_eq!(
+            crate::agent_env::resolve_identity_for_hook_in(repo, Tool::Codex, &id)
+                .unwrap()
+                .as_str(),
+            who
+        );
+    }
+}
+
+/// The launch's label reaches a codex SessionStart only from a standalone
+/// client's own hook, and any other tool's hook always carries it.
+#[test]
+fn only_a_hook_in_its_launch_carries_the_launch_label() {
+    let named = crate::agent_env::Stated::saying(&[("CLANK_AGENT", "painter")]);
+    let painter = Some(AgentLabel::parse("painter").unwrap());
+    assert_eq!(
+        launch_label(Tool::Codex, &named, &Parent::standalone()),
+        painter
+    );
+    assert_eq!(launch_label(Tool::Codex, &named, &Parent::daemon()), None);
+    assert_eq!(
+        launch_label(Tool::Codex, &named, &Parent::unreadable()),
+        None
+    );
+    for tool in [Tool::Claude, Tool::Grok, Tool::OpenCode] {
+        assert_eq!(
+            launch_label(tool, &named, &Parent::daemon()),
+            painter,
+            "{tool:?}"
+        );
+    }
+    assert_eq!(
+        launch_label(Tool::Codex, &stated(), &Parent::standalone()),
+        None
+    );
+}
+
+/// A parent process as a codex hook would find it.
+struct Parent(crate::cli::hook_owner::Argv);
+
+impl Parent {
+    fn standalone() -> Self {
+        Parent(crate::cli::hook_owner::Argv::Read(vec![
+            "/usr/local/bin/codex".into(),
+            "--no-daemon".into(),
+        ]))
+    }
+    fn daemon() -> Self {
+        Parent(crate::cli::hook_owner::Argv::Read(vec![
+            "/Users/x/.codex/packages/app-server-daemon/bin/codex".into(),
+            "app-server".into(),
+            "--listen".into(),
+            "unix://".into(),
+        ]))
+    }
+    fn unreadable() -> Self {
+        Parent(crate::cli::hook_owner::Argv::Unreadable)
+    }
+}
+
+impl crate::cli::hook_owner::Parentage for Parent {
+    fn parent(&self) -> i32 {
+        4242
+    }
+    fn token(&self, _pid: i32) -> Option<crate::proc_identity::ProcToken> {
+        crate::proc_identity::token_for(std::process::id() as i32)
+    }
+    fn argv(
+        &self,
+        _pid: i32,
+        _birth: &crate::proc_identity::ProcToken,
+    ) -> crate::cli::hook_owner::Argv {
+        self.0.clone()
+    }
+}
+
+/// A Grok running Claude-compatible hooks enters as claude. Its id is
+/// already bound under grok, so its start binds nothing whichever label
+/// it inherited, a claude agent's included, and every binding stays put.
+/// Grok's native hook binds it.
+#[test]
+fn a_compatible_grok_start_binds_nothing() {
+    let dir = init_repo();
+    let repo = dir.path();
+    let grok = AgentLabel::parse("grok").unwrap();
+    roster_agent(repo, &grok, Tool::Grok);
+    let codex = AgentLabel::parse("codex").unwrap();
+    crate::cli::agent::add_repo_roster_agent(
         repo,
-        &label,
-        Tool::Grok,
-        sid
-    ));
+        &codex,
+        crate::cli::teams_config::AgentDescription {
+            tool: Tool::Codex,
+            launch: None,
+            initial_prompt: None,
+        },
+        crate::cli::teams_config::RosterRole::Commit,
+    )
+    .unwrap();
+    let claude = AgentLabel::parse("claude").unwrap();
+    crate::cli::agent::add_repo_roster_agent(
+        repo,
+        &claude,
+        crate::cli::teams_config::AgentDescription {
+            tool: Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        },
+        crate::cli::teams_config::RosterRole::Commit,
+    )
+    .unwrap();
+    for (label, tool) in [
+        (&grok, Tool::Grok),
+        (&codex, Tool::Codex),
+        (&claude, Tool::Claude),
+    ] {
+        assert_eq!(crate::agent_store::resolve_tool(repo, label).unwrap(), tool);
+    }
+    let (p, r, c) = (
+        "01a0dd00-5b0f-7dc0-b418-24054b5112cf",
+        "01a16cdd-5f28-7bd2-b895-7122737638ce",
+        "742f6a04-f174-409a-ab01-419a16c5f372",
+    );
+    bind_tool(repo, "painter", p, Tool::Grok);
+    bind_tool(repo, "codex", r, Tool::Codex);
+    bind_tool(repo, "claude", c, Tool::Claude);
+    for inherited in [&grok, &codex, &claude] {
+        let mut input = start_input(p, "resume");
+        input.transcript_path = Some("/tmp/.grok/updates.jsonl".into());
+        assert_eq!(
+            session_started(repo, Tool::Claude, &input, Some(inherited)),
+            None,
+            "{inherited}"
+        );
+        assert_eq!(bound_session(repo, "painter"), Some((Tool::Grok, p.into())));
+        assert_eq!(bound_session(repo, "codex"), Some((Tool::Codex, r.into())));
+        assert_eq!(
+            bound_session(repo, "claude"),
+            Some((Tool::Claude, c.into()))
+        );
+        assert_eq!(bound_session(repo, "grok"), None);
+    }
 }
 
 /// No label in the environment: a session clank did not launch. It is
@@ -1109,29 +1225,14 @@ fn a_hand_started_session_is_identified_by_its_id_and_never_bound_here() {
     let dir = init_repo();
     let repo = dir.path();
     let sid = "9c96eb03-1458-4bac-abbb-90243cfd422c";
-    assert!(
-        session_started(
-            repo,
-            Tool::Claude,
-            &start_input(sid, "startup"),
-            None,
-            &stated()
-        )
-        .is_none()
-    );
+    assert!(session_started(repo, Tool::Claude, &start_input(sid, "startup"), None,).is_none());
     assert!(
         crate::agent_store::load_all_agent_configs(repo)
             .unwrap()
             .is_empty()
     );
     bind_tool(repo, "claude", sid, Tool::Claude);
-    let got = session_started(
-        repo,
-        Tool::Claude,
-        &start_input(sid, "clear"),
-        None,
-        &stated(),
-    );
+    let got = session_started(repo, Tool::Claude, &start_input(sid, "clear"), None);
     assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("claude"));
 }
 

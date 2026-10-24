@@ -15,7 +15,7 @@ use std::path::Path;
 
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::Tool;
-use clank_core::{IdentityInputs, ResolveError, resolve_agent_identity};
+use clank_core::{Caller, ResolveError, bound_to, resolve_agent_identity};
 
 use crate::agent_store::load_all_agent_configs_lossy;
 
@@ -210,12 +210,17 @@ pub(crate) fn detect_session_in(env: &dyn Ambient) -> Result<Option<(Tool, Sessi
             // Grok's session lives on disk, so a stated environment
             // must state the disk too — falling back to the real HOME
             // here would put the developer's sessions back in.
-            match (env.home(), env.cwd()) {
-                (Some(home), Some(cwd)) => {
-                    Ok(grok_session_for_cwd(&home, &cwd).map(|sid| (Tool::Grok, sid)))
-                }
-                _ => Ok(None),
-            }
+            // A Grok whose session can't be found is still inside a
+            // harness, never a caller outside one.
+            let found = match (env.home(), env.cwd()) {
+                (Some(home), Some(cwd)) => grok_session_for_cwd(&home, &cwd),
+                _ => None,
+            };
+            found
+                .map(|sid| Some((Tool::Grok, sid)))
+                .ok_or(EnvError::UnidentifiedSession {
+                    var: ENV_GROK_MARKER,
+                })
         }
     }
 }
@@ -311,6 +316,8 @@ pub enum EnvError {
         value: String,
         reason: String,
     },
+    /// A harness marker is set, but its session can't be identified.
+    UnidentifiedSession { var: &'static str },
 }
 
 impl std::fmt::Display for EnvError {
@@ -335,56 +342,38 @@ impl std::fmt::Display for EnvError {
             EnvError::InvalidLabel { var, value, reason } => {
                 write!(f, "{var}={value:?} is not a valid agent label: {reason}")
             }
+            EnvError::UnidentifiedSession { var } => {
+                write!(f, "{var} is set, but its session can't be identified")
+            }
         }
     }
 }
 
 impl std::error::Error for EnvError {}
 
-/// High-level wrapper: read env, load this repo's agent configs,
-/// and call the pure `resolve_agent_identity`. The single way
-/// any non-hook CLI command finds out "who am I" — used by
-/// `clank auto`, `clank wait`, `clank feedback write` (later),
-/// and `clank doctor`.
+/// Who the invoking CLI command is: the agent bound to its harness
+/// session, or, outside any session, the `CLANK_AGENT` override.
+/// Used by `clank auto`, `clank wait`, `clank feedback write`,
+/// `clank doctor` and every other command that acts as an agent.
 ///
-/// Stop-hook callers go through a different path because they
-/// receive `session_id` via stdin and `tool` via `--tool`, not
-/// from env — see `cli::stop_hook` (later commit).
+/// Inside a session, `CLANK_AGENT` is not consulted: a shared Codex
+/// app-server daemon hands every session it serves the variable of
+/// the pane that started it. Malformed or conflicting session
+/// variables are an error, never a reason to fall back to the name.
 pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
     resolve_identity_in(repo, &Process)
 }
 
 pub(crate) fn resolve_identity_in(repo: &Path, env: &dyn Ambient) -> anyhow::Result<AgentLabel> {
-    // Highest precedence: explicit CLANK_AGENT override. Short-
-    // circuit BEFORE touching session env — otherwise lower-
-    // precedence env state (BothToolsDetected, an unparseable
-    // session id, etc.) could fail the command even though the
-    // resolver would happily return the explicit label. This
-    // mirrors the pure resolver's precedence rule and is what
-    // codex's review on `99ce55b` flagged.
-    if let Some(label) = explicit_label_in(env)? {
-        return Ok(label);
-    }
-
     let detected = detect_session_in(env)?;
+    let caller = match &detected {
+        Some((tool, id)) => Caller::Session { tool: *tool, id },
+        None => Caller::Outside {
+            named: explicit_label_in(env)?,
+        },
+    };
     let agent_configs = load_all_agent_configs_lossy(repo)?;
-    let (tool, session_id_owned) = match detected {
-        Some((t, sid)) => (t, Some(sid)),
-        None => {
-            // No session detected. The resolver will return
-            // NoSession; we map that to a friendly error below.
-            // Default tool to Claude — it doesn't matter since
-            // the lookup path won't run without a session id.
-            (Tool::Claude, None)
-        }
-    };
-    let inputs = IdentityInputs {
-        tool,
-        explicit_label: None,
-        session_id: session_id_owned.as_ref(),
-        agent_configs: &agent_configs,
-    };
-    resolve_agent_identity(&inputs).map_err(|e| match e {
+    resolve_agent_identity(&caller, &agent_configs).map_err(|e| match e {
         ResolveError::NoSession => anyhow::anyhow!(
             "no session detected — pass --author <label>, set CLANK_AGENT, \
              or run inside claude/codex/grok/opencode"
@@ -399,29 +388,21 @@ pub(crate) fn resolve_identity_in(repo: &Path, env: &dyn Ambient) -> anyhow::Res
     })
 }
 
-/// Hook-specific identity resolution: caller passes `tool` (from
-/// `--tool`), `session_id` (from hook stdin), and the environment
-/// `CLANK_AGENT` may override from. Used by `clank stop-hook`, NOT by
-/// regular CLI commands (which read session_id from env). The hook
-/// names its own [`Process`] at the edge, so there is no wrapper
-/// here that hides one.
+/// A hook's identity: the agent bound to the session its stdin names.
+/// The hook's environment never decides it (see
+/// [`resolve_identity_in`]); only a SessionStart may bind, through
+/// [`session_start`].
 pub(crate) fn resolve_identity_for_hook_in(
     repo: &Path,
     tool: Tool,
     session_id: &SessionId,
-    env: &dyn Ambient,
 ) -> anyhow::Result<AgentLabel> {
-    if let Some(label) = explicit_label_in(env)? {
-        return Ok(label);
-    }
     let agent_configs = load_all_agent_configs_lossy(repo)?;
-    let inputs = IdentityInputs {
+    let caller = Caller::Session {
         tool,
-        explicit_label: None,
-        session_id: Some(session_id),
-        agent_configs: &agent_configs,
+        id: session_id,
     };
-    resolve_agent_identity(&inputs).map_err(|e| match e {
+    resolve_agent_identity(&caller, &agent_configs).map_err(|e| match e {
         ResolveError::NoSession => {
             anyhow::anyhow!("hook called without a session id (internal: caller passed Some)")
         }
@@ -434,6 +415,71 @@ pub(crate) fn resolve_identity_for_hook_in(
             tool = t.as_str(),
             sid = id.as_str(),
         ),
+    })
+}
+
+/// The agent bound to this session, if any.
+pub(crate) fn bound_agent(
+    repo: &Path,
+    tool: Tool,
+    session_id: &SessionId,
+) -> anyhow::Result<Option<AgentLabel>> {
+    Ok(bound_to(
+        tool,
+        session_id,
+        &load_all_agent_configs_lossy(repo)?,
+    ))
+}
+
+/// What a SessionStart does with its session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Start {
+    /// Already bound: identified by that binding, which stays as it is.
+    Bound(AgentLabel),
+    /// Unbound, and launched as this agent: bind it.
+    Bootstrap(AgentLabel),
+    /// Unbound, with no launch it can be tied to: it stays unbound
+    /// until `clank as`.
+    Unbound,
+    /// This id is bound under another tool, so this hook's entry point
+    /// isn't its provider. It is neither identified nor bootstrapped:
+    /// the bind would move that other binding.
+    HeldElsewhere,
+}
+
+/// Decide a SessionStart arriving through `tool`'s hook. `launched_as`
+/// comes from a hook whose environment is its own session's launch, and
+/// is `None` wherever that can't be established. An unbound session may
+/// take a label, replacing another session's binding, only through it,
+/// and only when the roster runs that agent on `tool`: the binding is
+/// recorded under the tool this lookup searched. A Grok running
+/// Claude-compatible hooks is therefore not bootstrapped here, since
+/// nothing in the call establishes the real provider; Grok's native hook
+/// binds it.
+pub(crate) fn session_start(
+    repo: &Path,
+    tool: Tool,
+    session_id: &SessionId,
+    launched_as: Option<&AgentLabel>,
+) -> anyhow::Result<Start> {
+    let agent_configs = load_all_agent_configs_lossy(repo)?;
+    if let Some(label) = bound_to(tool, session_id, &agent_configs) {
+        return Ok(Start::Bound(label));
+    }
+    if agent_configs
+        .iter()
+        .any(|(_, cfg)| cfg.session.as_ref().is_some_and(|s| &s.id == session_id))
+    {
+        return Ok(Start::HeldElsewhere);
+    }
+    let Some(label) = launched_as else {
+        return Ok(Start::Unbound);
+    };
+    let rostered = crate::agent_store::resolve_tool(repo, label)?;
+    Ok(if rostered == tool {
+        Start::Bootstrap(label.clone())
+    } else {
+        Start::Unbound
     })
 }
 
@@ -501,9 +547,11 @@ mod tests {
             "the stated disk is where the session is found"
         );
         assert_eq!(
-            detect_session_in(&marked()).unwrap(),
-            None,
-            "no stated home and cwd means no session — not the real ones"
+            detect_session_in(&marked()),
+            Err(EnvError::UnidentifiedSession {
+                var: ENV_GROK_MARKER
+            }),
+            "no stated home and cwd finds no session — not the real ones"
         );
     }
 
@@ -617,6 +665,189 @@ mod tests {
             };
             let got: Vec<&str> = vars.iter().map(|(v, _)| *v).collect();
             assert_eq!(got, want_vars);
+        }
+    }
+
+    fn repo_binding(pairs: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (label, sid) in pairs {
+            crate::agent_store::bind_session_to_agent(
+                dir.path(),
+                &AgentLabel::parse(label).unwrap(),
+                Tool::Codex,
+                &SessionId::parse(sid).unwrap(),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    const R: &str = "01a16cdd-5f28-7bd2-b895-7122737638ce";
+    const P: &str = "01a16cfb-9a15-7801-a3de-671cc0308ebb";
+    const U: &str = "01a16cfc-2e23-7352-875f-d74f16dc1305";
+
+    /// story-short, 2026-10-24: painter's commands ran in the shared codex
+    /// daemon, whose `CLANK_AGENT=codex` was inherited from another pane.
+    /// The session's binding names it; the inherited name never does.
+    #[test]
+    fn a_bound_session_is_its_binding_whatever_it_inherited() {
+        let dir = repo_binding(&[("codex", R), ("painter", P)]);
+        for (sid, who) in [(P, "painter"), (R, "codex")] {
+            let env = Stated::saying(&[(ENV_CLANK_AGENT, "codex"), (ENV_CODEX_SESSION, sid)]);
+            assert_eq!(resolve_identity_in(dir.path(), &env).unwrap().as_str(), who);
+            let id = SessionId::parse(sid).unwrap();
+            assert_eq!(
+                resolve_identity_for_hook_in(dir.path(), Tool::Codex, &id)
+                    .unwrap()
+                    .as_str(),
+                who
+            );
+        }
+    }
+
+    /// An unbound session is nobody, whatever it inherited, until
+    /// `clank as`; and malformed or conflicting session variables are an
+    /// error, not a reason to fall back to the name.
+    #[test]
+    fn an_inherited_name_never_identifies_a_session() {
+        let dir = repo_binding(&[("codex", R)]);
+        let refused = [
+            (
+                Stated::saying(&[(ENV_CLANK_AGENT, "codex"), (ENV_CODEX_SESSION, U)]),
+                "no agent is bound",
+            ),
+            (
+                Stated::saying(&[
+                    (ENV_CLANK_AGENT, "codex"),
+                    (ENV_CODEX_SESSION, "not/a/session"),
+                ]),
+                "is not a valid session id",
+            ),
+            (
+                Stated::saying(&[
+                    (ENV_CLANK_AGENT, "codex"),
+                    (ENV_CODEX_SESSION, R),
+                    (ENV_CLAUDE_SESSION, U),
+                ]),
+                "multiple session env vars",
+            ),
+        ];
+        for (env, why) in refused {
+            let err = format!("{:#}", resolve_identity_in(dir.path(), &env).unwrap_err());
+            assert!(err.contains(why), "{err}");
+        }
+        let id = SessionId::parse(U).unwrap();
+        assert!(resolve_identity_for_hook_in(dir.path(), Tool::Codex, &id).is_err());
+    }
+
+    /// Outside any session, CLANK_AGENT is the manual override it always
+    /// was.
+    #[test]
+    fn outside_a_session_the_name_is_the_override() {
+        let dir = repo_binding(&[("codex", R)]);
+        let env = Stated::saying(&[(ENV_CLANK_AGENT, "zoe")]);
+        assert_eq!(
+            resolve_identity_in(dir.path(), &env).unwrap().as_str(),
+            "zoe"
+        );
+        assert!(resolve_identity_in(dir.path(), &Stated::default()).is_err());
+    }
+
+    fn roster(
+        repo: &Path,
+        label: &str,
+        tool: Tool,
+        role: crate::cli::teams_config::RosterRole,
+    ) -> AgentLabel {
+        let label = AgentLabel::parse(label).unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            repo,
+            &label,
+            crate::cli::teams_config::AgentDescription {
+                tool,
+                launch: None,
+                initial_prompt: None,
+            },
+            role,
+        )
+        .unwrap();
+        label
+    }
+
+    /// A SessionStart keeps a bound session's label, bootstraps an unbound
+    /// one only from a launch label, and otherwise leaves it unbound.
+    #[test]
+    fn session_start_binds_only_an_unbound_launch() {
+        use crate::cli::teams_config::RosterRole::{Commit, Master};
+        let dir = repo_binding(&[("codex", R)]);
+        let codex = roster(dir.path(), "codex", Tool::Codex, Master);
+        let painter = roster(dir.path(), "painter", Tool::Codex, Commit);
+        let r = SessionId::parse(R).unwrap();
+        let u = SessionId::parse(U).unwrap();
+        let start = |id: &SessionId, launched: Option<&AgentLabel>| {
+            session_start(dir.path(), Tool::Codex, id, launched).unwrap()
+        };
+        assert_eq!(start(&r, Some(&painter)), Start::Bound(codex));
+        assert_eq!(start(&u, Some(&painter)), Start::Bootstrap(painter));
+        assert_eq!(start(&u, None), Start::Unbound);
+    }
+
+    /// The binding is looked up and recorded under the hook's tool, so a
+    /// launch label for an agent the roster runs on another tool can't
+    /// bootstrap: whichever label is inherited, a Claude-compatible Grok
+    /// start binds nothing.
+    #[test]
+    fn a_launch_on_another_tool_is_not_bootstrapped() {
+        use crate::cli::teams_config::RosterRole::{Commit, Master};
+        let dir = repo_binding(&[("codex", R)]);
+        let grok = roster(dir.path(), "grok", Tool::Grok, Master);
+        let codex = roster(dir.path(), "codex", Tool::Codex, Commit);
+        let u = SessionId::parse(U).unwrap();
+        for launched in [&grok, &codex] {
+            assert_eq!(
+                session_start(dir.path(), Tool::Claude, &u, Some(launched)).unwrap(),
+                Start::Unbound,
+                "{launched}"
+            );
+        }
+    }
+
+    /// An id already bound under another tool is no fresh session for
+    /// this entry point: a matching launch label still doesn't move it.
+    #[test]
+    fn an_id_held_under_another_tool_is_not_bootstrapped() {
+        use crate::cli::teams_config::RosterRole::{Commit, Master};
+        let dir = repo_binding(&[("codex", R)]);
+        roster(dir.path(), "codex", Tool::Codex, Master);
+        let claude = roster(dir.path(), "claude", Tool::Claude, Commit);
+        let r = SessionId::parse(R).unwrap();
+        assert_eq!(
+            session_start(dir.path(), Tool::Claude, &r, Some(&claude)).unwrap(),
+            Start::HeldElsewhere
+        );
+    }
+
+    /// A Grok marker whose session can't be found is a harness that can't
+    /// say who it is, not a caller outside one.
+    #[test]
+    fn an_unfound_grok_session_is_not_outside() {
+        let dir = repo_binding(&[("codex", R)]);
+        let home = tempfile::tempdir().unwrap();
+        for env in [
+            Stated::saying(&[(ENV_GROK_MARKER, "1"), (ENV_CLANK_AGENT, "codex")]),
+            Stated::saying(&[(ENV_GROK_MARKER, "1"), (ENV_CLANK_AGENT, "codex")])
+                .at(home.path(), dir.path()),
+        ] {
+            let err = format!("{:#}", resolve_identity_in(dir.path(), &env).unwrap_err());
+            assert!(err.contains("can't be identified"), "{err}");
         }
     }
 }

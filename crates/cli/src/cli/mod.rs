@@ -578,9 +578,9 @@ pub struct WaitArgs {
     pub repo: Option<PathBuf>,
     /// Agent label this caller is waiting as. Keys feedback files
     /// and the participant set. Optional: defaults via the shared
-    /// identity resolver (CLANK_AGENT env > session lookup via
-    /// CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID). Pass explicitly
-    /// to override or to run from outside a session.
+    /// identity resolver: the binding of the session named by
+    /// CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID, or CLANK_AGENT
+    /// outside any session. Pass explicitly to override.
     #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
     /// Exit when the process that spawned this wait goes away.

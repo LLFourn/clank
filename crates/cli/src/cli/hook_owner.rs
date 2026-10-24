@@ -100,6 +100,19 @@ pub(crate) fn lifetime_for(tool: clank_core::Tool, src: &impl Parentage) -> Life
     }
 }
 
+/// Whether this hook runs in its own session's launch environment, so
+/// the `CLANK_AGENT` it inherited was set for that session. A claude,
+/// grok or opencode hook is its client's child. A codex hook is only
+/// when a standalone client spawned it: under the app-server daemon,
+/// or when the parent can't be read, it carries whatever the daemon
+/// inherited from the pane that first started it.
+pub(crate) fn runs_in_its_launch(tool: clank_core::Tool, src: &impl Parentage) -> bool {
+    match tool {
+        clank_core::Tool::Codex => matches!(resolve(src), Owner::Process { .. }),
+        _ => true,
+    }
+}
+
 fn is_standalone_codex(argv: &[OsString]) -> bool {
     let program = argv
         .first()

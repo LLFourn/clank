@@ -1,68 +1,41 @@
-//! Pure resolver: maps a session (or explicit override) to an
-//! [`AgentLabel`].
+//! Pure resolver: maps the calling process to an [`AgentLabel`].
 //!
-//! Every CLI surface that needs to know "who am I" (the stop-hook
-//! adapter, `clank auto`, `clank wait`, `clank doctor`) builds
-//! [`IdentityInputs`] from env + stdin + on-disk config and calls
-//! [`resolve_agent_identity`]. The function is pure: no I/O, no
-//! clock, no env access — the CLI does all of that, then hands
-//! the resolver a snapshot.
+//! Every CLI surface that needs to know "who am I" builds a [`Caller`]
+//! from env + stdin and calls [`resolve_agent_identity`] with the
+//! repo's agent configs. The function is pure: no I/O, no clock, no
+//! env access.
 //!
-//! Precedence (high → low):
-//!
-//! 1. [`IdentityInputs::explicit_label`] from the `CLANK_AGENT`
-//!    env var. Lets advanced users force an identity regardless
-//!    of session bindings.
-//! 2. Session lookup: scan `agent_configs` for one whose
-//!    [`AgentConfig::session`] matches both [`SessionId`] AND
-//!    [`Tool`]. (Both must match — a claude session id and a
-//!    codex session id can collide, however unlikely.)
-//! 3. Error. No tool-name fallback (a previous design); writing
-//!    feedback under the wrong label is worse than refusing to
-//!    act.
-//!
-//! On `Err`, the caller's job is to emit an actionable message
-//! ("no agent set up for this session — run `clank init` or
-//! `clank as <label>`") and exit cleanly.
+//! A caller inside a harness session is that session, and only the
+//! session's binding names it. `CLANK_AGENT` is inherited by every
+//! descendant, including a shared Codex app-server daemon that serves
+//! sessions from other panes, so it can't say which session it was
+//! set for and never outranks a binding. Outside any session it is
+//! the manual override it was meant to be. Neither case falls back to
+//! guessing by tool: writing feedback under the wrong label is worse
+//! than refusing to act.
 
 use crate::agent_config::AgentConfig;
 use crate::ids::{AgentLabel, SessionId};
 use crate::vocab::Tool;
 
-/// Snapshot of everything the resolver needs to decide. Built by
-/// the CLI from env + stdin + disk; consumed by the pure
-/// resolver. No fields are `Option` for ergonomics — `session_id`
-/// being `None` is a real distinct state (e.g. running `clank
-/// status` outside any agent) that the resolver maps to a
-/// distinct error.
+/// Who is asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityInputs<'a> {
-    /// Which agent CLI is wrapping this invocation. Passed
-    /// explicitly via `--tool` from the hook config; not detected
-    /// from env (env vars leak across nested shells; see plan D4
-    /// "tool detection caveat").
-    pub tool: Tool,
-    /// `CLANK_AGENT` env override. Wins if set.
-    pub explicit_label: Option<AgentLabel>,
-    /// Current session id read from
-    /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` (or supplied
-    /// by hook stdin). `None` when running outside any agent.
-    pub session_id: Option<&'a SessionId>,
-    /// Every agent config in this repo, paired with its label.
-    /// Resolver scans these for a session match.
-    pub agent_configs: &'a [(AgentLabel, AgentConfig)],
+pub enum Caller<'a> {
+    /// Running outside any harness session. `named` is the
+    /// `CLANK_AGENT` override, if set.
+    Outside { named: Option<AgentLabel> },
+    /// Running in this harness session.
+    Session { tool: Tool, id: &'a SessionId },
 }
 
 /// Why the resolver couldn't pick a label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
-    /// Caller wasn't running inside an agent (no session id env
-    /// var, no hook stdin) AND no `CLANK_AGENT` override. Fix:
-    /// pass `--author` explicitly or run inside claude/codex/grok/opencode.
+    /// Outside any harness session and no `CLANK_AGENT` override.
+    /// Fix: pass `--author` explicitly or run inside an agent.
     NoSession,
-    /// Running inside an agent, session id resolved, but no agent
-    /// config in this repo has bound that session id. Fix: run
-    /// `clank init` (inside this session) or `clank as <label>`.
+    /// In a harness session that no agent config in this repo has
+    /// bound. Fix: `clank as <label>` inside that session.
     NoAgentForSession {
         /// Echoed back so the CLI can include it in the
         /// diagnostic for debugging.
@@ -81,7 +54,7 @@ impl std::fmt::Display for ResolveError {
             ResolveError::NoAgentForSession { session_id, tool } => write!(
                 f,
                 "no agent set up for {tool} session {session_id} — run \
-                 `clank init` (inside this session) or `clank as <label>`"
+                 `clank as <label>` inside this session"
             ),
         }
     }
@@ -89,27 +62,38 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// Resolve the calling agent's label. See module docs for the
-/// precedence rule.
-pub fn resolve_agent_identity(inputs: &IdentityInputs<'_>) -> Result<AgentLabel, ResolveError> {
-    if let Some(explicit) = &inputs.explicit_label {
-        return Ok(explicit.clone());
-    }
-    let Some(session_id) = inputs.session_id else {
-        return Err(ResolveError::NoSession);
-    };
-    for (label, cfg) in inputs.agent_configs {
-        if let Some(s) = &cfg.session
-            && &s.id == session_id
-            && s.tool == inputs.tool
-        {
-            return Ok(label.clone());
+/// The agent whose binding holds `id` for `tool`. Both must match: a
+/// claude and a codex session id can collide, however unlikely.
+pub fn bound_to(
+    tool: Tool,
+    id: &SessionId,
+    agent_configs: &[(AgentLabel, AgentConfig)],
+) -> Option<AgentLabel> {
+    agent_configs
+        .iter()
+        .find(|(_, cfg)| {
+            cfg.session
+                .as_ref()
+                .is_some_and(|s| &s.id == id && s.tool == tool)
+        })
+        .map(|(label, _)| label.clone())
+}
+
+/// Resolve the calling agent's label.
+pub fn resolve_agent_identity(
+    caller: &Caller<'_>,
+    agent_configs: &[(AgentLabel, AgentConfig)],
+) -> Result<AgentLabel, ResolveError> {
+    match caller {
+        Caller::Outside { named: Some(label) } => Ok(label.clone()),
+        Caller::Outside { named: None } => Err(ResolveError::NoSession),
+        Caller::Session { tool, id } => {
+            bound_to(*tool, id, agent_configs).ok_or_else(|| ResolveError::NoAgentForSession {
+                session_id: (*id).clone(),
+                tool: *tool,
+            })
         }
     }
-    Err(ResolveError::NoAgentForSession {
-        session_id: session_id.clone(),
-        tool: inputs.tool,
-    })
 }
 
 #[cfg(test)]
@@ -138,17 +122,19 @@ mod tests {
     }
 
     #[test]
-    fn explicit_label_wins_even_with_matching_session() {
-        let alice = (label("alice"), cfg_with_session("abc12345", Tool::Claude));
-        let configs = [alice];
-        let id = sid("abc12345");
-        let inputs = IdentityInputs {
-            tool: Tool::Claude,
-            explicit_label: Some(label("zoe")),
-            session_id: Some(&id),
-            agent_configs: &configs,
+    fn outside_a_session_the_name_is_the_identity() {
+        let configs = [(label("alice"), cfg_with_session("abc12345", Tool::Claude))];
+        let caller = Caller::Outside {
+            named: Some(label("zoe")),
         };
-        assert_eq!(resolve_agent_identity(&inputs).unwrap(), label("zoe"));
+        assert_eq!(
+            resolve_agent_identity(&caller, &configs).unwrap(),
+            label("zoe")
+        );
+        assert_eq!(
+            resolve_agent_identity(&Caller::Outside { named: None }, &configs),
+            Err(ResolveError::NoSession)
+        );
     }
 
     #[test]
@@ -157,83 +143,46 @@ mod tests {
         let bob = (label("bob"), cfg_with_session("def67890", Tool::Codex));
         let configs = [alice, bob];
         let id = sid("def67890");
-        let inputs = IdentityInputs {
+        let caller = Caller::Session {
             tool: Tool::Codex,
-            explicit_label: None,
-            session_id: Some(&id),
-            agent_configs: &configs,
-        };
-        assert_eq!(resolve_agent_identity(&inputs).unwrap(), label("bob"));
-    }
-
-    #[test]
-    fn session_lookup_requires_matching_tool() {
-        // Same id bound to alice-as-claude; lookup is for codex.
-        // Must miss; resolver does not silently accept the wrong
-        // tool.
-        let alice = (label("alice"), cfg_with_session("abc12345", Tool::Claude));
-        let configs = [alice];
-        let id = sid("abc12345");
-        let inputs = IdentityInputs {
-            tool: Tool::Codex,
-            explicit_label: None,
-            session_id: Some(&id),
-            agent_configs: &configs,
-        };
-        let err = resolve_agent_identity(&inputs).unwrap_err();
-        assert!(matches!(err, ResolveError::NoAgentForSession { .. }));
-    }
-
-    #[test]
-    fn no_session_id_returns_no_session_err() {
-        let configs: [(AgentLabel, AgentConfig); 0] = [];
-        let inputs = IdentityInputs {
-            tool: Tool::Claude,
-            explicit_label: None,
-            session_id: None,
-            agent_configs: &configs,
+            id: &id,
         };
         assert_eq!(
-            resolve_agent_identity(&inputs),
-            Err(ResolveError::NoSession)
+            resolve_agent_identity(&caller, &configs).unwrap(),
+            label("bob")
         );
     }
 
     #[test]
-    fn no_matching_agent_returns_no_agent_for_session() {
-        let configs: [(AgentLabel, AgentConfig); 0] = [];
+    fn session_lookup_requires_matching_tool() {
+        let configs = [(label("alice"), cfg_with_session("abc12345", Tool::Claude))];
         let id = sid("abc12345");
-        let inputs = IdentityInputs {
-            tool: Tool::Claude,
-            explicit_label: None,
-            session_id: Some(&id),
-            agent_configs: &configs,
+        let caller = Caller::Session {
+            tool: Tool::Codex,
+            id: &id,
         };
-        let err = resolve_agent_identity(&inputs).unwrap_err();
         assert_eq!(
-            err,
-            ResolveError::NoAgentForSession {
+            resolve_agent_identity(&caller, &configs),
+            Err(ResolveError::NoAgentForSession {
                 session_id: sid("abc12345"),
-                tool: Tool::Claude,
-            }
+                tool: Tool::Codex,
+            })
         );
     }
 
     #[test]
     fn agent_without_session_is_skipped_not_short_circuited() {
-        // alice has no session binding; bob does. The resolver
-        // must skip alice (no session) and continue to bob — not
-        // return Err on alice's None and miss bob entirely.
         let alice_no_session = (label("alice"), AgentConfig::default());
         let bob = (label("bob"), cfg_with_session("abc12345", Tool::Claude));
         let configs = [alice_no_session, bob];
         let id = sid("abc12345");
-        let inputs = IdentityInputs {
+        let caller = Caller::Session {
             tool: Tool::Claude,
-            explicit_label: None,
-            session_id: Some(&id),
-            agent_configs: &configs,
+            id: &id,
         };
-        assert_eq!(resolve_agent_identity(&inputs).unwrap(), label("bob"));
+        assert_eq!(
+            resolve_agent_identity(&caller, &configs).unwrap(),
+            label("bob")
+        );
     }
 }
