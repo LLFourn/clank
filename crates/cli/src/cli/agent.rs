@@ -1305,7 +1305,23 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     // No zellij projection here: the status TUI owns roster→pane
     // convergence (tui-zellij-pane-reconcile), so this command — like
     // every other roster write path — is a pure config mutation.
+    if let Some(note) = pane_note(super::open_zellij::in_session(), &label) {
+        eprintln!("{note}");
+    }
     Ok(())
+}
+
+/// What an added agent's caller should expect of its pane. Without
+/// it an agent sees an unbound roster entry and opens a pane by hand,
+/// beside the one the TUI opens.
+fn pane_note(in_zellij: bool, label: &AgentLabel) -> Option<String> {
+    in_zellij.then(|| {
+        format!(
+            "the clank status TUI opens `{label}`'s pane on its own; \
+             do not run `clank agent start {label}` or open a pane for it yourself",
+            label = label.as_str()
+        )
+    })
 }
 
 // ── agent mutation cores ─────────────────────────────────────
@@ -2399,6 +2415,18 @@ mod tests {
         AgentLabel::parse(s).unwrap()
     }
 
+    #[test]
+    fn an_add_in_zellij_says_the_tui_opens_the_pane() {
+        let painter = lbl("painter");
+        let note = pane_note(true, &painter).unwrap();
+        assert!(note.contains("opens `painter`'s pane on its own"), "{note}");
+        assert!(
+            note.contains("do not run `clank agent start painter`"),
+            "{note}"
+        );
+        assert_eq!(pane_note(false, &painter), None);
+    }
+
     /// Every roster command is a pure config write; the status TUI
     /// owns roster→pane convergence (tui-zellij-pane-reconcile).
     ///
@@ -2407,12 +2435,16 @@ mod tests {
     /// pane created before its config write is roster-absent — which
     /// is exactly what the reconciler destroys, so the command would
     /// race the owner into losing the position it meant to preserve.
+    /// Asking whether this is a Zellij session touches no pane, so it
+    /// is the one call allowed.
     #[test]
     fn roster_commands_never_touch_zellij() {
         // Split so this assertion is not itself a match.
         let calls = [concat!("open_", "zellij"), concat!("zellij", "_action")];
+        let session_check = concat!("open_", "zellij::in_session()");
         for (n, line) in include_str!("agent.rs").lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
+            let code = code.replace(session_check, "");
             for c in calls {
                 assert!(!code.contains(c), "agent.rs:{} calls {c}: {line}", n + 1);
             }
