@@ -33,10 +33,10 @@ pub struct StatusSnapshot {
     /// Where this was read. `--repo` means the reader need not be
     /// standing in it, and the pane says it too (codex on 772b84f).
     pub(crate) repo_path: PathBuf,
-    /// The serving monitor's build, and whether it is still the installed
-    /// one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) monitor: Option<String>,
+    /// Whether the repo's monitor runs, and its build. On the wire as
+    /// the `monitor:` line.
+    #[serde(serialize_with = "monitor_wire")]
+    pub(crate) monitor: crate::cli::monitor::Liveness,
     #[serde(rename = "repo_basename")]
     pub(crate) basename: String,
     pub(crate) branch: Option<String>,
@@ -427,6 +427,13 @@ fn active_plan_wire<S: serde::Serializer>(
     }
 }
 
+fn monitor_wire<S: serde::Serializer>(
+    monitor: &crate::cli::monitor::Liveness,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&monitor.line())
+}
+
 fn blocks_wire<S: serde::Serializer>(
     blocks: &[crate::cli::block::BlockEntry],
     s: S,
@@ -700,7 +707,7 @@ impl StatusSnapshot {
         Ok(Self {
             forks,
             repo_path: repo.to_path_buf(),
-            monitor: crate::cli::monitor::build_line(repo),
+            monitor: crate::cli::monitor::liveness(repo),
             basename: basename.to_string(),
             branch,
             head_sha,
@@ -755,9 +762,7 @@ impl StatusSnapshot {
         if let Some(s) = &self.head_sha {
             let _ = writeln!(out, "head:   {s}");
         }
-        if let Some(monitor) = &self.monitor {
-            let _ = writeln!(out, "monitor: {monitor}");
-        }
+        let _ = writeln!(out, "monitor: {}", self.monitor.line());
         for warning in &self.warnings {
             let _ = writeln!(
                 out,
@@ -1316,17 +1321,40 @@ pub(crate) struct InputSignature {
     head: Option<String>,
     dirty: Option<crate::git_io::DirtyStats>,
     clank: u64,
-    /// Liveness of recorded attended tasks, which can change without
-    /// a file write when the task process exits.
-    attendances: u64,
+    health: ProcessHealth,
     /// The monitor's account of its sources, which changes outside the
     /// repo: a producer starting or ending, or the monitor going.
     sources: u64,
 }
 
+/// The snapshot inputs that change with no file write: a process
+/// exiting. The TUI's idle probe reads exactly this, and the signature
+/// carries it, so a change the probe raises is one the gate keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessHealth {
+    /// See [`attendance_fingerprint`].
+    pub(crate) attendances: u64,
+    pub(crate) monitor: crate::cli::monitor::Liveness,
+}
+
+pub(crate) fn process_health(repo: &Path) -> ProcessHealth {
+    ProcessHealth {
+        attendances: attendance_fingerprint(repo),
+        monitor: crate::cli::monitor::liveness(repo),
+    }
+}
+
 /// Compute the current [`InputSignature`]. One ODB open (HEAD + the
 /// dirty walk); the `.clank` fingerprint is stat-only (no file reads).
 pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
+    input_signature_with(repo, process_health(repo))
+}
+
+/// [`input_signature`] with its [`ProcessHealth`] supplied.
+pub(crate) fn input_signature_with(
+    repo: &Path,
+    health: ProcessHealth,
+) -> anyhow::Result<InputSignature> {
     let git = crate::git_io::open(repo)?;
     let head = git.head_sha()?.map(|s| s.as_str().to_string());
     let dirty = git.working_tree_dirty()?;
@@ -1334,7 +1362,7 @@ pub(crate) fn input_signature(repo: &Path) -> anyhow::Result<InputSignature> {
         head,
         dirty,
         clank: clank_input_fingerprint(repo),
-        attendances: attendance_fingerprint(repo),
+        health,
         sources: sources_fingerprint(repo),
     })
 }
@@ -2372,6 +2400,31 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// The monitor dying changes no repo input, so the signature must
+    /// carry it or the gate discards the rebuild that would show it.
+    #[test]
+    fn input_signature_moves_when_only_the_monitor_does() {
+        use crate::cli::monitor::{Liveness, describe, liveness, publish, runtime_path};
+        let dir = fixture_repo();
+        let r = dir.path();
+        let socket = Path::new("/tmp/x.sock");
+        let me = std::process::id() as i32;
+        publish(r, &describe(r, me, socket)).unwrap();
+        let running = input_signature(r).unwrap();
+        assert_eq!(process_health(r).monitor, liveness(r));
+        assert!(matches!(
+            process_health(r).monitor,
+            Liveness::Running { .. }
+        ));
+
+        publish(r, &describe(r, i32::MAX, socket)).unwrap();
+        let gone = input_signature(r).unwrap();
+        assert_eq!(process_health(r).monitor, Liveness::Gone { pid: i32::MAX });
+        assert_ne!(running, gone);
+        let _ = std::fs::remove_file(runtime_path(r, "json"));
+        assert_ne!(gone, input_signature(r).unwrap(), "and so does its absence");
+    }
+
     #[test]
     fn input_signature_is_stable_when_nothing_changes() {
         let dir = fixture_repo();
@@ -2750,6 +2803,27 @@ mod dirty_and_wake_tests {
         assert!(!out.contains("stale"), "{out}");
     }
 
+    /// A published monitor whose process exited reads as gone, not as
+    /// a build; and nothing published is said, not omitted.
+    #[test]
+    fn the_monitor_line_says_when_there_is_none_to_wake_anyone() {
+        use crate::cli::monitor::Liveness;
+        let mut snap = minimal_snapshot();
+        snap.monitor = Liveness::Gone { pid: 11481 };
+        assert!(
+            snap.to_human()
+                .contains("\nmonitor: gone (pid 11481 exited)\n"),
+            "{}",
+            snap.to_human()
+        );
+        snap.monitor = Liveness::None;
+        assert!(
+            snap.to_human().contains("\nmonitor: none\n"),
+            "{}",
+            snap.to_human()
+        );
+    }
+
     #[test]
     fn a_marker_names_the_task_silencing_the_agent() {
         let mut snap = minimal_snapshot();
@@ -2927,7 +3001,7 @@ mod dirty_and_wake_tests {
         StatusSnapshot {
             forks: Vec::new(),
             repo_path: PathBuf::from("/repo"),
-            monitor: None,
+            monitor: crate::cli::monitor::Liveness::None,
             basename: "repo".to_string(),
             branch: Some("main".to_string()),
             head_sha: Some("abcd123".to_string()),
@@ -3012,6 +3086,8 @@ mod dirty_and_wake_tests {
             // Where it was read: `--repo` means the reader need not be
             // standing in it (codex on 772b84f).
             "repo_path": "/repo",
+            // Always said: no monitor is a fact, not an omission.
+            "monitor": "none",
             "repo_basename": "repo",
             "branch": "main",
             "head_sha": "abcd123",
@@ -3127,8 +3203,7 @@ mod dirty_and_wake_tests {
             // than here: `--repo` means the reader need not be
             // standing in it (codex on 772b84f).
             repo_path: _,
-            // Read from the runtime namespace, not the repo: shown when a
-            // monitor is published, and absent from a fixture without one.
+            // Read from the runtime namespace, not the repo.
             monitor: _,
             // The LOG and the paging that walks it: rows, the fold
             // boundary, the cursor, what a finalize stands for, the

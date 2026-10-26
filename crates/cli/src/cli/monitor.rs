@@ -1481,6 +1481,7 @@ pub(crate) fn look_at_in(
         Published::Other {
             proto,
             socket: None,
+            ..
         } => {
             // Something is there and cannot be addressed. Not an
             // absence, so not a reason to start a second one.
@@ -2598,7 +2599,14 @@ pub(crate) enum Published {
     /// rest of the body happened to parse, which is why it is
     /// optional. Without one there is no way to reach the holder, and
     /// a successor must say that rather than guess a path.
-    Other { proto: u32, socket: Option<String> },
+    ///
+    /// The pid likewise, read on its own so that a body whose other
+    /// fields changed can still be asked whether its process lives.
+    Other {
+        proto: u32,
+        pid: Option<i32>,
+        socket: Option<String>,
+    },
     /// Nothing there, or nothing readable even as a version.
     Nothing,
     /// The NAMESPACE is not ours, so nothing read from it is evidence
@@ -2635,9 +2643,13 @@ pub(crate) fn published_in(dir: &std::path::Path, repo: &std::path::Path, me: u3
         return Published::Nothing;
     };
     let body = serde_json::from_slice::<Descriptor>(&raw).ok();
+    let pid = serde_json::from_slice::<PidEnvelope>(&raw)
+        .ok()
+        .map(|p| p.pid);
     if !admits(PROTO, envelope.proto) {
         return Published::Other {
             proto: envelope.proto,
+            pid,
             // An older descriptor still parses here when it only ADDED
             // fields we now ignore, which is how a successor reaches
             // the holders this plan exists for.
@@ -2651,9 +2663,15 @@ pub(crate) fn published_in(dir: &std::path::Path, repo: &std::path::Path, me: u3
         // says it is.
         None => Published::Other {
             proto: envelope.proto,
+            pid,
             socket: None,
         },
     }
+}
+
+#[derive(serde::Deserialize)]
+struct PidEnvelope {
+    pid: i32,
 }
 
 /// One connected waiter, as the fold owner sees it.
@@ -5955,33 +5973,91 @@ fn forget_dead_observations(repo: &std::path::Path) {
     }
 }
 
-/// The serving monitor's build, for `clank status`: the routing
-/// descriptor joined to the observation record of the process it names.
-pub(crate) fn build_line(repo: &std::path::Path) -> Option<String> {
-    match published(repo) {
-        Published::Ours(d) => {
-            let observed = std::fs::read(observation_path(repo, d.pid))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Observation>(&bytes).ok())
-                .filter(|o| {
-                    o.pid == d.pid && o.birth.as_ref().is_some_and(|b| b.still_holds(o.pid))
-                });
-            Some(describe_build(d.pid, d.build.as_ref(), observed.as_ref()))
+/// Whether a repo's monitor process exists, and the build it serves.
+///
+/// Existence only: a `Running` monitor is not thereby responsive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// The published pid is alive and, where its observation record
+    /// carries a birth, still the process that wrote it.
+    Running {
+        pid: i32,
+        /// `None` when the descriptor carries none, as a legacy or
+        /// other-version one does not.
+        build: Option<DescribedBuild>,
+        /// What it last recorded of its installation, when a record
+        /// holds for this process.
+        observed: Option<Observed>,
+    },
+    /// The published pid is dead, or is a stranger by its recorded birth.
+    Gone {
+        pid: i32,
+    },
+    /// Something is published but no pid can be believed from it.
+    Unknown(String),
+    None,
+}
+
+impl Liveness {
+    /// The `monitor:` line of `clank status`.
+    pub(crate) fn line(&self) -> String {
+        match self {
+            Liveness::Running {
+                pid,
+                build,
+                observed,
+            } => describe_build(*pid, build.as_ref(), observed.as_ref()),
+            Liveness::Gone { pid } => format!("gone (pid {pid} exited)"),
+            Liveness::Unknown(why) => format!("unknown: {why}"),
+            Liveness::None => "none".to_string(),
         }
-        Published::Other { proto, .. } => Some(format!("proto {proto}, build unknown (legacy)")),
-        Published::Nothing | Published::Untrusted(_) => None,
     }
 }
 
-fn describe_build(
-    pid: i32,
-    build: Option<&DescribedBuild>,
-    observed: Option<&Observation>,
-) -> String {
+/// Whether `repo`'s monitor is running: the routing descriptor joined to
+/// the observation record of the process it names.
+pub(crate) fn liveness(repo: &std::path::Path) -> Liveness {
+    match published(repo) {
+        Published::Ours(d) => serving(repo, d.pid, d.build),
+        Published::Other { pid: Some(pid), .. } => serving(repo, pid, None),
+        Published::Other {
+            proto, pid: None, ..
+        } => Liveness::Unknown(format!("a proto {proto} descriptor with no readable pid")),
+        // Nothing read from a namespace we do not trust is evidence, of
+        // a monitor or of its absence.
+        Published::Untrusted(why) => Liveness::Unknown(why),
+        Published::Nothing => Liveness::None,
+    }
+}
+
+fn serving(repo: &std::path::Path, pid: i32, build: Option<DescribedBuild>) -> Liveness {
+    if !crate::signal::alive(pid) {
+        return Liveness::Gone { pid };
+    }
+    let recorded = std::fs::read(observation_path(repo, pid))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Observation>(&bytes).ok())
+        .filter(|o| o.pid == pid)
+        .and_then(|o| o.birth.map(|birth| (birth, o.state)));
+    let observed = match recorded {
+        Some((birth, state)) if birth.still_holds(pid) => Some(state),
+        // A record without a birth this build can compare proves
+        // nothing either way, so the live pid stands unobserved.
+        None | Some((crate::proc_identity::ProcToken::Unrecognised, _)) => None,
+        Some(_) => return Liveness::Gone { pid },
+    };
+    Liveness::Running {
+        pid,
+        build,
+        observed,
+    }
+}
+
+fn describe_build(pid: i32, build: Option<&DescribedBuild>, observed: Option<&Observed>) -> String {
     let Some(build) = build else {
         return format!("pid {pid}, build unknown (legacy)");
     };
-    let state = match observed.map(|o| &o.state) {
+    let state = match observed {
         Some(Observed::Current) => "current".to_string(),
         Some(Observed::Replaced { installed }) => {
             format!("replaced by {installed}, retiring")
@@ -8519,6 +8595,7 @@ mod tests {
             published(repo.path()),
             Published::Other {
                 proto: 3,
+                pid: Some(7),
                 socket: Some("/tmp/old.sock".to_string()),
             },
             "an older monitor is something to replace, not nothing"
@@ -8540,6 +8617,7 @@ mod tests {
             published(repo.path()),
             Published::Other {
                 proto: PROTO,
+                pid: None,
                 socket: None
             }
         );
@@ -15989,6 +16067,88 @@ mod build_tests {
         let _ = std::fs::remove_file(observation_path(repo.path(), old_pid));
     }
 
+    /// Running only for a live pid whose recorded birth, where it has
+    /// one, still holds; and a published descriptor never reads as
+    /// nothing published.
+    #[test]
+    fn liveness_is_whether_the_published_process_lives() {
+        let repo = repo();
+        let me = std::process::id() as i32;
+        // Above every platform's pid limit, so no process holds it.
+        let dead = i32::MAX;
+        let socket = std::path::Path::new("/tmp/x.sock");
+        let now = || liveness(repo.path());
+        assert_eq!(now(), Liveness::None);
+        assert_eq!(now().line(), "none");
+
+        publish(repo.path(), &describe(repo.path(), me, socket)).unwrap();
+        assert_eq!(
+            now(),
+            Liveness::Running {
+                pid: me,
+                build: None,
+                observed: None
+            }
+        );
+
+        publish(repo.path(), &describe(repo.path(), dead, socket)).unwrap();
+        assert_eq!(now(), Liveness::Gone { pid: dead });
+        assert_eq!(now().line(), format!("gone (pid {dead} exited)"));
+
+        // `me` stands in for a reused pid: alive, but not the process
+        // that wrote the record under that number.
+        publish(repo.path(), &describe(repo.path(), me, socket)).unwrap();
+        note_observation(
+            repo.path(),
+            &Observation {
+                pid: me,
+                birth: Some(crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 0 }),
+                running: running().to_string(),
+                installed_at: "/bin/clank".into(),
+                source: Source::Invocation,
+                state: Observed::Current,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            now(),
+            Liveness::Gone { pid: me },
+            "a stranger is not Running"
+        );
+        let _ = std::fs::remove_file(observation_path(repo.path(), me));
+
+        std::fs::write(
+            runtime_path(repo.path(), "json"),
+            format!(r#"{{"proto":3,"pid":{me},"repo":"/w","socket":"/tmp/old.sock"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            now(),
+            Liveness::Running {
+                pid: me,
+                build: None,
+                observed: None
+            },
+            "a legacy descriptor's pid is asked too"
+        );
+        assert_eq!(now().line(), format!("pid {me}, build unknown (legacy)"));
+        std::fs::write(
+            runtime_path(repo.path(), "json"),
+            format!(r#"{{"proto":3,"pid":{dead}}}"#),
+        )
+        .unwrap();
+        assert_eq!(now(), Liveness::Gone { pid: dead });
+
+        std::fs::write(runtime_path(repo.path(), "json"), r#"{"proto":3}"#).unwrap();
+        assert!(
+            matches!(now(), Liveness::Unknown(_)),
+            "published without a pid is neither absent nor running: {:?}",
+            now()
+        );
+        assert!(now().line().starts_with("unknown: "), "{}", now().line());
+        let _ = std::fs::remove_file(runtime_path(repo.path(), "json"));
+    }
+
     /// Status joins the routed monitor to its own observation record,
     /// and believes the record only of the living process it names.
     #[test]
@@ -16022,7 +16182,7 @@ mod build_tests {
             )
             .unwrap()
         };
-        let line = || build_line(repo.path()).unwrap();
+        let line = || liveness(repo.path()).line();
         assert!(line().ends_with("not yet observed"), "{}", line());
         observe(Observed::Current, crate::proc_identity::token_for(me));
         assert!(line().ends_with(": current"), "{}", line());

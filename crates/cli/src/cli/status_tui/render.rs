@@ -58,6 +58,39 @@ fn agent_mark(mode: clank_core::vocab::AutoMode, presence: Presence, lost: bool)
     }
 }
 
+/// The `monitor` gauge: its pid and build, dim, while its process runs;
+/// the warning colour whenever there is none to deliver a wake.
+pub(super) fn monitor_spans(monitor: &crate::cli::monitor::Liveness) -> Vec<Span> {
+    use crate::cli::monitor::{Liveness, Observed};
+    let warn = |text: &str| colored("33", text.to_string());
+    let shown = match monitor {
+        Liveness::Running {
+            pid,
+            build,
+            observed,
+        } => {
+            let build = match build {
+                Some(build) => {
+                    let state = match observed {
+                        Some(Observed::Current) => "current",
+                        Some(Observed::Replaced { .. }) => "replaced",
+                        Some(Observed::Unavailable { .. }) => "install unavailable",
+                        None => "not yet observed",
+                    };
+                    let id = build.running.get(..8).unwrap_or(&build.running);
+                    format!("{id} {state}")
+                }
+                None => "build unknown".to_string(),
+            };
+            dim(format!("pid {pid} · {build}"))
+        }
+        Liveness::Gone { pid } => warn(&format!("gone (pid {pid} exited)")),
+        Liveness::Unknown(_) => warn("unknown · build unknown"),
+        Liveness::None => warn("none"),
+    };
+    vec![label("monitor"), shown]
+}
+
 /// The `dirty` gauge: `+12` green, `−3` red (GitHub convention),
 /// `· 2 untracked` dim; an all-zero (mode-only) change falls back to
 /// a dim `changes`.
@@ -617,6 +650,7 @@ pub(super) fn scrollable_header(
     if let Some(d) = &snap.dirty {
         body.push(dirty_spans(d));
     }
+    body.push(monitor_spans(&snap.monitor));
 
     // `done` — last finished, only when the repo is idle: PANEL-LESS
     // renders only (the finalize row in the log carries it —
@@ -6465,8 +6499,8 @@ mod tests {
 
     #[test]
     fn log_fills_leftover_rows_most_recent_at_top() {
-        // 8 rows: bar + breath + gate + git = 4, separator + 3 log
-        // lines fit → the TAIL of the log (most recent) is shown.
+        // 8 rows: bar + breath + gate + git + monitor = 5, separator +
+        // 2 log lines fit → the TAIL of the log (most recent) is shown.
         // Rows arrive newest-first (e5 is the most recent commit).
         let s = snap_with_log(&["e5", "e4", "e3", "e2", "e1"]);
         let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
@@ -6474,13 +6508,12 @@ mod tests {
         // Each row now ends with its age in the pane's time column, so
         // the subject is read out of the row, not off its end.
         assert!(
-            texts[5].starts_with("1h ") && texts[5].ends_with("e5"),
+            texts[6].starts_with("1h ") && texts[6].ends_with("e5"),
             "most recent at the TOP of the log: {texts:?}"
         );
-        assert!(texts[6].contains("e4"), "got {texts:?}");
-        assert!(texts[7].contains("e3"), "got {texts:?}");
+        assert!(texts[7].contains("e4"), "got {texts:?}");
         assert!(
-            !texts.iter().any(|t| t.ends_with("e1")),
+            !texts.iter().any(|t| t.ends_with("e3")),
             "oldest dropped first"
         );
     }
@@ -6808,6 +6841,73 @@ mod tests {
             .unwrap();
         assert_eq!(visible(&dirty), "dirty  changes");
         assert!(!dirty.contains("\x1b[32m") && !dirty.contains("\x1b[31m"));
+    }
+
+    /// The `monitor` row in every state: pid and build, dim, while it
+    /// runs; the warning colour when nothing is there to wake anyone.
+    #[test]
+    fn the_monitor_row_shows_each_state() {
+        use crate::cli::monitor::{DescribedBuild, Liveness, Observed};
+        let build = DescribedBuild {
+            running: "71e4c5c1aabbccdd00112233445566ff".into(),
+            installed_at: "/bin/clank".into(),
+            source: crate::build_stamp::Source::Invocation,
+        };
+        let running = |observed| Liveness::Running {
+            pid: 7705,
+            build: Some(build.clone()),
+            observed,
+        };
+        let cases = [
+            (
+                running(Some(Observed::Current)),
+                "monitor  pid 7705 · 71e4c5c1 current",
+                false,
+            ),
+            (
+                running(Some(Observed::Replaced {
+                    installed: "ffff".into(),
+                })),
+                "monitor  pid 7705 · 71e4c5c1 replaced",
+                false,
+            ),
+            (
+                running(None),
+                "monitor  pid 7705 · 71e4c5c1 not yet observed",
+                false,
+            ),
+            (
+                Liveness::Running {
+                    pid: 7705,
+                    build: None,
+                    observed: None,
+                },
+                "monitor  pid 7705 · build unknown",
+                false,
+            ),
+            (
+                Liveness::Gone { pid: 11481 },
+                "monitor  gone (pid 11481 exited)",
+                true,
+            ),
+            (
+                Liveness::Unknown("a proto 3 descriptor with no readable pid".into()),
+                "monitor  unknown · build unknown",
+                true,
+            ),
+            (Liveness::None, "monitor  none", true),
+        ];
+        for (monitor, want, warns) in cases {
+            for mut s in [snap(None, vec![]), two_agent_snap()] {
+                s.monitor = monitor.clone();
+                let line = render(&s, 40, 80)
+                    .into_iter()
+                    .find(|l| visible(l).starts_with("monitor"))
+                    .unwrap_or_else(|| panic!("a monitor row for {monitor:?}"));
+                assert_eq!(visible(&line), want);
+                assert_eq!(line.contains("\x1b[33m"), warns, "{line:?}");
+            }
+        }
     }
 
     #[test]

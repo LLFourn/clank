@@ -2995,10 +2995,11 @@ fn paint_interval(spinner_visible: bool) -> Duration {
 /// it already holds — the panel kept showing a healthy row after the
 /// waiter died, including across key repaints (codex 451c5dbc,
 /// grok 8aa2736120d7). The signature being ABLE to see it is not the
-/// same as the loop ever asking.
-struct AttendanceProbe {
+/// same as the loop ever asking. A monitor exiting is the same kind of
+/// input, so it is probed here too.
+struct HealthProbe<T> {
     at: std::time::Instant,
-    fingerprint: u64,
+    last: T,
 }
 
 /// Ask, at most once per `every`, whether the verdict changed.
@@ -3009,19 +3010,19 @@ struct AttendanceProbe {
 ///
 /// Rate-limited around the probe, not inside it: a key storm turns
 /// this loop many times, and the reads are cheap but not free.
-fn attendance_changed(
-    state: &mut AttendanceProbe,
+fn health_changed<T: PartialEq>(
+    state: &mut HealthProbe<T>,
     now: std::time::Instant,
     every: Duration,
-    probe: impl FnOnce() -> u64,
+    probe: impl FnOnce() -> T,
 ) -> bool {
     if now.duration_since(state.at) < every {
         return false;
     }
     state.at = now;
-    let fingerprint = probe();
-    let changed = fingerprint != state.fingerprint;
-    state.fingerprint = fingerprint;
+    let health = probe();
+    let changed = health != state.last;
+    state.last = health;
     changed
 }
 
@@ -3055,15 +3056,15 @@ struct TurnClose {
 /// `refresh_pending` goes in and comes back so a rebuild already owed
 /// from this turn's own input cannot be lost here, and so the probe is
 /// visibly NOT conditional on whether one was.
-fn close_turn(
-    probe: &mut AttendanceProbe,
+fn close_turn<T: PartialEq>(
+    probe: &mut HealthProbe<T>,
     now: std::time::Instant,
     every: Duration,
     refresh_pending: bool,
-    observe: impl FnOnce() -> u64,
+    observe: impl FnOnce() -> T,
 ) -> TurnClose {
     let mut observed = 0usize;
-    let changed = attendance_changed(probe, now, every, || {
+    let changed = health_changed(probe, now, every, || {
         observed += 1;
         observe()
     });
@@ -3417,9 +3418,14 @@ pub(crate) async fn run_tui(
         Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
     )> = Default::default();
     let mut reopen_outcomes_pending = Vec::new();
-    let mut waker_probe = AttendanceProbe {
+    // The monitor's baseline is what the snapshot SHOWS, so a change
+    // between the build and this line is still a change.
+    let mut waker_probe = HealthProbe {
         at: std::time::Instant::now(),
-        fingerprint: crate::cli::status::attendance_fingerprint(&repo),
+        last: crate::cli::status::ProcessHealth {
+            attendances: crate::cli::status::attendance_fingerprint(&repo),
+            monitor: snapshot.monitor.clone(),
+        },
     };
     let mut admin_page_cache: Option<RemotePage> = None;
     let mut admin_page_shown = None;
@@ -5335,7 +5341,7 @@ pub(crate) async fn run_tui(
             std::time::Instant::now(),
             REBUILD_MIN,
             refresh_pending,
-            || crate::cli::status::attendance_fingerprint(&repo),
+            || crate::cli::status::process_health(&repo),
         )
         .refresh_pending;
 
@@ -7965,7 +7971,7 @@ pub(crate) mod tests {
     /// the gate still found it, parsed its parentheses and read its
     /// fields — restoring exactly the missing-call defect this is for.
     /// The same split rejected valid code, because a comment inserted
-    /// between `status::` and `attendance_fingerprint` is the same
+    /// between `status::` and `process_health` is the same
     /// dependency and failed a `contains` (codex on 8045e76).
     ///
     /// So comments are DROPPED, not skipped-while-counting, and each
@@ -8262,11 +8268,17 @@ pub(crate) mod tests {
         // stop this test BUILDING rather than leave it hunting a dead
         // string: that is how its predecessor was red for months while
         // guarding nothing.
-        type Close =
-            fn(&mut AttendanceProbe, std::time::Instant, Duration, bool, fn() -> u64) -> TurnClose;
-        type Fingerprint = fn(&std::path::Path) -> u64;
+        use crate::cli::status::ProcessHealth;
+        type Close = fn(
+            &mut HealthProbe<ProcessHealth>,
+            std::time::Instant,
+            Duration,
+            bool,
+            fn() -> ProcessHealth,
+        ) -> TurnClose;
+        type Health = fn(&std::path::Path) -> ProcessHealth;
         let _close: Close = close_turn;
-        let _fingerprint: Fingerprint = crate::cli::status::attendance_fingerprint;
+        let _health: Health = crate::cli::status::process_health;
 
         const RECV: &[&str] = &["match", "ev_rx", ".", "recv_timeout", "(", "wait", ")", "{"];
         const CLOSE: &[&str] = &["refresh_pending", "=", "close_turn", "("];
@@ -8347,7 +8359,7 @@ pub(crate) mod tests {
                 "status",
                 ":",
                 ":",
-                "attendance_fingerprint",
+                "process_health",
                 "(",
                 "&",
                 "repo",
@@ -8383,21 +8395,18 @@ pub(crate) mod tests {
     /// A turn's CLOSE is what raises the rebuild, and these drive the
     /// production operation rather than the helper beside it.
     ///
-    /// `attendance_changed` was already well covered and its call site
+    /// `health_changed` was already well covered and its call site
     /// was not: deleting the call from the loop left every test green,
     /// including the one that names the helper through the compiler
     /// (codex on fbb84e3). The decision now has a return value, so a
     /// test can assert what the turn decided instead of reading the
     /// source to see whether it asked.
     #[test]
-    fn a_turn_closes_by_asking_whether_attendance_changed() {
+    fn a_turn_closes_by_asking_whether_health_changed() {
         let every = Duration::from_secs(1);
         let t0 = std::time::Instant::now();
         let due = t0 + every;
-        let probe = |fp: u64| AttendanceProbe {
-            at: t0,
-            fingerprint: fp,
-        };
+        let probe = |fp: u64| HealthProbe { at: t0, last: fp };
 
         // A due flip on an idle turn asks for the rebuild.
         let mut p = probe(7);
@@ -8468,10 +8477,7 @@ pub(crate) mod tests {
         let t0 = std::time::Instant::now();
         let due = t0 + every;
         for already in [false, true] {
-            let mut p = AttendanceProbe {
-                at: t0,
-                fingerprint: 7,
-            };
+            let mut p = HealthProbe { at: t0, last: 7 };
             let close = close_turn(&mut p, due, every, already, || 9);
             assert_eq!(
                 close.observed, 1,
@@ -8496,17 +8502,14 @@ pub(crate) mod tests {
     fn the_panel_probes_for_a_completed_attendance_between_filesystem_events() {
         let every = Duration::from_secs(1);
         let t0 = std::time::Instant::now();
-        let mut state = AttendanceProbe {
-            at: t0,
-            fingerprint: 7,
-        };
+        let mut state = HealthProbe { at: t0, last: 7 };
 
         // Too soon: it does not even ask. The probe panics to prove
         // the rate limit is around it, not inside it.
-        assert!(!attendance_changed(&mut state, t0, every, || panic!(
+        assert!(!health_changed(&mut state, t0, every, || panic!(
             "probed inside the rate limit"
         )));
-        assert!(!attendance_changed(
+        assert!(!health_changed(
             &mut state,
             t0 + Duration::from_millis(999),
             every,
@@ -8515,22 +8518,112 @@ pub(crate) mod tests {
 
         // Due, and nothing changed: no rebuild is asked for.
         let t1 = t0 + every;
-        assert!(!attendance_changed(&mut state, t1, every, || 7));
+        assert!(!health_changed(&mut state, t1, every, || 7));
 
         // Due, and the verdict FLIPPED — a waiter died, with no file
         // touched. This is the raise the panel never made.
         let t2 = t1 + every;
-        assert!(attendance_changed(&mut state, t2, every, || 9));
+        assert!(health_changed(&mut state, t2, every, || 9));
 
         // And it flips ONCE: the new verdict is now the baseline, so
         // an unchanged world does not rebuild every tick.
         let t3 = t2 + every;
-        assert!(!attendance_changed(&mut state, t3, every, || 9));
+        assert!(!health_changed(&mut state, t3, every, || 9));
 
         // Back again is also a change — a waiter arriving matters as
         // much as one dying.
         let t4 = t3 + every;
-        assert!(attendance_changed(&mut state, t4, every, || 7));
+        assert!(health_changed(&mut state, t4, every, || 7));
+    }
+
+    /// A monitor that changes with no file written, by dying or by
+    /// appearing, reaches the screen: the turn's probe asks for the
+    /// rebuild, the signature gate keeps it, and the kept snapshot
+    /// renders the change. Only the observation moves; the repo,
+    /// attendance and sources stay as they were.
+    #[test]
+    fn a_monitor_only_change_is_rebuilt_kept_and_shown() {
+        use crate::cli::monitor::Liveness;
+        use crate::cli::status::{ProcessHealth, input_signature_with};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let health = |monitor: &Liveness| ProcessHealth {
+            attendances: 0,
+            monitor: monitor.clone(),
+        };
+        let row = |snapshot: &crate::cli::status::StatusSnapshot| {
+            render::render(snapshot, 40, 80)
+                .iter()
+                .map(|l| visible(l))
+                .find(|l| l.starts_with("monitor"))
+                .expect("a monitor row")
+        };
+        let every = REBUILD_MIN;
+        let t0 = std::time::Instant::now();
+        let running = Liveness::Running {
+            pid: 7705,
+            build: None,
+            observed: None,
+        };
+        for (before, after, shown) in [
+            (
+                running.clone(),
+                Liveness::Gone { pid: 7705 },
+                "monitor  gone (pid 7705 exited)",
+            ),
+            (
+                Liveness::None,
+                running.clone(),
+                "monitor  pid 7705 · build unknown",
+            ),
+        ] {
+            let mut snapshot = snap(None, vec![]);
+            snapshot.monitor = before.clone();
+            let mut probe = HealthProbe {
+                at: t0,
+                last: health(&snapshot.monitor),
+            };
+            let mut last_sig = input_signature_with(p, health(&before)).ok();
+            assert!(last_sig.is_some());
+
+            let quiet = close_turn(&mut probe, t0 + every, every, false, || health(&before));
+            assert!(!quiet.refresh_pending, "{before:?}: nothing moved yet");
+
+            let turn = close_turn(&mut probe, t0 + every * 2, every, false, || health(&after));
+            assert!(
+                turn.refresh_pending,
+                "{before:?} -> {after:?}: the probe must ask for the rebuild"
+            );
+            let sig = input_signature_with(p, health(&after)).ok();
+            assert_ne!(
+                sig, last_sig,
+                "{before:?} -> {after:?}: the gate must keep the rebuild"
+            );
+            let mut rebuilt = snap(None, vec![]);
+            rebuilt.monitor = after.clone();
+            let mut failures = 0;
+            assert!(apply_refresh(
+                &mut snapshot,
+                Vec::new(),
+                Ok(rebuilt),
+                &mut failures
+            ));
+            last_sig = sig;
+            assert_eq!(row(&snapshot), shown);
+
+            let settled = close_turn(&mut probe, t0 + every * 3, every, false, || health(&after));
+            assert!(!settled.refresh_pending, "{after:?}: it flips once");
+            assert_eq!(input_signature_with(p, health(&after)).ok(), last_sig);
+        }
     }
 
     #[test]
