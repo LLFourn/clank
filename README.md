@@ -183,6 +183,20 @@ state or role changes. Clank finds an agent's pane by that name, not by
 the command it runs, so a pane you start by hand, named for the agent,
 is that agent's pane. Rename one by hand and clank believes you.
 
+Everything clank types into an agent (`clank nudge`, an interrupting
+event, recovery's nudges and retries, attendance check-ins, user
+commands) goes to the one live pane with that name in the repo's
+workspace, as the tool the roster gives the agent. No such pane, two of
+them, or a pane whose name could be read as two agents means nothing is
+typed; once recovery's nudge has met that, `clank status` says which. Whether the tool may be typed into
+at all is decided by the tool alone: Claude and Codex are, Grok never
+is, and OpenCode is resumed through its plugin.
+
+The TUI learns that an agent's pane exited at its next listing of the
+panes: when you open the agents panel or an agent's page, when an
+agent's status glyph changes, or when the roster changes. A quiet TUI
+can show a pane that has gone until one of those happens.
+
 The name only means something inside the repo's **workspace**: the tab
 that holds the repo's TUI pane (`clank tui --repo <path>`), in whatever
 session that tab is. Two repos in one session can both have a `codex`;
@@ -213,8 +227,8 @@ repo's workspace, `clank as` also renames its own pane to the label, so
 clank can find it. It refuses, before binding anything, when another
 live pane there already has that name; when the workspace cannot be
 determined it binds and says the pane was not renamed; a rename zellij
-refuses leaves the binding and exits non-zero. A renamed pane is
-locatable, but typing into it still needs a launch through clank.
+refuses leaves the binding and exits non-zero. A renamed pane is that
+agent's pane like any other.
 
 From then on the session's binding is its identity, for every hook and
 every clank command it runs. `CLANK_AGENT` only binds a session that
@@ -609,26 +623,19 @@ bytes.
 `send --interrupt`, recovery, check-ins, the web chat) goes through one
 admission rule: CR becomes LF, Tab a space, other control characters
 U+FFFD, and a leading `!` gets `·` before it. It then types only when one
-dump reads the input as an ordinary prompt (Claude, Codex), or when it
-opens with a key committed evidence shows leaves the tool's shell mode
-(Grok's Ctrl+C, OpenCode's Esc, on the interrupt-first paths). Otherwise
-it is refused and an event wake stays pending. Codex's app-server and
-OpenCode's plugin take the same admitted text.
+dump reads the input as an ordinary prompt (Claude, Codex). Grok's and
+OpenCode's input cannot be read, so their panes are never typed into.
+Otherwise it is refused and an event wake stays pending. Codex's
+app-server and OpenCode's plugin take the same admitted text.
 
-**Evidence a human records.** These are gated on rows observed in throwaway
-panes against the installed harnesses, and stay refused until a row is
-committed in `crates/cli/src/cli/pane_input.rs`:
-
-- `USER_COMMAND_EVIDENCE`: Claude Code at an exact version runs a typed
-  `!<line>` plus Enter as one bash command (quotes, `$`, a line at the
-  chosen `max_command`), what its bash mode looks like in a `zellij action
-  dump-screen --ansi` dump, and whether a bash-mode command fires a Stop
-  hook. Without a row every request is refused at dispatch.
-- `SPACE_BEFORE_BANG`: Claude Code at a version keeps ` !x` (one leading
-  space) and a `!` after an LF as prompt text. Without a row, `·` is used.
-- `EXIT_KEY_EVIDENCE`: Grok's Ctrl+C clears a bare `!`, and OpenCode's Esc
-  leaves shell mode (and whether it also interrupts). Without a row, `clank
-  nudge` and the event-wake fallback refuse those tools' panes.
+**Evidence a human records.** User commands are gated on an observation
+made in a throwaway pane against the installed harness, and stay refused
+until it is committed as `USER_COMMAND_EVIDENCE` in
+`crates/cli/src/cli/pane_input.rs`: Claude Code runs a typed `!<line>`
+plus Enter as one bash command (quotes, `$`, a line at the chosen
+`max_command`), what its bash mode looks like in a `zellij action
+dump-screen --ansi` dump, and whether a bash-mode command fires a Stop
+hook. Without it every request is refused at dispatch.
 
 ### Background work: run and attend
 
@@ -1193,23 +1200,19 @@ or polls for completion. Relative profile paths with unknown launch cwd are
 refused. A read-only preflight failure permits verified terminal fallback;
 uncertainty after native control forbids a second transport attempt.
 
-The verified Zellij pane first receives Ctrl+C for Grok or Escape for other
-providers, then a brief inbox instruction. `clank nudge` uses the same
-interrupt-then-submit sequence with your message and remains independent of
+The agent's pane first receives Escape, then a brief inbox instruction.
+`clank nudge` uses the same interrupt-then-submit sequence with your message and remains independent of
 hook and binding health. Interrupting first is what lets an IDLE agent keep the
 message: submitting first started a turn that the interrupt then cancelled, and
 the interrupt key is inert at an idle prompt for every supported provider. For
 a BUSY agent the terminal path is best-effort. The message follows the interrupt
 directly, and what happens to input arriving while a turn is still being
 cancelled is up to the provider. Claude documents that input submitted while
-busy is queued and sent after Escape; for Codex, Grok and opencode it is not
-established. If the interrupt's delivery is not confirmed, no message is
-submitted. The key may still have landed, so the failure is not reported as
-safe to repeat. A message whose submission is unconfirmed is never resent
-automatically. Launch provenance
-must corroborate the actual running provider; restart older panes through an
-updated Clank launcher if that evidence is missing. Accepted terminal bytes are
-not proof that a subprocess stopped or an event was read.
+busy is queued and sent after Escape; for Codex it is not established. If the
+interrupt's delivery is not confirmed, no message is submitted. The key may
+still have landed, so the failure is not reported as safe to repeat. A message
+whose submission is unconfirmed is never resent automatically. Accepted
+terminal bytes are not proof that a subprocess stopped or an event was read.
 
 Interruption does not copy event contents into a second prompt, acknowledge work,
 supply a required reply or create a wake receipt. Missing/unverified transport
@@ -1220,10 +1223,10 @@ or deadline may leave an unconfirmed attempt, which also does not retry.
 The interruption path adds no watcher or idle polling. Upgrade all Clank clients
 and the monitor before enabling it. Monitor capability 10 includes this lifecycle;
 a newer client requests cooperative retirement of an older host. Refresh long-lived
-TUI clients as well so they share the replacement rather than keep local watchers. Grok and Claude currently use verified
-terminal control. OpenCode's server API has cancellation, but Clank has no verified
-attachable endpoint for a live TUI; it likewise uses the terminal path. No separate
-provider process/server is started to control a persisted session. Without a
+TUI clients as well so they share the replacement rather than keep local watchers. Claude
+uses terminal control. Grok's and OpenCode's panes are never typed into; OpenCode's
+server API has cancellation, but Clank has no verified attachable endpoint for a live
+TUI. No separate provider process/server is started to control a persisted session. Without a
 verified transport, pending work is delivered through the ordinary wait/hook.
 An already-armed local wait emits its normal context directly; it needs no detached
 interruption helper. Wake receipts and required replies keep their normal meaning.

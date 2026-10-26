@@ -948,7 +948,6 @@ mod tests {
                             blind_nudge: None,
                             attending: false,
                             asking: asking().is_some(),
-                            identify: false,
                             projection: Default::default(),
                         }],
                         0,

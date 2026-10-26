@@ -753,14 +753,6 @@ impl Turns {
             .recovery_quiet(&facts(g, None, &owed, &Process))
     }
 
-    /// Whether `author` has an attendance the monitor holds: its harness
-    /// version is then worth knowing, for the route a check-in needs.
-    pub(crate) fn attending(&self, author: &AgentLabel) -> bool {
-        self.agents
-            .get(author)
-            .is_some_and(|c| c.state.attendance != Attendance::None)
-    }
-
     /// What status and the TUI show of `author`: its attendance and,
     /// once it escalates, its repeat count.
     pub(crate) fn projection(

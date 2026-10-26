@@ -1,10 +1,8 @@
 use super::*;
 use crate::cli::composer::fixtures::claude;
-use crate::cli::pane_target::Process;
 use crate::cli::user_command::envelope::SiteKey;
 use crate::cli::user_command::envelope::testkey::{NOW, Signer, payload};
 use crate::cli::user_command::trust::{KeyName, Pin};
-use crate::proc_identity::ProcToken;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,24 +21,10 @@ fn sid(s: &str) -> SessionId {
     SessionId::parse(s).unwrap()
 }
 
-fn birth(n: u64) -> ProcToken {
-    ProcToken::MacStart { sec: n, usec: 0 }
-}
-
 fn seen() -> PaneSeen {
     PaneSeen {
         session: "zs".into(),
         pane: "terminal_3".into(),
-        pid: 42,
-        birth: birth(1),
-    }
-}
-
-fn process(pid: i32, b: u64) -> Process {
-    Process {
-        pid,
-        birth: birth(b),
-        harness: Ok("2.1.308".into()),
     }
 }
 
@@ -65,13 +49,14 @@ struct Fake {
     now: AtomicU64,
     trust: Mutex<TrustSet>,
     binding: Mutex<Option<(Tool, SessionId)>>,
-    discover: Mutex<Result<(PaneSeen, Tool), String>>,
+    /// What each lookup finds, in turn; the last one answers every lookup
+    /// after it.
+    discover: Mutex<Vec<Result<(PaneSeen, Tool), String>>>,
     looks: Mutex<Result<(), String>>,
-    launch: Mutex<Result<(Tool, Process), String>>,
     screen: Mutex<Option<String>>,
     answers: Vec<Write>,
     written: Mutex<Vec<Vec<String>>>,
-    evidence: Vec<UserCommandEvidence>,
+    evidence: Option<UserCommandEvidence>,
     history: Mutex<Vec<nudge_log::Record>>,
     /// A real repo whose binding lock and config are used instead.
     repo: Option<PathBuf>,
@@ -136,13 +121,12 @@ impl Fake {
             now: AtomicU64::new(NOW),
             trust: Mutex::new(one(key)),
             binding: Mutex::new(Some((Tool::Claude, sid("session-one")))),
-            discover: Mutex::new(Ok((seen(), Tool::Claude))),
+            discover: Mutex::new(vec![Ok((seen(), Tool::Claude))]),
             looks: Mutex::new(Ok(())),
-            launch: Mutex::new(Ok((Tool::Claude, process(42, 1)))),
             screen: Mutex::new(Some(claude(&["❯ "]))),
             answers: vec![Write::Ok, Write::Ok],
             written: Mutex::new(Vec::new()),
-            evidence: vec![ROW],
+            evidence: Some(ROW),
             history: Mutex::new(Vec::new()),
             repo: None,
             during: Mutex::new(None),
@@ -214,7 +198,11 @@ impl Seams for Fake {
         }
     }
     async fn discover(&self, _: &AgentLabel) -> Result<(PaneSeen, Tool), String> {
-        self.discover.lock().unwrap().clone()
+        let mut found = self.discover.lock().unwrap();
+        match found.len() {
+            1 => found[0].clone(),
+            _ => found.remove(0),
+        }
     }
     async fn last_look(&self, _: &AgentLabel, _: &SessionId) -> Result<(), String> {
         let answer = self.looks.lock().unwrap().clone();
@@ -240,16 +228,13 @@ impl Seams for Fake {
         }
         Ok(Box::new(Held::take(&self.pane_held)))
     }
-    fn launch(&self, _: &AgentLabel, _: &PaneSeen) -> Result<(Tool, Process), String> {
-        self.launch.lock().unwrap().clone()
-    }
     type Term<'a> = Term<'a>;
 
     fn terminal<'a>(&'a self, _: &'a PaneSeen) -> Term<'a> {
         Term(self)
     }
-    fn evidence(&self) -> &[UserCommandEvidence] {
-        &self.evidence
+    fn evidence(&self) -> Option<&UserCommandEvidence> {
+        self.evidence.as_ref()
     }
     fn history(&self, _: &AgentLabel, record: nudge_log::Record) {
         self.history.lock().unwrap().push(record);
@@ -761,10 +746,10 @@ async fn an_expired_request_is_refused() {
     assert_eq!(seams.writes(), 0);
 }
 
-/// Refused, with nothing typed: a binding that moved, a pane replaced
-/// since the first look, a pane that runs another tool, a pane that cannot
-/// be located with certainty, an unverified launch, no evidence row for
-/// the version, and a command longer than the row's bound.
+/// Refused, with nothing typed: a binding that moved, a pane that runs
+/// another tool or cannot be located with certainty, at the first look or
+/// again under the pane's lock, a pane replaced since the first look, no
+/// committed evidence, and a command longer than its bound.
 #[tokio::test]
 async fn a_changed_target_is_refused() {
     type Change = fn(&mut Fake);
@@ -773,22 +758,35 @@ async fn a_changed_target_is_refused() {
             *f.binding.lock().unwrap() = Some((Tool::Claude, sid("session-two")))
         }),
         ("replaced", |f| {
-            *f.launch.lock().unwrap() = Ok((Tool::Claude, process(42, 2)))
-        }),
-        ("pid", |f| {
-            *f.launch.lock().unwrap() = Ok((Tool::Claude, process(43, 1)))
+            *f.discover.lock().unwrap() = vec![
+                Ok((seen(), Tool::Claude)),
+                Ok((
+                    PaneSeen {
+                        pane: "terminal_4".into(),
+                        ..seen()
+                    },
+                    Tool::Claude,
+                )),
+            ]
         }),
         ("tool", |f| {
-            *f.discover.lock().unwrap() = Ok((seen(), Tool::Codex))
+            *f.discover.lock().unwrap() = vec![Ok((seen(), Tool::Codex))]
+        }),
+        ("tool under the lock", |f| {
+            *f.discover.lock().unwrap() =
+                vec![Ok((seen(), Tool::Claude)), Ok((seen(), Tool::Codex))]
         }),
         ("ambiguous", |f| {
-            *f.discover.lock().unwrap() = Err("live panes in 2 sessions".into())
+            *f.discover.lock().unwrap() = vec![Err("live panes in 2 sessions".into())]
         }),
-        ("unverified", |f| {
-            *f.launch.lock().unwrap() = Err("process ended".into())
+        ("ambiguous under the lock", |f| {
+            *f.discover.lock().unwrap() = vec![
+                Ok((seen(), Tool::Claude)),
+                Err("two panes are named claude".into()),
+            ]
         }),
-        ("evidence", |f| f.evidence.clear()),
-        ("bound", |f| f.evidence[0].max_command = 5),
+        ("evidence", |f| f.evidence = None),
+        ("bound", |f| f.evidence.as_mut().unwrap().max_command = 5),
     ];
     for (what, change) in changes {
         let w = World::new();

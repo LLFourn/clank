@@ -10,7 +10,7 @@
 //!
 //! So this shares nothing with the machinery it exists to bypass. It
 //! reads no hook, no inbox, no session binding and no wait — only the
-//! live pane listing. Its one write is the agent's nudge history, made
+//! roster and the live pane listing. Its one write is the agent's nudge history, made
 //! after the attempt's outcome is fixed and unable to change it.
 
 use super::{NudgeArgs, resolve_repo};
@@ -47,7 +47,8 @@ async fn nudge_with(
 
 /// Why a nudge did not complete.
 enum Failed {
-    /// Nothing reached the terminal: no zellij, no pane, no provenance.
+    /// Nothing reached the terminal: no zellij, or no one pane named for
+    /// the agent.
     Refused(anyhow::Error),
     Unconfirmed(Unconfirmed),
 }
@@ -59,22 +60,14 @@ async fn attempt(
     body: &str,
 ) -> Result<String, Failed> {
     open_zellij::require_zellij().map_err(Failed::Refused)?;
-    let (found, tool, process) =
-        super::pane_target::discover_process(repo.to_path_buf(), to.clone())
-            .await
-            .map_err(Failed::Refused)?;
-    let version = process.harness.as_deref().ok();
-    let target = crate::cli::pane_input::Target {
-        session: &found.session,
-        pane: &found.pane,
-        tool,
-        version,
-    };
-    let body = crate::cli::pane_input::Admitted::new(tool, version, body);
-    crate::cli::pane_input::interrupt_and_submit_async(target, &body)
+    let target = super::pane_target::discover(repo.to_path_buf(), to.clone())
+        .await
+        .map_err(Failed::Refused)?;
+    let body = crate::cli::pane_input::Admitted::new(body);
+    crate::cli::pane_input::interrupt_and_submit_async(target.input(), &body)
         .await
         .map_err(Failed::Unconfirmed)?;
-    Ok(format!("session {}, pane {}", found.session, found.pane))
+    Ok(format!("session {}, pane {}", target.session, target.pane))
 }
 
 /// What the attempt's result lets the history say.

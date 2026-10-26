@@ -3093,7 +3093,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // Agents whose turn failed with nothing left to wake them.
     let (recovery_answers, mut answered) = tokio::sync::mpsc::unbounded_channel::<RecoveryAnswer>();
     let (asks, mut authorizations) = tokio::sync::mpsc::unbounded_channel::<Authorize>();
-    let (identities, mut identified) = tokio::sync::mpsc::unbounded_channel::<Identified>();
     let mut recovery = crate::cli::recovery::Driver::new(
         repo.as_ref().clone(),
         std::env::var_os("HOME")
@@ -3186,7 +3185,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             Some(ask) = check_in_authorizations.recv() => Wake::AuthorizeCheckIn(ask),
             Some(done) = checked_in.recv() => Wake::CheckedIn(done),
             Some(a) = authorizations.recv() => Wake::Authorize(a),
-            Some(identity) = identified.recv() => Wake::Identified(identity),
             Some(answer) = answered.recv() => Wake::Answered(answer),
             Some(event) = changed_records.recv() => {
                 let mut events = std::collections::BTreeSet::from([event]);
@@ -3457,25 +3455,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     project(&mut recovery, &mut turns, &done.author, &g);
                 }
             }
-            Wake::Identified((author, session, running)) => {
-                let acts = recovery.identified(
-                    &author,
-                    &session,
-                    running,
-                    crate::cli::recovery::unix_now(),
-                );
-                if owner {
-                    act_on_recovery(
-                        &repo,
-                        &clients,
-                        acts,
-                        &recovery_answers,
-                        &asks,
-                        &records,
-                        &mut owned,
-                    );
-                }
-            }
             Wake::Answered((author, attempt, answer)) => {
                 let acts =
                     recovery.answer(&author, &attempt, answer, crate::cli::recovery::unix_now());
@@ -3648,10 +3627,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                         &pending,
                                     );
                                     project(&mut recovery, &mut turns, &author, &g);
-                                    if turns.attending(&author) {
-                                        recovery.wants_identity(&author);
-                                    }
-                                    identify_agents(&repo, &mut recovery, &identities, &mut owned);
                                     said
                                 })
                             }
@@ -3878,7 +3853,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &mut turns,
                             ));
                             let now = crate::cli::recovery::unix_now();
-                            let mut acts = recovery.reconcile(
+                            let acts = recovery.reconcile(
                                 recovery_facts(
                                     &repo,
                                     &state,
@@ -3899,7 +3874,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &records,
                                 &mut owned,
                             );
-                            identify_agents(&repo, &mut recovery, &identities, &mut owned);
                         }
                         folded_state = Some(state);
                     }
@@ -3954,7 +3928,6 @@ enum Wake {
     LeaseChanged,
     RecoveryDue,
     Authorize(Authorize),
-    Identified(Identified),
     Answered(RecoveryAnswer),
     Records(std::collections::BTreeSet<crate::cli::recovery::RecordEvent>),
     TimersDue,
@@ -4182,7 +4155,6 @@ fn recovery_facts(
         facts.push(crate::cli::recovery::Facts {
             agent_dir: dir,
             work: identities(&owed),
-            identify: turns.attending(&author),
             author,
             session,
             auto,
@@ -4362,11 +4334,9 @@ fn recovery_gate(
 struct Authorize {
     author: AgentLabel,
     attempt: crate::cli::recovery::AttemptRef,
-    /// The harness and its pane's screen as just read, for a send typed
-    /// into a pane.
+    /// The tool the roster gave the pane and its screen as just read, for a
+    /// send typed into a pane.
     screen: Option<(clank_core::Tool, Option<String>)>,
-    /// The provider process found in that pane.
-    process: Option<crate::cli::pane_target::Process>,
     /// The transport that will make the mutation.
     transport: crate::cli::recovery::Transport,
     /// The repo folded afresh for this send, so the last look can derive
@@ -4383,7 +4353,6 @@ async fn authorized(
     author: AgentLabel,
     attempt: crate::cli::recovery::AttemptRef,
     screen: Option<(clank_core::Tool, Option<String>)>,
-    process: Option<crate::cli::pane_target::Process>,
     transport: crate::cli::recovery::Transport,
 ) -> bool {
     let state = folded(repo).await.ok();
@@ -4392,7 +4361,6 @@ async fn authorized(
         author,
         attempt,
         screen,
-        process,
         transport,
         state,
         reply,
@@ -4418,7 +4386,8 @@ fn authorize(
 /// owns the live state, so a change already on disk vetoes the send
 /// whether or not a fold has seen it: the same gate a deadline asks
 /// (binding, deliverer, auto mode, a question, block or attendance); for a
-/// typed send, the input read as empty; and then the driver's own view,
+/// typed send, the input read as empty and the pane's tool still the
+/// roster's; and then the driver's own view,
 /// given the role on the roster and the work derived from the repo as
 /// freshly folded for this send, with the record read afresh nearest the
 /// mutation. Not atomic: what changes after it is the race the capability
@@ -4448,6 +4417,9 @@ fn may_send_now(
     let Ok(role) = crate::agent_store::resolve_role(repo, &a.author) else {
         return false;
     };
+    let typing_into = a.screen.as_ref().map(|(tool, _)| *tool).filter(|tool| {
+        crate::agent_store::resolve_tool(repo, &a.author).is_ok_and(|now| now == *tool)
+    });
     let live = crate::cli::recovery::Live {
         role: role.to_string(),
         work: identities(&owed),
@@ -4458,7 +4430,7 @@ fn may_send_now(
             .as_ref()
             .map(crate::cli::recovery::Bound::of),
         transport: a.transport,
-        process: a.process.clone(),
+        typing_into,
     };
     recovery.may_send(&a.author, &a.attempt, &live)
 }
@@ -4507,10 +4479,8 @@ struct CheckInAsk {
     session: clank_core::SessionId,
     /// The attendance the check-in was fired for.
     check_in: clank_core::turn_policy::CheckInRef,
-    /// The harness and its pane's screen as just read.
+    /// The tool the roster gave the pane, and its screen as just read.
     screen: (clank_core::Tool, Option<String>),
-    /// The provider process found in that pane.
-    process: crate::cli::pane_target::Process,
     reply: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -4521,19 +4491,12 @@ struct CheckedIn {
     outcome: Result<(), String>,
 }
 
-/// An agent's pane, the harness and process running in it, and the pane's
-/// screen as read when it was found.
-pub(crate) type Located = (
-    crate::cli::pane_target::Found,
-    clank_core::Tool,
-    crate::cli::pane_target::Process,
-    Option<String>,
-);
+/// An agent's pane, and its screen as read when it was found.
+pub(crate) type Located = (crate::cli::pane_target::Target, Option<String>);
 
-/// Where a check-in is typed: the agent's pane.
+/// Where recovery's typed sends and check-ins are typed: the agent's pane.
 pub(crate) trait Typist: Send + Sync + 'static {
-    /// The agent's pane, the harness and process running in it, and the
-    /// pane's screen as read now.
+    /// The agent's pane, and its screen as read now.
     fn locate(
         &self,
         repo: std::path::PathBuf,
@@ -4543,13 +4506,16 @@ pub(crate) trait Typist: Send + Sync + 'static {
     /// Type `text` into the pane and submit it.
     fn submit(
         &self,
-        found: crate::cli::pane_target::Found,
-        tool: clank_core::Tool,
+        target: crate::cli::pane_target::Target,
         text: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>> + Send,
+        >,
+    >;
 }
 
-/// The agent's zellij pane, as recovery's typed sends reach it.
+/// The agent's zellij pane.
 struct Panes;
 
 impl Typist for Panes {
@@ -4559,40 +4525,54 @@ impl Typist for Panes {
         author: AgentLabel,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Located, String>> + Send>> {
         Box::pin(async move {
-            let (found, tool, process) = crate::cli::pane_target::discover_process(repo, author)
+            let target = crate::cli::pane_target::discover(repo, author)
                 .await
                 .map_err(|e| format!("its pane was not found: {e:#}"))?;
             let screen =
-                crate::cli::open_zellij::dump_pane_screen(&found.session, &found.pane).await;
-            Ok((found, tool, process, screen))
+                crate::cli::open_zellij::dump_pane_screen(&target.session, &target.pane).await;
+            Ok((target, screen))
         })
     }
 
     fn submit(
         &self,
-        found: crate::cli::pane_target::Found,
-        tool: clank_core::Tool,
+        target: crate::cli::pane_target::Target,
         text: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>> + Send,
+        >,
+    > {
         Box::pin(async move {
-            let target = crate::cli::pane_input::Target {
-                session: &found.session,
-                pane: &found.pane,
-                tool,
-                version: None,
-            };
-            let text = crate::cli::pane_input::Admitted::new(tool, None, &text);
-            crate::cli::pane_input::submit_async(target, &text)
-                .await
-                .map_err(|e| match e {
-                    crate::cli::open_zellij::PaneWrite::NotStarted(why) => {
-                        format!("typing it did not start: {why}")
-                    }
-                    crate::cli::open_zellij::PaneWrite::Unknown(why) => {
-                        format!("typing it may not have finished: {why}")
-                    }
-                })
+            let text = crate::cli::pane_input::Admitted::new(&text);
+            crate::cli::pane_input::submit_async(target.input(), &text).await
         })
+    }
+}
+
+/// One typed recovery send through `typist`: find the agent's pane, ask the
+/// loop for its last look, then submit.
+async fn typed_send(
+    repo: std::path::PathBuf,
+    author: AgentLabel,
+    attempt: crate::cli::recovery::AttemptRef,
+    text: String,
+    typist: &dyn Typist,
+    asks: &tokio::sync::mpsc::UnboundedSender<Authorize>,
+) -> crate::cli::recovery::Answer {
+    use crate::cli::recovery::{Answer, Transport};
+    let (target, screen) = match typist.locate(repo.clone(), author.clone()).await {
+        Ok(located) => located,
+        Err(why) => return Answer::Unreachable(why),
+    };
+    let screen = Some((target.tool, screen));
+    if !authorized(asks, &repo, author, attempt, screen, Transport::Typed).await {
+        return Answer::Unavailable;
+    }
+    match typist.submit(target, text).await {
+        Ok(()) => Answer::Submitted { started: None },
+        Err(crate::cli::open_zellij::PaneWrite::NotStarted(_)) => Answer::Unavailable,
+        Err(crate::cli::open_zellij::PaneWrite::Unknown(_)) => Answer::Indeterminate,
     }
 }
 
@@ -4607,19 +4587,28 @@ async fn deliver_check_in(
     done: tokio::sync::mpsc::UnboundedSender<CheckedIn>,
 ) {
     let outcome = async {
-        let (found, tool, process, screen) = typist.locate(repo, due.author.clone()).await?;
+        let (target, screen) = typist.locate(repo, due.author.clone()).await?;
         let (reply, answer) = tokio::sync::oneshot::channel();
         asks.send(CheckInAsk {
             author: due.author.clone(),
             session: due.session.clone(),
             check_in: due.check_in.clone(),
-            screen: (tool, screen),
-            process,
+            screen: (target.tool, screen),
             reply,
         })
         .map_err(|_| "the monitor is gone".to_string())?;
         match answer.await {
-            Ok(Ok(())) => typist.submit(found, tool, due.text.clone()).await,
+            Ok(Ok(())) => typist
+                .submit(target, due.text.clone())
+                .await
+                .map_err(|e| match e {
+                    crate::cli::open_zellij::PaneWrite::NotStarted(why) => {
+                        format!("typing it did not start: {why}")
+                    }
+                    crate::cli::open_zellij::PaneWrite::Unknown(why) => {
+                        format!("typing it may not have finished: {why}")
+                    }
+                }),
             Ok(Err(why)) => Err(format!("its last look refused it: {why}")),
             Err(_) => Err("the monitor is gone".to_string()),
         }
@@ -4632,10 +4621,10 @@ async fn deliver_check_in(
     });
 }
 
-/// The last look before a check-in is typed: the session still bound, the
-/// route still granted for the very process recovery identified, its
-/// input line empty, and, by `g` as gathered now, the attendance still the
-/// one the check-in was fired for with every wake gate open.
+/// The last look before a check-in is typed: the session still bound to the
+/// tool the roster gave the pane, that harness resumed by typing, its input
+/// line empty, and, by `g` as gathered now, the attendance still the one
+/// the check-in was fired for with every wake gate open.
 fn may_check_in_now(
     repo: &std::path::Path,
     recovery: &crate::cli::recovery::Driver,
@@ -4647,8 +4636,8 @@ fn may_check_in_now(
     if !crate::agent_store::binding_matches(repo, &ask.author, *tool, ask.session.as_str()) {
         return Err("the session no longer holds the label".into());
     }
-    if !recovery.may_type_check_in(&ask.author, &ask.process) {
-        return Err("its pane runs no harness identified as granted a typed resume".into());
+    if !recovery.may_type_check_in(&ask.author) {
+        return Err("its harness is not resumed by typing".into());
     }
     if screen
         .as_deref()
@@ -4760,31 +4749,6 @@ fn settle_result(
     Ok(commit)
 }
 
-/// What identifying an agent's running harness found, for its binding.
-type Identified = (
-    AgentLabel,
-    clank_core::agent_config::Session,
-    Result<crate::cli::harness_identity::Running, String>,
-);
-
-/// Identify, off the loop, each agent whose running harness recovery has not
-/// asked about yet.
-fn identify_agents(
-    repo: &std::path::Path,
-    recovery: &mut crate::cli::recovery::Driver,
-    found: &tokio::sync::mpsc::UnboundedSender<Identified>,
-    owned: &mut OwnedTasks,
-) {
-    for (author, session) in recovery.unidentified() {
-        let repo = repo.to_path_buf();
-        let found = found.clone();
-        owned.departing.push(tokio::spawn(async move {
-            let running = crate::cli::harness_identity::identify(repo, author.clone()).await;
-            let _ = found.send((author, session, running));
-        }));
-    }
-}
-
 /// Carry out what recovery decided.
 fn act_on_recovery(
     repo: &std::path::Path,
@@ -4820,13 +4784,9 @@ fn act_on_recovery(
                         &Note::Recover {
                             opened_by: attempt.opened_by.clone(),
                             n: attempt.n,
-                            wake: crate::cli::pane_input::Admitted::new(
-                                clank_core::Tool::OpenCode,
-                                None,
-                                &text,
-                            )
-                            .as_str()
-                            .to_string(),
+                            wake: crate::cli::pane_input::Admitted::new(&text)
+                                .as_str()
+                                .to_string(),
                             tag,
                         },
                     )
@@ -4846,58 +4806,9 @@ fn act_on_recovery(
                 let answers = answers.clone();
                 let asks = asks.clone();
                 owned.departing.push(tokio::spawn(async move {
-                    let answer = match crate::cli::pane_target::discover_process(
-                        repo.clone(),
-                        author.clone(),
-                    )
-                    .await
-                    {
-                        Ok((found, tool, process)) => {
-                            let version = process.harness.clone().ok();
-                            let screen = crate::cli::open_zellij::dump_pane_screen(
-                                &found.session,
-                                &found.pane,
-                            )
+                    let answer =
+                        typed_send(repo, author.clone(), attempt.clone(), text, &Panes, &asks)
                             .await;
-                            let go = authorized(
-                                &asks,
-                                &repo,
-                                author.clone(),
-                                attempt.clone(),
-                                Some((tool, screen)),
-                                Some(process),
-                                Transport::Typed,
-                            )
-                            .await;
-                            match go {
-                                false => Answer::Unavailable,
-                                true => match crate::cli::pane_input::submit_async(
-                                    crate::cli::pane_input::Target {
-                                        session: &found.session,
-                                        pane: &found.pane,
-                                        tool,
-                                        version: version.as_deref(),
-                                    },
-                                    &crate::cli::pane_input::Admitted::new(
-                                        tool,
-                                        version.as_deref(),
-                                        &text,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(()) => Answer::Submitted { started: None },
-                                    Err(crate::cli::open_zellij::PaneWrite::NotStarted(_)) => {
-                                        Answer::Unavailable
-                                    }
-                                    Err(crate::cli::open_zellij::PaneWrite::Unknown(_)) => {
-                                        Answer::Indeterminate
-                                    }
-                                },
-                            }
-                        }
-                        Err(_) => Answer::Unavailable,
-                    };
                     let _ = answers.send((author, attempt, answer));
                 }));
             }
@@ -4919,11 +4830,9 @@ fn act_on_recovery(
                         author.clone(),
                         attempt.clone(),
                         None,
-                        None,
                         Transport::CodexStart,
                     );
-                    let text =
-                        crate::cli::pane_input::Admitted::new(clank_core::Tool::Codex, None, &text);
+                    let text = crate::cli::pane_input::Admitted::new(&text);
                     let answer = crate::cli::codex_interrupt::start_if_failed(
                         &repo, &author, &target, &text, go,
                     )
@@ -7630,19 +7539,6 @@ mod recovery_tests {
         writeln!(f, "{line}").unwrap();
     }
 
-    /// This test process, as an agent's running harness.
-    fn this_process(version: &str) -> crate::cli::harness_identity::Running {
-        let pid = std::process::id() as i32;
-        crate::cli::harness_identity::Running {
-            process: crate::cli::pane_target::Process {
-                pid,
-                birth: crate::proc_identity::token_for(pid).unwrap(),
-                harness: Ok(version.into()),
-            },
-            version: version.into(),
-        }
-    }
-
     /// A repo whose codex master is bound, auto, idle and owing work (an
     /// event in its inbox), its first nudge claimed by the driver: what a
     /// typed send's last look is made against.
@@ -7663,8 +7559,13 @@ mod recovery_tests {
 
         /// Claimed for `transport`.
         fn with(transport: Transport) -> Self {
-            use crate::cli::github::log::{EventLog, Transport as Wal};
             crate::cli::recovery::tests::enable(clank_core::Tool::Codex, Some(transport));
+            Self::by_policy()
+        }
+
+        /// Claimed for the transport Codex's resume candidate gives it.
+        fn by_policy() -> Self {
+            use crate::cli::github::log::{EventLog, Transport as Wal};
             let repo = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
             std::fs::write(
@@ -7737,11 +7638,6 @@ mod recovery_tests {
                 owed: (seq, ident),
             };
             driver.reconcile(vec![claimed.facts()], 0);
-            let asks = driver.unidentified();
-            let [(author, binding)] = asks.as_slice() else {
-                panic!("{asks:?}");
-            };
-            driver.identified(author, binding, Ok(this_process("0.161.0")), 1);
             let acts = driver.due(10_000, |_, _| Gate::Go);
             let [Act::Dispatch { attempt, .. }] = acts.as_slice() else {
                 panic!("{acts:?}");
@@ -7774,7 +7670,6 @@ mod recovery_tests {
                 blind_nudge: None,
                 attending: false,
                 asking: false,
-                identify: false,
                 projection: Default::default(),
             }
         }
@@ -7789,7 +7684,6 @@ mod recovery_tests {
             let a = Authorize {
                 author: self.codex.clone(),
                 attempt: self.attempt.clone(),
-                process: screen.is_some().then(|| this_process("0.161.0").process),
                 transport: match screen {
                     Some(_) => Transport::Typed,
                     None => Transport::CodexStart,
@@ -7959,6 +7853,193 @@ mod recovery_tests {
         }
     }
 
+    /// A typist that finds the agent's pane in a fixed listing, through the
+    /// real lookup, reads `screen` there, and records what it would type
+    /// where.
+    struct Listed {
+        scan: crate::cli::open_zellij::SessionScan,
+        screen: Option<String>,
+        typed: std::sync::Mutex<Vec<(crate::cli::pane_target::Target, String)>>,
+    }
+
+    impl Typist for Listed {
+        fn locate(
+            &self,
+            repo: std::path::PathBuf,
+            author: AgentLabel,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Located, String>> + Send>>
+        {
+            let found = crate::cli::pane_target::target_in(&self.scan, &repo, &author)
+                .map(|target| (target, self.screen.clone()))
+                .map_err(|e| format!("its pane was not found: {e:#}"));
+            Box::pin(async move { found })
+        }
+
+        fn submit(
+            &self,
+            target: crate::cli::pane_target::Target,
+            text: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>>
+                    + Send,
+            >,
+        > {
+            self.typed.lock().unwrap().push((target, text));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A pane as `list-panes --json --tab` reports it.
+    fn listed_pane(
+        session: &str,
+        id: u32,
+        tab: u32,
+        title: &str,
+        command: Option<&str>,
+    ) -> crate::cli::open_zellij::SessionPane {
+        crate::cli::open_zellij::SessionPane {
+            session: session.into(),
+            pane: serde_json::from_value(serde_json::json!({
+                "id": id,
+                "title": title,
+                "terminal_command": command,
+                "tab_id": tab,
+                "tab_name": format!("tab{tab}"),
+                "exited": false,
+            }))
+            .unwrap(),
+        }
+    }
+
+    /// Claimed's codex master, owed a nudge and found only by its name in a
+    /// listing of the repo's TUI pane in tab 0 of session `s` beside
+    /// `panes`: what the typed send answered, what it typed where, and the
+    /// agent's status line after.
+    async fn nudged_among(
+        panes: Vec<crate::cli::open_zellij::SessionPane>,
+    ) -> (
+        Answer,
+        Vec<(crate::cli::pane_target::Target, String)>,
+        String,
+    ) {
+        let mut c = Claimed::by_policy();
+        let tui = format!("clank tui --repo {}", c.repo.path().display());
+        let mut listing = vec![listed_pane("s", 1, 0, "", Some(&tui))];
+        listing.extend(panes);
+        let typist = Listed {
+            scan: crate::cli::open_zellij::SessionScan {
+                panes: listing,
+                unanswered: Vec::new(),
+                listing_failed: false,
+            },
+            screen: Some(CODEX_EMPTY.to_string()),
+            typed: Default::default(),
+        };
+        let Claimed {
+            repo,
+            codex,
+            driver,
+            attempt,
+            ..
+        } = &mut c;
+        let (asks, mut heard) = tokio::sync::mpsc::unbounded_channel::<Authorize>();
+        let sending = async {
+            let answer = typed_send(
+                repo.path().to_path_buf(),
+                codex.clone(),
+                attempt.clone(),
+                "carry on".into(),
+                &typist,
+                &asks,
+            )
+            .await;
+            drop(asks);
+            answer
+        };
+        let looking = async {
+            while let Some(a) = heard.recv().await {
+                authorize(
+                    repo.path(),
+                    &[],
+                    &Default::default(),
+                    &[],
+                    driver,
+                    &mut crate::cli::turn_custody::Turns::new(repo.path().to_path_buf()),
+                    a,
+                );
+            }
+        };
+        let (answer, ()) = tokio::join!(sending, looking);
+        driver.answer(codex, attempt, answer.clone(), 10_001);
+        let agent_dir = crate::agent_store::agents_root(repo.path()).join("codex");
+        let state = crate::cli::agent_state::load(&agent_dir).unwrap();
+        let typed = typist.typed.into_inner().unwrap();
+        (answer, typed, crate::cli::agent_state::line(&state, 10_001))
+    }
+
+    /// The incident: an idle master owing work, with no wait, that clank
+    /// did not start, is nudged into the pane its label names in the repo's
+    /// tab, whether that pane's title carries a status glyph or not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_master_is_nudged_into_the_pane_named_by_its_label() {
+        for title in ["codex", "💤 codex"] {
+            let (answer, typed, shown) =
+                nudged_among(vec![listed_pane("s", 3, 0, title, None)]).await;
+            assert_eq!(answer, Answer::Submitted { started: None }, "{title}");
+            let [(target, text)] = typed.as_slice() else {
+                panic!("{title}: {typed:?}");
+            };
+            assert_eq!(
+                (target.session.as_str(), target.pane.as_str(), target.tool),
+                ("s", "terminal_3", clank_core::Tool::Codex),
+                "{title}"
+            );
+            assert_eq!(text, "carry on");
+            assert!(!shown.contains("not nudged"), "{title}: {shown}");
+        }
+    }
+
+    /// No pane, two panes, or a pane named for the agent only in another
+    /// tab or session: nothing is typed, and the status line says why,
+    /// with no word of a launch or a version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_one_named_pane_is_no_nudge_and_status_says_why() {
+        let cases = [
+            (Vec::new(), "no pane named `codex`"),
+            (
+                vec![
+                    listed_pane("s", 3, 0, "codex", None),
+                    listed_pane("s", 4, 0, "💤 codex", None),
+                ],
+                "`codex` has 2 live panes",
+            ),
+            (
+                vec![
+                    listed_pane("s", 3, 1, "codex", None),
+                    listed_pane("other", 3, 0, "codex", None),
+                ],
+                "no pane named `codex`",
+            ),
+        ];
+        for (panes, why) in cases {
+            let (answer, typed, shown) = nudged_among(panes).await;
+            assert!(
+                matches!(&answer, Answer::Unreachable(said) if said.contains(why)),
+                "{why}: {answer:?}"
+            );
+            assert!(typed.is_empty(), "{why}: {typed:?}");
+            assert!(
+                shown.contains("not nudged: its pane was not found"),
+                "{shown}"
+            );
+            assert!(shown.contains(why), "{shown}");
+            for word in ["provenance", "launch", "version"] {
+                assert!(!shown.contains(word), "{word}: {shown}");
+            }
+        }
+    }
+
     /// Drafts already in the input at the last look, on the prompt row or
     /// under blank rows of the input, are refused: a typed send writes only
     /// on the loop's yes.
@@ -8002,7 +8083,6 @@ mod recovery_tests {
                 c.repo.path(),
                 c.codex.clone(),
                 c.attempt.clone(),
-                None,
                 None,
                 Transport::CodexStart,
             )
@@ -16683,8 +16763,6 @@ mod user_command_tests {
             record.pane = Some(PaneSeen {
                 session: "zs".into(),
                 pane: "terminal_1".into(),
-                pid: 1,
-                birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 0 },
             });
             held.save(&record).unwrap();
         }

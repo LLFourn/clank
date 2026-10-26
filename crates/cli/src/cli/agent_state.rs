@@ -22,9 +22,6 @@ pub(crate) struct AgentState {
     pub(crate) since: u64,
     pub(crate) suppressors: Vec<Suppressor>,
     pub(crate) nudge: Nudge,
-    /// How clank resumes this agent, and on what grounds, when it does.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) resumes: Option<String>,
     /// Why clank cannot nudge this agent itself, when it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cannot_resume: Option<String>,
@@ -425,9 +422,6 @@ pub(crate) fn line(state: &AgentState, now: u64) -> String {
     if unobserved {
         return out;
     }
-    if let Some(how) = &state.resumes {
-        out.push_str(&format!(" · resumed: {how}"));
-    }
     if let Some(why) = &state.cannot_resume {
         out.push_str(&format!(" · not nudged: {why}"));
     }
@@ -451,7 +445,6 @@ mod tests {
             since: 100,
             suppressors: Vec::new(),
             nudge: Nudge::Nothing,
-            resumes: None,
             cannot_resume: None,
             attending: None,
             asking: None,
@@ -478,8 +471,7 @@ mod tests {
         AgentState {
             activity: Activity::Unobserved,
             suppressors,
-            resumes: Some("retries only".into()),
-            cannot_resume: Some("its version is not known yet".into()),
+            cannot_resume: Some("no pane named `claude` in /r's tab".into()),
             ..state()
         }
     }
@@ -513,7 +505,7 @@ mod tests {
 
     /// Owed work keeps every caveat.
     #[test]
-    fn an_owing_agent_keeps_its_resume_and_nudge_caveats() {
+    fn an_owing_agent_keeps_its_nudge_caveats() {
         let s = AgentState {
             activity: Activity::Idle,
             suppressors: vec![Suppressor::Delivering],
@@ -522,8 +514,7 @@ mod tests {
         let shown = line(&s, 1000);
         for clause in [
             "waiting for work",
-            "resumed: retries only",
-            "not nudged: its version is not known yet",
+            "not nudged: no pane named `claude` in /r's tab",
         ] {
             assert!(shown.contains(clause), "{clause}: {shown}");
         }

@@ -118,7 +118,7 @@ fn pane_tool(
 /// Say `text` to `pane` as the pane's own tool, resolved from the agent
 /// table as `stop` resolves it: through Codex's app-server when its bound
 /// thread takes it, else typed by `terminal`, which refuses any pane the
-/// admission rule cannot clear. The text is admitted for that tool first.
+/// admission rule cannot clear. The text is admitted first.
 fn say_with(
     repo: &Path,
     table: &[PaneMeta],
@@ -132,7 +132,7 @@ fn say_with(
 ) -> anyhow::Result<()> {
     use clank_core::vocab::Tool;
     let tool = pane_tool(repo, table, pane)?;
-    let admitted = crate::cli::pane_input::Admitted::new(tool, None, text);
+    let admitted = crate::cli::pane_input::Admitted::new(text);
     if tool == Tool::Codex {
         let label = table
             .iter()

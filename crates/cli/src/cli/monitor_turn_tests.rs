@@ -305,15 +305,8 @@ async fn a_due_check_in_of_an_unbound_agent_is_not_due_again() {
     assert!(turns.due_authors(due_at).is_empty());
 }
 
-/// Recovery having identified `author`'s harness as this very process, a
-/// Claude granted a typed resume.
-fn identified(
-    repo: &std::path::Path,
-    author: &AgentLabel,
-) -> (
-    crate::cli::recovery::Driver,
-    crate::cli::pane_target::Process,
-) {
+/// Recovery holding `author` as bound now: a Claude, resumed by typing.
+fn recovering(repo: &std::path::Path, author: &AgentLabel) -> crate::cli::recovery::Driver {
     let binding = crate::agent_store::load_agent_config(repo, author)
         .unwrap()
         .unwrap()
@@ -333,28 +326,11 @@ fn identified(
             blind_nudge: None,
             attending: false,
             asking: false,
-            identify: true,
             projection: Default::default(),
         }],
         0,
     );
-    assert_eq!(recovery.unidentified().len(), 1, "asked once");
-    let pid = std::process::id() as i32;
-    let process = crate::cli::pane_target::Process {
-        pid,
-        birth: crate::proc_identity::token_for(pid).unwrap(),
-        harness: Ok("2.1.280".into()),
-    };
-    recovery.identified(
-        author,
-        &binding,
-        Ok(crate::cli::harness_identity::Running {
-            process: process.clone(),
-            version: "2.1.280".into(),
-        }),
-        0,
-    );
-    (recovery, process)
+    recovery
 }
 
 /// A Stop listing the subagent "sleeper" as running.
@@ -421,17 +397,13 @@ fn attend_sleeper(turns: &mut Turns, author: &AgentLabel, g: &crate::cli::turn_c
         .unwrap();
 }
 
-fn ask_for(
-    due: &crate::cli::turn_custody::CheckInDue,
-    process: &crate::cli::pane_target::Process,
-) -> CheckInAsk {
+fn ask_for(due: &crate::cli::turn_custody::CheckInDue) -> CheckInAsk {
     let (reply, _answer) = tokio::sync::oneshot::channel();
     CheckInAsk {
         author: due.author.clone(),
         session: due.session.clone(),
         check_in: due.check_in.clone(),
         screen: (clank_core::Tool::Claude, Some(EMPTY_INPUT.into())),
-        process: process.clone(),
         reply,
     }
 }
@@ -443,7 +415,7 @@ fn ask_for(
 #[tokio::test]
 async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
     let (repo, author, state) = owed_repo().await;
-    let (recovery, process) = identified(repo.path(), &author);
+    let recovery = recovering(repo.path(), &author);
     let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
     let now = || {
         gather(
@@ -524,13 +496,7 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
             }
             _ => {}
         }
-        let looked = may_check_in_now(
-            repo.path(),
-            &recovery,
-            &mut turns,
-            &now(),
-            &ask_for(&due, &process),
-        );
+        let looked = may_check_in_now(repo.path(), &recovery, &mut turns, &now(), &ask_for(&due));
         assert_eq!(
             looked,
             refused.map_or(Ok(()), |why| Err(why.to_string())),
@@ -548,7 +514,7 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
 #[tokio::test]
 async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
     let (repo, author, state) = owed_repo().await;
-    let (recovery, _) = identified(repo.path(), &author);
+    let recovery = recovering(repo.path(), &author);
     let (mut turns, due_at) = attended(repo.path(), &author, &state);
     let now = |at: u64| {
         gather(
@@ -1036,7 +1002,6 @@ async fn recovery_after_a_lost_park(later: Later) {
                 n: 1,
             },
             screen: None,
-            process: None,
             transport: crate::cli::recovery::Transport::Typed,
             state: Some(state.clone()),
             reply,
@@ -1334,17 +1299,11 @@ impl Typist for Recorded {
             if lost {
                 return Err("its pane was not found".into());
             }
-            let me = std::process::id() as i32;
             Ok((
-                crate::cli::pane_target::Found {
+                crate::cli::pane_target::Target {
                     session: "test".into(),
                     pane: "terminal_1".into(),
-                },
-                clank_core::Tool::Claude,
-                crate::cli::pane_target::Process {
-                    pid: me,
-                    birth: crate::proc_identity::token_for(me).unwrap(),
-                    harness: Ok("2.1.280".into()),
+                    tool: clank_core::Tool::Claude,
                 },
                 Some(EMPTY_INPUT.into()),
             ))
@@ -1353,10 +1312,13 @@ impl Typist for Recorded {
 
     fn submit(
         &self,
-        _found: crate::cli::pane_target::Found,
-        _tool: clank_core::Tool,
+        _target: crate::cli::pane_target::Target,
         text: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>> + Send,
+        >,
+    > {
         self.typed.lock().unwrap().push(text);
         Box::pin(async { Ok(()) })
     }
@@ -1515,15 +1477,13 @@ async fn a_check_in_its_last_look_refuses_is_not_typed() {
     assert!(typist.typed.lock().unwrap().is_empty());
 }
 
-/// The last look needs the very process recovery identified, still granted
-/// a typed resume, an empty input line and the session still bound: a
-/// harness never identified is never typed into.
+/// The last look needs recovery to hold the agent as resumed by typing: an
+/// agent recovery does not hold is never typed into.
 #[test]
-fn the_last_look_needs_an_identified_harness() {
+fn the_last_look_needs_a_harness_resumed_by_typing() {
     let repo = TempRepo::new();
     let driver =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
-    let me = std::process::id() as i32;
     let (reply, _answer) = tokio::sync::oneshot::channel();
     let author = AgentLabel::parse("claude").unwrap();
     let ask = CheckInAsk {
@@ -1534,11 +1494,6 @@ fn the_last_look_needs_an_identified_harness() {
             since: 0,
         },
         screen: (clank_core::Tool::Claude, Some(String::new())),
-        process: crate::cli::pane_target::Process {
-            pid: me,
-            birth: crate::proc_identity::token_for(me).unwrap(),
-            harness: Ok("2.1.280".into()),
-        },
         reply,
     };
     let g = crate::cli::turn_custody::Gathered::of(repo.path(), &author, None);

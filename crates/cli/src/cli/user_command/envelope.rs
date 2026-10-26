@@ -19,7 +19,7 @@ pub(crate) const SKEW: u64 = 30;
 /// The longest request id.
 pub(crate) const ID_MAX: usize = 64;
 /// The longest command admitted at all. The bound a dispatch types is the
-/// lower one its evidence row observed (`pane_input::USER_COMMAND_EVIDENCE`).
+/// lower one its evidence observed (`pane_input::USER_COMMAND_EVIDENCE`).
 pub(crate) const COMMAND_LIMIT: usize = 4096;
 /// The longest envelope read from stdin.
 pub(crate) const ENVELOPE_MAX: usize = 64 * 1024;

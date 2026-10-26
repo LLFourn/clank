@@ -6,7 +6,8 @@
 //! unrecognisable, and so never closed. This record keeps the labels
 //! whose panes clank opened, adopted or was told about by `clank as`,
 //! until a verified listing shows none left. It is lifecycle
-//! bookkeeping, not launch provenance.
+//! bookkeeping: it names which panes are clank's to close, never which
+//! agent a pane is.
 //!
 //! The record lives in the runtime namespace, so it survives a TUI
 //! restart but not a reboot, which zellij sessions do not survive either.

@@ -271,18 +271,15 @@ impl Seams for Live {
     }
 
     async fn discover(&self, label: &AgentLabel) -> Result<(PaneSeen, Tool), String> {
-        let (found, tool, process) =
-            crate::cli::pane_target::discover_process(self.repo.clone(), label.clone())
-                .await
-                .map_err(|e| format!("{e:#}"))?;
+        let target = crate::cli::pane_target::discover(self.repo.clone(), label.clone())
+            .await
+            .map_err(|e| format!("{e:#}"))?;
         Ok((
             PaneSeen {
-                session: found.session,
-                pane: found.pane,
-                pid: process.pid,
-                birth: process.birth,
+                session: target.session,
+                pane: target.pane,
             },
-            tool,
+            target.tool,
         ))
     }
 
@@ -319,15 +316,6 @@ impl Seams for Live {
         .map_err(|e| format!("{e:#}"))
     }
 
-    fn launch(
-        &self,
-        label: &AgentLabel,
-        pane: &PaneSeen,
-    ) -> Result<(Tool, crate::cli::pane_target::Process), String> {
-        crate::cli::pane_target::verify_launch(&self.repo, label, &pane.session, &pane.pane)
-            .map_err(|e| format!("{e:#}"))
-    }
-
     type Term<'a> = crate::cli::pane_input::Zellij<'a>;
 
     fn terminal<'a>(&'a self, pane: &'a PaneSeen) -> Self::Term<'a> {
@@ -337,8 +325,8 @@ impl Seams for Live {
         }
     }
 
-    fn evidence(&self) -> &[UserCommandEvidence] {
-        crate::cli::pane_input::USER_COMMAND_EVIDENCE
+    fn evidence(&self) -> Option<&UserCommandEvidence> {
+        crate::cli::pane_input::USER_COMMAND_EVIDENCE.as_ref()
     }
 
     fn history(&self, label: &AgentLabel, record: nudge_log::Record) {

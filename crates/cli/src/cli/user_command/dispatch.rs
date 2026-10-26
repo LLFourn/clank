@@ -3,12 +3,13 @@
 //! stored envelope before it acts.
 //!
 //! An attempt takes the request's id lock, then the pane's write lock,
-//! and with both held reads the input from one dump. Then comes its one
-//! commit point: the loop's readiness answer, then the label's
-//! `binding.lock`, and under it the trusted keys and clock, the envelope
-//! verified again, the binding read under the guard and the launch checked
-//! against the pane recorded at the first look; then `dispatching` is
-//! persisted and the command typed. Locks are released in reverse.
+//! and with both held finds the agent's pane again, which must still be the
+//! one recorded at the first look and still run Claude Code, and reads the
+//! input from one dump. Then comes its one commit point: the loop's
+//! readiness answer, then the label's `binding.lock`, and under it the
+//! trusted keys and clock, the envelope verified again and the binding read
+//! under the guard; then `dispatching` is persisted and the command typed.
+//! Locks are released in reverse.
 //!
 //! No cycle: the loop takes no `binding.lock`, takes id locks only with a
 //! try-lock, and never takes a pane lock (its own pane writers run off the
@@ -265,7 +266,7 @@ pub(crate) trait Seams: Sync {
     fn trust(&self) -> TrustSet;
     /// The tool and session bound to `label` now.
     fn binding(&self, label: &AgentLabel) -> Option<(Tool, SessionId)>;
-    /// The agent's one pane and the process its launch record verifies.
+    /// The agent's one pane, and the tool the roster gives it.
     async fn discover(&self, label: &AgentLabel) -> Result<(PaneSeen, Tool), String>;
     /// The loop's last look at the agent, asked before any lock but the id's.
     async fn last_look(&self, label: &AgentLabel, session: &SessionId) -> Result<(), String>;
@@ -276,17 +277,11 @@ pub(crate) trait Seams: Sync {
     ) -> Result<Box<dyn Send + 'a>, String>;
     /// Hold `pane`'s write lock until the guard is dropped.
     async fn lock_pane(&self, pane: &PaneSeen) -> Result<Box<dyn Send>, String>;
-    /// The tool and process `pane`'s launch record verifies now.
-    fn launch(
-        &self,
-        label: &AgentLabel,
-        pane: &PaneSeen,
-    ) -> Result<(Tool, crate::cli::pane_target::Process), String>;
     type Term<'a>: Terminal
     where
         Self: 'a;
     fn terminal<'a>(&'a self, pane: &'a PaneSeen) -> Self::Term<'a>;
-    fn evidence(&self) -> &[UserCommandEvidence];
+    fn evidence(&self) -> Option<&UserCommandEvidence>;
     fn history(&self, label: &AgentLabel, record: nudge_log::Record);
 }
 
@@ -400,6 +395,27 @@ pub(crate) async fn attempt(
         Ok(guard) => guard,
         Err(why) => return refuse(&mut record, format!("its pane could not be locked: {why}")),
     };
+    match seams.discover(label).await {
+        Ok((now, Tool::Claude)) if now == pane => {}
+        Ok((_, Tool::Claude)) => {
+            return refuse(
+                &mut record,
+                "its pane was replaced since it was first found; it needs a new request".into(),
+            );
+        }
+        Ok((_, tool)) => {
+            return refuse(
+                &mut record,
+                format!("its pane runs {tool}, not Claude Code"),
+            );
+        }
+        Err(why) => {
+            return refuse(
+                &mut record,
+                format!("its pane could not be located with certainty: {why}"),
+            );
+        }
+    }
     let term = seams.terminal(&pane);
     let read = term
         .dump()
@@ -417,10 +433,9 @@ pub(crate) async fn attempt(
             expires: verified.expires_at.saturating_add(envelope::SKEW + 1),
         };
     }
-    // The commit point: the loop's readiness, then the keys, the clock,
-    // the binding and the launch as they are now, with no await between
-    // them and the first byte but taking the binding lock, whose holders
-    // take no other lock.
+    // The commit point: the loop's readiness, then the keys, the clock and
+    // the binding as they are now, with no await between them and the first
+    // byte but taking the binding lock, whose holders take no other lock.
     if let Err(why) = seams.last_look(label, &verified.session).await {
         wait(&mut record, why);
         return Ended::Done;
@@ -441,38 +456,12 @@ pub(crate) async fn attempt(
             "the session it was signed for no longer holds the label".into(),
         );
     }
-    let process = match seams.launch(label, &pane) {
-        Ok((Tool::Claude, process)) => process,
-        Ok((tool, _)) => {
-            return refuse(
-                &mut record,
-                format!("its pane runs {tool}, not Claude Code"),
-            );
-        }
-        Err(why) => return refuse(&mut record, format!("its launch is not verified: {why}")),
-    };
-    if process.pid != pane.pid || process.birth != pane.birth {
+    let Some(row) = seams.evidence() else {
         return refuse(
             &mut record,
-            "its pane was replaced since it was first found; it needs a new request".into(),
-        );
-    }
-    let version = match &process.harness {
-        Ok(version) => version.clone(),
-        Err(why) => {
-            return refuse(
-                &mut record,
-                format!("its Claude Code version is unknown: {why}"),
-            );
-        }
-    };
-    let Some(row) = seams.evidence().iter().find(|row| row.version == version) else {
-        return refuse(
-            &mut record,
-            format!(
-                "no committed evidence that Claude Code {version} runs a typed `!` line as one \
-                 command; a human records it (README, \"User commands\")"
-            ),
+            "no committed evidence that Claude Code runs a typed `!` line as one command; a \
+             human records it (README, \"User commands\")"
+                .into(),
         );
     };
     if verified.command.line().chars().count() > row.max_command {

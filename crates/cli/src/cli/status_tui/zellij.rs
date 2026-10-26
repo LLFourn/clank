@@ -1310,99 +1310,8 @@ pub(super) enum WorkerMsg {
     /// Probe pane presence now — the loop asks when the agent panel
     /// or an agent's page is entered, so what it shows is current.
     Probe,
-    /// A watched pane process exited.
-    Exited(PaneLaunch),
-    /// This repo's launch records for this session, after they changed.
-    Launches(Vec<PaneLaunch>),
-    /// The loop is gone. The exit watch holds a sender too, so the
-    /// channel alone never disconnects.
+    /// The loop is gone.
     Close,
-}
-
-use crate::cli::pane_target::PaneLaunch;
-use crate::proc_identity::exit_watch::Armed;
-
-/// Arms and disarms kernel exit watches, so [`Watches`] is testable
-/// without real processes.
-pub(super) trait Arm {
-    fn arm(&mut self, launch: &PaneLaunch) -> Armed;
-    fn disarm(&mut self, launch: &PaneLaunch);
-}
-
-impl Arm for Option<std::sync::Arc<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>>> {
-    fn arm(&mut self, launch: &PaneLaunch) -> Armed {
-        match self {
-            Some(watch) => watch.arm(launch.clone(), launch.pid, &launch.birth),
-            None => Armed::Unknown,
-        }
-    }
-    fn disarm(&mut self, launch: &PaneLaunch) {
-        if let Some(watch) = self {
-            watch.disarm(launch);
-        }
-    }
-}
-
-/// One outcome per launch record, remembered until the record goes or
-/// names another process. Records outlive their processes, so without
-/// the memory every listing would re-arm a dead identity, find it
-/// ended, and list again.
-#[derive(Default)]
-pub(super) struct Watches {
-    tracked: std::collections::HashMap<std::path::PathBuf, (PaneLaunch, Armed)>,
-}
-
-impl Watches {
-    /// Whether the set changed, which is a reason to list.
-    fn rederive(&mut self, launches: Vec<PaneLaunch>, arm: &mut impl Arm) -> bool {
-        let incoming: std::collections::HashMap<_, _> = launches
-            .into_iter()
-            .map(|l| (l.record.clone(), l))
-            .collect();
-        let mut changed = false;
-        self.tracked.retain(|record, (launch, armed)| {
-            let keep = incoming.get(record) == Some(launch);
-            if !keep {
-                if *armed == Armed::Watching {
-                    arm.disarm(launch);
-                }
-                changed = true;
-            }
-            keep
-        });
-        for (record, launch) in incoming {
-            if !self.tracked.contains_key(&record) {
-                let armed = arm.arm(&launch);
-                self.tracked.insert(record, (launch, armed));
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Whether this exit is news. Only the current watch of a record
-    /// counts, and only once.
-    fn exited(&mut self, launch: &PaneLaunch) -> bool {
-        match self.tracked.get_mut(&launch.record) {
-            Some((current, armed)) if current == launch && *armed == Armed::Watching => {
-                *armed = Armed::Ended;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Folds the batch's watch traffic into its `probe`.
-    pub(super) fn absorb(&mut self, batch: &mut WorkerBatch, arm: &mut impl Arm) {
-        let mut list = false;
-        if let Some(launches) = batch.launches.take() {
-            list |= self.rederive(launches, arm);
-        }
-        for launch in std::mem::take(&mut batch.exits) {
-            list |= self.exited(&launch);
-        }
-        batch.probe |= list;
-    }
 }
 
 /// One batch of work for the worker, coalesced from the queue.
@@ -1411,10 +1320,8 @@ pub(super) struct WorkerBatch {
     pub(super) roster: Option<RosterView>,
     pub(super) glyphs: Option<StatusGlyphs>,
     pub(super) reopens: Vec<String>,
-    /// List panes now: the loop asked, or a watched pane changed.
+    /// List panes now: the loop asked.
     pub(super) probe: bool,
-    pub(super) exits: Vec<PaneLaunch>,
-    pub(super) launches: Option<Vec<PaneLaunch>>,
 }
 
 /// What the worker tells the loop. One channel, drained without
@@ -1511,7 +1418,6 @@ impl WorkerState {
             glyphs,
             reopens,
             probe,
-            ..
         } = batch;
         if let Some(view) = roster {
             // Invalidate on any TARGET change, not just on our own
@@ -1618,11 +1524,7 @@ impl ReconcileWorker {
     /// sends go nowhere). `wake` is called after a batch that produced
     /// a report, so the loop paints changed presence or lost-process
     /// marks without waiting for its next event.
-    pub(super) fn spawn(
-        repo: std::path::PathBuf,
-        runtime: &RuntimeWatch,
-        wake: impl Fn() + Send + 'static,
-    ) -> Self {
+    pub(super) fn spawn(repo: std::path::PathBuf, wake: impl Fn() + Send + 'static) -> Self {
         if !crate::cli::open_zellij::in_session() {
             return Self {
                 tx: None,
@@ -1638,9 +1540,7 @@ impl ReconcileWorker {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
         let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
         let mut worker = Self::in_session(report_rx);
-        let mut arm = runtime.attach_worker(tx.clone());
         let join = std::thread::spawn(move || {
-            let mut watches = Watches::default();
             let caller = crate::cli::open_zellij::caller_pane_id();
             let mut state = WorkerState::new(caller.clone());
             let mut tabs = ZellijTabIo;
@@ -1655,8 +1555,6 @@ impl ReconcileWorker {
             };
             serve(
                 &rx,
-                &mut watches,
-                &mut arm,
                 &mut state,
                 &mut io,
                 &mut tabs,
@@ -1811,14 +1709,12 @@ impl Drop for ReconcileWorker {
 }
 
 /// The TUI's one watch on the per-repo runtime directory, held for its
-/// whole life, in or out of zellij. It hears this repo's `clank remote`
-/// requests for the loop, and, once a reconcile worker attaches, this
-/// session's launch records and the pane exits that worker arms on it.
+/// whole life, in or out of zellij: it hears this repo's `clank remote`
+/// requests for the loop. Nothing else in the directory is read.
 pub(super) struct RuntimeWatch {
-    watch: Option<std::sync::Arc<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>>>,
+    _watch: Option<crate::proc_identity::exit_watch::ExitWatch<()>>,
     /// Why there is no watch, when there is none.
     pub(super) unavailable: Option<String>,
-    feed: std::sync::Arc<LaunchFeed>,
 }
 
 impl RuntimeWatch {
@@ -1828,110 +1724,39 @@ impl RuntimeWatch {
         requests: std::sync::mpsc::Sender<String>,
         wake: impl Fn() + Send + 'static,
     ) -> Self {
-        use crate::proc_identity::exit_watch::{ExitWatch, Wake};
-        let feed = std::sync::Arc::new(LaunchFeed::new({
-            let repo = repo.to_path_buf();
-            let session = crate::cli::open_zellij::current_session();
-            move || match &session {
-                Some(session) => crate::cli::pane_target::launches_in(&repo, session),
-                None => Vec::new(),
-            }
-        }));
         let dir = crate::cli::monitor::ensure_runtime_dir()
-            .map(|()| crate::cli::pane_target::launch_dir(repo).0);
+            .map(|()| crate::cli::monitor::runtime_dir(unsafe { libc::getuid() }));
+        Self::start_in(repo, dir, requests, wake)
+    }
+
+    fn start_in(
+        repo: &std::path::Path,
+        dir: Result<std::path::PathBuf, String>,
+        requests: std::sync::mpsc::Sender<String>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
+        use crate::proc_identity::exit_watch::{ExitWatch, Wake};
         let mut requests_seen = RequestScan::new(repo);
         let scan_dir = dir.clone().ok();
-        let launches = feed.clone();
-        let sink = move |wake_: Wake<PaneLaunch>| match wake_ {
-            Wake::Dir => {
-                if let Some(dir) = &scan_dir {
-                    for id in requests_seen.new_ids(dir) {
-                        let _ = requests.send(id);
-                        wake();
-                    }
+        let sink = move |wake_: Wake<()>| {
+            if let (Wake::Dir, Some(dir)) = (wake_, &scan_dir) {
+                for id in requests_seen.new_ids(dir) {
+                    let _ = requests.send(id);
+                    wake();
                 }
-                launches.changed();
             }
-            Wake::Exited(launch) => launches.exited(launch),
         };
         let (watch, unavailable) = match dir {
             Ok(dir) => match ExitWatch::new(Some(&dir), sink) {
-                Ok(watch) => (Some(std::sync::Arc::new(watch)), None),
+                Ok(watch) => (Some(watch), None),
                 Err(e) => (None, Some(format!("cannot watch {}: {e}", dir.display()))),
             },
             Err(e) => (None, Some(format!("no runtime directory: {e}"))),
         };
         Self {
-            watch,
+            _watch: watch,
             unavailable,
-            feed,
         }
-    }
-
-    /// The reconcile worker joins: launch changes and pane exits go to
-    /// `tx` from now on, starting with the records there are now. Returns
-    /// the shared watch it arms pane exits on.
-    pub(super) fn attach_worker(
-        &self,
-        tx: std::sync::mpsc::Sender<WorkerMsg>,
-    ) -> Option<std::sync::Arc<crate::proc_identity::exit_watch::ExitWatch<PaneLaunch>>> {
-        self.feed.attach(tx);
-        self.watch.clone()
-    }
-}
-
-/// This session's launch records as the reconcile worker last heard
-/// them, and the worker to tell. Reading the records, comparing and
-/// sending happen under one lock, which attaching takes too, so the
-/// worker hears snapshots in the order they were read: a directory
-/// change read before an attach can never arrive after it.
-struct LaunchFeed {
-    read: Box<dyn Fn() -> Vec<PaneLaunch> + Send + Sync>,
-    state: std::sync::Mutex<FeedState>,
-}
-
-#[derive(Default)]
-struct FeedState {
-    worker: Option<std::sync::mpsc::Sender<WorkerMsg>>,
-    last: Option<Vec<PaneLaunch>>,
-}
-
-impl LaunchFeed {
-    fn new(read: impl Fn() -> Vec<PaneLaunch> + Send + Sync + 'static) -> Self {
-        Self {
-            read: Box::new(read),
-            state: Default::default(),
-        }
-    }
-
-    /// The directory changed. The launch directory is shared by every
-    /// repo, so the worker hears only of a change to this repo's
-    /// records for this session; before it attaches there is no one to
-    /// tell, and attaching reads afresh.
-    fn changed(&self) {
-        let mut state = self.state.lock().unwrap();
-        let Some(worker) = state.worker.clone() else {
-            return;
-        };
-        let now = (self.read)();
-        if state.last.as_ref() != Some(&now) {
-            state.last = Some(now.clone());
-            let _ = worker.send(WorkerMsg::Launches(now));
-        }
-    }
-
-    fn exited(&self, launch: PaneLaunch) {
-        if let Some(worker) = &self.state.lock().unwrap().worker {
-            let _ = worker.send(WorkerMsg::Exited(launch));
-        }
-    }
-
-    fn attach(&self, worker: std::sync::mpsc::Sender<WorkerMsg>) {
-        let mut state = self.state.lock().unwrap();
-        let now = (self.read)();
-        state.last = Some(now.clone());
-        let _ = worker.send(WorkerMsg::Launches(now));
-        state.worker = Some(worker);
     }
 }
 
@@ -1971,19 +1796,15 @@ impl RequestScan {
 
 /// The worker's life: every batch until the channel closes, then the
 /// tab's base name back, so nothing pending can rename after it.
-#[allow(clippy::too_many_arguments)]
 fn serve<I: PaneIo>(
     rx: &std::sync::mpsc::Receiver<WorkerMsg>,
-    watches: &mut Watches,
-    arm: &mut impl Arm,
     state: &mut WorkerState,
     io: &mut I,
     tabs: &mut impl TabIo,
     mut rename: impl FnMut(&str, &str),
     mut reports: impl FnMut(Vec<Report>),
 ) {
-    worker_loop(rx, |mut batch| {
-        watches.absorb(&mut batch, arm);
+    worker_loop(rx, |batch| {
         reports(state.handle_with(batch, io, &mut rename, tabs))
     });
     state.tab.restore(tabs);
@@ -2005,8 +1826,6 @@ fn worker_loop(rx: &std::sync::mpsc::Receiver<WorkerMsg>, mut batch: impl FnMut(
             WorkerMsg::Glyphs(g) => b.glyphs = Some(g),
             WorkerMsg::Reopen(label) => b.reopens.push(label),
             WorkerMsg::Probe => b.probe = true,
-            WorkerMsg::Exited(launch) => b.exits.push(launch),
-            WorkerMsg::Launches(launches) => b.launches = Some(launches),
             WorkerMsg::Close => closing = true,
         };
         match rx.recv() {
@@ -2687,16 +2506,7 @@ mod tests {
         later.tab = "💤".to_string();
         tx.send(WorkerMsg::Glyphs(later)).unwrap();
         drop(tx);
-        serve(
-            &rx,
-            &mut Watches::default(),
-            &mut None,
-            &mut state,
-            &mut io,
-            &mut tabs,
-            |_, _| {},
-            |_| {},
-        );
+        serve(&rx, &mut state, &mut io, &mut tabs, |_, _| {}, |_| {});
         let tail: Vec<&str> = tabs
             .renames
             .iter()
@@ -4456,44 +4266,8 @@ mod tests {
         assert!(io.opened.is_empty() && io.closed.is_empty());
     }
 
-    fn launch(record: &str, pid: i32) -> PaneLaunch {
-        PaneLaunch {
-            record: record.into(),
-            label: "claude".into(),
-            pid,
-            birth: crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 2 },
-        }
-    }
-
-    /// Answers each arm from a script by pid; `Watching` otherwise.
-    #[derive(Default)]
-    struct FakeArm {
-        answers: std::collections::HashMap<i32, Armed>,
-        armed: Vec<i32>,
-        disarmed: Vec<i32>,
-    }
-
-    impl Arm for FakeArm {
-        fn arm(&mut self, launch: &PaneLaunch) -> Armed {
-            self.armed.push(launch.pid);
-            self.answers
-                .get(&launch.pid)
-                .copied()
-                .unwrap_or(Armed::Watching)
-        }
-        fn disarm(&mut self, launch: &PaneLaunch) {
-            self.disarmed.push(launch.pid);
-        }
-    }
-
     /// Each of `msgs` as its own batch through the real `serve`.
-    fn served(
-        msgs: Vec<WorkerMsg>,
-        watches: &mut Watches,
-        arm: &mut FakeArm,
-        io: &mut FakeIo,
-    ) -> Vec<Report> {
-        let mut state = WorkerState::new(None);
+    fn served(msgs: Vec<WorkerMsg>, state: &mut WorkerState, io: &mut FakeIo) -> Vec<Report> {
         let mut reports = Vec::new();
         for msg in msgs {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -4501,9 +4275,7 @@ mod tests {
             tx.send(WorkerMsg::Close).unwrap();
             serve(
                 &rx,
-                watches,
-                arm,
-                &mut state,
+                state,
                 io,
                 &mut NoTabs,
                 |_, _| {},
@@ -4519,16 +4291,7 @@ mod tests {
         let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])); 4]);
         let join = std::thread::spawn(move || {
             let mut state = WorkerState::new(None);
-            serve(
-                &rx,
-                &mut Watches::default(),
-                &mut FakeArm::default(),
-                &mut state,
-                &mut io,
-                &mut NoTabs,
-                |_, _| {},
-                |_| {},
-            );
+            serve(&rx, &mut state, &mut io, &mut NoTabs, |_, _| {}, |_| {});
             io.snapshots_taken
         });
         // Longer than the 5 s period this loop used to probe on.
@@ -4538,214 +4301,76 @@ mod tests {
         assert_eq!(join.join().unwrap(), 0);
     }
 
+    /// Once a listing has retitled with the glyphs it was sent, the same
+    /// glyphs again, batch after batch, list nothing: only a probe, a glyph
+    /// change or a roster change does.
     #[test]
-    fn a_pane_closed_while_its_session_lives_on_lists_once_and_reads_lost() {
-        let pane = launch("/run/r.pane-launch-a.json", 41);
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])), Some(Vec::new())]);
+    fn a_quiet_worker_lists_nothing_across_idle_batches() {
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])); 8]);
+        let mut state = WorkerState::new(None);
+        let same = || WorkerMsg::Glyphs(glyphs(&[("claude", "💤", "👀")]));
+        served(vec![same()], &mut state, &mut io);
+        assert_eq!(io.snapshots_taken, 1, "the first glyphs retitle");
+        served(vec![same(), same(), same()], &mut state, &mut io);
+        assert_eq!(io.snapshots_taken, 1, "nothing changed, nothing listed");
+    }
+
+    /// A pane started by hand, with no change to the agent's config, that
+    /// exits is shown gone at the next probe's listing, and not before.
+    #[test]
+    fn a_hand_started_panes_exit_shows_at_the_next_probe() {
+        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])); 4]);
+        let mut state = WorkerState::new(None);
+        let reports = served(vec![WorkerMsg::Probe], &mut state, &mut io);
+        assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
+        io.dead.insert("claude".into());
         io.lost = ["claude".to_string()].into();
-        let mut watches = Watches::default();
-        let mut arm = FakeArm::default();
-        served(
-            vec![WorkerMsg::Launches(vec![pane.clone()])],
-            &mut watches,
-            &mut arm,
-            &mut io,
+        assert!(
+            served(Vec::new(), &mut state, &mut io).is_empty(),
+            "an exit alone lists nothing"
         );
-        assert_eq!(io.snapshots_taken, 1, "a new record lists");
-        let reports = served(
-            vec![WorkerMsg::Exited(pane)],
-            &mut watches,
-            &mut arm,
-            &mut io,
-        );
-        assert_eq!(io.snapshots_taken, 2, "the exit lists once");
+        assert_eq!(io.snapshots_taken, 1);
+        let reports = served(vec![WorkerMsg::Probe], &mut state, &mut io);
+        assert_eq!(io.snapshots_taken, 2);
         assert_eq!(presence_of(&reports), Some(Some(Vec::new())));
         assert!(reports.contains(&Report::Lost(["claude".to_string()].into())));
     }
 
+    /// The runtime directory is shared: a stale `pane-launch-*.json` file
+    /// appearing in it is heard by nobody, while this repo's `clank remote`
+    /// reopen request in the same directory reaches the loop.
     #[test]
-    fn a_dead_retained_record_is_consumed_once() {
-        let dead = launch("/run/r.pane-launch-a.json", 41);
-        let mut io = FakeIo::new(vec![Some(Vec::new()); 8]);
-        let mut watches = Watches::default();
-        let mut arm = FakeArm::default();
-        arm.answers.insert(41, Armed::Ended);
-        served(
-            vec![
-                WorkerMsg::Launches(vec![dead.clone()]),
-                WorkerMsg::Launches(vec![dead.clone()]),
-                WorkerMsg::Probe,
-                WorkerMsg::Launches(vec![dead.clone()]),
-                WorkerMsg::Exited(dead.clone()),
-                WorkerMsg::Launches(vec![dead]),
-            ],
-            &mut watches,
-            &mut arm,
-            &mut io,
-        );
-        assert_eq!(arm.armed, [41], "armed once, never re-armed");
-        assert_eq!(io.snapshots_taken, 2, "the record's arrival and the probe");
-    }
-
-    #[test]
-    fn a_rebind_replaces_the_watch_and_a_stale_exit_is_discarded() {
-        let old = launch("/run/r.pane-launch-a.json", 41);
-        let new = launch("/run/r.pane-launch-a.json", 42);
-        let mut io = FakeIo::new(vec![Some(Vec::new()); 8]);
-        let mut watches = Watches::default();
-        let mut arm = FakeArm::default();
-        served(
-            vec![
-                WorkerMsg::Launches(vec![old.clone()]),
-                WorkerMsg::Launches(vec![new.clone()]),
-            ],
-            &mut watches,
-            &mut arm,
-            &mut io,
-        );
-        assert_eq!(arm.disarmed, [41]);
-        assert_eq!(io.snapshots_taken, 2);
-        served(
-            vec![WorkerMsg::Exited(old)],
-            &mut watches,
-            &mut arm,
-            &mut io,
-        );
-        assert_eq!(io.snapshots_taken, 2, "the replaced watch's exit is stale");
-        served(
-            vec![WorkerMsg::Exited(new.clone()), WorkerMsg::Exited(new)],
-            &mut watches,
-            &mut arm,
-            &mut io,
-        );
-        assert_eq!(io.snapshots_taken, 3, "the new one's exit lists, once");
-    }
-
-    #[test]
-    fn an_unknown_watch_never_reads_as_an_exit() {
-        let pane = launch("/run/r.pane-launch-a.json", 41);
-        let mut io = FakeIo::new(vec![Some(live(&[("claude", true)])); 4]);
-        let mut watches = Watches::default();
-        let mut arm = FakeArm::default();
-        arm.answers.insert(41, Armed::Unknown);
-        let reports = served(
-            vec![
-                WorkerMsg::Launches(vec![pane.clone()]),
-                WorkerMsg::Exited(pane.clone()),
-                WorkerMsg::Launches(vec![pane]),
-            ],
-            &mut watches,
-            &mut arm,
-            &mut io,
-        );
-        assert_eq!(arm.armed, [41]);
-        assert_eq!(io.snapshots_taken, 1, "the arrival only");
-        assert_eq!(presence_of(&reports), Some(Some(vec!["claude".into()])));
-    }
-
-    #[test]
-    fn two_records_for_one_label_are_both_watched() {
-        let mut watches = Watches::default();
-        let mut arm = FakeArm::default();
-        let a = launch("/run/r.pane-launch-a.json", 41);
-        let b = launch("/run/r.pane-launch-b.json", 42);
-        assert!(watches.rederive(vec![a.clone(), b.clone()], &mut arm));
-        arm.armed.sort();
-        assert_eq!(arm.armed, [41, 42]);
-        assert!(watches.exited(&a));
-        assert!(watches.exited(&b));
-    }
-
-    #[test]
-    fn the_feed_forwards_only_this_repos_record_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let feed = LaunchFeed::new(move || {
-            crate::cli::pane_target::launches_at(&path, "mine.pane-launch-", "live")
-        });
-        feed.attach(tx);
-        assert!(
-            matches!(rx.try_recv(), Ok(WorkerMsg::Launches(l)) if l.is_empty()),
-            "the records there are on attaching"
-        );
-        let birth = crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 2 };
-        let publish = |name: &str, session: &str| {
-            crate::cli::pane_target::publish_for_test(
-                &dir.path().join(name),
-                session,
-                "claude",
-                7,
-                birth.clone(),
-            )
-        };
-        publish("theirs.pane-launch-x.json", "live");
-        feed.changed();
-        publish("mine.pane-launch-y.json", "other");
-        feed.changed();
-        assert!(rx.try_recv().is_err(), "another repo's or session's record");
-        publish("mine.pane-launch-z.json", "live");
-        feed.changed();
-        feed.changed();
-        let got: Vec<WorkerMsg> = rx.try_iter().collect();
-        assert!(
-            matches!(got.as_slice(), [WorkerMsg::Launches(l)] if l.len() == 1),
-            "one batch for the one change"
-        );
-    }
-
-    /// The watch thread reads the records for a directory change while
-    /// the worker attaches, and the records change in between: the
-    /// worker must never hear the older read after the newer one.
-    #[test]
-    fn a_change_read_while_the_worker_attaches_never_arrives_after_it() {
+    fn only_a_reopen_request_in_the_runtime_directory_reaches_the_loop() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
-        let version = Arc::new(AtomicUsize::new(1));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
-        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
-        let gate_rx = Mutex::new(gate_rx);
-        let records = version.clone();
-        let feed = Arc::new(LaunchFeed::new(move || {
-            let v = records.load(Ordering::SeqCst);
-            if std::thread::current().name() == Some("dir") {
-                let _ = entered_tx.send(());
-                let _ = gate_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
-            }
-            (0..v as i32)
-                .map(|i| launch(&format!("/run/r.pane-launch-{i}.json"), 40 + i))
-                .collect()
-        }));
-        let watch_thread = {
-            let feed = feed.clone();
-            std::thread::Builder::new()
-                .name("dir".into())
-                .spawn(move || feed.changed())
-                .unwrap()
-        };
-        let _ = entered_rx.recv_timeout(Duration::from_millis(500));
-        version.store(2, Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let attaching = {
-            let feed = feed.clone();
-            std::thread::spawn(move || feed.attach(tx))
-        };
-        let t = std::time::Instant::now();
-        while !attaching.is_finished() && t.elapsed() < Duration::from_millis(500) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let _ = gate_tx.send(());
-        watch_thread.join().unwrap();
-        attaching.join().unwrap();
-        let heard: Vec<usize> = rx
-            .try_iter()
-            .map(|m| match m {
-                WorkerMsg::Launches(l) => l.len(),
-                _ => panic!("only launch records were sent"),
-            })
-            .collect();
-        assert_eq!(heard.last(), Some(&2), "{heard:?}");
-        assert!(heard.windows(2).all(|w| w[0] <= w[1]), "{heard:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::path::Path::new("/w/proj");
+        let (tx, requests) = std::sync::mpsc::channel();
+        let woken = std::sync::Arc::new(AtomicUsize::new(0));
+        let wakes = woken.clone();
+        let watch = RuntimeWatch::start_in(repo, Ok(dir.path().to_path_buf()), tx, move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(watch.unavailable, None);
+        let tag = crate::cli::monitor::runtime_path_in(dir.path(), repo, "")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(dir.path().join(format!("{tag}pane-launch-x.json")), "{}").unwrap();
+        assert!(
+            requests
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a launch file is nobody's request"
+        );
+        assert_eq!(woken.load(Ordering::SeqCst), 0);
+        let request = crate::cli::remote_control::request_path(repo, "r1");
+        std::fs::write(dir.path().join(request.file_name().unwrap()), "{}").unwrap();
+        assert_eq!(
+            requests.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok("r1".to_string())
+        );
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        drop(watch);
     }
 }

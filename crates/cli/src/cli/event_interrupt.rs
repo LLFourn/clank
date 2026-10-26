@@ -205,7 +205,7 @@ pub(crate) async fn run(repo: PathBuf, label: clank_core::ids::AgentLabel) {
         if crate::agent_store::resolve_role(repo, label).is_err() {
             return InterruptOutcome::Unavailable;
         }
-        let native = super::pane_input::Admitted::new(clank_core::Tool::Codex, None, &text);
+        let native = super::pane_input::Admitted::new(&text);
         match super::codex_interrupt::try_wake(repo, label, &native).await {
             Ok(true) => return InterruptOutcome::Submitted,
             Ok(false) => {}, // No native mutation: verified terminal fallback is safe.
@@ -214,22 +214,15 @@ pub(crate) async fn run(repo: PathBuf, label: clank_core::ids::AgentLabel) {
                 return InterruptOutcome::Indeterminate;
             }
         }
-        let (target, tool, process) = match super::pane_target::discover_process(repo.clone(), label.clone()).await {
+        let target = match super::pane_target::discover(repo.clone(), label.clone()).await {
             Ok(target) => target,
             Err(error) => {
                 eprintln!("interrupt `{label}`: unavailable ({error:#}); normal delivery remains pending");
                 return InterruptOutcome::Unavailable;
             }
         };
-        let version = process.harness.as_deref().ok();
-        let pane = super::pane_input::Target {
-            session: &target.session,
-            pane: &target.pane,
-            tool,
-            version,
-        };
-        let hint = super::pane_input::Admitted::new(tool, version, &text);
-        match super::pane_input::wake_for_events_async(pane, &hint).await {
+        let hint = super::pane_input::Admitted::new(&text);
+        match super::pane_input::wake_for_events_async(target.input(), &hint).await {
             Ok(()) => InterruptOutcome::Submitted,
             Err(super::pane_input::Unconfirmed::Refused(why)) => {
                 eprintln!("interrupt `{label}`: unavailable ({why}); normal delivery remains pending");

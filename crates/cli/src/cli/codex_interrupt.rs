@@ -822,7 +822,7 @@ mod tests {
         // A refused target never connects, and the script would wait for
         // it forever.
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let hint = crate::cli::pane_input::Admitted::new(Tool::Codex, None, HINT);
+            let hint = crate::cli::pane_input::Admitted::new(HINT);
             tokio::join!(try_wake(repo.path(), &label, &hint), script)
         })
         .await

@@ -7,8 +7,8 @@
 //! - Ordinary text is an [`Admitted`]: structural control bytes are made
 //!   inert and a leading `!` cannot reach a harness's shell-mode trigger.
 //! - An ordinary terminal write proceeds only when the pane's input is
-//!   positively read as not in shell mode, or when the sequence opens with
-//!   a key committed evidence shows leaves it ([`EXIT_KEY_EVIDENCE`]).
+//!   positively read as not in shell mode. A harness whose input cannot be
+//!   read (Grok, OpenCode) is never typed into.
 //! - Every write sequence holds the pane's one cross-process lock
 //!   ([`lock_pane`]) from its look through its last byte.
 //!
@@ -102,30 +102,17 @@ pub(crate) fn stop_pane(session: &str, pane: &str, tool: Tool) -> anyhow::Result
 /// - Every other control character, ESC, DEL and C1 included, becomes
 ///   U+FFFD, so the change is visible: Esc interrupts, and a CSI sequence
 ///   can be a key such as the kitty Enter.
-/// - A `!` opening the text after its leading whitespace is encoded for its
-///   tool so no harness reads it as the shell-mode trigger: U+00B7 `·`
-///   before it, or for a Claude version with a committed row in
-///   [`SPACE_BEFORE_BANG`], the leading whitespace as one ASCII space.
+/// - A `!` opening the text after its leading whitespace gets U+00B7 `·`
+///   before it, so no harness reads it as the shell-mode trigger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted(String);
 
 impl Admitted {
-    /// `raw`, admitted for `tool` at `version` (`None` when unknown).
-    pub(crate) fn new(tool: Tool, version: Option<&str>, raw: &str) -> Self {
-        Self::by(SPACE_BEFORE_BANG, tool, version, raw)
-    }
-
-    fn by(evidence: &[BangEvidence], tool: Tool, version: Option<&str>, raw: &str) -> Self {
+    pub(crate) fn new(raw: &str) -> Self {
         let mut text = neutralised(raw);
         let lead = text.len() - text.trim_start().len();
         if text[lead..].starts_with('!') {
-            let spaced =
-                version.is_some_and(|v| evidence.iter().any(|e| e.tool == tool && e.version == v));
-            if spaced {
-                text.replace_range(..lead, " ");
-            } else {
-                text.insert(lead, BANG_GUARD);
-            }
+            text.insert(lead, BANG_GUARD);
         }
         Admitted(text)
     }
@@ -165,44 +152,12 @@ fn neutralised(raw: &str) -> String {
     out
 }
 
-/// A live observation that a harness version, given a leading `!` after a
-/// single space, keeps the line as a prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BangEvidence {
-    pub(crate) tool: Tool,
-    /// Exactly the version observed: no later version is assumed.
-    pub(crate) version: &'static str,
-    pub(crate) how: &'static str,
-}
-
-/// Committed observations for the space encoding. Empty until a human
-/// records one from a throwaway pane (README, "User commands"): until then
-/// every tool gets the `·` encoding.
-pub(crate) const SPACE_BEFORE_BANG: &[BangEvidence] = &[];
-
-/// A live observation that the key an interrupt-first path already sends
-/// first (`stop_argv`) leaves the harness's shell mode at a version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExitKeyEvidence {
-    pub(crate) tool: Tool,
-    /// Exactly the version observed.
-    pub(crate) version: &'static str,
-    /// For Grok, that Ctrl+C clears a bare `!` with nothing after it; for
-    /// OpenCode, that Esc in shell mode leaves it, and whether it also
-    /// interrupts.
-    pub(crate) how: &'static str,
-}
-
-/// Committed observations for Grok's and OpenCode's exit keys. Empty until
-/// a human records one, so both are refused on every terminal path.
-pub(crate) const EXIT_KEY_EVIDENCE: &[ExitKeyEvidence] = &[];
-
-/// A live observation that Claude Code at a version runs a user command
-/// typed as `!<line>` into its empty input followed by Enter as one bash
-/// command, for lines up to `max_command` characters.
+/// A live observation that Claude Code runs a user command typed as
+/// `!<line>` into its empty input followed by Enter as one bash command,
+/// for lines up to `max_command` characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UserCommandEvidence {
-    /// Exactly the Claude Code version observed.
+    /// The Claude Code version observed, as the harness reports it.
     pub(crate) version: &'static str,
     /// The longest line observed to run whole.
     pub(crate) max_command: usize,
@@ -211,82 +166,36 @@ pub(crate) struct UserCommandEvidence {
     pub(crate) how: &'static str,
 }
 
-/// Committed observations for the user-command keystrokes. Empty until a
+/// The committed observation for the user-command keystrokes. None until a
 /// human records one, so every user command is refused at dispatch.
-pub(crate) const USER_COMMAND_EVIDENCE: &[UserCommandEvidence] = &[];
+pub(crate) const USER_COMMAND_EVIDENCE: Option<UserCommandEvidence> = None;
 
-/// Which kind of sequence an ordinary write is: whether it opens with the
-/// tool's interrupt key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Opening {
-    InterruptFirst,
-    TextFirst,
-}
-
-/// What lets an ordinary terminal write proceed at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Proof {
-    /// A dump under the lock must read the input as taking ordinary text.
-    Reading,
-    /// The interrupt key sent first is proven to leave shell mode.
-    ExitKey,
-}
-
-fn proof_for(
-    evidence: &[ExitKeyEvidence],
-    tool: Tool,
-    opening: Opening,
-    version: Option<&str>,
-) -> Result<Proof, String> {
-    match tool {
-        Tool::Claude | Tool::Codex => Ok(Proof::Reading),
-        Tool::Grok | Tool::OpenCode => {
-            let proven = opening == Opening::InterruptFirst
-                && version
-                    .is_some_and(|v| evidence.iter().any(|e| e.tool == tool && e.version == v));
-            if proven {
-                Ok(Proof::ExitKey)
-            } else {
-                Err(format!(
-                    "{tool}'s input cannot be read, and no committed evidence shows the key this \
-                     path sends first leaves its shell mode at {}; nothing was typed",
-                    version.unwrap_or("its unknown version")
-                ))
-            }
-        }
+/// Whether an ordinary sequence may type into the pane now: one dump, taken
+/// under the lock the caller holds, must read its input as taking ordinary
+/// text.
+async fn admit_write(term: &impl Terminal, tool: Tool) -> Result<(), String> {
+    if matches!(tool, Tool::Grok | Tool::OpenCode) {
+        return Err(format!(
+            "{tool}'s input cannot be read, so whether it is in shell mode cannot be known; \
+             nothing was typed"
+        ));
     }
-}
-
-/// Whether this sequence may type into the pane now: by its proof, and for
-/// a reading, by one dump taken under the lock the caller holds.
-async fn admit_write(
-    term: &impl Terminal,
-    evidence: &[ExitKeyEvidence],
-    tool: Tool,
-    opening: Opening,
-    version: Option<&str>,
-) -> Result<(), String> {
-    match proof_for(evidence, tool, opening, version)? {
-        Proof::ExitKey => Ok(()),
-        Proof::Reading => {
-            let read = term
-                .dump()
-                .await
-                .map(|screen| super::composer::composer(tool, &screen))
-                .unwrap_or(Composer::Unreadable);
-            if read.takes_ordinary_text() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "its input reads as {}, not as a prompt that takes ordinary text; nothing \
-                     was typed",
-                    match read {
-                        Composer::Shell => "shell mode",
-                        _ => "unreadable",
-                    }
-                ))
+    let read = term
+        .dump()
+        .await
+        .map(|screen| super::composer::composer(tool, &screen))
+        .unwrap_or(Composer::Unreadable);
+    if read.takes_ordinary_text() {
+        Ok(())
+    } else {
+        Err(format!(
+            "its input reads as {}, not as a prompt that takes ordinary text; nothing \
+             was typed",
+            match read {
+                Composer::Shell => "shell mode",
+                _ => "unreadable",
             }
-        }
+        ))
     }
 }
 
@@ -422,14 +331,12 @@ fn run_sync<F: std::future::Future>(work: F) -> F::Output {
     }
 }
 
-/// Where an ordinary write goes: the pane, its tool, and the harness
-/// version its launch recorded, when known.
+/// Where an ordinary write goes: the pane, and the tool it runs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Target<'a> {
     pub(crate) session: &'a str,
     pub(crate) pane: &'a str,
     pub(crate) tool: Tool,
-    pub(crate) version: Option<&'a str>,
 }
 
 /// Interrupt the agent's current turn, then submit `text`.
@@ -514,11 +421,11 @@ async fn interrupt_and_submit_reserving(
         session: target.session,
         pane: target.pane,
     };
-    interrupt_and_submit_on(&term, EXIT_KEY_EVIDENCE, target, text).await
+    interrupt_and_submit_on(&term, target, text).await
 }
 
-/// [`interrupt_and_submit_async`] on a supplied terminal and evidence, the
-/// lock already held.
+/// [`interrupt_and_submit_async`] on a supplied terminal, the lock already
+/// held.
 ///
 /// So the REAL bytes, per provider, can be recorded in order without a
 /// terminal. The order is also asserted on [`interrupt_then_submit`]
@@ -527,22 +434,15 @@ async fn interrupt_and_submit_reserving(
 /// it. This is the seam that sees the keys themselves.
 async fn interrupt_and_submit_on(
     term: &impl Terminal,
-    evidence: &[ExitKeyEvidence],
     target: Target<'_>,
     text: &Admitted,
 ) -> Result<(), Unconfirmed> {
     if text.is_empty() {
         return Err(Unconfirmed::Empty);
     }
-    admit_write(
-        term,
-        evidence,
-        target.tool,
-        Opening::InterruptFirst,
-        target.version,
-    )
-    .await
-    .map_err(Unconfirmed::Refused)?;
+    admit_write(term, target.tool)
+        .await
+        .map_err(Unconfirmed::Refused)?;
     let (pane, tool) = (target.pane, target.tool);
     let write = |argv| async { term.write(argv).await.map_err(|e| anyhow::anyhow!("{e}")) };
     interrupt_then_submit(
@@ -591,15 +491,9 @@ async fn submit_on(
     let Some(argvs) = say_argvs(target.pane, text.as_str()) else {
         return Err(PaneWrite::NotStarted("there was nothing to say".into()));
     };
-    admit_write(
-        term,
-        EXIT_KEY_EVIDENCE,
-        target.tool,
-        Opening::TextFirst,
-        target.version,
-    )
-    .await
-    .map_err(PaneWrite::NotStarted)?;
+    admit_write(term, target.tool)
+        .await
+        .map_err(PaneWrite::NotStarted)?;
     for (index, mut argv) in argvs.into_iter().enumerate() {
         if index == 1 && target.tool == Tool::Codex {
             // Past Codex's paste window, so the key is a key: Tab, which
@@ -719,9 +613,7 @@ async fn say_on(
     let Some(argvs) = say_argvs(pane, text.as_str()) else {
         return Ok(());
     };
-    admit_write(term, EXIT_KEY_EVIDENCE, tool, Opening::TextFirst, None)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    admit_write(term, tool).await.map_err(anyhow::Error::msg)?;
     for (i, mut argv) in argvs.into_iter().enumerate() {
         if i == 1 && tool == Tool::Codex {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -801,38 +693,12 @@ mod tests {
         }
     }
 
-    fn target(tool: Tool, version: Option<&str>) -> Target<'_> {
+    fn target(tool: Tool) -> Target<'static> {
         Target {
             session: "s",
             pane: "7",
             tool,
-            version,
         }
-    }
-
-    const ROWS: &[ExitKeyEvidence] = &[
-        ExitKeyEvidence {
-            tool: Tool::Grok,
-            version: "1.0.62",
-            how: "test row",
-        },
-        ExitKeyEvidence {
-            tool: Tool::OpenCode,
-            version: "1.18.30",
-            how: "test row",
-        },
-    ];
-
-    fn version_of(tool: Tool) -> Option<&'static str> {
-        match tool {
-            Tool::Grok => Some("1.0.62"),
-            Tool::OpenCode => Some("1.18.30"),
-            _ => None,
-        }
-    }
-
-    fn admitted(tool: Tool, raw: &str) -> Admitted {
-        Admitted::new(tool, None, raw)
     }
 
     /// Interrupt, then submit — once each, in that order.
@@ -936,28 +802,22 @@ mod tests {
     /// The keys actually written, in order, for every provider — through
     /// the same function both production callers reach.
     ///
-    /// The interrupt key is FIRST and is the provider's own (Ctrl+C for
-    /// Grok, Esc for the rest); the message and its submit follow, Codex's
-    /// paste-safe Enter included. Grok and OpenCode get there only with an
-    /// exit-key row for their version.
+    /// The interrupt key is FIRST and is the provider's own; the message
+    /// and its submit follow, Codex's paste-safe Enter included. Grok's
+    /// interrupt is Ctrl+C, the rest Esc.
     #[tokio::test(start_paused = true)]
     async fn every_provider_is_interrupted_with_its_own_key_before_the_message() {
         let key = |argv: &Vec<String>| argv[4..].join(" ");
+        assert_eq!(key(&stop_argv("7", Tool::Grok)), "3");
+        assert_eq!(key(&stop_argv("7", Tool::OpenCode)), "27");
         for (tool, interrupt, submit) in [
             (Tool::Claude, "27", "13"),
-            (Tool::Grok, "3", "13"),
-            (Tool::OpenCode, "27", "13"),
             (Tool::Codex, "27", "27 91 49 51 59 49 58 49 117"),
         ] {
             let term = fake(idle(tool));
-            interrupt_and_submit_on(
-                &term,
-                ROWS,
-                target(tool, version_of(tool)),
-                &admitted(tool, "hello"),
-            )
-            .await
-            .unwrap();
+            interrupt_and_submit_on(&term, target(tool), &Admitted::new("hello"))
+                .await
+                .unwrap();
             let written = term.written.into_inner();
             assert_eq!(written.len(), 3, "{tool:?}: {written:?}");
             assert_eq!(key(&written[0]), interrupt, "{tool:?} is interrupted first");
@@ -978,7 +838,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_interrupt_write_is_an_interrupt_failure_and_types_nothing() {
         let term = Fake {
-            screen: None,
+            screen: idle(Tool::Claude),
             answer: |_| {
                 Err(PaneWrite::Unknown(
                     "terminal input transport timed out; acceptance is unknown".into(),
@@ -986,14 +846,9 @@ mod tests {
             },
             written: RefCell::new(Vec::new()),
         };
-        let error = interrupt_and_submit_on(
-            &term,
-            ROWS,
-            target(Tool::Grok, version_of(Tool::Grok)),
-            &admitted(Tool::Grok, "hello"),
-        )
-        .await
-        .unwrap_err();
+        let error = interrupt_and_submit_on(&term, target(Tool::Claude), &Admitted::new("hello"))
+            .await
+            .unwrap_err();
         assert_eq!(term.written.borrow().len(), 1, "only the interrupt");
         let said = format!("{error:#}");
         assert!(
@@ -1009,7 +864,7 @@ mod tests {
     async fn a_submit_only_send_writes_no_interrupt() {
         for (tool, submit) in [(Tool::Claude, "13"), (Tool::Codex, "9")] {
             let term = fake(idle(tool));
-            submit_on(&term, target(tool, None), &admitted(tool, "hello"))
+            submit_on(&term, target(tool), &Admitted::new("hello"))
                 .await
                 .unwrap();
             let written = term.written.into_inner();
@@ -1028,12 +883,7 @@ mod tests {
             answer: |_| Err(PaneWrite::NotStarted("no zellij".into())),
             written: RefCell::new(Vec::new()),
         };
-        let tried = submit_on(
-            &first,
-            target(Tool::Claude, None),
-            &admitted(Tool::Claude, "hi"),
-        )
-        .await;
+        let tried = submit_on(&first, target(Tool::Claude), &Admitted::new("hi")).await;
         assert!(matches!(tried, Err(PaneWrite::NotStarted(_))));
         let second = Fake {
             screen: idle(Tool::Claude),
@@ -1043,12 +893,7 @@ mod tests {
             },
             written: RefCell::new(Vec::new()),
         };
-        let tried = submit_on(
-            &second,
-            target(Tool::Claude, None),
-            &admitted(Tool::Claude, "hi"),
-        )
-        .await;
+        let tried = submit_on(&second, target(Tool::Claude), &Admitted::new("hi")).await;
         assert!(
             matches!(tried, Err(PaneWrite::Unknown(_))),
             "the text was typed"
@@ -1072,10 +917,7 @@ mod tests {
     /// a space; ESC, other C0, DEL and C1 become U+FFFD.
     #[test]
     fn structural_bytes_are_neutralised_and_lines_kept() {
-        let said = admitted(
-            Tool::Claude,
-            "a\r\nb\rc\nd\te\u{1b}[13;1:1uf\u{7}\u{7f}\u{85}g",
-        );
+        let said = Admitted::new("a\r\nb\rc\nd\te\u{1b}[13;1:1uf\u{7}\u{7f}\u{85}g");
         assert_eq!(
             said.as_str(),
             "a\nb\nc\nd e\u{fffd}[13;1:1uf\u{fffd}\u{fffd}\u{fffd}g"
@@ -1083,41 +925,18 @@ mod tests {
         assert!(!said.as_str().contains('\r'));
     }
 
-    /// A leading `!`, after any leading whitespace, gets `·` before it for
-    /// every tool without a space row; a `!` anywhere else, or after an LF
+    /// A leading `!`, after any leading whitespace, gets `·` before it; a
+    /// `!` anywhere else, or after an LF
     /// inside the message, is left as text. A neutralised control byte
     /// before a `!` is not whitespace, so nothing is added there.
     #[test]
-    fn a_leading_bang_is_encoded_for_every_tool() {
-        for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
-            assert_eq!(admitted(tool, "!git push").as_str(), "\u{b7}!git push");
-            assert_eq!(admitted(tool, "  \n\t!rm").as_str(), "  \n \u{b7}!rm");
-            assert_eq!(admitted(tool, "\r!x").as_str(), "\n\u{b7}!x", "{tool:?}");
-            assert_eq!(admitted(tool, "say !this").as_str(), "say !this");
-            assert_eq!(admitted(tool, "line\n!two").as_str(), "line\n!two");
-            assert_eq!(admitted(tool, "\u{1b}!x").as_str(), "\u{fffd}!x");
-        }
-    }
-
-    /// The space encoding is used only for the tool and exact version a
-    /// committed row names; the shipped table names none.
-    #[test]
-    fn the_space_encoding_needs_its_row() {
-        const ROW: &[BangEvidence] = &[BangEvidence {
-            tool: Tool::Claude,
-            version: "2.1.308",
-            how: "test row",
-        }];
-        let by = |tool, version| Admitted::by(ROW, tool, version, "  \t!git push").0;
-        assert_eq!(by(Tool::Claude, Some("2.1.308")), " !git push");
-        assert_eq!(by(Tool::Claude, Some("2.1.309")), "   \u{b7}!git push");
-        assert_eq!(by(Tool::Claude, None), "   \u{b7}!git push");
-        assert_eq!(by(Tool::Codex, Some("2.1.308")), "   \u{b7}!git push");
-        assert!(SPACE_BEFORE_BANG.is_empty());
-        assert_eq!(
-            Admitted::new(Tool::Claude, Some("2.1.308"), "!x").as_str(),
-            "\u{b7}!x"
-        );
+    fn a_leading_bang_is_encoded() {
+        assert_eq!(Admitted::new("!git push").as_str(), "\u{b7}!git push");
+        assert_eq!(Admitted::new("  \n\t!rm").as_str(), "  \n \u{b7}!rm");
+        assert_eq!(Admitted::new("\r!x").as_str(), "\n\u{b7}!x");
+        assert_eq!(Admitted::new("say !this").as_str(), "say !this");
+        assert_eq!(Admitted::new("line\n!two").as_str(), "line\n!two");
+        assert_eq!(Admitted::new("\u{1b}!x").as_str(), "\u{fffd}!x");
     }
 
     /// Every ordinary sequence types the ADMITTED text: a raw `!` line and
@@ -1127,26 +946,17 @@ mod tests {
         let raw = "!git push\rnext\nline";
         let expect = "\u{b7}!git push\nnext\nline";
         let interrupt = fake(idle(Tool::Claude));
-        interrupt_and_submit_on(
-            &interrupt,
-            ROWS,
-            target(Tool::Claude, None),
-            &admitted(Tool::Claude, raw),
-        )
-        .await
-        .unwrap();
+        interrupt_and_submit_on(&interrupt, target(Tool::Claude), &Admitted::new(raw))
+            .await
+            .unwrap();
         assert_eq!(interrupt.written.borrow()[1].last().unwrap(), expect);
         let submit = fake(idle(Tool::Codex));
-        submit_on(
-            &submit,
-            target(Tool::Codex, None),
-            &admitted(Tool::Codex, raw),
-        )
-        .await
-        .unwrap();
+        submit_on(&submit, target(Tool::Codex), &Admitted::new(raw))
+            .await
+            .unwrap();
         assert_eq!(submit.written.borrow()[0].last().unwrap(), expect);
         let say = fake(idle(Tool::Claude));
-        say_on(&say, "7", Tool::Claude, &admitted(Tool::Claude, raw))
+        say_on(&say, "7", Tool::Claude, &Admitted::new(raw))
             .await
             .unwrap();
         assert_eq!(say.written.borrow()[0].last().unwrap(), expect);
@@ -1169,19 +979,18 @@ mod tests {
         for (tool, screen) in refused {
             let interrupt = fake(screen.clone());
             let tried =
-                interrupt_and_submit_on(&interrupt, ROWS, target(tool, None), &admitted(tool, "x"))
-                    .await;
+                interrupt_and_submit_on(&interrupt, target(tool), &Admitted::new("x")).await;
             assert!(
                 matches!(tried, Err(Unconfirmed::Refused(_))),
                 "{tool:?} {screen:?}"
             );
             assert!(interrupt.written.borrow().is_empty());
             let submit = fake(screen.clone());
-            let tried = submit_on(&submit, target(tool, None), &admitted(tool, "x")).await;
+            let tried = submit_on(&submit, target(tool), &Admitted::new("x")).await;
             assert!(matches!(tried, Err(PaneWrite::NotStarted(_))), "{tool:?}");
             assert!(submit.written.borrow().is_empty());
             let say = fake(screen.clone());
-            assert!(say_on(&say, "7", tool, &admitted(tool, "x")).await.is_err());
+            assert!(say_on(&say, "7", tool, &Admitted::new("x")).await.is_err());
             assert!(say.written.borrow().is_empty());
         }
         for (tool, screen) in [
@@ -1189,61 +998,33 @@ mod tests {
             (Tool::Codex, codex(&["› half a thought"])),
         ] {
             let submit = fake(Some(screen));
-            submit_on(&submit, target(tool, None), &admitted(tool, "x"))
+            submit_on(&submit, target(tool), &Admitted::new("x"))
                 .await
                 .unwrap();
             assert_eq!(submit.written.borrow().len(), 2, "{tool:?}");
         }
     }
 
-    /// Grok and OpenCode: the interrupt-first path sends the exit key first
-    /// only behind a row for the exact version, and is refused without one;
-    /// the text-first paths are refused even with a row. Every refusal
-    /// writes nothing and never asks for a dump it could not read.
+    /// Grok and OpenCode: every path is refused for its tool, writing
+    /// nothing and never asking for a dump it could not read.
     #[tokio::test(start_paused = true)]
-    async fn grok_and_opencode_need_a_proven_exit_key() {
+    async fn grok_and_opencode_are_never_typed_into() {
+        let unreadable = |why: &str| why.contains("input cannot be read");
         for tool in [Tool::Grok, Tool::OpenCode] {
-            for version in [None, Some("0.0.1")] {
-                let term = fake(None);
-                let tried = interrupt_and_submit_on(
-                    &term,
-                    ROWS,
-                    target(tool, version),
-                    &admitted(tool, "x"),
-                )
-                .await;
-                assert!(matches!(tried, Err(Unconfirmed::Refused(_))), "{tool:?}");
-                assert!(term.written.borrow().is_empty());
-            }
             let term = fake(None);
-            let tried = interrupt_and_submit_on(
-                &term,
-                EXIT_KEY_EVIDENCE,
-                target(tool, version_of(tool)),
-                &admitted(tool, "x"),
-            )
-            .await;
+            let tried = interrupt_and_submit_on(&term, target(tool), &Admitted::new("x")).await;
             assert!(
-                matches!(tried, Err(Unconfirmed::Refused(_))),
-                "the shipped table proves no exit key: {tool:?}"
+                matches!(&tried, Err(Unconfirmed::Refused(why)) if unreadable(why)),
+                "{tool:?}: {tried:?}"
             );
-            let term = fake(None);
-            let tried =
-                submit_on(&term, target(tool, version_of(tool)), &admitted(tool, "x")).await;
-            assert!(matches!(tried, Err(PaneWrite::NotStarted(_))));
-            let term = fake(None);
+            let tried = submit_on(&term, target(tool), &Admitted::new("x")).await;
             assert!(
-                say_on(&term, "7", tool, &admitted(tool, "x"))
-                    .await
-                    .is_err()
+                matches!(&tried, Err(PaneWrite::NotStarted(why)) if unreadable(why)),
+                "{tool:?}: {tried:?}"
             );
-            assert!(term.written.borrow().is_empty());
+            assert!(say_on(&term, "7", tool, &Admitted::new("x")).await.is_err());
+            assert!(term.written.borrow().is_empty(), "{tool:?}");
         }
-        assert_eq!(
-            proof_for(ROWS, Tool::Grok, Opening::TextFirst, Some("1.0.62")).map_err(|_| ()),
-            Err(()),
-            "a text-first path never rests on an exit key"
-        );
     }
 
     /// The user-command writer types `!` and the line as one write, then
@@ -1322,13 +1103,9 @@ mod tests {
                     let term = Logged(log, who);
                     run_sync(async {
                         if who == "ordinary" {
-                            submit_on(
-                                &term,
-                                target(Tool::Claude, None),
-                                &admitted(Tool::Claude, "x"),
-                            )
-                            .await
-                            .unwrap();
+                            submit_on(&term, target(Tool::Claude), &Admitted::new("x"))
+                                .await
+                                .unwrap();
                         } else {
                             let c = crate::cli::user_command::envelope::Command::for_test("ls");
                             type_user_command(&term, "7", &c).await.unwrap();
@@ -1407,9 +1184,8 @@ mod tests {
                     session: &s,
                     pane: &p,
                     tool: Tool::Claude,
-                    version: None,
                 };
-                let text = Admitted::new(Tool::Claude, None, "x");
+                let text = Admitted::new("x");
                 let submitted = submit_async(target, &text).await;
                 let woke = wake_for_events_async(target, &text).await;
                 let _ = done.send((submitted, woke));

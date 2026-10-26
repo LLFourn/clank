@@ -1260,7 +1260,7 @@ fn received_work_is_quiet_without_a_check_in_route_until_the_deadline() {
     st.step(
         Event::CheckInUndeliverable {
             check_in,
-            why: "its running version could not be established".into(),
+            why: "its pane was not found".into(),
         },
         &at,
     );

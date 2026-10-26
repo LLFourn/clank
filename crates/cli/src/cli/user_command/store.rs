@@ -43,13 +43,12 @@ impl State {
 }
 
 /// The pane a request's agent was found in at the monitor's first look.
+// Unknown fields are ignored, not refused: an entry admitted by an older
+// clank also names the process it found there, which nothing reads now.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct PaneSeen {
     pub(crate) session: String,
     pub(crate) pane: String,
-    pub(crate) pid: i32,
-    pub(crate) birth: crate::proc_identity::ProcToken,
 }
 
 /// One request's entry: the exact envelope as admitted, and clank's own
@@ -558,6 +557,27 @@ mod tests {
             assert!(!r.moved(state, Some("key changed".into()), 14));
         }
         assert_eq!((r.state, r.updated_at), (State::Delivered, 13));
+    }
+
+    /// An entry an older clank saved, its pane naming the process found in
+    /// it, still loads, as the pane alone.
+    #[test]
+    fn an_entry_whose_pane_names_a_process_still_loads() {
+        let mut saved = serde_json::to_value(record()).unwrap();
+        saved["pane"] = serde_json::json!({
+            "session": "zs",
+            "pane": "terminal_3",
+            "pid": 42,
+            "birth": {"v": "mac1", "sec": 1, "usec": 0},
+        });
+        let loaded: Record = serde_json::from_value(saved).unwrap();
+        assert_eq!(
+            loaded.pane,
+            Some(PaneSeen {
+                session: "zs".into(),
+                pane: "terminal_3".into(),
+            })
+        );
     }
 
     #[test]

@@ -558,36 +558,6 @@ async fn start_with(
     }
 
     let workdir = matches!(launch_tool, Tool::Grok | Tool::Claude).then_some(repo.as_path());
-    let path = composed
-        .env_overrides
-        .get("PATH")
-        .map(std::ffi::OsString::from)
-        .or_else(|| std::env::var_os("PATH"));
-    let cwd = match workdir {
-        Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir()?,
-    };
-    let launch = super::harness_identity::at_launch(
-        launch_tool,
-        &composed.program,
-        &cwd,
-        path.as_deref(),
-        |cmd| launch_context(cmd, &composed, workdir),
-    );
-    if let Err(error) = super::pane_target::record(
-        &repo,
-        &label,
-        launch_tool,
-        &composed.program,
-        launch.version,
-    ) {
-        eprintln!("clank: launch provenance unavailable for interruption: {error:#}");
-    }
-    // The file whose version was recorded is the file run.
-    if let Some(exe) = launch.exe {
-        composed.program = exe.to_string_lossy().into_owned();
-    }
-
     exec_composed(composed, workdir).map(|()| None)
 }
 

@@ -508,29 +508,19 @@ impl Episode {
     }
 }
 
-/// The transport clank may use to `action` a `tool` running at `version`,
-/// or why it may not. A nudge needs the harness's resume capability
-/// ([`crate::cli::resume`]), which committed evidence for that version
-/// must enable. A retry may use it too, and a Codex retry otherwise takes
-/// Codex's own `turn/start`, which starts a turn only on the exact failed
-/// turn and never interrupts. Recovery never cancels a turn, so an agent
-/// with neither waits for a person.
-pub(crate) fn transport_for(
-    tool: Tool,
-    action: Action,
-    version: Option<&str>,
-) -> Result<Transport, &'static str> {
+/// The transport clank may use to nudge or retry an agent running `tool`,
+/// or why it may not: the harness's resume candidate
+/// ([`crate::cli::resume`]). Recovery never cancels a turn, so an agent with
+/// none waits for a person.
+pub(crate) fn transport_for(tool: Tool) -> Result<Transport, &'static str> {
     #[cfg(test)]
     if let Some(t) = tests::enabled(tool) {
-        return t.ok_or(crate::cli::resume::NO_EVIDENCE);
+        return t.ok_or(crate::cli::resume::NO_CANDIDATE);
     }
-    match crate::cli::resume::resume_for(tool, version) {
-        Ok(grant) => Ok(match grant.resume {
-            crate::cli::resume::Resume::TypedSubmit => Transport::Typed,
-            crate::cli::resume::Resume::Plugin => Transport::Helper,
-        }),
-        Err(_) if tool == Tool::Codex && action == Action::Retry => Ok(Transport::CodexStart),
-        Err(why) => Err(why),
+    match crate::cli::resume::candidate(tool) {
+        Some(crate::cli::resume::Resume::TypedSubmit) => Ok(Transport::Typed),
+        Some(crate::cli::resume::Resume::Plugin) => Ok(Transport::Helper),
+        None => Err(crate::cli::resume::NO_CANDIDATE),
     }
 }
 
@@ -705,6 +695,9 @@ pub(crate) enum Answer {
     Refused,
     /// The transport was not there to try; nothing was sent.
     Unavailable,
+    /// No one pane named for the agent could be found to type into, and
+    /// why; nothing was sent.
+    Unreachable(String),
     /// It may have reached the harness. Never replayed.
     Indeterminate,
 }
@@ -728,10 +721,8 @@ pub(crate) struct Ctx<'a> {
     pub(crate) now: u64,
     pub(crate) session: &'a str,
     pub(crate) tool: Tool,
-    /// How a nudge reaches the agent, or why it cannot.
-    pub(crate) nudge: Result<Transport, &'static str>,
-    /// How a retry reaches it, or why it cannot.
-    pub(crate) retry: Result<Transport, &'static str>,
+    /// How a nudge or a retry reaches the agent, or why it cannot.
+    pub(crate) transport: Result<Transport, &'static str>,
     /// What the monitor found when it checked, where it checked.
     pub(crate) gate: Option<Gate>,
     /// The agent owes work and has no wait to take it.
@@ -741,30 +732,12 @@ pub(crate) struct Ctx<'a> {
     pub(crate) fallback: Option<Fallback>,
     /// The agent's roster role.
     pub(crate) role: &'a str,
-    /// Its running harness is still being identified.
-    pub(crate) identifying: bool,
     /// The launch the agent is bound to.
     pub(crate) bound: Option<Bound>,
     /// The highest attempt number ever issued to this agent, in any
     /// episode or interval: a claim continues past it, so no two attempts,
     /// their answers, tags or history share an identity.
     pub(crate) issued: u32,
-}
-
-impl Ctx<'_> {
-    /// How `e`'s next attempt reaches the agent, or why it cannot.
-    fn transport(&self, e: &Episode) -> Result<Transport, &'static str> {
-        match e.action() {
-            Action::Nudge => self.nudge,
-            Action::Retry => self.retry,
-        }
-    }
-
-    /// Whether `e` is refused only for want of a version that is on its
-    /// way: a hold until it arrives, never a refusal.
-    fn awaiting(&self, e: &Episode) -> bool {
-        self.identifying && self.transport(e) == Err(crate::cli::resume::NO_VERSION)
-    }
 }
 
 /// How long a claimed attempt has for its transport to answer.
@@ -853,13 +826,6 @@ pub(crate) fn decide(
             // Held: no deadline, so nothing looks again until a fold says
             // the hold is over.
             (Some(Gate::Hold | Gate::AutoOff), State::Waiting, _) => e.next_at = None,
-            // Its harness's version is on its way: nothing is decided for
-            // want of it, and its arrival decides again.
-            (_, State::Waiting, at) if ctx.awaiting(e) => {
-                if at.is_some_and(|at| at <= ctx.now) {
-                    e.next_at = None;
-                }
-            }
             (_, State::Waiting, None) => e.next_at = Some(ctx.now + RETRY_LOOK),
             _ => effects.extend(due(e, snap, ctx)),
         }
@@ -942,7 +908,7 @@ fn opened(kind: Kind, id: String, class: String, ctx: &Ctx) -> Episode {
     };
     // An idle agent is given its settle period first, transport or not: a
     // turn's end is read moments before the Stop hook parks it.
-    if let (Kind::Failed, Err(why), false) = (kind, ctx.transport(&e), ctx.awaiting(&e)) {
+    if let (Kind::Failed, Err(why)) = (kind, ctx.transport) {
         escalate(&mut e, ctx, why);
         return e;
     }
@@ -1041,8 +1007,8 @@ fn follow(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) {
     e.failed_turn = turn.id.clone();
     e.class = next;
     match e.next_wait() {
-        _ if ctx.transport(e).is_err() && !ctx.awaiting(e) => {
-            let why = ctx.transport(e).expect_err("checked");
+        _ if ctx.transport.is_err() => {
+            let why = ctx.transport.expect_err("checked");
             escalate(e, ctx, why)
         }
         Ok(wait) => {
@@ -1090,7 +1056,7 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
                 e.next_at = Some(ctx.now + fallback_wait(e));
                 return None;
             }
-            let Ok(transport) = ctx.transport(e).map_err(|why| escalate(e, ctx, why)) else {
+            let Ok(transport) = ctx.transport.map_err(|why| escalate(e, ctx, why)) else {
                 return None;
             };
             Some(claim(e, transport, ctx))
@@ -1109,7 +1075,7 @@ fn due(e: &mut Episode, snap: &Snapshot, ctx: &Ctx) -> Option<Effect> {
                 e.next_at = Some(ctx.now + RETRY_LOOK);
                 return None;
             }
-            let Ok(transport) = ctx.transport(e).map_err(|why| escalate(e, ctx, why)) else {
+            let Ok(transport) = ctx.transport.map_err(|why| escalate(e, ctx, why)) else {
                 return None;
             };
             let current = snap.anchored()
@@ -1206,7 +1172,7 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
             a.disposition = Disposition::Refused;
             close(&mut e);
         }
-        Answer::Unavailable if e.kind == Kind::Fallback => {
+        Answer::Unavailable | Answer::Unreachable(_) if e.kind == Kind::Fallback => {
             a.disposition = Disposition::Unavailable;
             if e.unavailable() >= FALLBACK_CHECKS {
                 escalate(
@@ -1219,7 +1185,7 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
                 e.next_at = Some(ctx.now + fallback_wait(&e));
             }
         }
-        Answer::Unavailable => {
+        Answer::Unavailable | Answer::Unreachable(_) => {
             a.disposition = Disposition::Unavailable;
             if e.unavailable() >= UNAVAILABLE_LIMIT {
                 escalate(&mut e, ctx, "its recovery transport never answered");
@@ -1260,9 +1226,6 @@ pub(crate) struct Facts {
     /// what ends it, whether or not the agent owes anything. A cancelled
     /// question has no hook and no Stop, only its result in the record.
     pub(crate) asking: bool,
-    /// The monitor holds an attendance for it, whose check-in route turns
-    /// on the harness it runs.
-    pub(crate) identify: bool,
     pub(crate) projection: Projection,
 }
 
@@ -1349,20 +1312,17 @@ struct Watched {
     role: String,
     attending: bool,
     asking: bool,
-    /// Its harness is worth identifying whether or not it owes anything:
-    /// the route an attendance's check-in needs depends on it.
-    identify: bool,
     projection: Projection,
     delivering: bool,
     fallback: Option<Fallback>,
     /// The activity last published, and since when.
     activity: Option<(crate::cli::agent_state::Activity, u64)>,
     published: Option<crate::cli::agent_state::AgentState>,
-    /// The harness it is running, as far as it has been identified, for
-    /// `binding`.
-    running: Identity,
-    /// The binding `running` was identified for: a new one, even of the
-    /// same session, is a new launch to identify.
+    /// Why its last typed attempt found no pane to type into, until one is
+    /// submitted or it is bound again.
+    unreachable: Option<String>,
+    /// The binding it holds: binding again, even to the same session, is a
+    /// new binding.
     binding: Option<clank_core::agent_config::Session>,
     /// A verified user command waits for its turn to end, so its record is
     /// read whether or not it owes anything.
@@ -1474,6 +1434,9 @@ impl Pending {
             },
             Answer::Unavailable => Outcome::Refused {
                 reason: format!("no {} was there to try", self.transport),
+            },
+            Answer::Unreachable(why) => Outcome::Refused {
+                reason: why.clone(),
             },
             Answer::Indeterminate => Outcome::Indeterminate {
                 reason: "it may have reached the harness".into(),
@@ -1723,30 +1686,24 @@ impl Driver {
                     role: String::new(),
                     attending: false,
                     asking: false,
-                    identify: false,
                     projection: Default::default(),
                     delivering: false,
                     fallback: None,
                     activity: None,
                     published: crate::cli::agent_state::load(&f.agent_dir),
-                    running: Identity::Unasked,
+                    unreachable: None,
                     binding: None,
                     user_command: false,
                 });
             w.auto = f.auto;
             w.obligated = f.obligated && !f.delivering;
             w.role = f.role.clone();
-            let process_ended = match &w.running {
-                Identity::Known(r) => !r.process.birth.still_holds(r.process.pid),
-                _ => false,
-            };
-            if w.binding.as_ref() != Some(&f.session) || process_ended {
+            if w.binding.as_ref() != Some(&f.session) {
                 w.binding = Some(f.session.clone());
-                w.running = Identity::Unasked;
+                w.unreachable = None;
             }
             w.attending = f.attending;
             w.asking = f.asking;
-            w.identify = f.identify;
             w.projection = f.projection.clone();
             w.delivering = f.delivering;
             w.fallback = f.blind_nudge.map(|every| Fallback {
@@ -1974,6 +1931,13 @@ impl Driver {
         self.settle(author, attempt, |p| p.outcome(&answer), now);
         let mut acts = Vec::new();
         if let Some(w) = self.agents.get_mut(author) {
+            if attempt.session == w.session {
+                match &answer {
+                    Answer::Unreachable(why) => w.unreachable = Some(why.clone()),
+                    Answer::Submitted { .. } => w.unreachable = None,
+                    _ => {}
+                }
+            }
             acts.extend(decision(author, w, now, None, Some((attempt, answer))));
         }
         self.publish(now);
@@ -2035,81 +1999,12 @@ impl Driver {
         current && still_permitted(w, &e, live)
     }
 
-    /// The agents whose running harness has not been asked for, marked as
-    /// being asked: each is identified once per binding and process, off
-    /// the loop.
-    pub(crate) fn unidentified(
-        &mut self,
-    ) -> Vec<(
-        clank_core::ids::AgentLabel,
-        clank_core::agent_config::Session,
-    )> {
+    /// Whether a check-in may be typed into `author`'s pane now: its harness
+    /// is resumed by typing.
+    pub(crate) fn may_type_check_in(&self, author: &clank_core::ids::AgentLabel) -> bool {
         self.agents
-            .iter_mut()
-            .filter(|(_, w)| {
-                w.running == Identity::Unasked
-                    && (w.obligated || w.identify)
-                    && matches!(w.tool, Tool::Claude | Tool::Codex)
-            })
-            .filter_map(|(author, w)| {
-                w.running = Identity::Pending;
-                Some((author.clone(), w.binding.clone()?))
-            })
-            .collect()
-    }
-
-    /// What identifying `author`'s running harness found, for the
-    /// `binding` it was asked for: dropped if the agent has been bound
-    /// again since, even to the same session.
-    pub(crate) fn identified(
-        &mut self,
-        author: &clank_core::ids::AgentLabel,
-        binding: &clank_core::agent_config::Session,
-        found: Result<crate::cli::harness_identity::Running, String>,
-        now: u64,
-    ) -> Vec<Act> {
-        let mut acts = Vec::new();
-        if let Some(w) = self
-            .agents
-            .get_mut(author)
-            .filter(|w| w.binding.as_ref() == Some(binding) && w.running == Identity::Pending)
-        {
-            w.running = match found {
-                Ok(running) => Identity::Known(running),
-                Err(why) => Identity::Unknown(why),
-            };
-            if w.obligated {
-                acts.extend(decision(author, w, now, suppressed(w), None));
-            }
-        }
-        self.publish(now);
-        self.accounted(acts, now)
-    }
-
-    /// Whether a check-in may be typed into `process` now: still the very
-    /// process identified for `author`'s binding, and still granted.
-    pub(crate) fn may_type_check_in(
-        &self,
-        author: &clank_core::ids::AgentLabel,
-        process: &crate::cli::pane_target::Process,
-    ) -> bool {
-        self.agents.get(author).is_some_and(|w| match &w.running {
-            Identity::Known(running) => {
-                running.process == *process
-                    && process.birth.still_holds(process.pid)
-                    && transport_for(w.tool, Action::Nudge, Some(&running.version))
-                        == Ok(Transport::Typed)
-            }
-            _ => false,
-        })
-    }
-
-    /// `author` holds an attendance now, so the harness it runs is worth
-    /// identifying before the next fold says so.
-    pub(crate) fn wants_identity(&mut self, author: &clank_core::ids::AgentLabel) {
-        if let Some(w) = self.agents.get_mut(author) {
-            w.identify = true;
-        }
+            .get(author)
+            .is_some_and(|w| transport_for(w.tool) == Ok(Transport::Typed))
     }
 
     /// Publish `author`'s turn projection as it is now.
@@ -2143,16 +2038,9 @@ impl Driver {
                 since,
                 suppressors: suppressors(w),
                 nudge: nudge(w.episode.as_ref()),
-                resumes: resumes(w.tool, w.running.version()),
-                cannot_resume: match (
-                    &w.running,
-                    transport_for(w.tool, Action::Nudge, w.running.version()),
-                ) {
-                    (_, Ok(_)) => None,
-                    (Identity::Unknown(why), Err(_)) => Some(format!(
-                        "its running version could not be established: {why}"
-                    )),
-                    (_, Err(why)) => Some(why.to_string()),
+                cannot_resume: match transport_for(w.tool) {
+                    Ok(_) => w.unreachable.clone(),
+                    Err(why) => Some(why.to_string()),
                 },
                 attending: w.projection.attended.clone(),
                 asking: w.projection.asking.clone(),
@@ -2336,11 +2224,6 @@ fn decision(
     gate: Option<Gate>,
     answer: Option<(&AttemptRef, Answer)>,
 ) -> Vec<Act> {
-    let version = w.running.version();
-    let (nudge, retry) = (
-        transport_for(w.tool, Action::Nudge, version),
-        transport_for(w.tool, Action::Retry, version),
-    );
     let gate = match gate {
         None if !w.auto => Some(Gate::AutoOff),
         g => g,
@@ -2349,15 +2232,12 @@ fn decision(
         now,
         session: &w.session,
         tool: w.tool,
-        nudge,
-        retry,
+        transport: transport_for(w.tool),
         gate,
         obligated: w.obligated,
         readable: w.read.is_some(),
         fallback: w.fallback.clone(),
         role: &w.role,
-        identifying: matches!(w.running, Identity::Unasked | Identity::Pending)
-            && matches!(w.tool, Tool::Claude | Tool::Codex),
         bound: w.binding.as_ref().map(Bound::of),
         issued: 0,
     };
@@ -2427,7 +2307,7 @@ fn decision(
     effects
         .into_iter()
         .filter_map(|Effect::Dispatch { n, tag, target }| {
-            ctx.transport(e).ok().map(|transport| Act::Dispatch {
+            ctx.transport.ok().map(|transport| Act::Dispatch {
                 author: author.clone(),
                 attempt: AttemptRef {
                     session: e.session.clone(),
@@ -2447,47 +2327,17 @@ fn decision(
 }
 
 /// Whether `e`'s claimed attempt may still go by the transport it was
-/// claimed with, judged by the harness running now: an obsolete claim is
-/// refused, never sent another way. A typed send must also be typing into
-/// that same, still living, process.
+/// claimed with, judged by the harness it is bound to now: an obsolete claim
+/// is refused, never sent another way. A typed send must also be typing
+/// into a pane the roster gives that same harness.
 fn still_permitted(w: &Watched, e: &Episode, live: &Live) -> bool {
     let Some(claimed) = e.attempts.last() else {
         return false;
     };
-    let now = transport_for(w.tool, e.action(), w.running.version());
-    if now != Ok(live.transport) || live.transport.name() != claimed.transport {
+    if transport_for(w.tool) != Ok(live.transport) || live.transport.name() != claimed.transport {
         return false;
     }
-    if claimed.transport != Transport::Typed.name() {
-        return true;
-    }
-    match (&w.running, &live.process) {
-        (Identity::Known(running), Some(process)) => {
-            running.process == *process && process.birth.still_holds(process.pid)
-        }
-        _ => false,
-    }
-}
-
-/// What clank knows of the harness an agent is running: its version is the
-/// only one a capability is judged by.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Identity {
-    Unasked,
-    Pending,
-    Known(crate::cli::harness_identity::Running),
-    /// It could not be established, and why. Not asked again for this
-    /// binding.
-    Unknown(String),
-}
-
-impl Identity {
-    fn version(&self) -> Option<&str> {
-        match self {
-            Identity::Known(r) => Some(&r.version),
-            _ => None,
-        }
-    }
+    claimed.transport != Transport::Typed.name() || live.typing_into == Some(w.tool)
 }
 
 /// What is true of an agent at a send, derived from disk then rather than
@@ -2501,23 +2351,8 @@ pub(crate) struct Live {
     pub(crate) bound: Option<Bound>,
     /// The transport asking to send.
     pub(crate) transport: Transport,
-    /// The provider process a typed send found in the pane it will type
-    /// into.
-    pub(crate) process: Option<crate::cli::pane_target::Process>,
-}
-
-/// How the agent is resumed, and on what grounds: by observation of its
-/// version, by the later-versions policy, or, for a Codex retry only, by
-/// its own `turn/start`.
-fn resumes(tool: Tool, version: Option<&str>) -> Option<String> {
-    match crate::cli::resume::resume_for(tool, version) {
-        Ok(grant) => Some(match grant.policy_beyond {
-            None => format!("observed to queue at {}", version.unwrap_or_default()),
-            Some(from) => format!("allowed by policy beyond observed {from}"),
-        }),
-        Err(_) => (transport_for(tool, Action::Retry, version) == Ok(Transport::CodexStart))
-            .then(|| "retries only, by Codex's own turn/start".to_string()),
-    }
+    /// The tool the roster gives the pane a typed send will type into.
+    pub(crate) typing_into: Option<Tool>,
 }
 
 /// What holds the agent's nudges back just now, as the last fold saw it:
@@ -2705,7 +2540,7 @@ impl Reply {
 /// How an agent of `tool` hears that recovery will retry its failed turn:
 /// a helper hands it the wake, or the turn's own notice says so.
 pub(crate) fn retry_announcement(tool: Tool) -> &'static str {
-    match transport_for(tool, Action::Retry, None) {
+    match transport_for(tool) {
         Ok(Transport::Helper) => "helper",
         _ => "notice",
     }
@@ -2934,14 +2769,12 @@ pub(crate) mod tests {
             now,
             session: "s1",
             tool: Tool::OpenCode,
-            nudge: transport.ok_or(crate::cli::resume::NO_EVIDENCE),
-            retry: transport.ok_or(crate::cli::resume::NO_EVIDENCE),
+            transport: transport.ok_or(crate::cli::resume::NO_CANDIDATE),
             gate,
             obligated: false,
             readable: true,
             fallback: None,
             role: "",
-            identifying: false,
             bound: None,
             issued: 0,
         }
@@ -3153,7 +2986,7 @@ pub(crate) mod tests {
     fn without_a_transport_a_failure_is_told_once_and_left_to_a_person() {
         let s = snap([started("t1"), failed("t1", "server_overloaded")]);
         let (ep, _) = decide(None, &s, &ctx(0, None, None));
-        assert!(told(&ep).is_some_and(|t| t.contains("not enabled")));
+        assert!(told(&ep).is_some_and(|t| t.contains("no way to resume")));
         let (ep, fx) = decide(ep, &s, &ctx(5, None, GO));
         assert!(acting(&fx).is_empty());
         assert_eq!(ep.unwrap().state, State::Escalated);
@@ -3526,7 +3359,6 @@ pub(crate) mod tests {
             blind_nudge: None,
             attending: false,
             asking: false,
-            identify: false,
             projection: Default::default(),
         }
     }
@@ -3629,7 +3461,7 @@ pub(crate) mod tests {
         assert!(acts.contains(&Act::Watch(watch_of(&rollout))), "{acts:?}");
         assert!(
             waiting_for_you(dir.path())
-                .is_some_and(|t| t.contains("server_overloaded") && t.contains("not enabled")),
+                .is_some_and(|t| t.contains("server_overloaded") && t.contains("no way to resume")),
             "{acts:?}"
         );
         assert_eq!(load(dir.path()).unwrap().state, State::Escalated);
@@ -3958,7 +3790,6 @@ pub(crate) mod tests {
             blind_nudge: None,
             attending: false,
             asking: false,
-            identify: false,
             projection: Default::default(),
         };
         let watch = WatchKey {
@@ -4573,7 +4404,6 @@ pub(crate) mod tests {
             blind_nudge: None,
             attending: false,
             asking: false,
-            identify: false,
             projection: Default::default(),
         };
         let acts = d.reconcile(vec![f], 0);
@@ -5460,7 +5290,7 @@ pub(crate) mod tests {
         let (ep, fx) = decide(ep, &s, &owing(IDLE_WAITS[0], None, GO));
         assert!(fx.is_empty());
         assert!(
-            told(&ep).is_some_and(|t| t.contains("idle") && t.contains("not enabled")),
+            told(&ep).is_some_and(|t| t.contains("idle") && t.contains("no way to resume")),
             "{ep:?}"
         );
     }
@@ -5681,33 +5511,10 @@ pub(crate) mod tests {
         assert_ne!(a, fallback_identity(&["xy".into()]));
     }
 
-    /// This test process, as an agent's provider process launched at
-    /// `version`.
-    fn launched(version: &str) -> crate::cli::pane_target::Process {
-        let pid = std::process::id() as i32;
-        crate::cli::pane_target::Process {
-            pid,
-            birth: crate::proc_identity::token_for(pid).unwrap(),
-            harness: Ok(version.into()),
-        }
-    }
-
-    fn me() -> crate::cli::pane_target::Process {
-        launched("0.161.0")
-    }
-
-    fn running(version: &str) -> crate::cli::harness_identity::Running {
-        crate::cli::harness_identity::Running {
-            process: launched(version),
-            version: version.into(),
-        }
-    }
-
     /// Claim an idle Codex agent's first nudge, with a typed transport.
     fn claimed_codex() -> (tempfile::TempDir, PathBuf, Driver, AttemptRef) {
         enable(Tool::Codex, Some(Transport::Typed));
         let (dir, record, mut d) = idle_codex();
-        identify(&mut d, Ok(running("0.161.0")), 1);
         let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
         let attempt = dispatches(&acts)[0].0.clone();
         (dir, record, d, attempt)
@@ -5719,7 +5526,7 @@ pub(crate) mod tests {
             work: vec!["continue plan=p".into()],
             bound: Some(first_launch()),
             transport: Transport::Typed,
-            process: Some(me()),
+            typing_into: Some(Tool::Codex),
         }
     }
 
@@ -5884,7 +5691,7 @@ pub(crate) mod tests {
             "read before deciding"
         );
         assert_eq!(s.nudge, Nudge::At(5 + IDLE_WAITS[0]));
-        assert!(s.cannot_resume.is_some(), "no capability evidence");
+        assert_eq!(s.cannot_resume, None, "Codex is typed into");
 
         let mut off = codex_facts(dir.path(), &rollout, "session-one", true, false);
         off.auto = false;
@@ -6348,7 +6155,7 @@ pub(crate) mod tests {
             work: vec!["the new role's review".into()],
             bound: Some(first_launch()),
             transport: Transport::Typed,
-            process: Some(me()),
+            typing_into: Some(Tool::Codex),
         }
     }
 
@@ -6402,39 +6209,17 @@ pub(crate) mod tests {
         assert_eq!(load(dir.path()).unwrap().role, "commit");
     }
 
-    /// The production selector, by the committed evidence: a nudge only
-    /// ever types, under evidence for the agent's version; a Codex retry
-    /// types where that evidence allows, and otherwise takes Codex's own
-    /// `turn/start`.
+    /// The production selector: the harness's resume candidate, for a
+    /// nudge and a retry alike.
     #[test]
-    fn the_production_selector_chooses_per_action() {
-        use Action::{Nudge, Retry};
-        let at = |tool, action, version| transport_for(tool, action, version);
+    fn the_production_selector_follows_the_candidate() {
+        assert_eq!(transport_for(Tool::Claude), Ok(Transport::Typed));
+        assert_eq!(transport_for(Tool::Codex), Ok(Transport::Typed));
+        assert_eq!(transport_for(Tool::OpenCode), Ok(Transport::Helper));
         assert_eq!(
-            at(Tool::Claude, Nudge, Some("2.1.280")),
-            Ok(Transport::Typed)
+            transport_for(Tool::Grok),
+            Err(crate::cli::resume::NO_CANDIDATE)
         );
-        assert_eq!(at(Tool::Claude, Retry, Some("2.4.0")), Ok(Transport::Typed));
-        assert_eq!(
-            at(Tool::Claude, Nudge, Some("2.1.279")),
-            Err(crate::cli::resume::NO_EVIDENCE)
-        );
-        assert!(at(Tool::Claude, Retry, None).is_err());
-        assert_eq!(
-            at(Tool::Codex, Nudge, Some("0.161.0")),
-            Ok(Transport::Typed)
-        );
-        assert_eq!(
-            at(Tool::Codex, Retry, Some("0.161.0")),
-            Ok(Transport::Typed)
-        );
-        assert!(at(Tool::Codex, Nudge, Some("0.159.3")).is_err());
-        assert_eq!(
-            at(Tool::Codex, Retry, Some("0.159.3")),
-            Ok(Transport::CodexStart)
-        );
-        assert_eq!(at(Tool::Codex, Retry, None), Ok(Transport::CodexStart));
-        assert!(at(Tool::OpenCode, Retry, Some("1.0.0")).is_err());
     }
 
     fn claude_line(line: &str) -> String {
@@ -6443,12 +6228,10 @@ pub(crate) mod tests {
         v.to_string()
     }
 
-    /// With the committed evidence and nothing enabled by hand, a Claude
-    /// agent that stopped owing work is nudged once its running harness is
-    /// identified at an observed version, by a typed submit of the hint,
-    /// and its state says on what grounds.
+    /// With nothing enabled by hand, a Claude agent that stopped owing work
+    /// is nudged by a typed submit of the hint.
     #[test]
-    fn an_idle_claude_is_nudged_by_the_committed_evidence() {
+    fn an_idle_claude_is_nudged_by_typing() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("t.jsonl");
         append(
@@ -6465,14 +6248,8 @@ pub(crate) mod tests {
             false,
         );
         d.reconcile(vec![f], 0);
-        identify(&mut d, Ok(running("2.1.280")), 1);
-        assert!(d.unidentified().is_empty(), "asked once");
         let state = crate::cli::agent_state::load(dir.path()).unwrap();
         assert_eq!(state.cannot_resume, None);
-        assert_eq!(
-            state.resumes.as_deref(),
-            Some("observed to queue at 2.1.280")
-        );
         let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
         let [
             Act::Dispatch {
@@ -6505,132 +6282,116 @@ pub(crate) mod tests {
     }
 
     /// A Codex turn that failed at capacity is retried with no hand
-    /// enabling: by typed submit when the running harness is at an observed
-    /// version, and otherwise, including when it cannot be identified, by
-    /// its own `turn/start`.
+    /// enabling, by typed submit.
     #[test]
-    fn a_codex_capacity_failure_is_retried_by_the_committed_evidence() {
-        for (found, want) in [
-            (Ok(running("0.161.0")), Transport::Typed),
-            (Ok(running("0.159.3")), Transport::CodexStart),
-            (Err("no launch record".to_string()), Transport::CodexStart),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let record = rollout(dir.path(), "0.161.0", FAILED);
-            let mut d = driver();
-            d.reconcile(
-                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
-                0,
-            );
-            identify(&mut d, found.clone(), 1);
-            let acts = d.due(retries("server_overloaded")[0], |_, _| Gate::Go);
-            let [
-                Act::Dispatch {
-                    transport,
-                    text,
-                    tag,
-                    ..
-                },
-            ] = acts.as_slice()
-            else {
-                panic!("{found:?}: {acts:?}");
-            };
-            assert_eq!(
-                (*transport, text.clone()),
-                (want, wake_text(tag)),
-                "{found:?}"
-            );
-        }
+    fn a_codex_capacity_failure_is_retried_by_typing() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = rollout(dir.path(), "0.161.0", FAILED);
+        let mut d = driver();
+        d.reconcile(
+            vec![codex_facts(dir.path(), &record, "session-one", true, false)],
+            0,
+        );
+        let acts = d.due(retries("server_overloaded")[0], |_, _| Gate::Go);
+        let [
+            Act::Dispatch {
+                transport,
+                text,
+                tag,
+                ..
+            },
+        ] = acts.as_slice()
+        else {
+            panic!("{acts:?}");
+        };
+        assert_eq!(
+            (*transport, text.clone()),
+            (Transport::Typed, wake_text(tag))
+        );
     }
 
-    /// A record's version is history, not authority: a Codex session begun
-    /// on an observed version, now running an older or unidentified one, is
-    /// not nudged by typing, and says why.
+    /// A typed send that found no pane to type into is a send that was not
+    /// there to try, and the agent's state says why until it is bound
+    /// again.
     #[test]
-    fn a_record_version_never_enables_typing() {
-        for (found, why) in [
-            (
-                Ok(running("0.159.3")),
-                crate::cli::resume::NO_EVIDENCE.to_string(),
-            ),
-            (
-                Err("no launch record".to_string()),
-                "its running version could not be established: no launch record".to_string(),
-            ),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let record = rollout(dir.path(), "0.161.0", DONE);
-            let mut d = driver();
-            d.reconcile(
-                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
-                0,
-            );
-            identify(&mut d, found, 1);
-            let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+    fn a_typed_send_with_no_pane_says_why_until_a_relaunch() {
+        let (dir, _record, mut d, attempt) = claimed_codex();
+        let why = "its pane was not found: no pane named `agent` in /w's tab";
+        d.answer(
+            &label(),
+            &attempt,
+            Answer::Unreachable(why.into()),
+            IDLE_WAITS[0] + 1,
+        );
+        let state = crate::cli::agent_state::load(dir.path()).unwrap();
+        assert_eq!(state.cannot_resume.as_deref(), Some(why));
+        assert!(matches!(
+            &nudged(dir.path()).last().unwrap().outcome,
+            crate::cli::nudge_log::Outcome::Refused { reason } if reason == why
+        ));
+        assert_eq!(load(dir.path()).unwrap().state, State::Waiting);
+        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 2);
+        let state = crate::cli::agent_state::load(dir.path()).unwrap();
+        assert_eq!(state.cannot_resume, None);
+    }
+
+    /// A Grok agent owing work is never typed into, whatever its record
+    /// says, and its state says why.
+    #[test]
+    fn a_grok_agent_is_never_typed_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = rollout(dir.path(), "1.0.62", DONE);
+        let mut d = driver();
+        d.reconcile(
+            vec![facts(
+                "grok",
+                dir.path(),
+                &record,
+                "session-one",
+                true,
+                false,
+            )],
+            0,
+        );
+        for at in [IDLE_WAITS[0], IDLE_WAITS[0] + IDLE_WAITS[1]] {
+            let acts = d.due(at, |_, _| Gate::Go);
             assert!(dispatches(&acts).is_empty(), "{acts:?}");
-            let state = crate::cli::agent_state::load(dir.path()).unwrap();
-            assert_eq!(state.cannot_resume.as_deref(), Some(why.as_str()));
         }
+        let state = crate::cli::agent_state::load(dir.path()).unwrap();
+        assert_eq!(
+            state.cannot_resume.as_deref(),
+            Some(crate::cli::resume::NO_CANDIDATE)
+        );
     }
 
     /// A claim is sent only by the transport it was claimed with, as the
-    /// harness running now still permits: one whose harness is identified
-    /// again at an unsupported version, or whose process is no longer the
-    /// one identified, is refused, and not sent another way.
+    /// harness bound now still permits, and typed only into a pane the
+    /// roster gives that harness: anything else is refused, and not sent
+    /// another way.
     #[test]
     fn an_obsolete_claim_is_refused() {
-        let claim = || {
-            let dir = tempfile::tempdir().unwrap();
-            let record = rollout(dir.path(), "0.161.0", DONE);
-            let mut d = driver();
-            d.reconcile(
-                vec![codex_facts(dir.path(), &record, "session-one", true, false)],
-                0,
-            );
-            identify(&mut d, Ok(running("0.161.0")), 1);
-            let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
-            let attempt = dispatches(&acts)[0].0.clone();
-            (dir, d, attempt)
-        };
-        let (dir, mut d, attempt) = claim();
+        let (_dir, _record, mut d, attempt) = claimed_codex();
         assert!(d.may_send(&label(), &attempt, &live("master")));
-        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
-        identify(&mut d, Ok(running("0.159.3")), IDLE_WAITS[0] + 2);
-        assert!(
-            !d.may_send(&label(), &attempt, &live("master")),
-            "relaunched older"
-        );
-
-        let (dir, mut d, attempt) = claim();
-        relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
-        identify(&mut d, Err("gone".into()), IDLE_WAITS[0] + 2);
-        assert!(
-            !d.may_send(&label(), &attempt, &live("master")),
-            "relaunched unidentified"
-        );
-
-        let (_dir, mut d, attempt) = claim();
-        let mut ended = std::process::Command::new("true").spawn().unwrap();
-        let pid = ended.id() as i32;
-        let birth = crate::proc_identity::token_for(pid);
-        ended.wait().unwrap();
-        let elsewhere = Live {
-            process: birth.map(|birth| crate::cli::pane_target::Process {
-                pid,
-                birth,
-                harness: Ok("0.161.0".into()),
-            }),
+        for typing_into in [None, Some(Tool::Claude)] {
+            let elsewhere = Live {
+                typing_into,
+                ..live("master")
+            };
+            assert!(
+                !d.may_send(&label(), &attempt, &elsewhere),
+                "{typing_into:?}"
+            );
+        }
+        let helper = Live {
+            transport: Transport::Helper,
             ..live("master")
         };
+        assert!(!d.may_send(&label(), &attempt, &helper), "another way");
+        enable(Tool::Codex, None);
         assert!(
-            !d.may_send(&label(), &attempt, &elsewhere),
-            "another process"
+            !d.may_send(&label(), &attempt, &live("master")),
+            "no longer resumed"
         );
-        let unseen = Live {
-            process: None,
-            ..live("master")
-        };
-        assert!(!d.may_send(&label(), &attempt, &unseen), "no process seen");
     }
 
     /// The launch the test facts bind an agent to.
@@ -6639,19 +6400,6 @@ pub(crate) mod tests {
             session: "session-one".into(),
             at: "2026-10-05T00:00:00Z".into(),
         }
-    }
-
-    /// Answer the driver's one pending identification with `found`.
-    fn identify(
-        d: &mut Driver,
-        found: Result<crate::cli::harness_identity::Running, String>,
-        now: u64,
-    ) {
-        let asks = d.unidentified();
-        let [(author, binding)] = asks.as_slice() else {
-            panic!("{asks:?}");
-        };
-        d.identified(author, binding, found, now);
     }
 
     /// The idle Codex agent in `dir`, bound again to the same session by a
@@ -6669,117 +6417,14 @@ pub(crate) mod tests {
         d.reconcile(vec![f], now);
     }
 
-    /// An identification is for the binding it was asked for: a new launch
-    /// of the same session is asked again, whatever was known or not known
-    /// of the old one, and the old one's late answer is dropped.
+    /// A relaunch of the same session recovers an agent its old launch left
+    /// waiting for a person: the new binding retires the old episode, and
+    /// the new launch is nudged on a fresh budget, its attempt numbers past
+    /// the old one's, and the old launch's claim refused.
     #[test]
-    fn a_relaunch_is_identified_again() {
-        for first in [Ok(running("0.161.0")), Err("no launch record".to_string())] {
-            let (dir, _record, mut d) = idle_codex();
-            identify(&mut d, first.clone(), 1);
-            assert!(d.unidentified().is_empty(), "{first:?}: asked once");
-            relaunched(&mut d, dir.path(), 2);
-            let asks = d.unidentified();
-            assert_eq!(asks.len(), 1, "{first:?}: the new launch is asked about");
-            let (author, new) = asks[0].clone();
-            let mut old = new.clone();
-            old.updated_at = "2026-10-05T00:00:00Z".parse().unwrap();
-            let resumes = || crate::cli::agent_state::load(dir.path()).unwrap().resumes;
-            d.identified(&author, &old, Ok(running("9.9.9")), 3);
-            assert!(
-                !resumes().unwrap_or_default().contains("9.9.9"),
-                "{first:?}: the old launch's answer is dropped"
-            );
-            d.identified(&author, &new, Ok(running("0.161.0")), 4);
-            assert_eq!(resumes().as_deref(), Some("observed to queue at 0.161.0"));
-        }
-    }
-
-    /// An identified process that has ended is asked about again.
-    #[test]
-    fn an_ended_process_is_identified_again() {
-        let (dir, record, mut d) = idle_codex();
-        let mut ended = std::process::Command::new("true").spawn().unwrap();
-        let pid = ended.id() as i32;
-        let birth = crate::proc_identity::token_for(pid).unwrap();
-        ended.wait().unwrap();
-        let gone = crate::cli::harness_identity::Running {
-            process: crate::cli::pane_target::Process {
-                pid,
-                birth,
-                harness: Ok("0.161.0".into()),
-            },
-            version: "0.161.0".into(),
-        };
-        identify(&mut d, Ok(gone), 1);
-        d.reconcile(
-            vec![codex_facts(dir.path(), &record, "session-one", true, false)],
-            2,
-        );
-        assert_eq!(d.unidentified().len(), 1);
-    }
-
-    /// A Claude turn that failed while its harness was still being
-    /// identified waits for the answer rather than escalating, and is
-    /// retried once it comes: a pending identity is a hold, not a refusal.
-    #[test]
-    fn a_failure_waits_for_its_harness_to_be_identified() {
-        let dir = tempfile::tempdir().unwrap();
-        let transcript = dir.path().join("t.jsonl");
-        let failed = claude_failed();
-        append(
-            &transcript,
-            &[&claude_line(failed[0]), &claude_line(failed[1])],
-        );
-        let mut d = driver();
-        let f = || {
-            vec![facts(
-                "claude",
-                dir.path(),
-                &transcript,
-                "session-one",
-                true,
-                false,
-            )]
-        };
-        d.reconcile(f(), 0);
-        assert_eq!(
-            waiting_for_you(dir.path()),
-            None,
-            "not escalated while asking"
-        );
-        let wait = retries("overloaded")[0];
-        let acts = d.due(wait, |_, _| Gate::Go);
-        assert!(dispatches(&acts).is_empty(), "not before the answer");
-        assert_eq!(
-            waiting_for_you(dir.path()),
-            None,
-            "nor escalated at its deadline"
-        );
-        assert_eq!(d.next_due(), None, "and nothing looks again until it comes");
-        identify(&mut d, Ok(running("2.1.280")), 1);
-        let at = d.next_due().unwrap();
-        let acts = d.due(at, |_, _| Gate::Go);
-        assert!(
-            matches!(
-                &acts[..],
-                [Act::Dispatch {
-                    transport: Transport::Typed,
-                    ..
-                }]
-            ),
-            "{acts:?}"
-        );
-    }
-
-    /// A supported relaunch of the same session recovers an agent its old
-    /// launch left waiting for a person: the new binding retires the old
-    /// episode, and the new launch is nudged on a fresh budget, its attempt
-    /// numbers past the old one's, and the old launch's claim refused.
-    #[test]
-    fn a_supported_relaunch_recovers_an_unsupported_launchs_agent() {
+    fn a_relaunch_recovers_an_escalated_agent() {
+        enable(Tool::Codex, None);
         let (dir, _record, mut d) = idle_codex();
-        identify(&mut d, Err("no launch record".into()), 1);
         d.due(IDLE_WAITS[0], |_, _| Gate::Go);
         assert!(
             waiting_for_you(dir.path()).is_some(),
@@ -6791,7 +6436,7 @@ pub(crate) mod tests {
             None,
             "the old escalation is retired"
         );
-        identify(&mut d, Ok(running("0.161.0")), IDLE_WAITS[0] + 2);
+        enable(Tool::Codex, Some(Transport::Typed));
         let at = d.next_due().unwrap();
         let acts = d.due(at, |_, _| Gate::Go);
         let new = dispatches(&acts)[0].0.clone();
@@ -6811,8 +6456,8 @@ pub(crate) mod tests {
     /// retired, and the new launch is decided afresh.
     #[test]
     fn a_restart_tells_the_same_launch_from_a_replacement() {
+        enable(Tool::Codex, None);
         let (dir, record, mut d) = idle_codex();
-        identify(&mut d, Err("no launch record".into()), 1);
         d.due(IDLE_WAITS[0], |_, _| Gate::Go);
         let escalated = load(dir.path()).unwrap();
         assert_eq!(escalated.state, State::Escalated);
@@ -6830,10 +6475,10 @@ pub(crate) mod tests {
         );
         drop(d);
 
+        enable(Tool::Codex, Some(Transport::Typed));
         let mut d = driver();
         relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 2);
         assert_eq!(waiting_for_you(dir.path()), None, "replaced while offline");
-        identify(&mut d, Ok(running("0.161.0")), IDLE_WAITS[0] + 3);
         let at = d.next_due().unwrap();
         assert_eq!(dispatches(&d.due(at, |_, _| Gate::Go)).len(), 1);
     }
@@ -6853,7 +6498,6 @@ pub(crate) mod tests {
                 _ => Some(block_storage(dir.path())),
             };
             relaunched(&mut d, dir.path(), IDLE_WAITS[0] + 1);
-            identify(&mut d, Ok(running("0.161.0")), IDLE_WAITS[0] + 1);
             assert!(!d.may_send(&label(), &old, &live("master")), "{hold}");
             match repair {
                 None => std::fs::write(issued_path(dir.path()), old.n.to_string()).unwrap(),

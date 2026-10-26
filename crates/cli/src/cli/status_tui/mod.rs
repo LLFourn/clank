@@ -3309,7 +3309,7 @@ pub(crate) async fn run_tui(
     };
     let mut reconcile_worker = {
         let wake = ev_tx.clone();
-        zellij::ReconcileWorker::spawn(repo.clone(), &runtime, move || {
+        zellij::ReconcileWorker::spawn(repo.clone(), move || {
             let _ = wake.send(Ev::Worker);
         })
     };
@@ -11143,7 +11143,6 @@ pub(crate) mod tests {
                 since: 0,
                 suppressors: Vec::new(),
                 nudge: crate::cli::agent_state::Nudge::Nothing,
-                resumes: None,
                 cannot_resume: None,
                 attending: Some(att.clone()),
                 asking: None,

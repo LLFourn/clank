@@ -65,7 +65,7 @@ pub struct ProcessDetails {
     /// Consumers must escape control characters before terminal rendering.
     pub argv: Field<Vec<OsString>>,
     pub state: Field<ProcessState>,
-    /// Relationships at inspection time, not evidence of launch provenance.
+    /// Relationships at inspection time, not evidence of who started it.
     /// Zero can be legitimately reported for a kernel process's parent/group.
     pub parent: Field<i32>,
     pub group: Field<i32>,
