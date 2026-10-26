@@ -1554,6 +1554,30 @@ pub(crate) fn watch_status_paths(
     })
 }
 
+/// The TUI's watchers: the keeper, which holds the repo's monitor
+/// subscription and brings a monitor back when it goes, and the same
+/// diff watcher as [`watch_status_paths`]. Plain `status --watch` stays
+/// on [`watch_status_paths`], which never starts anything.
+pub(crate) fn watch_tui_paths(
+    tx: mpsc::Sender<()>,
+    repo: &Path,
+    spawn: impl Fn(&Path) -> std::io::Result<Box<dyn crate::cli::monitor::Started>> + Send + 'static,
+) -> anyhow::Result<TuiWatchers> {
+    let keeper = crate::cli::monitor::keeper::MonitorKeeper::start(repo, tx.clone(), spawn);
+    let diff = watch_diff_paths(tx, repo)?;
+    Ok(TuiWatchers {
+        keeper,
+        _diff: diff,
+    })
+}
+
+/// What [`watch_tui_paths`] keeps alive. Dropping it stops the keeper
+/// and the diff watcher.
+pub(crate) struct TuiWatchers {
+    pub(crate) keeper: crate::cli::monitor::keeper::MonitorKeeper,
+    _diff: RecommendedWatcher,
+}
+
 /// The two watchers `status` keeps alive together. Dropping this stops
 /// both. The SHARED core watcher feeds gate state; the status-only diff
 /// watcher feeds dirty/diff. They send on one channel; the loop's
@@ -2423,6 +2447,42 @@ mod dirty_and_wake_tests {
         assert_ne!(running, gone);
         let _ = std::fs::remove_file(runtime_path(r, "json"));
         assert_ne!(gone, input_signature(r).unwrap(), "and so does its absence");
+    }
+
+    /// Plain `status --watch` subscribes read-only and never reaches a
+    /// starter. Starting a monitor is banned in this suite, so the
+    /// wiring is read: the watch loop takes [`watch_status_paths`], which
+    /// takes `core_wakes`, which only subscribes.
+    #[test]
+    fn status_watch_never_reaches_a_starter() {
+        let src = include_str!("status.rs");
+        let span = |start: &str, end: &str| {
+            let from = src.find(start).unwrap_or_else(|| panic!("{start}"));
+            let to = src[from..].find(end).unwrap_or_else(|| panic!("{end}"));
+            &src[from..from + to]
+        };
+        let run_watch = span("async fn run_watch(", "let mut last_emitted");
+        assert!(
+            run_watch.contains("watch_status_paths(tx, &repo)?"),
+            "{run_watch}"
+        );
+        assert!(!run_watch.contains("watch_tui_paths"), "{run_watch}");
+        let paths = span("pub(crate) fn watch_status_paths(", "\n}\n");
+        assert!(paths.contains("monitor::core_wakes(repo"), "{paths}");
+        for starting in ["keeper", "spawn", "attempt", "attach_or_spawn"] {
+            assert!(!paths.contains(starting), "{starting} in {paths}");
+        }
+
+        let monitor = include_str!("monitor.rs");
+        let from = monitor
+            .find("pub(crate) fn core_wakes(")
+            .expect("core_wakes");
+        let to = monitor[from..].find("\n}\n").expect("its end");
+        let core = &monitor[from..from + to];
+        assert!(core.contains("match subscribe(repo)"), "{core}");
+        for starting in ["spawn", "attempt", "keeper"] {
+            assert!(!core.contains(starting), "{starting} in {core}");
+        }
     }
 
     #[test]

@@ -598,7 +598,7 @@ fn start_with(
         .build()
         .map_err(|e| e.to_string())
         .map(|runtime| {
-            runtime.block_on(super::monitor::attach_or_spawn_until(
+            super::monitor::Attached::from(runtime.block_on(super::monitor::attach_or_spawn_until(
                 repo,
                 Who::Observer,
                 deadline,
@@ -615,7 +615,7 @@ fn start_with(
                 },
                 connect,
                 took_it,
-            ))
+            )))
         });
     let spawned = spawned.load(std::sync::atomic::Ordering::Acquire);
     match attached {

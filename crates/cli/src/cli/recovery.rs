@@ -5931,6 +5931,67 @@ pub(crate) mod tests {
         assert_eq!(load(dir.path()).unwrap().kind, Kind::Fallback);
     }
 
+    /// A bound, auto agent that owes work, has no parked wait and is
+    /// OBSERVED idle gets the monitor's look scheduled. Not being read
+    /// is not idle, and neither is a record that cannot be read; and a
+    /// question, block or qualifying attendance holds the look back.
+    #[test]
+    fn only_an_observed_idle_waiterless_agent_is_scheduled_a_look() {
+        use crate::cli::agent_state::{Activity, Nudge, load as published};
+        let looks = |f: fn(&Path, &Path) -> Facts, record: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("record.jsonl");
+            if record {
+                append(&path, &[&line(STARTED, "t1"), &line(DONE, "t1")]);
+            }
+            let mut d = driver();
+            d.reconcile(vec![f(dir.path(), &path)], 10);
+            let s = published(dir.path()).unwrap();
+            (s.activity, s.nudge, d.next_due())
+        };
+        let idle = |dir: &Path, record: &Path| codex_facts(dir, record, "session-one", true, false);
+
+        assert_eq!(
+            looks(idle, true),
+            (
+                Activity::Idle,
+                Nudge::At(10 + IDLE_WAITS[0]),
+                Some(10 + IDLE_WAITS[0])
+            ),
+        );
+
+        let (activity, nudge, due) = looks(
+            |dir, record| codex_facts(dir, record, "session-one", false, false),
+            true,
+        );
+        assert_eq!(activity, Activity::Unobserved);
+        assert!(!matches!(nudge, Nudge::At(_)) && due.is_none(), "{nudge:?}");
+
+        let (activity, nudge, due) = looks(idle, false);
+        assert!(matches!(activity, Activity::Unknown(_)), "{activity:?}");
+        assert!(!matches!(nudge, Nudge::At(_)) && due.is_none(), "{nudge:?}");
+
+        for (held, f) in [
+            (
+                "attending",
+                (|dir: &Path, record: &Path| Facts {
+                    attending: true,
+                    ..codex_facts(dir, record, "session-one", true, false)
+                }) as fn(&Path, &Path) -> Facts,
+            ),
+            ("asking", |dir, record| Facts {
+                asking: true,
+                ..codex_facts(dir, record, "session-one", true, false)
+            }),
+        ] {
+            let (activity, nudge, due) = looks(f, true);
+            assert!(
+                !matches!(nudge, Nudge::At(_)) && due.is_none(),
+                "{held}: {activity:?} {nudge:?} {due:?}"
+            );
+        }
+    }
+
     fn idle_codex() -> (tempfile::TempDir, PathBuf, Driver) {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("record.jsonl");

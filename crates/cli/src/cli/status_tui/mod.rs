@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use super::term::{AltScreen, paint, term_size};
 
-use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_status_paths};
+use super::status::{StatusSnapshot, spawn_sigwinch_forwarder, watch_tui_paths};
 
 mod event_content;
 pub(crate) mod lease;
@@ -1269,6 +1269,52 @@ fn event_prompts(
         texts.into_iter().map(|t| (None, t.clone())).collect()
     } else {
         pairs.into_iter().map(|(a, t)| (Some(a), t)).collect()
+    }
+}
+
+/// The nothing-changed gate, and the one exception the monitor keeper
+/// makes to it.
+///
+/// A flush rebuilds when the input signature moved since the last
+/// accepted rebuild, or when the keeper has handed over from a local
+/// watcher to a monitor since then: what changed in that gap may not
+/// have moved the signature this gate compared against, and baselining
+/// it away is the staleness the handoff exists to prevent.
+struct RebuildGate {
+    accepted: Option<crate::cli::status::InputSignature>,
+    fresh: crate::cli::monitor::keeper::FreshRebuild,
+    served: u64,
+}
+
+/// A rebuild the gate let through, to be accepted once it succeeds.
+struct Due {
+    sig: Option<crate::cli::status::InputSignature>,
+    fresh: u64,
+}
+
+impl RebuildGate {
+    fn new(
+        accepted: Option<crate::cli::status::InputSignature>,
+        fresh: crate::cli::monitor::keeper::FreshRebuild,
+    ) -> Self {
+        Self {
+            accepted,
+            fresh,
+            served: 0,
+        }
+    }
+
+    /// The rebuild owed for inputs at `sig`, if any.
+    fn due(&self, sig: Option<crate::cli::status::InputSignature>) -> Option<Due> {
+        let fresh = self.fresh.owed();
+        (fresh > self.served || sig != self.accepted).then_some(Due { sig, fresh })
+    }
+
+    /// `due`'s rebuild succeeded: its inputs, and every handoff it saw,
+    /// are served.
+    fn accept(&mut self, due: Due) {
+        self.accepted = due.sig;
+        self.served = due.fresh;
     }
 }
 
@@ -3220,7 +3266,7 @@ pub(crate) async fn run_tui(
     let _lease = lease::acquire(&repo).map_err(|why| anyhow::anyhow!("{why}"))?;
 
     let (tx, rx) = mpsc::channel::<()>();
-    let _watcher = watch_status_paths(tx, &repo)?;
+    let watchers = watch_tui_paths(tx, &repo, crate::cli::monitor::spawn_monitor)?;
     // Resize is NOT a data change, so SIGWINCH gets its OWN channel and
     // maps to `Ev::Resize` — otherwise the nothing-changed gate (which
     // only fires on `Ev::Refresh`) would swallow it and leave a taller
@@ -3336,7 +3382,10 @@ pub(crate) async fn run_tui(
 
     // Probe the input signature BEFORE the first build so any change
     // racing the build re-builds next wake (under-gate, never over-gate).
-    let mut last_sig = crate::cli::status::input_signature(&repo).ok();
+    let mut gate = RebuildGate::new(
+        crate::cli::status::input_signature(&repo).ok(),
+        watchers.keeper.fresh(),
+    );
     // Consecutive failed refreshes (tui-transient-refresh-resilience);
     // reset by every successful rebuild. `refresh_retry_at` schedules
     // the bounded self-retry after a failure.
@@ -5363,7 +5412,7 @@ pub(crate) async fn run_tui(
             // no snapshot input is dropped — no rebuild, no log re-fold, no
             // repaint. The probe is far cheaper than the work it guards.
             let sig = crate::cli::status::input_signature(&repo).ok();
-            if sig != last_sig {
+            if let Some(due) = gate.due(sig) {
                 // Capture index-addressed targets by LABEL from the OLD
                 // state before rebuilding — external roster/library edits
                 // can reorder rows, so kept indices could silently retarget
@@ -5467,7 +5516,7 @@ pub(crate) async fn run_tui(
                 log.next = fresh.next;
                 refind_entry(&mut log, held, &snapshot, cols);
                 if refresh_ok {
-                    last_sig = sig;
+                    gate.accept(due);
                     refresh_retry_at = None;
                 } else {
                     refresh_retry_at =
@@ -7130,8 +7179,8 @@ pub(crate) mod tests {
     fn apply_refresh_keeps_frame_and_signature_on_failure() {
         // THE contract (intro 1913796): the accepted signature
         // advances ONLY on successful snapshot replacement — a
-        // failed rebuild returns false (caller leaves last_sig
-        // untouched, so the SAME signature stays retryable), keeps
+        // failed rebuild returns false (the caller's gate does not
+        // accept it, so the SAME signature stays retryable), keeps
         // the old frame, and mounts exactly one transient notice.
         use crate::cli::log::OnelineRow;
         use crate::cli::status_tui::fixtures::snap;
@@ -8541,6 +8590,76 @@ pub(crate) mod tests {
         // much as one dying.
         let t4 = t3 + every;
         assert!(health_changed(&mut state, t4, every, || 7));
+    }
+
+    /// The keeper's handoff from a local watcher to a monitor gets one
+    /// rebuild past a signature that has not moved, and only one: owed
+    /// until a rebuild succeeds, then served.
+    #[test]
+    fn a_handoff_forces_exactly_one_rebuild_past_an_unchanged_signature() {
+        use crate::cli::monitor::Attempt;
+        use crate::cli::monitor::keeper::{FreshRebuild, Live, Port};
+        use crate::cli::status::{ProcessHealth, input_signature_with};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(p)
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sig = || {
+            input_signature_with(
+                p,
+                ProcessHealth {
+                    attendances: 0,
+                    monitor: crate::cli::monitor::Liveness::None,
+                },
+            )
+            .ok()
+        };
+        assert!(sig().is_some());
+        let fresh = FreshRebuild::default();
+        let mut gate = RebuildGate::new(sig(), fresh.clone());
+        assert!(gate.due(sig()).is_none(), "nothing moved, nothing owed");
+
+        let (wake, woken) = mpsc::channel();
+        let mut keeper = Live::new(
+            || Attempt::Unproven("unused".into()),
+            |_| Ok(()),
+            None,
+            wake,
+            fresh,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        keeper.handoff();
+        assert_eq!(woken.try_iter().count(), 1, "the panel is woken for it");
+
+        assert!(gate.due(sig()).is_some(), "the gap is rebuilt");
+        assert!(
+            gate.due(sig()).is_some(),
+            "and stays owed while no rebuild has succeeded"
+        );
+        let due = gate.due(sig()).unwrap();
+        gate.accept(due);
+        assert!(gate.due(sig()).is_none(), "exactly once");
+    }
+
+    /// `run_tui` hands the real starter to the keeper. No test may start
+    /// a monitor, so every keeper test substitutes it; without this,
+    /// production could pass a stub and the suite would stay green.
+    #[test]
+    fn the_tui_hands_the_real_starter_to_its_keeper() {
+        let src = include_str!("mod.rs");
+        let from = src.find("pub(crate) async fn run_tui(").expect("run_tui");
+        let body = &src[from..from + src[from..].find("'evloop: loop").expect("its loop")];
+        assert!(
+            body.contains("watch_tui_paths(tx, &repo, crate::cli::monitor::spawn_monitor)"),
+            "the TUI keeps its monitor with the installed build's starter"
+        );
     }
 
     /// A monitor that changes with no file written, by dying or by

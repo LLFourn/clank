@@ -54,6 +54,9 @@ mod grok_tests;
 #[path = "monitor_turn_tests.rs"]
 mod turn_tests;
 
+#[path = "monitor_keeper.rs"]
+pub(crate) mod keeper;
+
 /// What a monitor can do, not just what its frames look like.
 ///
 /// 4 is the HOSTING contract: this monitor runs an author's config
@@ -1375,6 +1378,73 @@ impl From<Seen> for Attached {
     }
 }
 
+/// What one attach-or-spawn attempt ended as, kept typed for a caller
+/// that schedules on it.
+///
+/// [`Attached::Alone`] says why in a sentence, which is fine for a log
+/// and unusable as a control protocol: a keeper that read "newer" out
+/// of it would be steering on diagnostic text.
+#[derive(Debug)]
+pub(crate) enum Attempt {
+    /// Compatible, and attached.
+    Shared(Conn),
+    /// A newer monitor keeps the repo.
+    Newer(String),
+    /// A monitor of our version refused this client on its merits.
+    Theirs(String),
+    /// Nothing was established, including whether anybody is repairing.
+    Unproven(String),
+    /// Another client holds the repair permit.
+    Busy(String),
+    /// The repo was free to start a monitor in, and starting it failed.
+    SpawnFailed(String),
+    /// Nothing serves the repo and nothing was started: its lease stayed
+    /// held, or the handoff ran out of time first.
+    NotStarted(String),
+    /// A monitor was started and had not admitted this client by the
+    /// deadline.
+    Unattached(String),
+}
+
+impl Attempt {
+    /// Why it did not attach, for the log; `None` when it did.
+    pub(crate) fn why(&self) -> Option<&str> {
+        match self {
+            Attempt::Shared(_) => None,
+            Attempt::Newer(why)
+            | Attempt::Theirs(why)
+            | Attempt::Unproven(why)
+            | Attempt::Busy(why)
+            | Attempt::SpawnFailed(why)
+            | Attempt::NotStarted(why)
+            | Attempt::Unattached(why) => Some(why),
+        }
+    }
+}
+
+impl From<Attempt> for Attached {
+    fn from(attempt: Attempt) -> Self {
+        match attempt {
+            Attempt::Shared(conn) => Attached::Shared(conn),
+            other => Attached::Alone(other.why().unwrap_or_default().to_string()),
+        }
+    }
+}
+
+/// The attempt a classification that ends it is.
+///
+/// `Err`, with why, for the two that leave the repo to be repaired:
+/// nothing usable, or an older peer whose lease decides.
+fn settled(seen: Seen) -> Result<Attempt, String> {
+    match seen {
+        Seen::Shared(conn) => Ok(Attempt::Shared(conn)),
+        Seen::Newer(why) => Ok(Attempt::Newer(why)),
+        Seen::Theirs(why) => Ok(Attempt::Theirs(why)),
+        Seen::Unproven(why) => Ok(Attempt::Unproven(why)),
+        Seen::Vacant(why) | Seen::OlderPeer { why, .. } => Err(why),
+    }
+}
+
 /// Attach to this repo's monitor, or report why we are on our own.
 ///
 /// Test-only: production always connects-or-SPAWNS, so attaching
@@ -1925,7 +1995,17 @@ pub(crate) async fn attach_or_spawn_with(
     who: Who,
     spawn: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn Started>>,
 ) -> Attached {
-    attach_or_spawn_by(
+    attempt_with(repo, who, spawn).await.into()
+}
+
+/// [`attach_or_spawn_with`], keeping how the attempt ended as an
+/// [`Attempt`].
+pub(crate) async fn attempt_with(
+    repo: &std::path::Path,
+    who: Who,
+    spawn: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn Started>>,
+) -> Attempt {
+    attempt_by(
         repo,
         who,
         ATTACH_BUDGET,
@@ -1942,6 +2022,7 @@ pub(crate) async fn attach_or_spawn_with(
 /// decision is reachable without a process: no test here may start a
 /// binary, and one that started the real monitor would leave it
 /// holding this repo's lease after the test returned.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn attach_or_spawn_by(
     repo: &std::path::Path,
@@ -1957,6 +2038,28 @@ pub(crate) async fn attach_or_spawn_by(
     + Copy,
     took_it: impl Fn(&std::path::Path) -> bool,
 ) -> Attached {
+    attempt_by(repo, who, budget, settle, limit, spawn, connect, took_it)
+        .await
+        .into()
+}
+
+/// [`attach_or_spawn_by`], keeping how the attempt ended as an
+/// [`Attempt`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attempt_by(
+    repo: &std::path::Path,
+    who: Who,
+    budget: Duration,
+    settle: Duration,
+    limit: u32,
+    spawn: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn Started>>,
+    connect: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> std::io::Result<std::os::unix::net::UnixStream>
+    + Copy,
+    took_it: impl Fn(&std::path::Path) -> bool,
+) -> Attempt {
     // ONE deadline over the whole handoff: notify, wait for ownership
     // to free, start, attach. The retries used to take a fresh budget
     // each, so the count was the bound rather than any deadline.
@@ -1993,20 +2096,18 @@ pub(crate) async fn attach_or_spawn_until(
     ) -> std::io::Result<std::os::unix::net::UnixStream>
     + Copy,
     took_it: impl Fn(&std::path::Path) -> bool,
-) -> Attached {
+) -> Attempt {
     let left = by.saturating_duration_since(std::time::Instant::now());
     if left.is_zero() {
-        return Attached::Alone("the handoff ran out of time before it began".into());
+        return Attempt::NotStarted("the handoff ran out of time before it began".into());
     }
-    let mut why = match look_at(repo, who.clone(), first.min(left), connect) {
-        Seen::Shared(conn) => return Attached::Shared(conn),
-        // A monitor that should keep the repo. Starting one would add
-        // a monitor that cannot own anything, and doing it on every
-        // park is the cost this classification exists to remove.
-        Seen::Theirs(why) | Seen::Newer(why) | Seen::Unproven(why) => {
-            return Attached::Alone(why);
-        }
-        Seen::Vacant(why) | Seen::OlderPeer { why, .. } => why,
+    // A monitor that should keep the repo ends the attempt here.
+    // Starting one would add a monitor that cannot own anything, and
+    // doing it on every park is the cost this classification exists to
+    // remove.
+    let mut why = match settled(look_at(repo, who.clone(), first.min(left), connect)) {
+        Ok(ended) => return ended,
+        Err(why) => why,
     };
 
     // The repo is ours when its LEASE frees, and nothing sooner says
@@ -2027,13 +2128,13 @@ pub(crate) async fn attach_or_spawn_until(
     let permit = match take_repair_permit(repo) {
         Repair::Acquired(permit) => permit,
         Repair::Busy => {
-            return Attached::Alone(format!("{why}, and another client is already starting one"));
+            return Attempt::Busy(format!("{why}, and another client is already starting one"));
         }
         // Not established that anybody is repairing — only that we
         // cannot ask. Saying otherwise would be a guess reported as a
         // fact.
         Repair::Unavailable(gate) => {
-            return Attached::Alone(format!("{why}, and the repair gate is unusable: {gate}"));
+            return Attempt::Unproven(format!("{why}, and the repair gate is unusable: {gate}"));
         }
     };
 
@@ -2043,12 +2144,9 @@ pub(crate) async fn attach_or_spawn_until(
     // than starting anything.
     let left = by.saturating_duration_since(std::time::Instant::now());
     if !left.is_zero() {
-        match look_at(repo, who.clone(), left, connect) {
-            Seen::Shared(conn) => return Attached::Shared(conn),
-            Seen::Theirs(next) | Seen::Newer(next) | Seen::Unproven(next) => {
-                return Attached::Alone(next);
-            }
-            Seen::Vacant(next) | Seen::OlderPeer { why: next, .. } => why = next,
+        match settled(look_at(repo, who.clone(), left, connect)) {
+            Ok(ended) => return ended,
+            Err(next) => why = next,
         }
     }
 
@@ -2057,7 +2155,7 @@ pub(crate) async fn attach_or_spawn_until(
         // Still held when time ran out. This client does its own work;
         // a monitor that cannot own the repo helps nobody.
         Ownership::Busy => {
-            return Attached::Alone(format!("{why}, and its lease is still held"));
+            return Attempt::NotStarted(format!("{why}, and its lease is still held"));
         }
     }
 
@@ -2069,14 +2167,14 @@ pub(crate) async fn attach_or_spawn_until(
         .saturating_duration_since(std::time::Instant::now())
         .is_zero()
     {
-        return Attached::Alone(format!("{why}, and the handoff ran out of time"));
+        return Attempt::NotStarted(format!("{why}, and the handoff ran out of time"));
     }
 
     match spawn(repo) {
         // Handed over BEFORE any attach can return, so no exit path
         // below can be the one that drops it.
         Ok(started) => supervise(started),
-        Err(e) => return Attached::Alone(format!("{why}, and starting one failed: {e}")),
+        Err(e) => return Attempt::SpawnFailed(format!("{why}, and starting one failed: {e}")),
     }
 
     let mut attempts = 1;
@@ -2095,19 +2193,16 @@ pub(crate) async fn attach_or_spawn_until(
         if left.is_zero() {
             break;
         }
-        match look_at(repo, who.clone(), left, connect) {
-            Seen::Shared(conn) => return Attached::Shared(conn),
-            Seen::Theirs(next) | Seen::Newer(next) | Seen::Unproven(next) => {
-                return Attached::Alone(next);
-            }
-            Seen::Vacant(next) | Seen::OlderPeer { why: next, .. } => why = next,
+        match settled(look_at(repo, who.clone(), left, connect)) {
+            Ok(ended) => return ended,
+            Err(next) => why = next,
         }
     }
     // Held until here: startup and classification are both done, and a
     // permit released sooner is one the next client takes while this
     // one is still working.
     drop(permit);
-    Attached::Alone(format!(
+    Attempt::Unattached(format!(
         "started a monitor for {}, but {why}",
         repo.display()
     ))
@@ -8359,6 +8454,12 @@ mod recovery_tests {
         assert!(
             with_helper[0].obligated && !with_helper[0].delivering,
             "a helper is not a deliverer"
+        );
+        let (observer, _rx) = client(Served::Observer, "session-one");
+        let with_observer = facts(&[observer]);
+        assert!(
+            with_observer[0].obligated && !with_observer[0].delivering,
+            "an observer, the TUI's keeper among them, is not a deliverer"
         );
 
         let (waiter, _rx) = client(

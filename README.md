@@ -439,8 +439,12 @@ itself or they exist for one-off upgrades. They still work:
 - `stop-hook` and `question-hook` are the tool hooks `clank setup` installs.
 - `rewire --from-stdin` is the `post-rewrite` git hook `clank init` installs;
   it remaps feedback after a rebase or amend.
-- `monitor start` runs the per-repo watcher that every wait and TUI shares;
-  clank starts it when needed. `monitor upgrade` replaces monitors from
+- `monitor start` runs the per-repo watcher that every wait and TUI shares.
+  A parked wait starts one when none is running, and an open `clank tui`
+  keeps one up: when its monitor retires or exits, the TUI starts the
+  successor, retrying with a backoff while another client, a held lease or
+  a newer monitor stands in the way. `clank status --watch` only subscribes
+  and never starts one. `monitor upgrade` replaces monitors from
   builds that predate self-retirement; run it once after upgrading from one.
 - `block migrate` flattens the legacy plan-scoped block layout.
 - `open dry <path> [--json]` reports what `clank open` would do for a path
