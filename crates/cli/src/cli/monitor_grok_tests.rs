@@ -173,7 +173,7 @@ async fn an_attending_groks_background_wait_delivers_a_new_event() {
     let session = SessionId::parse("11111111-1111-4111-8111-111111111111").unwrap();
     crate::agent_store::bind_session_to_agent(repo.path(), &author, Tool::Grok, &session).unwrap();
 
-    let g = Gathered::of(repo.path(), &author, Some((&[], None)), Ok(()));
+    let g = Gathered::of(repo.path(), &author, Some((&[], None)));
     let mut turns = Turns::new(repo.path().to_path_buf());
     turns
         .attend(

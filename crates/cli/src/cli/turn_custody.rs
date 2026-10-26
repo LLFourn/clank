@@ -40,17 +40,14 @@ pub(crate) struct Gathered {
     /// `None` before the monitor has folded the repo, when what is owed
     /// is not known.
     owed: Option<Vec<(OwedItem, WaitItem)>>,
-    route: Result<(), String>,
 }
 
 impl Gathered {
-    /// The agent as it is now, owing `owed` (`None` when not yet known),
-    /// with `route` saying whether a check-in could reach it.
+    /// The agent as it is now, owing `owed` (`None` when not yet known).
     pub(crate) fn of(
         repo: &Path,
         author: &AgentLabel,
         owed: Option<(&[clank_core::wait::WaitItem], Option<&Path>)>,
-        route: Result<(), String>,
     ) -> Self {
         let config = crate::agent_store::load_agent_config(repo, author);
         let binding = config
@@ -82,7 +79,6 @@ impl Gathered {
             asking,
             blocked: super::wait::blocked(repo, author),
             owed: owed.map(|(items, cwd)| owed_items(items, cwd)),
-            route,
         }
     }
 
@@ -209,7 +205,6 @@ fn facts<'a>(
         blocked: g.blocked,
         owed,
         liveness: live,
-        check_in_route: g.route.clone(),
         user_command: false,
     }
 }

@@ -10,7 +10,7 @@ fn unbinding_an_attended_agent_removes_its_due_timer() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[], Ok(()));
+    let g = gathered(repo.path(), "claude", &[]);
     attend_name(&mut turns, "claude", "session-one", &g);
     turns
         .answer(
@@ -23,7 +23,7 @@ fn unbinding_an_attended_agent_removes_its_due_timer() {
         .unwrap();
     let due = turns.next_deadline().expect("armed");
     crate::agent_store::release_binding(repo.path(), &author, &sid("session-one")).unwrap();
-    let unbound = gathered(repo.path(), "claude", &[], Ok(())).at(due);
+    let unbound = gathered(repo.path(), "claude", &[]).at(due);
     assert!(turns.check_in(&author, &unbound).is_none());
     assert_eq!(
         turns.next_deadline(),
@@ -82,13 +82,8 @@ fn message(handle: &str) -> clank_core::wait::WaitItem {
     }
 }
 
-fn gathered(
-    repo: &Path,
-    who: &str,
-    owed: &[clank_core::wait::WaitItem],
-    route: Result<(), String>,
-) -> Gathered {
-    Gathered::of(repo, &label(who), Some((owed, None)), route)
+fn gathered(repo: &Path, who: &str, owed: &[clank_core::wait::WaitItem]) -> Gathered {
+    Gathered::of(repo, &label(who), Some((owed, None)))
 }
 
 fn running_subagent() -> TaskSnapshot {
@@ -145,7 +140,7 @@ fn silent(why: SilentReason) -> WireVerdict {
 fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[], Ok(()));
+    let g = gathered(repo.path(), "claude", &[]);
     let said = attend_name(&mut turns, "claude", "session-one", &g);
     assert!(said.contains("from your next turn-end"), "{said}");
     assert!(said.contains("after 10m"), "{said}");
@@ -182,7 +177,7 @@ fn a_restart_keeps_the_deadline_and_proves_nothing_until_the_next_stop() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[], Ok(()));
+    let g = gathered(repo.path(), "claude", &[]);
     attend_name(&mut turns, "claude", "session-one", &g);
     turns
         .answer(
@@ -229,7 +224,7 @@ fn the_drive_gate_answers_before_anything_is_presented() {
             1,
             &report,
             true,
-            &gathered(repo.path(), "codex", &owed, Ok(())),
+            &gathered(repo.path(), "codex", &owed),
         )
         .unwrap();
     assert_eq!(frame.verdict, silent(SilentReason::AutoOff));
@@ -246,7 +241,7 @@ fn the_drive_gate_answers_before_anything_is_presented() {
             2,
             &report,
             true,
-            &gathered(repo.path(), "codex", &owed, Ok(())),
+            &gathered(repo.path(), "codex", &owed),
         )
         .unwrap();
     assert_eq!(
@@ -262,7 +257,7 @@ fn the_drive_gate_answers_before_anything_is_presented() {
             3,
             &report,
             true,
-            &gathered(repo.path(), "codex", &owed, Ok(())),
+            &gathered(repo.path(), "codex", &owed),
         )
         .unwrap();
     let WireVerdict::Diagnostic { message } = frame.verdict else {
@@ -283,7 +278,7 @@ fn owed_work_is_presented_with_the_text_the_hook_frames() {
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let owed = [message("7")];
-    let g = gathered(repo.path(), "claude", &owed, Ok(()));
+    let g = gathered(repo.path(), "claude", &owed);
     let frame = turns
         .answer(
             &author,
@@ -332,7 +327,7 @@ fn repeated_delivery_is_counted_by_delivery_and_escalates_with_its_duties() {
     let author = label("codex");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let owed = [message("9")];
-    let g = gathered(repo.path(), "codex", &owed, Ok(()));
+    let g = gathered(repo.path(), "codex", &owed);
     let mut conn = 0;
     let mut deliver = |turns: &mut Turns, position: u64, ok: bool| {
         conn += 1;
@@ -393,7 +388,7 @@ fn a_count_below_the_threshold_is_not_shown() {
     let repo = repo_with("codex", Tool::Codex, "sess-below");
     let author = label("codex");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "codex", &[message("1")], Ok(()));
+    let g = gathered(repo.path(), "codex", &[message("1")]);
     let frame = turns
         .answer(
             &author,
@@ -418,7 +413,7 @@ fn a_result_from_another_connection_is_not_credited() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[message("1")], Ok(()));
+    let g = gathered(repo.path(), "claude", &[message("1")]);
     let frame = turns
         .answer(
             &author,
@@ -479,7 +474,7 @@ fn a_closed_carrier_fails_its_presentation_and_the_work_is_presented_fresh() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[message("1")], Ok(()));
+    let g = gathered(repo.path(), "claude", &[message("1")]);
     let report = stop(
         Tool::Claude,
         "session-one",
@@ -506,36 +501,22 @@ fn a_closed_carrier_fails_its_presentation_and_the_work_is_presented_fresh() {
     );
 }
 
-/// The check-in route: with none, an attendance quiets nothing and the
-/// turn-end parks; one lost after the silence makes the check-in
-/// undeliverable, which is shown, and recovery treats the agent as any
-/// other past the deadline.
+/// An agent no recovery has identified, so with no typed route, is
+/// quieted by its first qualifying Stop, which arms the check-in; one that
+/// cannot be typed is recorded undeliverable, which is shown, and recovery
+/// treats the agent as any other past the deadline.
 #[test]
-fn a_silence_needs_a_route_and_a_lost_one_is_recorded() {
+fn a_silence_needs_no_route_and_a_lost_check_in_is_recorded() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let routeless = gathered(
-        repo.path(),
-        "claude",
-        &[],
-        Err("its version is not known yet".into()),
-    );
-    attend_name(&mut turns, "claude", "session-one", &routeless);
+    let g = gathered(repo.path(), "claude", &[]);
+    attend_name(&mut turns, "claude", "session-one", &g);
     let report = stop(Tool::Claude, "session-one", running_subagent(), None);
-    let frame = turns.answer(&author, 1, &report, true, &routeless).unwrap();
+    let frame = turns.answer(&author, 1, &report, true, &g).unwrap();
     assert_eq!(frame.verdict, WireVerdict::Park);
-    assert_eq!(
-        turns.next_deadline(),
-        None,
-        "nothing quieted, so no check-in is owed"
-    );
-
-    let g = gathered(repo.path(), "claude", &[], Ok(()));
-    let frame = turns.answer(&author, 2, &report, true, &g).unwrap();
-    assert_eq!(frame.verdict, WireVerdict::Park);
-    let due = turns.next_deadline().expect("armed");
-    let at_due = gathered(repo.path(), "claude", &[], Ok(())).at(due);
+    let due = turns.next_deadline().expect("armed by the first Stop");
+    let at_due = gathered(repo.path(), "claude", &[]).at(due);
     let check_in = turns.check_in(&author, &at_due).expect("owed");
     assert_eq!(check_in.session, sid("session-one"));
     assert!(check_in.text.contains("check-in"), "{}", check_in.text);
@@ -652,7 +633,6 @@ fn present_receipt(
         &fixture.repo,
         &fixture.author,
         Some((std::slice::from_ref(&fixture.item), Some(&fixture.cwd))),
-        Ok(()),
     );
     let report = match tool {
         Tool::Claude => stop(
@@ -801,7 +781,6 @@ async fn a_session_starts_receipt_follows_only_claudes_context() {
             &fixture.repo,
             &fixture.author,
             Some((std::slice::from_ref(&fixture.item), Some(&fixture.cwd))),
-            Ok(()),
         );
         let report = Report::SessionStart {
             tool,
@@ -840,12 +819,7 @@ async fn a_session_starts_receipt_follows_only_claudes_context() {
 async fn alone_mode_presents_nothing_and_the_monitor_delivers_once_after() {
     let fixture = receipt_fixture(Tool::Codex);
     let owed = std::slice::from_ref(&fixture.item);
-    let alone = Gathered::of(
-        &fixture.repo,
-        &fixture.author,
-        Some((owed, None)),
-        Err(String::new()),
-    );
+    let alone = Gathered::of(&fixture.repo, &fixture.author, Some((owed, None)));
     let verdict = alone.alone_verdict(&sid(&fixture.session));
     assert_eq!(
         frame_of(verdict).verdict,
@@ -904,7 +878,7 @@ fn alone_mode_is_never_quiet_on_attendance() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[], Ok(()));
+    let g = gathered(repo.path(), "claude", &[]);
     attend_name(&mut turns, "claude", "session-one", &g);
     turns
         .answer(
@@ -915,13 +889,13 @@ fn alone_mode_is_never_quiet_on_attendance() {
             &g,
         )
         .unwrap();
-    let alone = gathered(repo.path(), "claude", &[message("1")], Err(String::new()));
+    let alone = gathered(repo.path(), "claude", &[message("1")]);
     assert_eq!(
         alone.alone_verdict(&sid("session-one")),
         Verdict::Notify(clank_core::turn_policy::Notice::MonitorUnavailable)
     );
     crate::agent_store::set_auto_mode(repo.path(), &author, AutoMode::Off).unwrap();
-    let off = gathered(repo.path(), "claude", &[message("1")], Err(String::new()));
+    let off = gathered(repo.path(), "claude", &[message("1")]);
     assert_eq!(
         off.alone_verdict(&sid("session-one")),
         Verdict::Silent(SilentWhy::AutoOff)
@@ -984,7 +958,7 @@ fn a_presentation_is_worded_for_the_role_the_roster_gives_now() {
             1,
             &report,
             true,
-            &gathered(repo.path(), "codex", &[], Ok(())),
+            &gathered(repo.path(), "codex", &[]),
         )
         .unwrap();
     assert_eq!(parked.verdict, WireVerdict::Park);
@@ -1006,7 +980,7 @@ fn a_presentation_is_worded_for_the_role_the_roster_gives_now() {
             1,
             &report,
             false,
-            &gathered(repo.path(), "codex", &[message("1")], Ok(())),
+            &gathered(repo.path(), "codex", &[message("1")]),
         )
         .unwrap();
     let text = frame.rendered.expect("presented");
@@ -1023,7 +997,7 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     let repo = repo_with("grok", Tool::Grok, "session-one");
     let author = label("grok");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let unfolded = Gathered::of(repo.path(), &author, None, Ok(()));
+    let unfolded = Gathered::of(repo.path(), &author, None);
     let handoff = |wait_running| Report::Handoff {
         handoff: clank_core::turn_policy::Handoff {
             session: sid("session-one"),
@@ -1074,7 +1048,7 @@ fn idle_stop() -> Report {
 /// with the commit its `Delivered` makes.
 fn present_owed(turns: &mut Turns, repo: &Path, conn: u64) -> (Frame, Option<Commit>) {
     let author = label("claude");
-    let g = gathered(repo, "claude", &owed_blocks(repo, "claude"), Ok(()));
+    let g = gathered(repo, "claude", &owed_blocks(repo, "claude"));
     let frame = turns.answer(&author, conn, &idle_stop(), true, &g).unwrap();
     let presentation = frame.presentation().expect("presented").clone();
     let commit = turns
@@ -1099,12 +1073,7 @@ async fn a_delivered_answer_is_received_and_not_presented_again() {
     assert!(owed_blocks(repo.path(), "claude").is_empty());
 
     let mut restarted = Turns::new(repo.path().to_path_buf());
-    let g = gathered(
-        repo.path(),
-        "claude",
-        &owed_blocks(repo.path(), "claude"),
-        Ok(()),
-    );
+    let g = gathered(repo.path(), "claude", &owed_blocks(repo.path(), "claude"));
     let frame = restarted
         .answer(&label("claude"), 2, &idle_stop(), true, &g)
         .unwrap();
@@ -1125,12 +1094,7 @@ async fn an_answer_whose_presentation_failed_stays_owed() {
     ask_and_answer(repo.path(), "claude", "q", "Proceed?", "yes");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(
-        repo.path(),
-        "claude",
-        &owed_blocks(repo.path(), "claude"),
-        Ok(()),
-    );
+    let g = gathered(repo.path(), "claude", &owed_blocks(repo.path(), "claude"));
     let failed = turns.answer(&author, 1, &idle_stop(), true, &g).unwrap();
     let presentation = failed.presentation().unwrap().clone();
     let emit_failed = TurnResult::EmitFailed {
@@ -1251,7 +1215,7 @@ fn an_attending_delivery_renders_only_unreceived_work_across_a_restart() {
     let author = label("claude");
     let report = stop(Tool::Claude, "session-one", running_subagent(), None);
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let one = gathered(repo.path(), "claude", &[message("1")], Ok(()));
+    let one = gathered(repo.path(), "claude", &[message("1")]);
     attend_name(&mut turns, "claude", "session-one", &one);
     let frame = turns.answer(&author, 1, &report, true, &one).unwrap();
     let presentation = frame.presentation().expect("never received").clone();
@@ -1262,7 +1226,7 @@ fn an_attending_delivery_renders_only_unreceived_work_across_a_restart() {
     let mut back = Turns::new(repo.path().to_path_buf());
     let frame = back.answer(&author, 2, &report, true, &one).unwrap();
     assert_eq!(frame.verdict, WireVerdict::Park);
-    let both = gathered(repo.path(), "claude", &[message("1"), message("2")], Ok(()));
+    let both = gathered(repo.path(), "claude", &[message("1"), message("2")]);
     let frame = back.answer(&author, 3, &report, true, &both).unwrap();
     let text = frame.rendered.unwrap_or_default();
     assert!(
@@ -1279,7 +1243,7 @@ fn a_parked_report_ends_while_a_user_command_waits_for_its_agent() {
     let repo = repo_with("claude", Tool::Claude, "session-uc");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[], Ok(()));
+    let g = gathered(repo.path(), "claude", &[]);
     let report = stop(Tool::Claude, "session-uc", TaskSnapshot::Unavailable, None);
     let first = turns.answer(&author, 1, &report, true, &g).unwrap();
     assert_eq!(first.verdict, WireVerdict::Park);

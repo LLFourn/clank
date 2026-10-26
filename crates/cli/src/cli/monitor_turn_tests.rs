@@ -41,7 +41,6 @@ fn gathered_with(
         &Default::default(),
         &mut Default::default(),
         pending,
-        &Default::default(),
     )
 }
 
@@ -80,7 +79,6 @@ async fn a_failed_emit_keeps_unlogged_work_owed() {
             &mut Default::default(),
             &Default::default(),
             &mut turns,
-            &Default::default(),
         );
         let (frame, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
             .await
@@ -166,7 +164,6 @@ async fn a_presentation_its_carrier_never_received_fails_at_once() {
         &mut Default::default(),
         &Default::default(),
         &mut turns,
-        &Default::default(),
     );
     assert!(clients.is_empty(), "the carrier is retired");
     assert_eq!(turns.state(&author).unwrap().outstanding, None);
@@ -198,7 +195,6 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
         &mut Default::default(),
         &Default::default(),
         &mut turns,
-        &Default::default(),
     );
     let (frame, mut hook) = tokio::task::spawn_blocking(move || (hook.frame(), hook))
         .await
@@ -259,8 +255,7 @@ async fn a_delivery_discharges_the_transient_work_it_presented() {
 #[tokio::test]
 async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
     let (repo, author, state) = owed_repo().await;
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
-    let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
+    let (mut turns, due_at) = attended(repo.path(), &author, &state);
     assert_eq!(turns.next_deadline(), Some(due_at));
     crate::agent_store::release_binding(
         repo.path(),
@@ -276,7 +271,6 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
         &mut Default::default(),
         &[],
         &mut turns,
-        &routes,
     );
     assert_eq!(turns.next_deadline(), None);
     assert!(
@@ -293,8 +287,7 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
 #[tokio::test]
 async fn a_due_check_in_of_an_unbound_agent_is_not_due_again() {
     let (repo, author, state) = owed_repo().await;
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
-    let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
+    let (mut turns, due_at) = attended(repo.path(), &author, &state);
     crate::agent_store::release_binding(
         repo.path(),
         &author,
@@ -389,7 +382,6 @@ fn attended(
     repo: &std::path::Path,
     author: &AgentLabel,
     state: &crate::repo_state::RepoState,
-    routes: &Routes,
 ) -> (Turns, u64) {
     let _ = std::fs::remove_file(
         crate::agent_store::agents_root(repo)
@@ -404,7 +396,6 @@ fn attended(
         &Default::default(),
         &mut Default::default(),
         &[],
-        routes,
     );
     attend_sleeper(&mut turns, author, &g);
     turns
@@ -452,7 +443,6 @@ fn ask_for(
 #[tokio::test]
 async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
     let (repo, author, state) = owed_repo().await;
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let (recovery, process) = identified(repo.path(), &author);
     let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
     let now = || {
@@ -463,7 +453,6 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
             &Default::default(),
             &mut Default::default(),
             &[],
-            &routes,
         )
     };
     let cases: [(&str, Option<&str>); 7] = [
@@ -482,7 +471,7 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
         ),
     ];
     for (change, refused) in cases {
-        let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
+        let (mut turns, due_at) = attended(repo.path(), &author, &state);
         let due = turns
             .check_in(&author, &now().at(due_at))
             .expect("it fires");
@@ -559,9 +548,8 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
 #[tokio::test]
 async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
     let (repo, author, state) = owed_repo().await;
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let (recovery, _) = identified(repo.path(), &author);
-    let (mut turns, due_at) = attended(repo.path(), &author, &state, &routes);
+    let (mut turns, due_at) = attended(repo.path(), &author, &state);
     let now = |at: u64| {
         gather(
             repo.path(),
@@ -570,7 +558,6 @@ async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
             &Default::default(),
             &mut Default::default(),
             &[],
-            &routes,
         )
         .at(at)
     };
@@ -823,7 +810,6 @@ fn serve(
         &mut Default::default(),
         &Default::default(),
         turns,
-        &Routes::new(),
     )
 }
 
@@ -839,7 +825,6 @@ fn gathered(
         &Default::default(),
         &mut Default::default(),
         &[],
-        &Routes::new(),
     )
 }
 
@@ -914,7 +899,6 @@ async fn a_verdict_and_its_result_travel_on_one_connection() {
 async fn an_attending_agents_turn_end_parks_and_a_later_event_wakes_it() {
     let (repo, author, timer) = timer_repo();
     let state = folded(repo.path()).await.unwrap();
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gather(
         repo.path(),
@@ -923,7 +907,6 @@ async fn an_attending_agents_turn_end_parks_and_a_later_event_wakes_it() {
         &Default::default(),
         &mut Default::default(),
         &[],
-        &routes,
     );
     attend_sleeper(&mut turns, &author, &g);
     let serve_now = |clients: &mut Vec<Client>, state, turns: &mut Turns| {
@@ -936,7 +919,6 @@ async fn an_attending_agents_turn_end_parks_and_a_later_event_wakes_it() {
             &mut Default::default(),
             &Default::default(),
             turns,
-            &routes,
         )
     };
 
@@ -1003,7 +985,6 @@ async fn recovery_after_a_lost_park(later: Later) {
     let (repo, author, timer) = timer_repo();
     log_timer_event(repo.path(), &timer);
     let state = folded(repo.path()).await.unwrap();
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gather(
         repo.path(),
@@ -1012,7 +993,6 @@ async fn recovery_after_a_lost_park(later: Later) {
         &Default::default(),
         &mut Default::default(),
         &[],
-        &routes,
     );
     let shown = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
     let presentation = shown.presentation().expect("presented").clone();
@@ -1038,7 +1018,6 @@ async fn recovery_after_a_lost_park(later: Later) {
             &mut Default::default(),
             pending,
             turns,
-            &routes,
         )
         .try_into()
         .unwrap();
@@ -1068,7 +1047,6 @@ async fn recovery_after_a_lost_park(later: Later) {
             &Default::default(),
             pending,
             turns,
-            &routes,
             &ask,
         )
         .map(|(gate, _)| gate);
@@ -1076,7 +1054,6 @@ async fn recovery_after_a_lost_park(later: Later) {
             repo.path(),
             clients,
             turns,
-            &routes,
             Some(state),
             &Default::default(),
             &mut Default::default(),
@@ -1108,7 +1085,6 @@ async fn recovery_after_a_lost_park(later: Later) {
         &mut Default::default(),
         &Default::default(),
         &mut turns,
-        &routes,
     );
     let (frame, hook) = tokio::task::spawn_blocking(move || {
         let mut hook = hook;
@@ -1416,7 +1392,6 @@ async fn check_in_through(
 #[tokio::test]
 async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
     let (repo, author, state) = owed_repo().await;
-    let routes: Routes = [(author.clone(), Ok(()))].into_iter().collect();
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gather(
         repo.path(),
@@ -1425,7 +1400,6 @@ async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
         &Default::default(),
         &mut Default::default(),
         &[],
-        &routes,
     );
     turns
         .attend(
@@ -1471,7 +1445,6 @@ async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
             &Default::default(),
             &mut Default::default(),
             &[],
-            &routes,
         )
         .at(due_at);
         let due = turns.check_in(&author, &at_due).expect("due");
@@ -1568,7 +1541,7 @@ fn the_last_look_needs_an_identified_harness() {
         },
         reply,
     };
-    let g = crate::cli::turn_custody::Gathered::of(repo.path(), &author, None, Err(String::new()));
+    let g = crate::cli::turn_custody::Gathered::of(repo.path(), &author, None);
     assert!(
         may_check_in_now(
             repo.path(),
@@ -1641,4 +1614,79 @@ async fn recovery_requests_are_carried_out_for_a_bound_session_only() {
         recovery_control(repo.path(), &mut recovery, &reply("session-gone"), 0).map(|(s, _)| s),
         Err("this session no longer holds the label".to_string())
     );
+}
+
+/// The loop's step at an attendance deadline serves the agent's parked
+/// wait again, with no repo change and no typed route: the work it had
+/// received and the attendance quieted is presented once the deadline
+/// passes. The check-in is still owed beside it, and the work comes back
+/// without it ever being typed.
+#[tokio::test]
+async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline() {
+    let (repo, author, state) = owed_repo().await;
+    let then = crate::cli::turn_custody::now_ms() - 120_000;
+    let g = gathered(repo.path(), &author, &state).at(then);
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let first = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
+    let presentation = first.presentation().expect("the owed work").clone();
+    assert!(
+        turns
+            .result(&author, 1, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .is_some()
+    );
+    attend_sleeper(&mut turns, &author, &g);
+    let parked = turns
+        .answer(&author, 2, &listing_the_sleeper(), true, &g.at(then + 1))
+        .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park, "received work is quiet");
+    let deadline = turns.next_deadline().expect("the quiet arms a check-in");
+    assert_eq!(deadline, then + 60_000);
+
+    let (out, mut queue) = tokio::sync::mpsc::channel(CLIENT_QUEUE);
+    let mut clients = vec![Client {
+        who: Served::Agent {
+            author: author.clone(),
+        },
+        holder: None,
+        out,
+        writer: None,
+        farewell: None,
+        shown: Default::default(),
+        conn: 2,
+        report: Some(Reporting {
+            report: listing_the_sleeper(),
+            stepped: true,
+            reader: None,
+        }),
+    }];
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    let mut round = |clients: &mut Vec<Client>, turns: &mut Turns, now| {
+        deadline_round(
+            repo.path(),
+            clients,
+            Some(&state),
+            &[],
+            &Default::default(),
+            turns,
+            &mut recovery,
+            now,
+        )
+    };
+
+    let (dues, _) = round(&mut clients, &mut turns, deadline - 1);
+    assert!(dues.is_empty());
+    assert!(queue.try_recv().is_err(), "nothing before the deadline");
+    assert_eq!(clients.len(), 1);
+
+    let (dues, _) = round(&mut clients, &mut turns, deadline);
+    assert_eq!(dues.len(), 1, "the check-in is still owed");
+    let note = queue.try_recv().expect("the parked wait was served");
+    assert!(
+        note.contains("deliver") && note.contains("scheduled work"),
+        "{note}"
+    );
+    assert!(clients.is_empty(), "a delivery retires the parked report");
+    assert_eq!(turns.next_deadline(), None, "not due again");
 }

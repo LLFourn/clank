@@ -13,7 +13,7 @@ fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<String
     let Some((label, handoff)) = route(input, repo, env)? else {
         return Ok(None);
     };
-    let g = crate::cli::turn_custody::Gathered::of(repo, &label, None, Err(String::new()));
+    let g = crate::cli::turn_custody::Gathered::of(repo, &label, None);
     let frame = crate::cli::turn_custody::frame_of(g.handoff_verdict(&handoff));
     Ok(wire(&frame).0.map(|out| {
         let block: serde_json::Value = serde_json::from_str(&out).unwrap();

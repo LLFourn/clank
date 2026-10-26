@@ -2086,29 +2086,6 @@ impl Driver {
         self.accounted(acts, now)
     }
 
-    /// Where each agent's check-in could be typed: its resume route, as
-    /// the evidence for the harness it runs grants it.
-    pub(crate) fn check_in_routes(
-        &self,
-    ) -> std::collections::BTreeMap<clank_core::ids::AgentLabel, Result<(), String>> {
-        self.agents
-            .iter()
-            .map(|(author, w)| {
-                let route = match transport_for(w.tool, Action::Nudge, w.running.version()) {
-                    Ok(Transport::Typed) => Ok(()),
-                    Ok(_) => Err("this harness is resumed through a helper, not typed".into()),
-                    Err(why) => Err(match &w.running {
-                        Identity::Unknown(found) => {
-                            format!("its running version could not be established: {found}")
-                        }
-                        _ => why.to_string(),
-                    }),
-                };
-                (author.clone(), route)
-            })
-            .collect()
-    }
-
     /// Whether a check-in may be typed into `process` now: still the very
     /// process identified for `author`'s binding, and still granted.
     pub(crate) fn may_type_check_in(

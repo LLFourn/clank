@@ -3161,13 +3161,11 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             }
             Wake::RecoveryDue => {
                 if owner {
-                    let routes = recovery.check_in_routes();
                     let acts = recovery.due(crate::cli::recovery::unix_now(), |author, session| {
                         due_gate(
                             &repo,
                             &clients,
                             &mut turns,
-                            &routes,
                             folded_state.as_ref(),
                             &hosted,
                             &mut timer_backlogs,
@@ -3206,34 +3204,29 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 let now = crate::cli::turn_custody::now_ms();
                 leaving.extend(expire_reports(&mut clients, now));
                 if owner {
-                    let routes = recovery.check_in_routes();
-                    let stepped = due_check_ins(&mut turns, now, |author| {
-                        gather(
-                            &repo,
-                            folded_state.as_ref(),
-                            author,
-                            &hosted,
-                            &mut Default::default(),
-                            &pending,
-                            &routes,
-                        )
-                    });
-                    for (author, g, due) in stepped {
-                        if let Some(due) = due {
-                            owned.departing.push(tokio::spawn(deliver_check_in(
-                                repo.as_ref().clone(),
-                                due,
-                                std::sync::Arc::new(Panes),
-                                check_in_asks.clone(),
-                                check_in_done.clone(),
-                            )));
-                        }
-                        project(&mut recovery, &mut turns, &author, &g);
+                    let (dues, served) = deadline_round(
+                        &repo,
+                        &mut clients,
+                        folded_state.as_ref(),
+                        &pending,
+                        &hosted,
+                        &mut turns,
+                        &mut recovery,
+                        now,
+                    );
+                    leaving.extend(served);
+                    for due in dues {
+                        owned.departing.push(tokio::spawn(deliver_check_in(
+                            repo.as_ref().clone(),
+                            due,
+                            std::sync::Arc::new(Panes),
+                            check_in_asks.clone(),
+                            check_in_done.clone(),
+                        )));
                     }
                 }
             }
             Wake::Heard(conn, said) => {
-                let routes = recovery.check_in_routes();
                 let author = turns.carrier(conn).cloned();
                 match said {
                     Heard::Line(line) => match (
@@ -3255,7 +3248,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                         &hosted,
                                         &mut Default::default(),
                                         pending,
-                                        &routes,
                                     )
                                 },
                             );
@@ -3266,7 +3258,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &hosted,
                                 &mut Default::default(),
                                 &pending,
-                                &routes,
                             );
                             match settled {
                                 Ok(Some(commit)) => {
@@ -3288,7 +3279,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &mut Default::default(),
                                 &hosted,
                                 &mut turns,
-                                &routes,
                             ));
                         }
                         (_, Ok(result)) => eprintln!(
@@ -3314,7 +3304,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &hosted,
                                 &mut Default::default(),
                                 &pending,
-                                &routes,
                             );
                             turns.closed(&author, conn, &g);
                             project(&mut recovery, &mut turns, &author, &g);
@@ -3327,7 +3316,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &mut Default::default(),
                                 &hosted,
                                 &mut turns,
-                                &routes,
                             ));
                         }
                     }
@@ -3335,7 +3323,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             }
             Wake::AuthorizeCheckIn(ask) => {
                 let allowed = if owner {
-                    let routes = recovery.check_in_routes();
                     let g = gather(
                         &repo,
                         folded_state.as_ref(),
@@ -3343,7 +3330,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &hosted,
                         &mut Default::default(),
                         &pending,
-                        &routes,
                     );
                     may_check_in_now(&repo, &recovery, &mut turns, &g, &ask)
                 } else {
@@ -3357,7 +3343,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         "monitor: `{}`'s check-in was not delivered: {why}",
                         done.author
                     );
-                    let routes = recovery.check_in_routes();
                     let g = gather(
                         &repo,
                         folded_state.as_ref(),
@@ -3365,7 +3350,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &hosted,
                         &mut Default::default(),
                         &pending,
-                        &routes,
                     );
                     turns.check_in_failed(&done.author, done.check_in, why, &g);
                     project(&mut recovery, &mut turns, &done.author, &g);
@@ -3541,7 +3525,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 answered
                             }
                             Control::Attend { .. } | Control::Clear { .. } => {
-                                let routes = recovery.check_in_routes();
                                 let answered =
                                     turn_control(&repo, &mut turns, &request, |author| {
                                         gather(
@@ -3551,7 +3534,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                             &hosted,
                                             &mut Default::default(),
                                             &pending,
-                                            &routes,
                                         )
                                     });
                                 answered.map(|(author, said)| {
@@ -3562,7 +3544,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                         &hosted,
                                         &mut Default::default(),
                                         &pending,
-                                        &routes,
                                     );
                                     project(&mut recovery, &mut turns, &author, &g);
                                     if turns.attending(&author) {
@@ -3653,7 +3634,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 if let Some(author) = reporting {
                     // Read afresh, as a newcomer's items are: the cached
                     // backlog may still hold a row acknowledged since.
-                    let routes = recovery.check_in_routes();
                     leaving.extend(serve_reports(
                         &repo,
                         &mut clients,
@@ -3663,7 +3643,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut Default::default(),
                         &hosted,
                         &mut turns,
-                        &routes,
                     ));
                 }
             }
@@ -3698,7 +3677,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     ));
                 }
                 if owner && let Some(state) = &folded_state {
-                    let routes = recovery.check_in_routes();
                     leaving.extend(serve_reports(
                         &repo,
                         &mut clients,
@@ -3708,7 +3686,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut timer_backlogs,
                         &hosted,
                         &mut turns,
-                        &routes,
                     ));
                 }
             }
@@ -3787,7 +3764,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             &mut timer_backlogs,
                             &hosted,
                         ));
-                        let routes = recovery.check_in_routes();
                         if owner {
                             leaving.extend(serve_reports(
                                 &repo,
@@ -3798,7 +3774,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 &mut timer_backlogs,
                                 &hosted,
                                 &mut turns,
-                                &routes,
                             ));
                             let now = crate::cli::recovery::unix_now();
                             let mut acts = recovery.reconcile(
@@ -3810,7 +3785,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                     &mut timer_backlogs,
                                     &pending,
                                     &mut turns,
-                                    &routes,
                                 ),
                                 now,
                             );
@@ -3851,7 +3825,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             if changed {
                 user_commands.state_changed();
             }
-            let routes = recovery.check_in_routes();
             leaving.extend(user_command_round(
                 &repo,
                 &mut user_commands,
@@ -3862,7 +3835,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 &hosted,
                 &mut turns,
                 &mut recovery,
-                &routes,
                 &recovery_answers,
                 &asks,
                 &records,
@@ -3889,7 +3861,7 @@ enum Wake {
     Emitted(AgentLabel, crate::cli::event_source::Emission),
     Lifecycle(crate::cli::event_source::LifecycleReport),
     Interrupted(AgentLabel),
-    /// A held report's hook reached its deadline, or a check-in is due.
+    /// A held report's hook reached its deadline, or an attendance's.
     TurnsDue,
     /// A reporting connection said something, or closed.
     Heard(u64, Heard),
@@ -3923,7 +3895,6 @@ fn user_command_round(
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
-    routes: &Routes,
     answers: &tokio::sync::mpsc::UnboundedSender<RecoveryAnswer>,
     asks: &tokio::sync::mpsc::UnboundedSender<Authorize>,
     records: &crate::cli::recovery::RecordWatch,
@@ -3956,7 +3927,6 @@ fn user_command_round(
             timer_backlogs,
             hosted,
             turns,
-            routes,
         ));
     }
     leaving
@@ -4052,7 +4022,6 @@ fn recovery_facts(
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     pending: &[(AgentLabel, WaitItem)],
     turns: &mut crate::cli::turn_custody::Turns,
-    routes: &Routes,
 ) -> Vec<crate::cli::recovery::Facts> {
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
@@ -4097,12 +4066,8 @@ fn recovery_facts(
         };
         let obligated = !delivering && !owed.is_empty();
         let cwd = std::env::current_dir().ok();
-        let g = crate::cli::turn_custody::Gathered::of(
-            repo,
-            &author,
-            Some((&owed, cwd.as_deref())),
-            route_of(routes, &author),
-        );
+        let g =
+            crate::cli::turn_custody::Gathered::of(repo, &author, Some((&owed, cwd.as_deref())));
         if counting {
             turns.observed(&author, &g);
         }
@@ -4231,7 +4196,6 @@ fn due_gate(
     repo: &std::path::Path,
     clients: &[Client],
     turns: &mut crate::cli::turn_custody::Turns,
-    routes: &Routes,
     state: Option<&crate::repo_state::RepoState>,
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
@@ -4243,7 +4207,7 @@ fn due_gate(
         return crate::cli::recovery::Gate::Hold;
     };
     let owed = owed_now(repo, state, author, hosted, timer_backlogs, pending);
-    recovery_gate(repo, clients, turns, routes, author, session, &owed)
+    recovery_gate(repo, clients, turns, author, session, &owed)
 }
 
 /// Whether a due recovery attempt may go ahead now, from the agent as it
@@ -4255,7 +4219,6 @@ fn recovery_gate(
     repo: &std::path::Path,
     clients: &[Client],
     turns: &mut crate::cli::turn_custody::Turns,
-    routes: &Routes,
     author: &AgentLabel,
     session: &str,
     owed: &[WaitItem],
@@ -4284,12 +4247,7 @@ fn recovery_gate(
         return Gate::AutoOff;
     }
     let cwd = std::env::current_dir().ok();
-    let g = crate::cli::turn_custody::Gathered::of(
-        repo,
-        author,
-        Some((owed, cwd.as_deref())),
-        route_of(routes, author),
-    );
+    let g = crate::cli::turn_custody::Gathered::of(repo, author, Some((owed, cwd.as_deref())));
     match turns.recovery_quiet(author, &g) {
         Some(_) => Gate::Hold,
         None => Gate::Go,
@@ -4372,9 +4330,8 @@ fn may_send_now(
     turns: &mut crate::cli::turn_custody::Turns,
     a: &Authorize,
 ) -> bool {
-    let routes = recovery.check_in_routes();
     let Some((crate::cli::recovery::Gate::Go, owed)) =
-        last_look(repo, clients, hosted, pending, turns, &routes, a)
+        last_look(repo, clients, hosted, pending, turns, a)
     else {
         return false;
     };
@@ -4413,7 +4370,6 @@ fn last_look(
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     pending: &[(AgentLabel, WaitItem)],
     turns: &mut crate::cli::turn_custody::Turns,
-    routes: &Routes,
     a: &Authorize,
 ) -> Option<(crate::cli::recovery::Gate, Vec<WaitItem>)> {
     let state = a.state.as_ref()?;
@@ -4438,15 +4394,7 @@ fn last_look(
         &reviews,
         head.as_ref(),
     );
-    let gate = recovery_gate(
-        repo,
-        clients,
-        turns,
-        routes,
-        &a.author,
-        &a.attempt.session,
-        &owed,
-    );
+    let gate = recovery_gate(repo, clients, turns, &a.author, &a.attempt.session, &owed);
     Some((gate, owed))
 }
 
@@ -4632,6 +4580,58 @@ fn due_check_ins(
             (author, g, due)
         })
         .collect()
+}
+
+/// The loop's step when attendance deadlines fall due: each due check-in
+/// is stepped, and each of those agents' parked waits is served again with
+/// its facts as they are now. Returns the check-ins to type, and the
+/// writers of the reports it retired.
+///
+/// No repo change marks a deadline, so without this re-serve a park whose
+/// work the attendance quieted would hold it until something else changed;
+/// the typed check-in cannot stand in, since a session may have no route
+/// for one.
+#[allow(clippy::too_many_arguments)]
+fn deadline_round(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &[(AgentLabel, WaitItem)],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+    now: u64,
+) -> (
+    Vec<crate::cli::turn_custody::CheckInDue>,
+    Vec<tokio::task::JoinHandle<Wrote>>,
+) {
+    let stepped = due_check_ins(turns, now, |author| {
+        gather(
+            repo,
+            state,
+            author,
+            hosted,
+            &mut Default::default(),
+            pending,
+        )
+    });
+    let mut dues = Vec::new();
+    let mut leaving = Vec::new();
+    for (author, g, due) in stepped {
+        dues.extend(due);
+        project(recovery, turns, &author, &g);
+        leaving.extend(serve_reports(
+            repo,
+            clients,
+            state,
+            Some(&author),
+            pending,
+            &mut Default::default(),
+            hosted,
+            turns,
+        ));
+    }
+    (dues, leaving)
 }
 
 /// Settle a result from connection `conn` against `author`'s custody. A
@@ -6148,7 +6148,6 @@ pub(crate) async fn publish_one_fold(repo: &std::path::Path) {
         &mut Default::default(),
         &[],
         &mut turns,
-        &Routes::new(),
     );
     recovery.reconcile(facts, crate::cli::recovery::unix_now());
 }
@@ -7180,17 +7179,6 @@ fn serve_to_cached(
     leaving
 }
 
-/// Where a check-in could reach each agent, as the monitor knows it.
-pub(crate) type Routes = std::collections::BTreeMap<AgentLabel, Result<(), String>>;
-
-/// The route `author`'s check-in would take, or why it has none.
-fn route_of(routes: &Routes, author: &AgentLabel) -> Result<(), String> {
-    routes
-        .get(author)
-        .cloned()
-        .unwrap_or_else(|| Err("its harness has not been identified yet".into()))
-}
-
 /// What `author` is owed now, from `state`, with what is held for it from
 /// a source no log keeps.
 #[allow(clippy::too_many_arguments)]
@@ -7225,7 +7213,6 @@ fn gather(
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     pending: &[(AgentLabel, WaitItem)],
-    routes: &Routes,
 ) -> crate::cli::turn_custody::Gathered {
     let owed = state.map(|state| owed_now(repo, state, author, hosted, timer_backlogs, pending));
     let cwd = std::env::current_dir().ok();
@@ -7233,7 +7220,6 @@ fn gather(
         repo,
         author,
         owed.as_deref().map(|owed| (owed, cwd.as_deref())),
-        route_of(routes, author),
     )
 }
 
@@ -7250,7 +7236,6 @@ fn serve_reports(
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     turns: &mut crate::cli::turn_custody::Turns,
-    routes: &Routes,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut leaving = Vec::new();
     let mut keep = Vec::with_capacity(clients.len());
@@ -7268,15 +7253,7 @@ fn serve_reports(
         if !reporting.stepped {
             turns.observe_questions(&author, &reporting.report);
         }
-        let g = gather(
-            repo,
-            state,
-            &author,
-            hosted,
-            timer_backlogs,
-            pending,
-            routes,
-        );
+        let g = gather(repo, state, &author, hosted, timer_backlogs, pending);
         let first = !reporting.stepped;
         let Some(frame) = turns.answer(&author, client.conn, &reporting.report, first, &g) else {
             keep.push(client);
@@ -8149,7 +8126,6 @@ mod recovery_tests {
         let turns = std::cell::RefCell::new(crate::cli::turn_custody::Turns::new(
             repo.path().to_path_buf(),
         ));
-        let routes = std::cell::RefCell::new(Routes::new());
         let facts = |clients: &[Client]| {
             recovery_facts(
                 repo.path(),
@@ -8159,7 +8135,6 @@ mod recovery_tests {
                 &mut Default::default(),
                 &[],
                 &mut turns.borrow_mut(),
-                &routes.borrow(),
             )
         };
 
@@ -8258,7 +8233,6 @@ mod recovery_tests {
                 repo.path(),
                 &codex,
                 Some((&owed_now(), None)),
-                Err("no route".into()),
             );
             let frame = turns
                 .borrow_mut()
@@ -8303,13 +8277,8 @@ mod recovery_tests {
         // A qualifying attendance holds recovery back; a codex one never
         // qualifies, since nothing wakes it when its work completes.
         bind(clank_core::Tool::Claude, "session-one");
-        routes.borrow_mut().insert(codex.clone(), Ok(()));
-        let g = crate::cli::turn_custody::Gathered::of(
-            repo.path(),
-            &codex,
-            Some((&owed_now(), None)),
-            Ok(()),
-        );
+        let g =
+            crate::cli::turn_custody::Gathered::of(repo.path(), &codex, Some((&owed_now(), None)));
         turns
             .borrow_mut()
             .attend(
@@ -8405,7 +8374,6 @@ mod recovery_tests {
             &mut Default::default(),
             &[],
             &mut turns.borrow_mut(),
-            &routes.borrow(),
         );
         assert!(
             !handled[0].obligated,
@@ -8422,13 +8390,11 @@ mod recovery_tests {
         let turns = std::cell::RefCell::new(crate::cli::turn_custody::Turns::new(
             repo.path().to_path_buf(),
         ));
-        let routes: Routes = [(codex.clone(), Ok(()))].into_iter().collect();
         let gate_owing = |clients: &[Client], session: &str, owed: &[WaitItem]| {
             recovery_gate(
                 repo.path(),
                 clients,
                 &mut turns.borrow_mut(),
-                &routes,
                 &codex,
                 session,
                 owed,
@@ -8470,8 +8436,7 @@ mod recovery_tests {
         )
         .unwrap();
         assert_eq!(gate(&[]), Gate::Go);
-        let g =
-            crate::cli::turn_custody::Gathered::of(repo.path(), &codex, Some((&[], None)), Ok(()));
+        let g = crate::cli::turn_custody::Gathered::of(repo.path(), &codex, Some((&[], None)));
         turns
             .borrow_mut()
             .attend(
@@ -16635,7 +16600,6 @@ mod user_command_tests {
         let mut turns = crate::cli::turn_custody::Turns::new(w.repo.clone());
         let mut recovery =
             crate::cli::recovery::Driver::new(w.repo.clone(), w.home.path().to_path_buf());
-        let routes = recovery.check_in_routes();
         let (answers, _a) = tokio::sync::mpsc::unbounded_channel();
         let (asks, _b) = tokio::sync::mpsc::unbounded_channel();
         let (changes, _c) = tokio::sync::mpsc::unbounded_channel();
@@ -16655,7 +16619,6 @@ mod user_command_tests {
                 &Default::default(),
                 turns,
                 &mut recovery,
-                &routes,
                 &answers,
                 &asks,
                 &records,
@@ -16671,7 +16634,6 @@ mod user_command_tests {
             &mut Default::default(),
             &Default::default(),
             &mut turns,
-            &routes,
         );
         assert!(queue.try_recv().unwrap().contains("park"), "parked first");
         round(&mut clients, &mut uc, &mut turns, &mut owned);

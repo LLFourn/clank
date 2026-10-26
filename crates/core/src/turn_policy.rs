@@ -115,9 +115,6 @@ pub struct Facts<'a> {
     pub blocked: bool,
     pub owed: &'a [OwedItem],
     pub liveness: &'a dyn Liveness,
-    /// Whether the agent's resume route could carry a check-in now, or
-    /// why not. A silence with no way to check in is an unwakeable one.
-    pub check_in_route: Result<(), String>,
     /// A person's signed command, verified just now, waits for this agent
     /// to sit idle and only a park stands in its way.
     pub user_command: bool,
@@ -291,9 +288,6 @@ pub enum Unqualified {
     NoProcessProof,
     ProcessGone,
     UnknownKind,
-    /// The check-in could not reach the agent, so a silence would be
-    /// one nothing can end.
-    NoCheckInRoute(String),
     PastDeadline,
 }
 
@@ -335,9 +329,6 @@ pub fn qualifies(
             Some(_) => {}
         },
         TaskKind::Unknown(_) => return Qualifies::No(Unqualified::UnknownKind),
-    }
-    if let Err(why) = &facts.check_in_route {
-        return Qualifies::No(Unqualified::NoCheckInRoute(why.clone()));
     }
     if facts.now >= since.saturating_add(*expect) {
         return Qualifies::No(Unqualified::PastDeadline);

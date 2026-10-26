@@ -52,7 +52,6 @@ fn facts<'a>(now: Ms, binding: &'a SessionId, owed: &'a [OwedItem]) -> Facts<'a>
         blocked: false,
         owed,
         liveness: &LIVE,
-        check_in_route: Ok(()),
         user_command: false,
     }
 }
@@ -1237,39 +1236,42 @@ fn an_unbroken_live_result_keeps_counting() {
     assert_eq!(next, 3);
 }
 
+/// No check-in route is consulted: an attendance on a session whose
+/// typed check-in could never reach it quiets the work it received, and
+/// its deadline alone ends that, even when the check-in it fires is lost.
 #[test]
-fn a_silence_needs_a_route_that_can_check_in() {
+fn received_work_is_quiet_without_a_check_in_route_until_the_deadline() {
     let s = session();
-    let mut st = SessionState::new(s.clone());
-    st.step(
-        attend(Selector::Name(SUBAGENT_NAME.into()), None),
-        &facts(T0, &s, &[]),
-    );
-    let mut routeless = facts(T0 + MINUTE, &s, &[]);
-    routeless.check_in_route = Err("its version is not known yet".into());
+    let a = owed("event:a", "read:a");
+    let mut st = received_then_attending(&s, &a);
+    let deadline = st.next_deadline().expect("the quiet arms its check-in");
+    let before = facts(deadline - 1, &s, &a);
+    assert_eq!(st.recovery_quiet(&before), Some(Quiet::Attending));
     assert_eq!(
-        verdict(st.step(
-            Event::TurnEnd(report(Tool::Claude, tasks(RUNNING))),
-            &routeless
-        )),
+        verdict(st.step(Event::Parked(report(Tool::Claude, tasks(RUNNING))), &before)),
         Verdict::Park
     );
-    assert!(matches!(
-        st.attendance,
-        Attendance::Standing {
-            check_in: CheckIn::Unarmed,
-            ..
-        }
+
+    let at = facts(deadline, &s, &a);
+    let check_in = match effects(st.step(Event::CheckInDue, &at)).as_slice() {
+        [Effect::CheckIn { check_in, .. }] => check_in.clone(),
+        other => panic!("no check-in fired: {other:?}"),
+    };
+    st.step(
+        Event::CheckInUndeliverable {
+            check_in,
+            why: "its running version could not be established".into(),
+        },
+        &at,
+    );
+    assert_eq!(st.recovery_quiet(&at), None);
+    let (_, identities) = presented(verdict(
+        st.step(Event::Parked(report(Tool::Claude, tasks(RUNNING))), &at),
     ));
-    assert_eq!(st.next_deadline(), None, "no silence, so no check-in owed");
-    assert_eq!(st.recovery_quiet(&routeless), None);
     assert_eq!(
-        verdict(st.step(
-            Event::TurnEnd(report(Tool::Claude, tasks(RUNNING))),
-            &facts(T0 + 2 * MINUTE, &s, &[])
-        )),
-        attending(),
-        "the route back, the next Stop is quiet"
+        identities,
+        ["event:a"],
+        "past its deadline the attendance quiets nothing, check-in lost or not"
     );
 }
 
@@ -2295,10 +2297,11 @@ fn past_the_deadline_or_unqualified_received_work_is_deliverable() {
     );
 
     let mut st = received_then_attending(&s, &a);
-    let mut no_route = facts(T0 + 2 * MINUTE, &s, &a);
-    no_route.check_in_route = Err("no harness".into());
-    let (_, identities) = presented(verdict(st.step(running_stop(), &no_route)));
-    assert_eq!(identities, ["event:a"]);
+    let (_, identities) = presented(verdict(st.step(
+        Event::TurnEnd(report(Tool::Codex, tasks(RUNNING))),
+        &facts(T0 + 2 * MINUTE, &s, &a),
+    )));
+    assert_eq!(identities, ["event:a"], "no completion wake, so no quiet");
 }
 
 #[test]

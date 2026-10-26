@@ -272,7 +272,7 @@ async fn alone(
     out: &mut impl Write,
 ) {
     if let Report::Handoff { handoff, .. } = report {
-        let g = super::turn_custody::Gathered::of(repo, author, None, Err(String::new()));
+        let g = super::turn_custody::Gathered::of(repo, author, None);
         let _ = emit(
             out,
             &super::turn_custody::frame_of(g.handoff_verdict(handoff)),
@@ -281,8 +281,7 @@ async fn alone(
     }
     let bound = report.session();
     let verdict = |owed: &[clank_core::wait::WaitItem]| {
-        super::turn_custody::Gathered::of(repo, author, Some((owed, None)), Err(String::new()))
-            .alone_verdict(bound)
+        super::turn_custody::Gathered::of(repo, author, Some((owed, None))).alone_verdict(bound)
     };
     let gated = verdict(&[]);
     if gated != clank_core::turn_policy::Verdict::Park {
