@@ -52,6 +52,7 @@ pub mod open;
 pub mod open_zellij;
 mod owned_callback;
 pub mod pane_input;
+pub(crate) mod pane_owners;
 pub(crate) mod pane_target;
 pub mod pick;
 pub(crate) mod plan_mutation;

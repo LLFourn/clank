@@ -2421,6 +2421,8 @@ const REBUILD_MIN: Duration = Duration::from_secs(1);
 
 const REOPEN_NOTICE: &str = "reopen pane";
 
+const OWNERSHIP_NOTICE: &str = "panes";
+
 /// What the gate is waiting on this agent for, with the TUI's verb
 /// and since when. The clock is what the page's `auto` compares to
 /// find whoever has been kept waiting longest.
@@ -3467,6 +3469,11 @@ pub(crate) async fn run_tui(
             }
         }
         reopen_outcomes_pending.extend(reopen_outcomes);
+        // Mounted every pass while it stands, because a refresh rebuilds
+        // the log rows and would otherwise drop it.
+        if let Some(notice) = reconcile_worker.ownership_notice() {
+            mount_notice(&mut snapshot.log_rows, OWNERSHIP_NOTICE, &notice);
+        }
         let (rows, cols) = term_size();
         // Every pass, before any render: see the fn's invariant doc.
         enforce_panel_tops_log(mode, &mut log);

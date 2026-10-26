@@ -187,18 +187,14 @@ fn rename_pane(id: &str, name: &str) {
 }
 
 /// Per-refresh retitle data, derived ON THE LOOP (pure — no zellij)
-/// and sent to the worker: each label's status emoji for BOTH possible
-/// pane roles (the pane's actual role comes from the batch's listing).
-/// Pane titles have ONE owner — the worker — so these renames can
-/// never race the reconciler's role stamps (codex ff9579f).
+/// and sent to the worker. Pane titles have ONE owner — the worker — so
+/// these renames can never race the reconciler's (codex ff9579f).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StatusGlyphs {
-    /// label → the title its pane should carry: status glyph plus
-    /// `<label> (<role>)`, the role being the ROSTER's. The pane's own
-    /// title used to supply the role, which made titles a second
-    /// source of truth for who is master — stamped by one path, parsed
-    /// by another, and wrong after a stale swap re-applied
-    /// (placement-is-a-layout-applied-not-panes-shuffled).
+    /// label → the title its pane should carry: the status glyph (which
+    /// the ROSTER's role decides), then the label. A role or state change
+    /// rewrites only the glyph, so the identity the title carries stays
+    /// put.
     titles: std::collections::BTreeMap<String, String>,
     /// The bar's glyph, which the tab's name carries.
     tab: String,
@@ -214,7 +210,7 @@ impl StatusGlyphs {
                 let emoji = agent_status_emoji(snap, &a.label, role);
                 (
                     a.label.clone(),
-                    format!("{emoji} {}", agent_pane_title(&a.label, role.as_str())),
+                    format!("{emoji} {}", agent_pane_title(&a.label)),
                 )
             })
             .collect();
@@ -328,6 +324,65 @@ pub(super) struct PaneReconciler {
     /// a creation sees the label as still missing and opens a SECOND
     /// pane for it — the duplicate reviewer this exists to prevent.
     pending: std::collections::BTreeMap<String, u32>,
+    /// Why the ownership record could not be read or written, as last
+    /// tried.
+    ownership_error: Option<String>,
+    /// Pane names in the workspace that read as an agent no candidate
+    /// claims, from the last pass that had no usable record: seen, and
+    /// deliberately not closed.
+    unclaimed: Labels,
+    /// Roster labels the last pass did not open, and the panes that may
+    /// already be theirs.
+    withheld: (Labels, Vec<crate::cli::open_zellij::Ambiguity>),
+}
+
+type Labels = std::collections::BTreeSet<String>;
+
+/// The labels a pane of the workspace may be identified as: the roster,
+/// plus every label the ownership record holds. Desired membership stays
+/// the roster alone ([`plan_panes`]), so a pane whose agent left the
+/// roster is still recognised, counted as excess, and closed.
+fn ownership_candidates(cur: &RosterView, record: &Result<Option<Labels>, String>) -> Labels {
+    let mut out = cur.labels.clone();
+    if let Ok(Some(owned)) = record {
+        out.extend(owned.iter().cloned());
+    }
+    out
+}
+
+/// One listing as the reconciler reads it: the agent pairs, and the panes
+/// whose names read as two candidates. Those are evidence neither for nor
+/// against any label they name, so such a label is neither opened nor
+/// dropped from the record.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct Seen {
+    pub(super) pairs: Vec<(String, bool)>,
+    pub(super) ambiguous: Vec<crate::cli::open_zellij::Ambiguity>,
+}
+
+impl Seen {
+    fn ambiguous_labels(&self) -> Labels {
+        self.ambiguous
+            .iter()
+            .flat_map(|a| a.candidates.iter().cloned())
+            .collect()
+    }
+
+    fn doubts(&self, label: &str) -> Vec<crate::cli::open_zellij::Ambiguity> {
+        self.ambiguous
+            .iter()
+            .filter(|a| a.candidates.contains(label))
+            .cloned()
+            .collect()
+    }
+}
+
+/// A verifying read-back: the listing, and whether the reviewers are
+/// placed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Verified {
+    pub(super) seen: Seen,
+    pub(super) placed: bool,
 }
 
 /// Consecutive FAILING passes allowed for one roster before the tab is
@@ -387,6 +442,9 @@ pub(super) enum ReopenOutcome {
     Unplaced,
     NotOnRoster,
     NotInSession,
+    /// A pane may already be the label's: its name reads as this label
+    /// and another.
+    Ambiguous(Vec<crate::cli::open_zellij::Ambiguity>),
 }
 
 impl ReopenOutcome {
@@ -402,6 +460,11 @@ impl ReopenOutcome {
             ),
             Self::NotOnRoster => format!("`{label}` is not on the roster"),
             Self::NotInSession => "not inside a zellij session; nothing to reopen into".to_string(),
+            Self::Ambiguous(doubts) => format!(
+                "`{label}` may already have a pane, so none was opened: {}. Rename that pane \
+                 to one agent's label",
+                crate::cli::open_zellij::describe_ambiguities(doubts)
+            ),
         }
     }
 }
@@ -425,6 +488,9 @@ pub(super) struct PanePlan {
     /// STAGE is not the roster master — including when nothing is (a
     /// staged team replacement). Read from geometry, never titles.
     pub(super) relocate: Option<(String, Option<String>)>,
+    /// Roster labels with no pane but one that may be theirs: not
+    /// opened, since that pane may be the one.
+    pub(super) withheld: Labels,
 }
 
 impl PanePlan {
@@ -433,19 +499,22 @@ impl PanePlan {
     }
 }
 
-pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan {
+pub(super) fn plan_panes(cur: &RosterView, seen: &Seen) -> PanePlan {
+    let live = &seen.pairs;
+    let ambiguous = seen.ambiguous_labels();
     // Desired state, modeled explicitly: EXACTLY one pane per roster
     // label, and the pane titled master is exactly the roster master.
     let mut count: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for (l, _) in live {
         *count.entry(l.as_str()).or_default() += 1;
     }
-    let add = cur
+    let (withheld, add): (Labels, Labels) = cur
         .labels
         .iter()
         .filter(|l| !count.contains_key(l.as_str()))
         .cloned()
-        .collect();
+        .partition(|l| ambiguous.contains(l));
+    let add = add.into_iter().collect();
     let mut remove = Vec::new();
     for (label, n) in &count {
         let excess = if cur.labels.contains(*label) {
@@ -466,6 +535,8 @@ pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan 
         .collect();
     let relocate = match cur.master.as_deref() {
         None => None,
+        // The stage may hold an ambiguous pane that is the master's.
+        Some(new) if ambiguous.contains(new) => None,
         Some(new) => {
             let stale = titled.iter().find(|l| **l != new).map(|l| l.to_string());
             if stale.is_none() && titled.contains(&new) {
@@ -479,6 +550,7 @@ pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan 
         add,
         remove,
         relocate,
+        withheld,
     }
 }
 
@@ -492,22 +564,33 @@ pub(super) fn plan_panes(cur: &RosterView, live: &[(String, bool)]) -> PanePlan 
 /// the reconciler: the real impl holds raw panes, tests hold pairs.
 pub(super) trait PaneIo {
     type Snap;
-    fn snapshot(&mut self) -> Option<Self::Snap>;
-    fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)>;
+    /// One listing seen through the repo's workspace, its panes named
+    /// against `candidates`. `None` when zellij did not answer or the
+    /// workspace is unresolved: either way, nothing may be acted on.
+    fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap>;
+    fn seen(&mut self, snap: &Self::Snap) -> Seen;
     /// Post-action ground truth for convergence: the label/stage pairs
     /// AND whether the reviewers are correctly placed, from ONE read.
     /// Both, because a pass that only removed still has to answer for
     /// placement — checking labels alone lets an unstacked tab be
     /// cached (codex on d5121e1) — and splitting them would cost a
     /// second session-wide listing.
-    fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)>;
+    fn verify(&mut self, candidates: &Labels, reviewers: &[String]) -> Option<Verified>;
+    /// Pane names in `snap`'s workspace that read as an agent label no
+    /// candidate claims.
+    fn unclaimed(&mut self, snap: &Self::Snap) -> Labels;
+    /// The ownership record: `Ok(None)` when there is none.
+    fn owned(&mut self) -> Result<Option<Labels>, String>;
+    /// Add `own` and drop `disown` from the ownership record, every other
+    /// label kept.
+    fn reown(&mut self, own: &Labels, disown: &Labels) -> Result<(), String>;
     /// The pane to restore focus to after the pass. Takes the pass's
     /// listing so the target costs no session-wide query of its own.
     fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String>;
     fn restore_focus(&mut self, id: &str);
-    /// Open the pane for `label` in the repo's tab, running its launch
-    /// command; reports the id when one was made. Where it lands is
-    /// the layout's business, applied afterwards.
+    /// Open the pane for `label` in the workspace's tab, named for it;
+    /// reports the id when one was made. Where it lands is the layout's
+    /// business, applied afterwards.
     fn add(&mut self, label: &str, snap: &Self::Snap) -> Option<String>;
     /// Whether the reviewers are ALREADY stacked in `snap`. Presence
     /// of every label does not imply correct placement, so the
@@ -528,9 +611,9 @@ pub(super) trait PaneIo {
     /// an exited pane as its label's — identity, so a corpse can be
     /// closed — and this is the other question: is the agent open.
     fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String>;
-    /// `(pane id, label)` for every pane running one of this repo's
-    /// agents — the retitler's map, read off the same listing presence
-    /// uses. The ROLE is the roster's, not the pane's.
+    /// `(pane id, label)` for every pane of the workspace named for an
+    /// agent — the retitler's map, read off the same listing presence
+    /// uses.
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)>;
     /// Bound agents with no pane but a process still holding their
     /// session. Read only; this never starts or reconnects an agent.
@@ -541,63 +624,118 @@ pub(super) trait PaneIo {
     }
 }
 
+/// One listing and the workspace it was read through.
+pub(super) struct Scoped {
+    panes: Vec<crate::cli::open_zellij::ZellijPane>,
+    ws: crate::cli::open_zellij::Workspace,
+}
+
+impl Scoped {
+    /// `panes` seen from the TUI: its own pane's tab, else the repo's one
+    /// TUI pane's. `None` when neither names a tab.
+    fn of(
+        panes: Vec<crate::cli::open_zellij::ZellijPane>,
+        repo: &std::path::Path,
+        caller: Option<&str>,
+        candidates: &Labels,
+    ) -> Option<Self> {
+        let ws =
+            crate::cli::open_zellij::Workspace::local(&panes, repo, caller, candidates.clone())?;
+        Some(Self { panes, ws })
+    }
+
+    fn seen(&self) -> Seen {
+        Seen {
+            pairs: crate::cli::open_zellij::agent_pane_pairs(&self.panes, &self.ws),
+            ambiguous: crate::cli::open_zellij::ambiguities(&self.panes, &self.ws),
+        }
+    }
+
+    fn stacked(&self, repo: &std::path::Path, reviewers: &[String]) -> bool {
+        crate::cli::open_zellij::reviewers_are_stacked(&self.panes, &self.ws, repo, reviewers)
+    }
+
+    fn verified(&self, repo: &std::path::Path, reviewers: &[String]) -> Verified {
+        Verified {
+            seen: self.seen(),
+            placed: self.stacked(repo, reviewers),
+        }
+    }
+
+    fn unclaimed(&self, repo: &std::path::Path, caller: Option<&str>) -> Labels {
+        crate::cli::open_zellij::unclaimed_labels(&self.panes, &self.ws, repo, caller)
+    }
+
+    fn live_labels(&self) -> Labels {
+        crate::cli::open_zellij::live_agent_labels(&self.panes, &self.ws)
+    }
+}
+
 /// The real zellij-backed [`PaneIo`].
 struct ZellijPaneIo<'a> {
     repo: &'a std::path::Path,
+    /// The TUI's own pane, whose tab is the workspace.
+    caller: Option<String>,
 }
 
 impl PaneIo for ZellijPaneIo<'_> {
-    type Snap = Vec<crate::cli::open_zellij::ZellijPane>;
-    fn snapshot(&mut self) -> Option<Self::Snap> {
-        crate::cli::open_zellij::snapshot_panes()
+    type Snap = Scoped;
+    fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
+        Scoped::of(
+            crate::cli::open_zellij::snapshot_panes()?,
+            self.repo,
+            self.caller.as_deref(),
+            candidates,
+        )
     }
-    fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
-        crate::cli::open_zellij::agent_pane_pairs(snap, self.repo)
+    fn seen(&mut self, snap: &Self::Snap) -> Seen {
+        snap.seen()
     }
-    fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)> {
+    fn verify(&mut self, candidates: &Labels, reviewers: &[String]) -> Option<Verified> {
         // A FRESH listing, not `dump-layout`. The dump was the cheap
         // source (1.0s vs 5.6s on a 28-pane session) but it cannot
         // identify an agent that has STARTED: it reports the running
         // program, which the exec turns into `opencode`, `uv`,
         // `caffeinate`, a vendored codex path, even a child like
-        // `rust-analyzer`. The listing keeps the CONFIGURED command,
-        // so `clank agent start <label> --repo <repo>` is still there
-        // — provenance and label in one string that the exec cannot
-        // touch. Identifying by pane TITLE instead was tried and
-        // rejected: the title carries no ownership marker, so any
-        // pane in the repo named `x (reviewer)` would pass, and it
-        // cannot round-trip the legal label domain (`AgentLabel`
-        // permits emoji and spaces), which fails OPEN — a wrong label
-        // that never converges — where this fails closed
-        // (zellij-pane-placement-and-cost).
+        // `rust-analyzer`. The listing keeps each pane's name. A name
+        // identifies an agent only against the roster and the ownership
+        // record, inside the repo's workspace, and is refused when it
+        // reads as two candidates: a bare title would let any pane named
+        // like an agent pass (zellij-pane-placement-and-cost).
         //
         // Cost is bounded by WHEN this runs: a converged pass returns
         // on its first listing and never reaches here, so the second
         // read is paid only by passes that actually changed something.
-        let snap = crate::cli::open_zellij::snapshot_panes()?;
-        Some((
-            crate::cli::open_zellij::agent_pane_pairs(&snap, self.repo),
-            crate::cli::open_zellij::reviewers_are_stacked(&snap, self.repo, reviewers),
-        ))
+        Some(self.snapshot(candidates)?.verified(self.repo, reviewers))
+    }
+    fn unclaimed(&mut self, snap: &Self::Snap) -> Labels {
+        snap.unclaimed(self.repo, self.caller.as_deref())
+    }
+    fn owned(&mut self) -> Result<Option<Labels>, String> {
+        crate::cli::pane_owners::load(self.repo).map_err(|e| format!("{e:#}"))
+    }
+    fn reown(&mut self, own: &Labels, disown: &Labels) -> Result<(), String> {
+        crate::cli::pane_owners::update(self.repo, own, disown)
+            .map(drop)
+            .map_err(|e| format!("{e:#}"))
     }
     fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String> {
-        crate::cli::open_zellij::pass_focus_target(snap)
+        crate::cli::open_zellij::pass_focus_target(&snap.panes)
     }
     fn restore_focus(&mut self, id: &str) {
         crate::cli::open_zellij::focus_pane(id);
     }
     fn add(&mut self, label: &str, snap: &Self::Snap) -> Option<String> {
-        crate::cli::open_zellij::open_agent_pane(self.repo, label, snap)
+        crate::cli::open_zellij::open_agent_pane(self.repo, label, &snap.panes, &snap.ws)
     }
     fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
-        crate::cli::open_zellij::reviewers_are_stacked(snap, self.repo, reviewers)
+        snap.stacked(self.repo, reviewers)
     }
     fn tab_of(&mut self, snap: &Self::Snap, caller: &str) -> Option<u32> {
-        crate::cli::open_zellij::owned_tab(snap, caller)
+        crate::cli::open_zellij::owned_tab(&snap.panes, caller)
     }
     fn compose(&mut self, master: &str, reviewers: &[String], snap: &Self::Snap) -> Option<String> {
-        let tab = crate::cli::open_zellij::repo_tab_id(snap, self.repo)?;
-        let orientation = crate::cli::open_zellij::tab_orientation(snap, self.repo, tab);
+        let orientation = crate::cli::open_zellij::tab_orientation(&snap.panes, snap.ws.tab());
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         crate::cli::open_zellij::compose_live_layout(
             self.repo,
@@ -609,22 +747,20 @@ impl PaneIo for ZellijPaneIo<'_> {
         .ok()
     }
     fn override_layout(&mut self, kdl: &str, snap: &Self::Snap) -> bool {
-        let Some(tab) = crate::cli::open_zellij::repo_tab_id(snap, self.repo) else {
-            return false;
-        };
-        crate::cli::open_zellij::override_tab_layout(self.repo, tab, kdl)
+        crate::cli::open_zellij::override_tab_layout(self.repo, snap.ws.tab(), kdl)
     }
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
-        crate::cli::open_zellij::remove_reviewer_panes(self.repo, labels, snap);
+        crate::cli::open_zellij::remove_reviewer_panes(labels, &snap.panes, &snap.ws);
     }
     fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
-        crate::cli::open_zellij::live_agent_labels(snap, self.repo)
+        snap.live_labels()
     }
     fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
-        crate::cli::open_zellij::agent_panes_by_command(snap, self.repo)
+        crate::cli::open_zellij::agent_panes_by_title(&snap.panes, &snap.ws)
     }
     fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
-        let panes = crate::cli::open_zellij::live_agent_labels(snap, self.repo);
+        let mut panes = snap.live_labels();
+        panes.extend(snap.seen().ambiguous_labels());
         let Ok(configs) = crate::agent_store::load_all_agent_configs(self.repo) else {
             return Default::default();
         };
@@ -676,7 +812,90 @@ impl PaneReconciler {
             failed_repairs: 0,
             failing: None,
             pending: std::collections::BTreeMap::new(),
+            ownership_error: None,
+            unclaimed: Labels::new(),
+            withheld: Default::default(),
         }
+    }
+
+    /// The ownership record as this pass reads it, noting why when it
+    /// cannot be read.
+    fn read_owned(&mut self, io: &mut impl PaneIo) -> Result<Option<Labels>, String> {
+        let record = io.owned();
+        self.ownership_error = record.as_ref().err().cloned();
+        record
+    }
+
+    /// Bring the ownership record up to what this pass established.
+    ///
+    /// A label is owned once its pane is created, and adopted when a
+    /// roster label's pane is seen. A label is dropped only on an
+    /// answered, verified listing (`seen`) that shows no pane of it, no
+    /// ambiguous pane naming it, and no creation of it still pending;
+    /// roster labels are never dropped, since a pane opened elsewhere may
+    /// not be listed yet and the roster makes them candidates anyway.
+    /// An unreadable record is left as it is, and nothing is written
+    /// when nothing changes.
+    fn settle_ownership(
+        &mut self,
+        cur: &RosterView,
+        record: &Result<Option<Labels>, String>,
+        seen: Option<&Seen>,
+        created: &Labels,
+        io: &mut impl PaneIo,
+    ) {
+        let Ok(known) = record else {
+            return;
+        };
+        let known = known.clone().unwrap_or_default();
+        let mut own = created.clone();
+        let mut disown = Labels::new();
+        if let Some(seen) = seen {
+            let ambiguous = seen.ambiguous_labels();
+            let listed: Labels = seen.pairs.iter().map(|(l, _)| l.clone()).collect();
+            own.extend(listed.iter().filter(|l| cur.labels.contains(*l)).cloned());
+            disown = known
+                .iter()
+                .filter(|l| {
+                    !cur.labels.contains(*l)
+                        && !listed.contains(*l)
+                        && !ambiguous.contains(*l)
+                        && !self.pending.contains_key(*l)
+                })
+                .cloned()
+                .collect();
+        }
+        own.retain(|l| !known.contains(l));
+        if own.is_empty() && disown.is_empty() {
+            return;
+        }
+        self.ownership_error = io.reown(&own, &disown).err();
+    }
+
+    /// What the operator should be told about pane ownership, if anything.
+    fn ownership_notice(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        let (labels, doubts) = &self.withheld;
+        if !labels.is_empty() {
+            let names: Vec<String> = labels.iter().map(|l| format!("`{l}`")).collect();
+            parts.push(format!(
+                "{}: not opened, since a pane may already be theirs ({}); rename it to one \
+                 agent's label",
+                names.join(", "),
+                crate::cli::open_zellij::describe_ambiguities(doubts)
+            ));
+        }
+        if !self.unclaimed.is_empty() {
+            let names: Vec<String> = self.unclaimed.iter().map(|l| format!("`{l}`")).collect();
+            parts.push(format!(
+                "{}: not on roster, not closed (no pane-ownership record says clank opened it)",
+                names.join(", ")
+            ));
+        }
+        if let Some(e) = &self.ownership_error {
+            parts.push(format!("pane-ownership record: {e}"));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
 
     /// Fold creations this reconciler has not yet seen listed into the
@@ -691,14 +910,15 @@ impl PaneReconciler {
     /// Believed panes are reported NOT staged: the layout that places
     /// them runs after the adds, so `false` is what a listing would say
     /// about a pane created this pass.
-    fn believe_pending(&mut self, live: &[(String, bool)]) -> Vec<(String, bool)> {
-        self.confirm_listed(live);
+    fn believe_pending(&mut self, seen: &Seen) -> Seen {
+        self.confirm_listed(&seen.pairs);
         self.pending.retain(|_, left| {
             *left = left.saturating_sub(1);
             *left > 0
         });
-        let mut out = live.to_vec();
-        out.extend(self.pending.keys().map(|l| (l.clone(), false)));
+        let mut out = seen.clone();
+        out.pairs
+            .extend(self.pending.keys().map(|l| (l.clone(), false)));
         out
     }
 
@@ -752,18 +972,35 @@ impl PaneReconciler {
         if self.converged.as_ref() == Some(&cur) {
             return false;
         }
+        let record = self.read_owned(io);
+        let candidates = ownership_candidates(&cur, &record);
         // Listing failure → touch nothing AND stay unconverged, so the
         // next refresh retries (acting on a partial listing would
         // re-open every pane; forgetting the event would drop it).
-        let Some(mut snap) = io.snapshot() else {
+        let Some(mut snap) = io.snapshot(&candidates) else {
             return false;
         };
-        let plan = plan_panes(&cur, &self.believe_pending(&io.pairs(&snap)));
+        self.unclaimed = match &record {
+            Ok(Some(_)) => Labels::new(),
+            _ => io.unclaimed(&snap),
+        };
+        let listed = io.seen(&snap);
+        let plan = plan_panes(&cur, &self.believe_pending(&listed));
+        self.withheld = (
+            plan.withheld.clone(),
+            listed
+                .ambiguous
+                .iter()
+                .filter(|a| !a.candidates.is_disjoint(&plan.withheld))
+                .cloned()
+                .collect(),
+        );
         let reviewers = cur.reviewers();
         // Every label present AND placed: nothing to do, and no
         // re-layout — an override on a tab that is already right
         // would only move the user's focus for nothing.
         if plan.is_converged() && io.is_placed(&reviewers, &snap) {
+            self.settle_ownership(&cur, &record, Some(&listed), &Labels::new(), io);
             self.converged = Some(cur);
             return false;
         }
@@ -780,11 +1017,13 @@ impl PaneReconciler {
             io.remove_all(&plan.remove, &snap);
         }
         let mut membership_changed = !plan.remove.is_empty();
+        let mut created = Labels::new();
         for label in &plan.add {
             if io.add(label, &snap).is_some() {
                 // Believed live until a listing confirms it, so the
                 // next pass cannot open this label a second time.
                 self.pending.insert(label.clone(), PENDING_CREATE_PASSES);
+                created.insert(label.clone());
                 membership_changed = true;
             }
         }
@@ -793,7 +1032,7 @@ impl PaneReconciler {
         // listing is refreshed after any membership change and the
         // roster is intersected with it. A refresh that fails leaves
         // the pass to verify and retry.
-        if membership_changed && let Some(fresh) = io.snapshot() {
+        if membership_changed && let Some(fresh) = io.snapshot(&candidates) {
             snap = fresh;
         }
         self.apply_layout(&cur, io, &snap);
@@ -804,12 +1043,18 @@ impl PaneReconciler {
         // Converged only when a VERIFYING read confirms the target
         // state — every action above is best-effort, so observation is
         // not achievement.
-        let verified = io.verify(&reviewers);
-        if let Some((after, _)) = &verified {
-            self.confirm_listed(after);
+        let verified = io.verify(&candidates, &reviewers);
+        if let Some(v) = &verified {
+            self.confirm_listed(&v.seen.pairs);
         }
-        if verified.is_some_and(|(after, placed)| placed && plan_panes(&cur, &after).is_converged())
-        {
+        self.settle_ownership(
+            &cur,
+            &record,
+            verified.as_ref().map(|v| &v.seen),
+            &created,
+            io,
+        );
+        if verified.is_some_and(|v| v.placed && plan_panes(&cur, &v.seen).is_converged()) {
             self.note_success();
             self.converged = Some(cur);
         } else if self.note_failure(&cur) {
@@ -871,10 +1116,17 @@ impl PaneReconciler {
         if !cur.labels.contains(label) {
             return ReopenOutcome::NotOnRoster;
         }
-        let Some(mut snap) = io.snapshot() else {
+        let record = self.read_owned(io);
+        let candidates = ownership_candidates(cur, &record);
+        let Some(mut snap) = io.snapshot(&candidates) else {
             return ReopenOutcome::NoListing;
         };
-        let mut plan = plan_panes(cur, &self.believe_pending(&io.pairs(&snap)));
+        let seen = io.seen(&snap);
+        let doubts = seen.doubts(label);
+        if !doubts.is_empty() {
+            return ReopenOutcome::Ambiguous(doubts);
+        }
+        let mut plan = plan_panes(cur, &self.believe_pending(&seen));
         if !plan.add.iter().any(|l| l == label) {
             if io.live_labels(&snap).contains(label) {
                 return ReopenOutcome::AlreadyOpen;
@@ -886,11 +1138,11 @@ impl PaneReconciler {
             // Close it and list again — `add` finds panes by that same
             // identity and would otherwise decline to make one.
             io.remove_all(&[label.to_string()], &snap);
-            let Some(fresh) = io.snapshot() else {
+            let Some(fresh) = io.snapshot(&candidates) else {
                 return ReopenOutcome::NoListing;
             };
             snap = fresh;
-            plan = plan_panes(cur, &self.believe_pending(&io.pairs(&snap)));
+            plan = plan_panes(cur, &self.believe_pending(&io.seen(&snap)));
             if !plan.add.iter().any(|l| l == label) {
                 return ReopenOutcome::NotCreated;
             }
@@ -909,11 +1161,12 @@ impl PaneReconciler {
         }
         self.pending
             .insert(label.to_string(), PENDING_CREATE_PASSES);
+        self.settle_ownership(cur, &record, None, &Labels::from([label.to_string()]), io);
         // The layout may only name what is running, and the new pane is
         // not in the pass-start listing: list again, then apply. A
         // reopened master is staged by the same override that stacks a
         // reopened reviewer.
-        if let Some(fresh) = io.snapshot() {
+        if let Some(fresh) = io.snapshot(&candidates) {
             snap = fresh;
         }
         self.apply_layout(cur, io, &snap);
@@ -923,11 +1176,12 @@ impl PaneReconciler {
         // claim a placement the tab does not show. A master belongs on
         // the stage; a reviewer belongs in the stack. The same read-back
         // confirms the label, so the belief does not outlive the pane.
-        let placed = io.verify(&reviewers).is_some_and(|(after, stacked)| {
-            self.confirm_listed(&after);
-            after
+        let placed = io.verify(&candidates, &reviewers).is_some_and(|v| {
+            self.confirm_listed(&v.seen.pairs);
+            v.seen
+                .pairs
                 .iter()
-                .any(|(l, staged)| l == label && (if as_master { *staged } else { stacked }))
+                .any(|(l, staged)| l == label && (if as_master { *staged } else { v.placed }))
         });
         if let Some(id) = &focus {
             io.restore_focus(id);
@@ -987,18 +1241,27 @@ impl<I: PaneIo> Observed<'_, I> {
 
 impl<I: PaneIo> PaneIo for Observed<'_, I> {
     type Snap = I::Snap;
-    fn snapshot(&mut self) -> Option<Self::Snap> {
-        let s = self.inner.snapshot();
+    fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
+        let s = self.inner.snapshot(candidates);
         self.note(s.is_some());
         s
     }
-    fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
-        self.inner.pairs(snap)
+    fn seen(&mut self, snap: &Self::Snap) -> Seen {
+        self.inner.seen(snap)
     }
-    fn verify(&mut self, reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)> {
-        let v = self.inner.verify(reviewers);
+    fn verify(&mut self, candidates: &Labels, reviewers: &[String]) -> Option<Verified> {
+        let v = self.inner.verify(candidates, reviewers);
         self.note(v.is_some());
         v
+    }
+    fn unclaimed(&mut self, snap: &Self::Snap) -> Labels {
+        self.inner.unclaimed(snap)
+    }
+    fn owned(&mut self) -> Result<Option<Labels>, String> {
+        self.inner.owned()
+    }
+    fn reown(&mut self, own: &Labels, disown: &Labels) -> Result<(), String> {
+        self.inner.reown(own, disown)
     }
     fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String> {
         self.inner.capture_focus(snap)
@@ -1165,6 +1428,9 @@ pub(super) enum Report {
     /// A change in the labels whose bound process outlived its pane.
     Lost(std::collections::BTreeSet<String>),
     Reopened(String, ReopenOutcome),
+    /// A change in what the operator should be told about pane
+    /// ownership.
+    Ownership(Option<String>),
 }
 
 /// The worker's per-batch state: the reconciler AND the retitler,
@@ -1186,6 +1452,8 @@ struct WorkerState {
     /// The glyphs the last answered listing retitled with. A refresh
     /// that brings the same glyphs again is no reason to list.
     listed_for: Option<StatusGlyphs>,
+    /// The ownership notice last reported.
+    ownership: Option<String>,
 }
 
 impl WorkerState {
@@ -1198,6 +1466,7 @@ impl WorkerState {
             tab: TabMirror::new(caller),
             glyphs: None,
             listed_for: None,
+            ownership: None,
         }
     }
 
@@ -1275,7 +1544,16 @@ impl WorkerState {
         }
         let retitle = self.glyphs.is_some() && self.glyphs != self.listed_for;
         let listed = probe || retitle;
-        let listing = if listed { io.snapshot() } else { None };
+        let listing = if listed {
+            let record = io.owned();
+            let candidates = match &self.last_roster {
+                Some(view) => ownership_candidates(view, &record),
+                None => record.ok().flatten().unwrap_or_default(),
+            };
+            io.snapshot(&candidates)
+        } else {
+            None
+        };
         if let (true, Some(g)) = (listed, &self.glyphs) {
             let rows = listing.as_ref().map(|snap| io.title_rows(snap));
             self.panes.update_with(g, rows, rename);
@@ -1298,6 +1576,11 @@ impl WorkerState {
                 self.lost = lost.clone();
                 reports.push(Report::Lost(lost));
             }
+        }
+        let ownership = self.reconciler.ownership_notice();
+        if ownership != self.ownership {
+            self.ownership = ownership.clone();
+            reports.push(Report::Ownership(ownership));
         }
         reports
     }
@@ -1326,6 +1609,8 @@ pub(super) struct ReconcileWorker {
     /// Reopen answers not yet handed to the loop — the worker's, and
     /// those that needed no worker (there is none outside zellij).
     answered: Vec<(String, ReopenOutcome)>,
+    /// The last ownership notice the worker reported.
+    ownership: Option<String>,
 }
 
 impl ReconcileWorker {
@@ -1347,6 +1632,7 @@ impl ReconcileWorker {
                 presence: None,
                 lost: Default::default(),
                 answered: Vec::new(),
+                ownership: None,
             };
         }
         let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
@@ -1355,9 +1641,13 @@ impl ReconcileWorker {
         let mut arm = runtime.attach_worker(tx.clone());
         let join = std::thread::spawn(move || {
             let mut watches = Watches::default();
-            let mut state = WorkerState::new(crate::cli::open_zellij::caller_pane_id());
+            let caller = crate::cli::open_zellij::caller_pane_id();
+            let mut state = WorkerState::new(caller.clone());
             let mut tabs = ZellijTabIo;
-            let io = ZellijPaneIo { repo: &repo };
+            let io = ZellijPaneIo {
+                repo: &repo,
+                caller,
+            };
             let seen = std::cell::Cell::new(None);
             let mut io = Observed {
                 inner: io,
@@ -1410,6 +1700,7 @@ impl ReconcileWorker {
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
+            ownership: None,
         }
     }
 
@@ -1422,6 +1713,7 @@ impl ReconcileWorker {
                     Report::Presence(live) => self.presence = live,
                     Report::Lost(lost) => self.lost = lost,
                     Report::Reopened(label, outcome) => self.answered.push((label, outcome)),
+                    Report::Ownership(notice) => self.ownership = notice,
                 }
             }
         }
@@ -1446,6 +1738,13 @@ impl ReconcileWorker {
     pub(super) fn lost(&mut self) -> std::collections::BTreeSet<String> {
         self.drain();
         self.lost.clone()
+    }
+
+    /// What the operator should be told about pane ownership, as of the
+    /// last report.
+    pub(super) fn ownership_notice(&mut self) -> Option<String> {
+        self.drain();
+        self.ownership.clone()
     }
 
     /// Ask the worker to list panes now. Non-blocking.
@@ -1779,6 +2078,7 @@ mod tests {
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
+            ownership: None,
         };
         assert_eq!(w.reach(), ZellijReach::NotInSession);
     }
@@ -1797,6 +2097,7 @@ mod tests {
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
+            ownership: None,
         };
         // Nothing reported yet: the last value stands, and this must
         // not wait for a report that is never coming.
@@ -1892,13 +2193,21 @@ mod tests {
         pairs.iter().map(|(l, m)| (l.to_string(), *m)).collect()
     }
 
+    /// A listing of `pairs` with no ambiguous pane.
+    fn clear(pairs: Vec<(String, bool)>) -> Seen {
+        Seen {
+            pairs,
+            ambiguous: Vec::new(),
+        }
+    }
+
     #[test]
     fn plan_adds_missing_members_and_removes_stale_panes() {
         // Live panes lag the roster in both directions: `new` has no
         // pane yet, `gone` has a pane but left the roster.
         let plan = plan_panes(
             &view(&["claude", "codex", "new"], Some("claude")),
-            &live(&[("claude", true), ("codex", false), ("gone", false)]),
+            &clear(live(&[("claude", true), ("codex", false), ("gone", false)])),
         );
         assert_eq!(plan.add, vec!["new".to_string()]);
         assert_eq!(plan.remove, vec!["gone".to_string()]);
@@ -1910,7 +2219,7 @@ mod tests {
     fn plan_converged_state_is_a_no_op() {
         let plan = plan_panes(
             &view(&["claude", "codex"], Some("claude")),
-            &live(&[("codex", false), ("claude", true)]),
+            &clear(live(&[("codex", false), ("claude", true)])),
         );
         assert!(plan.is_converged());
     }
@@ -1922,7 +2231,7 @@ mod tests {
         // reconciler must see the re-layout from the geometry.
         let plan = plan_panes(
             &view(&["claude", "codex"], Some("codex")),
-            &live(&[("claude", true), ("codex", false)]),
+            &clear(live(&[("claude", true), ("codex", false)])),
         );
         assert_eq!(plan.add, Vec::<String>::new());
         assert_eq!(plan.remove, Vec::<String>::new());
@@ -1939,7 +2248,7 @@ mod tests {
         // converges in the stack.
         let plan = plan_panes(
             &view(&["codex"], Some("codex")),
-            &live(&[("claude", true), ("codex", false)]),
+            &clear(live(&[("claude", true), ("codex", false)])),
         );
         assert_eq!(plan.remove, vec!["claude".to_string()]);
         assert_eq!(
@@ -1955,7 +2264,7 @@ mod tests {
         // be staged, with no stale occupant to name.
         let plan = plan_panes(
             &view(&["claude", "codex"], Some("claude")),
-            &live(&[("claude", false), ("codex", false)]),
+            &clear(live(&[("claude", false), ("codex", false)])),
         );
         assert_eq!(plan.relocate, Some(("claude".to_string(), None)));
         assert!(!plan.is_converged());
@@ -1971,7 +2280,7 @@ mod tests {
             live(&[("codex", true), ("claude", true)]),
             live(&[("claude", true), ("codex", true)]),
         ] {
-            let plan = plan_panes(&view(&["claude", "codex"], Some("codex")), &lv);
+            let plan = plan_panes(&view(&["claude", "codex"], Some("codex")), &clear(lv));
             assert_eq!(
                 plan.relocate,
                 Some(("codex".to_string(), Some("claude".to_string()))),
@@ -1989,7 +2298,11 @@ mod tests {
         // duplicated layout never verifies as converged.
         let plan = plan_panes(
             &view(&["claude", "codex"], Some("claude")),
-            &live(&[("claude", true), ("codex", false), ("codex", false)]),
+            &clear(live(&[
+                ("claude", true),
+                ("codex", false),
+                ("codex", false),
+            ])),
         );
         assert_eq!(plan.add, Vec::<String>::new());
         assert_eq!(plan.remove, vec!["codex".to_string()]);
@@ -2031,6 +2344,10 @@ mod tests {
         /// run out, `owner`.
         owners: std::collections::VecDeque<Option<u32>>,
         owner: Option<u32>,
+        /// The ownership record as `owned` reads it.
+        record: Result<Option<Labels>, String>,
+        /// Every `reown` call, as `(own, disown)`.
+        reowns: Vec<(Labels, Labels)>,
     }
 
     /// The repo every fake composes for. Composition needs a path
@@ -2066,6 +2383,8 @@ mod tests {
                 compose_fails: false,
                 owners: std::collections::VecDeque::new(),
                 owner: None,
+                record: Ok(Some(Labels::new())),
+                reowns: Vec::new(),
             }
         }
 
@@ -2077,20 +2396,37 @@ mod tests {
 
     impl PaneIo for FakeIo {
         type Snap = Vec<(String, bool)>;
-        fn snapshot(&mut self) -> Option<Self::Snap> {
+        fn snapshot(&mut self, _: &Labels) -> Option<Self::Snap> {
             self.snapshots_taken += 1;
             self.snaps.pop_front().unwrap_or(None)
         }
-        fn pairs(&mut self, snap: &Self::Snap) -> Vec<(String, bool)> {
-            snap.clone()
+        fn seen(&mut self, snap: &Self::Snap) -> Seen {
+            clear(snap.clone())
         }
-        fn verify(&mut self, _reviewers: &[String]) -> Option<(Vec<(String, bool)>, bool)> {
+        fn verify(&mut self, _: &Labels, _reviewers: &[String]) -> Option<Verified> {
             self.verifies_taken += 1;
             let placed = self.verify_placed.pop_front().unwrap_or(true);
             self.verifies
                 .pop_front()
                 .unwrap_or(None)
-                .map(|p| (p, placed))
+                .map(|pairs| Verified {
+                    seen: clear(pairs),
+                    placed,
+                })
+        }
+        fn unclaimed(&mut self, _: &Self::Snap) -> Labels {
+            Labels::new()
+        }
+        fn owned(&mut self) -> Result<Option<Labels>, String> {
+            self.record.clone()
+        }
+        fn reown(&mut self, own: &Labels, disown: &Labels) -> Result<(), String> {
+            self.reowns.push((own.clone(), disown.clone()));
+            let mut now = self.record.clone()?.unwrap_or_default();
+            now.extend(own.iter().cloned());
+            now.retain(|l| !disown.contains(l));
+            self.record = Ok(Some(now));
+            Ok(())
         }
         fn capture_focus(&mut self, _snap: &Self::Snap) -> Option<String> {
             self.focus_captures += 1;
@@ -2433,7 +2769,7 @@ mod tests {
                     };
                     (
                         label.to_string(),
-                        format!("{emoji} {}", agent_pane_title(label, role)),
+                        format!("{emoji} {}", agent_pane_title(label)),
                     )
                 })
                 .collect(),
@@ -3200,11 +3536,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (
-                    "terminal_claude".to_string(),
-                    "R claude (reviewer)".to_string()
-                ),
-                ("terminal_codex".to_string(), "M codex (master)".to_string()),
+                ("terminal_claude".to_string(), "R claude".to_string()),
+                ("terminal_codex".to_string(), "M codex".to_string()),
             ]
         );
     }
@@ -3523,6 +3856,7 @@ mod tests {
             presence: None,
             lost: Default::default(),
             answered: Vec::new(),
+            ownership: None,
         };
         w.reopen("r1");
         assert_eq!(
@@ -3604,49 +3938,70 @@ mod tests {
         );
     }
 
+    /// The retitler's map, from a listing as zellij reports it: the
+    /// workspace's panes whose names read as a candidate, in any form a
+    /// build wrote. A plugin, a pane in another tab, and a name that is
+    /// no candidate are left out.
     #[test]
-    fn agent_panes_by_command_from_a_live_listing() {
-        // `list-panes --json --command` as zellij reports it; the
-        // retitler's map is by LAUNCH COMMAND, never by title — a
-        // title is what this map is about to overwrite.
+    fn the_retitlers_map_is_the_workspaces_named_panes() {
         let panes: Vec<crate::cli::open_zellij::ZellijPane> = serde_json::from_str(
             r#"[
-              {"id":0,"is_plugin":true,"title":"(.) - zellij:link"},
-              {"id":0,"is_plugin":false,"title":"stale (reviewer)","terminal_command":"clank agent start claude --repo /r"},
-              {"id":1,"is_plugin":false,"title":"👀 codex (reviewer)","terminal_command":"clank agent start codex --repo /r"},
-              {"id":2,"is_plugin":false,"title":"status","terminal_command":"clank status --repo /r --tui"},
-              {"id":3,"is_plugin":false,"title":"ruthless (reviewer)","terminal_command":"clank agent start ruthless --repo /other"}
+              {"id":0,"is_plugin":true,"title":"(.) - zellij:link","tab_id":0},
+              {"id":0,"title":"claude (master)","terminal_command":"clank agent start claude --repo /r","tab_id":0},
+              {"id":1,"title":"👀 codex (reviewer)","tab_id":0},
+              {"id":2,"title":"","terminal_command":"clank status --repo /r --tui","tab_id":0},
+              {"id":3,"title":"ruthless","tab_id":1},
+              {"id":4,"title":"zsh","tab_id":0}
             ]"#,
         )
         .unwrap();
+        let ws = crate::cli::open_zellij::Workspace::anchored(
+            &panes,
+            std::path::Path::new("/r"),
+            ["claude", "codex", "ruthless"].map(String::from).into(),
+        )
+        .unwrap();
         assert_eq!(
-            crate::cli::open_zellij::agent_panes_by_command(&panes, std::path::Path::new("/r")),
+            crate::cli::open_zellij::agent_panes_by_title(&panes, &ws),
             vec![
                 ("terminal_0".to_string(), "claude".to_string()),
                 ("terminal_1".to_string(), "codex".to_string()),
             ],
-            "the stale title on terminal_0 says nothing; the other repo's pane is not ours"
         );
     }
 
-    /// The worker owns pane titles and titles each from the roster
-    /// role: a standby agent's pane says so, not `reviewer`, whatever
-    /// its creation-time stamp was.
+    /// A role change rewrites the glyph and nothing else, so the title
+    /// still names the same agent.
     #[test]
-    fn a_standby_agents_pane_is_titled_standby() {
-        let mut s = crate::cli::status_tui::fixtures::two_agent_snap();
-        s.master = Some("claude".into());
+    fn a_role_change_rewrites_only_the_glyph() {
+        let mut s = crate::cli::status_tui::fixtures::with_agents(
+            crate::cli::status_tui::fixtures::snap(
+                Some(crate::cli::status_tui::fixtures::plan_state(
+                    "p",
+                    crate::cli::status_tui::fixtures::reviewer_missing("codex"),
+                )),
+                vec![],
+            ),
+            &[
+                ("claude", crate::cli::teams_config::RosterRole::Master),
+                ("codex", crate::cli::teams_config::RosterRole::Commit),
+            ],
+        );
+        let title = |s: &StatusSnapshot| StatusGlyphs::of(s).titles["codex"].clone();
+        let reviewing = title(&s);
         s.agents[1].role = crate::cli::teams_config::RosterRole::Standby;
-        let mut titled = Vec::new();
-        PaneStatus::new().update_with(
-            &StatusGlyphs::of(&s),
-            Some(vec![("1".to_string(), "codex".to_string())]),
-            |id, title| titled.push((id.to_string(), title.to_string())),
-        );
+        let standby = title(&s);
         assert_eq!(
-            titled,
-            [("1".to_string(), "💤 codex (standby)".to_string())]
+            (reviewing.as_str(), standby.as_str()),
+            ("👀 codex", "💤 codex")
         );
+        let roster: Labels = ["claude", "codex"].map(String::from).into();
+        for t in [&reviewing, &standby] {
+            assert_eq!(
+                crate::cli::open_zellij::resolve_title(t, &roster),
+                crate::cli::open_zellij::PaneIdentity::Agent("codex".into())
+            );
+        }
     }
 
     #[test]
@@ -3776,10 +4131,329 @@ mod tests {
         assert_eq!(
             renames.borrow().as_slice(),
             &[
-                ("terminal_0".to_string(), "R claude (reviewer)".to_string()),
-                ("terminal_1".to_string(), "M codex (master)".to_string()),
+                ("terminal_0".to_string(), "R claude".to_string()),
+                ("terminal_1".to_string(), "M codex".to_string()),
             ]
         );
+    }
+
+    /// A zellij whose session is a list of panes the test writes, read
+    /// through the real workspace and name resolution, with the
+    /// ownership record a real file. Closing removes panes from the
+    /// list; opening adds one named for its label, unless `lagging`, when
+    /// the pane is created but never listed.
+    struct ListingIo {
+        repo: tempfile::TempDir,
+        record: std::path::PathBuf,
+        panes: Vec<serde_json::Value>,
+        next_id: u32,
+        lagging: bool,
+        closed: Vec<String>,
+        opened: Vec<String>,
+    }
+
+    /// The TUI's own pane, whose tab is the workspace.
+    const TUI_PANE: &str = "terminal_1";
+
+    impl ListingIo {
+        /// Tab 0 holds this repo's TUI pane and `titles` as panes
+        /// `terminal_2…`; tab 1 holds another repo's TUI pane and its own
+        /// `painter`.
+        fn with(titles: &[&str]) -> Self {
+            let repo = tempfile::tempdir().unwrap();
+            let record = repo.path().join("pane-owners.json");
+            let mut panes = vec![serde_json::json!({
+                "id": 1, "title": "", "tab_id": 0,
+                "terminal_command": format!("clank tui --repo {}", repo.path().display()),
+            })];
+            let mut next_id = 2;
+            for title in titles {
+                panes.push(serde_json::json!({"id": next_id, "title": title, "tab_id": 0}));
+                next_id += 1;
+            }
+            panes.push(serde_json::json!({
+                "id": 50, "title": "", "tab_id": 1,
+                "terminal_command": "clank tui --repo /elsewhere",
+            }));
+            panes.push(serde_json::json!({"id": 51, "title": "painter", "tab_id": 1}));
+            Self {
+                repo,
+                record,
+                panes,
+                next_id,
+                lagging: false,
+                closed: Vec::new(),
+                opened: Vec::new(),
+            }
+        }
+
+        fn own(&self, labels: &[&str]) {
+            let labels: Labels = labels.iter().map(|l| l.to_string()).collect();
+            crate::cli::pane_owners::update_at(&self.record, &labels, &Labels::new()).unwrap();
+        }
+
+        fn recorded(&self) -> Option<Labels> {
+            crate::cli::pane_owners::load_at(&self.record).unwrap()
+        }
+
+        fn ids(&self) -> Vec<String> {
+            self.panes
+                .iter()
+                .map(|p| format!("terminal_{}", p["id"]))
+                .collect()
+        }
+    }
+
+    impl PaneIo for ListingIo {
+        type Snap = Scoped;
+        fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
+            let panes =
+                serde_json::from_value(serde_json::Value::Array(self.panes.clone())).unwrap();
+            Scoped::of(panes, self.repo.path(), Some(TUI_PANE), candidates)
+        }
+        fn seen(&mut self, snap: &Self::Snap) -> Seen {
+            snap.seen()
+        }
+        fn verify(&mut self, candidates: &Labels, _: &[String]) -> Option<Verified> {
+            let snap = self.snapshot(candidates)?;
+            Some(Verified {
+                seen: snap.seen(),
+                placed: true,
+            })
+        }
+        fn unclaimed(&mut self, snap: &Self::Snap) -> Labels {
+            snap.unclaimed(self.repo.path(), Some(TUI_PANE))
+        }
+        fn owned(&mut self) -> Result<Option<Labels>, String> {
+            crate::cli::pane_owners::load_at(&self.record).map_err(|e| format!("{e:#}"))
+        }
+        fn reown(&mut self, own: &Labels, disown: &Labels) -> Result<(), String> {
+            crate::cli::pane_owners::update_at(&self.record, own, disown)
+                .map(drop)
+                .map_err(|e| format!("{e:#}"))
+        }
+        fn capture_focus(&mut self, _: &Self::Snap) -> Option<String> {
+            None
+        }
+        fn restore_focus(&mut self, _: &str) {}
+        fn add(&mut self, label: &str, _: &Self::Snap) -> Option<String> {
+            let id = self.next_id;
+            self.next_id += 1;
+            if !self.lagging {
+                self.panes
+                    .push(serde_json::json!({"id": id, "title": label, "tab_id": 0}));
+            }
+            self.opened.push(label.to_string());
+            Some(format!("terminal_{id}"))
+        }
+        fn is_placed(&mut self, _: &[String], _: &Self::Snap) -> bool {
+            true
+        }
+        fn compose(&mut self, _: &str, _: &[String], _: &Self::Snap) -> Option<String> {
+            None
+        }
+        fn override_layout(&mut self, _: &str, _: &Self::Snap) -> bool {
+            false
+        }
+        fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
+            let ids = crate::cli::open_zellij::remove_target_ids(labels, &snap.panes, &snap.ws);
+            self.panes
+                .retain(|p| !ids.contains(&format!("terminal_{}", p["id"])));
+            self.closed.extend(ids);
+        }
+        fn live_labels(&mut self, snap: &Self::Snap) -> Labels {
+            snap.live_labels()
+        }
+        fn title_rows(&mut self, snap: &Self::Snap) -> Vec<(String, String)> {
+            crate::cli::open_zellij::agent_panes_by_title(&snap.panes, &snap.ws)
+        }
+        fn lost_labels(&mut self, _: &Self::Snap) -> Labels {
+            Labels::new()
+        }
+    }
+
+    /// `painter` is recorded as owned and its pane `💤 painter`
+    /// (terminal_3) runs beside `claude`, a shell and an editor; another
+    /// repo's tab in the same session has a `painter` too. Removing
+    /// painter from the roster without renaming its pane closes exactly
+    /// terminal_3, and the read-back that shows it gone drops painter
+    /// from the record.
+    #[test]
+    fn a_removed_agents_pane_is_found_through_the_record_and_closed() {
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter", "zsh", "nvim notes"]);
+        io.own(&["claude", "painter"]);
+        PaneReconciler::new().reconcile(view(&["claude"], Some("claude")), &mut io);
+        assert_eq!(io.closed, ["terminal_3"]);
+        assert_eq!(
+            io.ids(),
+            [
+                "terminal_1",
+                "terminal_2",
+                "terminal_4",
+                "terminal_5",
+                "terminal_50",
+                "terminal_51"
+            ],
+            "the shell, the editor and the other repo's painter are untouched"
+        );
+        assert_eq!(io.recorded(), Some(["claude".to_string()].into()));
+    }
+
+    /// A whole-team replacement closes every old owned label's pane, opens
+    /// the new team's, and leaves the record holding the new team only.
+    #[test]
+    fn a_whole_team_replacement_closes_the_old_and_opens_the_new() {
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter (reviewer)", "zsh"]);
+        io.own(&["claude", "painter"]);
+        PaneReconciler::new().reconcile(view(&["ada", "bea"], Some("ada")), &mut io);
+        let mut closed = io.closed.clone();
+        closed.sort();
+        assert_eq!(closed, ["terminal_2", "terminal_3"]);
+        assert_eq!(io.opened, ["ada", "bea"]);
+        assert_eq!(io.recorded(), Some(["ada", "bea"].map(String::from).into()));
+    }
+
+    /// With no record, a pass adopts the roster's panes into one; after a
+    /// TUI restart (a new reconciler) that record still finds the pane of
+    /// an agent removed while no TUI ran, and closes it.
+    #[test]
+    fn after_a_restart_the_record_still_finds_a_stale_pane() {
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter"]);
+        assert_eq!(io.recorded(), None);
+        PaneReconciler::new().reconcile(view(&["claude", "painter"], Some("claude")), &mut io);
+        assert!(io.closed.is_empty());
+        assert_eq!(
+            io.recorded(),
+            Some(["claude", "painter"].map(String::from).into())
+        );
+        PaneReconciler::new().reconcile(view(&["claude"], Some("claude")), &mut io);
+        assert_eq!(io.closed, ["terminal_3"]);
+    }
+
+    /// With no record, nothing off the roster is claimed: the stale pane
+    /// is not closed, and the worker reports it as not on the roster and
+    /// not closed.
+    #[test]
+    fn without_a_record_a_stale_pane_is_reported_not_closed() {
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter"]);
+        let mut state = WorkerState::new(None);
+        let reports = state.handle(
+            wb(Some(view(&["claude"], Some("claude"))), None, Vec::new()),
+            &mut io,
+            |_, _| {},
+        );
+        assert!(io.closed.is_empty());
+        let notice = reports
+            .iter()
+            .find_map(|r| match r {
+                Report::Ownership(Some(n)) => Some(n.clone()),
+                _ => None,
+            })
+            .expect("an ownership notice");
+        assert!(
+            notice.contains("`painter`") && notice.contains("not on roster, not closed"),
+            "{notice}"
+        );
+        assert!(!notice.contains("`claude`"), "{notice}");
+    }
+
+    /// A pane opened for `painter` that no listing shows yet is not a
+    /// disappearance: removing painter from the roster while that
+    /// creation is still believed keeps painter in the record.
+    #[test]
+    fn a_creation_not_yet_listed_is_not_dropped_from_the_record() {
+        let mut io = ListingIo::with(&["🔨 claude"]);
+        io.lagging = true;
+        let mut r = PaneReconciler::new();
+        r.reconcile(view(&["claude", "painter"], Some("claude")), &mut io);
+        assert_eq!(io.opened, ["painter"]);
+        assert_eq!(
+            io.recorded(),
+            Some(["claude", "painter"].map(String::from).into())
+        );
+        r.reconcile(view(&["claude"], Some("claude")), &mut io);
+        assert!(
+            io.recorded().unwrap().contains("painter"),
+            "{:?}",
+            io.recorded()
+        );
+    }
+
+    /// Without the TUI's own pane or this repo's TUI pane in the listing
+    /// there is no workspace: an owned agent's pane off the roster is not
+    /// closed, a missing roster agent is not opened, and the record is
+    /// not touched.
+    #[test]
+    fn an_unresolved_workspace_is_never_acted_on() {
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter"]);
+        io.panes.retain(|p| p["id"] != 1);
+        io.own(&["claude", "painter"]);
+        PaneReconciler::new().reconcile(view(&["claude", "bea"], Some("claude")), &mut io);
+        assert!(io.closed.is_empty() && io.opened.is_empty());
+        assert_eq!(
+            io.recorded(),
+            Some(["claude", "painter"].map(String::from).into())
+        );
+    }
+
+    /// A pane whose name reads as two candidates is neither painter's nor
+    /// absent: it is not closed, and painter stays recorded.
+    #[test]
+    fn an_ambiguous_pane_is_not_a_disappearance() {
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter"]);
+        io.own(&["claude", "painter", "💤 painter"]);
+        PaneReconciler::new().reconcile(view(&["claude"], Some("claude")), &mut io);
+        assert!(io.closed.is_empty());
+        assert!(io.recorded().unwrap().contains("painter"));
+    }
+
+    /// A `💤 painter` pane beside a roster and record of `claude`,
+    /// `painter` and `💤 painter` may be either agent's, so a pass opens
+    /// neither, closes nothing, and says which pane is in doubt.
+    #[test]
+    fn an_ambiguous_pane_is_not_a_missing_one() {
+        let labels = ["claude", "painter", "💤 painter"];
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter"]);
+        io.own(&labels);
+        let mut state = WorkerState::new(None);
+        let reports = state.handle(
+            wb(Some(view(&labels, Some("claude"))), None, Vec::new()),
+            &mut io,
+            |_, _| {},
+        );
+        assert!(io.opened.is_empty(), "{:?}", io.opened);
+        assert!(io.closed.is_empty(), "{:?}", io.closed);
+        let notice = reports
+            .iter()
+            .find_map(|r| match r {
+                Report::Ownership(Some(n)) => Some(n.clone()),
+                _ => None,
+            })
+            .expect("an ownership notice");
+        assert!(
+            notice.contains("terminal_3")
+                && notice.contains("`painter`")
+                && notice.contains("`💤 painter`")
+                && notice.contains("not opened"),
+            "{notice}"
+        );
+    }
+
+    /// The per-agent reopen asks the same question: a pane that may be
+    /// painter's means none is opened, and the outcome names it.
+    #[test]
+    fn a_reopen_beside_an_ambiguous_pane_opens_nothing() {
+        let labels = ["claude", "painter", "💤 painter"];
+        let mut io = ListingIo::with(&["🔨 claude", "💤 painter"]);
+        io.own(&labels);
+        let out = PaneReconciler::new().reopen(&view(&labels, Some("claude")), "painter", &mut io);
+        let ReopenOutcome::Ambiguous(doubts) = &out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(doubts.len(), 1);
+        assert_eq!(doubts[0].pane, "terminal_3");
+        assert!(out.describe("painter").contains("terminal_3"));
+        assert!(io.opened.is_empty() && io.closed.is_empty());
     }
 
     fn launch(record: &str, pid: i32) -> PaneLaunch {

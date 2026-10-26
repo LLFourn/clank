@@ -1712,7 +1712,14 @@ impl TempRepo {
 #[cfg(test)]
 impl Drop for TempRepo {
     fn drop(&mut self) {
-        for ext in ["json", "lock", "status", "repair"] {
+        for ext in [
+            "json",
+            "lock",
+            "status",
+            "repair",
+            "pane-owners.json",
+            "pane-owners.lock",
+        ] {
             let _ = std::fs::remove_file(runtime_path(self.0.path(), ext));
         }
         // Mutation callers canonicalize even when a test's temp root has a

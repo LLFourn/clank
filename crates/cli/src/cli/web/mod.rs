@@ -86,7 +86,8 @@ impl Zellij {
         })?;
         if open_zellij::repo_tab_id(&panes, repo).is_none() {
             anyhow::bail!(
-                "session `{session}` holds none of {}'s panes — no status pane, no agent pane",
+                "session `{session}` does not hold exactly one TUI pane of {}, so its \
+                 workspace is unknown",
                 repo.display()
             );
         }
@@ -150,13 +151,47 @@ fn say_with(
     terminal(tool, &admitted)
 }
 
+impl Zellij {
+    fn scoped_table(&self, panes: &[open_zellij::ZellijPane]) -> Vec<PaneMeta> {
+        scoped_table(
+            panes,
+            &self.repo,
+            &crate::cli::pane_owners::roster_labels(&self.repo),
+            crate::cli::pane_owners::owned_labels(&self.repo),
+        )
+    }
+}
+
+/// The repo's agent panes in `panes` that the page shows and may type
+/// into: named within the workspace its TUI pane anchors against the
+/// roster AND the owned labels, then kept to the roster. Naming against
+/// the roster alone would read a removed agent's pane as a current
+/// agent's whenever its title also reads as one. A pane that reads as
+/// two candidates is nobody's. Empty when the workspace is unresolved.
+fn scoped_table(
+    panes: &[open_zellij::ZellijPane],
+    repo: &Path,
+    roster: &std::collections::BTreeSet<String>,
+    owned: std::collections::BTreeSet<String>,
+) -> Vec<PaneMeta> {
+    let mut candidates = roster.clone();
+    candidates.extend(owned);
+    let Some(ws) = open_zellij::Workspace::anchored(panes, repo, candidates) else {
+        return Vec::new();
+    };
+    open_zellij::agent_pane_table(panes, &ws)
+        .into_iter()
+        .filter(|meta| roster.contains(&meta.label))
+        .collect()
+}
+
 impl Panes for Zellij {
     fn session(&self) -> &str {
         &self.session
     }
     fn table(&self) -> Option<Vec<PaneMeta>> {
         let panes = open_zellij::snapshot_panes_in(&self.session)?;
-        Some(open_zellij::agent_pane_table(&panes, &self.repo))
+        Some(self.scoped_table(&panes))
     }
     fn subscribe(&self, ids: &[String]) -> Option<SubscribeChild> {
         open_zellij::subscribe_panes(&self.session, ids)
@@ -176,7 +211,7 @@ impl Panes for Zellij {
         let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {
             anyhow::anyhow!("zellij did not answer for session `{}`", self.session)
         })?;
-        let table = open_zellij::agent_pane_table(&panes, &self.repo);
+        let table = self.scoped_table(&panes);
         say_with(
             &self.repo,
             &table,
@@ -192,7 +227,7 @@ impl Panes for Zellij {
         let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {
             anyhow::anyhow!("zellij did not answer for session `{}`", self.session)
         })?;
-        let table = open_zellij::agent_pane_table(&panes, &self.repo);
+        let table = self.scoped_table(&panes);
         let tool = pane_tool(&self.repo, &table, pane)?;
         crate::cli::pane_input::stop_pane(&self.session, pane, tool)
     }
@@ -1303,6 +1338,52 @@ mod tests {
             )
             .is_err(),
             "a pane that is not an agent here"
+        );
+    }
+
+    /// `painter` is on the roster and `💤 painter` is recorded as owned but
+    /// off it, so a pane titled `💤 painter` may be either. It is not
+    /// published as painter, and neither `say` nor `stop` will treat it as
+    /// an agent to type into; claude's pane beside it still is one.
+    #[test]
+    fn a_pane_that_may_be_a_removed_agents_is_no_input_target() {
+        use super::*;
+        let repo = tempfile::tempdir().unwrap();
+        let panes: Vec<open_zellij::ZellijPane> = serde_json::from_str(&format!(
+            r#"[{{"id":1,"title":"","terminal_command":"clank tui --repo {}","tab_id":0}},
+                {{"id":2,"title":"🔨 claude","tab_id":0}},
+                {{"id":7,"title":"💤 painter","tab_id":0}}]"#,
+            repo.path().display()
+        ))
+        .unwrap();
+        let roster: std::collections::BTreeSet<String> =
+            ["claude", "painter"].map(String::from).into();
+        let table = scoped_table(
+            &panes,
+            repo.path(),
+            &roster,
+            ["💤 painter".to_string()].into(),
+        );
+        let published: Vec<(&str, &str)> = table
+            .iter()
+            .map(|m| (m.id.as_str(), m.label.as_str()))
+            .collect();
+        assert_eq!(published, [("terminal_2", "claude")]);
+        assert!(
+            pane_tool(repo.path(), &table, "terminal_7").is_err(),
+            "stop"
+        );
+        assert!(
+            say_with(
+                repo.path(),
+                &table,
+                "terminal_7",
+                "x",
+                |_, _| panic!("not an input target"),
+                |_, _| panic!("not an input target"),
+            )
+            .is_err(),
+            "say"
         );
     }
 

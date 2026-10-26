@@ -228,22 +228,38 @@ mod tests {
         }
     }
 
-    /// A pane as `list-panes --json` reports one, in `session`.
-    fn pane(session: &str, id: u32, command: &str, exited: bool) -> SessionPane {
+    /// A terminal pane as `list-panes --json --tab` reports one: `title`
+    /// in `tab` of `session`, running `command`.
+    fn pane(
+        session: &str,
+        id: u32,
+        tab: u32,
+        title: &str,
+        command: Option<&str>,
+        exited: bool,
+    ) -> SessionPane {
         SessionPane {
             session: session.into(),
             pane: serde_json::from_value(serde_json::json!({
                 "id": id,
+                "title": title,
                 "terminal_command": command,
+                "tab_id": tab,
+                "tab_name": format!("tab{tab}"),
                 "exited": exited,
             }))
             .unwrap(),
         }
     }
 
-    fn agent_pane(session: &str, id: u32, name: &str, exited: bool) -> SessionPane {
-        let cmd = open_zellij::agent_start_command(name, &repo().to_string_lossy());
-        pane(session, id, &cmd, exited)
+    /// `repo`'s TUI pane: the anchor of its workspace.
+    fn tui(session: &str, id: u32, tab: u32, repo: &Path) -> SessionPane {
+        let command = format!("clank tui --repo {}", repo.display());
+        pane(session, id, tab, "", Some(&command), false)
+    }
+
+    fn named(session: &str, id: u32, tab: u32, title: &str, exited: bool) -> SessionPane {
+        pane(session, id, tab, title, None, exited)
     }
 
     fn scan(panes: Vec<SessionPane>, unanswered: &[&str]) -> SessionScan {
@@ -254,21 +270,30 @@ mod tests {
         }
     }
 
-    /// The case the first draft of the plan got wrong: `clank open`
-    /// inside an existing session puts the repo's panes in THAT
-    /// session, so the conventional `clank-<basename>` name is not
-    /// where they are.
+    fn candidates(labels: &[&str]) -> std::collections::BTreeSet<String> {
+        labels.iter().map(|l| l.to_string()).collect()
+    }
+
+    fn find(scan: &SessionScan, name: &str) -> anyhow::Result<Found> {
+        locate(scan, repo(), &label(name), candidates(&["claude", "rev"]))
+    }
+
+    /// `clank open` inside an existing session puts the repo's tab in THAT
+    /// session, so the conventional `clank-<basename>` name is not where
+    /// it is: the TUI pane says where.
     #[test]
     fn a_pane_is_found_in_a_session_the_convention_does_not_name() {
-        let found = locate(
+        let found = find(
             &scan(
-                vec![agent_pane("someones-own-session", 3, "rev", false)],
+                vec![
+                    tui("someones-own-session", 1, 0, repo()),
+                    named("someones-own-session", 3, 0, "👀 rev", false),
+                ],
                 &[],
             ),
-            repo(),
-            &label("rev"),
+            "rev",
         )
-        .expect("a live pane is a target wherever it lives");
+        .expect("a live pane named for the agent is a target wherever it lives");
         assert_eq!(
             found,
             Found {
@@ -278,14 +303,62 @@ mod tests {
         );
     }
 
-    /// `launched_by` ignores exit state on purpose, so the naive
-    /// composition types into a corpse and zellij returns success.
+    /// A pane is its name: one started by hand as `rev` is found, and one
+    /// running rev's exact launch command under another name is not.
+    #[test]
+    fn a_pane_is_its_name_not_its_command() {
+        let launch = format!("clank agent start rev --repo {}", repo().display());
+        let renamed = scan(
+            vec![
+                tui("s", 1, 0, repo()),
+                pane("s", 3, 0, "editor", Some(&launch), false),
+            ],
+            &[],
+        );
+        let err = find(&renamed, "rev").unwrap_err().to_string();
+        assert!(err.contains("no pane named `rev`"), "{err}");
+        let by_hand = scan(
+            vec![
+                tui("s", 1, 0, repo()),
+                pane("s", 4, 0, "rev", Some("clank agent start rev"), false),
+            ],
+            &[],
+        );
+        assert_eq!(find(&by_hand, "rev").unwrap().pane, "terminal_4");
+    }
+
+    /// One session holds two repos' tabs, each with a `rev`: each repo
+    /// finds only the `rev` in its own tab.
+    #[test]
+    fn two_repos_in_one_session_each_find_their_own_pane() {
+        let other = Path::new("/w/other");
+        let both = scan(
+            vec![
+                tui("shared", 1, 0, repo()),
+                named("shared", 2, 0, "rev", false),
+                tui("shared", 5, 1, other),
+                named("shared", 6, 1, "rev", false),
+            ],
+            &[],
+        );
+        assert_eq!(find(&both, "rev").unwrap().pane, "terminal_2");
+        let theirs = locate(&both, other, &label("rev"), candidates(&["rev"])).unwrap();
+        assert_eq!(theirs.pane, "terminal_6");
+    }
+
+    /// An exited pane is still the agent's, so it is named, not typed into:
+    /// zellij would accept the keystrokes anyway.
     #[test]
     fn a_corpse_is_refused_and_named() {
-        let err = locate(
-            &scan(vec![agent_pane("clank-proj", 3, "rev", true)], &[]),
-            repo(),
-            &label("rev"),
+        let err = find(
+            &scan(
+                vec![
+                    tui("clank-proj", 1, 0, repo()),
+                    named("clank-proj", 3, 0, "rev", true),
+                ],
+                &[],
+            ),
+            "rev",
         )
         .unwrap_err()
         .to_string();
@@ -294,21 +367,65 @@ mod tests {
     }
 
     #[test]
-    fn two_live_panes_refuse_rather_than_pick() {
-        let err = locate(
+    fn two_live_panes_with_one_name_refuse_rather_than_pick() {
+        let err = find(
             &scan(
                 vec![
-                    agent_pane("clank-proj", 3, "rev", false),
-                    agent_pane("other", 9, "rev", false),
+                    tui("clank-proj", 1, 0, repo()),
+                    named("clank-proj", 3, 0, "rev", false),
+                    named("clank-proj", 9, 0, "💤 rev", false),
                 ],
                 &[],
             ),
-            repo(),
-            &label("rev"),
+            "rev",
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("clank-proj") && err.contains("other"), "{err}");
+        assert!(
+            err.contains("terminal_3") && err.contains("terminal_9"),
+            "{err}"
+        );
+    }
+
+    /// A title that reads as two candidates is refused as unknowable, not
+    /// read as bob being absent: it names the pane and what it reads as.
+    #[test]
+    fn an_ambiguous_title_is_no_target() {
+        let s = scan(
+            vec![tui("s", 1, 0, repo()), named("s", 3, 0, "💤 bob", false)],
+            &[],
+        );
+        let err = locate(&s, repo(), &label("bob"), candidates(&["bob", "💤 bob"]))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("no pane named"), "{err}");
+        assert!(
+            err.contains("cannot be known")
+                && err.contains("terminal_3")
+                && err.contains("`💤 bob`"),
+            "{err}"
+        );
+    }
+
+    /// A plainly-bob pane beside one that may also be bob is not a unique
+    /// target: the second may be another copy.
+    #[test]
+    fn a_unique_match_beside_an_ambiguous_pane_is_refused() {
+        let s = scan(
+            vec![
+                tui("s", 1, 0, repo()),
+                named("s", 3, 0, "bob", false),
+                named("s", 4, 0, "💤 bob", false),
+            ],
+            &[],
+        );
+        let err = locate(&s, repo(), &label("bob"), candidates(&["bob", "💤 bob"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("terminal_4") && err.contains("nothing was typed"),
+            "{err}"
+        );
     }
 
     /// The listing itself failing is not "no sessions".
@@ -321,12 +438,10 @@ mod tests {
     fn a_failed_listing_is_not_an_empty_one() {
         let blind = open_zellij::assemble_scan(None);
         assert!(blind.listing_failed);
-        let err = locate(&blind, repo(), &label("rev"))
-            .unwrap_err()
-            .to_string();
+        let err = find(&blind, "rev").unwrap_err().to_string();
         assert!(err.contains("not even whether there is one"), "{err}");
         assert!(
-            !err.contains("no pane for"),
+            !err.contains("no pane named"),
             "an unasked question is not a negative answer: {err}"
         );
     }
@@ -344,50 +459,68 @@ mod tests {
         assert!(!scan.listing_failed);
     }
 
-    /// A silent session could hold a second copy of the target, so one
-    /// visible match is not enough to act on.
+    /// A silent session could hold this repo's other tab, so one anchor
+    /// and one match are not enough to act on.
     #[test]
-    fn one_match_beside_a_silent_session_still_refuses() {
-        let err = locate(
-            &scan(vec![agent_pane("clank-proj", 3, "rev", false)], &["stale"]),
-            repo(),
-            &label("rev"),
+    fn one_workspace_beside_a_silent_session_still_refuses() {
+        let err = find(
+            &scan(
+                vec![
+                    tui("clank-proj", 1, 0, repo()),
+                    named("clank-proj", 3, 0, "rev", false),
+                ],
+                &["stale"],
+            ),
+            "rev",
         )
         .unwrap_err()
         .to_string();
         assert!(err.contains("stale"), "names what went unread: {err}");
-        assert!(err.contains("another"), "and why that matters: {err}");
+        assert!(err.contains("nothing was typed"), "{err}");
+    }
+
+    /// No TUI pane, or two, is no workspace: a pane named `rev` is then
+    /// nobody's target, and the refusal is not "unanswered".
+    #[test]
+    fn no_anchor_or_two_anchors_is_no_workspace() {
+        let none = find(&scan(vec![named("s", 3, 0, "rev", false)], &[]), "rev")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            none.contains("no session shows this repo's TUI pane"),
+            "{none}"
+        );
+        assert!(!none.contains("did not answer"), "{none}");
+        let two = find(
+            &scan(
+                vec![
+                    tui("a", 1, 0, repo()),
+                    named("a", 3, 0, "rev", false),
+                    tui("b", 1, 0, repo()),
+                ],
+                &[],
+            ),
+            "rev",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(two.contains("2 places"), "{two}");
     }
 
     /// "Nothing answered" must not read as "the agent is not there".
     #[test]
     fn nothing_found_reads_differently_when_a_session_went_unread() {
-        let quiet = locate(&scan(Vec::new(), &[]), repo(), &label("rev"))
+        let quiet = find(&scan(vec![tui("s", 1, 0, repo())], &[]), "rev")
             .unwrap_err()
             .to_string();
-        let unread = locate(&scan(Vec::new(), &["stale"]), repo(), &label("rev"))
+        let unread = find(&scan(Vec::new(), &["stale"]), "rev")
             .unwrap_err()
             .to_string();
-        assert!(quiet.contains("no pane"), "{quiet}");
+        assert!(quiet.contains("no pane named"), "{quiet}");
         assert!(
             !quiet.contains("did not answer"),
             "nothing was missed here: {quiet}"
         );
         assert!(unread.contains("did not answer"), "{unread}");
-        assert_ne!(quiet, unread, "the two must not be the same sentence");
-    }
-
-    /// Another repo's agent of the same name is not this one's: the
-    /// launch command carries the repo path.
-    #[test]
-    fn another_repos_pane_with_the_same_label_is_not_a_target() {
-        let theirs = pane(
-            "clank-proj",
-            3,
-            &open_zellij::agent_start_command("rev", "/w/other"),
-            false,
-        );
-        let err = locate(&scan(vec![theirs], &[]), repo(), &label("rev")).unwrap_err();
-        assert!(err.to_string().contains("no pane"), "{err}");
     }
 }

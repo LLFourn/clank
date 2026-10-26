@@ -17,7 +17,8 @@ use clank_core::agent_config::Session;
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::Tool;
 
-use crate::cli::open_zellij::{self, CallerIdentity, SessionPane};
+use crate::cli::open_zellij::{self, CallerIdentity, Lookup, SessionPane, SessionScan};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Holder {
@@ -31,6 +32,13 @@ pub(crate) enum Holder {
     Pane {
         session: String,
         tab: String,
+    },
+    /// A live pane in the repo's workspace may run this agent: its name
+    /// reads as this label and another, so neither "nobody" nor a holder
+    /// is known.
+    Uncertain {
+        session: String,
+        why: String,
     },
 }
 
@@ -60,33 +68,31 @@ const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Gather the listings and decide. Every probe is a read.
 ///
-/// `repo_arg` is the `--repo` the launching process was given, so the
-/// command searched for is byte-identical to the one in its own pane.
-/// `claude_program` is what the launch would exec, so a wrapper sees
-/// the listing request the same way it would see the launch.
+/// `session` is the agent's bound session, `None` for a fresh agent:
+/// then only a live pane can hold it. `claude_program` is what the
+/// launch would exec, so a wrapper sees the listing request the same way
+/// it would see the launch.
 pub(crate) fn find(
-    session: &Session,
+    session: Option<&Session>,
     label: &AgentLabel,
-    repo_arg: &str,
+    repo: &Path,
     claude_program: String,
 ) -> Holder {
-    let launch_command = open_zellij::agent_start_command(label.as_str(), repo_arg);
     let caller = open_zellij::caller_identity();
-    let panes = if caller == CallerIdentity::Unidentified {
-        Vec::new()
-    } else {
-        open_zellij::panes_in_all_sessions(SCAN_DEADLINE).panes
+    let scan = (caller != CallerIdentity::Unidentified)
+        .then(|| open_zellij::panes_in_all_sessions(SCAN_DEADLINE));
+    let claude = match session {
+        Some(s) if s.tool == Tool::Claude => claude_agents_listing(claude_program),
+        _ => Vec::new(),
     };
-    let claude = if session.tool == Tool::Claude {
-        claude_agents_listing(claude_program)
-    } else {
-        Vec::new()
-    };
+    let candidates = crate::cli::pane_owners::candidates(repo, label.as_str());
     decide(
-        session.id.as_str(),
-        &launch_command,
+        session.map(|s| s.id.as_str()),
+        label.as_str(),
+        repo,
+        candidates,
         &caller,
-        &panes,
+        scan.as_ref(),
         &claude,
     )
 }
@@ -104,41 +110,58 @@ pub(crate) fn claude_agents_listing(program: String) -> Vec<ClaudeSession> {
         .unwrap_or_default()
 }
 
-/// `launch_command` is the byte-exact `clank agent start …` string
-/// the agent's pane runs; a sibling worktree's pane differs in its
-/// `--repo` and so never matches.
+/// A pane holds `label` when it is a live pane named `label` in the
+/// repo's workspace, its panes named against `candidates`. A scan that
+/// resolves no workspace names no pane holder: that fails open, the
+/// launch of today.
 ///
-/// The caller's own pane is in `panes` too, so it is excluded by
+/// The caller's own pane is in the scan too, so it is excluded by
 /// (session, pane id). An unidentified caller inside zellij cannot be
-/// excluded, so the panes are not consulted at all — a match might be
-/// the caller, and refusing every launch is the worse error.
+/// excluded, so `scan` is `None` and panes are not consulted at all — a
+/// match might be the caller, and refusing every launch is the worse
+/// error.
 pub(crate) fn decide(
-    session_id: &str,
-    launch_command: &str,
+    session_id: Option<&str>,
+    label: &str,
+    repo: &Path,
+    candidates: std::collections::BTreeSet<String>,
     caller: &CallerIdentity,
-    panes: &[SessionPane],
+    scan: Option<&SessionScan>,
     claude: &[ClaudeSession],
 ) -> Holder {
-    if *caller != CallerIdentity::Unidentified {
+    if let Some(scan) = scan
+        && let Ok((session, ws)) = open_zellij::scan_workspace(scan, repo, candidates)
+    {
         let is_caller = |sp: &SessionPane| match caller {
             CallerIdentity::Pane { session, pane_id } => {
                 sp.session == *session && sp.pane.pane_id() == *pane_id
             }
             _ => false,
         };
-        if let Some(other) = panes
+        let others = scan
+            .panes
             .iter()
-            .find(|sp| sp.pane.runs(launch_command) && !is_caller(sp))
-        {
-            return Holder::Pane {
-                session: other.session.clone(),
-                tab: other.pane.tab_name().to_string(),
-            };
+            .filter(|sp| sp.session == session && !sp.pane.has_exited() && !is_caller(sp));
+        match ws.lookup(others, label) {
+            Lookup::Known(found) => {
+                if let Some(other) = found.first() {
+                    return Holder::Pane {
+                        session: other.session.clone(),
+                        tab: other.pane.tab_name().to_string(),
+                    };
+                }
+            }
+            Lookup::Uncertain(doubts) => {
+                return Holder::Uncertain {
+                    session,
+                    why: open_zellij::describe_ambiguities(&doubts),
+                };
+            }
         }
     }
     if let Some(short_id) = claude
         .iter()
-        .find(|c| c.kind == "background" && c.session_id == session_id)
+        .find(|c| c.kind == "background" && Some(c.session_id.as_str()) == session_id)
         .and_then(|c| c.id.clone())
     {
         return Holder::ClaudeBackground { short_id };
@@ -146,21 +169,69 @@ pub(crate) fn decide(
     Holder::Nobody
 }
 
+/// [`decide`] over one session's `list-panes --json` output, from its
+/// pane `caller`.
+#[cfg(test)]
+pub(crate) fn decide_over(
+    listing: &str,
+    caller: &str,
+    session_id: Option<&str>,
+    label: &str,
+    repo: &Path,
+    candidates: std::collections::BTreeSet<String>,
+) -> Holder {
+    let panes: Vec<open_zellij::ZellijPane> = serde_json::from_str(listing).unwrap();
+    let scan = SessionScan {
+        panes: panes
+            .into_iter()
+            .map(|pane| SessionPane {
+                session: "work".into(),
+                pane,
+            })
+            .collect(),
+        unanswered: Vec::new(),
+        listing_failed: false,
+    };
+    let caller = CallerIdentity::Pane {
+        session: "work".into(),
+        pane_id: caller.into(),
+    };
+    decide(
+        session_id,
+        label,
+        repo,
+        candidates,
+        &caller,
+        Some(&scan),
+        &[],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::open_zellij::ZellijPane;
 
-    const CMD: &str = "clank agent start codex --repo /r";
     const SESSION: &str = "01a04034-cebe-7c12-8595-99c9b9b9de9c";
+
+    fn repo() -> &'static Path {
+        Path::new("/r")
+    }
 
     /// A `list-panes --json --command --tab` element as zellij 0.45.0
     /// emits it, trimmed to the fields that vary here.
-    fn pane_json(id: u32, command: &str, exited: bool, tab: &str) -> String {
+    fn pane_json(id: u32, title: &str, exited: bool, tab: u32) -> String {
         format!(
             r#"{{"id":{id},"is_plugin":false,"is_focused":false,"exited":{exited},
-                "title":"codex (reviewer)","terminal_command":"{command}",
-                "tab_id":0,"tab_name":"{tab}","pane_x":0,"pane_y":0,"pane_columns":80,"pane_rows":24}}"#
+                "title":"{title}","terminal_command":"clank agent start codex --repo /r",
+                "tab_id":{tab},"tab_name":"t{tab}","pane_x":0,"pane_y":0,"pane_columns":80,"pane_rows":24}}"#
+        )
+    }
+
+    /// `repo`'s TUI pane in `tab`.
+    fn tui_json(id: u32, tab: u32, repo: &str) -> String {
+        format!(
+            r#"{{"id":{id},"title":"","terminal_command":"clank tui --repo {repo}","tab_id":{tab},"tab_name":"t{tab}"}}"#
         )
     }
 
@@ -176,6 +247,14 @@ mod tests {
             .collect()
     }
 
+    fn scan_of(panes: Vec<SessionPane>, unanswered: &[&str]) -> SessionScan {
+        SessionScan {
+            panes,
+            unanswered: unanswered.iter().map(|s| s.to_string()).collect(),
+            listing_failed: false,
+        }
+    }
+
     fn caller(session: &str, id: u32) -> CallerIdentity {
         CallerIdentity::Pane {
             session: session.into(),
@@ -183,102 +262,155 @@ mod tests {
         }
     }
 
+    fn holds(session: Option<&str>, caller: &CallerIdentity, scan: &SessionScan) -> Holder {
+        decide(
+            session,
+            "codex",
+            repo(),
+            ["claude", "codex"].map(String::from).into(),
+            caller,
+            Some(scan),
+            &[],
+        )
+    }
+
     #[test]
     fn a_lone_self_match_is_nobody() {
-        // The launching pane's own command is the one being searched
-        // for; a scan that does not know who is asking finds itself
-        // and refuses every fresh launch (codex on f125770).
-        let panes = listing("clank-r", &[pane_json(3, CMD, false, "r")]);
+        // The launching pane carries the agent's own name; a scan that
+        // does not know who is asking finds itself and refuses every
+        // fresh launch (codex on f125770).
+        let scan = scan_of(
+            listing(
+                "clank-r",
+                &[tui_json(1, 0, "/r"), pane_json(3, "codex", false, 0)],
+            ),
+            &[],
+        );
         assert_eq!(
-            decide(SESSION, CMD, &caller("clank-r", 3), &panes, &[]),
+            holds(Some(SESSION), &caller("clank-r", 3), &scan),
             Holder::Nobody
         );
     }
 
     #[test]
-    fn self_plus_another_names_the_other() {
-        let mut panes = listing("clank-r", &[pane_json(3, CMD, false, "r")]);
-        panes.extend(listing("clank-big", &[pane_json(9, CMD, false, "r-tab")]));
+    fn self_plus_another_in_the_workspace_names_the_other() {
+        let scan = scan_of(
+            listing(
+                "big",
+                &[
+                    tui_json(1, 4, "/r"),
+                    pane_json(3, "codex", false, 4),
+                    pane_json(9, "👀 codex", false, 4),
+                ],
+            ),
+            &[],
+        );
+        let pane = Holder::Pane {
+            session: "big".into(),
+            tab: "t4".into(),
+        };
+        assert_eq!(holds(Some(SESSION), &caller("big", 3), &scan), pane);
         assert_eq!(
-            decide(SESSION, CMD, &caller("clank-r", 3), &panes, &[]),
-            Holder::Pane {
-                session: "clank-big".into(),
-                tab: "r-tab".into()
-            }
+            holds(None, &caller("big", 3), &scan),
+            pane,
+            "a fresh agent too"
         );
     }
 
     #[test]
     fn the_same_pane_id_in_another_session_is_not_the_caller() {
-        let panes = listing("clank-big", &[pane_json(3, CMD, false, "r-tab")]);
-        assert_eq!(
-            decide(SESSION, CMD, &caller("clank-r", 3), &panes, &[]),
-            Holder::Pane {
-                session: "clank-big".into(),
-                tab: "r-tab".into()
-            }
+        let scan = scan_of(
+            listing(
+                "big",
+                &[tui_json(1, 0, "/r"), pane_json(3, "codex", false, 0)],
+            ),
+            &[],
         );
-    }
-
-    #[test]
-    fn an_unidentified_caller_does_not_consult_panes() {
-        let panes = listing("clank-big", &[pane_json(9, CMD, false, "r-tab")]);
-        assert_eq!(
-            decide(SESSION, CMD, &CallerIdentity::Unidentified, &panes, &[]),
-            Holder::Nobody
-        );
-    }
-
-    #[test]
-    fn outside_zellij_a_lone_match_anywhere_is_a_holder() {
-        let panes = listing("clank-big", &[pane_json(9, CMD, false, "r-tab")]);
-        assert_eq!(
-            decide(SESSION, CMD, &CallerIdentity::NotInZellij, &panes, &[]),
-            Holder::Pane {
-                session: "clank-big".into(),
-                tab: "r-tab".into()
-            }
-        );
-    }
-
-    #[test]
-    fn an_exited_pane_holds_nothing() {
-        // zellij keeps a pane open after its process ends and still
-        // reports its command; refusing over that corpse is the
-        // failure this exists to remove (codex on d38a63d).
-        let mut panes = listing("clank-r", &[pane_json(3, CMD, false, "r")]);
-        panes.extend(listing("clank-big", &[pane_json(9, CMD, true, "r-tab")]));
-        assert_eq!(
-            decide(SESSION, CMD, &caller("clank-r", 3), &panes, &[]),
-            Holder::Nobody
-        );
-        let alone = listing("clank-big", &[pane_json(9, CMD, true, "r-tab")]);
-        assert_eq!(
-            decide(SESSION, CMD, &CallerIdentity::NotInZellij, &alone, &[]),
-            Holder::Nobody
-        );
-        let live = listing("clank-big", &[pane_json(9, CMD, false, "r-tab")]);
         assert!(matches!(
-            decide(SESSION, CMD, &CallerIdentity::NotInZellij, &live, &[]),
+            holds(Some(SESSION), &caller("clank-r", 3), &scan),
             Holder::Pane { .. }
         ));
     }
 
     #[test]
-    fn another_repos_pane_with_the_same_label_does_not_count() {
-        let panes = listing(
-            "clank-big",
-            &[pane_json(
-                9,
-                "clank agent start codex --repo /r/.clank/worktrees/x",
-                false,
-                "x",
-            )],
-        );
+    fn an_unidentified_caller_does_not_consult_panes() {
         assert_eq!(
-            decide(SESSION, CMD, &CallerIdentity::NotInZellij, &panes, &[]),
+            decide(
+                Some(SESSION),
+                "codex",
+                repo(),
+                ["codex".to_string()].into(),
+                &CallerIdentity::Unidentified,
+                None,
+                &[],
+            ),
             Holder::Nobody
         );
+    }
+
+    #[test]
+    fn an_exited_pane_holds_nothing() {
+        // zellij keeps a pane open after its process ends; refusing over
+        // that corpse is the failure this exists to remove (codex on
+        // d38a63d).
+        let dead = scan_of(
+            listing(
+                "big",
+                &[tui_json(1, 0, "/r"), pane_json(9, "codex", true, 0)],
+            ),
+            &[],
+        );
+        assert_eq!(
+            holds(Some(SESSION), &CallerIdentity::NotInZellij, &dead),
+            Holder::Nobody
+        );
+    }
+
+    /// The same session holds two repos' tabs, each with a `codex`: the
+    /// other repo's is no holder of this one's.
+    #[test]
+    fn another_repos_tab_with_the_same_label_does_not_count() {
+        let scan = scan_of(
+            listing(
+                "shared",
+                &[
+                    tui_json(1, 0, "/r"),
+                    tui_json(5, 1, "/r/.clank/worktrees/x"),
+                    pane_json(9, "codex", false, 1),
+                ],
+            ),
+            &[],
+        );
+        assert_eq!(
+            holds(None, &CallerIdentity::NotInZellij, &scan),
+            Holder::Nobody
+        );
+    }
+
+    /// No workspace is resolved, so no pane refuses the start: no TUI
+    /// pane, two of them, or one beside a session that did not answer.
+    #[test]
+    fn an_unresolved_workspace_refuses_nothing() {
+        let live = pane_json(9, "codex", false, 0);
+        for scan in [
+            scan_of(listing("s", std::slice::from_ref(&live)), &[]),
+            scan_of(
+                listing(
+                    "s",
+                    &[tui_json(1, 0, "/r"), tui_json(2, 3, "/r"), live.clone()],
+                ),
+                &[],
+            ),
+            scan_of(
+                listing("s", &[tui_json(1, 0, "/r"), live.clone()]),
+                &["stale"],
+            ),
+        ] {
+            assert_eq!(
+                holds(None, &CallerIdentity::NotInZellij, &scan),
+                Holder::Nobody
+            );
+        }
     }
 
     /// Two entries of real `claude agents --json` output (2026-09-04),
@@ -290,18 +422,28 @@ mod tests {
          "sessionId":"7f4ce6a6-93b6-4a9b-8b8b-73dbd6e36bd4","name":"driver","status":"busy"}
     ]"#;
 
+    fn background(session: &str, scan: Option<&SessionScan>) -> Holder {
+        let claude = parse_claude_agents(CLAUDE_AGENTS.as_bytes());
+        decide(
+            Some(session),
+            "codex",
+            repo(),
+            ["codex".to_string()].into(),
+            &CallerIdentity::NotInZellij,
+            scan,
+            &claude,
+        )
+    }
+
     #[test]
     fn a_background_claude_session_is_attached_to() {
-        let claude = parse_claude_agents(CLAUDE_AGENTS.as_bytes());
-        assert_eq!(claude.len(), 2, "both kinds parse");
         assert_eq!(
-            decide(
-                "1f47fd71-2eb5-4f8c-9244-f74e5e4c7c69",
-                CMD,
-                &CallerIdentity::NotInZellij,
-                &[],
-                &claude
-            ),
+            parse_claude_agents(CLAUDE_AGENTS.as_bytes()).len(),
+            2,
+            "both kinds parse"
+        );
+        assert_eq!(
+            background("1f47fd71-2eb5-4f8c-9244-f74e5e4c7c69", None),
             Holder::ClaudeBackground {
                 short_id: "1f47fd71".into()
             }
@@ -310,26 +452,15 @@ mod tests {
 
     #[test]
     fn an_interactive_claude_entry_is_not_background() {
-        let claude = parse_claude_agents(CLAUDE_AGENTS.as_bytes());
         assert_eq!(
-            decide(
-                "7f4ce6a6-93b6-4a9b-8b8b-73dbd6e36bd4",
-                CMD,
-                &CallerIdentity::NotInZellij,
-                &[],
-                &claude
-            ),
+            background("7f4ce6a6-93b6-4a9b-8b8b-73dbd6e36bd4", None),
             Holder::Nobody
         );
     }
 
     #[test]
     fn a_session_absent_from_the_listing_or_an_unreadable_listing_is_nobody() {
-        let claude = parse_claude_agents(CLAUDE_AGENTS.as_bytes());
-        assert_eq!(
-            decide(SESSION, CMD, &CallerIdentity::NotInZellij, &[], &claude),
-            Holder::Nobody
-        );
+        assert_eq!(background(SESSION, None), Holder::Nobody);
         assert!(
             parse_claude_agents(b"'claude agents' requires an interactive terminal").is_empty()
         );
@@ -340,16 +471,15 @@ mod tests {
     fn a_live_pane_wins_over_a_background_entry() {
         // A pane still open elsewhere is the holder even if claude
         // also lists the session; attaching would not free the pane.
-        let claude = parse_claude_agents(CLAUDE_AGENTS.as_bytes());
-        let panes = listing("clank-big", &[pane_json(9, CMD, false, "r-tab")]);
-        assert!(matches!(
-            decide(
-                "1f47fd71-2eb5-4f8c-9244-f74e5e4c7c69",
-                CMD,
-                &CallerIdentity::NotInZellij,
-                &panes,
-                &claude
+        let scan = scan_of(
+            listing(
+                "big",
+                &[tui_json(1, 0, "/r"), pane_json(9, "codex", false, 0)],
             ),
+            &[],
+        );
+        assert!(matches!(
+            background("1f47fd71-2eb5-4f8c-9244-f74e5e4c7c69", Some(&scan)),
             Holder::Pane { .. }
         ));
     }

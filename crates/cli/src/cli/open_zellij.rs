@@ -134,6 +134,12 @@ trait OpenIo {
     fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()>;
     /// Every pane of every zellij session on the machine.
     async fn scan(&mut self) -> SessionScan;
+    /// Record that clank owns `repo`'s panes for `labels`.
+    fn own(
+        &mut self,
+        repo: &Path,
+        labels: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()>;
     /// Tell the person where something already is.
     fn report(&mut self, text: &str) {
         println!("{text}");
@@ -160,6 +166,29 @@ impl OpenIo for RealOpenIo {
 
     async fn scan(&mut self) -> SessionScan {
         panes_in_all_sessions_async(std::time::Duration::from_secs(3)).await
+    }
+
+    fn own(
+        &mut self,
+        repo: &Path,
+        labels: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        crate::cli::pane_owners::update(repo, labels, &std::collections::BTreeSet::new()).map(drop)
+    }
+}
+
+/// After a spawn that opened `repo`'s tab: its panes are clank's. A
+/// failure to say so is reported, not fatal: the tab is open, and the
+/// TUI adopts its roster's panes on its first pass.
+fn own_opened(io: &mut impl OpenIo, repo: &Path, master: &str, reviewers: &[String]) {
+    let labels = std::iter::once(master.to_string())
+        .chain(reviewers.iter().cloned())
+        .collect();
+    if let Err(e) = io.own(repo, &labels) {
+        io.report(&format!(
+            "warning: could not record that clank owns {}'s panes: {e:#}",
+            repo.display()
+        ));
     }
 }
 
@@ -470,7 +499,11 @@ async fn open_all(
     if let Some(pre) = &pre {
         let _ = io.spawn(pre);
     }
-    io.spawn(&spawn)
+    io.spawn(&spawn)?;
+    for tab in &tabs {
+        own_opened(io, Path::new(&tab.repo_path), &tab.master, &tab.reviewers);
+    }
+    Ok(())
 }
 
 /// Resolve target worktrees, each with the tab name it is given, to tab
@@ -691,6 +724,7 @@ async fn open_tab(
         let _ = io.spawn(pre);
     }
     io.spawn(&spawn_argv)?;
+    own_opened(io, &repo, &master_label, &reviewer_labels);
     Ok(tab)
 }
 
@@ -1447,14 +1481,7 @@ fn agent_group_kdl(
     };
     out.push_str(&format!("pane split_direction=\"{outer}\" {{\n"));
     // The stage.
-    push_agent_pane(
-        &mut out,
-        "    ",
-        " size=\"65%\"",
-        master,
-        "master",
-        repo_path,
-    );
+    push_agent_pane(&mut out, "    ", " size=\"65%\"", master, repo_path);
     // The side region: reviewer stack + instrument pane.
     out.push_str(&format!(
         "    pane size=\"35%\" split_direction=\"{inner}\" {{\n"
@@ -1464,14 +1491,7 @@ fn agent_group_kdl(
         ReviewerStack::Roster(reviewers) => {
             out.push_str("        pane stacked=true {\n");
             for reviewer in reviewers {
-                push_agent_pane(
-                    &mut out,
-                    "            ",
-                    "",
-                    reviewer.as_str(),
-                    "reviewer",
-                    repo_path,
-                );
+                push_agent_pane(&mut out, "            ", "", reviewer.as_str(), repo_path);
             }
             out.push_str("        }\n");
         }
@@ -1601,29 +1621,327 @@ pub(crate) fn validate_template(template: &str) -> anyhow::Result<()> {
     substitute_marker(template, "pane\n").map(|_| ())
 }
 
+/// The pane name for an agent: its label, and nothing else. The name is
+/// the pane's identity ([`resolve_title`]), so a role in it would go
+/// stale the moment the role changed. The single source of the format
+/// for every writer: the layout, `new-pane`, `clank as` and the TUI's
+/// glyph retitle.
+pub(crate) fn agent_pane_title(label: &str) -> String {
+    label.to_string()
+}
+
+/// The glyphs the TUI writes before an agent's pane name. Closed, so a
+/// title is read as `<glyph> <label>` only for these.
+pub(crate) const AGENT_PANE_GLYPHS: [&str; 3] = ["🔨", "💤", "👀"];
+
+/// The role words an old `<label> (<role>)` title may carry: the resolved
+/// roles earlier builds wrote, and the roster's tier words beside them.
+const OLD_TITLE_ROLES: [&str; 7] = [
+    "master", "reviewer", "standby", "commit", "plan", "final", "gate",
+];
+
+/// What a pane's title says about which agent it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneIdentity {
+    Agent(String),
+    /// The title reads as two or more distinct candidates. Refused, never
+    /// guessed: neither present nor absent.
+    Ambiguous(std::collections::BTreeSet<String>),
+    Unknown,
+}
+
+/// Every label `title` can be read as: the title itself, `<glyph>
+/// <label>`, and the old `<label> (<role>)` with or without a glyph.
+fn title_readings(title: &str) -> Vec<&str> {
+    let mut bare = vec![title];
+    bare.extend(
+        AGENT_PANE_GLYPHS
+            .iter()
+            .filter_map(|g| title.strip_prefix(g)?.strip_prefix(' ')),
+    );
+    let mut out = bare.clone();
+    for t in bare {
+        out.extend(
+            OLD_TITLE_ROLES
+                .iter()
+                .filter_map(|role| t.strip_suffix(')')?.strip_suffix(role)?.strip_suffix(" (")),
+        );
+    }
+    out
+}
+
+/// The one reading of a pane title as an agent: every reading that is a
+/// candidate is collected before choosing, so a literal label is never
+/// preferred over another label's decorated title.
+pub(crate) fn resolve_title(
+    title: &str,
+    candidates: &std::collections::BTreeSet<String>,
+) -> PaneIdentity {
+    let mut found: std::collections::BTreeSet<String> = title_readings(title)
+        .into_iter()
+        .filter(|r| candidates.contains(*r))
+        .map(str::to_string)
+        .collect();
+    match found.len() {
+        0 => PaneIdentity::Unknown,
+        1 => PaneIdentity::Agent(found.pop_first().expect("one")),
+        _ => PaneIdentity::Ambiguous(found),
+    }
+}
+
+/// A repo's workspace: one tab of one session, established by the repo's
+/// TUI pane (or, for the TUI itself, its own pane), never by the agent
+/// names it scopes. `candidates` are the labels a pane in it may be
+/// identified as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Workspace {
+    tab: u32,
+    candidates: std::collections::BTreeSet<String>,
+}
+
+impl Workspace {
+    /// The workspace of a listing that holds exactly one of `repo`'s TUI
+    /// panes. `None` for none, several, or one whose tab is not listed.
+    pub(crate) fn anchored(
+        panes: &[ZellijPane],
+        repo: &Path,
+        candidates: std::collections::BTreeSet<String>,
+    ) -> Option<Self> {
+        Some(Self {
+            tab: repo_tab_id(panes, repo)?,
+            candidates,
+        })
+    }
+
+    /// The TUI's workspace: the tab holding its own pane `caller` when
+    /// the listing names it, which needs no anchor, else
+    /// [`Self::anchored`].
+    pub(crate) fn local(
+        panes: &[ZellijPane],
+        repo: &Path,
+        caller: Option<&str>,
+        candidates: std::collections::BTreeSet<String>,
+    ) -> Option<Self> {
+        match caller.and_then(|c| owned_tab(panes, c)) {
+            Some(tab) => Some(Self { tab, candidates }),
+            None => Self::anchored(panes, repo, candidates),
+        }
+    }
+
+    pub(crate) fn tab(&self) -> u32 {
+        self.tab
+    }
+
+    /// What `pane` is in this workspace: `Unknown` outside its tab and for
+    /// plugin panes.
+    ///
+    /// EXIT STATE IS NOT CONSULTED, and every reader shares that rule. A
+    /// crashed agent's pane is still that agent's pane, so the reconciler
+    /// leaves it standing rather than opening a replacement: respawn is
+    /// MANUAL. Auto-respawn would relaunch a tool that just failed, and
+    /// one that refuses a second session straight back into that error on
+    /// every pass. What must not follow is a corpse outliving a live
+    /// duplicate, which is why [`remove_target_ids`] closes exited copies
+    /// first.
+    pub(crate) fn identify(&self, pane: &ZellijPane) -> PaneIdentity {
+        if pane.is_plugin || pane.tab_id != Some(self.tab) {
+            return PaneIdentity::Unknown;
+        }
+        resolve_title(&pane.title, &self.candidates)
+    }
+
+    /// The agent `pane` is, if exactly one. `None` is NOT absence: an
+    /// ambiguous pane is `None` too, so this only serves projections whose
+    /// callers are handed [`ambiguities`] beside them. A question about one
+    /// label is [`Self::lookup`].
+    fn agent_of(&self, pane: &ZellijPane) -> Option<String> {
+        match self.identify(pane) {
+            PaneIdentity::Agent(label) => Some(label),
+            _ => None,
+        }
+    }
+
+    fn ambiguity(&self, pane: &ZellijPane) -> Option<Ambiguity> {
+        match self.identify(pane) {
+            PaneIdentity::Ambiguous(candidates) => Some(Ambiguity {
+                pane: pane.pane_id(),
+                title: pane.title.clone(),
+                candidates,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `label`'s panes among `panes`, or the panes that could be its and
+    /// another's. Uncertain whenever any pane reads as `label` and another
+    /// candidate, even beside one that is plainly `label`'s: that pane may
+    /// be a second copy.
+    pub(crate) fn lookup<'a, P: AsPane + 'a>(
+        &self,
+        panes: impl IntoIterator<Item = &'a P>,
+        label: &str,
+    ) -> Lookup<'a, P> {
+        let mut found = Vec::new();
+        let mut doubts = Vec::new();
+        for item in panes {
+            let pane = item.as_pane();
+            match self.identify(pane) {
+                PaneIdentity::Agent(l) if l == label => found.push(item),
+                PaneIdentity::Ambiguous(c) if c.contains(label) => doubts.push(Ambiguity {
+                    pane: pane.pane_id(),
+                    title: pane.title.clone(),
+                    candidates: c,
+                }),
+                _ => {}
+            }
+        }
+        if doubts.is_empty() {
+            Lookup::Known(found)
+        } else {
+            Lookup::Uncertain(doubts)
+        }
+    }
+}
+
+/// A pane whose title reads as two or more candidates: it may be any of
+/// them, so it is evidence neither for nor against one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ambiguity {
+    pub(crate) pane: String,
+    pub(crate) title: String,
+    pub(crate) candidates: std::collections::BTreeSet<String>,
+}
+
+impl std::fmt::Display for Ambiguity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<String> = self.candidates.iter().map(|c| format!("`{c}`")).collect();
+        write!(
+            f,
+            "pane {} is titled `{}`, which reads as {}",
+            self.pane,
+            self.title,
+            names.join(" or ")
+        )
+    }
+}
+
+/// Every ambiguity, one sentence, for a refusal.
+pub(crate) fn describe_ambiguities(all: &[Ambiguity]) -> String {
+    all.iter()
+        .map(Ambiguity::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What a listing says about one label's panes.
+#[derive(Debug)]
+pub(crate) enum Lookup<'a, P> {
+    /// Every pane that is the label's, possibly none, and no pane that
+    /// might also be.
+    Known(Vec<&'a P>),
+    /// Some pane may or may not be the label's: neither absence nor a
+    /// unique match follows.
+    Uncertain(Vec<Ambiguity>),
+}
+
+/// One listed pane, from a session's own listing or a scan of them all.
+pub(crate) trait AsPane {
+    fn as_pane(&self) -> &ZellijPane;
+}
+
+impl AsPane for ZellijPane {
+    fn as_pane(&self) -> &ZellijPane {
+        self
+    }
+}
+
+impl AsPane for SessionPane {
+    fn as_pane(&self) -> &ZellijPane {
+        &self.pane
+    }
+}
+
+/// Why a scan of every session names no workspace for a repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unresolved {
+    ListingFailed,
+    /// These sessions did not answer; any could hold the repo's tab.
+    Unanswered(Vec<String>),
+    NoAnchor,
+    /// `(session, tab name)` of each TUI pane found.
+    ManyAnchors(Vec<(String, String)>),
+}
+
+impl std::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ListingFailed => f.write_str("zellij's sessions could not be listed"),
+            Self::Unanswered(s) => write!(
+                f,
+                "zellij session(s) {} did not answer, and any of them could hold this \
+                 repo's tab",
+                s.join(", ")
+            ),
+            Self::NoAnchor => f.write_str("no session shows this repo's TUI pane"),
+            Self::ManyAnchors(at) => write!(
+                f,
+                "this repo's TUI pane is open in {} places ({})",
+                at.len(),
+                at.iter()
+                    .map(|(s, t)| format!("session `{s}`, tab `{t}`"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }
+    }
+}
+
+/// The session and workspace `repo` has across every session `scan` saw.
+/// Uniqueness is only known from a complete scan: one anchor beside a
+/// session that did not answer is not unique.
+pub(crate) fn scan_workspace(
+    scan: &SessionScan,
+    repo: &Path,
+    candidates: std::collections::BTreeSet<String>,
+) -> Result<(String, Workspace), Unresolved> {
+    if scan.listing_failed {
+        return Err(Unresolved::ListingFailed);
+    }
+    if !scan.unanswered.is_empty() {
+        return Err(Unresolved::Unanswered(scan.unanswered.clone()));
+    }
+    let anchors: Vec<&SessionPane> = scan
+        .panes
+        .iter()
+        .filter(|sp| is_anchor(&sp.pane, repo))
+        .collect();
+    match anchors.as_slice() {
+        [] => Err(Unresolved::NoAnchor),
+        [one] => match one.pane.tab_id {
+            Some(tab) => Ok((one.session.clone(), Workspace { tab, candidates })),
+            None => Err(Unresolved::NoAnchor),
+        },
+        many => Err(Unresolved::ManyAnchors(
+            many.iter()
+                .map(|sp| (sp.session.clone(), sp.pane.tab_name.clone()))
+                .collect(),
+        )),
+    }
+}
+
 /// One agent pane. `cwd` is per-pane so the launched tool (e.g.
 /// `claude --resume`, which doesn't take a path argument) runs in
 /// the repo regardless of the shell that invoked
 /// `zellij --layout`; `--repo` pins clank-side resolution (codex
 /// 8075d43 + 361b104).
-/// The pane name for an agent: `"<label> (<role>)"`. The SINGLE
-/// source of this format — the zellij layout names panes with it here,
-/// and `clank tui` matches it to map panes back to agents
-/// (tui-agent-pane-status-emoji). A round-trip test pins the two
-/// together so the format can't drift silently.
-pub(crate) fn agent_pane_title(label: &str, role_str: &str) -> String {
-    format!("{label} ({role_str})")
-}
-
 fn push_agent_pane(
     out: &mut String,
     indent: &str,
     extra_attrs: &str,
     label: &str,
-    role_str: &str,
     repo_path: &str,
 ) {
-    let name_esc = kdl_escape(&agent_pane_title(label, role_str));
+    let name_esc = kdl_escape(&agent_pane_title(label));
     let repo_esc = kdl_escape(repo_path);
     out.push_str(&format!(
         "{indent}pane{extra_attrs} name=\"{name_esc}\" cwd=\"{repo_esc}\" {{\n"
@@ -1655,9 +1973,9 @@ pub(crate) fn agent_start_argv(label: &str, repo_path: &str) -> Vec<String> {
 
 /// The command string zellij reports as a pane's `terminal_command` when
 /// launched from [`agent_start_argv`]: `clank agent start <label> --repo
-/// <repo>`. This is an agent pane's UNIQUE identity within a session —
-/// the bare label repeats across worktree tabs, but the absolute
-/// `--repo` path disambiguates them.
+/// <repo>`. What a pane runs, not who it is: identity is the pane's name
+/// ([`Workspace::identify`]).
+#[cfg(test)]
 pub(crate) fn agent_start_command(label: &str, repo_path: &str) -> String {
     format!("clank {}", agent_start_argv(label, repo_path).join(" "))
 }
@@ -1683,10 +2001,13 @@ pub(crate) struct ZellijPane {
     is_focused: bool,
     /// The pane's process has ended (zellij holds the pane open with
     /// its exit code). Deliberately NOT part of identifying a pane —
-    /// see [`agent_pane_label`] — and used only to choose WHICH copy
+    /// see [`Workspace::identify`] — and used only to choose WHICH copy
     /// to close in [`remove_target_ids`].
     #[serde(default)]
     exited: bool,
+    /// The pane's name, which is the agent's identity.
+    #[serde(default)]
+    title: String,
     /// Present only with `--tab`; empty otherwise.
     #[serde(default)]
     tab_name: String,
@@ -1721,26 +2042,6 @@ impl ZellijPane {
         format!("{kind}_{}", self.id)
     }
 
-    /// Whether a RUNNING process in this pane was launched with exactly
-    /// `command`. `exited` matters here and nowhere else in identity: a
-    /// pane zellij keeps open after its process ended still reports the
-    /// command, and [`find_pane_by_command`] wants that (so a dead copy
-    /// can be found and closed), but a dead pane holds no session
-    /// (a-session-has-one-holder).
-    pub(crate) fn runs(&self, command: &str) -> bool {
-        self.launched_by(command) && !self.exited
-    }
-
-    /// Whether `command` LAUNCHED this pane, alive or not.
-    ///
-    /// Split from [`runs`] because a caller that reports absence has to
-    /// tell "this agent has no pane" from "its pane is a corpse": the
-    /// two need different words, and zellij accepts keystrokes typed at
-    /// either.
-    pub(crate) fn launched_by(&self, command: &str) -> bool {
-        !self.is_plugin && self.terminal_command.as_deref() == Some(command)
-    }
-
     pub(crate) fn has_exited(&self) -> bool {
         self.exited
     }
@@ -1750,55 +2051,11 @@ impl ZellijPane {
     }
 }
 
-/// The terminal pane whose running command is exactly `cmd`, if any.
-fn find_pane_by_command<'a>(panes: &'a [ZellijPane], cmd: &str) -> Option<&'a ZellijPane> {
-    panes
-        .iter()
-        .find(|p| !p.is_plugin && p.terminal_command.as_deref() == Some(cmd))
-}
-
-/// The agent label a pane runs for `repo_path`, parsed from the exact
-/// `clank agent start <label> --repo <path>` invocation
-/// [`agent_start_command`] composes. `None` for any other command
-/// shape or another repo's agents — the reconciler must only ever see
-/// THIS repo's panes (tui-zellij-pane-reconcile).
-///
-/// EXIT STATE IS NOT CONSULTED, and that is the single rule every
-/// reader shares — the idempotence guard in [`add_reviewer_pane`],
-/// the multiplicity count in `plan_panes`, and the removals. A
-/// crashed agent's pane is still that agent's pane, so the reconciler
-/// leaves it standing rather than opening a replacement: respawn is
-/// MANUAL, by design. Auto-respawn would relaunch a tool that just
-/// failed, and for one that refuses a second session
-/// (`already has an active writer`) it would relaunch it straight
-/// back into that error on every pass.
-///
-/// The cost is accepted: a crashed agent blocks its own replacement
-/// until someone acts. What must not follow is a corpse outliving a
-/// live duplicate, which is why [`remove_target_ids`] closes exited
-/// copies first.
-fn agent_pane_label<'a>(pane: &'a ZellijPane, repo_path: &str) -> Option<&'a str> {
-    if pane.is_plugin {
-        return None;
-    }
-    // Strip the KNOWN repo suffix rather than splitting at the first
-    // space: `AgentLabel` permits spaces (it forbids only empty,
-    // dot-segments and `/`), so a label like `two words` produced the
-    // exact command `clank agent start two words --repo /repo` and a
-    // first-space split read it as `two` with a tail that never
-    // matched. That agent was then permanently absent — and since
-    // verification now reads this same parser, permanently absent
-    // means reconciliation never converges (codex on 1fe53e0).
-    //
-    // Anchoring on both ends keeps what the split gave for free: a
-    // different repo does not match, and a trailing extra argument
-    // leaves the suffix un-terminal so it does not either.
-    let rest = pane
-        .terminal_command
-        .as_deref()?
-        .strip_prefix("clank agent start ")?;
-    let label = rest.strip_suffix(&format!(" --repo {repo_path}"))?;
-    (!label.is_empty()).then_some(label)
+/// Whether `pane` is `repo`'s TUI pane, the anchor of its workspace:
+/// `clank tui --repo <repo>` or the older `clank status --repo <repo>
+/// --tui`, the path compared canonically.
+fn is_anchor(pane: &ZellijPane, repo: &Path) -> bool {
+    pane_for(pane, repo) == Some(None)
 }
 
 /// One `--json` pane listing for a whole reconcile pass
@@ -1861,17 +2118,15 @@ pub(crate) struct PaneMeta {
     pub(crate) exited: bool,
 }
 
-/// This repo's agent panes from a listing, by label — the identity
-/// `agent_pane_label` reads off the launch command, never a title.
-pub(crate) fn agent_pane_table(panes: &[ZellijPane], repo: &Path) -> Vec<PaneMeta> {
-    let repo_str = repo.to_string_lossy();
+/// The workspace's agent panes from a listing, by label.
+pub(crate) fn agent_pane_table(panes: &[ZellijPane], ws: &Workspace) -> Vec<PaneMeta> {
     let mut out: Vec<PaneMeta> = panes
         .iter()
         .filter_map(|p| {
-            let label = agent_pane_label(p, &repo_str)?;
+            let label = ws.agent_of(p)?;
             Some(PaneMeta {
                 id: p.pane_id(),
-                label: label.to_string(),
+                label,
                 columns: p.pane_columns,
                 rows: p.pane_rows,
                 exited: p.exited,
@@ -2063,19 +2318,18 @@ async fn run_pane_write(
     }
 }
 
-/// Project a pane listing to this repo's agents as `(label, staged)`
-/// — the label from the exact launch command, `staged` from GEOMETRY:
+/// Project a pane listing to the workspace's agents as `(label, staged)`
+/// — the label from the pane's name, `staged` from GEOMETRY:
 /// the pane holding the most cells of any agent pane in its tab is
 /// the one on the stage. Titles used to answer this and were a second
 /// source of truth for who is master — stamped by one path, parsed by
 /// another, and wrong after alt+[ re-applied a stale swap. Where a
 /// pane sits is what the layout decides and what the read-back checks
 /// (placement-is-a-layout-applied-not-panes-shuffled). Pure.
-pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String, bool)> {
-    let repo_str = repo.to_string_lossy();
-    let mine: Vec<(&ZellijPane, &str)> = panes
+pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], ws: &Workspace) -> Vec<(String, bool)> {
+    let mine: Vec<(&ZellijPane, String)> = panes
         .iter()
-        .filter_map(|p| agent_pane_label(p, &repo_str).map(|l| (p, l)))
+        .filter_map(|p| ws.agent_of(p).map(|l| (p, l)))
         .collect();
     let area = |p: &ZellijPane| u32::from(p.pane_columns) * u32::from(p.pane_rows);
     mine.iter()
@@ -2084,49 +2338,61 @@ pub(crate) fn agent_pane_pairs(panes: &[ZellijPane], repo: &Path) -> Vec<(String
                 .iter()
                 .filter(|(o, _)| o.tab() == p.tab() && o.id != p.id)
                 .all(|(o, _)| area(o) < area(p));
-            (l.to_string(), biggest_in_tab && area(p) > 0)
+            (l.clone(), biggest_in_tab && area(p) > 0)
         })
         .collect()
 }
 
-/// `(pane id, label)` for every pane in the listing that is one of
-/// this repo's agents, by launch command. The retitler's map; the
-/// role each label has is the ROSTER's to say.
-pub(crate) fn agent_panes_by_command(panes: &[ZellijPane], repo: &Path) -> Vec<(String, String)> {
-    let repo_str = repo.to_string_lossy();
+/// `(pane id, label)` for every pane in the listing that is one of the
+/// workspace's agents. The retitler's map.
+pub(crate) fn agent_panes_by_title(panes: &[ZellijPane], ws: &Workspace) -> Vec<(String, String)> {
     panes
         .iter()
-        .filter_map(|p| agent_pane_label(p, &repo_str).map(|l| (p.pane_id(), l.to_owned())))
+        .filter_map(|p| ws.agent_of(p).map(|l| (p.pane_id(), l)))
         .collect()
 }
 
-/// This repo's instrument pane: `clank tui --repo <repo>`, or the
-/// `clank status --repo <repo> --tui` a session opened before the
-/// rename still runs — both are the TUI, and a reconciler that knew
-/// only the new spelling would treat every open session's pane as
-/// nobody's.
-pub(crate) fn is_status_pane(pane: &ZellijPane, repo_str: &str) -> bool {
-    !pane.is_plugin
-        && pane.terminal_command.as_deref().is_some_and(|c| {
-            c == format!("clank tui --repo {repo_str}")
-                || c == format!("clank status --repo {repo_str} --tui")
-        })
+/// The workspace's panes that read as two or more candidates: what the
+/// projections above leave out, which is not absence.
+pub(crate) fn ambiguities(panes: &[ZellijPane], ws: &Workspace) -> Vec<Ambiguity> {
+    panes.iter().filter_map(|p| ws.ambiguity(p)).collect()
 }
 
-/// The tab this repo's panes live in: the tab of its instrument pane,
-/// else of any of its agent panes. `None` when the session shows
-/// nothing of the repo's.
+/// The names of the workspace's terminal panes that read as a valid
+/// agent label no candidate claims: what clank sees and will not close.
+/// `repo`'s TUI pane and `caller` are not counted.
+pub(crate) fn unclaimed_labels(
+    panes: &[ZellijPane],
+    ws: &Workspace,
+    repo: &Path,
+    caller: Option<&str>,
+) -> std::collections::BTreeSet<String> {
+    panes
+        .iter()
+        .filter(|p| !p.is_plugin && p.tab_id == Some(ws.tab))
+        .filter(|p| !is_anchor(p, repo) && Some(p.pane_id().as_str()) != caller)
+        .filter(|p| ws.identify(p) == PaneIdentity::Unknown)
+        .filter_map(|p| {
+            title_readings(&p.title)
+                .into_iter()
+                .rev()
+                .find(|r| clank_core::ids::AgentLabel::parse(r).is_ok())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The tab of this listing's one TUI pane for `repo`. `None` for none,
+/// several, or one whose tab the listing does not say. Never inferred
+/// from agent panes: the workspace scopes the agent matcher, so it cannot
+/// depend on it.
 pub(crate) fn repo_tab_id(panes: &[ZellijPane], repo: &Path) -> Option<u32> {
-    let repo_str = repo.to_string_lossy();
-    panes
-        .iter()
-        .find(|p| is_status_pane(p, &repo_str))
-        .or_else(|| {
-            panes
-                .iter()
-                .find(|p| agent_pane_label(p, &repo_str).is_some())
-        })
-        .map(|p| p.tab())
+    let mut anchors = panes.iter().filter(|p| is_anchor(p, repo));
+    let one = anchors.next()?;
+    if anchors.next().is_some() {
+        return None;
+    }
+    one.tab_id
 }
 
 /// The tab's orientation: its SHAPE decides, the same rule
@@ -2155,30 +2421,25 @@ pub(crate) fn repo_tab_id(panes: &[ZellijPane], repo: &Path) -> Option<u32> {
 /// keys over the swap variants clank ships, so a manual flip still
 /// works and is still forgotten by the next re-layout, which returns
 /// the tab to the shape its size implies.
-pub(crate) fn tab_orientation(panes: &[ZellijPane], _repo: &Path, tab_id: u32) -> Orientation {
+pub(crate) fn tab_orientation(panes: &[ZellijPane], tab_id: u32) -> Orientation {
     Orientation::detect(tab_dims(panes, tab_id))
 }
 
-/// Open a pane for `label` in this repo's tab, running its launch
-/// command — its identity to every listing that follows. Placement is
-/// not attempted here: the layout applied afterwards puts it where it
-/// belongs. Focus only picks the TAB `new-pane` opens in. Returns the
-/// id zellij printed for the new pane, so the caller can believe it
-/// live before a listing lists it.
-pub(crate) fn open_agent_pane(repo: &Path, label: &str, panes: &[ZellijPane]) -> Option<String> {
+/// Open a pane for `label` in the workspace's tab, named for it — its
+/// identity to every listing that follows — and running its launch
+/// command. Placement is not attempted here: the layout applied
+/// afterwards puts it where it belongs. Focus only picks the TAB
+/// `new-pane` opens in. Returns the id zellij printed for the new pane,
+/// so the caller can believe it live before a listing lists it.
+pub(crate) fn open_agent_pane(
+    repo: &Path,
+    label: &str,
+    panes: &[ZellijPane],
+    ws: &Workspace,
+) -> Option<String> {
+    let in_tab = open_beside(panes, ws, label)?;
     let repo_str = repo.to_string_lossy();
-    if find_pane_by_command(panes, &agent_start_command(label, &repo_str)).is_some() {
-        return None;
-    }
-    let tab = repo_tab_id(panes, repo);
-    let in_tab = panes
-        .iter()
-        .find(|p| Some(p.tab()) == tab && !p.is_plugin)
-        .map(ZellijPane::pane_id)
-        .or_else(caller_pane_id);
-    if let Some(id) = &in_tab {
-        zellij_action(&["focus-pane-id", id]);
-    }
+    zellij_action(&["focus-pane-id", &in_tab]);
     let new_pane = new_pane_argv(label, &repo_str);
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
     let out = zellij_action(&refs)?;
@@ -2186,20 +2447,32 @@ pub(crate) fn open_agent_pane(repo: &Path, label: &str, panes: &[ZellijPane]) ->
     (!created.is_empty()).then_some(created)
 }
 
-/// This repo's agent labels with a LIVE pane: the process the launch
-/// command started is still running. [`agent_pane_pairs`] counts a
-/// pane zellij keeps open after its process ended — identity, so the
-/// corpse can be found and closed — but "is this agent open" is a
-/// question about the process (the-tui-knows-whether-a-pane-is-open).
+/// The pane of the workspace's tab to open `label`'s beside, when it has
+/// none, alive or not. A pane that might be `label`'s is not none.
+fn open_beside(panes: &[ZellijPane], ws: &Workspace, label: &str) -> Option<String> {
+    match ws.lookup(panes, label) {
+        Lookup::Known(found) if found.is_empty() => {}
+        _ => return None,
+    }
+    panes
+        .iter()
+        .find(|p| p.tab_id == Some(ws.tab) && !p.is_plugin)
+        .map(ZellijPane::pane_id)
+}
+
+/// The workspace's agent labels with a LIVE pane: the process in it is
+/// still running. [`agent_pane_pairs`] counts a pane zellij keeps open
+/// after its process ended — identity, so the corpse can be found and
+/// closed — but "is this agent open" is a question about the process
+/// (the-tui-knows-whether-a-pane-is-open).
 pub(crate) fn live_agent_labels(
     panes: &[ZellijPane],
-    repo: &Path,
+    ws: &Workspace,
 ) -> std::collections::BTreeSet<String> {
-    let repo_str = repo.to_string_lossy();
     panes
         .iter()
         .filter(|p| !p.exited)
-        .filter_map(|p| agent_pane_label(p, &repo_str).map(str::to_owned))
+        .filter_map(|p| ws.agent_of(p))
         .collect()
 }
 
@@ -2615,7 +2888,7 @@ fn new_pane_argv(label: &str, repo: &str) -> Vec<String> {
     let mut argv = vec!["new-pane".to_string()];
     argv.extend([
         "--name".to_string(),
-        agent_pane_title(label, "reviewer"),
+        agent_pane_title(label),
         "--cwd".to_string(),
         repo.to_string(),
         "--".to_string(),
@@ -2686,14 +2959,28 @@ pub(crate) fn owned_tab(panes: &[ZellijPane], caller: &str) -> Option<u32> {
 }
 
 pub(crate) fn rename_pane(id: &str, name: &str) {
+    let _ = rename_pane_checked(id, name);
+}
+
+/// Rename the pane `id` in this session, or say what zellij answered.
+pub(crate) fn rename_pane_checked(id: &str, name: &str) -> Result<(), String> {
     // `.output()` (NOT `.status()`): isolate the child's stdout/stderr
     // from the alt-screen — a stale pane id (closed between list-panes
     // and the rename) or any zellij hiccup must not bleed an error line
     // onto the TUI, which the event-driven loop would leave until the
     // next watcher event (ruthless 9c38523).
-    let _ = std::process::Command::new("zellij")
+    let out = std::process::Command::new("zellij")
         .args(["action", "rename-pane", "--pane-id", id, name])
-        .output();
+        .output()
+        .map_err(|e| format!("could not run zellij: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "zellij exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
 }
 
 /// zellij is the workspace, so `clank open` without it is a setup
@@ -2819,23 +3106,18 @@ fn tab_dims(panes: &[ZellijPane], tab_id: u32) -> (u16, u16) {
 /// empty `index_in_pane_group` — so geometry is the only signal.
 pub(crate) fn reviewers_are_stacked(
     panes: &[ZellijPane],
+    ws: &Workspace,
     repo: &Path,
     reviewers: &[String],
 ) -> bool {
-    let repo_str = repo.to_string_lossy();
     let mine: Vec<&ZellijPane> = panes
         .iter()
-        .filter(|p| {
-            agent_pane_label(p, &repo_str).is_some_and(|l| reviewers.iter().any(|r| r == l))
-        })
+        .filter(|p| ws.agent_of(p).is_some_and(|l| reviewers.contains(&l)))
         .collect();
     let Some(first) = mine.first() else {
         return true;
     };
-    let statuses: Vec<&ZellijPane> = panes
-        .iter()
-        .filter(|p| is_status_pane(p, &repo_str))
-        .collect();
+    let statuses: Vec<&ZellijPane> = panes.iter().filter(|p| is_anchor(p, repo)).collect();
     // A lone reviewer forms no stack of its own; the only question is
     // whether the instrument pane shares one WITH it — the reported
     // bug's first-reviewer form, in either shape.
@@ -2849,14 +3131,14 @@ pub(crate) fn reviewers_are_stacked(
     !statuses.iter().any(|st| inside_stack(st, first, &span))
 }
 
-/// Best-effort: close the panes of removed reviewers, matched by exact
-/// launch command in the pass's shared listing. `labels` is a MULTISET
+/// Best-effort: close the panes of removed reviewers, matched by name in
+/// the workspace of the pass's shared listing. `labels` is a MULTISET
 /// — duplicate entries close DISTINCT panes (the duplicate-pane plan
 /// entries; codex 5d498d0). Closing kills each pane's process tree —
 /// that is the agent-exit guarantee. Focus restoration is the worker's
 /// pass-level transaction.
-pub(crate) fn remove_reviewer_panes(repo: &Path, labels: &[String], panes: &[ZellijPane]) {
-    for id in remove_target_ids(labels, panes, &repo.to_string_lossy()) {
+pub(crate) fn remove_reviewer_panes(labels: &[String], panes: &[ZellijPane], ws: &Workspace) {
+    for id in remove_target_ids(labels, panes, ws) {
         zellij_action(&["close-pane", "--pane-id", &id]);
     }
 }
@@ -2864,7 +3146,11 @@ pub(crate) fn remove_reviewer_panes(repo: &Path, labels: &[String], panes: &[Zel
 /// The DISTINCT pane ids the remove multiset resolves to: each label
 /// occurrence consumes one matching pane, so duplicate labels map to
 /// different panes (codex 4df5f0c). Pure.
-fn remove_target_ids(labels: &[String], panes: &[ZellijPane], repo_path: &str) -> Vec<String> {
+pub(crate) fn remove_target_ids(
+    labels: &[String],
+    panes: &[ZellijPane],
+    ws: &Workspace,
+) -> Vec<String> {
     let mut budget: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for l in labels {
         *budget.entry(l.as_str()).or_default() += 1;
@@ -2879,10 +3165,10 @@ fn remove_target_ids(labels: &[String], panes: &[ZellijPane], repo_path: &str) -
     // closed the budget covers them all and this just reorders ids.
     for exited_first in [true, false] {
         for pane in panes.iter().filter(|p| p.exited == exited_first) {
-            let Some(label) = agent_pane_label(pane, repo_path) else {
+            let Some(label) = ws.agent_of(pane) else {
                 continue;
             };
-            let Some(n) = budget.get_mut(label) else {
+            let Some(n) = budget.get_mut(label.as_str()) else {
                 continue;
             };
             if *n == 0 {
@@ -3078,12 +3364,36 @@ fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
 
+    /// The name clank gives the pane a test describes by its launch
+    /// command; empty for any other command.
+    fn title_for(cmd: &str) -> String {
+        cmd.strip_prefix("clank agent start ")
+            .and_then(|rest| rest.split(" --repo ").next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The workspace of `panes`' first pane's tab, with each pane's title,
+    /// stripped of glyph and role, as a candidate.
+    fn every(panes: &[ZellijPane]) -> Workspace {
+        Workspace {
+            tab: panes[0].tab_id.expect("fixture pane has a tab"),
+            candidates: panes
+                .iter()
+                .filter_map(|p| title_readings(&p.title).last().map(|r| r.to_string()))
+                .filter(|t| !t.is_empty())
+                .collect(),
+        }
+    }
+
     #[derive(Default)]
     struct FakeOpenIo {
         replies: std::collections::VecDeque<anyhow::Result<QueryOutput>>,
         calls: Vec<(&'static str, Vec<String>)>,
         scan: SessionScan,
         reports: Vec<String>,
+        /// Every ownership record call: the repo, then its labels.
+        owned: Vec<Vec<String>>,
     }
 
     impl FakeOpenIo {
@@ -3114,6 +3424,16 @@ mod tests {
         async fn scan(&mut self) -> SessionScan {
             self.calls.push(("scan", Vec::new()));
             std::mem::take(&mut self.scan)
+        }
+        fn own(
+            &mut self,
+            repo: &Path,
+            labels: &std::collections::BTreeSet<String>,
+        ) -> anyhow::Result<()> {
+            let mut call = vec![repo.display().to_string()];
+            call.extend(labels.iter().cloned());
+            self.owned.push(call);
+            Ok(())
         }
         fn report(&mut self, text: &str) {
             self.reports.push(text.to_string());
@@ -3410,6 +3730,14 @@ mod tests {
         );
         let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
         assert!(layout.contains("tab name=\"fork\"") && layout.contains("tab name=\"proj\""));
+        assert_eq!(
+            io.owned
+                .iter()
+                .map(|call| call[1..].to_vec())
+                .collect::<Vec<_>>(),
+            [["codex"], ["codex"]],
+            "each opened tab's team is recorded as clank's"
+        );
     }
 
     /// `--all` inside a session queries its tabs once, and gives each
@@ -3787,9 +4115,9 @@ ttys004   zellij attach clank-foo
             LAND,
         )
         .unwrap();
-        assert!(kdl.contains("name=\"alice (master)\""));
-        assert!(kdl.contains("name=\"bob (reviewer)\""));
-        assert!(kdl.contains("name=\"carol (reviewer)\""));
+        assert!(kdl.contains("name=\"alice\""));
+        assert!(kdl.contains("name=\"bob\""));
+        assert!(kdl.contains("name=\"carol\""));
         assert!(kdl.contains("command \"clank\""));
         // Each pane's args MUST pin --repo per codex 361b104.
         assert!(
@@ -3836,7 +4164,7 @@ ttys004   zellij attach clank-foo
         )
         .unwrap();
         assert_eq!(
-            remove_target_ids(&["codex".into(), "codex".into()], &panes, "/a"),
+            remove_target_ids(&["codex".into(), "codex".into()], &panes, &every(&panes)),
             vec!["terminal_1".to_string(), "terminal_2".to_string()],
             "two entries, two DISTINCT panes; the third codex pane and claude survive"
         );
@@ -3942,6 +4270,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(tab),
             is_focused: false,
             exited: false,
@@ -3975,7 +4304,7 @@ ttys004   zellij attach clank-foo
                 pane(ru, 1, r.0, r.1, r.2, r.3),
             ];
             assert!(
-                reviewers_are_stacked(&panes, repo, &two),
+                reviewers_are_stacked(&panes, &every(&panes), repo, &two),
                 "{name}: a real zellij stack must read as PLACED"
             );
         }
@@ -3989,6 +4318,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(1),
             is_focused: false,
             exited: false,
@@ -4005,7 +4335,7 @@ ttys004   zellij attach clank-foo
             pane("clank agent start codex --repo /r", 0, 1, 60, 40),
             pane("clank agent start ruthless --repo /r", 60, 1, 60, 40),
         ];
-        assert!(!reviewers_are_stacked(&panes, repo, &two));
+        assert!(!reviewers_are_stacked(&panes, &every(&panes), repo, &two));
     }
 
     #[test]
@@ -4020,6 +4350,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(1),
             is_focused: false,
             exited: false,
@@ -4038,7 +4369,7 @@ ttys004   zellij attach clank-foo
         // Identical shape, geometry entirely absent.
         let zeroed = vec![bare(cx, 0, 0, 0), bare(ru, 0, 0, 0)];
         assert!(
-            !reviewers_are_stacked(&zeroed, repo, &two),
+            !reviewers_are_stacked(&zeroed, &every(&zeroed), repo, &two),
             "all-zero geometry must not read as an identical-shape stack"
         );
 
@@ -4046,14 +4377,14 @@ ttys004   zellij attach clank-foo
         // (y + 0 == y) but is not a collapsed title bar.
         let zero_member = vec![bare(cx, 1, 62, 0), bare(ru, 1, 62, 93)];
         assert!(
-            !reviewers_are_stacked(&zero_member, repo, &two),
+            !reviewers_are_stacked(&zero_member, &every(&zero_member), repo, &two),
             "a zero-row pane is not a collapsed member"
         );
 
         // The real collapsed shape still passes, so the guard did not
         // simply reject everything.
         let real = vec![bare(cx, 1, 62, 1), bare(ru, 2, 62, 93)];
-        assert!(reviewers_are_stacked(&real, repo, &two));
+        assert!(reviewers_are_stacked(&real, &every(&real), repo, &two));
     }
 
     #[test]
@@ -4068,6 +4399,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(tab),
             is_focused: false,
             exited: false,
@@ -4078,14 +4410,13 @@ ttys004   zellij attach clank-foo
             pane_columns: 62,
             pane_rows: 40,
         };
-        let repo = std::path::Path::new("/r");
-        let two = vec!["codex".to_string(), "ruthless".to_string()];
         let panes = vec![
             pane("clank agent start codex --repo /r", 1),
             pane("clank agent start ruthless --repo /r", 9),
         ];
+        let mine: Vec<&ZellijPane> = panes.iter().collect();
         assert!(
-            !reviewers_are_stacked(&panes, repo, &two),
+            reviewer_stack_span(&mine).is_none(),
             "identical coordinates in different tabs are two panes, not a stack"
         );
     }
@@ -4100,6 +4431,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(tab),
             is_focused: false,
             exited: false,
@@ -4110,14 +4442,13 @@ ttys004   zellij attach clank-foo
             pane_columns: 62,
             pane_rows: h,
         };
-        let repo = std::path::Path::new("/r");
-        let two = vec!["codex".to_string(), "ruthless".to_string()];
         let panes = vec![
             pane("clank agent start codex --repo /r", 1, 1, 1),
             pane("clank agent start ruthless --repo /r", 7, 2, 93),
         ];
+        let mine: Vec<&ZellijPane> = panes.iter().collect();
         assert!(
-            !reviewers_are_stacked(&panes, repo, &two),
+            reviewer_stack_span(&mine).is_none(),
             "different tabs cannot be one stack"
         );
     }
@@ -4130,6 +4461,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(1),
             is_focused: false,
             exited: false,
@@ -4151,7 +4483,7 @@ ttys004   zellij attach clank-foo
             pane("clank status --repo /r --tui", 2, 1),
         ];
         assert!(
-            !reviewers_are_stacked(&panes, repo, &two),
+            !reviewers_are_stacked(&panes, &every(&panes), repo, &two),
             "the instrument pane sharing the run is the reported bug"
         );
     }
@@ -4167,6 +4499,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(0),
             is_focused: false,
             exited: false,
@@ -4182,20 +4515,14 @@ ttys004   zellij attach clank-foo
         let rev = agent_start_command("kimi", "/repo");
         let status = "clank status --repo /repo --tui";
 
+        let shared = [pane(&rev, 125, 1, 53, 133), pane(status, 125, 1, 53, 133)];
         assert!(
-            !reviewers_are_stacked(
-                &[pane(&rev, 125, 1, 53, 133), pane(status, 125, 1, 53, 133)],
-                repo,
-                &one
-            ),
+            !reviewers_are_stacked(&shared, &every(&shared), repo, &one),
             "one reviewer sharing the instrument pane's geometry is NOT placed"
         );
+        let beside = [pane(&rev, 125, 1, 53, 100), pane(status, 125, 101, 53, 33)];
         assert!(
-            reviewers_are_stacked(
-                &[pane(&rev, 125, 1, 53, 100), pane(status, 125, 101, 53, 33)],
-                repo,
-                &one
-            ),
+            reviewers_are_stacked(&beside, &every(&beside), repo, &one),
             "beside the instrument pane IS placed"
         );
     }
@@ -4211,6 +4538,7 @@ ttys004   zellij attach clank-foo
             id: 1,
             is_plugin: false,
             terminal_command: Some(cmd.to_string()),
+            title: title_for(cmd),
             tab_id: Some(0),
             is_focused: false,
             exited: false,
@@ -4234,7 +4562,7 @@ ttys004   zellij attach clank-foo
             pane(status, 40, 0, 40, 16),
         ];
         assert!(
-            !reviewers_are_stacked(&broken, repo, &reviewers),
+            !reviewers_are_stacked(&broken, &every(&broken), repo, &reviewers),
             "status inside the reviewer stack is NOT placed"
         );
 
@@ -4244,86 +4572,262 @@ ttys004   zellij attach clank-foo
             pane(&r2, 40, 0, 40, 16),
             pane(status, 40, 16, 40, 8),
         ];
-        assert!(reviewers_are_stacked(&good, repo, &reviewers));
+        assert!(reviewers_are_stacked(
+            &good,
+            &every(&good),
+            repo,
+            &reviewers
+        ));
 
         // Reviewers not stacked at all is also not placed.
         let split = vec![pane(&r1, 40, 0, 40, 8), pane(&r2, 40, 8, 40, 8)];
-        assert!(!reviewers_are_stacked(&split, repo, &reviewers));
+        assert!(!reviewers_are_stacked(
+            &split,
+            &every(&split),
+            repo,
+            &reviewers
+        ));
 
         // A repo with no status pane still resolves on the reviewers.
         let no_status = vec![pane(&r1, 40, 0, 40, 16), pane(&r2, 40, 0, 40, 16)];
-        assert!(reviewers_are_stacked(&no_status, repo, &reviewers));
+        assert!(reviewers_are_stacked(
+            &no_status,
+            &every(&no_status),
+            repo,
+            &reviewers
+        ));
     }
 
-    #[test]
-    fn agent_pane_label_parses_only_this_repos_agent_panes() {
-        // tui-zellij-pane-reconcile: the reconciler classifies live
-        // panes by the EXACT command agent_start_command composes —
-        // other repos' agents, plugins, and arbitrary commands with
-        // similar prefixes must all be invisible to it.
-        let pane = |cmd: Option<&str>, is_plugin: bool| ZellijPane {
-            id: 1,
-            is_plugin,
-            terminal_command: cmd.map(str::to_string),
-            tab_id: Some(0),
-            is_focused: false,
-            exited: false,
-            tab_name: String::new(),
-            tab_position: None,
-            pane_x: 0,
-            pane_y: 0,
-            pane_columns: 0,
-            pane_rows: 0,
-        };
-        let ours = pane(Some("clank agent start bob --repo /repo"), false);
-        assert_eq!(agent_pane_label(&ours, "/repo"), Some("bob"));
-        // Same command shape, different repo → not ours.
-        assert_eq!(agent_pane_label(&ours, "/other"), None);
-        // Extra trailing args break the exact match (deliberate: only
-        // panes we composed count).
-        let extra = pane(Some("clank agent start bob --repo /repo --x"), false);
-        assert_eq!(agent_pane_label(&extra, "/repo"), None);
-        // Plugins and unrelated commands are invisible.
-        assert_eq!(
-            agent_pane_label(
-                &pane(Some("clank agent start bob --repo /repo"), true),
-                "/repo"
-            ),
-            None
-        );
-        assert_eq!(agent_pane_label(&pane(Some("zsh"), false), "/repo"), None);
-        assert_eq!(agent_pane_label(&pane(None, false), "/repo"), None);
+    fn set(labels: &[&str]) -> std::collections::BTreeSet<String> {
+        labels.iter().map(|l| l.to_string()).collect()
+    }
 
-        // The FULL legal label domain round-trips. `AgentLabel`
-        // forbids only empty, dot-segments and `/`, so spaces and
-        // emoji are legal names a user can really create — and an
-        // agent this parser cannot read is an agent reconciliation
-        // can never converge on, because it drives both the initial
-        // classification and the verify.
-        for label in ["two words", "🔥bot", "a b c", "with-dash", "under_score"] {
-            let cmd = agent_start_command(label, "/repo");
-            assert_eq!(
-                agent_pane_label(&pane(Some(&cmd), false), "/repo"),
-                Some(label),
-                "the command composed for {label:?} must parse back to it"
+    /// The exact label, `<glyph> <label>`, and the old `<label> (<role>)`
+    /// with and without a glyph all name the agent, for every real glyph
+    /// and labels with spaces or emoji in them.
+    #[test]
+    fn every_title_form_names_its_agent() {
+        for label in ["codex", "two words", "🔥bot"] {
+            let roster = set(&[label, "claude"]);
+            let mut titles = vec![label.to_string(), format!("{label} (reviewer)")];
+            for glyph in AGENT_PANE_GLYPHS {
+                titles.push(format!("{glyph} {label}"));
+                titles.push(format!("{glyph} {label} (master)"));
+            }
+            for title in titles {
+                assert_eq!(
+                    resolve_title(&title, &roster),
+                    PaneIdentity::Agent(label.to_string()),
+                    "{title:?}"
+                );
+            }
+        }
+        assert_eq!(
+            resolve_title("zsh", &set(&["codex"])),
+            PaneIdentity::Unknown
+        );
+        assert_eq!(
+            resolve_title("🚀 codex", &set(&["codex"])),
+            PaneIdentity::Unknown,
+            "only the TUI's own glyphs are stripped"
+        );
+        assert_eq!(
+            resolve_title("codex (painter)", &set(&["codex"])),
+            PaneIdentity::Unknown,
+            "only role words are stripped"
+        );
+    }
+
+    /// A title that reads as two distinct roster labels is refused, never
+    /// resolved to the literal one; the same title is that label when it
+    /// is the only candidate.
+    #[test]
+    fn a_title_reading_as_two_candidates_is_ambiguous() {
+        let glyphed = format!("{} bob", AGENT_PANE_GLYPHS[1]);
+        let old_glyphed = format!("{} x (plan)", AGENT_PANE_GLYPHS[0]);
+        for (title, roster) in [
+            (glyphed.as_str(), set(&["bob", &glyphed])),
+            ("x (plan)", set(&["x (plan)", "x"])),
+            (old_glyphed.as_str(), set(&["x (plan)", "x"])),
+        ] {
+            assert!(
+                matches!(resolve_title(title, &roster), PaneIdentity::Ambiguous(ref c) if c.len() == 2),
+                "{title:?} with {roster:?}"
             );
         }
-        // A label that itself looks like the suffix still round-trips:
-        // the LAST occurrence is the real one.
-        let tricky = "x --repo /repo";
-        let cmd = agent_start_command(tricky, "/repo");
         assert_eq!(
-            agent_pane_label(&pane(Some(&cmd), false), "/repo"),
-            Some(tricky)
+            resolve_title("x (plan)", &set(&["x (plan)"])),
+            PaneIdentity::Agent("x (plan)".into()),
+            "a literal label that is the only candidate is itself"
         );
-        // An empty label is not a pane we composed.
         assert_eq!(
-            agent_pane_label(
-                &pane(Some("clank agent start  --repo /repo"), false),
-                "/repo"
+            resolve_title(&glyphed, &set(&[&glyphed])),
+            PaneIdentity::Agent(glyphed.clone())
+        );
+    }
+
+    /// A pane that reads as `painter` and `💤 painter` makes painter's
+    /// panes uncertain, even beside one plainly painter's, and no pane is
+    /// opened for it; a label it does not name stays known.
+    #[test]
+    fn an_ambiguous_pane_leaves_its_labels_uncertain_and_unopened() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":2,"title":"🔨 claude","tab_id":0},
+              {"id":3,"title":"💤 painter","tab_id":0}
+            ]"#,
+        )
+        .unwrap();
+        let ws = Workspace {
+            tab: 0,
+            candidates: set(&["claude", "painter", "💤 painter"]),
+        };
+        for label in ["painter", "💤 painter"] {
+            let Lookup::Uncertain(doubts) = ws.lookup(&panes, label) else {
+                panic!("{label}");
+            };
+            assert_eq!(doubts[0].pane, "terminal_3");
+            assert_eq!(open_beside(&panes, &ws, label), None, "{label}");
+        }
+        assert!(matches!(ws.lookup(&panes, "claude"), Lookup::Known(ref f) if f.len() == 1));
+        assert!(matches!(ws.lookup(&panes, "bea"), Lookup::Known(ref f) if f.is_empty()));
+        assert_eq!(
+            open_beside(&panes, &ws, "bea").as_deref(),
+            Some("terminal_2")
+        );
+    }
+
+    /// Identity is the name in the workspace's tab: a plugin, a pane in
+    /// another tab, and a pane running an agent's launch command under
+    /// another name are none of its agents.
+    #[test]
+    fn a_workspace_names_only_its_own_tabs_terminal_panes() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":1,"is_plugin":true,"title":"codex","tab_id":0},
+              {"id":2,"title":"codex","tab_id":1},
+              {"id":3,"title":"editor","terminal_command":"clank agent start codex --repo /a","tab_id":0},
+              {"id":4,"title":"👀 codex","terminal_command":"bash","tab_id":0}
+            ]"#,
+        )
+        .unwrap();
+        let ws = Workspace {
+            tab: 0,
+            candidates: set(&["codex"]),
+        };
+        let named: Vec<Option<String>> = panes.iter().map(|p| ws.agent_of(p)).collect();
+        assert_eq!(named, [None, None, None, Some("codex".to_string())]);
+    }
+
+    /// One session holding two repos' tabs, each with `claude` and
+    /// `codex`: each repo's workspace is its own TUI pane's tab, so each
+    /// sees only its own panes and neither counts the other's as a
+    /// duplicate.
+    #[test]
+    fn two_repos_in_one_session_each_see_only_their_tab() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[
+              {"id":1,"title":"","terminal_command":"clank tui --repo /a","tab_id":0},
+              {"id":2,"title":"💤 claude","tab_id":0},
+              {"id":3,"title":"👀 codex","tab_id":0},
+              {"id":5,"title":"","terminal_command":"clank tui --repo /b","tab_id":1},
+              {"id":6,"title":"💤 claude","tab_id":1},
+              {"id":7,"title":"codex","tab_id":1}
+            ]"#,
+        )
+        .unwrap();
+        for (repo, ids) in [
+            ("/a", ["terminal_2", "terminal_3"]),
+            ("/b", ["terminal_6", "terminal_7"]),
+        ] {
+            let ws =
+                Workspace::anchored(&panes, Path::new(repo), set(&["claude", "codex"])).unwrap();
+            let mine: Vec<String> = agent_panes_by_title(&panes, &ws)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(mine, ids, "{repo}");
+            assert_eq!(
+                remove_target_ids(&["codex".into()], &panes, &ws).len(),
+                1,
+                "{repo}: one codex to close, not the other repo's too"
+            );
+        }
+    }
+
+    /// A workspace needs exactly one of the repo's TUI panes; agent panes
+    /// never stand in for one.
+    #[test]
+    fn a_workspace_is_anchored_by_exactly_one_tui_pane() {
+        let panes = |json: &str| serde_json::from_str::<Vec<ZellijPane>>(json).unwrap();
+        let repo = Path::new("/a");
+        let none = panes(r#"[{"id":2,"title":"codex","tab_id":4}]"#);
+        assert_eq!(repo_tab_id(&none, repo), None);
+        let two = panes(
+            r#"[{"id":1,"terminal_command":"clank tui --repo /a","tab_id":0},
+                {"id":5,"terminal_command":"clank status --repo /a --tui","tab_id":3}]"#,
+        );
+        assert_eq!(repo_tab_id(&two, repo), None);
+        let untabbed = panes(r#"[{"id":1,"terminal_command":"clank tui --repo /a"}]"#);
+        assert_eq!(repo_tab_id(&untabbed, repo), None);
+        let one =
+            panes(r#"[{"id":1,"terminal_command":"clank status --repo /a --tui","tab_id":3}]"#);
+        assert_eq!(repo_tab_id(&one, repo), Some(3));
+        assert!(
+            Workspace::local(&none, repo, Some("terminal_2"), set(&[]))
+                .is_some_and(|w| w.tab() == 4)
+        );
+    }
+
+    /// Across sessions a workspace is resolved only from a complete scan
+    /// with exactly one TUI pane; a TUI pane in a session other than the
+    /// conventional one counts the same.
+    #[test]
+    fn a_scan_resolves_a_workspace_only_when_complete_and_unique() {
+        let pane = |session: &str, id: u32, tab: u32, command: &str| SessionPane {
+            session: session.into(),
+            pane: serde_json::from_value(serde_json::json!({
+                "id": id, "terminal_command": command, "tab_id": tab
+            }))
+            .unwrap(),
+        };
+        let repo = Path::new("/a");
+        let tui = |session: &str, tab: u32| pane(session, 1, tab, "clank tui --repo /a");
+        let scan =
+            |panes: Vec<SessionPane>, unanswered: &[&str], listing_failed: bool| SessionScan {
+                panes,
+                unanswered: unanswered.iter().map(|s| s.to_string()).collect(),
+                listing_failed,
+            };
+        let resolved = scan_workspace(
+            &scan(vec![tui("someones-own", 2)], &[], false),
+            repo,
+            set(&[]),
+        )
+        .unwrap();
+        assert_eq!((resolved.0.as_str(), resolved.1.tab()), ("someones-own", 2));
+        let unresolved = [
+            (scan(vec![], &[], false), Unresolved::NoAnchor),
+            (
+                scan(vec![tui("s", 0), tui("t", 0)], &[], false),
+                Unresolved::ManyAnchors(vec![
+                    ("s".into(), String::new()),
+                    ("t".into(), String::new()),
+                ]),
             ),
-            None
-        );
+            (
+                scan(vec![], &["slow"], false),
+                Unresolved::Unanswered(vec!["slow".into()]),
+            ),
+            (
+                scan(vec![tui("s", 0)], &["slow"], false),
+                Unresolved::Unanswered(vec!["slow".into()]),
+            ),
+            (scan(vec![], &[], true), Unresolved::ListingFailed),
+        ];
+        for (scan, why) in unresolved {
+            assert_eq!(scan_workspace(&scan, repo, set(&[])).unwrap_err(), why);
+        }
     }
 
     // A realistic `list-panes --json --command` (subset of fields per
@@ -4350,24 +4854,6 @@ ttys004   zellij attach clank-foo
     }
 
     #[test]
-    fn find_pane_by_command_disambiguates_same_label_across_repos() {
-        let panes = parse_panes();
-        assert_eq!(
-            find_pane_by_command(&panes, &agent_start_command("codex", "/a"))
-                .unwrap()
-                .pane_id(),
-            "terminal_1"
-        );
-        assert_eq!(
-            find_pane_by_command(&panes, &agent_start_command("codex", "/b"))
-                .unwrap()
-                .pane_id(),
-            "terminal_7"
-        );
-        assert!(find_pane_by_command(&panes, &agent_start_command("ghost", "/a")).is_none());
-    }
-
-    #[test]
     fn remove_closes_the_exited_copy_not_the_live_one() {
         // The reported shape: a duplicate pane whose tool refused the
         // session (`already has an active writer`) and exited 1, while
@@ -4386,14 +4872,18 @@ ttys004   zellij attach clank-foo
         )
         .unwrap();
         assert_eq!(
-            remove_target_ids(&["codex".to_string()], &panes, "/a"),
+            remove_target_ids(&["codex".to_string()], &panes, &every(&panes)),
             vec!["terminal_2".to_string()],
             "the corpse is the excess copy, whatever order the listing reports"
         );
         // A label leaving the roster entirely still loses BOTH panes:
         // the preference picks WHICH, never HOW MANY.
         assert_eq!(
-            remove_target_ids(&["codex".to_string(), "codex".to_string()], &panes, "/a"),
+            remove_target_ids(
+                &["codex".to_string(), "codex".to_string()],
+                &panes,
+                &every(&panes)
+            ),
             vec!["terminal_2".to_string(), "terminal_1".to_string()]
         );
     }
@@ -4410,14 +4900,16 @@ ttys004   zellij attach clank-foo
             ]"#,
         )
         .unwrap();
-        assert_eq!(agent_pane_label(&panes[0], "/a"), Some("codex"));
+        let ws = every(&panes);
+        assert_eq!(ws.agent_of(&panes[0]).as_deref(), Some("codex"));
         assert_eq!(
-            agent_pane_pairs(&panes, Path::new("/a")),
+            agent_pane_pairs(&panes, &ws),
             vec![("codex".to_string(), false)]
         );
         // The idempotence guard sees it too, so no replacement is made.
-        assert!(
-            find_pane_by_command(&panes, &agent_start_command("codex", "/a")).is_some(),
+        assert_eq!(
+            open_beside(&panes, &ws, "codex"),
+            None,
             "a corpse must still satisfy the guard, or the pass respawns it"
         );
     }
@@ -4540,11 +5032,11 @@ ttys004   zellij attach clank-foo
         )
         .unwrap();
         assert!(
-            kdl.contains(&format!("name=\"alice (master)\" cwd=\"{TEST_REPO}\"")),
+            kdl.contains(&format!("name=\"alice\" cwd=\"{TEST_REPO}\"")),
             "master pane should set cwd; got:\n{kdl}"
         );
         assert!(
-            kdl.contains(&format!("name=\"bob (reviewer)\" cwd=\"{TEST_REPO}\"")),
+            kdl.contains(&format!("name=\"bob\" cwd=\"{TEST_REPO}\"")),
             "reviewer pane should set cwd; got:\n{kdl}"
         );
     }
@@ -4560,9 +5052,9 @@ ttys004   zellij attach clank-foo
             LAND,
         )
         .unwrap();
-        let bob_idx = kdl.find("name=\"bob (reviewer)\"").unwrap();
-        let alice_idx = kdl.find("name=\"alice (reviewer)\"").unwrap();
-        let codex_idx = kdl.find("name=\"codex (reviewer)\"").unwrap();
+        let bob_idx = kdl.find("name=\"bob\"").unwrap();
+        let alice_idx = kdl.find("name=\"alice\"").unwrap();
+        let codex_idx = kdl.find("name=\"codex\"").unwrap();
         assert!(bob_idx < alice_idx, "bob must come before alice");
         assert!(alice_idx < codex_idx, "alice must come before codex");
     }
@@ -4717,8 +5209,8 @@ ttys004   zellij attach clank-foo
         assert!(!kdl.contains("zellij:tab-bar"));
         // Marker replaced with the agent group.
         assert!(!kdl.contains(AGENTS_MARKER));
-        assert!(kdl.contains("name=\"alice (master)\""));
-        assert!(kdl.contains("name=\"bob (reviewer)\""));
+        assert!(kdl.contains("name=\"alice\""));
+        assert!(kdl.contains("name=\"bob\""));
         let _: kdl::KdlDocument = kdl.parse().expect("substituted output is valid KDL");
     }
 
@@ -4734,7 +5226,7 @@ ttys004   zellij attach clank-foo
 "##;
         let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LAND).unwrap();
         assert!(!kdl.contains(AGENTS_MARKER));
-        assert!(kdl.contains("name=\"m (master)\""));
+        assert!(kdl.contains("name=\"m\""));
     }
 
     /// (how many root `keybinds` nodes, the first one's first global
@@ -4825,7 +5317,7 @@ layout {
             "{kdl}"
         );
         assert!(kdl.contains("unbind \"Ctrl w\"\n"), "{kdl}");
-        assert!(kdl.contains("name=\"m (master)\""));
+        assert!(kdl.contains("name=\"m\""));
     }
 
     /// A template whose `keybinds` has modes but no global `unbind`
@@ -4949,7 +5441,7 @@ keybinds {
         // replaced.
         assert!(kdl.contains("// put clank_agents here someday"));
         assert!(kdl.contains("tab name=\"clank_agents\""));
-        assert!(kdl.contains("name=\"m (master)\""));
+        assert!(kdl.contains("name=\"m\""));
     }
 
     #[test]
@@ -4984,7 +5476,7 @@ keybinds {
         .unwrap();
         // Stage: master gets the big pane.
         assert!(
-            kdl.contains("pane size=\"65%\" name=\"alice (master)\""),
+            kdl.contains("pane size=\"65%\" name=\"alice\""),
             "master is the 65% stage:\n{kdl}"
         );
         // Reviewers stack (one visible, rest collapsed bars).
@@ -5196,25 +5688,18 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         assert!(live_session_names("").is_empty());
     }
 
+    /// An exited pane is still its agent's, and live presence says it is
+    /// not running.
     #[test]
-    fn a_pane_runs_a_command_only_while_its_process_lives() {
-        let json = |exited: bool, plugin: bool| {
-            format!(
-                r#"{{"id":4,"is_plugin":{plugin},"exited":{exited},"title":"t",
-                    "terminal_command":"clank agent start codex --repo /r","tab_name":"r"}}"#
-            )
-        };
-        let pane = |exited, plugin| -> ZellijPane {
-            serde_json::from_str(&json(exited, plugin)).expect("list-panes element")
-        };
-        let cmd = "clank agent start codex --repo /r";
-        assert!(pane(false, false).runs(cmd));
-        assert!(!pane(true, false).runs(cmd), "an exited pane holds nothing");
-        assert!(!pane(false, true).runs(cmd), "a plugin pane runs no agent");
-        assert!(!pane(false, false).runs("clank agent start codex --repo /other"));
-        assert_eq!(pane(false, false).tab_name(), "r");
-        // The identity match deliberately still sees the exited copy.
-        assert!(find_pane_by_command(&[pane(true, false)], cmd).is_some());
+    fn an_exited_pane_keeps_its_identity_but_is_not_live() {
+        let panes: Vec<ZellijPane> = serde_json::from_str(
+            r#"[{"id":4,"exited":true,"title":"💤 codex","tab_id":0,"tab_name":"r"}]"#,
+        )
+        .unwrap();
+        let ws = every(&panes);
+        assert_eq!(ws.agent_of(&panes[0]).as_deref(), Some("codex"));
+        assert!(live_agent_labels(&panes, &ws).is_empty());
+        assert_eq!(panes[0].tab_name(), "r");
     }
 
     #[test]
@@ -5567,20 +6052,21 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         serde_json::from_str(json).unwrap()
     }
 
-    /// The web page's pane table: this repo's agents only, by launch
-    /// command, with the width a subscribed viewport does not carry.
+    /// The web page's pane table: the workspace's agents only, by name,
+    /// with the width a subscribed viewport does not carry.
     #[test]
     fn the_pane_table_is_this_repos_agents_with_their_sizes() {
         let panes = panes_of(
             r#"[
-          {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_columns":120,"pane_rows":40},
-          {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_columns":60,"pane_rows":40,"exited":true},
-          {"id":3,"terminal_command":"clank agent start other --repo /b","tab_id":6,"pane_columns":60,"pane_rows":40},
-          {"id":4,"terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_columns":60,"pane_rows":10},
+          {"id":1,"title":"🔨 claude","tab_id":6,"pane_columns":120,"pane_rows":40},
+          {"id":2,"title":"codex","tab_id":6,"pane_columns":60,"pane_rows":40,"exited":true},
+          {"id":3,"title":"claude","tab_id":7,"pane_columns":60,"pane_rows":40},
+          {"id":4,"title":"","terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_columns":60,"pane_rows":10},
           {"id":0,"title":"zellij:tab-bar","is_plugin":true,"tab_id":6}
         ]"#,
         );
-        let table = agent_pane_table(&panes, Path::new("/a"));
+        let ws = Workspace::anchored(&panes, Path::new("/a"), set(&["claude", "codex"])).unwrap();
+        let table = agent_pane_table(&panes, &ws);
         assert_eq!(
             table,
             vec![
@@ -5599,7 +6085,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                     exited: true
                 },
             ],
-            "another repo's agent and the instrument pane are not agents of this repo"
+            "another tab's agent and the instrument pane are not agents of this repo"
         );
     }
 
@@ -5703,34 +6189,34 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
           {"id":3,"title":"other (master)","terminal_command":"clank agent start other --repo /b","tab_id":9,"pane_x":0,"pane_columns":100,"pane_y":0,"pane_rows":40}
         ]"#,
         );
+        let ws = Workspace {
+            tab: 6,
+            candidates: set(&["claude", "codex", "other"]),
+        };
         assert_eq!(
-            agent_pane_pairs(&panes, Path::new("/a")),
+            agent_pane_pairs(&panes, &ws),
             vec![("claude".to_string(), false), ("codex".to_string(), true)]
         );
         // Two panes of equal size stage nobody: the answer must be
         // positive evidence, never a tie broken by listing order.
         let tie = panes_of(
             r#"[
-          {"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":6,"pane_columns":50,"pane_rows":20},
-          {"id":2,"terminal_command":"clank agent start codex --repo /a","tab_id":6,"pane_columns":50,"pane_rows":20}
+          {"id":1,"title":"claude","tab_id":6,"pane_columns":50,"pane_rows":20},
+          {"id":2,"title":"codex","tab_id":6,"pane_columns":50,"pane_rows":20}
         ]"#,
         );
-        assert!(
-            agent_pane_pairs(&tie, Path::new("/a"))
-                .iter()
-                .all(|(_, s)| !s)
-        );
+        assert!(agent_pane_pairs(&tie, &ws).iter().all(|(_, s)| !s));
     }
 
     #[test]
-    fn the_repo_tab_is_where_its_instrument_or_agent_panes_are() {
+    fn the_repo_tab_is_where_its_instrument_pane_is() {
         let panes = panes_of(LANDSCAPE_HEALTHY_JSON);
         assert_eq!(repo_tab_id(&panes, Path::new("/a")), Some(6));
         assert_eq!(repo_tab_id(&panes, Path::new("/elsewhere")), None);
         let agents_only = panes_of(
             r#"[{"id":1,"terminal_command":"clank agent start claude --repo /a","tab_id":4}]"#,
         );
-        assert_eq!(repo_tab_id(&agents_only, Path::new("/a")), Some(4));
+        assert_eq!(repo_tab_id(&agents_only, Path::new("/a")), None);
     }
 
     /// The tab's SHAPE answers, and the arrangement inside it does
@@ -5749,7 +6235,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         ]"#,
         );
         assert_eq!(
-            tab_orientation(&arranged_landscape, Path::new("/a"), 6),
+            tab_orientation(&arranged_landscape, 6),
             Orientation::Portrait,
             "a tall tab is portrait however its panes are sitting"
         );
@@ -5762,7 +6248,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         ]"#,
         );
         assert_eq!(
-            tab_orientation(&arranged_portrait, Path::new("/a"), 3),
+            tab_orientation(&arranged_portrait, 3),
             Orientation::Landscape,
             "and a wide one is landscape"
         );
@@ -5795,13 +6281,10 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
           {"id":3,"terminal_command":"clank status --repo /a --tui","tab_id":6,"pane_x":40,"pane_columns":40,"pane_y":0,"pane_rows":137}
         ]"#,
         );
+        assert_eq!(tab_orientation(&before, 6), Orientation::Portrait);
         assert_eq!(
-            tab_orientation(&before, Path::new("/a"), 6),
-            Orientation::Portrait
-        );
-        assert_eq!(
-            tab_orientation(&after, Path::new("/a"), 6),
-            tab_orientation(&before, Path::new("/a"), 6),
+            tab_orientation(&after, 6),
+            tab_orientation(&before, 6),
             "the tab is the same size, so it is the same shape — the \
              arrangement mid-swap is not evidence of anything"
         );

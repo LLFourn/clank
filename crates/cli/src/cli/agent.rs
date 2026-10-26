@@ -251,9 +251,32 @@ enum Purpose {
     Preview,
 }
 
-/// Who already runs a bound session: [`session_holder::find`], or a
-/// test's answer.
-type FindHolder = fn(&Session, &AgentLabel, &str, String) -> Holder;
+/// Who already runs the agent, its bound session if it has one:
+/// [`session_holder::find`], or a test's answer.
+type FindHolder = fn(Option<&Session>, &AgentLabel, &Path, String) -> Holder;
+
+/// Refuse to start an agent with no bound session when a live pane in the
+/// repo's workspace already runs it, or may.
+fn refuse_a_second_fresh_copy(
+    find_holder: FindHolder,
+    label: &AgentLabel,
+    repo: &Path,
+    claude_program: String,
+) -> anyhow::Result<()> {
+    match find_holder(None, label, repo, claude_program) {
+        Holder::Pane { session, tab } => anyhow::bail!(
+            "`{label}` already has a live pane in this repo's tab (zellij session `{session}`, \
+             tab `{tab}`). Starting it here would run a second copy. Use that pane, or close \
+             it first."
+        ),
+        Holder::Uncertain { session, why } => anyhow::bail!(
+            "whether `{label}` already has a live pane in this repo's tab (zellij session \
+             `{session}`) cannot be known: {why}. Starting it here could run a second copy. \
+             Rename that pane to one agent's label, then retry."
+        ),
+        Holder::Nobody | Holder::ClaudeBackground { .. } => Ok(()),
+    }
+}
 
 /// `agent start`, or its preview. With `print`, the composed launch is
 /// printed and returned instead of run.
@@ -323,6 +346,17 @@ async fn start_with(
         // ancestor (fork-session-id-chaining). Grok retains its stable
         // preparation intent until the intended child binds. `--print` peeks.
         None => {
+            // Before the fork intent, which a real start consumes: a
+            // refusal must leave everything as it was. A preview starts
+            // nothing, so it has no second copy to refuse.
+            if !print {
+                refuse_a_second_fresh_copy(
+                    find_holder,
+                    &label,
+                    &repo,
+                    launch_program(Tool::Claude, desc.launch.as_ref()),
+                )?;
+            }
             let spec = fork_intent(&repo, &label, desc.tool, superseded, print)?;
             match spec {
                 Some(spec) if spec.tool == Tool::Grok => {
@@ -372,9 +406,9 @@ async fn start_with(
         }
         Some(session) => match match (
             find_holder(
-                session,
+                Some(session),
                 &label,
-                &repo_as_given(&args, &repo),
+                &repo,
                 launch_program(Tool::Claude, desc.launch.as_ref()),
             ),
             purpose,
@@ -392,6 +426,19 @@ async fn start_with(
                 );
                 Holder::Nobody
             }
+            (
+                Holder::Uncertain {
+                    session: held_in,
+                    why,
+                },
+                Purpose::Preview,
+            ) => {
+                eprintln!(
+                    "`{label}` may be running now in zellij session `{held_in}` ({why}); this \
+                     is what its next start runs"
+                );
+                Holder::Nobody
+            }
             (holder, _) => holder,
         } {
             Holder::Pane {
@@ -403,6 +450,15 @@ async fn start_with(
                  refuses. Close that pane, or attach to that session instead \
                  (`zellij attach {held_in}`).",
                 session.tool.as_str(),
+                session.tool.as_str(),
+            ),
+            Holder::Uncertain {
+                session: held_in,
+                why,
+            } => anyhow::bail!(
+                "`{label}` may already be running in zellij session `{held_in}`: {why}. This \
+                 pane could resume the same {} conversation a second time. Rename that pane \
+                 to one agent's label, then retry.",
                 session.tool.as_str(),
             ),
             Holder::ClaudeBackground { short_id } => (
@@ -533,17 +589,6 @@ async fn start_with(
     }
 
     exec_composed(composed, workdir).map(|()| None)
-}
-
-/// The `--repo` this process was GIVEN, not the resolved path: the
-/// pane's `terminal_command` carries the literal argument, and the
-/// holder scan is byte matching against it.
-fn repo_as_given(args: &AgentStartArgs, resolved: &Path) -> String {
-    args.repo
-        .as_deref()
-        .unwrap_or(resolved)
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// The profile's args, plus what every launch of `tool` must carry.
@@ -1937,8 +1982,7 @@ fn set_review(args: AgentSetReviewArgs) -> anyhow::Result<()> {
 
 /// Change a reviewer's tier (`Commit` ↔ `Gate`) IN PLACE — a pure config
 /// edit, so the agent's bound session and zellij pane are untouched (the
-/// pane title is `"<name> (reviewer)"` for both tiers — nothing visual
-/// changes). Takes [`ReviewKind`] (which has no `Master` variant) so the
+/// pane's name is the label for both tiers — nothing visual changes). Takes [`ReviewKind`] (which has no `Master` variant) so the
 /// "this only ever sets a reviewer tier" invariant is compiler-enforced —
 /// a caller cannot ask to write a second master. Refuses if `<label>` is
 /// the master (changing the master is `clank agent make-master`, which
@@ -3500,7 +3544,7 @@ mod tests {
         assert_eq!(read_repo(repo.path()).agents[&web].launch, None);
     }
 
-    fn running_in_a_pane(_: &Session, _: &AgentLabel, _: &str, _: String) -> Holder {
+    fn running_in_a_pane(_: Option<&Session>, _: &AgentLabel, _: &Path, _: String) -> Holder {
         Holder::Pane {
             session: "elsewhere".into(),
             tab: "work".into(),
@@ -3558,8 +3602,81 @@ mod tests {
         assert!(format!("{err:#}").contains("already running"), "{err:#}");
     }
 
-    fn nobody_runs_it(_: &Session, _: &AgentLabel, _: &str, _: String) -> Holder {
+    fn nobody_runs_it(_: Option<&Session>, _: &AgentLabel, _: &Path, _: String) -> Holder {
         Holder::Nobody
+    }
+
+    /// A live pane runs the agent only when it has no bound session: the
+    /// holder `agent start` asks about a fresh agent.
+    fn a_fresh_copy_runs(session: Option<&Session>, _: &AgentLabel, _: &Path, _: String) -> Holder {
+        match session {
+            None => Holder::Pane {
+                session: "work".into(),
+                tab: "proj".into(),
+            },
+            Some(_) => Holder::Nobody,
+        }
+    }
+
+    /// The holder an unbound agent is asked about has no session; a live
+    /// pane it names refuses the start, saying where, and nobody holding
+    /// it lets the start go on.
+    #[test]
+    fn a_fresh_agent_with_a_live_pane_is_not_started_again() {
+        let label = AgentLabel::parse("web").unwrap();
+        let err =
+            refuse_a_second_fresh_copy(a_fresh_copy_runs, &label, Path::new("/r"), "claude".into())
+                .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("already has a live pane") && err.contains("`work`"),
+            "{err}"
+        );
+        refuse_a_second_fresh_copy(nobody_runs_it, &label, Path::new("/r"), "claude".into())
+            .unwrap();
+    }
+
+    /// The real holder decision over a listing of `/r`'s tab: the
+    /// caller's pane `web`, and a live `💤 web` pane while `web` and
+    /// `💤 web` are both candidates.
+    fn an_ambiguous_pane_may_run_it(
+        session: Option<&Session>,
+        label: &AgentLabel,
+        repo: &Path,
+        _: String,
+    ) -> Holder {
+        session_holder::decide_over(
+            &format!(
+                r#"[{{"id":1,"title":"","terminal_command":"clank tui --repo {}","tab_id":0,"tab_name":"t"}},
+                    {{"id":3,"title":"💤 web","tab_id":0,"tab_name":"t"}},
+                    {{"id":5,"title":"web","tab_id":0,"tab_name":"t"}}]"#,
+                repo.display()
+            ),
+            "terminal_5",
+            session.map(|s| s.id.as_str()),
+            label.as_str(),
+            repo,
+            ["web", "💤 web"].map(String::from).into(),
+        )
+    }
+
+    /// A pane that may be the agent's refuses a fresh start, naming the
+    /// pane, rather than reading as nobody.
+    #[test]
+    fn a_fresh_agent_beside_a_pane_that_may_be_it_is_not_started() {
+        let label = AgentLabel::parse("web").unwrap();
+        let err = refuse_a_second_fresh_copy(
+            an_ambiguous_pane_may_run_it,
+            &label,
+            Path::new("/r"),
+            "claude".into(),
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("cannot be known") && err.contains("terminal_3"),
+            "{err}"
+        );
     }
 
     const OLD_SESSION: &str = "01a156a7-f516-7dc0-8b58-520faf122796";

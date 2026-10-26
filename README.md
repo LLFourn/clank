@@ -176,6 +176,31 @@ of its own.
 if it has one, or starting a fresh one if it doesn't. `clank open` is
 what brings up the whole team.)
 
+**A pane is named by its agent, and that name is its identity.** Each
+agent pane is titled with its label alone; the TUI puts the agent's
+status glyph in front (`👀 codex`) and changes only the glyph as its
+state or role changes. Clank finds an agent's pane by that name, not by
+the command it runs, so a pane you start by hand, named for the agent,
+is that agent's pane. Rename one by hand and clank believes you.
+
+The name only means something inside the repo's **workspace**: the tab
+that holds the repo's TUI pane (`clank tui --repo <path>`), in whatever
+session that tab is. Two repos in one session can both have a `codex`;
+each sees only its own. A repo with agent panes but no TUI pane open has
+no workspace, so nothing finds, nudges or reconciles its agents until
+its TUI is open again. Looking across sessions, a workspace counts only
+when every session answered and exactly one TUI pane was found.
+
+Clank remembers which labels it owns panes for (the runtime record
+`pane-owners.json`, kept across TUI restarts): the panes it opened, the
+roster's panes it saw, and the pane `clank as` renamed. So an agent
+removed from the roster still has its pane recognised and closed. A
+pane whose name matches nothing clank owns, such as a shell or an
+editor, is never closed; when the record is missing the TUI lists such
+panes as `not on roster, not closed` and leaves them for you. A pane
+whose name could be read as two agents (`bob` and `💤 bob` both on the
+roster) is refused rather than guessed.
+
 **3. Each agent is bound as it starts.**
 
 The pane's tool runs with `CLANK_AGENT=<label>` in its environment,
@@ -183,7 +208,13 @@ and clank's SessionStart hook binds that label to the session the tool
 just created — so work can be routed to it — and rebinds it when
 `/clear` hands the process a new session id. Nothing to type. Only a
 session you started yourself needs `clank as <label>` (claude and
-codex and native Grok; opencode binds through its plugin).
+codex and native Grok; opencode binds through its plugin). Inside the
+repo's workspace, `clank as` also renames its own pane to the label, so
+clank can find it. It refuses, before binding anything, when another
+live pane there already has that name; when the workspace cannot be
+determined it binds and says the pane was not renamed; a rename zellij
+refuses leaves the binding and exits non-zero. A renamed pane is
+locatable, but typing into it still needs a launch through clank.
 
 From then on the session's binding is its identity, for every hook and
 every clank command it runs. `CLANK_AGENT` only binds a session that
@@ -1344,10 +1375,12 @@ binary's embedded skills are newer than the installed files — run
 `clank setup --force`.
 
 An agent pane that says **`<label>` is already running in zellij
-session `…`, tab `…`** found a live pane elsewhere with the same
-agent — usually a tab in another session you opened earlier. Close
-that pane or use it there; a session has one holder, and a second
-resume of it is what the tool itself refuses. A claude agent whose
+session `…`, tab `…`** found another live pane named for the same
+agent in the repo's workspace. Close that pane or use it there; a
+session has one holder, and a second resume of it is what the tool
+itself refuses. An agent with no session yet is refused the same way
+(**already has a live pane in this repo's tab**), so a fresh agent is
+not started twice. A claude agent whose
 tab was closed keeps running as a background session; `clank agent
 start` notices and `claude attach`es to it instead of resuming, so the
 conversation carries on where it was.
