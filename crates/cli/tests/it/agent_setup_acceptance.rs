@@ -136,6 +136,7 @@ fn failed_repair_keeps_non_grok_fork_intent_and_does_not_execute_provider() {
     let path = clank::cli::fork::fork_spec_path(f.env.repo(), &f.label);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let spec = serde_json::to_vec(&clank::cli::fork::ForkSpec {
+        opencode: None,
         tool: Tool::Codex,
         from_session: Some("ancestor".into()),
         prompt: "orient".into(),
@@ -192,6 +193,7 @@ fn claude_trust_failure_preserves_fork_intent_and_configuration() {
     let path = clank::cli::fork::fork_spec_path(f.env.repo(), &f.label);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let spec = serde_json::to_vec(&clank::cli::fork::ForkSpec {
+        opencode: None,
         tool: Tool::Claude,
         from_session: Some("ancestor".into()),
         prompt: "orient".into(),

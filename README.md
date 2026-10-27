@@ -226,8 +226,15 @@ and clank's SessionStart hook binds that label to the session the tool
 just created — so work can be routed to it — and rebinds it when
 `/clear` hands the process a new session id. OpenCode has no such
 hook, so clank chooses an OpenCode session's id itself, records the
-binding, and launches it with `--session <id>`; a forked OpenCode pane,
-whose id OpenCode chooses, is asked to bind itself. Nothing to type.
+binding, and launches it with `--session <id>`. A forked OpenCode agent's
+child session is prepared before it launches: `opencode api session.fork`
+copies the source, `session.move` places the child in the fork, and
+`session.get` must confirm it is stored there before clank binds it and
+launches `opencode --session <child>`. Preparation uses the profile's
+executable and `launch.env` in the fork; a profile selecting a server
+(`--server`, `--standalone`) is refused, since `opencode api` would fork in
+another store. A forked OpenCode agent with no source session starts fresh
+and is asked to bind itself. Nothing to type.
 Only a session you started yourself needs `clank as <label>`. Inside the
 repo's workspace, `clank as` also renames its own pane to the label, so
 clank can find it. It refuses, before binding anything, when another
@@ -440,7 +447,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `rereview` | Make every reviewer review a plan's latest commit again |
 | `agent` | Roster: `add` / `make-master` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
 | `team` | Your saved teams (`save` / `list` / `show` / `remove`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
-| `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove` |
+| `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove`; `recover <agent> --child <id>` / `--forget` settles an OpenCode fork whose reply was lost |
 | `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
 | `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
@@ -1424,6 +1431,17 @@ explicit `clank open --fork …`. If automatic opening fails, the error states t
 fork's existing path; the fork remains created. A later query failure likewise
 does not undo a tab created by an earlier invocation. Inspect the selected
 session before retrying or deleting anything.
+
+**An OpenCode agent in a fork refuses to start, saying its fork may exist:**
+clank records each `session.fork` request before sending it and the child's id
+as soon as the reply names it, so a start never forks twice. When the reply was
+lost, the child may exist without clank knowing it, and starts refuse rather
+than copy the history again. Find the child with `opencode session list` in the
+source repo, then, in the fork, run `clank fork recover <agent> --child <id>`:
+the next start moves it into the fork and confirms it there before binding it.
+Or delete any stray child and run `clank fork recover <agent> --forget`, and
+the next start forks afresh. Either refuses an agent that is already bound or
+already has a recorded child, and touches no other agent.
 
 **Building takes minutes and `cargo test` seems to hang before any
 test runs** — on macOS, that is Gatekeeper. `syspolicyd` assesses

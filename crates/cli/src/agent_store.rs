@@ -715,10 +715,21 @@ pub fn reserve_opencode_session(
     mint: impl FnOnce() -> SessionId,
 ) -> anyhow::Result<Session> {
     let guard = BindingGuard::acquire(repo, label)?;
+    reserve_opencode_locked(&guard, superseded, mint)
+}
+
+/// [`reserve_opencode_session`] for a caller already holding the label's
+/// binding lock, which it needs held across work before the bind.
+pub(crate) fn reserve_opencode_locked(
+    guard: &BindingGuard,
+    superseded: Option<&Session>,
+    mint: impl FnOnce() -> SessionId,
+) -> anyhow::Result<Session> {
+    let label = guard.label;
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("formatting timestamp")?;
-    mutate_locked(&guard, |cfg| match &cfg.session {
+    mutate_locked(guard, |cfg| match &cfg.session {
         Some(s) if s.tool == Tool::OpenCode => Ok(s.clone()),
         Some(s) if Some(s) != superseded => Err(anyhow::anyhow!(
             "`{label}` was bound to {} session {} while it was starting",

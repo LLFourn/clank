@@ -188,6 +188,35 @@ fn grok_fork_reserves_child_intent_without_copying_or_binding() {
 }
 
 #[test]
+fn an_opencode_fork_with_a_source_is_not_told_to_bind_itself() {
+    use clank_core::vocab::Tool;
+    let env = source_with_bound_team();
+    let source_id = "ses_0af1b2c3d4e5f607SourceAAAA";
+    bind_session(&env, "claude", Tool::OpenCode, source_id);
+    let dest = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "oc-child"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+    let spec = clank::cli::fork::load_fork_spec(&dest, &label)
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.tool, Tool::OpenCode);
+    assert_eq!(spec.from_session.as_deref(), Some(source_id));
+    assert!(
+        spec.opencode.is_none(),
+        "nothing is requested before a start"
+    );
+    assert!(
+        spec.prompt.contains("worktree `oc-child`"),
+        "{}",
+        spec.prompt
+    );
+    assert!(!spec.prompt.contains("clank as"), "{}", spec.prompt);
+}
+
+#[test]
 fn fork_creates_worktree_and_seeds_team() {
     let env = source_with_bound_team();
     let repo = env.repo();

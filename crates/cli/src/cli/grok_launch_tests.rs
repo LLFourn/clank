@@ -77,6 +77,7 @@ impl Fixture {
             &f.repo,
             &f.label,
             &ForkSpec {
+                opencode: None,
                 tool: Tool::Grok,
                 from_session: Some(SOURCE.into()),
                 prompt: "orient child".into(),

@@ -307,7 +307,7 @@ review            feedback {write read}
                   block {ask answer clean}
 the team          agent {list add remove make-master set-review swap launch start}
                   team {save list show remove, agent library add/remove}
-                  open  fork {create list remove}
+                  open  fork {create list remove recover}
 talking           send  nudge  user-command {trust-key untrust-key keys submit status}
                   events {list show read ack reply}
 running remote    remote {status on off}
@@ -410,6 +410,7 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `fork create` | to try something in a parallel worktree | human | R | keep | |
 | `fork list` | to see the forks | human | R | keep |  |
 | `fork remove` | to clean one up | human | R | keep |  |
+| `fork recover` | to settle an OpenCode fork whose reply was lost | human | R | keep |  |
 | `stash` | to set a plan aside for another | agent | R S | keep |  |
 | `stash push` | the same as bare `stash` | agent | S | keep | |
 | `stash pop` | to bring the plan back | agent | S | keep | |
@@ -542,6 +543,7 @@ Generated. Do not edit by hand.
 | `fork create` | action |  |  | Fork the team into a linked worktree (or `--clone`) | [NAME] [SOURCE] | --fresh --pr --branch --path --clone --team -d/--draft --prompt --no-open |
 | `fork list` | action |  |  | List this repo's forks |  | --repo |
 | `fork remove` | action |  |  | Remove a fork's worktree or clone | <NAME> | --force --repo |
+| `fork recover` | action |  |  | Settle an OpenCode fork whose `session.fork` reply was lost | <AGENT> | --child --forget --repo one of --child/--forget (required) |
 | `stash` | group, bare runs |  |  | Set a plan's commits aside and restore them later | [PLAN] | --repo --for --to-queue --priority --dry-run |
 | `stash push` | action |  |  | Set a plan aside, the same as bare `clank stash` | [PLAN] | --repo --for --to-queue --priority --dry-run |
 | `stash pop` | action |  |  | Bring a stashed plan back onto the branch | [PLAN] | --repo |

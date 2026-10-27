@@ -45,6 +45,25 @@ pub struct ForkSpec {
     /// Grok's durable launch intent. Absent in legacy specs and other tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok: Option<GrokForkIntent>,
+    /// Absent until OpenCode's `session.fork` is requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<OpenCodeForkIntent>,
+}
+
+impl ForkSpec {
+    /// An OpenCode child with a source is prepared and bound before it
+    /// launches; without one it launches fresh and binds itself.
+    pub(crate) fn prepares_opencode_child(&self) -> bool {
+        self.tool == clank_core::vocab::Tool::OpenCode && self.from_session.is_some()
+    }
+}
+
+/// Written before `session.fork` is sent, so a lost reply is never taken
+/// for no request; `child_id` is written as soon as a reply names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenCodeForkIntent {
+    #[serde(default)]
+    pub child_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -344,6 +363,20 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
         super::ForkCmd::Create(a) => run_create(a).await,
         super::ForkCmd::List(a) => run_list(a).await,
         super::ForkCmd::Remove(a) => run_remove(a).await,
+        super::ForkCmd::Recover(a) => {
+            let repo = resolve_repo(a.repo.as_deref())?;
+            let label = AgentLabel::parse(&a.label)
+                .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", a.label))?;
+            let recovery = match a.child {
+                Some(id) => super::opencode_fork::Recovery::Adopt(id),
+                None => super::opencode_fork::Recovery::Forget,
+            };
+            eprintln!(
+                "{}",
+                super::opencode_fork::recover(&repo, &label, recovery)?
+            );
+            Ok(())
+        }
     }
 }
 
@@ -854,7 +887,8 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
     let purpose = purpose_owned.as_deref().unwrap_or("parallel work");
     for seed in &seeds {
         let label = &seed.label;
-        let spec = ForkSpec {
+        let mut spec = ForkSpec {
+            opencode: None,
             tool: seed.tool,
             from_session: seed.from_session.clone(),
             grok: if seed.tool == clank_core::vocab::Tool::Grok {
@@ -862,15 +896,23 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
             } else {
                 None
             },
-            prompt: format!(
-                "You are `{label}` in {kind_word} `{name}` of {source_path} \
-                 (branch `{name}` off {base}), session forked for: {purpose}. \
-                 Run `clank as {label}` to bind this forked session.{queue_note}",
-                label = label.as_str(),
-                kind_word = if args.clone { "clone" } else { "worktree" },
-                source_path = source.display(),
-            ),
+            prompt: String::new(),
         };
+        spec.prompt = format!(
+            "You are `{label}` in {kind_word} `{name}` of {source_path} \
+             (branch `{name}` off {base}), session forked for: {purpose}.{bind_note}{queue_note}",
+            label = label.as_str(),
+            kind_word = if args.clone { "clone" } else { "worktree" },
+            source_path = source.display(),
+            bind_note = if spec.prepares_opencode_child() {
+                String::new()
+            } else {
+                format!(
+                    " Run `clank as {}` to bind this forked session.",
+                    label.as_str()
+                )
+            },
+        );
         save_fork_spec(&dest, label, &spec)?;
 
         // Carbon-copy the source's per-agent SETTINGS into the fork —
@@ -1759,6 +1801,7 @@ detached
         assert!(take_fork_spec(repo, &label).unwrap().is_none());
 
         let spec = ForkSpec {
+            opencode: None,
             grok: None,
             tool: clank_core::vocab::Tool::Codex,
             from_session: Some("ancestor-id".into()),

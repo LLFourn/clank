@@ -49,6 +49,7 @@ pub mod nudge;
 pub(crate) mod nudge_log;
 pub mod open;
 pub mod open_zellij;
+pub(crate) mod opencode_fork;
 mod owned_callback;
 pub mod pane_input;
 pub(crate) mod pane_owners;
@@ -224,6 +225,28 @@ pub enum ForkCmd {
     List(ForkListArgs),
     /// Remove a fork's worktree or clone.
     Remove(ForkRemoveArgs),
+    /// Settle an OpenCode fork whose `session.fork` reply was lost
+    ///
+    /// Run in the fork; it touches only that agent's fork intent.
+    Recover(ForkRecoverArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("recovery").required(true).args(["child", "forget"])))]
+pub struct ForkRecoverArgs {
+    #[arg(value_name = "AGENT")]
+    pub label: String,
+    /// Adopt this child session (find it with `opencode session list` in
+    /// the source repo). The next `clank agent start` moves it into the
+    /// fork and confirms it there before binding it.
+    #[arg(long, value_name = "ID")]
+    pub child: Option<String>,
+    /// Drop the unanswered request so the next start forks afresh. Delete
+    /// any stray child the lost request made first.
+    #[arg(long)]
+    pub forget: bool,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -2322,6 +2345,31 @@ mod agent_team_cli_parse_tests {
     struct ForkNoun {
         #[command(subcommand)]
         cmd: super::ForkCmd,
+    }
+
+    #[test]
+    fn fork_recover_takes_exactly_one_of_child_or_forget() {
+        let parse =
+            |argv: &[&str]| ForkNoun::try_parse_from([&["t", "recover"][..], argv].concat());
+        match parse(&["kimi", "--child", "ses_x"]).unwrap().cmd {
+            super::ForkCmd::Recover(a) => {
+                assert_eq!(
+                    (a.label.as_str(), a.child.as_deref(), a.forget),
+                    ("kimi", Some("ses_x"), false)
+                )
+            }
+            other => panic!("expected recover, got {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["kimi", "--forget"]).unwrap().cmd,
+            super::ForkCmd::Recover(super::ForkRecoverArgs {
+                forget: true,
+                child: None,
+                ..
+            })
+        ));
+        assert!(parse(&["kimi"]).is_err());
+        assert!(parse(&["kimi", "--forget", "--child", "ses_x"]).is_err());
     }
 
     #[test]

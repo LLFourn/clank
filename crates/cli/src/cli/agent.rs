@@ -194,9 +194,14 @@ fn print_human(rows: &[AgentRow]) {
 /// field (per `agent-add-cli-and-repo-scope`). Session binding
 /// state comes from the per-agent skeleton.
 async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
-    start_with(args, Purpose::Start, session_holder::find)
-        .await
-        .map(|_| ())
+    start_with(
+        args,
+        Purpose::Start,
+        session_holder::find,
+        &super::opencode_fork::Cli,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// The bound session the roster has moved away from: its tool is not
@@ -284,6 +289,7 @@ async fn start_with(
     args: AgentStartArgs,
     purpose: Purpose,
     find_holder: FindHolder,
+    opencode: &dyn super::opencode_fork::Api,
 ) -> anyhow::Result<Option<ComposedLaunch>> {
     let print = args.print || purpose == Purpose::Preview;
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -366,7 +372,7 @@ async fn start_with(
                             "Grok fork: prepare history in {} through ACP, then launch the child; preview does not prepare or consume the intent",
                             repo.display()
                         );
-                        let preview = compose_grok_preview(&repo, &label);
+                        let preview = compose_preparation_preview(&repo, &label);
                         print_composed(&preview);
                         return Ok(Some(preview));
                     }
@@ -381,6 +387,30 @@ async fn start_with(
                     (
                         compose_prepared_grok(&repo, &label, &desc, &prepared),
                         Tool::Grok,
+                    )
+                }
+                Some(spec) if spec.prepares_opencode_child() => {
+                    super::opencode_fork::validate_profile(desc.launch.as_ref())?;
+                    if print {
+                        eprintln!(
+                            "OpenCode fork: fork {} with session.fork, move the child into {} \
+                             and confirm it there, then bind and launch it; preview makes no \
+                             API call and no write",
+                            spec.from_session.as_deref().unwrap_or_default(),
+                            repo.display()
+                        );
+                        let preview = compose_preparation_preview(&repo, &label);
+                        print_composed(&preview);
+                        return Ok(Some(preview));
+                    }
+                    super::setup::ensure_launch_setup(&repo, spec.tool, desc.launch.as_ref())
+                        .await?;
+                    consume_fork = true;
+                    (
+                        compose_prepared_opencode(
+                            &repo, &label, &desc, superseded, &spec, opencode,
+                        )?,
+                        Tool::OpenCode,
                     )
                 }
                 spec => {
@@ -476,13 +506,18 @@ async fn start_with(
                         super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
                     super::grok_launch::validate_resume(&provider, &repo, session.id.as_str())?;
                 }
+                let orientation = unlaunched_opencode_child(&repo, &label, session)?;
+                consume_fork = orientation.is_some();
+                let prompt = orientation
+                    .map(|spec| spec.prompt)
+                    .or_else(|| start_prompt(&desc, cfg.as_ref(), session.tool));
                 (
                     compose_launch(
                         &repo,
                         &label,
                         session,
                         desc.launch.as_ref(),
-                        start_prompt(&desc, cfg.as_ref(), session.tool).as_deref(),
+                        prompt.as_deref(),
                     ),
                     session.tool,
                 )
@@ -549,12 +584,32 @@ async fn start_with(
     }
 
     // Failed setup or trust preparation must leave the one-shot fork retryable.
-    if consume_fork {
-        crate::cli::fork::take_fork_spec(&repo, &label)?;
-    }
-
     let workdir = matches!(launch_tool, Tool::Grok | Tool::Claude).then_some(repo.as_path());
-    exec_composed(composed, workdir).map(|()| None)
+    launch_consuming_fork(&repo, &label, consume_fork, || {
+        exec_composed(composed, workdir)
+    })
+    .map(|()| None)
+}
+
+/// Consume the fork intent, then hand over to `run`. The launched process
+/// owns the orientation once exec replaces this one; an exec that returns
+/// launched nothing, so the intent is put back for the next start.
+fn launch_consuming_fork(
+    repo: &Path,
+    label: &AgentLabel,
+    consume: bool,
+    run: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let taken = if consume {
+        crate::cli::fork::take_fork_spec(repo, label)?
+    } else {
+        None
+    };
+    run().inspect_err(|_| {
+        if let Some(spec) = &taken {
+            let _ = crate::cli::fork::save_fork_spec(repo, label, spec);
+        }
+    })
 }
 
 /// The profile's args, plus what every launch of `tool` must carry.
@@ -744,9 +799,8 @@ fn start_prompt(desc: &AgentDescription, cfg: Option<&AgentConfig>, tool: Tool) 
 /// first, and launches it as a resume: `--session` creates a session
 /// that does not exist yet. A preview shows an id it does not record.
 ///
-/// A fork is the exception: OpenCode chooses the child's id, and its
-/// `--session` names the PARENT, so it binds later through `clank as`.
-
+/// A fork with no source session is the exception: it launches fresh
+/// with the orientation prompt and binds later through `clank as`.
 fn compose_unbound_launch(
     repo: &Path,
     label: &AgentLabel,
@@ -866,10 +920,10 @@ fn compose_fork_launch(
     worktree: &Path,
     home: Option<&Path>,
 ) -> ComposedLaunch {
-    // A Grok preview must describe the preparation owner, never print the
-    // unsafe interactive --fork-session command. Real starts prepare first.
-    if spec.tool == Tool::Grok {
-        return compose_grok_preview(worktree, label);
+    // A preview must describe the preparation owner, never print an
+    // interactive fork command that would misplace the child.
+    if spec.tool == Tool::Grok || spec.prepares_opencode_child() {
+        return compose_preparation_preview(worktree, label);
     }
     let program = desc
         .launch
@@ -911,16 +965,8 @@ fn compose_fork_launch(
             args.push(worktree.display().to_string());
             args.push(sid.clone());
         }
-        (Some(_), Tool::Grok) => unreachable!("Grok is composed through preparation above"),
-        // opencode: `--session <src> --fork` — the TUI resumes a COPY
-        // and mints a fresh `ses_` id; the source is untouched. The
-        // new id binds later via the plugin + `clank as`: binding the
-        // `--session` argument here would bind the fork to its parent.
-        // cwd comes from the pane, like claude.
-        (Some(sid), Tool::OpenCode) => {
-            args.push("--session".into());
-            args.push(sid.clone());
-            args.push("--fork".into());
+        (Some(_), Tool::Grok | Tool::OpenCode) => {
+            unreachable!("composed through preparation above")
         }
         // No source session to fork (fork-robustness): launch a FRESH
         // session — same shape as the bootstrap launch, but carrying
@@ -948,7 +994,7 @@ fn compose_fork_launch(
     }
 }
 
-fn compose_grok_preview(repo: &Path, label: &AgentLabel) -> ComposedLaunch {
+fn compose_preparation_preview(repo: &Path, label: &AgentLabel) -> ComposedLaunch {
     ComposedLaunch {
         program: "clank".into(),
         args: vec![
@@ -1009,6 +1055,52 @@ fn compose_prepared_grok(
         args,
         env_overrides: env,
     }
+}
+
+/// The fork intent whose prepared child `session` is. Kept until a launch
+/// is about to exec, so a child bound by a start whose exec failed still
+/// gets its orientation.
+fn unlaunched_opencode_child(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &Session,
+) -> anyhow::Result<Option<crate::cli::fork::ForkSpec>> {
+    Ok(
+        crate::cli::fork::load_fork_spec(repo, label)?.filter(|spec| {
+            spec.tool == Tool::OpenCode
+                && spec.opencode.as_ref().and_then(|i| i.child_id.as_deref())
+                    == Some(session.id.as_str())
+        }),
+    )
+}
+
+/// The prepared child, launched as an ordinary bound resume carrying the
+/// fork's orientation prompt.
+fn compose_prepared_opencode(
+    repo: &Path,
+    label: &AgentLabel,
+    desc: &AgentDescription,
+    superseded: Option<&Session>,
+    spec: &crate::cli::fork::ForkSpec,
+    api: &dyn super::opencode_fork::Api,
+) -> anyhow::Result<ComposedLaunch> {
+    let launch = desc.launch.as_ref();
+    super::opencode_fork::validate_profile(launch)?;
+    let mut env = tool_env_defaults(Tool::OpenCode);
+    env.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
+    let backend = super::opencode_fork::Backend {
+        program: launch_program(Tool::OpenCode, launch),
+        env,
+        cwd: repo.to_path_buf(),
+    };
+    let session = super::opencode_fork::prepare(repo, label, &backend, superseded, api)?;
+    Ok(compose_launch(
+        repo,
+        label,
+        &session,
+        launch,
+        Some(&spec.prompt),
+    ))
 }
 
 /// Append the launch prompt in the tool's own dialect: opencode's
@@ -2401,6 +2493,7 @@ async fn launch_with(args: AgentLaunchArgs, find_holder: FindHolder) -> anyhow::
         },
         Purpose::Preview,
         find_holder,
+        &super::opencode_fork::Cli,
     )
     .await
     .map(|_| ())
@@ -2623,7 +2716,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_and_fork_launches_omit_the_bootstrap_id() {
+    fn fresh_and_sourceless_fork_launches_omit_the_bootstrap_id() {
         // The id is unknowable until opencode mints it, so neither
         // launch can own one — and neither may inherit a parent's.
         let desc = desc_with(Tool::OpenCode, None);
@@ -2631,9 +2724,10 @@ mod tests {
         assert!(!fresh.env_overrides.contains_key(BOOTSTRAP_VAR));
 
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::OpenCode,
-            from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
+            from_session: None,
             prompt: "orient".into(),
         };
         let fork = compose_fork_launch(
@@ -3922,6 +4016,7 @@ mod tests {
             },
             Purpose::Start,
             running_in_a_pane,
+            &NoApiCalls,
         )
         .await
         .unwrap_err();
@@ -4007,6 +4102,20 @@ mod tests {
 
     const OLD_SESSION: &str = "01a156a7-f516-7dc0-8b58-520faf122796";
 
+    struct NoApiCalls;
+
+    impl crate::cli::opencode_fork::Api for NoApiCalls {
+        fn call(
+            &self,
+            _: &crate::cli::opencode_fork::Backend,
+            method: &str,
+            _: &str,
+            _: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, crate::cli::opencode_fork::CallError> {
+            panic!("this start must make no OpenCode API call, made {method}")
+        }
+    }
+
     /// A git repo whose `browser2` roster entry is `entry`, bound to a
     /// session of `bound_tool`.
     fn changed_tool(entry: &str, bound_tool: &str) -> tempfile::TempDir {
@@ -4043,6 +4152,7 @@ mod tests {
             },
             purpose,
             nobody_runs_it,
+            &NoApiCalls,
         )
         .await
         .unwrap()
@@ -4112,6 +4222,7 @@ mod tests {
             repo.path(),
             &label,
             &crate::cli::fork::ForkSpec {
+                opencode: None,
                 tool: Tool::Codex,
                 from_session: Some("01a156a7-0000-7000-8000-00000000f0f0".into()),
                 prompt: "forked".into(),
@@ -4140,6 +4251,7 @@ mod tests {
             repo.path(),
             &label,
             &crate::cli::fork::ForkSpec {
+                opencode: None,
                 tool: Tool::Codex,
                 from_session: Some("01a156a7-0000-7000-8000-00000000f0f0".into()),
                 prompt: "forked".into(),
@@ -4163,6 +4275,7 @@ mod tests {
             repo.path(),
             &label,
             &crate::cli::fork::ForkSpec {
+                opencode: None,
                 tool: Tool::Grok,
                 from_session: Some("019a0000-0000-7000-8000-000000000010".into()),
                 prompt: "older Grok fork intent".into(),
@@ -4211,6 +4324,7 @@ mod tests {
         let label = AgentLabel::parse("browser2").unwrap();
         std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             tool: Tool::Codex,
             from_session: None,
             prompt: "forked".into(),
@@ -4604,10 +4718,12 @@ mod tests {
                     "{tool:?} resume: {:?}",
                     resumed.args
                 );
+                // An OpenCode fork with a source is prepared, not composed here.
                 let spec = crate::cli::fork::ForkSpec {
+                    opencode: None,
                     grok: None,
                     tool,
-                    from_session: Some("src-session".into()),
+                    from_session: (tool != Tool::OpenCode).then(|| "src-session".into()),
                     prompt: "orient".into(),
                 };
                 let forked = compose_fork_launch(&lbl("p"), &spec, &desc, wt, None);
@@ -4692,6 +4808,7 @@ mod tests {
 
         // claude takes it as a flag, so the prompt is untouched.
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Claude,
             from_session: Some("src-session".into()),
@@ -4712,31 +4829,32 @@ mod tests {
         assert_eq!(c.args[n + 1], "recovery-scan · kimi");
         assert!(c.args.iter().any(|a| a == orient));
 
-        // codex and opencode derive it, so the name must LEAD — the
-        // orientation prompt opens "You are `kimi` in worktree …",
-        // which buries the fork name where truncation cuts it off.
-        for tool in [Tool::Codex, Tool::OpenCode] {
-            let spec = crate::cli::fork::ForkSpec {
-                grok: None,
-                tool,
-                from_session: Some("src-session".into()),
-                prompt: orient.into(),
-            };
-            let c = compose_fork_launch(&lbl("kimi"), &spec, &desc_with(tool, None), wt, None);
-            let prompt = c.args.last().expect("a prompt");
-            assert!(
-                prompt.starts_with("recovery-scan · kimi"),
-                "{tool:?} fork prompt must lead with the fork name: {prompt}"
-            );
-            assert!(
-                prompt.ends_with(orient),
-                "orientation is preserved: {prompt}"
-            );
-            assert!(
-                !c.args.iter().any(|a| a == "-n"),
-                "{tool:?} has no name flag"
-            );
-        }
+        // codex derives it, so the name must LEAD — the orientation
+        // prompt opens "You are `kimi` in worktree …", which buries the
+        // fork name where truncation cuts it off. A prepared OpenCode
+        // child is named the same way, through its resume launch.
+        let tool = Tool::Codex;
+        let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
+            grok: None,
+            tool,
+            from_session: Some("src-session".into()),
+            prompt: orient.into(),
+        };
+        let c = compose_fork_launch(&lbl("kimi"), &spec, &desc_with(tool, None), wt, None);
+        let prompt = c.args.last().expect("a prompt");
+        assert!(
+            prompt.starts_with("recovery-scan · kimi"),
+            "{tool:?} fork prompt must lead with the fork name: {prompt}"
+        );
+        assert!(
+            prompt.ends_with(orient),
+            "orientation is preserved: {prompt}"
+        );
+        assert!(
+            !c.args.iter().any(|a| a == "-n"),
+            "{tool:?} has no name flag"
+        );
     }
 
     #[test]
@@ -4960,6 +5078,43 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_that_fails_to_exec_keeps_its_fork_intent() {
+        let repo = tempfile::tempdir().unwrap();
+        let name = label("kimi");
+        let spec = crate::cli::fork::ForkSpec {
+            grok: None,
+            tool: Tool::OpenCode,
+            from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
+            prompt: "Review the parallel fork plan.".into(),
+            opencode: Some(crate::cli::fork::OpenCodeForkIntent {
+                child_id: Some("ses_039d60658ffe0RPgue3noZ0Qqg".into()),
+            }),
+        };
+        crate::cli::fork::save_fork_spec(repo.path(), &name, &spec).unwrap();
+        let failed = launch_consuming_fork(repo.path(), &name, true, || {
+            Err(anyhow::anyhow!("No such file or directory"))
+        });
+        assert!(failed.is_err());
+        let kept = crate::cli::fork::take_fork_spec(repo.path(), &name).unwrap();
+        assert_eq!(kept.as_ref().map(|s| &s.prompt), Some(&spec.prompt));
+        assert_eq!(
+            kept.and_then(|s| s.opencode)
+                .and_then(|o| o.child_id)
+                .as_deref(),
+            Some("ses_039d60658ffe0RPgue3noZ0Qqg")
+        );
+
+        crate::cli::fork::save_fork_spec(repo.path(), &name, &spec).unwrap();
+        launch_consuming_fork(repo.path(), &name, true, || Ok(())).unwrap();
+        assert!(
+            crate::cli::fork::take_fork_spec(repo.path(), &name)
+                .unwrap()
+                .is_none(),
+            "a launch that runs owns the orientation"
+        );
+    }
+
+    #[test]
     fn auto_mode_sends_a_fresh_opencode_agent_no_prompt() {
         let repo = tempfile::tempdir().unwrap();
         let cfg = AgentConfig {
@@ -5091,66 +5246,175 @@ mod tests {
     }
 
     #[test]
-    fn an_opencode_fork_and_its_fallback_are_not_bound_at_launch() {
-        // OpenCode chooses the child's id, so the `--session` a fork names
-        // is its parent's: the fork still asks to be bound.
+    fn an_opencode_fork_without_a_source_launches_fresh_and_unbound() {
         let repo = tempfile::tempdir().unwrap();
         let worktree = repo.path().join("x");
         let ask = "orient. Run `clank as tester` to bind this forked session.";
-        for (from, expected) in [
-            (
-                Some("ses_039d60658ffe0RPgue3noZ0Qqf"),
-                &["--session", "ses_039d60658ffe0RPgue3noZ0Qqf", "--fork"][..],
-            ),
-            (None, &[][..]),
-        ] {
-            let spec = crate::cli::fork::ForkSpec {
-                grok: None,
-                tool: Tool::OpenCode,
-                from_session: from.map(String::from),
-                prompt: ask.into(),
-            };
-            let desc = desc_with(Tool::OpenCode, None);
-            let c = unbound_launch(&worktree, "tester", &desc, Some(&spec), false).unwrap();
-            let mut args = expected.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-            args.extend(["--prompt".into(), format!("x · tester — {ask}")]);
-            assert_eq!(c.args, args, "{from:?}");
-            assert_eq!(binding(&worktree, "tester"), None, "{from:?}");
+        let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
+            grok: None,
+            tool: Tool::OpenCode,
+            from_session: None,
+            prompt: ask.into(),
+        };
+        let desc = desc_with(Tool::OpenCode, None);
+        let c = unbound_launch(&worktree, "tester", &desc, Some(&spec), false).unwrap();
+        assert_eq!(
+            c.args,
+            ["--prompt".to_string(), format!("x · tester — {ask}")]
+        );
+        assert_eq!(binding(&worktree, "tester"), None);
+    }
+
+    fn opencode_fork_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("x");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        crate::cli::fork::save_fork_spec(
+            &repo,
+            &lbl("tester"),
+            &crate::cli::opencode_fork::tests::opencode_spec(),
+        )
+        .unwrap();
+        (dir, repo)
+    }
+
+    fn opencode_profile(args: &[&str]) -> AgentDescription {
+        desc_with(
+            Tool::OpenCode,
+            Some(LaunchConfig {
+                command: Some("oc-2".into()),
+                args: args.iter().map(|a| a.to_string()).collect(),
+                env: BTreeMap::from([("K".to_string(), "V".to_string())]),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_prepared_opencode_fork_launches_its_bound_child_under_the_profile() {
+        use crate::cli::opencode_fork::tests::{CHILD, Fake};
+        let (_d, repo) = opencode_fork_repo();
+        let spec = crate::cli::fork::load_fork_spec(&repo, &lbl("tester"))
+            .unwrap()
+            .unwrap();
+        let api = Fake::opencode();
+        let desc = opencode_profile(&["--model", "m"]);
+        let c = compose_prepared_opencode(&repo, &lbl("tester"), &desc, None, &spec, &api).unwrap();
+        assert_eq!(c.program, "oc-2");
+        assert_eq!(
+            c.args,
+            [
+                "--model",
+                "m",
+                "--session",
+                CHILD,
+                "--prompt",
+                "x · tester — orient"
+            ]
+        );
+        assert_eq!(
+            binding(&repo, "tester").map(|s| s.id.as_str().to_string()),
+            Some(CHILD.into())
+        );
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for call in calls.iter() {
+            assert_eq!(call.backend.program, "oc-2", "{}", call.method);
+            assert_eq!(call.backend.cwd, repo, "{}", call.method);
+            assert_eq!(
+                call.backend.env,
+                BTreeMap::from([
+                    ("K".to_string(), "V".to_string()),
+                    (
+                        "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".to_string(),
+                        "1".to_string()
+                    ),
+                ]),
+                "{}",
+                call.method
+            );
         }
     }
 
     #[test]
-    fn opencode_fork_resumes_a_copy_under_the_fork_flag() {
-        // `opencode --session <src> --fork` branches the source under
-        // a fresh ses_ id (verified live, opencode-agent-tool M2); the
-        // orientation prompt rides behind --prompt like every other
-        // opencode launch.
+    fn a_backend_selecting_profile_is_refused_before_any_call_or_write() {
+        let (_d, repo) = opencode_fork_repo();
+        let path = crate::cli::fork::fork_spec_path(&repo, &lbl("tester"));
+        let before = std::fs::read(&path).unwrap();
+        let spec = crate::cli::fork::load_fork_spec(&repo, &lbl("tester"))
+            .unwrap()
+            .unwrap();
+        for args in [
+            &["--server", "http://h:1"][..],
+            &["--server=http://h:1"],
+            &["--standalone"],
+        ] {
+            let desc = opencode_profile(args);
+            let err =
+                compose_prepared_opencode(&repo, &lbl("tester"), &desc, None, &spec, &NoApiCalls)
+                    .unwrap_err();
+            assert!(format!("{err:#}").contains("--s"), "{err:#}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(binding(&repo, "tester"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_whose_launch_never_ran_resumes_with_its_orientation_until_consumed() {
+        use crate::cli::opencode_fork::tests::{CHILD, Fake, opencode_spec};
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "browser2": { "tool": "opencode", "role": "standby" }
+            } }"#,
+        );
+        let label = lbl("browser2");
+        let spec = opencode_spec();
+        crate::cli::fork::save_fork_spec(repo.path(), &label, &spec).unwrap();
         let desc = desc_with(Tool::OpenCode, None);
-        let spec = crate::cli::fork::ForkSpec {
-            grok: None,
-            tool: Tool::OpenCode,
-            from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
-            prompt: "orient".into(),
-        };
-        let c = compose_fork_launch(
-            &lbl("tester"),
-            &spec,
-            &desc,
-            Path::new("/repo/.clank/worktrees/x"),
-            None,
+        let first =
+            compose_prepared_opencode(repo.path(), &label, &desc, None, &spec, &Fake::opencode())
+                .unwrap();
+
+        let retry = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(session_arg(&retry), Some(CHILD), "{retry:?}");
+        assert_eq!(retry.args.last(), first.args.last(), "{retry:?}");
+        assert!(retry.args.last().unwrap().ends_with("orient"), "{retry:?}");
+
+        crate::cli::fork::take_fork_spec(repo.path(), &label).unwrap();
+        let later = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(session_arg(&later), Some(CHILD), "{later:?}");
+        assert!(
+            !later.args.iter().any(|a| a.contains("orient")),
+            "{later:?}"
         );
-        assert_eq!(c.program, "opencode");
-        assert_eq!(
-            c.args,
-            vec![
-                "--session",
-                "ses_039d60658ffe0RPgue3noZ0Qqf",
-                "--fork",
-                "--prompt",
-                // No name flag: the fork's name leads the prompt.
-                "x · tester — orient",
-            ]
+    }
+
+    #[tokio::test]
+    async fn an_opencode_fork_preview_makes_no_call_and_no_write() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        seed_repo_config(
+            repo.path(),
+            r#"{ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "browser2": { "tool": "opencode", "role": "standby" }
+            } }"#,
         );
+        crate::cli::fork::save_fork_spec(
+            repo.path(),
+            &lbl("browser2"),
+            &crate::cli::opencode_fork::tests::opencode_spec(),
+        )
+        .unwrap();
+        let before = snapshot(repo.path());
+        let preview = next_start(repo.path(), Purpose::Preview).await;
+        assert_eq!(preview.program, "clank", "{preview:?}");
+        assert_eq!(snapshot(repo.path()), before);
     }
 
     #[test]
@@ -5433,6 +5697,7 @@ mod tests {
         // The spec's tool is what flows to the trust step (captured in
         // the same match arm that picks the composer).
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Codex,
             from_session: None,
@@ -5605,6 +5870,7 @@ mod tests {
         };
         let wt = std::path::Path::new("/repo/.clank/worktrees/x");
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Grok,
             from_session: Some("cccccccc-1111-2222-3333-444444444444".into()),
@@ -5625,6 +5891,7 @@ mod tests {
         );
 
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Grok,
             from_session: None,
@@ -5703,6 +5970,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Claude,
             from_session: None,
@@ -5717,6 +5985,7 @@ mod tests {
         );
 
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Codex,
             from_session: None,
@@ -5752,6 +6021,7 @@ mod tests {
                 initial_prompt: None,
             };
             let spec = crate::cli::fork::ForkSpec {
+                opencode: None,
                 grok: None,
                 tool,
                 from_session: Some("gone-999".into()),
@@ -5774,7 +6044,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_launch_still_resumes_when_the_store_cannot_be_probed() {
+    fn fork_launch_still_prepares_when_the_store_cannot_be_probed() {
         // opencode's store is unprobeable, so the probe answers None
         // — "cannot tell", never "gone". Treating it as gone would
         // silently discard LIVE sessions, which is a worse bug than
@@ -5785,6 +6055,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::OpenCode,
             from_session: Some("ses_0af1b2c3d4e5f607".into()),
@@ -5798,10 +6069,16 @@ mod tests {
             std::path::Path::new("/repo/.clank/worktrees/x"),
             Some(empty.path()),
         );
-        assert!(
-            c.args.iter().any(|a| a == "--session"),
-            "unprobeable must still resume: {:?}",
-            c.args
+        assert_eq!(
+            c.args,
+            [
+                "agent",
+                "start",
+                "tester",
+                "--repo",
+                "/repo/.clank/worktrees/x"
+            ],
+            "unprobeable must still be prepared from its source"
         );
     }
 
@@ -5818,6 +6095,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Claude,
             from_session: Some("abc-123".into()),
@@ -5847,6 +6125,7 @@ mod tests {
             initial_prompt: None,
         };
         let spec = crate::cli::fork::ForkSpec {
+            opencode: None,
             grok: None,
             tool: Tool::Codex,
             from_session: Some("def-456".into()),
