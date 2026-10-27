@@ -181,21 +181,17 @@ pub fn detect_session_from_env() -> Result<Option<(Tool, SessionId)>, EnvError> 
     detect_session_in(&Process)
 }
 
+/// Each harness's own session-id variable, as `clank as` reads it.
+pub(crate) const SESSION_VARS: [(&str, Tool); 4] = [
+    (ENV_CLAUDE_SESSION, Tool::Claude),
+    (ENV_CODEX_SESSION, Tool::Codex),
+    (ENV_GROK_SESSION, Tool::Grok),
+    (ENV_OPENCODE_SESSION, Tool::OpenCode),
+];
+
 pub(crate) fn detect_session_in(env: &dyn Ambient) -> Result<Option<(Tool, SessionId)>, EnvError> {
-    let explicit = select_explicit_session(&[
-        (
-            ENV_CLAUDE_SESSION,
-            Tool::Claude,
-            env.var(ENV_CLAUDE_SESSION),
-        ),
-        (ENV_CODEX_SESSION, Tool::Codex, env.var(ENV_CODEX_SESSION)),
-        (ENV_GROK_SESSION, Tool::Grok, env.var(ENV_GROK_SESSION)),
-        (
-            ENV_OPENCODE_SESSION,
-            Tool::OpenCode,
-            env.var(ENV_OPENCODE_SESSION),
-        ),
-    ])?;
+    let explicit =
+        select_explicit_session(&SESSION_VARS.map(|(var, tool)| (var, tool, env.var(var))))?;
     match explicit {
         Some((tool, raw)) => Ok(Some((tool, parse_session_id(&raw, tool)?))),
         // Older Grok sessions expose only a marker. Explicit session

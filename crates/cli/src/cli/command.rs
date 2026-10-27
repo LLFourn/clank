@@ -301,9 +301,12 @@ pub enum Command {
     Team(crate::cli::TeamArgs),
     /// Bind this session to a roster label
     ///
-    /// Reads the tool's session id from the environment
-    /// (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) and records the
-    /// binding in the agent's local config.
+    /// Reads the harness's own session id from the environment and
+    /// records the binding in the agent's local config: Claude Code's
+    /// CLAUDE_CODE_SESSION_ID, Codex's CODEX_THREAD_ID, Grok's
+    /// GROK_SESSION_ID, or OpenCode's OPENCODE_SESSION_ID (set by
+    /// OpenCode in its bash tool's shells). Agents clank launches are
+    /// already bound; this is for a session started by hand, or a fork.
     As(crate::cli::AsArgs),
     /// Manage this agent's auto-mode
     ///
@@ -530,6 +533,20 @@ mod tests {
     /// someone would actually type. Scanning only the table missed the
     /// Quickstart entirely, which is where the commands that matter
     /// are.
+    #[test]
+    fn clank_as_help_names_every_session_variable_it_reads() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("as")
+            .expect("as")
+            .render_long_help()
+            .to_string();
+        for (var, tool) in crate::agent_env::SESSION_VARS {
+            assert!(help.contains(var), "{tool:?}'s {var} is missing: {help}");
+        }
+    }
+
     #[test]
     fn the_readme_names_only_real_subcommands() {
         use clap::CommandFactory;

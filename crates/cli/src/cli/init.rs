@@ -11,8 +11,7 @@
 //!   empty new-shape config; `--team <name>` copies a user-scope
 //!   team's composition + referenced agents into it.
 //!
-//! It does NOT bind a session, read agent env vars
-//! (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
+//! It does NOT bind a session, read harness session env vars, prompt for an
 //! identity, or assign a role. Session binding is `clank as`'s
 //! sole job; roles are roster-derived.
 
@@ -27,8 +26,7 @@ use crate::init_facts::{
 /// `clank init` is pure repo setup: scaffold `.clank/`, install
 /// the git hook, retire legacy Claude permissions, and optionally
 /// pick a team.
-/// It does NOT bind sessions, read agent env vars
-/// (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
+/// It does NOT bind sessions, read harness session env vars, prompt for an
 /// identity, or assign any role — that's `clank as`'s job. Plan:
 /// `teams-based-agent-registration` (lloyd 2026-06-09: init
 /// assigns nothing).

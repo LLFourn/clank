@@ -1,8 +1,7 @@
 //! `clank as <label>` — bind the calling agent's session to a
 //! clank label, and name its pane for it.
 //!
-//! Reads `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` /
-//! `OPENCODE_SESSION_ID` from env,
+//! Reads the harness's session id from env (`agent_env::SESSION_VARS`),
 //! writes `.clank/agents/<label>/config.json` with the session
 //! field set, and clears the same session id from any OTHER
 //! agent's config (one session can't be bound to two labels at

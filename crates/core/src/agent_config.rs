@@ -43,7 +43,7 @@ pub struct AgentConfig {
     pub auto_mode: Option<AutoMode>,
     /// Session this agent label is currently bound to. Written by
     /// `clank as <label>` (or `clank init` phase 2) using the
-    /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env var.
+    /// harness's session-id env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Session>,
     /// Extra wake sources for this agent's `clank wait`

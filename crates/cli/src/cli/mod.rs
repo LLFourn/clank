@@ -580,7 +580,7 @@ pub struct WaitArgs {
     /// Agent label this caller is waiting as. Keys feedback files
     /// and the participant set. Optional: defaults via the shared
     /// identity resolver: the binding of the session named by
-    /// CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID, or CLANK_AGENT
+    /// the harness's session variable (see `clank as --help`), or CLANK_AGENT
     /// outside any session. Pass explicitly to override.
     #[arg(long, value_name = "AGENT")]
     pub author: Option<String>,
