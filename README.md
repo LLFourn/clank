@@ -189,8 +189,9 @@ commands) goes to the one live pane with that name in the repo's
 workspace, as the tool the roster gives the agent. No such pane, two of
 them, or a pane whose name could be read as two agents means nothing is
 typed; once recovery's nudge has met that, `clank status` says which. Whether the tool may be typed into
-at all is decided by the tool alone: Claude and Codex are, Grok never
-is, and OpenCode is resumed through its plugin.
+unattended is decided by the tool alone: Claude and Codex are, Grok never
+is, and OpenCode is resumed through its plugin. `clank nudge` types into
+all four.
 
 The TUI learns that an agent's pane exited at its next listing of the
 panes: when you open the agents panel or an agent's page, when an
@@ -482,8 +483,11 @@ Three levels, for three situations:
 - `clank nudge` is the recovery route for when the inbox cannot reach the
   agent at all: a wedged hook, a stale binding, a wake that never fires. It
   interrupts the agent's pane and types the message into its terminal,
-  reading no inbox and no binding. Nothing waits to be acknowledged, but
-  each attempt and its outcome is kept in the agent's nudge history.
+  reading no inbox and no binding. It is deliberately blunt: it does not
+  read the pane first, works for every tool, and submits whatever is
+  already in the input along with your message. Nothing waits to be
+  acknowledged, but each attempt and its outcome is kept in the agent's
+  nudge history.
 
 ### User commands
 
@@ -619,14 +623,15 @@ Deny rules match tool calls, so they cover `Read`/`Edit`/`Write` of those
 paths and the obvious Bash spellings, not every Bash path to the same
 bytes.
 
-**Ordinary text cannot reach a shell mode.** Every other pane write (nudge,
-`send --interrupt`, recovery, check-ins, the web chat) goes through one
+**Ordinary text cannot reach a shell mode.** Every other pane write
+(`send --interrupt`, recovery, check-ins, the web chat) goes through one
 admission rule: CR becomes LF, Tab a space, other control characters
 U+FFFD, and a leading `!` gets `·` before it. It then types only when one
 dump reads the input as an ordinary prompt (Claude, Codex). Grok's and
 OpenCode's input cannot be read, so their panes are never typed into.
 Otherwise it is refused and an event wake stays pending. Codex's
-app-server and OpenCode's plugin take the same admitted text.
+app-server and OpenCode's plugin take the same admitted text. `clank
+nudge` neutralises the same characters but skips the screen check.
 
 **Evidence a human records.** User commands are gated on an observation
 made in a throwaway pane against the installed harness, and stay refused

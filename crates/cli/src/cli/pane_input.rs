@@ -402,11 +402,19 @@ pub(crate) struct Target<'a> {
 /// blind retry could send a second interrupt into a cancellation already
 /// under way, which for Grok escalates toward quit. A submission that was
 /// not confirmed may already be partly typed.
-pub(crate) async fn interrupt_and_submit_async(
-    target: Target<'_>,
-    text: &Admitted,
-) -> Result<(), Unconfirmed> {
-    interrupt_and_submit_reserving(target, text, Reserve::Wait).await
+///
+/// `clank nudge` sends this without reading the pane first: it is the
+/// escape hatch for a stuck agent, so a person's draft in the input is
+/// submitted with the text, and an input in shell mode runs it.
+pub(crate) async fn nudge(target: Target<'_>, text: &Admitted) -> Result<(), Unconfirmed> {
+    let _lock = lock_pane_async(target.session, target.pane, Reserve::Wait)
+        .await
+        .map_err(Unconfirmed::Refused)?;
+    let term = Zellij {
+        session: target.session,
+        pane: target.pane,
+    };
+    interrupt_then_type(&term, target, text).await
 }
 
 async fn interrupt_and_submit_reserving(
@@ -443,6 +451,17 @@ async fn interrupt_and_submit_on(
     admit_write(term, target.tool)
         .await
         .map_err(Unconfirmed::Refused)?;
+    interrupt_then_type(term, target, text).await
+}
+
+async fn interrupt_then_type(
+    term: &impl Terminal,
+    target: Target<'_>,
+    text: &Admitted,
+) -> Result<(), Unconfirmed> {
+    if text.is_empty() {
+        return Err(Unconfirmed::Empty);
+    }
     let (pane, tool) = (target.pane, target.tool);
     let write = |argv| async { term.write(argv).await.map_err(|e| anyhow::anyhow!("{e}")) };
     interrupt_then_submit(
@@ -824,6 +843,29 @@ mod tests {
             assert_eq!(written[1][1], "write-chars", "{tool:?}: then the message");
             assert_eq!(written[1].last().unwrap(), "hello");
             assert_eq!(key(&written[2]), submit, "{tool:?}: then its own submit");
+        }
+    }
+
+    /// `clank nudge` is blunt: whatever the pane shows, even nothing
+    /// readable, every tool gets its interrupt key, the text and its submit.
+    #[tokio::test]
+    async fn a_nudge_types_into_any_tool_without_reading_the_pane() {
+        let key = |argv: &Vec<String>| argv[4..].join(" ");
+        for (tool, interrupt, submit) in [
+            (Tool::Claude, "27", "13"),
+            (Tool::Codex, "27", "27 91 49 51 59 49 58 49 117"),
+            (Tool::OpenCode, "27", "13"),
+            (Tool::Grok, "3", "13"),
+        ] {
+            let term = fake(None);
+            interrupt_then_type(&term, target(tool), &Admitted::new("hello"))
+                .await
+                .unwrap();
+            let written = term.written.into_inner();
+            assert_eq!(written.len(), 3, "{tool:?}: {written:?}");
+            assert_eq!(key(&written[0]), interrupt, "{tool:?}");
+            assert_eq!(written[1].last().unwrap(), "hello", "{tool:?}");
+            assert_eq!(key(&written[2]), submit, "{tool:?}");
         }
     }
 
