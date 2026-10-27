@@ -1221,7 +1221,9 @@ pub enum AgentCmd {
     /// By name, the agent is copied from your library (`clank team agent
     /// add` puts one there); with `--tool`, it is defined here. `--review`
     /// sets the tier; without it the agent becomes master on a roster that
-    /// has none, and a `commit` reviewer otherwise.
+    /// has none, and a `commit` reviewer otherwise. In a repo with no
+    /// `.clank/config.json` it first sets up what `clank init` would
+    /// (`.clank/.gitignore`, the `post-rewrite` hook) but imports no team.
     #[command(after_long_help = "\
 Examples:
   # a codex reviewer that reviews every commit

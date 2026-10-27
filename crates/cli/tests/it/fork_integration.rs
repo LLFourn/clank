@@ -626,6 +626,11 @@ fn fork_without_roster_falls_back_to_the_default_team() {
             .unwrap();
     assert_eq!(cfg["agents"]["claude"]["role"], "master");
     assert_eq!(cfg["agents"]["codex"]["role"], "commit");
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".clank/.gitignore")).unwrap(),
+        clank::init_facts::clank_gitignore_body(),
+        "a roster written from nothing gets init's support files"
+    );
     for label in ["claude", "codex"] {
         let spec: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dest.join(format!(".clank/agents/{label}/fork.json")))
@@ -634,6 +639,60 @@ fn fork_without_roster_falls_back_to_the_default_team() {
         .unwrap();
         assert!(spec["from_session"].is_null(), "{label} starts fresh");
     }
+}
+
+#[test]
+fn a_new_fork_gets_its_own_support_setup_whatever_its_roster_source() {
+    use clank::init_facts::{
+        GitignoreState, HookState, classify_clank_gitignore, classify_post_rewrite_hook,
+    };
+    let env = source_with_bound_team();
+    let mut args = fork_args(&env, "cloned");
+    args.clone = true;
+    let clone = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    assert_eq!(
+        classify_post_rewrite_hook(&clone),
+        HookState::Canonical,
+        "a clone installs its own hook"
+    );
+    assert_eq!(classify_clank_gitignore(&clone), GitignoreState::Canonical);
+
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    write(env.repo(), "src/lib.rs", "// base\n");
+    commit(env.repo(), "[misc] base without the managed ignore");
+    let tree = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "wt"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    assert_eq!(
+        classify_clank_gitignore(&tree),
+        GitignoreState::Canonical,
+        "a worktree whose base lacks the ignore gets it"
+    );
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tree.join(".clank/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        cfg["agents"]["claude"]["role"], "master",
+        "the source's roster is copied"
+    );
+
+    let env = source_with_bound_team();
+    write_user_teams(&env, &[("solo", &[("codex", RosterRole::Master)])]);
+    let mut args = fork_args(&env, "templated");
+    args.team = Some("solo".into());
+    let templated = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(templated.join(".clank/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg["agents"]["codex"]["role"], "master",
+        "the template replaces the copied roster"
+    );
+    assert_eq!(classify_post_rewrite_hook(&templated), HookState::Canonical);
 }
 
 #[test]

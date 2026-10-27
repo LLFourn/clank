@@ -5,12 +5,6 @@ use crate::common;
 use common::TestEnv;
 use std::path::Path;
 
-fn write(repo: &Path, rel: &str, body: &str) {
-    let abs = repo.join(rel);
-    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-    std::fs::write(abs, body).unwrap();
-}
-
 fn init_repo() -> TestEnv {
     TestEnv::init()
 }
@@ -109,7 +103,6 @@ fn run_doctor(env: &TestEnv) -> serde_json::Value {
 fn doctor_warns_on_unbound_reviewer() {
     let env = init_repo();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     register_agents(&env, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
@@ -142,7 +135,6 @@ fn doctor_warns_on_unbound_reviewer() {
 fn doctor_does_not_warn_on_bound_reviewer() {
     let env = init_repo();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     register_agents(&env, &[("codex", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
@@ -172,7 +164,6 @@ fn doctor_does_not_warn_on_bound_reviewer() {
 fn doctor_warns_on_unbound_master_symmetrically() {
     let env = init_repo();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     register_agents(&env, &[("lloyd", clank_core::vocab::Role::Master)]);
     write_skeleton(
         repo,
@@ -204,7 +195,6 @@ fn doctor_warns_when_launch_command_missing_from_path() {
     // typos before the user tries `clank agent start <name>`.
     let env = init_repo();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     // Launch lives on the declaration per
     // agent-add-cli-and-repo-scope Phase 1.
     register_agent_with_launch(
@@ -254,8 +244,6 @@ fn doctor_warns_on_missing_skeleton() {
     // a Warn naming the label + diagnostic mentioning
     // `clank init`.
     let env = init_repo();
-    let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     register_agents(&env, &[("phantom", clank_core::vocab::Role::Reviewer)]);
     // No skeleton written.
 
@@ -292,7 +280,6 @@ fn doctor_warns_on_orphan_skeleton() {
     // `clank agent add` AND `rm -rf`.
     let env = init_repo();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     // Registered team is just a master (`boss`); the `orphan`
     // skeleton below is NOT in the registered set.
     register_agents(&env, &[("boss", clank_core::vocab::Role::Master)]);
@@ -343,7 +330,6 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
     // unchanged by this plan.)
     let env = init_repo();
     let repo = env.repo();
-    write(repo, ".clank/.gitignore", ".gitignore\n");
     register_agents(&env, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,

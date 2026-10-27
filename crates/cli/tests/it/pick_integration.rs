@@ -365,9 +365,9 @@ fn pick_purge_strips_clank_and_drops_empty_commits() {
     );
     // The TARGET's own tracked .clank content is preserved — the strip
     // set is what the pick INTRODUCES, never the target's files (the
-    // fixture's `git add -A` tracks .clank/config.json on main).
+    // fixture's `git add -A` tracks .clank/.gitignore on main).
     assert!(
-        tree.contains(".clank/config.json"),
+        tree.contains(".clank/.gitignore"),
         "target-owned .clank content preserved: {tree}"
     );
 }

@@ -1382,6 +1382,13 @@ fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
 /// — thin shell: parse the label + role, build the launch profile,
 /// dispatch to the matching `pub` core by scope/tool.
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    add_with_home(args, home.as_deref())
+}
+
+/// [`add`] with `$HOME` passed in. `--global` writes only the user
+/// library and never resolves, let alone initializes, a repo.
+fn add_with_home(args: AgentAddArgs, home: Option<&Path>) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
     let role = args.review.map_or(NewRole::Default, |kind| {
@@ -1390,7 +1397,8 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
 
     if args.global {
         let (label, desc) = library_entry_from_add(&args)?;
-        return declare_global_agent(&library_home()?, &label, desc);
+        let home = home.ok_or_else(|| anyhow::anyhow!("the agent library needs $HOME"))?;
+        return declare_global_agent(home, &label, desc);
     }
 
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -1406,10 +1414,7 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
             add_repo_roster_agent(&repo, &label, desc, role)?;
         }
         // By-name: copy the description from the user-scope library.
-        None => {
-            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            add_repo_roster_agent_by_name(&repo, home.as_deref(), &label, role)?;
-        }
+        None => add_repo_roster_agent_by_name(&repo, home, &label, role)?,
     }
     // No zellij projection here: the status TUI owns roster→pane
     // convergence (tui-zellij-pane-reconcile), so this command — like
@@ -1818,9 +1823,30 @@ pub fn add_repo_roster_agent(
     desc: AgentDescription,
     role: impl Into<NewRole>,
 ) -> anyhow::Result<()> {
+    insert_roster_agent(
+        repo,
+        label,
+        role.into(),
+        || Ok(desc),
+        crate::cli::init::support_before_first_config,
+        "",
+    )?;
+    Ok(())
+}
+
+/// The one add path. `setup` runs after the add is validated and before
+/// the roster is published, all under the roster lock, so a failed setup
+/// publishes nothing and a concurrent first add sees this one's roster.
+fn insert_roster_agent(
+    repo: &Path,
+    label: &AgentLabel,
+    choice: NewRole,
+    describe: impl FnOnce() -> anyhow::Result<AgentDescription>,
+    setup: impl FnOnce(&Path) -> anyhow::Result<Option<crate::cli::init::SupportSetup>>,
+    origin: &str,
+) -> anyhow::Result<Option<crate::cli::init::SupportSetup>> {
     let _roster = roster_lock(repo)?;
     let mut repo_cfg = read_repo_config(repo)?;
-    let choice = role.into();
     let role = choice.on(&repo_cfg);
     let before = repo_cfg.clone();
     if repo_cfg.agents.contains_key(label) {
@@ -1830,6 +1856,8 @@ pub fn add_repo_roster_agent(
             label = label.as_str()
         );
     }
+    let desc = describe()?;
+    let setup = setup(repo)?;
     repo_cfg
         .agents
         .insert(label.clone(), RosterAgent::from_description(desc, role));
@@ -1840,12 +1868,12 @@ pub fn add_repo_roster_agent(
         RosterTransitionPolicy::PreserveGate,
     )?;
     eprintln!(
-        "added `{}` to this repo's roster: {}{}",
+        "added `{}` to this repo's roster: {}{}{origin}",
         label.as_str(),
         role_phrase(role),
         choice.why(role)
     );
-    Ok(())
+    Ok(setup)
 }
 
 /// Add `<label>` to THIS repo's roster BY NAME: copy its
@@ -1881,34 +1909,14 @@ pub fn add_repo_roster_agent_by_name(
     label: &AgentLabel,
     role: impl Into<NewRole>,
 ) -> anyhow::Result<()> {
-    let _roster = roster_lock(repo)?;
-    let mut repo_cfg = read_repo_config(repo)?;
-    let choice = role.into();
-    let role = choice.on(&repo_cfg);
-    let before = repo_cfg.clone();
-    if repo_cfg.agents.contains_key(label) {
-        anyhow::bail!(
-            "agent `{label}` is already on this repo's roster. \
-             Remove it with `clank agent remove {label}` first, or pick a different name.",
-            label = label.as_str()
-        );
-    }
-    let desc = library_description(home, label)?;
-    repo_cfg
-        .agents
-        .insert(label.clone(), RosterAgent::from_description(desc, role));
-    write_repo_transition(
+    insert_roster_agent(
         repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::PreserveGate,
+        label,
+        role.into(),
+        || library_description(home, label),
+        crate::cli::init::support_before_first_config,
+        " (copied from the library)",
     )?;
-    eprintln!(
-        "added `{}` to this repo's roster: {}{} (copied from the library)",
-        label.as_str(),
-        role_phrase(role),
-        choice.why(role)
-    );
     Ok(())
 }
 
@@ -3050,6 +3058,260 @@ mod tests {
             2,
             "the raw writer must appear only at its definition and inside write_repo_transition"
         );
+    }
+
+    // ── agent add, first add in a repo clank never set up ──────
+
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        repo
+    }
+
+    fn hook_path(repo: &Path) -> PathBuf {
+        crate::init_facts::post_rewrite_hook_path(repo).unwrap()
+    }
+
+    /// Every file under `root`, `.git` included, with its bytes.
+    fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_first_add_sets_up_what_init_would_and_adds_only_its_agent_as_master() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = git_repo();
+        let qwen = AgentLabel::parse("qwen").unwrap();
+        add_repo_roster_agent(repo.path(), &qwen, desc(Tool::Claude), NewRole::Default).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".clank/.gitignore")).unwrap(),
+            crate::init_facts::clank_gitignore_body()
+        );
+        assert!(repo.path().join(".clank/plans").is_dir());
+        let hook = hook_path(repo.path());
+        assert_eq!(
+            std::fs::read_to_string(&hook).unwrap(),
+            crate::init_facts::POST_REWRITE_BODY
+        );
+        assert_eq!(
+            std::fs::metadata(&hook).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        let roster = read_repo(repo.path());
+        assert_eq!(roster.agents.keys().collect::<Vec<_>>(), [&qwen]);
+        assert_eq!(roster.agents[&qwen].role, RosterRole::Master);
+        forget_roster_lock(repo.path());
+    }
+
+    #[test]
+    fn a_first_add_reports_what_it_installed() {
+        let repo = git_repo();
+        let setup = insert_roster_agent(
+            repo.path(),
+            &AgentLabel::parse("qwen").unwrap(),
+            NewRole::Default,
+            || Ok(desc(Tool::Claude)),
+            crate::cli::init::support_before_first_config,
+            "",
+        )
+        .unwrap()
+        .expect("a first add sets the repo up");
+        assert_eq!(
+            setup.summary(),
+            "wrote .clank/.gitignore, installed the post-rewrite hook"
+        );
+        forget_roster_lock(repo.path());
+    }
+
+    #[test]
+    fn a_first_add_by_name_ignores_the_default_team() {
+        let repo = git_repo();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(
+            home.path().join(".clank/config.json"),
+            r#"{
+                "agents": { "boss": { "tool": "claude" }, "qwen": { "tool": "codex" } },
+                "teams": { "default": {
+                    "boss": { "role": "master" },
+                    "qwen": { "role": "commit" }
+                } }
+            }"#,
+        )
+        .unwrap();
+        let qwen = AgentLabel::parse("qwen").unwrap();
+        add_repo_roster_agent_by_name(repo.path(), Some(home.path()), &qwen, NewRole::Default)
+            .unwrap();
+        let roster = read_repo(repo.path());
+        assert_eq!(roster.agents.keys().collect::<Vec<_>>(), [&qwen]);
+        assert_eq!(roster.agents[&qwen].role, RosterRole::Master);
+        forget_roster_lock(repo.path());
+    }
+
+    #[test]
+    fn a_global_add_never_touches_the_repo() {
+        use crate::cli::command::{Cli, Command};
+        use clap::Parser;
+        let repo = git_repo();
+        let home = tempfile::tempdir().unwrap();
+        let repo_arg = repo.path().to_str().unwrap();
+        let Command::Agent(crate::cli::AgentArgs {
+            command: crate::cli::AgentCmd::Add(args),
+        }) = Cli::try_parse_from([
+            "clank", "agent", "add", "web", "--global", "--tool", "codex", "--repo", repo_arg,
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("agent add --global")
+        };
+        let before = tree(repo.path());
+        add_with_home(args, Some(home.path())).unwrap();
+        assert_eq!(tree(repo.path()), before);
+        assert!(!repo.path().join(".clank").exists());
+        assert!(
+            read_user_config(home.path())
+                .unwrap()
+                .agents
+                .contains_key(&AgentLabel::parse("web").unwrap())
+        );
+    }
+
+    #[test]
+    fn concurrent_first_adds_keep_both_agents_and_one_master() {
+        for _ in 0..10 {
+            let repo = git_repo();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let adds: Vec<_> = ["claude", "codex"]
+                .into_iter()
+                .map(|name| {
+                    let barrier = barrier.clone();
+                    let path = repo.path().to_path_buf();
+                    std::thread::spawn(move || {
+                        let label = AgentLabel::parse(name).unwrap();
+                        barrier.wait();
+                        add_repo_roster_agent(&path, &label, desc(Tool::Claude), NewRole::Default)
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for add in adds {
+                add.join().unwrap();
+            }
+            let roles: Vec<RosterRole> = read_repo(repo.path())
+                .agents
+                .values()
+                .map(|a| a.role)
+                .collect();
+            assert_eq!(roles.len(), 2, "both adds survive");
+            assert_eq!(
+                roles.iter().filter(|r| **r == RosterRole::Master).count(),
+                1,
+                "{roles:?}"
+            );
+            forget_roster_lock(repo.path());
+        }
+    }
+
+    #[test]
+    fn a_failed_setup_publishes_no_roster() {
+        let repo = git_repo();
+        let err = insert_roster_agent(
+            repo.path(),
+            &AgentLabel::parse("qwen").unwrap(),
+            NewRole::Default,
+            || Ok(desc(Tool::Claude)),
+            |_| anyhow::bail!("injected setup failure"),
+            "",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("injected"), "{err:#}");
+        assert!(!repo.path().join(".clank/config.json").exists());
+        forget_roster_lock(repo.path());
+    }
+
+    #[test]
+    fn an_unmanaged_clank_gitignore_is_kept_and_fails_the_first_add() {
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        let ours = "# mine\n*.log\n";
+        std::fs::write(repo.path().join(".clank/.gitignore"), ours).unwrap();
+        let qwen = AgentLabel::parse("qwen").unwrap();
+        let err = add_repo_roster_agent(repo.path(), &qwen, desc(Tool::Claude), NewRole::Default)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unmanaged content"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".clank/.gitignore")).unwrap(),
+            ours
+        );
+        assert!(!repo.path().join(".clank/config.json").exists());
+        forget_roster_lock(repo.path());
+    }
+
+    #[test]
+    fn a_foreign_hook_is_kept_and_the_first_add_says_so() {
+        let repo = git_repo();
+        let hook = hook_path(repo.path());
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let foreign = "#!/bin/sh\necho mine\n";
+        std::fs::write(&hook, foreign).unwrap();
+        let qwen = AgentLabel::parse("qwen").unwrap();
+        let setup = insert_roster_agent(
+            repo.path(),
+            &qwen,
+            NewRole::Default,
+            || Ok(desc(Tool::Claude)),
+            crate::cli::init::support_before_first_config,
+            "",
+        )
+        .unwrap()
+        .expect("a first add sets the repo up");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), foreign);
+        assert!(
+            setup
+                .summary()
+                .contains("kept your existing post-rewrite hook"),
+            "{}",
+            setup.summary()
+        );
+        assert!(read_repo(repo.path()).agents.contains_key(&qwen));
+        forget_roster_lock(repo.path());
+    }
+
+    #[test]
+    fn an_add_to_an_initialized_repo_changes_only_the_roster() {
+        let repo = git_repo();
+        crate::cli::init::setup_repo_support(repo.path(), false).unwrap();
+        crate::cli::init::seed_bare(None, repo.path()).unwrap();
+        let mut before = tree(repo.path());
+        let qwen = AgentLabel::parse("qwen").unwrap();
+        add_repo_roster_agent(repo.path(), &qwen, desc(Tool::Claude), NewRole::Default).unwrap();
+        let mut after = tree(repo.path());
+        let config = PathBuf::from(".clank/config.json");
+        assert_ne!(before.remove(&config), after.remove(&config));
+        assert_eq!(after, before);
+        forget_roster_lock(repo.path());
     }
 
     // ── agent add, default role ──────────────────────────────

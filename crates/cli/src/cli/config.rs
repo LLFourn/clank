@@ -868,6 +868,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--global needs $HOME set"))?;
                 set_user_key(&home, path, value, def.type_desc)?;
             } else {
+                crate::cli::init::support_before_first_config(&repo)?;
                 set_key(&repo.join(".clank/config.json"), path, value, def.type_desc)?;
             }
             let kvs = resolve_key_values(&repo);
@@ -1212,6 +1213,44 @@ mod tests {
         let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("bool"));
+    }
+
+    #[test]
+    fn a_first_repo_config_write_sets_up_what_init_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let args = super::super::ConfigArgs {
+            command: Some(super::super::ConfigKey::ReviewAdhocFeedback(
+                super::super::ConfigKeyArgs {
+                    value: Some("false".to_string()),
+                    then: None,
+                },
+            )),
+            repo: Some(tmp.path().to_path_buf()),
+            json: false,
+            global: false,
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run(args))
+            .unwrap();
+        assert_eq!(
+            crate::init_facts::classify_clank_gitignore(tmp.path()),
+            crate::init_facts::GitignoreState::Canonical
+        );
+        assert_eq!(
+            crate::init_facts::classify_post_rewrite_hook(tmp.path()),
+            crate::init_facts::HookState::Canonical
+        );
+        assert!(tmp.path().join(".clank/config.json").is_file());
     }
 
     #[test]

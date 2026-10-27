@@ -216,13 +216,14 @@ fn clank_initialized_with_master_and_reviewer() {
     git(repo, &["commit", "--quiet", "-m", "seed"]);
 
     let v = run_open(repo, home.path());
-    assert_eq!(v["state"], "clank_init_needed");
+    assert_eq!(
+        v["state"], "clank_ready",
+        "the first agent add set the repo up"
+    );
     assert_eq!(v["clank"]["master_agents"], serde_json::json!(["claude"]));
     assert_eq!(v["clank"]["agents"].as_array().unwrap().len(), 2);
     // No JSONL on disk under fake HOME → not resumable, so each
-    // agent gets a bind_agent (no resume_agent). The init gaps
-    // also surface a clank_init recommendation; the count of
-    // bind_agents specifically must be 2.
+    // agent gets a bind_agent (no resume_agent).
     let kinds = rec_kinds(&v);
     let bind_count = kinds.iter().filter(|k| *k == "bind_agent").count();
     assert_eq!(bind_count, 2, "expected 2 bind_agent recs; got {kinds:?}");

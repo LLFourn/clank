@@ -314,25 +314,8 @@ pub fn repo_checks(
     let mut out: Vec<CheckResult> = Vec::new();
     const SECTION: &str = "repo";
 
-    // .clank/.gitignore presence.
-    let gi = repo.join(".clank/.gitignore");
-    match std::fs::read_to_string(&gi) {
-        Ok(_) => out.push(CheckResult::ok(
-            SECTION,
-            ".clank/.gitignore",
-            format!("present at {}", gi.display()),
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.push(CheckResult::warn(
-            SECTION,
-            ".clank/.gitignore",
-            "missing — run `clank init`".to_string(),
-        )),
-        Err(e) => out.push(CheckResult::fail(
-            SECTION,
-            ".clank/.gitignore",
-            format!("read failed: {e}"),
-        )),
-    }
+    out.push(check_clank_gitignore(repo));
+    out.extend(check_post_rewrite_hook(repo));
 
     // The `.clank/.gitignore` allow-list keeps only plans/ + finished/
     // tracked; everything else under .clank/ is local.
@@ -728,6 +711,68 @@ fn check_gitignore_probe(repo: &Path, rel: &str, expect_tracked: bool) -> CheckR
             format!("tracked (as expected)"),
         )
     }
+}
+
+fn check_clank_gitignore(repo: &Path) -> CheckResult {
+    use crate::init_facts::{GitignoreState, clank_gitignore_path, classify_clank_gitignore};
+    const NAME: &str = ".clank/.gitignore";
+    let path = clank_gitignore_path(repo);
+    match classify_clank_gitignore(repo) {
+        GitignoreState::Canonical => {
+            CheckResult::ok("repo", NAME, format!("up to date at {}", path.display()))
+        }
+        GitignoreState::Missing => CheckResult::warn("repo", NAME, "missing — run `clank init`"),
+        GitignoreState::Legacy => {
+            CheckResult::warn("repo", NAME, "an older clank body — run `clank init`")
+        }
+        GitignoreState::Drifted => CheckResult::warn(
+            "repo",
+            NAME,
+            format!(
+                "{} is not clank's, so `clank init` refuses to overwrite it; \
+                 inspect it, delete it, or reduce it to the managed entries",
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// `None` outside a git repository, where there is no hook to have.
+fn check_post_rewrite_hook(repo: &Path) -> Option<CheckResult> {
+    use crate::init_facts::{HookState, classify_post_rewrite_hook, post_rewrite_hook_path};
+    const NAME: &str = "post-rewrite hook";
+    let path = post_rewrite_hook_path(repo)?;
+    Some(match classify_post_rewrite_hook(repo) {
+        HookState::Indeterminate => return None,
+        HookState::Canonical => {
+            CheckResult::ok("repo", NAME, format!("installed at {}", path.display()))
+        }
+        HookState::Missing => CheckResult::warn(
+            "repo",
+            NAME,
+            format!(
+                "missing at {}, so a rewrite strands review feedback — run `clank init`",
+                path.display()
+            ),
+        ),
+        HookState::Refreshable => CheckResult::warn(
+            "repo",
+            NAME,
+            format!(
+                "{} is an older clank hook — run `clank init`",
+                path.display()
+            ),
+        ),
+        HookState::Foreign => CheckResult::warn(
+            "repo",
+            NAME,
+            format!(
+                "{} is not clank's; chain `clank rewire --from-stdin` into it, \
+                 or replace it with `clank init --force-hooks`",
+                path.display()
+            ),
+        ),
+    })
 }
 
 /// The root `.gitignore` should own NO `.clank/` rules under the single-source
@@ -2100,6 +2145,90 @@ mod tests {
             .expect("gitignore check ran");
         assert_eq!(gi.status, CheckStatus::Warn);
         assert!(gi.message.contains("clank init"));
+    }
+
+    fn check<'a>(results: &'a [CheckResult], name: &str) -> &'a CheckResult {
+        results
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("{name} check ran"))
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let s = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(s.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn repo_checks_flag_a_missing_ignore_and_a_missing_hook_independently() {
+        let no_ignore = init_git_repo();
+        crate::cli::init::setup_repo_support(no_ignore.path(), false).unwrap();
+        std::fs::remove_file(no_ignore.path().join(".clank/.gitignore")).unwrap();
+        let results = repo_checks(no_ignore.path(), None, None);
+        let gi = check(&results, ".clank/.gitignore");
+        assert_eq!(gi.status, CheckStatus::Warn);
+        assert!(gi.message.contains("clank init"), "{}", gi.message);
+        assert_eq!(check(&results, "post-rewrite hook").status, CheckStatus::Ok);
+
+        let no_hook = init_git_repo();
+        crate::cli::init::setup_repo_support(no_hook.path(), false).unwrap();
+        std::fs::remove_file(crate::init_facts::post_rewrite_hook_path(no_hook.path()).unwrap())
+            .unwrap();
+        let results = repo_checks(no_hook.path(), None, None);
+        assert_eq!(check(&results, ".clank/.gitignore").status, CheckStatus::Ok);
+        let hook = check(&results, "post-rewrite hook");
+        assert_eq!(hook.status, CheckStatus::Warn);
+        assert!(hook.message.contains("clank init"), "{}", hook.message);
+    }
+
+    #[test]
+    fn a_linked_worktree_reads_the_hook_from_the_common_dir() {
+        let main = init_git_repo();
+        git(
+            main.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "base"],
+        );
+        let linked = tempfile::tempdir().unwrap();
+        let wt = linked.path().join("wt");
+        git(
+            main.path(),
+            &["worktree", "add", "--quiet", wt.to_str().unwrap()],
+        );
+        let wt = dunce::canonicalize(&wt).unwrap();
+        crate::cli::init::setup_repo_support(&wt, false).unwrap();
+        let common = dunce::canonicalize(main.path())
+            .unwrap()
+            .join(".git/hooks/post-rewrite");
+        assert_eq!(
+            std::fs::read_to_string(&common).unwrap(),
+            crate::init_facts::POST_REWRITE_BODY
+        );
+        assert_eq!(
+            check(&repo_checks(&wt, None, None), "post-rewrite hook").status,
+            CheckStatus::Ok
+        );
+
+        std::fs::remove_file(&common).unwrap();
+        let results = repo_checks(&wt, None, None);
+        let hook = check(&results, "post-rewrite hook");
+        assert_eq!(hook.status, CheckStatus::Warn);
+        let reported = crate::init_facts::post_rewrite_hook_path(&wt).unwrap();
+        assert_eq!(
+            dunce::canonicalize(reported.parent().unwrap()).unwrap(),
+            common.parent().unwrap()
+        );
+        assert!(
+            hook.message.contains(&reported.display().to_string()),
+            "{}",
+            hook.message
+        );
+        assert_eq!(check(&results, ".clank/.gitignore").status, CheckStatus::Ok);
     }
 
     #[test]

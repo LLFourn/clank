@@ -34,10 +34,8 @@ use crate::init_facts::{
 /// assigns nothing).
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let repo = repo_for_init(args.repo.as_deref(), &std::env::current_dir()?)?;
-    write_scaffold(&repo)?;
-    migrate_claude_perms(&repo)?;
-    write_post_rewrite_hook(&repo, args.force_hooks)?;
-    warn_if_globally_excluded(&repo);
+    let setup = setup_repo_support(&repo, args.force_hooks)?;
+    println!("set up clank in {}: {}", repo.display(), setup.summary());
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     match args.team.as_deref() {
@@ -53,6 +51,94 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
         None => seed_bare(home.as_deref(), &repo)?,
     }
     Ok(())
+}
+
+/// What [`setup_repo_support`] did to each file it manages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportSetup {
+    pub gitignore: GitignoreChange,
+    pub retired_claude_perms: bool,
+    pub hook: HookChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitignoreChange {
+    Wrote,
+    Upgraded,
+    UpToDate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookChange {
+    Wrote,
+    Refreshed,
+    ForceOverwrote,
+    KeptForeign,
+    NoGitDir,
+}
+
+impl SupportSetup {
+    /// One clause per file, in the order they were set up.
+    pub fn summary(&self) -> String {
+        let gitignore = match self.gitignore {
+            GitignoreChange::Wrote => "wrote .clank/.gitignore",
+            GitignoreChange::Upgraded => "upgraded .clank/.gitignore",
+            GitignoreChange::UpToDate => ".clank/.gitignore already up to date",
+        };
+        let perms = self
+            .retired_claude_perms
+            .then_some("removed legacy clank permissions from .claude/settings.local.json");
+        let hook = match self.hook {
+            HookChange::Wrote => "installed the post-rewrite hook",
+            HookChange::Refreshed => "the post-rewrite hook is up to date",
+            HookChange::ForceOverwrote => "force-overwrote the post-rewrite hook",
+            HookChange::KeptForeign => "kept your existing post-rewrite hook",
+            HookChange::NoGitDir => "no git directory for the post-rewrite hook",
+        };
+        [Some(gitignore), perms, Some(hook)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The repo support `clank init` and a repo's first `clank agent add`
+/// share: the `.clank/` scaffold and its `.gitignore`, the legacy
+/// Claude permission cleanup, and the `post-rewrite` hook. It never
+/// touches the roster. An unmanaged `.clank/.gitignore` is left as it is
+/// and fails setup; a foreign hook is kept, with a warning, unless
+/// `force_hooks`.
+pub fn setup_repo_support(repo: &Path, force_hooks: bool) -> anyhow::Result<SupportSetup> {
+    let gitignore = write_scaffold(repo)?;
+    let retired_claude_perms = migrate_claude_perms(repo)?;
+    let hook = write_post_rewrite_hook(repo, force_hooks)?;
+    warn_if_globally_excluded(repo);
+    Ok(SupportSetup {
+        gitignore,
+        retired_claude_perms,
+        hook,
+    })
+}
+
+/// Repo support for a command about to write `.clank/config.json`: when
+/// the file does not exist yet, [`setup_repo_support`] without forcing
+/// the hook, announced. `None` when the repo already has a config.
+pub fn support_before_first_config(repo: &Path) -> anyhow::Result<Option<SupportSetup>> {
+    let config = repo.join(".clank/config.json");
+    if config
+        .try_exists()
+        .map_err(|e| anyhow::anyhow!("checking {}: {e}", config.display()))?
+    {
+        return Ok(None);
+    }
+    let setup = setup_repo_support(repo, false)?;
+    eprintln!(
+        "initialized clank in {}: {}",
+        repo.display(),
+        setup.summary()
+    );
+    Ok(Some(setup))
 }
 
 /// The repository `clank init` sets up: the one containing the selected
@@ -186,26 +272,25 @@ fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
 /// the worktree's gitdir; hooks live in the main repo's
 /// shared `.git/hooks/`). If a foreign hook exists, print a
 /// warning and leave it alone unless `force` is set.
-fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
+fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<HookChange> {
     let Some(hook_path) = resolve_hook_path(repo, "post-rewrite") else {
-        // Not a real git repo (resolve failed); skip silently.
-        return Ok(());
+        return Ok(HookChange::NoGitDir);
     };
     if let Some(parent) = hook_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("creating hooks dir `{}`: {e}", parent.display()))?;
     }
-    match std::fs::read_to_string(&hook_path) {
+    Ok(match std::fs::read_to_string(&hook_path) {
         Ok(existing) if existing.contains(POST_REWRITE_MARKER) => {
             // Already ours; refresh body in case it changed.
             std::fs::write(&hook_path, POST_REWRITE_BODY)?;
             set_executable(&hook_path)?;
-            println!("{} up to date", hook_path.display());
+            HookChange::Refreshed
         }
         Ok(_) if force => {
             std::fs::write(&hook_path, POST_REWRITE_BODY)?;
             set_executable(&hook_path)?;
-            println!("force-overwrote {}", hook_path.display());
+            HookChange::ForceOverwrote
         }
         Ok(_) => {
             eprintln!(
@@ -214,15 +299,15 @@ fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
                  or chain `clank rewire --from-stdin` into it manually.",
                 hook_path.display()
             );
+            HookChange::KeptForeign
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::write(&hook_path, POST_REWRITE_BODY)?;
             set_executable(&hook_path)?;
-            println!("wrote {}", hook_path.display());
+            HookChange::Wrote
         }
         Err(e) => return Err(e.into()),
-    }
-    Ok(())
+    })
 }
 
 /// Resolve `<git-common-dir>/hooks/<name>` via gix's common dir —
@@ -250,7 +335,7 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
+fn write_scaffold(repo: &Path) -> anyhow::Result<GitignoreChange> {
     let clank_dir = repo.join(".clank");
     let plans_dir = clank_dir.join("plans");
     std::fs::create_dir_all(&plans_dir)?;
@@ -259,17 +344,15 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
     // Exact allow-list model: `/*` catches every local-only `.clank/`
     // path, and only the explicit `!` entries below are tracked.
     // Order matters, so a canonical file must match byte-for-byte.
-    match std::fs::read_to_string(&gitignore) {
+    Ok(match std::fs::read_to_string(&gitignore) {
         Ok(existing) => match classify_gitignore_body(&existing) {
-            crate::init_facts::GitignoreState::Canonical => {
-                println!("{} already up to date", gitignore.display());
-            }
+            crate::init_facts::GitignoreState::Canonical => GitignoreChange::UpToDate,
             crate::init_facts::GitignoreState::Legacy => {
                 // The old per-dir deny list — replace wholesale with the
                 // canonical allow-list (a Legacy body is only the recognized
                 // managed entries, so nothing user-authored is lost).
                 std::fs::write(&gitignore, clank_gitignore_body())?;
-                println!("upgraded {}", gitignore.display());
+                GitignoreChange::Upgraded
             }
             _ => {
                 anyhow::bail!(
@@ -282,11 +365,10 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::write(&gitignore, clank_gitignore_body())?;
-            println!("wrote {}", gitignore.display());
+            GitignoreChange::Wrote
         }
         Err(e) => return Err(e.into()),
-    }
-    Ok(())
+    })
 }
 
 /// Tracked `.clank/` paths probed for ancestor-ignore warnings.
@@ -334,17 +416,17 @@ const LEGACY_CLAUDE_ALLOW_RULES: &[&str] = &[
 /// Retire clank's blanket Claude approvals on re-init. An absent or
 /// unparsable operator file is untouched; a file with no matching
 /// rules is byte-identical; a file clank alone wrote is removed.
-fn migrate_claude_perms(repo: &Path) -> anyhow::Result<()> {
+fn migrate_claude_perms(repo: &Path) -> anyhow::Result<bool> {
     let path = repo.join(".claude/settings.local.json");
     let body = match std::fs::read_to_string(&path) {
         Ok(body) => body,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => {
             eprintln!(
                 "warning: cannot read {} for legacy permission cleanup: {e}",
                 path.display()
             );
-            return Ok(());
+            return Ok(false);
         }
     };
     let mut value: serde_json::Value = match serde_json::from_str(&body) {
@@ -354,7 +436,7 @@ fn migrate_claude_perms(repo: &Path) -> anyhow::Result<()> {
                 "warning: cannot parse {} for legacy permission cleanup: {e}",
                 path.display()
             );
-            return Ok(());
+            return Ok(false);
         }
     };
     let Some(allow) = value
@@ -362,7 +444,7 @@ fn migrate_claude_perms(repo: &Path) -> anyhow::Result<()> {
         .and_then(|p| p.get_mut("allow"))
         .and_then(serde_json::Value::as_array_mut)
     else {
-        return Ok(());
+        return Ok(false);
     };
     let before = allow.len();
     allow.retain(|entry| {
@@ -371,7 +453,7 @@ fn migrate_claude_perms(repo: &Path) -> anyhow::Result<()> {
             .is_some_and(|s| LEGACY_CLAUDE_ALLOW_RULES.contains(&s))
     });
     if allow.len() == before {
-        return Ok(());
+        return Ok(false);
     }
     let only_empty_permissions = value.as_object().is_some_and(|obj| {
         obj.len() == 1
@@ -393,8 +475,7 @@ fn migrate_claude_perms(repo: &Path) -> anyhow::Result<()> {
             format!("{}\n", serde_json::to_string_pretty(&value)?),
         )?;
     }
-    println!("removed legacy clank permissions from {}", path.display());
-    Ok(())
+    Ok(true)
 }
 
 /// True if the matched rule lives in `<repo>/.clank/.gitignore`
