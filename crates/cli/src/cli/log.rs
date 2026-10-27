@@ -3,6 +3,7 @@
 //! Default: last 30 commits from HEAD. `--plan` filters to one plan.
 //! Explicit `<range>` overrides the default window.
 
+use std::io::Write;
 use std::path::Path;
 
 use super::{LogArgs, repo_basename, resolve_repo};
@@ -14,10 +15,14 @@ use clank_core::repo_state::LogEvent;
 use clank_core::vocab::Verdict;
 
 pub async fn run(args: LogArgs) -> anyhow::Result<()> {
+    write_log(&args, color(), &mut std::io::stdout().lock()).await
+}
+
+async fn write_log(args: &LogArgs, c: bool, out: &mut dyn Write) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-
-    let head = git_rev_parse(&repo, "HEAD").ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+    let git = crate::git_io::open(&repo)?;
+    let head = git.head_sha()?;
 
     let plan_filter: Option<PlanKey> = match args.plan.as_deref() {
         Some(raw) => {
@@ -30,46 +35,36 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let (from, to) = match &args.range {
-        Some(range) => parse_range(&repo, range)?,
-        None => {
+    // `None` only on an unborn branch with no range asked for: there is
+    // no history to read, but the events are still a timeline.
+    let span: Option<(Option<CommitSha>, CommitSha)> = match &args.range {
+        Some(range) => Some(parse_range(&repo, range)?),
+        None => head.map(|head| {
             let from = if args.limit > 0 {
                 git_rev_parse(&repo, &format!("HEAD~{}", args.limit))
             } else {
                 None
             };
             (from, head)
-        }
+        }),
     };
 
     let state = crate::rebuild::rebuild_repo(&repo)
         .await
         .map_err(|e| anyhow::anyhow!("failed to rebuild repo: {e}"))?;
-    let git = crate::git_io::open(&repo)?;
-    let mut page = match from.as_ref() {
-        Some(base) => git.first_parent_commits_between(base, &to)?,
-        None if args.range.is_none() && args.limit > 0 => {
-            git.first_parent_page_to(&to, args.limit)?
-        }
-        None => {
-            let mut all = git.first_parent_commits_to(&to)?;
-            all.reverse();
-            all
-        }
+    let page = match &span {
+        Some((from, to)) => read_page(&git, from.as_ref(), to, args)?,
+        None => Vec::new(),
     };
-    // Range reads return oldest-first; bounded pages are already newest-first.
-    if from.is_some() {
-        page.reverse();
-    }
     if args.diagnostics {
         let mut diagnostics = Vec::new();
-        if let Some(oldest) = page.last() {
+        if let (Some((_, to)), Some(oldest)) = (&span, page.last()) {
             let from = git.parent_of(&oldest.sha)?;
             crate::rebuild::rebuild_from_recording_with_git(
                 &repo,
                 &git,
                 from.as_ref(),
-                &to,
+                to,
                 &mut diagnostics,
             )?;
         }
@@ -83,25 +78,30 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
             })
             .collect();
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&records)?);
+            writeln!(out, "{}", serde_json::to_string_pretty(&records)?)?;
         } else if records.is_empty() {
-            println!("no history diagnostics");
+            writeln!(out, "no history diagnostics")?;
         } else {
             for record in records {
-                println!("{}  {}", record.sha, record.warning);
+                writeln!(out, "{}  {}", record.sha, record.warning)?;
             }
         }
         return Ok(());
     }
-    let adopted_at = state.fold.adopted_at.as_ref();
-    let tip_post_adoption = match adopted_at {
-        None => false,
-        Some(_) if state.head.as_ref() == Some(&to) => true,
-        Some(adopted) => git
-            .first_parent_chain_find(&to, &std::iter::once(adopted.clone()).collect())?
-            .is_some(),
+    let history = match &span {
+        Some((_, to)) => {
+            let adopted_at = state.fold.adopted_at.as_ref();
+            let tip_post_adoption = match adopted_at {
+                None => false,
+                Some(_) if state.head.as_ref() == Some(to) => true,
+                Some(adopted) => git
+                    .first_parent_chain_find(to, &std::iter::once(adopted.clone()).collect())?
+                    .is_some(),
+            };
+            history_from_page(&repo, &git, to, page, adopted_at, tip_post_adoption).await?
+        }
+        None => HistoryWindow::default(),
     };
-    let history = history_from_page(&repo, &git, &to, page, adopted_at, tip_post_adoption).await?;
     let log_events = history.folded;
 
     let filtered: Vec<&LogEvent> = log_events
@@ -136,12 +136,6 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         )
     };
 
-    if filtered.is_empty() && history.plain.is_empty() && gh_events.is_empty() && nudges.is_empty()
-    {
-        println!("no log events");
-        return Ok(());
-    }
-
     // Most recent first (git log convention).
     let filtered: Vec<&LogEvent> = filtered.into_iter().rev().collect();
     let plain: &[PlainCommit] = if plan_filter.is_none() {
@@ -149,7 +143,13 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     } else {
         &[]
     };
-    let items = interleave_with_plain(&filtered, plain, &gh_events, &nudges);
+    let items = interleave_with_plain(
+        &filtered,
+        plain,
+        &gh_events,
+        &nudges,
+        history.next.is_some(),
+    );
 
     let reviewable_shas: Vec<CommitSha> = filtered
         .iter()
@@ -162,13 +162,57 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         .collect();
 
     if args.json {
-        print_json(&items, &repo, &reviewable_shas)?;
+        return print_json(out, &items, &repo, &reviewable_shas);
+    }
+    if items.is_empty() && span.is_some() {
+        writeln!(out, "no log events")?;
     } else if args.oneline {
-        print_oneline(&items, &repo, &reviewable_shas)?;
+        print_oneline(out, &items, &repo, &reviewable_shas, c)?;
     } else {
-        print_human(&items, &repo, &reviewable_shas)?;
+        print_human(out, &items, &repo, &reviewable_shas, c)?;
+    }
+    if span.is_none() {
+        let line = no_commits_line(git.current_branch()?.as_deref());
+        if c {
+            writeln!(out, "{DIM}{line}{Z}")?;
+        } else {
+            writeln!(out, "{line}")?;
+        }
     }
     Ok(())
+}
+
+fn no_commits_line(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!("branch `{branch}` has no commits yet"),
+        None => "this branch has no commits yet".to_string(),
+    }
+}
+
+/// The first-parent commits in `from..to` (or `-n` back from `to`),
+/// newest first.
+fn read_page(
+    git: &crate::git_io::Repo,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+    args: &LogArgs,
+) -> anyhow::Result<Vec<CommitMeta>> {
+    Ok(match from {
+        Some(base) => {
+            // Range reads return oldest-first; bounded pages are already newest-first.
+            let mut page = git.first_parent_commits_between(base, to)?;
+            page.reverse();
+            page
+        }
+        None if args.range.is_none() && args.limit > 0 => {
+            git.first_parent_page_to(to, args.limit)?
+        }
+        None => {
+            let mut all = git.first_parent_commits_to(to)?;
+            all.reverse();
+            all
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +221,7 @@ pub(crate) struct PlainCommit {
     pub(crate) refs: Vec<String>,
 }
 
+#[derive(Default)]
 pub(crate) struct HistoryWindow {
     pub(crate) folded: Vec<LogEvent>,
     pub(crate) plain: Vec<PlainCommit>,
@@ -238,11 +283,7 @@ async fn history_from_page(
     tip_post_adoption: bool,
 ) -> anyhow::Result<HistoryWindow> {
     if page.is_empty() {
-        return Ok(HistoryWindow {
-            folded: Vec::new(),
-            plain: Vec::new(),
-            next: None,
-        });
+        return Ok(HistoryWindow::default());
     }
 
     let next_tip = git.parent_of(&page.last().expect("non-empty page").sha)?;
@@ -315,7 +356,7 @@ pub(crate) enum TimelineItem<'a> {
 /// Two-pointer newest-first merge preserving each list's own order.
 /// Github events OLDER than the oldest displayed commit fall outside
 /// the folded range and are excluded (when any commits are shown at
-/// all); newer-than-newest ones lead the view — a just-arrived event
+/// all and older history exists); newer-than-newest ones lead the view — a just-arrived event
 /// is exactly what the reader wants on top. `gh` arrives
 /// oldest-first (the snapshot's order).
 #[cfg(test)]
@@ -323,21 +364,27 @@ pub(crate) fn interleave<'a>(
     events: &[&'a LogEvent],
     gh: &'a [crate::cli::github::timeline::MergedEvent],
 ) -> Vec<TimelineItem<'a>> {
-    interleave_with_plain(events, &[], gh, &[])
+    interleave_with_plain(events, &[], gh, &[], true)
 }
 
 /// [`interleave`] with the plain commits and each agent's nudge history,
 /// which sits among the events by time under the same floor.
+///
+/// `older_history`: commits older than those shown exist. Without them
+/// the window reaches the root, so an event from before the first
+/// commit has no older page to belong to and stays in this one.
 pub(crate) fn interleave_with_plain<'a>(
     events: &[&'a LogEvent],
     plain: &'a [PlainCommit],
     gh: &'a [crate::cli::github::timeline::MergedEvent],
     nudges: &'a [crate::cli::github::timeline::Nudge],
+    older_history: bool,
 ) -> Vec<TimelineItem<'a>> {
     let floor = plain
         .last()
         .map(|p| p.meta.author_ts)
-        .or_else(|| events.last().map(|e| e.ts()));
+        .or_else(|| events.last().map(|e| e.ts()))
+        .filter(|_| older_history);
     // The carried index is the ORIGINAL snapshot position — captured
     // by enumerate BEFORE the floor filter and the reversal, so the
     // displayed row and the event it opens share identity (codex
@@ -668,86 +715,96 @@ pub(crate) fn verdict_mark(v: Verdict, c: bool) -> String {
 
 // ── renderers ───────────────────────────────────────────────
 
-fn print_human(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+fn print_human(
+    out: &mut dyn Write,
+    items: &[TimelineItem],
+    repo: &Path,
+    shas: &[CommitSha],
+    c: bool,
+) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
-    let c = color();
     let mut started = false;
     let mut chunk: Vec<&LogEvent> = Vec::new();
     for item in items {
         match item {
             TimelineItem::Repo(e) => chunk.push(e),
             TimelineItem::Plain(commit) => {
-                print_human_events(&chunk, repo, &reviews, c, &mut started)?;
+                print_human_events(out, &chunk, repo, &reviews, c, &mut started)?;
                 chunk.clear();
                 if started {
-                    println!();
+                    writeln!(out)?;
                 }
                 started = true;
                 let (author, date, body) = commit_info(repo, &commit.meta.sha);
                 if c {
-                    println!("{Y}commit {}{Z}", commit.meta.sha.as_str());
+                    writeln!(out, "{Y}commit {}{Z}", commit.meta.sha.as_str())?;
                 } else {
-                    println!("commit {}", commit.meta.sha.as_str());
+                    writeln!(out, "commit {}", commit.meta.sha.as_str())?;
                 }
-                println!("Author: {author}");
-                println!("Date:   {date}");
+                writeln!(out, "Author: {author}")?;
+                writeln!(out, "Date:   {date}")?;
                 if !commit.refs.is_empty() {
-                    println!("Refs:   {}", commit.refs.join(", "));
+                    writeln!(out, "Refs:   {}", commit.refs.join(", "))?;
                 }
-                println!();
+                writeln!(out)?;
                 for line in body.lines() {
-                    println!("    {line}");
+                    writeln!(out, "    {line}")?;
                 }
             }
             TimelineItem::Nudge(n) => {
-                print_human_events(&chunk, repo, &reviews, c, &mut started)?;
+                print_human_events(out, &chunk, repo, &reviews, c, &mut started)?;
                 chunk.clear();
                 if started {
-                    println!();
+                    writeln!(out)?;
                 }
                 started = true;
                 let line = format!("{NUDGE_GLYPH} @{} {}", n.agent, n.record.summary());
                 if c {
-                    println!("{C}{line}{Z}");
+                    writeln!(out, "{C}{line}{Z}")?;
                 } else {
-                    println!("{line}");
+                    writeln!(out, "{line}")?;
                 }
                 for text in n.record.text.lines() {
-                    println!("    {text}");
+                    writeln!(out, "    {text}")?;
                 }
             }
             TimelineItem::Github(_, g) => {
-                print_human_events(&chunk, repo, &reviews, c, &mut started)?;
+                print_human_events(out, &chunk, repo, &reviews, c, &mut started)?;
                 chunk.clear();
                 if started {
-                    println!();
+                    writeln!(out)?;
                 }
                 started = true;
                 let mark = if g.baseline { "  (pre-watch)" } else { "" };
                 let badge = format!("{} {}", g.delivery().glyph(), event_badge(g));
                 let line = event_row_text(g);
                 if c {
-                    println!("{}", colored_event_row(&badge, &line, g.baseline, mark));
+                    writeln!(
+                        out,
+                        "{}",
+                        colored_event_row(&badge, &line, g.baseline, mark)
+                    )?;
                 } else {
-                    println!("{badge} {line}{mark}");
+                    writeln!(out, "{badge} {line}{mark}")?;
                 }
 
                 // The row says who it is for; this is where it came from.
                 let clean = |text: &str| crate::cli::status_tui::text::one_line(text, usize::MAX);
-                println!("From: {}", clean(&g.source));
+                writeln!(out, "From: {}", clean(&g.source))?;
                 if let Some(actor) = &g.actor {
-                    println!("By:   {}", clean(actor));
+                    writeln!(out, "By:   {}", clean(actor))?;
                 }
                 if let Some(url) = &g.url {
-                    println!("{url}");
+                    writeln!(out, "{url}")?;
                 }
             }
         }
     }
-    print_human_events(&chunk, repo, &reviews, c, &mut started)
+    print_human_events(out, &chunk, repo, &reviews, c, &mut started)
 }
 
 fn print_human_events(
+    out: &mut dyn Write,
     events: &[&LogEvent],
     repo: &Path,
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
@@ -756,7 +813,7 @@ fn print_human_events(
 ) -> anyhow::Result<()> {
     for event in events.iter() {
         if *started {
-            println!();
+            writeln!(out)?;
         }
         *started = true;
         let (plan, sha, kind) = match event {
@@ -770,66 +827,79 @@ fn print_human_events(
             } => (plan, sha, kind_label(*touched_plan, *touched_code)),
             LogEvent::PlanFinalized { plan, sha, .. } => {
                 if c {
-                    println!(
+                    writeln!(
+                        out,
                         "{Y}finalize {}{Z} {C}(plan: {}){Z}",
                         short(sha),
                         plan.as_str()
-                    );
+                    )?;
                 } else {
-                    println!("finalize {} (plan: {})", short(sha), plan.as_str());
+                    writeln!(out, "finalize {} (plan: {})", short(sha), plan.as_str())?;
                 }
                 continue;
             }
             LogEvent::PlanDeleted { plan, sha, .. } => {
-                println!("delete {} (plan: {})", short(sha), plan.as_str());
+                writeln!(out, "delete {} (plan: {})", short(sha), plan.as_str())?;
                 continue;
             }
             LogEvent::AdHoc { sha, .. } => {
                 let (author, date, body) = commit_info(repo, sha);
                 if c {
-                    println!("{Y}commit {}{Z}", sha.as_str());
+                    writeln!(out, "{Y}commit {}{Z}", sha.as_str())?;
                 } else {
-                    println!("commit {}", sha.as_str());
+                    writeln!(out, "commit {}", sha.as_str())?;
                 }
-                println!("Author: {author}");
-                println!("Date:   {date}");
-                println!();
+                writeln!(out, "Author: {author}")?;
+                writeln!(out, "Date:   {date}")?;
+                writeln!(out)?;
                 for line in body.lines() {
-                    println!("    {line}");
+                    writeln!(out, "    {line}")?;
                 }
                 // Ad-hoc commits carry reviews too
                 // (review.adhoc_feedback — adhoc-reviews-in-log).
-                print_reviews(reviews, sha.as_str(), c);
+                print_reviews(out, reviews, sha.as_str(), c)?;
                 continue;
             }
         };
         let (author, date, body) = commit_info(repo, sha);
         if c {
-            println!(
+            writeln!(
+                out,
                 "{Y}commit {}{Z} {C}(plan: {}, {kind}){Z}",
                 sha.as_str(),
                 plan.as_str()
-            );
+            )?;
         } else {
-            println!("commit {} (plan: {}, {kind})", sha.as_str(), plan.as_str());
+            writeln!(
+                out,
+                "commit {} (plan: {}, {kind})",
+                sha.as_str(),
+                plan.as_str()
+            )?;
         }
-        println!("Author: {author}");
-        println!("Date:   {date}");
-        println!();
+        writeln!(out, "Author: {author}")?;
+        writeln!(out, "Date:   {date}")?;
+        writeln!(out)?;
         for line in body.lines() {
-            println!("    {line}");
+            writeln!(out, "    {line}")?;
         }
-        print_reviews(reviews, sha.as_str(), c);
+        print_reviews(out, reviews, sha.as_str(), c)?;
     }
     Ok(())
 }
 
-fn print_reviews(reviews: &std::collections::BTreeMap<String, Vec<Review>>, sha: &str, c: bool) {
+fn print_reviews(
+    out: &mut dyn Write,
+    reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+    sha: &str,
+    c: bool,
+) -> std::io::Result<()> {
     if let Some(rs) = reviews.get(sha) {
         for line in human_review_lines(rs, c) {
-            println!("{line}");
+            writeln!(out, "{line}")?;
         }
     }
+    Ok(())
 }
 
 /// The `clank log` review block under a commit, as lines — pure so the
@@ -1380,29 +1450,38 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
         .collect()
 }
 
-fn print_oneline(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+fn print_oneline(
+    out: &mut dyn Write,
+    items: &[TimelineItem],
+    repo: &Path,
+    shas: &[CommitSha],
+    c: bool,
+) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
-    let c = color();
-    print_oneline_rows(oneline_items_rows(items, &reviews, &Default::default()), c);
+    print_oneline_rows(
+        out,
+        oneline_items_rows(items, &reviews, &Default::default()),
+        c,
+    )?;
     Ok(())
 }
 
-fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
+fn print_oneline_rows(out: &mut dyn Write, rows: Vec<OnelineRow>, c: bool) -> std::io::Result<()> {
     for row in rows {
         match row {
-            OnelineRow::Notice(message) => println!("{message}"),
+            OnelineRow::Notice(message) => writeln!(out, "{message}")?,
             OnelineRow::Nudge { agent, summary, .. } => {
                 if c {
-                    println!("{C}{NUDGE_GLYPH} @{agent}{Z} {summary}");
+                    writeln!(out, "{C}{NUDGE_GLYPH} @{agent}{Z} {summary}")?;
                 } else {
-                    println!("{NUDGE_GLYPH} @{agent} {summary}");
+                    writeln!(out, "{NUDGE_GLYPH} @{agent} {summary}")?;
                 }
             }
             OnelineRow::RunEnd => {
                 if c {
-                    println!("{DIM}{RUN_END_RULE}{Z}");
+                    writeln!(out, "{DIM}{RUN_END_RULE}{Z}")?;
                 } else {
-                    println!("{RUN_END_RULE}");
+                    writeln!(out, "{RUN_END_RULE}")?;
                 }
             }
             OnelineRow::PlainCommit {
@@ -1414,9 +1493,9 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
                     format!(" ({})", refs.join(", "))
                 };
                 if c {
-                    println!("  {Y}{}{Z} {subject}{refs}", short(&sha));
+                    writeln!(out, "  {Y}{}{Z} {subject}{refs}", short(&sha))?;
                 } else {
-                    println!("  {} {subject}{refs}", short(&sha));
+                    writeln!(out, "  {} {subject}{refs}", short(&sha))?;
                 }
             }
             OnelineRow::Github {
@@ -1432,9 +1511,9 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
                 let mark = if baseline { " (pre-watch)" } else { "" };
                 let badge = format!("{} {badge}", delivery.glyph());
                 if c {
-                    println!("{}", colored_event_row(&badge, &line, baseline, mark));
+                    writeln!(out, "{}", colored_event_row(&badge, &line, baseline, mark))?;
                 } else {
-                    println!("{badge} {line}{mark}");
+                    writeln!(out, "{badge} {line}{mark}")?;
                 }
             }
             OnelineRow::Header {
@@ -1444,9 +1523,9 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
             } => {
                 let name = plan_footer_text(plan.as_deref(), duration_secs);
                 if c {
-                    println!("{C}{name}{Z}");
+                    writeln!(out, "{C}{name}{Z}")?;
                 } else {
-                    println!("{name}");
+                    writeln!(out, "{name}")?;
                 }
             }
             OnelineRow::Commit {
@@ -1464,9 +1543,9 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
                         "" => g.to_string(),
                         col => format!("{col}{g}{Z}"),
                     };
-                    println!("{icon} {Y}{}{Z} {subject}", short(&sha));
+                    writeln!(out, "{icon} {Y}{}{Z} {subject}", short(&sha))?;
                 } else {
-                    println!("{g} {} {subject}", short(&sha));
+                    writeln!(out, "{g} {} {subject}", short(&sha))?;
                 }
             }
             OnelineRow::Review {
@@ -1482,13 +1561,14 @@ fn print_oneline_rows(rows: Vec<OnelineRow>, c: bool) {
                     format!(": {summary}")
                 };
                 if c {
-                    println!("    {m} {C}{author}{Z}{snip}");
+                    writeln!(out, "    {m} {C}{author}{Z}{snip}")?;
                 } else {
-                    println!("    {m} {author}{snip}");
+                    writeln!(out, "    {m} {author}{snip}")?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Typed rows for `clank log --json` (typed-json-not-json-macro,
@@ -1646,10 +1726,15 @@ enum LogJsonRow<'a> {
     },
 }
 
-fn print_json(items: &[TimelineItem], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+fn print_json(
+    out: &mut dyn Write,
+    items: &[TimelineItem],
+    repo: &Path,
+    shas: &[CommitSha],
+) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
-    let out = json_items(items, &reviews);
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    let rows = json_items(items, &reviews);
+    writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
     Ok(())
 }
 
@@ -2162,7 +2247,7 @@ mod json_output_tests {
             nudge("claude", 150, "n1"),
             nudge("codex", 300, "n2"),
         ];
-        let items = interleave_with_plain(&events, &[], &gh_events, &nudges);
+        let items = interleave_with_plain(&events, &[], &gh_events, &nudges, true);
         let shape: Vec<String> = items
             .iter()
             .map(|i| match i {
@@ -3578,6 +3663,229 @@ mod event_row_tests {
             event_row_text(&both),
             "@claude → @codex (/src/clank)  “ok”",
             "a local holder and a reply's target are both shown, each as what it is"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod unborn_tests {
+    use super::*;
+    use crate::cli::github::log::{EventLog, Transport};
+    use crate::cli::github::timeline::DeliveryState;
+
+    /// Oldest first, each in the delivery state its fixture leaves it in.
+    pub(crate) const MESSAGES: [(&str, DeliveryState); 3] = [
+        ("never woken for", DeliveryState::Unwoken),
+        ("woken for", DeliveryState::Woken),
+        ("acknowledged", DeliveryState::Acknowledged),
+    ];
+
+    pub(crate) fn git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", "@9000 +0000")
+            .env("GIT_COMMITTER_DATE", "@9000 +0000")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A branch with no commits whose `claude` has been sent
+    /// [`MESSAGES`], all before the time [`git`] dates commits at: the
+    /// first commit comes after the messages, as it did when they hid.
+    pub(crate) fn unborn_repo_with_messages() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--quiet", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "t@t"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        let mut log = EventLog::open(
+            &crate::agent_store::agents_root(repo.path()).join("claude/events"),
+            crate::inbox::MESSAGES_SOURCE,
+        )
+        .unwrap();
+        for (i, (subject, _)) in MESSAGES.iter().enumerate() {
+            log.append_inbox(
+                Transport::Message,
+                None,
+                Some(&format!("m{i}")),
+                Some(2000 + 1000 * i as u64),
+                &clank_core::wait::WaitItem::Message {
+                    presentation: None,
+                    handle: format!("h{i}"),
+                    from: Some("codex".into()),
+                    repo: None,
+                    subject: (*subject).into(),
+                    body: (*subject).into(),
+                    requires_reply: false,
+                    reply_route: None,
+                    selector: None,
+                },
+            )
+            .unwrap();
+        }
+        let rows = log.read_rows().unwrap().unwrap().rows;
+        for (row, (_, state)) in rows.iter().zip(MESSAGES) {
+            match state {
+                DeliveryState::Woken => {
+                    let key = clank_core::wait::EventPresentation {
+                        source: crate::inbox::MESSAGES_SOURCE.into(),
+                        seq: row.seq,
+                        ident: row.ident.clone(),
+                    };
+                    log.append_presentations(&[key], 2500, || true).unwrap();
+                }
+                DeliveryState::Acknowledged => log.append_checked_ack(row.seq, &row.ident).unwrap(),
+                _ => {}
+            }
+        }
+        repo
+    }
+
+    async fn log(repo: &Path, flags: &[&str]) -> anyhow::Result<String> {
+        let argv = ["clank", "log", "--repo", repo.to_str().unwrap()]
+            .into_iter()
+            .chain(flags.iter().copied());
+        let crate::cli::command::Cli {
+            command: crate::cli::command::Command::Log(args),
+        } = clap::Parser::try_parse_from(argv)?
+        else {
+            panic!("`clank log` parses as a log");
+        };
+        let mut out = Vec::new();
+        write_log(&args, false, &mut out).await?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn json(text: &str) -> Vec<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(text)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    const COMMIT_KINDS: [&str; 7] = [
+        "intro",
+        "commit",
+        "finalized",
+        "deleted",
+        "ad-hoc",
+        "git-commit",
+        "review",
+    ];
+
+    #[tokio::test]
+    async fn an_unborn_branch_logs_its_messages_and_says_it_has_no_commits() {
+        let repo = unborn_repo_with_messages();
+        for flags in [&[][..], &["--oneline"][..]] {
+            let out = log(repo.path(), flags).await.unwrap();
+            let lines: Vec<&str> = out.lines().collect();
+            let rows: Vec<&str> = MESSAGES
+                .iter()
+                .rev()
+                .map(|(subject, state)| {
+                    let mark = format!("{} ✉ ", state.glyph());
+                    *lines
+                        .iter()
+                        .find(|l| l.starts_with(&mark) && l.contains(subject))
+                        .unwrap_or_else(|| panic!("`{mark}… {subject}` in {out}"))
+                })
+                .collect();
+            let at = |row: &str| lines.iter().position(|l| *l == row).unwrap();
+            assert!(
+                rows.windows(2).all(|w| at(w[0]) < at(w[1])),
+                "newest first: {out}"
+            );
+            assert_eq!(
+                lines.last(),
+                Some(&"branch `main` has no commits yet"),
+                "{out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unborn_branch_json_is_its_events_and_no_commit_rows() {
+        let repo = unborn_repo_with_messages();
+        for flags in [&["--json"][..], &["--json", "--no-github"][..]] {
+            let rows = json(&log(repo.path(), flags).await.unwrap());
+            let subjects: Vec<&str> = rows.iter().filter_map(|r| r["subject"].as_str()).collect();
+            assert_eq!(subjects, ["acknowledged", "woken for", "never woken for"]);
+            assert!(
+                rows.iter()
+                    .all(|r| !COMMIT_KINDS.contains(&r["kind"].as_str().unwrap())),
+                "{rows:?}"
+            );
+        }
+
+        let rows = json(
+            &log(repo.path(), &["--json", "--plan", "foo"])
+                .await
+                .unwrap(),
+        );
+        assert!(rows.is_empty(), "a plan's view leaves repo-wide events out");
+
+        let empty = tempfile::tempdir().unwrap();
+        git(empty.path(), &["init", "--quiet", "-b", "main"]);
+        assert_eq!(log(empty.path(), &["--json"]).await.unwrap().trim(), "[]");
+    }
+
+    #[tokio::test]
+    async fn the_first_commit_joins_the_same_events() {
+        let repo = unborn_repo_with_messages();
+        let before = json(&log(repo.path(), &["--json"]).await.unwrap());
+        git(
+            repo.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "first"],
+        );
+
+        let after = json(&log(repo.path(), &["--json"]).await.unwrap());
+        let (commits, events): (Vec<_>, Vec<_>) = after
+            .into_iter()
+            .partition(|r| COMMIT_KINDS.contains(&r["kind"].as_str().unwrap()));
+        assert_eq!(events, before, "the same events, once each");
+        assert_eq!(commits.len(), 1, "{commits:?}");
+        assert_eq!(commits[0]["subject"], "first");
+
+        let human = log(repo.path(), &[]).await.unwrap();
+        assert!(human.contains("    first"), "{human}");
+        assert!(!human.contains("no commits yet"), "{human}");
+    }
+
+    #[tokio::test]
+    async fn an_unborn_branch_still_refuses_history_it_cannot_resolve() {
+        let repo = unborn_repo_with_messages();
+        for range in ["nosuch", "nosuch..main", "main"] {
+            let err = log(repo.path(), &[range]).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("cannot resolve"),
+                "{range}: {err:#}"
+            );
+        }
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(log(not_a_repo.path(), &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unborn_branch_has_no_history_diagnostics() {
+        let repo = unborn_repo_with_messages();
+        assert_eq!(
+            log(repo.path(), &["--diagnostics"]).await.unwrap(),
+            "no history diagnostics\n"
+        );
+        assert_eq!(
+            json(
+                &log(repo.path(), &["--diagnostics", "--json"])
+                    .await
+                    .unwrap()
+            ),
+            Vec::<serde_json::Value>::new()
         );
     }
 }

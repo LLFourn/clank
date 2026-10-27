@@ -3829,7 +3829,7 @@ pub(crate) async fn run_tui(
 
         let total = head + snapshot.log_rows.len();
         if total == 0 && matches!(mode, Mode::LogScroll) && !snapshot.agents.is_empty() {
-            // An unborn repository has no timeline entry to select. Keep
+            // An empty timeline has no entry to select. Keep
             // focus on the real panel instead of presenting a cursor in an
             // empty region.
             mode = Mode::AgentPanel { sel: 0 };

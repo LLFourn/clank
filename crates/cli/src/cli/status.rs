@@ -1072,20 +1072,14 @@ async fn run_watch(
 /// status error.
 async fn recent_log_rows(repo: &Path, state: &RepoState) -> TuiLogRead {
     const LOG_WINDOW: usize = 30;
-    match state.head.clone() {
-        Some(head) => {
-            log_rows_windowed(
-                repo,
-                &head,
-                LOG_WINDOW,
-                state.fold.adopted_at.as_ref(),
-                true,
-                &stands_for_plans(state),
-            )
-            .await
-        }
-        None => TuiLogRead::default(),
-    }
+    log_rows_windowed(
+        repo,
+        state.head.as_ref(),
+        LOG_WINDOW,
+        state.fold.adopted_at.as_ref(),
+        &stands_for_plans(state),
+    )
+    .await
 }
 
 /// sha → branch names whose tips sit on that commit, for the TUI log
@@ -1142,7 +1136,7 @@ pub(crate) async fn tui_log_page(
     adopted_at: Option<&crate::lifecycle::CommitSha>,
     stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
-    log_rows_page(repo, cursor, page_size, adopted_at, false, stands_for).await
+    log_rows_page(repo, Some(cursor), page_size, adopted_at, false, stands_for).await
 }
 
 /// Which finalize commits stand for their whole plan: a finished plan
@@ -1176,39 +1170,30 @@ pub(crate) async fn tui_log_with_events(
     adopted_at: Option<&crate::lifecycle::CommitSha>,
     stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
-    match crate::cli::log::git_rev_parse(repo, "HEAD") {
-        Some(head) => log_rows_windowed(repo, &head, window, adopted_at, true, stands_for).await,
-        None => TuiLogRead::default(),
-    }
+    let head = crate::cli::log::git_rev_parse(repo, "HEAD");
+    log_rows_windowed(repo, head.as_ref(), window, adopted_at, stands_for).await
 }
 
-/// Build oneline log rows for `HEAD~window..head`, newest first.
+/// Oneline log rows for `HEAD~window..head`, newest first, with the
+/// timeline's events. An unborn branch (`head` is `None`) has only the
+/// events.
 async fn log_rows_windowed(
     repo: &Path,
-    head: &crate::lifecycle::CommitSha,
+    head: Option<&crate::lifecycle::CommitSha>,
     window: usize,
     adopted_at: Option<&crate::lifecycle::CommitSha>,
-    include_github: bool,
     stands_for: &crate::cli::log::StandsFor,
 ) -> TuiLogRead {
-    let cursor = crate::cli::log::HistoryCursor {
+    let cursor = head.map(|head| crate::cli::log::HistoryCursor {
         tip: head.clone(),
         post_adoption: adopted_at.is_some(),
-    };
-    log_rows_page(
-        repo,
-        &cursor,
-        window,
-        adopted_at,
-        include_github,
-        stands_for,
-    )
-    .await
+    });
+    log_rows_page(repo, cursor.as_ref(), window, adopted_at, true, stands_for).await
 }
 
 async fn log_rows_page(
     repo: &Path,
-    cursor: &crate::cli::log::HistoryCursor,
+    cursor: Option<&crate::cli::log::HistoryCursor>,
     window: usize,
     adopted_at: Option<&crate::lifecycle::CommitSha>,
     include_github: bool,
@@ -1216,8 +1201,15 @@ async fn log_rows_page(
 ) -> TuiLogRead {
     use clank_core::repo_state::LogEvent;
 
-    let Ok(history) = crate::cli::log::history_page(repo, cursor, window, adopted_at).await else {
-        return TuiLogRead::default();
+    let history = match cursor {
+        Some(cursor) => {
+            let Ok(history) = crate::cli::log::history_page(repo, cursor, window, adopted_at).await
+            else {
+                return TuiLogRead::default();
+            };
+            history
+        }
+        None => crate::cli::log::HistoryWindow::default(),
     };
     let events = history.folded;
 
@@ -1246,6 +1238,7 @@ async fn log_rows_page(
         &history.plain,
         &snap.events,
         &snap.nudges,
+        history.next.is_some(),
     );
     let mut rows: Vec<crate::cli::log::OnelineRow> = snap
         .notices
@@ -2170,7 +2163,7 @@ mod dirty_and_wake_tests {
         assert_eq!(head_row.meta.sha, head);
         assert!(head_row.refs.iter().any(|name| name == "main"));
 
-        let items = crate::cli::log::interleave_with_plain(&[], &history.plain, &[], &[]);
+        let items = crate::cli::log::interleave_with_plain(&[], &history.plain, &[], &[], true);
         let rows =
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         assert_eq!(rows.len(), 3);
@@ -2218,7 +2211,7 @@ mod dirty_and_wake_tests {
         );
 
         let folded: Vec<&clank_core::repo_state::LogEvent> = history.folded.iter().rev().collect();
-        let items = crate::cli::log::interleave_with_plain(&folded, &history.plain, &[], &[]);
+        let items = crate::cli::log::interleave_with_plain(&folded, &history.plain, &[], &[], true);
         let rows =
             crate::cli::log::oneline_items_rows(&items, &Default::default(), &Default::default());
         let actual: Vec<_> = rows
@@ -2306,8 +2299,100 @@ mod dirty_and_wake_tests {
         assert_eq!(crate::rebuild::fold_commit_count(), 0);
     }
 
+    /// The pane's message rows as (state, subject), each read through
+    /// the event its row opens.
+    fn message_rows(
+        rows: &[crate::cli::log::OnelineRow],
+        events: &[crate::cli::github::timeline::MergedEvent],
+    ) -> Vec<(crate::cli::github::timeline::DeliveryState, String)> {
+        rows.iter()
+            .filter_map(|row| match row {
+                crate::cli::log::OnelineRow::Github {
+                    event_idx,
+                    delivery,
+                    ..
+                } => Some((*delivery, events[*event_idx].body.clone().unwrap())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn unborn_messages() -> Vec<(crate::cli::github::timeline::DeliveryState, String)> {
+        crate::cli::log::unborn_tests::MESSAGES
+            .iter()
+            .rev()
+            .map(|(subject, state)| (*state, subject.to_string()))
+            .collect()
+    }
+
+    /// The snapshot's first read, its refresh and the web page's ledger
+    /// all show an unborn branch's messages; the first commit then
+    /// joins them through the same read.
     #[tokio::test]
-    async fn unborn_repo_has_no_log_rows() {
+    async fn an_unborn_branch_shows_its_messages_in_the_pane_and_on_the_page() {
+        use crate::cli::log::unborn_tests::{git, unborn_repo_with_messages};
+        let dir = unborn_repo_with_messages();
+        let repo = dir.path();
+
+        let snap = StatusSnapshot::build_async(
+            repo,
+            "repo",
+            None,
+            crate::rebuild::CachePolicy::Bypass,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            message_rows(&snap.log_rows, &snap.github_events),
+            unborn_messages()
+        );
+        let ledger = crate::cli::status_tui::web_facts(&snap, &Default::default())
+            .ledger
+            .rows;
+        for (state, subject) in unborn_messages() {
+            assert!(
+                ledger.iter().any(|r| r.text.contains(&subject)
+                    && r.glyph.as_deref() == Some(format!("{} ✉", state.glyph()).as_str())),
+                "{subject}: {ledger:?}"
+            );
+        }
+
+        let refreshed = tui_log_with_events(repo, 30, None, &Default::default()).await;
+        assert_eq!(
+            message_rows(&refreshed.rows, &refreshed.github_events),
+            unborn_messages()
+        );
+        assert!(refreshed.next.is_none());
+
+        git(repo, &["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        let first = tui_log_with_events(repo, 30, None, &Default::default()).await;
+        assert_eq!(
+            message_rows(&first.rows, &first.github_events),
+            unborn_messages()
+        );
+        let commits: Vec<&str> = first
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                crate::cli::log::OnelineRow::PlainCommit { subject, .. } => Some(subject.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits, ["first"]);
+        assert!(
+            matches!(
+                first.rows.first(),
+                Some(crate::cli::log::OnelineRow::PlainCommit { .. })
+            ),
+            "the commit is newer than every message: {:?}",
+            first.rows
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unborn_repo_with_no_events_has_an_empty_log() {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "--quiet", "-b", "main"]);
         let read = tui_log_with_events(dir.path(), 30, None, &Default::default()).await;
