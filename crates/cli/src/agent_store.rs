@@ -702,6 +702,42 @@ pub fn record_transcript(
     })
 }
 
+/// Bind `label` to an OpenCode session before it is launched, so the
+/// model never spends a turn on it. A session already reserved (by a
+/// concurrent start, or a start whose exec failed) is returned rather
+/// than replaced. `superseded` is the other tool's binding the caller
+/// read: it may be replaced, but any other binding that appeared since
+/// is refused.
+pub fn reserve_opencode_session(
+    repo: &Path,
+    label: &AgentLabel,
+    superseded: Option<&Session>,
+    mint: impl FnOnce() -> SessionId,
+) -> anyhow::Result<Session> {
+    let guard = BindingGuard::acquire(repo, label)?;
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("formatting timestamp")?;
+    mutate_locked(&guard, |cfg| match &cfg.session {
+        Some(s) if s.tool == Tool::OpenCode => Ok(s.clone()),
+        Some(s) if Some(s) != superseded => Err(anyhow::anyhow!(
+            "`{label}` was bound to {} session {} while it was starting",
+            s.tool.as_str(),
+            s.id.as_str()
+        )),
+        _ => {
+            let s = Session {
+                id: mint(),
+                tool: Tool::OpenCode,
+                updated_at: now,
+                transcript: None,
+            };
+            cfg.session = Some(s.clone());
+            Ok(s)
+        }
+    })?
+}
+
 pub fn bind_session_to_agent(
     repo: &Path,
     label: &AgentLabel,

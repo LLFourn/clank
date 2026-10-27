@@ -23,8 +23,8 @@ use crate::cli::session_holder::{self, Holder};
 use crate::cli::teams_config::{
     AgentDescription, RepoConfigFile, ReviewKind, RosterAgent, RosterRole, UserConfigFile,
 };
-use clank_core::agent_config::{LaunchConfig, Session};
-use clank_core::ids::AgentLabel;
+use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
+use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -184,10 +184,10 @@ fn print_human(rows: &[AgentRow]) {
 /// - **Resume** (declaration + bound session): exec with the
 ///   configured launch profile + session-restore suffix.
 /// - **Bootstrap** (declaration but no bound session — skeleton
-///   missing OR `session: None`): exec the bare tool with a seed
-///   prompt instructing the agent to run `clank as <label>`. After
-///   that bind, subsequent calls hit the resume path. See
-///   `compose_bootstrap_launch` for the program-resolution policy.
+///   missing OR `session: None`): exec the bare tool, which binds its
+///   session as it starts; an OpenCode session is bound by clank
+///   before the exec ([`compose_unbound_launch`]). Subsequent calls hit
+///   the resume path.
 ///   Plan: `agent-start-bootstraps-missing-skeleton`.
 ///
 /// Launch profile source: the merged declaration's `launch`
@@ -315,7 +315,8 @@ async fn start_with(
         eprintln!(
             "`{label}` is configured for {new} but bound to a {old_tool} session ({id}); \
              {verb} {new} fresh. The {old_tool} session stays bound until the new one \
-             reports in, and can still be resumed by hand with {old_tool}.",
+             is bound (for opencode, before it launches), and can still be resumed by \
+             hand with {old_tool}.",
             new = desc.tool.as_str(),
             old_tool = old.tool.as_str(),
             id = old.id.as_str(),
@@ -382,25 +383,25 @@ async fn start_with(
                         Tool::Grok,
                     )
                 }
-                Some(spec) => {
+                spec => {
+                    let tool = spec.as_ref().map_or(desc.tool, |s| s.tool);
                     if !print {
-                        super::setup::ensure_launch_setup(&repo, spec.tool, desc.launch.as_ref())
+                        super::setup::ensure_launch_setup(&repo, tool, desc.launch.as_ref())
                             .await?;
-                        consume_fork = true;
+                        consume_fork = spec.is_some();
                     }
-                    let tool = spec.tool;
-                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                     (
-                        compose_fork_launch(&label, &spec, &desc, &repo, home.as_deref()),
+                        compose_unbound_launch(
+                            &repo,
+                            &label,
+                            &desc,
+                            cfg.as_ref(),
+                            superseded,
+                            spec.as_ref(),
+                            print,
+                        )?,
                         tool,
                     )
-                }
-                None => {
-                    if !print {
-                        super::setup::ensure_launch_setup(&repo, desc.tool, desc.launch.as_ref())
-                            .await?;
-                    }
-                    (compose_bootstrap_launch(&repo, &label, &desc)?, desc.tool)
                 }
             }
         }
@@ -475,18 +476,13 @@ async fn start_with(
                         super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
                     super::grok_launch::validate_resume(&provider, &repo, session.id.as_str())?;
                 }
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                let auto_mode =
-                    crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
-                let resolved_prompt =
-                    resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode, session.tool);
                 (
                     compose_launch(
                         &repo,
                         &label,
                         session,
                         desc.launch.as_ref(),
-                        resolved_prompt.as_deref(),
+                        start_prompt(&desc, cfg.as_ref(), session.tool).as_deref(),
                     ),
                     session.tool,
                 )
@@ -735,11 +731,90 @@ pub(crate) fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -
     out
 }
 
-/// Bootstrap launch: a registered agent has no bound session in
-/// this repo. Spawn the tool (from its `AgentDescription`) with a
-/// seed prompt instructing the agent to run `clank as <label>`,
-/// which creates the skeleton + session binding. Subsequent
-/// `clank agent start <label>` calls resume normally.
+/// The configured or auto-mode prompt a launch of an existing session
+/// carries.
+fn start_prompt(desc: &AgentDescription, cfg: Option<&AgentConfig>, tool: Tool) -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg, home.as_deref());
+    resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode, tool)
+}
+
+/// The launch of an agent with no bound session. OpenCode has no hook
+/// to bind itself, so clank chooses its session id, records the binding
+/// first, and launches it as a resume: `--session` creates a session
+/// that does not exist yet. A preview shows an id it does not record.
+///
+/// A fork is the exception: OpenCode chooses the child's id, and its
+/// `--session` names the PARENT, so it binds later through `clank as`.
+
+fn compose_unbound_launch(
+    repo: &Path,
+    label: &AgentLabel,
+    desc: &AgentDescription,
+    cfg: Option<&AgentConfig>,
+    superseded: Option<&Session>,
+    fork: Option<&crate::cli::fork::ForkSpec>,
+    print: bool,
+) -> anyhow::Result<ComposedLaunch> {
+    if let Some(spec) = fork {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        return Ok(compose_fork_launch(
+            label,
+            spec,
+            desc,
+            repo,
+            home.as_deref(),
+        ));
+    }
+    if desc.tool != Tool::OpenCode {
+        return compose_bootstrap_launch(repo, label, desc);
+    }
+    let session = if print {
+        Session {
+            id: mint_opencode_session_id(),
+            tool: Tool::OpenCode,
+            updated_at: String::new(),
+            transcript: None,
+        }
+    } else {
+        crate::agent_store::reserve_opencode_session(
+            repo,
+            label,
+            superseded,
+            mint_opencode_session_id,
+        )
+        .with_context(|| format!("`{label}` was not launched: its session could not be bound"))?
+    };
+    Ok(compose_launch(
+        repo,
+        label,
+        &session,
+        desc.launch.as_ref(),
+        start_prompt(desc, cfg, Tool::OpenCode).as_deref(),
+    ))
+}
+
+/// A new id in OpenCode 2.1.4's own session format (`Session.ID.create`
+/// in the shipped binary): `ses_`, 12 hex digits of the bitwise NOT of
+/// `ms * 0x1000 + counter`, so newer sessions sort first (a start mints
+/// one id, so its counter is 1), then 14 random base62 characters.
+fn mint_opencode_session_id() -> SessionId {
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let mut random = [0u8; 14];
+    getrandom::fill(&mut random).expect("the OS can produce random bytes");
+    let tail: String = random
+        .iter()
+        .map(|b| BASE62[usize::from(*b) % BASE62.len()] as char)
+        .collect();
+    let id = format!("ses_{:012x}{tail}", !((ms << 12) + 1) & 0xffff_ffff_ffff);
+    SessionId::parse(&id).expect("an OpenCode session id is a valid session id")
+}
+
+/// Bootstrap launch: a registered agent has no bound session in this
+/// repo and its tool binds the session itself once it runs.
 fn compose_bootstrap_launch(
     repo: &Path,
     label: &AgentLabel,
@@ -839,8 +914,9 @@ fn compose_fork_launch(
         (Some(_), Tool::Grok) => unreachable!("Grok is composed through preparation above"),
         // opencode: `--session <src> --fork` — the TUI resumes a COPY
         // and mints a fresh `ses_` id; the source is untouched. The
-        // new id binds later via the plugin + `clank as` (same as a
-        // fresh start). cwd comes from the pane, like claude.
+        // new id binds later via the plugin + `clank as`: binding the
+        // `--session` argument here would bind the fork to its parent.
+        // cwd comes from the pane, like claude.
         (Some(sid), Tool::OpenCode) => {
             args.push("--session".into());
             args.push(sid.clone());
@@ -1003,14 +1079,13 @@ fn name_led_prompt(tool: Tool, name: &str, prompt: String) -> String {
 /// gets a prompt. What it says depends on who binds the session: a
 /// tool with a SessionStart hook clank installs (claude, codex) binds
 /// itself from `CLANK_AGENT` before this prompt is even read
-/// (a-session-binds-itself-at-start), so the prompt only opens the
-/// turn; a tool without one still has to be asked.
+/// (a-session-binds-itself-at-start), and clank binds an OpenCode
+/// session before launching it, so the prompt only opens the turn;
+/// Grok still has to be asked.
 pub(super) fn bootstrap_prompt(tool: Tool, label: &AgentLabel) -> String {
     match tool {
-        Tool::Claude | Tool::Codex => "Session started.".to_string(),
-        Tool::OpenCode | Tool::Grok => {
-            format!("Run `clank as {}` to bind this session.", label.as_str())
-        }
+        Tool::Claude | Tool::Codex | Tool::OpenCode => "Session started.".to_string(),
+        Tool::Grok => format!("Run `clank as {}` to bind this session.", label.as_str()),
     }
 }
 
@@ -1118,10 +1193,11 @@ pub(super) fn resolve_initial_prompt(
         // Background completion, rather than Stop, carries delivered work.
         return Some(match tool {
             Tool::Grok => DEFAULT_AUTO_PROMPT_GROK.to_string(),
-            // opencode joined the hook-driven side once the M1 spike
-            // proved the plugin loop (turn end → stop-hook →
-            // inject) — the grok-style arming interim is gone.
-            Tool::Claude | Tool::Codex | Tool::OpenCode => DEFAULT_AUTO_PROMPT.to_string(),
+            Tool::Claude | Tool::Codex => DEFAULT_AUTO_PROMPT.to_string(),
+            // The plugin arms OpenCode's wait when its session is created
+            // or first seen idle; an acknowledgement would only spend a
+            // model turn.
+            Tool::OpenCode => return None,
         });
     }
     None
@@ -1162,7 +1238,7 @@ fn compose_launch(
     if tool == Tool::OpenCode {
         // The resume path knows the exact session at composition time;
         // the plugin arms its bootstrap wait for THIS identity only.
-        // Fresh and fork launches omit it — their id is minted later.
+        // Fork launches omit it — their id is minted later.
         env_overrides.insert(
             crate::agent_env::ENV_CLANK_BOOTSTRAP_SESSION.to_string(),
             session.id.as_str().to_string(),
@@ -4492,13 +4568,15 @@ mod tests {
     fn resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset() {
         // Pinned: exact equality against the constant so a future
         // tweak to DEFAULT_AUTO_PROMPT fails the test deliberately.
-        // Claude, codex AND opencode get the bare ack — an
-        // orchestrator (stop hook / clank plugin) reacts to the
-        // turn ending.
-        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        for tool in [Tool::Claude, Tool::Codex] {
             let out = resolve_initial_prompt(None, AutoMode::On, tool);
             assert_eq!(out, Some("Session resumed.".to_string()));
         }
+        assert_eq!(
+            resolve_initial_prompt(None, AutoMode::On, Tool::OpenCode),
+            None,
+            "OpenCode's plugin waits without a model turn"
+        );
     }
 
     #[test]
@@ -4521,8 +4599,9 @@ mod tests {
     #[test]
     fn resolve_initial_prompt_declaration_wins_over_auto_default() {
         // Including for grok: an explicit prompt overrides the arming
-        // default too.
-        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+        // default too. OpenCode has no default, but a configured prompt
+        // still reaches it.
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
             let out = resolve_initial_prompt(Some("custom"), AutoMode::On, tool);
             assert_eq!(out, Some("custom".to_string()));
         }
@@ -4543,34 +4622,239 @@ mod tests {
     // ── compose_bootstrap_launch policy tests ─────────────────
     // Plan: agent-start-bootstraps-missing-skeleton.
 
+    fn kimi_desc(initial_prompt: Option<&str>) -> AgentDescription {
+        AgentDescription {
+            initial_prompt: initial_prompt.map(String::from),
+            ..desc_with(
+                Tool::OpenCode,
+                Some(LaunchConfig {
+                    command: None,
+                    args: vec!["--model".into(), "moonshotai/kimi-k3".into()],
+                    env: Default::default(),
+                }),
+            )
+        }
+    }
+
+    /// An unbound agent's launch, with auto mode pinned off so the user's
+    /// own default cannot add a prompt.
+    fn unbound_launch(
+        repo: &Path,
+        name: &str,
+        desc: &AgentDescription,
+        fork: Option<&crate::cli::fork::ForkSpec>,
+        print: bool,
+    ) -> anyhow::Result<ComposedLaunch> {
+        let cfg = AgentConfig {
+            auto_mode: Some(AutoMode::Off),
+            ..Default::default()
+        };
+        compose_unbound_launch(repo, &label(name), desc, Some(&cfg), None, fork, print)
+    }
+
+    fn session_arg(c: &ComposedLaunch) -> Option<&str> {
+        let at = c.args.iter().position(|a| a == "--session")?;
+        c.args.get(at + 1).map(String::as_str)
+    }
+
+    fn binding(repo: &Path, name: &str) -> Option<Session> {
+        load_agent_config(repo, &label(name)).unwrap()?.session
+    }
+
+    /// `ses_` + 12 hex + 14 base62, as `ses_039d60658ffe0RPgue3noZ0Qqf`.
+    fn is_opencode_session_id(id: &str) -> bool {
+        id.strip_prefix("ses_").is_some_and(|rest| {
+            rest.len() == 26
+                && rest[..12]
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                && rest[12..].bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+    }
+
     #[test]
-    fn opencode_prompts_ride_behind_the_prompt_flag() {
-        // opencode's TUI positional is a PROJECT PATH — a prompt
-        // pushed as the trailing positional would be read as a
-        // directory (opencode-agent-tool M2). Every launch mode's
-        // prompt must use `--prompt`.
-        let desc = desc_with(
-            Tool::OpenCode,
-            Some(LaunchConfig {
-                command: None,
-                args: vec!["--model".into(), "moonshotai/kimi-k3".into()],
-                env: Default::default(),
-            }),
+    fn a_fresh_opencode_agent_is_bound_before_it_launches() {
+        let repo = tempfile::tempdir().unwrap();
+        let c = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap();
+        let id = session_arg(&c).expect("--session").to_string();
+        assert!(is_opencode_session_id(&id), "{id}");
+        let bound = binding(repo.path(), "kimi").expect("bound before the launch runs");
+        assert_eq!(
+            (bound.tool, bound.id.as_str()),
+            (Tool::OpenCode, id.as_str())
         );
-        let c =
-            compose_bootstrap_launch(Path::new("/repo"), &label("kimi"), &desc).expect("compose");
         assert_eq!(c.program, "opencode");
         assert_eq!(
             c.args,
-            vec![
-                "--model".to_string(),
-                "moonshotai/kimi-k3".to_string(),
+            ["--model", "moonshotai/kimi-k3", "--session", id.as_str()],
+            "no prompt: nothing asks the model to bind"
+        );
+        assert_eq!(
+            c.env_overrides
+                .get(crate::agent_env::ENV_CLANK_BOOTSTRAP_SESSION),
+            Some(&id),
+            "the plugin arms this session's wait"
+        );
+    }
+
+    #[test]
+    fn auto_mode_sends_a_fresh_opencode_agent_no_prompt() {
+        let repo = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig {
+            auto_mode: Some(AutoMode::On),
+            ..Default::default()
+        };
+        let c = compose_unbound_launch(
+            repo.path(),
+            &label("kimi"),
+            &kimi_desc(None),
+            Some(&cfg),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !c.args.iter().any(|a| a == "--prompt"),
+            "an acknowledgement would spend a model turn: {:?}",
+            c.args
+        );
+    }
+
+    #[test]
+    fn a_configured_prompt_still_reaches_a_fresh_opencode_agent() {
+        // opencode's TUI positional is a PROJECT PATH, so the prompt rides
+        // behind `--prompt`, and its title derives from it.
+        let repo = tempfile::tempdir().unwrap();
+        let c = unbound_launch(
+            repo.path(),
+            "kimi",
+            &kimi_desc(Some("Read the plan.")),
+            None,
+            false,
+        )
+        .unwrap();
+        let place = repo.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            c.args[c.args.len() - 2..],
+            [
                 "--prompt".to_string(),
-                // opencode's --title is `run`-only, so the interactive
-                // launch derives its title from this prompt.
-                "repo · kimi — Run `clank as kimi` to bind this session.".to_string(),
+                format!("{place} · kimi — Read the plan.")
             ]
         );
+    }
+
+    #[test]
+    fn concurrent_fresh_starts_share_one_opencode_session() {
+        let repo = tempfile::tempdir().unwrap();
+        let ids: Vec<String> = std::thread::scope(|s| {
+            let starts: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        let c = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false)
+                            .unwrap();
+                        session_arg(&c).unwrap().to_string()
+                    })
+                })
+                .collect();
+            starts.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let bound = binding(repo.path(), "kimi").unwrap();
+        assert!(
+            ids.iter().all(|id| id == bound.id.as_str()),
+            "{ids:?} vs {bound:?}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_binding_that_cannot_be_recorded_launches_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+        let config = repo.path().join(".clank/agents/kimi/config.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "{ not json").unwrap();
+        let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("`kimi` was not launched") && err.contains("parsing"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "{ not json");
+
+        let claude = r#"{ "session": { "id": "01a156a7-f516-7dc0-8b58-520faf122796",
+                         "tool": "claude", "updated_at": "2026-10-20T00:00:00Z" } }"#;
+        std::fs::write(&config, claude).unwrap();
+        let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("was bound to claude session"),
+            "a binding that appeared after the start read none is not replaced: {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), claude);
+    }
+
+    #[tokio::test]
+    async fn an_opencode_agent_started_again_resumes_its_recorded_session() {
+        let repo = changed_tool(r#"{ "tool": "opencode", "role": "standby" }"#, "claude");
+        std::fs::remove_file(repo.path().join(".clank/agents/browser2/config.json")).unwrap();
+        let before = snapshot(repo.path());
+        let preview = next_start(repo.path(), Purpose::Start).await;
+        assert!(
+            is_opencode_session_id(session_arg(&preview).unwrap()),
+            "{preview:?}"
+        );
+        assert_eq!(snapshot(repo.path()), before, "--print records nothing");
+
+        let first = unbound_launch(
+            repo.path(),
+            "browser2",
+            &desc_with(Tool::OpenCode, None),
+            None,
+            false,
+        )
+        .unwrap();
+        let id = session_arg(&first).unwrap();
+        let again = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(session_arg(&again), Some(id), "{again:?}");
+
+        let config = repo.path().join(".clank/agents/browser2/config.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        value["auto_mode"] = serde_json::json!("on");
+        std::fs::write(&config, value.to_string()).unwrap();
+        let auto = next_start(repo.path(), Purpose::Start).await;
+        assert_eq!(session_arg(&auto), Some(id), "{auto:?}");
+        assert!(
+            !auto.args.iter().any(|a| a == "--prompt"),
+            "auto mode sends a resumed OpenCode agent no acknowledgement: {auto:?}"
+        );
+    }
+
+    #[test]
+    fn an_opencode_fork_and_its_fallback_are_not_bound_at_launch() {
+        // OpenCode chooses the child's id, so the `--session` a fork names
+        // is its parent's: the fork still asks to be bound.
+        let repo = tempfile::tempdir().unwrap();
+        let worktree = repo.path().join("x");
+        let ask = "orient. Run `clank as tester` to bind this forked session.";
+        for (from, expected) in [
+            (
+                Some("ses_039d60658ffe0RPgue3noZ0Qqf"),
+                &["--session", "ses_039d60658ffe0RPgue3noZ0Qqf", "--fork"][..],
+            ),
+            (None, &[][..]),
+        ] {
+            let spec = crate::cli::fork::ForkSpec {
+                grok: None,
+                tool: Tool::OpenCode,
+                from_session: from.map(String::from),
+                prompt: ask.into(),
+            };
+            let desc = desc_with(Tool::OpenCode, None);
+            let c = unbound_launch(&worktree, "tester", &desc, Some(&spec), false).unwrap();
+            let mut args = expected.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+            args.extend(["--prompt".into(), format!("x · tester — {ask}")]);
+            assert_eq!(c.args, args, "{from:?}");
+            assert_eq!(binding(&worktree, "tester"), None, "{from:?}");
+        }
     }
 
     #[test]
@@ -4773,16 +5057,13 @@ mod tests {
     #[test]
     fn bootstrap_prompt_is_pinned_per_tool() {
         let l = label("phantom");
-        for tool in [Tool::Claude, Tool::Codex] {
+        for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
             assert_eq!(bootstrap_prompt(tool, &l), "Session started.", "{tool:?}");
         }
-        for tool in [Tool::OpenCode, Tool::Grok] {
-            assert_eq!(
-                bootstrap_prompt(tool, &l),
-                "Run `clank as phantom` to bind this session.",
-                "{tool:?}"
-            );
-        }
+        assert_eq!(
+            bootstrap_prompt(Tool::Grok, &l),
+            "Run `clank as phantom` to bind this session.",
+        );
     }
 
     /// Every composed launch — bootstrap, resume, attach, fork — runs

@@ -1211,9 +1211,10 @@ pub enum AgentCmd {
     ///
     /// The tool runs with the agent's launch profile. A session bound
     /// with the same tool is resumed. Without one, or when the roster
-    /// now names a different tool, the tool starts fresh and is told to
-    /// bind itself with `clank as <name>`; the old binding stays until
-    /// the new session reports in.
+    /// now names a different tool, the tool starts fresh and binds as it
+    /// starts; the old binding stays until the new session reports in.
+    /// An OpenCode session is bound by clank before launch instead,
+    /// replacing the old binding then.
     Start(AgentStartArgs),
     /// Put an agent on this repo's roster, with its review tier
     ///

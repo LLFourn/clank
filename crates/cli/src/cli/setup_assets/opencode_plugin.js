@@ -46,7 +46,11 @@
 //      produces a turn, so without this no wait ever exists (the penlock
 //      incident). DETACHED: setup must never block on a long-poll;
 //    - first sighting of a session — only once `session.wait` has said
-//      it is idle, and only if nothing happened to it meanwhile.
+//      it is idle, and only if nothing happened to it meanwhile. Its
+//      session.created counts as a sighting even when the bootstrap arm
+//      came first: clank launches a fresh session with
+//      `--session <id>`, so the bootstrap id can name a session that
+//      does not exist yet, whose idle check failed.
 //
 // Loop discipline:
 // - At most ONE in-flight stop-hook wait per session.
@@ -405,7 +409,7 @@ export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
           void report(s, "retry", s.running?.input && turnName(s, s.running.input))
           break
       }
-      if (first && !s.inflight) armWhenIdle(s, "first-sighting")
+      if ((first || event.type === "session.created") && !s.inflight) armWhenIdle(s, "first-sighting")
     }
 
     const pump = async () => {

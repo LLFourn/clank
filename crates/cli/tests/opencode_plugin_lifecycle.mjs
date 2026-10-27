@@ -419,6 +419,36 @@ const TOKEN = "ses_0bootstrap00000000000000000"
   assert(svc.logs.some((l) => l.message.startsWith("arm dropped: session moved")), "the stale arm is dropped")
 }
 {
+  // A fresh launch is bound to an id clank chose (`--session <id>`), so its
+  // bootstrap id can name a session OpenCode has not created yet. The
+  // session's first event is OpenCode 2.1.4's durable session.created, with
+  // no top-level location; it arms the wait without a turn.
+  const created = (sessionID, version) => ({
+    id: `evt_${++eventSeq}`,
+    created: Date.now(),
+    type: "session.created",
+    durable: { aggregateID: sessionID, seq: 0, version: 1 },
+    data: { sessionID, projectID: "prj_0", location: { directory: DIR }, slug: "s", version },
+  })
+  for (const token of [TOKEN, undefined]) {
+    const svc = makeService()
+    svc.waitGates.set(TOKEN, "error")
+    await withToken(token, () => svc.instance("/somewhere/else"))
+    await settle()
+    assert(svc.waits().length === 0, "no wait before the session exists")
+    svc.waitGates.delete(TOKEN)
+    svc.sessionDirs.set(TOKEN, DIR)
+    svc.waitResults.push({ exitCode: 0, stdout: "first-work\n", stderr: "" })
+    svc.bus.publish(created(TOKEN, "2.1.4"))
+    await settle()
+    assert(
+      same(svc.waits().map((w) => [w.input.session_id, w.cwd]), [[TOKEN, DIR]]),
+      `session.created arms the bound zero-turn session (token ${token}): ${JSON.stringify(svc.waits())}`,
+    )
+    assert(svc.prompts.length === 1 && svc.prompts[0].text === "first-work", "its work is delivered without a turn")
+  }
+}
+{
   // An idle check that fails never arms.
   const svc = makeService()
   svc.waitGates.set(TOKEN, "error")

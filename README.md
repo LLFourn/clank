@@ -221,9 +221,11 @@ roster) is refused rather than guessed.
 The pane's tool runs with `CLANK_AGENT=<label>` in its environment,
 and clank's SessionStart hook binds that label to the session the tool
 just created — so work can be routed to it — and rebinds it when
-`/clear` hands the process a new session id. Nothing to type. Only a
-session you started yourself needs `clank as <label>` (claude and
-codex and native Grok; opencode binds through its plugin). Inside the
+`/clear` hands the process a new session id. OpenCode has no such
+hook, so clank chooses an OpenCode session's id itself, records the
+binding, and launches it with `--session <id>`; a forked OpenCode pane,
+whose id OpenCode chooses, is asked to bind itself. Nothing to type.
+Only a session you started yourself needs `clank as <label>`. Inside the
 repo's workspace, `clank as` also renames its own pane to the label, so
 clank can find it. It refuses, before binding anything, when another
 live pane there already has that name; when the workspace cannot be

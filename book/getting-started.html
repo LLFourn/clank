@@ -44,7 +44,7 @@ clank doctor</code></pre>
   <li>the role skills <code>clank-master</code>, <code>clank-reviewer</code> and <code>clank-standby</code>, plus <code>clank-github</code>, for each tool;</li>
   <li>clank’s Stop and SessionStart hooks, merged into Claude Code’s <code>settings.json</code> and Codex’s <code>hooks.json</code>;</li>
   <li>Grok’s native hooks, in <code>~/.grok/hooks/clank.json</code>;</li>
-  <li>the opencode plugin, which binds the session and carries its work loop.</li>
+  <li>the opencode plugin, which carries its work loop.</li>
 </ul>
 <p>The hooks are how an agent gets woken, and the skills are how it learns its job. Run <code>clank setup</code> again after every upgrade. <code>clank setup --dry-run</code> shows what would change first, and <code>clank setup --force</code> overwrites skill files you have edited.</p>
 <p><code>clank doctor</code> checks the repo, your user-level install and the current session, and prints OK, WARN or FAIL with what to do about each. It exits non-zero on any FAIL. It is the first thing to run whenever something seems off.</p>
