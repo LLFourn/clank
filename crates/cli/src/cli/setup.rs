@@ -33,9 +33,9 @@ const SKILL_SLASH_COMMAND: &str = include_str!("setup_assets/skill_slash_command
 /// so one body installs to every skill dir.
 pub const GITHUB_SKILL_BODY: &str = include_str!("setup_assets/github_events_skill.md");
 
-/// The opencode plugin: session BINDING via `shell.env` + the
-/// `session.idle` work loop (opencode-agent-tool M2). Content
-/// invariants pinned by tests below; installed by `clank setup`.
+/// The opencode 2.x server plugin: identity scrubbing in every shell
+/// plus the per-session work loop. Its lifecycle is exercised by
+/// `tests/opencode_plugin_lifecycle.mjs`; installed by `clank setup`.
 pub const OPENCODE_PLUGIN: &str = include_str!("setup_assets/opencode_plugin.js");
 
 /// The role skills, by their `~/.<tool>/skills/<name>/` dir name.
@@ -164,7 +164,7 @@ const WORK_LOOP_GROK: WorkLoop = WorkLoop {
 };
 
 /// opencode is plugin-driven (opencode-agent-tool M1/M2): the clank
-/// plugin long-polls `clank stop-hook` on session.idle and INJECTS
+/// plugin long-polls `clank stop-hook` when a turn ends and INJECTS
 /// work as a new prompt — from the agent's seat, work simply
 /// arrives. No arming, no reminder; the skill must forbid
 /// self-arming (a parked wait duplicates the plugin's deliveries
@@ -355,6 +355,91 @@ pub(super) fn provider_asset_inventory(tool: Tool, claude_async: bool) -> Vec<Ow
         ));
     }
     out
+}
+
+/// The first OpenCode major whose loader takes clank's plugin: it is a
+/// 2.x server plugin, and 1.x's loader calls every export as a 1.x plugin.
+const OPENCODE_PLUGIN_MAJOR: u64 = 2;
+
+/// Whether a launch profile's OpenCode can load clank's plugin, judged
+/// from its install rather than by running it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenCodeSupport {
+    Supported(String),
+    TooOld(String),
+    Unknown(String),
+}
+
+impl OpenCodeSupport {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            OpenCodeSupport::Supported(v) => format!("OpenCode {v} can load clank's plugin"),
+            OpenCodeSupport::TooOld(v) => format!(
+                "OpenCode {v} cannot load clank's plugin: it is an OpenCode \
+                 {OPENCODE_PLUGIN_MAJOR}.x plugin. Upgrade OpenCode, then restart it"
+            ),
+            OpenCodeSupport::Unknown(why) => format!(
+                "OpenCode's version could not be read ({why}); clank's plugin needs \
+                 OpenCode {OPENCODE_PLUGIN_MAJOR}.x"
+            ),
+        }
+    }
+}
+
+/// The executable a launch profile runs for OpenCode from `cwd`.
+pub(crate) fn opencode_executable(
+    launch: Option<&clank_core::agent_config::LaunchConfig>,
+    cwd: &Path,
+) -> Option<PathBuf> {
+    super::agent::launch_executable(Tool::OpenCode, launch, cwd)
+}
+
+pub(crate) fn opencode_support(executable: Option<&Path>) -> OpenCodeSupport {
+    let Some(executable) = executable else {
+        return OpenCodeSupport::Unknown("no `opencode` executable was found".into());
+    };
+    let Some(version) = opencode_install_version(executable) else {
+        return OpenCodeSupport::Unknown(format!(
+            "{} is not a Homebrew or npm install",
+            executable.display()
+        ));
+    };
+    match version
+        .split('.')
+        .next()
+        .and_then(|m| m.parse::<u64>().ok())
+    {
+        Some(major) if major >= OPENCODE_PLUGIN_MAJOR => OpenCodeSupport::Supported(version),
+        Some(_) => OpenCodeSupport::TooOld(version),
+        None => OpenCodeSupport::Unknown(format!("unrecognised version `{version}`")),
+    }
+}
+
+/// The version an OpenCode executable was installed as: a Homebrew keg
+/// (`Cellar/opencode/<version>/…`) or the `package.json` of the npm
+/// `opencode*` package that holds it.
+fn opencode_install_version(executable: &Path) -> Option<String> {
+    let real = dunce::canonicalize(executable).ok()?;
+    let parts: Vec<_> = real
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    if let Some(i) = parts
+        .windows(2)
+        .position(|w| w[0] == "Cellar" && w[1] == "opencode")
+    {
+        return parts.get(i + 2).map(|v| v.to_string());
+    }
+    real.ancestors().skip(1).find_map(|dir| {
+        let raw = std::fs::read_to_string(dir.join("package.json")).ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        manifest
+            .get("name")?
+            .as_str()?
+            .starts_with("opencode")
+            .then(|| manifest.get("version")?.as_str().map(str::to_string))
+            .flatten()
+    })
 }
 
 pub(super) fn resolve_provider_root(
@@ -572,6 +657,10 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             args.dry_run,
             &mut summary,
         )?;
+    }
+    match opencode_support(opencode_executable(None, &std::env::current_dir()?).as_deref()) {
+        OpenCodeSupport::Supported(_) => {}
+        support => summary.push(format!("  OpenCode: {}", support.describe())),
     }
     // Native initialize may create provider cache directories. A dry run must
     // not invoke it in the user's home; real setup probes once, never at idle.
@@ -3722,15 +3811,11 @@ mod tests {
 
     #[test]
     fn opencode_plugin_scrubs_every_foreign_identity_var() {
-        // The plugin's blank-scrub list must track SESSION_IDENTITY_VARS
-        // (minus its own var, which it SETS): a var added to clank's
-        // identity set but not blanked by the plugin would leak a
-        // parent agent's identity into opencode tool shells.
+        // The plugin blanks every identity var in every shell; opencode
+        // stamps its own OPENCODE_SESSION_ID after the hook. A var added
+        // to clank's identity set but not blanked here would leak a
+        // parent agent's identity into opencode shells.
         for var in crate::agent_env::SESSION_IDENTITY_VARS {
-            if *var == "OPENCODE_SESSION_ID" {
-                assert!(OPENCODE_PLUGIN.contains("output.env.OPENCODE_SESSION_ID"));
-                continue;
-            }
             assert!(
                 OPENCODE_PLUGIN.contains(&format!("\"{var}\"")),
                 "plugin must blank-scrub {var}"
@@ -3738,245 +3823,135 @@ mod tests {
         }
     }
 
-    /// In-process model of the plugin's event-loop discipline —
-    /// the state machine opencode_plugin.js's event handler must
-    /// implement. The source-invariant tests below pin the JS to
-    /// this model's critical ordering; the full JS is executable
-    /// manually via `node crates/cli/tests/opencode_plugin_lifecycle.mjs`.
-    struct LoopModel {
-        inflight: bool,
-        activity: u32,
-        seen_msgs: std::collections::HashSet<&'static str>,
-        pending_wait: Option<u32>,
-        /// The turn was stopped by a human, not finished.
-        aborted: bool,
-        arms: u32,
-        injections: u32,
-    }
-
-    impl LoopModel {
-        fn new() -> Self {
-            LoopModel {
-                inflight: false,
-                activity: 0,
-                seen_msgs: Default::default(),
-                pending_wait: None,
-                aborted: false,
-                arms: 0,
-                injections: 0,
-            }
-        }
-
-        /// message.updated with role=user: activity is FIRST
-        /// SIGHTINGS of message ids only — opencode re-emits the
-        /// turn's own user message after idle (housekeeping).
-        fn user_message(&mut self, id: &'static str) {
-            if self.seen_msgs.insert(id) {
-                self.activity += 1;
-                // Prompting again is what ends the stop Esc began.
-                self.aborted = false;
-            }
-        }
-
-        /// message.updated, role=assistant, error MessageAbortedError:
-        /// opencode's mark for a turn a human stopped.
-        fn abort(&mut self) {
-            self.aborted = true;
-        }
-
-        fn idle(&mut self) {
-            if self.inflight {
-                return;
-            }
-            // Arming after an interrupt would long-poll holding the
-            // guard, so the next genuine idle is ignored as in-flight.
-            if self.aborted {
-                return;
-            }
-            self.inflight = true;
-            self.arms += 1;
-            self.pending_wait = Some(self.activity);
-        }
-
-        /// The wait completes: the guard is released BEFORE the
-        /// injection decision — the injected turn's terminal idle
-        /// must arm the next wait (codex d7c8908).
-        fn wait_returns(&mut self, work: bool) {
-            let seen = self.pending_wait.take().expect("wait armed");
-            self.inflight = false;
-            if work && self.activity == seen && !self.aborted {
-                self.injections += 1;
-            }
-        }
+    fn executable(path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_path_buf()
     }
 
     #[test]
-    fn opencode_loop_model_rearms_and_discards_stale() {
-        let mut m = LoopModel::new();
-        // Turn 1: the turn's own user message, then idle; opencode
-        // RE-updates that same message during the wait — a
-        // re-sighting must not discard the continuation.
-        m.user_message("msg_user_1");
-        m.idle();
-        m.user_message("msg_user_1");
-        m.wait_returns(true);
-        assert_eq!((m.arms, m.injections), (1, 1));
-        // The injected turn runs (its own user message appears),
-        // ends in a terminal idle: the next wait MUST arm even
-        // though the injected turn's prompt call may still be
-        // pending — the guard covers only the wait.
-        m.user_message("msg_inject_1");
-        m.idle();
-        m.wait_returns(true);
-        assert_eq!((m.arms, m.injections), (2, 2));
-        // A genuinely NEW user message during a wait discards.
-        m.idle();
-        m.user_message("msg_user_2");
-        m.wait_returns(true);
-        assert_eq!((m.arms, m.injections), (3, 2));
-        // An idle during an in-flight wait is ignored.
-        m.idle();
-        m.idle();
-        assert_eq!(m.arms, 4);
-    }
+    fn an_opencode_1x_install_is_told_it_cannot_load_the_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let brew = executable(&temp.path().join("Cellar/opencode/1.18.11/bin/opencode"));
+        let support = opencode_support(Some(&brew));
+        assert_eq!(support, OpenCodeSupport::TooOld("1.18.11".into()));
+        assert!(support.describe().contains("cannot load clank's plugin"));
 
-    /// Esc means stop. `session.idle` fires for an interrupted turn
-    /// exactly as it does for a finished one, so the idle alone cannot
-    /// tell them apart — and the staleness guard cannot either, since
-    /// an abort produces no new USER message and leaves the activity
-    /// count untouched. Both orderings are covered: opencode emits
-    /// housekeeping after the idle, so the abort can be observed on
-    /// either side of it.
-    #[test]
-    fn opencode_loop_model_does_not_prod_an_interrupted_turn() {
-        // Abort observed BEFORE the idle: nothing arms, nothing injects.
-        let mut m = LoopModel::new();
-        m.user_message("msg_user_1");
-        m.abort();
-        m.idle();
+        let pkg = temp.path().join("lib/node_modules/opencode-ai");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"opencode-ai","version":"1.4.0"}"#,
+        )
+        .unwrap();
+        let bin = executable(&pkg.join("bin/opencode"));
+        let link = temp.path().join("bin/opencode");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
         assert_eq!(
-            (m.arms, m.injections),
-            (0, 0),
-            "an interrupted turn must not even arm a wait"
+            opencode_support(Some(&link)),
+            OpenCodeSupport::TooOld("1.4.0".into())
         );
+    }
 
-        // Prompting again ends the stop: the loop works normally after.
-        m.user_message("msg_user_2");
-        m.idle();
-        m.wait_returns(true);
+    #[test]
+    fn an_opencode_2x_install_supports_the_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let brew = executable(&temp.path().join("Cellar/opencode/2.1.4/bin/opencode"));
         assert_eq!(
-            (m.arms, m.injections),
-            (1, 1),
-            "a new prompt re-arms the loop"
+            opencode_support(Some(&brew)),
+            OpenCodeSupport::Supported("2.1.4".into())
         );
-
-        // Abort observed AFTER the idle, while the wait is in flight:
-        // the wait armed, so the discard has to happen at injection.
-        m.user_message("msg_user_3");
-        m.idle();
-        m.abort();
-        m.wait_returns(true);
+        let pkg = temp.path().join("node_modules/opencode-ai");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"opencode-ai","version":"2.0.1"}"#,
+        )
+        .unwrap();
+        let bin = executable(&pkg.join("bin/opencode"));
         assert_eq!(
-            (m.arms, m.injections),
-            (2, 1),
-            "an abort during the wait discards its continuation"
-        );
-
-        // And the latch persists: a later idle still injects nothing.
-        m.idle();
-        assert_eq!((m.arms, m.injections), (2, 1));
-
-        // A turn that ends by COMPLETING is unaffected — the fix must
-        // not buy quiet by breaking the loop.
-        m.user_message("msg_user_4");
-        m.idle();
-        m.wait_returns(true);
-        assert_eq!((m.arms, m.injections), (3, 2));
-    }
-
-    #[test]
-    fn opencode_plugin_keys_the_abort_on_the_assistant_message() {
-        let src = OPENCODE_PLUGIN;
-        // The FACT, not a heuristic (elapsed time, empty output): the
-        // assistant message's error, or a session error.
-        assert!(src.contains(r#"error?.name === "MessageAbortedError""#));
-        assert!(src.contains(r#"info?.role === "assistant""#));
-        // session.error's schema makes sessionID optional. One without it
-        // is dropped before anything reads it, never guessed at.
-        let unattributed = src.find("if (!id) return").expect("no-session guard");
-        assert!(unattributed < src.find("\"session.error\"").expect("session.error"));
-        // The latch clears when the human prompts again.
-        assert!(src.contains("aborted.delete(id)"));
-        // Checked before arming, before renewing after a deadline,
-        // and before injection. The abort can arrive on either side
-        // of the idle or while the wait is in flight.
-        assert_eq!(src.matches("aborted.has(id)").count(), 3);
-        let arm = src.find("inflight.add(id)").expect("arm site");
-        let release = src.find("inflight.delete(id)").expect("wait release");
-        let inject = src
-            .find("client.session.promptAsync(")
-            .expect("injection site");
-        let checks: Vec<_> = src
-            .match_indices("aborted.has(id)")
-            .map(|(i, _)| i)
-            .collect();
-        assert!(checks[0] < arm, "the arm-time check must precede arming");
-        assert!(
-            checks[1] > release && checks[1] < inject,
-            "the renewal-time check must follow the wait release"
-        );
-        assert!(
-            checks[2] > checks[1] && checks[2] < inject,
-            "the injection-time check must follow renewal and precede injection"
+            opencode_support(Some(&bin)),
+            OpenCodeSupport::Supported("2.0.1".into())
         );
     }
 
     #[test]
-    fn opencode_plugin_releases_the_wait_guard_before_injecting() {
-        // The lifecycle regression (codex d7c8908): a guard held
-        // across the injection await swallows the injected turn's
-        // terminal session.idle and the loop goes dormant after one
-        // delivery. Pinned at the source level: the finally that
-        // releases the guard closes before the injection, which
-        // must sit OUTSIDE the guarded try and use promptAsync
-        // (return-on-accept), never the synchronous prompt().
-        let src = OPENCODE_PLUGIN;
-        let guarded_try = src.find("try {").expect("wait try block");
-        let release = src.find("} finally {").expect("guard release");
-        let inject = src
-            .find("client.session.promptAsync(")
-            .expect("promptAsync injection");
-        assert!(guarded_try < release && release < inject);
-        assert!(
-            !src[guarded_try..inject].contains("promptAsync("),
-            "injection must not be inside the wait guard"
+    fn opencode_support_resolves_the_selected_profiles_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = "review-selected-opencode-unique";
+        let bin = executable(
+            &temp
+                .path()
+                .join(format!("Cellar/opencode/1.18.11/bin/{program}")),
         );
-        assert!(
-            !src.contains("session.prompt("),
-            "the synchronous prompt() pins the whole model turn"
+        let launch = clank_core::agent_config::LaunchConfig {
+            command: Some(program.into()),
+            env: std::collections::BTreeMap::from([(
+                "PATH".into(),
+                bin.parent().unwrap().to_string_lossy().into_owned(),
+            )]),
+            ..Default::default()
+        };
+        let found = opencode_executable(Some(&launch), temp.path());
+        assert_eq!(
+            found.as_deref(),
+            Some(bin.as_path()),
+            "the executable this profile runs"
+        );
+        assert_eq!(
+            opencode_support(found.as_deref()),
+            OpenCodeSupport::TooOld("1.18.11".into())
         );
     }
 
     #[test]
-    fn opencode_plugin_staleness_counts_first_sightings_only() {
-        // Observed live: opencode re-emits message.updated for the
-        // turn's OWN user message right after session.idle; counting
-        // user-role events (rather than new ids) marks every wait
-        // stale and every continuation is silently discarded.
-        assert!(OPENCODE_PLUGIN.contains("!seenUserMessages.has(info.id)"));
-        assert!(OPENCODE_PLUGIN.contains("seenUserMessages.add(info.id)"));
+    fn a_relative_opencode_command_resolves_from_the_launch_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let bin = executable(&repo.join("tools/Cellar/opencode/2.1.4/bin/opencode"));
+        let launch = clank_core::agent_config::LaunchConfig {
+            command: Some("./tools/Cellar/opencode/2.1.4/bin/opencode".into()),
+            ..Default::default()
+        };
+        let found = opencode_executable(Some(&launch), &repo).unwrap();
+        assert_eq!(
+            dunce::canonicalize(found).unwrap(),
+            dunce::canonicalize(bin).unwrap()
+        );
+        assert!(
+            opencode_executable(Some(&launch), temp.path()).is_none(),
+            "relative to the launch's directory only"
+        );
     }
 
     #[test]
-    fn opencode_plugin_pins_the_loop_discipline() {
-        // Exact-session-only binding: no sessionID in the hook call
-        // (user PTYs) → no injection, never a cwd guess.
-        assert!(OPENCODE_PLUGIN.contains("if (!input.sessionID) return"));
-        // At most one in-flight wait per session.
-        assert!(OPENCODE_PLUGIN.contains("if (inflight.has(id)) return"));
-        // Stale continuations are discarded, not injected.
-        assert!(OPENCODE_PLUGIN.contains("!== seen) return"));
-        // The real command path, empty-stdout-quiescent wire.
-        assert!(OPENCODE_PLUGIN.contains("clank stop-hook --tool opencode"));
+    fn an_unrecognised_opencode_install_says_its_version_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let bare = executable(&temp.path().join("bin/opencode"));
+        assert!(matches!(
+            opencode_support(Some(&bare)),
+            OpenCodeSupport::Unknown(_)
+        ));
+        assert!(matches!(
+            opencode_support(None),
+            OpenCodeSupport::Unknown(_)
+        ));
+        assert!(
+            opencode_support(None)
+                .describe()
+                .contains("needs OpenCode 2.x")
+        );
+    }
+
+    /// The loader imports the plugin as an ES module; one that does not
+    /// parse never loads, whether or not node is there to run the
+    /// lifecycle harness (`tests/it/opencode_plugin_lifecycle.rs`).
+    #[test]
+    fn opencode_plugin_parses_as_a_module() {
+        crate::cli::js_guard::parse_as(OPENCODE_PLUGIN, crate::cli::js_guard::Kind::Module)
+            .unwrap();
     }
 }

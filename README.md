@@ -743,10 +743,13 @@ auto-mode drives it:
   while preserving user hooks. Deterministic launch fixtures verify the wiring;
   authenticated model completion acceptance remains a separate live check. See
   [the integration contract](GROK-INTEGRATION.md).
-- **opencode** — the clank plugin long-polls in-hook on
-  `session.idle` and injects the items as a new prompt; the agent
-  never arms anything. Global and custom configuration directories load
-  additively; multiple Clank plugin copies run one loop per client. Launch
+- **opencode** (2.x) — the clank plugin long-polls in-hook when a
+  session's execution succeeds and prompts the items into it; the agent
+  never arms anything. One OpenCode service hosts every session and
+  directory, and the plugin runs one loop per session, in that session's
+  own directory. `clank doctor` says when a bound session has finished a
+  turn but the plugin never reported it — usually an OpenCode that did not
+  load the plugin. Launch
   repair also upgrades an existing setup-owned global copy, preserving local
   edits through the usual non-force ownership checks. The launch profile carries the model:
   `clank agent add kimi --tool opencode -- --model moonshotai/kimi-k3`.

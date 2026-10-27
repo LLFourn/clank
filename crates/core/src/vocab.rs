@@ -231,10 +231,9 @@ pub enum Tool {
     /// newest session dir for the cwd).
     Grok,
     /// opencode (anomalyco) — opencode-agent-tool M0. Session identity
-    /// comes from the clank opencode PLUGIN injecting
-    /// `OPENCODE_SESSION_ID` into shell executions (opencode exports
-    /// nothing natively); the work-loop shape is decided by the M1
-    /// spike. Serialized as `opencode` (one word, like the binary).
+    /// is the `OPENCODE_SESSION_ID` opencode 2.x exports into its bash
+    /// tool's shells; the clank plugin drives the work loop. Serialized
+    /// as `opencode` (one word, like the binary).
     #[serde(rename = "opencode")]
     OpenCode,
 }

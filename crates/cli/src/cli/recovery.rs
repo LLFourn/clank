@@ -40,17 +40,23 @@ pub(crate) fn retries(class: &str) -> &'static [u64] {
     }
 }
 
-/// OpenCode's error, in the classes [`retries`] knows. It names errors by
-/// type, and an `APIError` by its HTTP status.
+/// OpenCode's error, in the classes [`retries`] knows. 2.x names a failed
+/// execution's error by a `provider.*` type (1.x by an error class), and
+/// a generic error by its HTTP status.
 pub(crate) fn opencode_class(name: &str, status: Option<u16>) -> &'static str {
     match (name, status) {
-        ("ProviderAuthError", _) => "authentication_failed",
+        ("ProviderAuthError" | "provider.auth", _) => "authentication_failed",
         ("MessageOutputLengthError", _) => "max_output_tokens",
-        ("APIError", Some(429)) => "rate_limit",
-        ("APIError", Some(529 | 503)) => "overloaded",
-        ("APIError", Some(500..=599)) => "server_error",
-        ("APIError", Some(401 | 403)) => "authentication_failed",
-        ("APIError", Some(400 | 404 | 413 | 422)) => "invalid_request",
+        ("provider.rate-limit", _) => "rate_limit",
+        ("provider.quota" | "provider.free-limit", _) => "usage_limit_exceeded",
+        ("provider.invalid-request" | "provider.content-filter", _) => "invalid_request",
+        ("provider.no-route" | "provider.unknown", _) => "model_not_found",
+        ("APIError" | "provider.error" | "provider.internal", Some(429)) => "rate_limit",
+        ("APIError" | "provider.error" | "provider.internal", Some(529 | 503)) => "overloaded",
+        ("APIError" | "provider.error", Some(500..=599)) => "server_error",
+        ("provider.internal" | "provider.transport" | "provider.timeout", _) => "server_error",
+        ("APIError" | "provider.error", Some(401 | 403)) => "authentication_failed",
+        ("APIError" | "provider.error", Some(400 | 404 | 413 | 422)) => "invalid_request",
         _ => "unknown",
     }
 }
@@ -4143,6 +4149,29 @@ pub(crate) mod tests {
             "max_output_tokens"
         );
         assert_eq!(opencode_class("UnknownError", None), "unknown");
+        assert_eq!(
+            opencode_class("provider.auth", None),
+            "authentication_failed"
+        );
+        assert_eq!(
+            opencode_class("provider.rate-limit", Some(429)),
+            "rate_limit"
+        );
+        assert_eq!(opencode_class("provider.internal", Some(529)), "overloaded");
+        assert_eq!(
+            opencode_class("provider.internal", Some(500)),
+            "server_error"
+        );
+        assert_eq!(opencode_class("provider.transport", None), "server_error");
+        assert_eq!(
+            opencode_class("provider.quota", None),
+            "usage_limit_exceeded"
+        );
+        assert_eq!(
+            opencode_class("provider.error", Some(404)),
+            "invalid_request"
+        );
+        assert_eq!(opencode_class("provider.invalid-output", None), "unknown");
     }
 
     #[test]

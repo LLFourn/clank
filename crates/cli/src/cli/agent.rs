@@ -582,6 +582,24 @@ fn launch_program(tool: Tool, launch: Option<&LaunchConfig>) -> String {
         .unwrap_or_else(|| tool.as_str().to_string())
 }
 
+/// The file a launch of `tool` under `launch` would exec from `repo`, the
+/// launch's working directory: its program found on the launch's own
+/// `PATH` (the profile's, over the inherited one), a relative program
+/// with a directory taken from `repo`, as the exec itself resolves them.
+pub(crate) fn launch_executable(
+    tool: Tool,
+    launch: Option<&LaunchConfig>,
+    repo: &Path,
+) -> Option<PathBuf> {
+    let mut env = tool_env_defaults(tool);
+    env.extend(launch.map(|l| l.env.clone()).unwrap_or_default());
+    let path = env
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    which::which_in(launch_program(tool, launch), path, repo).ok()
+}
+
 /// `claude attach <short id>` and nothing else: `attach` is a
 /// subcommand, and the profile's args belong to the process that is
 /// already running with them. The env goes along as for any launch.
@@ -1052,7 +1070,7 @@ struct ComposedLaunch {
 /// - Triggers turn-end with minimum surface (a one-line ack).
 /// - Does NOT instruct the agent to run `clank wait` itself (an
 ///   orchestrator reacts to the turn ending: claude/codex via their
-///   stop hook, opencode via the clank plugin's `session.idle`
+///   stop hook, opencode via the clank plugin's settled-execution
 ///   handler — opencode-agent-tool M1; a wait instruction here
 ///   would double-trigger). Grok uses a native background handoff and gets
 ///   [`DEFAULT_AUTO_PROMPT_GROK`] instead.
@@ -1101,7 +1119,7 @@ pub(super) fn resolve_initial_prompt(
         return Some(match tool {
             Tool::Grok => DEFAULT_AUTO_PROMPT_GROK.to_string(),
             // opencode joined the hook-driven side once the M1 spike
-            // proved the plugin loop (session.idle → stop-hook →
+            // proved the plugin loop (turn end → stop-hook →
             // inject) — the grok-style arming interim is gone.
             Tool::Claude | Tool::Codex | Tool::OpenCode => DEFAULT_AUTO_PROMPT.to_string(),
         });

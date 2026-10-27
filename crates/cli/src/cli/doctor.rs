@@ -109,6 +109,17 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     // configured Grok provider. No probe runs in an idle lifecycle callback.
     results.extend(grok_checks(repo.as_deref(), home.as_deref()).await);
 
+    if let Some(repo) = repo.as_deref() {
+        let data = opencode_data_dir(home.as_deref());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+        results.extend(opencode_plugin_checks(
+            repo,
+            home.as_deref(),
+            &|session| opencode_last_settle(data.as_deref(), session),
+            now,
+        ));
+    }
+
     // Session scope — only meaningful inside an agent.
     results.extend(session_checks(repo.as_deref()));
 
@@ -459,7 +470,7 @@ pub fn repo_checks(
         // state where a missing binary should be diagnosed (codex
         // 0c90514/00fc9b4).
         let program = effective_launch_program(desc);
-        if which::which(&program).is_err() {
+        if super::agent::launch_executable(desc.tool, desc.launch.as_ref(), repo).is_none() {
             let source = if desc.launch.as_ref().is_some_and(|l| l.command.is_some()) {
                 "launch.command"
             } else {
@@ -858,6 +869,23 @@ async fn provider_user_checks(
     } else {
         None
     };
+    if tool == Tool::OpenCode {
+        let support = super::setup::opencode_support(
+            super::setup::opencode_executable(launch, repo).as_deref(),
+        );
+        let message = support.describe();
+        out.push(match support {
+            super::setup::OpenCodeSupport::Supported(_) => {
+                CheckResult::ok("user", "version", message)
+            }
+            super::setup::OpenCodeSupport::TooOld(_) => {
+                CheckResult::fail("user", "version", message)
+            }
+            super::setup::OpenCodeSupport::Unknown(_) => {
+                CheckResult::warn("user", "version", message)
+            }
+        });
+    }
     for root in roots {
         let settings = root.join("settings.json");
         let installed_async = std::fs::read_to_string(&settings)
@@ -1283,8 +1311,354 @@ fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What OpenCode's own store says about a session's latest settled
+/// execution: the one record of a finished turn that does not depend on
+/// clank's plugin having loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenCodeSettle {
+    At { unix_secs: u64, outcome: String },
+    Never,
+    Unknown(String),
+}
+
+/// How long after OpenCode settles a turn the plugin's report of it may
+/// still be in flight: reports are chained per session, and each is a
+/// process start and a monitor round trip.
+const REPORT_GRACE_SECS: u64 = 120;
+
+fn opencode_data_dir(home: Option<&Path>) -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local/share")))
+        .map(|d| d.join("opencode"))
+}
+
+/// Read-only lookup of one session's row in OpenCode 2.x's store. Why not
+/// a SQLite crate: one bounded read at the doctor command boundary does
+/// not earn a bundled C dependency, and without `sqlite3` the check says
+/// it could not tell rather than guessing.
+fn opencode_last_settle(data: Option<&Path>, session: &str) -> OpenCodeSettle {
+    let Some(db) = data
+        .map(|d| d.join("opencode.db"))
+        .filter(|db| db.is_file())
+    else {
+        return OpenCodeSettle::Unknown("OpenCode's store was not found".into());
+    };
+    if !session
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return OpenCodeSettle::Unknown(format!("`{session}` is not an OpenCode session id"));
+    }
+    let out = std::process::Command::new("sqlite3")
+        .arg("-readonly")
+        .args(["-cmd", ".timeout 1000"])
+        .arg(format!("file:{}?mode=ro", db.display()))
+        .arg(format!(
+            "select coalesce(time_idle, ''), coalesce(idle_outcome, '') \
+             from session_v2 where id = '{session}'"
+        ))
+        .stdin(std::process::Stdio::null())
+        .output();
+    let out = match out {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            return OpenCodeSettle::Unknown(format!(
+                "sqlite3 could not read OpenCode's store: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Err(e) => return OpenCodeSettle::Unknown(format!("sqlite3 is not available: {e}")),
+    };
+    parse_settle_row(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_settle_row(row: &str) -> OpenCodeSettle {
+    let row = row.trim();
+    if row.is_empty() {
+        return OpenCodeSettle::Unknown("OpenCode's store has no such session".into());
+    }
+    let (idle, outcome) = row.split_once('|').unwrap_or((row, ""));
+    match idle.parse::<u64>() {
+        Ok(ms) => OpenCodeSettle::At {
+            unix_secs: ms / 1000,
+            outcome: outcome.to_string(),
+        },
+        Err(_) if idle.is_empty() => OpenCodeSettle::Never,
+        Err(_) => OpenCodeSettle::Unknown(format!("unexpected row `{row}`")),
+    }
+}
+
+/// Whether clank's plugin is reporting each OpenCode-bound agent's turns.
+fn opencode_plugin_checks(
+    repo: &Path,
+    home: Option<&Path>,
+    settle: &dyn Fn(&str) -> OpenCodeSettle,
+    now: u64,
+) -> Vec<CheckResult> {
+    let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, home) else {
+        return Vec::new();
+    };
+    std::iter::once(set.master.clone())
+        .chain(set.members.iter().map(|m| m.label.clone()))
+        .filter_map(|label| {
+            let session = load_agent_config(repo, &label).ok().flatten()?.session?;
+            (session.tool == clank_core::Tool::OpenCode).then(|| {
+                let reports =
+                    crate::cli::recovery::observed_path(&agents_root(repo).join(label.as_str()));
+                opencode_plugin_check(
+                    &label,
+                    &session,
+                    &reports,
+                    &settle(session.id.as_str()),
+                    now,
+                )
+            })
+        })
+        .collect()
+}
+
+/// The latest time clank's plugin reported a turn of `session` under its
+/// current binding. A report from before `bound` is an older binding's and
+/// says nothing about whether the plugin is loaded now.
+fn latest_report(reports: &Path, session: &str, bound: u64) -> Option<u64> {
+    let (_, lines) = crate::cli::web::transcript::Tail::open(reports, 1024 * 1024).ok()?;
+    lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l.text).ok())
+        .filter(|v| v.get("session").and_then(|s| s.as_str()) == Some(session))
+        .filter_map(|v| v.get("at")?.as_u64())
+        .filter(|at| *at >= bound)
+        .max()
+}
+
+/// Whether the plugin has reported `session`'s latest settled turn, as of
+/// `now`. A turn OpenCode settled is reported once a report for the
+/// session is at or after the settle; until [`REPORT_GRACE_SECS`] after
+/// the settle, an unreported one may still be in flight.
+fn opencode_plugin_check(
+    label: &AgentLabel,
+    session: &clank_core::agent_config::Session,
+    reports: &Path,
+    settle: &OpenCodeSettle,
+    now: u64,
+) -> CheckResult {
+    const SECTION: &str = "repo";
+    let name = format!("agent: {} opencode plugin", label.as_str());
+    let id = session.id.as_str();
+    let bound = time::OffsetDateTime::parse(
+        &session.updated_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map(|t| t.unix_timestamp().max(0) as u64)
+    .unwrap_or(0);
+    let fix = "OpenCode most likely did not load clank's plugin (its log names \
+               `plugin/clank.js` in a `failed to load plugin` line). Run `clank setup` \
+               and restart OpenCode; the plugin needs OpenCode 2.x";
+    let reported = latest_report(reports, id, bound);
+    let healthy = |at: u64| {
+        CheckResult::ok(
+            SECTION,
+            name.clone(),
+            format!("the plugin is reporting session {id}'s turns (latest at {at})"),
+        )
+    };
+    let unreported = match settle {
+        OpenCodeSettle::At { unix_secs, outcome }
+            if *unix_secs > bound && reported.is_none_or(|r| r < *unix_secs) =>
+        {
+            Some((*unix_secs, outcome.as_str()))
+        }
+        _ => None,
+    };
+    match (unreported, reported, settle) {
+        (Some((at, outcome)), _, _) if now < at + REPORT_GRACE_SECS => CheckResult::ok(
+            SECTION,
+            name,
+            format!(
+                "session {id} finished a turn at {at} ({outcome}); its report may still be \
+                 on its way"
+            ),
+        ),
+        (Some((at, outcome)), Some(last), _) => CheckResult::warn(
+            SECTION,
+            name,
+            format!(
+                "OpenCode finished a turn of session {id} at {at} ({outcome}), after the \
+                 plugin's last report at {last}, and the plugin has not reported it. {fix}"
+            ),
+        ),
+        (Some((at, outcome)), None, _) => CheckResult::warn(
+            SECTION,
+            name,
+            format!(
+                "session {id} finished a turn at {at} ({outcome}) since it was bound at \
+                 {bound}, but the plugin has never reported one under this binding. {fix}"
+            ),
+        ),
+        (None, Some(last), _) => healthy(last),
+        (None, None, OpenCodeSettle::Unknown(why)) => CheckResult::warn(
+            SECTION,
+            name,
+            format!(
+                "no turn of session {id} has been reported, and whether it has finished one \
+                 since it was bound cannot be read ({why}). If it has, {fix}"
+            ),
+        ),
+        (None, None, _) => CheckResult::ok(
+            SECTION,
+            name,
+            format!(
+                "no report yet: session {id} has not finished a turn since it was bound; \
+                 the plugin reports each turn as it ends"
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod opencode_plugin {
+        use super::super::{CheckStatus, OpenCodeSettle, opencode_plugin_check, parse_settle_row};
+
+        const SID: &str = "ses_0bound00000000000000000";
+        const BOUND: u64 = 1_793_064_908;
+
+        fn session() -> clank_core::agent_config::Session {
+            clank_core::agent_config::Session {
+                id: clank_core::ids::SessionId::parse(SID).unwrap(),
+                tool: clank_core::Tool::OpenCode,
+                updated_at: "2026-10-27T01:35:08Z".into(),
+                transcript: None,
+            }
+        }
+
+        fn check(
+            reports: &[(&str, u64)],
+            settle: OpenCodeSettle,
+            now: u64,
+        ) -> (CheckStatus, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("turns.jsonl");
+            let body: String = reports
+                .iter()
+                .map(|(s, at)| format!("{{\"session\":\"{s}\",\"turn\":\"completed\",\"id\":\"msg_1\",\"at\":{at}}}\n"))
+                .collect();
+            std::fs::write(&path, body).unwrap();
+            let label = clank_core::ids::AgentLabel::parse("qwen").unwrap();
+            let r = opencode_plugin_check(&label, &session(), &path, &settle, now);
+            (r.status, r.message)
+        }
+
+        fn at(secs: u64) -> OpenCodeSettle {
+            OpenCodeSettle::At {
+                unix_secs: secs,
+                outcome: "succeeded".into(),
+            }
+        }
+
+        const LATER: u64 = BOUND + 100_000;
+
+        #[test]
+        fn a_session_whose_turns_are_reported_is_healthy() {
+            let (status, msg) = check(&[(SID, BOUND + 50)], at(BOUND + 49), LATER);
+            assert_eq!(status, CheckStatus::Ok, "{msg}");
+            assert!(msg.contains("is reporting"), "{msg}");
+        }
+
+        #[test]
+        fn a_session_that_has_not_finished_a_turn_since_binding_is_not_yet_reported() {
+            for settle in [OpenCodeSettle::Never, at(BOUND - 1)] {
+                let (status, msg) = check(&[], settle, LATER);
+                assert_eq!(status, CheckStatus::Ok, "{msg}");
+                assert!(msg.starts_with("no report yet"), "{msg}");
+                assert!(
+                    !msg.contains("did not load"),
+                    "a fresh session is not a failure: {msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_finished_turn_never_reported_is_expected_but_missing_once_its_grace_is_over() {
+            let other = "ses_0other0000000000000000";
+            let settled = BOUND + 526;
+            let (status, msg) = check(&[(other, BOUND + 500)], at(settled), settled + 121);
+            assert_eq!(status, CheckStatus::Warn, "{msg}");
+            assert!(msg.contains("never reported"), "{msg}");
+            assert!(msg.contains("clank setup"), "{msg}");
+            let (status, msg) = check(&[], at(settled), settled + 60);
+            assert_eq!(
+                status,
+                CheckStatus::Ok,
+                "a first report may still be in flight: {msg}"
+            );
+            assert!(msg.contains("may still be"), "{msg}");
+        }
+
+        #[test]
+        fn reports_that_stopped_before_a_later_turn_are_missing_once_its_grace_is_over() {
+            let settled = BOUND + 70;
+            let (status, msg) = check(&[(SID, BOUND + 10)], at(settled), settled + 200);
+            assert_eq!(
+                status,
+                CheckStatus::Warn,
+                "a short turn long past its grace: {msg}"
+            );
+            assert!(msg.contains("after the plugin's last report"), "{msg}");
+            let (status, msg) = check(&[(SID, BOUND + 10)], at(settled), settled + 10);
+            assert_eq!(status, CheckStatus::Ok, "a report still in flight: {msg}");
+        }
+
+        #[test]
+        fn a_long_turn_that_just_ended_is_within_its_grace() {
+            let now = LATER;
+            let (status, msg) = check(&[(SID, now - 600)], at(now), now);
+            assert_eq!(status, CheckStatus::Ok, "{msg}");
+            assert!(!msg.contains("did not load"), "{msg}");
+        }
+
+        #[test]
+        fn a_report_from_before_the_binding_is_not_evidence_for_it() {
+            let (status, msg) = check(&[(SID, BOUND - 100)], OpenCodeSettle::Never, LATER);
+            assert_eq!(status, CheckStatus::Ok, "{msg}");
+            assert!(msg.starts_with("no report yet"), "{msg}");
+            let (status, msg) = check(&[(SID, BOUND - 100)], at(BOUND + 10), LATER);
+            assert_eq!(status, CheckStatus::Warn, "{msg}");
+            assert!(
+                msg.contains("never reported one under this binding"),
+                "{msg}"
+            );
+        }
+
+        #[test]
+        fn an_unreadable_store_says_it_cannot_tell() {
+            let (status, msg) = check(
+                &[],
+                OpenCodeSettle::Unknown("sqlite3 is not available".into()),
+                LATER,
+            );
+            assert_eq!(status, CheckStatus::Warn, "{msg}");
+            assert!(
+                msg.contains("cannot be read (sqlite3 is not available)"),
+                "{msg}"
+            );
+        }
+
+        #[test]
+        fn the_store_row_reads_as_its_settle() {
+            assert_eq!(
+                parse_settle_row("1793065434866|interrupted\n"),
+                OpenCodeSettle::At {
+                    unix_secs: 1_793_065_434,
+                    outcome: "interrupted".into()
+                }
+            );
+            assert_eq!(parse_settle_row("|\n"), OpenCodeSettle::Never);
+            assert!(matches!(parse_settle_row(""), OpenCodeSettle::Unknown(_)));
+        }
+    }
+
     #[test]
     fn claude_mode_drift_matrix() {
         // Both drift directions warn; matched modes are healthy; a
@@ -1419,6 +1793,49 @@ mod tests {
         assert!(rows.iter().all(|r| r.status == CheckStatus::Ok), "{rows:?}");
         assert_eq!(std::fs::read_to_string(calls).unwrap(), "selected\n");
         assert!(!home.join(".claude").exists());
+    }
+
+    #[tokio::test]
+    async fn opencode_doctor_checks_the_selected_profiles_opencode_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        for (version, status) in [("1.18.11", CheckStatus::Fail), ("2.1.4", CheckStatus::Ok)] {
+            let bin = temp
+                .path()
+                .join(format!("Cellar/opencode/{version}/bin/opencode"));
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let launch = clank_core::agent_config::LaunchConfig {
+                command: Some(bin.to_string_lossy().into()),
+                env: std::collections::BTreeMap::from([(
+                    "HOME".into(),
+                    home.to_string_lossy().into(),
+                )]),
+                ..Default::default()
+            };
+            let ambient = crate::agent_env::Stated::default().at(&home, temp.path());
+            let rows = provider_user_checks(
+                "selected",
+                clank_core::Tool::OpenCode,
+                Some(&launch),
+                temp.path(),
+                &ambient,
+            )
+            .await;
+            let row = rows
+                .iter()
+                .find(|r| r.name == "opencode selected: version")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no version row: {:?}",
+                        rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(row.status, status, "{version}: {}", row.message);
+            assert!(row.message.contains(version), "{}", row.message);
+        }
     }
 
     #[tokio::test]

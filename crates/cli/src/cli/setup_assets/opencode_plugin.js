@@ -1,56 +1,100 @@
 // clank's opencode plugin — installed by `clank setup`. Do not edit
 // in place; setup overwrites on upgrade.
 //
+// Contract: OpenCode 2.x server plugins (verified 2026-10-27 against the
+// 2.1.4 loader bundled in the opencode binary, and
+// https://opencode.ai/v2/docs/build/plugins/migrate-v1). The loader
+// requires a DEFAULT export `{ id, setup }` and rejects anything else
+// ("Plugin must export a default definition with an id and an effect or
+// setup function"); 1.x's named `ClankPlugin` export never loads in 2.x.
+// `setup(ctx)` registers through the context and returns its cleanup:
+// `ctx.shell.hook("create.before")` replaces `shell.env`,
+// `ctx.event.subscribe()` replaces the `event` hook, and
+// `ctx.session.wait/prompt` replace `client.session.status/promptAsync`.
+// There is no `$` and no toast API in a server plugin, and the file
+// imports nothing from `@opencode-ai/plugin`, so no dependency pin
+// matters to it. 1.x is not served: its loader calls every export.
+//
+// One plugin instance runs per OpenCode location (directory) inside a
+// service shared by every session and directory, and setup may run again
+// on reload. So nothing here belongs to "the" directory or "the" session:
+//
+// - Each session is OWNED by exactly one live instance, through a
+//   process-wide registry keyed by session id. An instance never acts on
+//   a session another owns, and gives up its sessions on disposal.
+// - Each session's cwd is its own (the event's location, else the
+//   session's record), never the instance's. clank resolves the repo and
+//   the agent from that cwd and session; a guessed cwd would bind the
+//   session to the wrong repo.
+//
 // Two jobs (opencode-agent-tool):
 //
-// 1. BINDING (shell.env): every tool shell gets OPENCODE_SESSION_ID
-//    so `clank as <label>` binds the EXACT session. User PTYs invoke
-//    the same hook with no session context — inject only when the
-//    hook call carries a sessionID, never guess from cwd or global
-//    state. Foreign agent identity vars inherited from a parent
-//    agent's shell are scrubbed BY BLANKING (shell.env can only set
-//    vars; clank reads a blank var as unset).
+// 1. BINDING. OpenCode itself exports OPENCODE_SESSION_ID into the shell
+//    of the bash tool it runs for a session, AFTER the create.before hook.
+//    That is the only shell that knows its session, so the plugin never
+//    sets the variable: it BLANKS it, with every foreign agent identity
+//    var, in every shell, so a shell opencode does not stamp (a user's
+//    `!` shell, a terminal) carries no inherited identity at all. clank
+//    reads a blank var as unset.
 //
-// 2. WORK LOOP: spawn `clank stop-hook --tool opencode` — it
-//    long-polls clank for work. NON-EMPTY stdout is a continuation
-//    prompt injected via client.session.promptAsync; EMPTY stdout
-//    means quiescent, inject nothing (an unconditional nudge would
+// 2. WORK LOOP: spawn `clank stop-hook --tool opencode` — it long-polls
+//    clank for work. NON-EMPTY stdout is a continuation prompt; EMPTY
+//    stdout means quiescent, inject nothing (an unconditional nudge would
 //    idle-loop the session forever). The wait is ARMED on:
-//    - session.idle — the steady-state trigger;
-//    - plugin load, when the launch handed us
-//      CLANK_BOOTSTRAP_SESSION_ID — a resumed session never produces
-//      a turn, so without this no wait ever exists (the penlock
-//      incident), and the arm must be DETACHED so opencode startup
-//      never blocks on a long-poll;
-//    - first sighting of a session — but only when an explicit
-//      `session.status()` says idle: an arbitrary first event is not
-//      an idle signal and can arrive mid-turn.
+//    - session.execution.succeeded — the steady-state trigger;
+//    - load, for CLANK_BOOTSTRAP_SESSION_ID — a resumed session never
+//      produces a turn, so without this no wait ever exists (the penlock
+//      incident). DETACHED: setup must never block on a long-poll;
+//    - first sighting of a session — only once `session.wait` has said
+//      it is idle, and only if nothing happened to it meanwhile.
 //
 // Loop discipline:
-// - At most ONE in-flight stop-hook wait per session; an idle firing
-//   while a wait is pending is ignored.
-// - An INTERRUPTED turn is not a finished one. `session.idle` means
-//   the session stopped being busy, which is equally true after the
-//   user hits Esc — prodding then restarts exactly what they stopped.
-// - A FAILED turn is not a finished one either. After a provider error
-//   the plugin arms nothing: an immediate re-injection repeats the
-//   failure for as long as it lasts. clank's monitor decides whether a
-//   retry is ever made, and when; the plugin only waits for that
-//   decision as a recovery helper.
+// - At most ONE in-flight stop-hook wait per session.
+// - Only a SUCCEEDED execution arms. An interrupted one is not finished:
+//   prodding after Esc restarts exactly what the user stopped. A failed
+//   one is not either: re-injecting after a provider error repeats the
+//   failure for as long as it lasts; clank's monitor decides whether a
+//   retry is made, and the plugin only waits for that decision as a
+//   recovery helper. Both latch until an execution takes up a person's
+//   next input.
+// - Every inbox and execution event is activity. An asynchronous arm
+//   (bootstrap, first sighting, renewal) carries the activity count from
+//   before its idleness check and is dropped if it moved. A completed
+//   wait's continuation is DISCARDED unless the count is unchanged since
+//   the triggering settle and no latch is set — clank never auto-acks, so
+//   the next settle re-presents the work.
+// - Continuations are prompted with delivery "queue": if a turn began in
+//   the gap, the prompt waits behind it rather than steering into it.
 // - OpenCode keeps no record clank can read, so the plugin reports each
-//   turn's start and end (`--observe`), with the turn's user message id,
-//   in the order it saw them: per session, each report waits for the one
-//   before it, since the monitor reads them as the session's history.
-// - A completed wait's continuation is DISCARDED unless the session
-//   is still idle at injection time: any session activity observed
-//   after the triggering idle invalidates it. Discarding is safe —
-//   clank never auto-acks, so the next idle re-presents the work.
-// - Diagnostics (exit 0 + stderr) surface as a TUI toast and a log
-//   entry, never as an injected prompt: a model turn spent on a
-//   diagnostic re-arms the same diagnostic on that turn's idle.
+//   turn's start and end (`--observe`). A turn is one EXECUTION, named by
+//   the user input it took up (its inbox id), and its end is that
+//   execution's settle — never "whichever input was delivered last".
+//   `pending` holds only inputs waiting for a FUTURE execution:
+//   - delivered into a running execution that has no input yet: it is
+//     that execution's;
+//   - delivered while idle, or queued behind a running execution that has
+//     one: it waits, and the next execution takes the latest one waiting;
+//   - delivered (steered) into a running execution that has one: the
+//     execution absorbs it, and it is consumed when that execution
+//     settles — unless the execution settles as SUPERSEDED, which is the
+//     steered input taking over: it then waits for the successor.
+//   Queued or steered is the input's mode when it is delivered: a person
+//   can switch it while it waits (`session.inbox.delivery.changed`).
+//   Per session, each report waits for the one before it, since the
+//   monitor reads them as the session's history.
+//   OpenCode's message ids must start `msg_`, so a recovery retry is
+//   submitted as `msg_<tag>` and reported back under its tag.
+// - Diagnostics (exit 0 + stderr) go to OpenCode's log, never into a
+//   prompt: a model turn spent on a diagnostic re-arms the same
+//   diagnostic when it ends.
 // - A deadline returns a renewal control message. The plugin starts
 //   another wait while the session is still idle, without creating a
-//   model turn or relying on another session.idle event.
+//   model turn.
+// - Disposal aborts everything the instance owns: the event subscription
+//   and every stop-hook child. Nothing it started may prompt or re-arm
+//   afterwards.
+
+import { spawn } from "node:child_process"
 
 const RENEW_WAIT_WIRE = '{"clank":"renew_wait"}'
 
@@ -67,341 +111,342 @@ const FOREIGN_IDENTITY_VARS = [
   "CLANK_BOOTSTRAP_SESSION_ID",
 ]
 
-const blanks = () =>
-  Object.fromEntries(FOREIGN_IDENTITY_VARS.map((v) => [v, ""]))
+const SHELL_BLANKS = Object.fromEntries(
+  [...FOREIGN_IDENTITY_VARS, "OPENCODE_SESSION_ID"].map((v) => [v, ""]),
+)
 
-export const ClankPlugin = async ({ client, $, directory }) => {
-  // OpenCode loads global and custom/project directories additively and local
-  // files at different URLs are separate modules. The loader gives all plugins
-  // for this instance the same client; a weak process registry chooses one loop
-  // without retaining disposed instances or conflating different clients.
-  const key = Symbol.for("clank.opencode.clients")
-  const clients = globalThis[key] ??= new WeakSet()
-  if (clients.has(client)) return {}
-  clients.add(client)
-  const inflight = new Set()
-  // Per-session activity counter, counting only FIRST SIGHTINGS of
-  // user message ids: a wait remembers the count at its triggering
-  // idle and injects only if it is unchanged. Anything the session
-  // does next begins with a NEW user message, and nothing else is a
-  // reliable signal — opencode emits housekeeping right AFTER
-  // session.idle (session.updated, session.diff, assistant
-  // message.updated, and a RE-update of the turn's own user
-  // message), so counting events rather than new ids marks every
-  // wait stale (both observed live).
-  const activity = new Map()
-  const seenUserMessages = new Set()
-  const seenSessions = new Set()
-  // Sessions whose current turn a HUMAN stopped. opencode marks the
-  // interrupted turn's ASSISTANT message with MessageAbortedError —
-  // read from there rather than from `session.error`, whose schema
-  // makes sessionID OPTIONAL, so it cannot attribute an abort to a
-  // session at all.
-  const aborted = new Set()
-  // Sessions whose last turn ended on a provider error. No wait is armed
-  // for them on the idle that follows: re-injecting at once is a loop for
-  // as long as the error lasts (an expired key, a billing hold). clank is
-  // told instead, and decides whether anything is retried, and when.
-  const failed = new Set()
-  // The user message id of each session's current turn.
-  const turns = new Map()
-  // How each turn was last reported ending. An idle can come before the
-  // update that says its turn was stopped or failed, so a "completed" may
-  // be followed by the turn's real end; nothing else is said twice.
-  const outcomes = new Map()
-  // Each session's reports, chained so they reach clank in order.
-  const reports = new Map()
+const OWNERS = Symbol.for("clank.opencode.sessions")
 
-  const sessionOf = (event) => {
-    const p = event?.properties ?? {}
-    return p.sessionID ?? p.info?.sessionID ?? p.part?.sessionID
-  }
-
-  const log = (message, extra) =>
-    client.app
-      .log({ body: { service: "clank", level: "info", message, ...(extra ? { extra } : {}) } })
-      .catch(() => {})
-
-  // Explicit idleness, never a guess. `session.status()` answers a
-  // map that is ACTIVE-ONLY: opencode DELETES a session from it on
-  // idle (packages/opencode/src/session/status.ts), so a quiescent
-  // session reads as a successful map with NO entry. Missing on
-  // success = idle; a busy/retry entry = not; a failed call =
-  // unknown, and unknown never arms — arming blind can inject into
-  // a running turn.
-  const isIdle = async (id) => {
+export const runClank = (args, { input, env, cwd, signal }) =>
+  new Promise((resolve) => {
+    const out = []
+    const err = []
+    let child
     try {
-      const res = await client.session.status({ query: { directory } })
-      // Only a real payload counts as evidence: the SDK answers HTTP
-      // errors WITHOUT throwing, as { error, request, response } with
-      // no `data` — reading that wrapper's absent key as "idle" would
-      // arm on a FAILED call. Unknown never arms.
-      const data = res?.data
-      if (!data || typeof data !== "object") return false
-      return data[id] === undefined
-    } catch {
-      return false
+      child = spawn("clank", args, { cwd, env, signal, stdio: ["pipe", "pipe", "pipe"] })
+    } catch (error) {
+      return resolve({ exitCode: null, stdout: "", stderr: "", error })
     }
-  }
+    child.stdout.on("data", (c) => out.push(c))
+    child.stderr.on("data", (c) => err.push(c))
+    child.on("error", (error) => resolve({ exitCode: null, stdout: "", stderr: "", error }))
+    child.on("close", (exitCode) =>
+      resolve({
+        exitCode,
+        stdout: Buffer.concat(out).toString(),
+        stderr: Buffer.concat(err).toString(),
+      }),
+    )
+    child.stdin.on("error", () => {})
+    child.stdin.end(input)
+  })
 
-  const hookInput = (id) =>
-    JSON.stringify({ session_id: id, cwd: directory, stop_hook_active: false })
+const consoleLog = (message, extra) => console.error(`[clank] ${message}`, extra ? JSON.stringify(extra) : "")
 
-  const arm = async (id, why, gen) => {
-    if (inflight.has(id)) return
-    if (aborted.has(id)) {
-      log("arm suppressed after Esc", { sessionID: id, why })
-      return
+export const makePlugin = ({ run = runClank, log = consoleLog } = {}) => ({
+  id: "clank",
+  setup: async (ctx) => {
+    const owners = (globalThis[OWNERS] ??= new Map())
+    const me = {}
+    const abort = new AbortController()
+    let disposed = false
+    const sessions = new Map()
+
+    const owns = (id) => {
+      if (disposed) return false
+      const owner = owners.get(id)
+      if (owner === undefined) owners.set(id, me)
+      return (owner ?? me) === me
     }
-    if (failed.has(id)) {
-      log("arm suppressed after a provider error", { sessionID: id, why })
-      return
-    }
-    // For async idle evidence (bootstrap / first-sighting): the
-    // activity generation captured BEFORE the status call must still
-    // hold, or a turn that started mid-check receives a mid-turn
-    // injection with its baseline baked in.
-    if (gen !== undefined && (activity.get(id) ?? 0) !== gen) {
-      log("arm dropped: session moved during status check", { sessionID: id, why })
-      return
-    }
-    inflight.add(id)
-    log("arm", { sessionID: id, why })
-    const seen = activity.get(id) ?? 0
-    let continuation = ""
-    let diagnostic = ""
-    let renew = false
-    try {
-      // The full HookInput shape — stop_hook_active is REQUIRED by
-      // the parser (a partial shape is silently swallowed: the hook
-      // exits 0 with empty stdout on parse errors).
-      const proc = await $`echo ${hookInput(id)} | clank stop-hook --tool opencode`
-        .env({ ...process.env, OPENCODE_SESSION_ID: id, ...blanks() })
-        .quiet()
-        .nothrow()
-      if (proc.exitCode === 0) {
-        const output = proc.stdout.toString().trim()
-        if (output === RENEW_WAIT_WIRE) renew = true
-        else continuation = output
-        diagnostic = proc.stderr.toString().trim()
-      } else {
-        log("stop-hook non-zero exit", { sessionID: id, exitCode: proc.exitCode })
+
+    const session = (id) => {
+      let s = sessions.get(id)
+      if (!s) {
+        s = {
+          id,
+          dir: undefined,
+          seen: false,
+          inflight: false,
+          activity: 0,
+          aborted: false,
+          failed: false,
+          running: undefined,
+          pending: [],
+          latest: undefined,
+          reports: Promise.resolve(),
+          inputs: new Map(),
+          tags: new Map(),
+        }
+        sessions.set(id, s)
       }
-    } catch (e) {
-      log("stop-hook spawn failed", { sessionID: id, error: String(e) })
-    } finally {
-      // The guard covers ONLY the wait. It must be released before
-      // the injected turn runs: that turn's terminal session.idle
-      // is what arms the NEXT wait, and a guard held across it
-      // (as an awaited synchronous prompt() would) makes the loop
-      // deliver once and go dormant (codex d7c8908).
-      inflight.delete(id)
+      return s
     }
-    if (renew) {
-      // The old wait's ceiling is a new arm, not a prompt. Verify
-      // idleness again because the user may have started a turn while
-      // the old wait was ending. The generation also guards a turn
-      // starting during the asynchronous status check.
-      if ((activity.get(id) ?? 0) !== seen || aborted.has(id)) return
+
+    const directory = async (s) => {
+      if (s.dir) return s.dir
+      try {
+        const res = await ctx.session.get({ sessionID: s.id })
+        s.dir ??= (res?.data ?? res)?.location?.directory
+      } catch (e) {
+        log("session lookup failed", { sessionID: s.id, error: String(e) })
+      }
+      return s.dir
+    }
+
+    // The full HookInput shape — stop_hook_active is REQUIRED by the
+    // parser (a partial shape is silently swallowed: the hook exits 0
+    // with empty stdout on parse errors).
+    const clank = (s, dir, args) =>
+      run(["stop-hook", "--tool", "opencode", ...args], {
+        input: JSON.stringify({ session_id: s.id, cwd: dir, stop_hook_active: false }),
+        env: { ...process.env, ...SHELL_BLANKS, OPENCODE_SESSION_ID: s.id },
+        cwd: dir,
+        signal: abort.signal,
+      })
+
+    // `session.wait` resolves once the session's loop is idle. A failed
+    // call is unknown, and unknown never arms — arming blind can inject
+    // into a running turn.
+    const idle = async (s) => {
+      try {
+        await ctx.session.wait({ sessionID: s.id })
+        return !disposed
+      } catch {
+        return false
+      }
+    }
+
+    const armWhenIdle = (s, why) => {
+      const gen = s.activity
       void (async () => {
-        if (await isIdle(id)) await arm(id, "deadline", seen)
-        else log("renew dropped: session no longer idle", { sessionID: id })
-      })().catch((e) => log("renew failed", { sessionID: id, error: String(e) }))
-      return
+        if (await idle(s)) await arm(s, why, gen)
+      })().catch((e) => log(`${why} failed`, { sessionID: s.id, error: String(e) }))
     }
-    if (!continuation) {
-      // Exit 0 + stderr is a Diagnostic. Toast + log, never a prompt:
-      // an injected diagnostic's turn would re-arm this same
-      // diagnostic on its idle — a paid loop.
-      if (diagnostic) {
-        log("diagnostic", { sessionID: id, diagnostic })
-        try {
-          await client.tui.showToast({
-            body: { title: "clank", message: diagnostic, variant: "warning" },
-          })
-        } catch {}
+
+    const arm = async (s, why, gen) => {
+      if (disposed || s.inflight) return
+      if (s.aborted) return log("arm suppressed after an interruption", { sessionID: s.id, why })
+      if (s.failed) return log("arm suppressed after a failed turn", { sessionID: s.id, why })
+      if (gen !== undefined && s.activity !== gen) {
+        return log("arm dropped: session moved during the idle check", { sessionID: s.id, why })
       }
-      return
-    }
-    if ((activity.get(id) ?? 0) !== seen) return log("discard stale continuation", { sessionID: id })
-    // The abort may be observed on EITHER side of the triggering
-    // idle — opencode emits housekeeping after it — so the decision
-    // is made here, where both orderings have been seen.
-    if (aborted.has(id)) {
-      log("discard after Esc", { sessionID: id })
-      return
-    }
-    log("inject", { sessionID: id })
-    // promptAsync: return-on-accept. The handler must not pin the
-    // whole model turn. A rejected injection is logged, never an
-    // unhandled rejection (the bootstrap arm is detached).
-    try {
-      await client.session.promptAsync({
-        path: { id },
-        body: { parts: [{ type: "text", text: continuation }] },
-      })
-    } catch (e) {
-      log("inject failed", { sessionID: id, error: String(e) })
-    }
-  }
-
-  // Report what clank cannot read for itself. The answer to a failure
-  // says whether a recovery helper should wait for an authorized retry.
-  const observe = async (id, kind, turn, error) => {
-    const args = ["--observe", kind]
-    if (turn) args.push("--turn-id", turn)
-    if (error?.name) args.push("--class", error.name)
-    const status = error?.data?.statusCode
-    if (Number.isInteger(status)) args.push("--status", String(status))
-    try {
-      const proc = await $`echo ${hookInput(id)} | clank stop-hook --tool opencode ${args}`
-        .env({ ...process.env, OPENCODE_SESSION_ID: id, ...blanks() })
-        .quiet()
-        .nothrow()
-      return JSON.parse(proc.stdout.toString().trim() || "{}").recovery
-    } catch (e) {
-      log("observe failed", { sessionID: id, error: String(e) })
-    }
-  }
-
-  const report = (id, kind, turn, error) => {
-    const next = (reports.get(id) ?? Promise.resolve()).then(() => observe(id, kind, turn, error))
-    reports.set(id, next.catch(() => {}))
-    return next
-  }
-
-  // A turn's end, against the turn it names. Only the current turn's end
-  // moves this session's latches; an old turn's late update changes
-  // nothing about the turn running now.
-  const ended = (id, kind, turn, error) => {
-    if (!turn) return
-    const was = outcomes.get(turn)
-    if (was === kind || (kind === "completed" && was)) return
-    outcomes.set(turn, kind)
-    const current = turns.get(id) === turn
-    if (current && kind === "interrupted") aborted.add(id)
-    if (kind !== "failed") return void report(id, kind, turn)
-    if (current) failed.add(id)
-    void (async () => {
-      const recovery = await report(id, "failed", turn, error)
-      if (current && recovery === "helper") await recoveryHelper(id)
-    })().catch((e) => log("failure report failed", { sessionID: id, error: String(e) }))
-  }
-
-  const reply = (id, answer, dispatch) =>
-    $`echo ${hookInput(id)} | clank stop-hook --tool opencode --recovery-reply ${answer} --attempt ${String(dispatch.n)} --opened-by ${dispatch.opened_by}`
-      .env({ ...process.env, OPENCODE_SESSION_ID: id, ...blanks() })
-      .quiet()
-      .nothrow()
-
-  // Park until clank authorizes one retry. The local activity check only
-  // drops a stale retry: the server accepts the prompt later, so it is
-  // not a guarantee the session is still idle, and clank enables this
-  // only once that has been established for this OpenCode.
-  const recoveryHelper = async (id) => {
-    const seen = activity.get(id) ?? 0
-    let dispatch
-    try {
-      const proc = await $`echo ${hookInput(id)} | clank stop-hook --tool opencode --recovery-helper`
-        .env({ ...process.env, OPENCODE_SESSION_ID: id, ...blanks() })
-        .quiet()
-        .nothrow()
-      const out = proc.stdout.toString().trim()
-      if (!out) return
-      dispatch = JSON.parse(out)
-    } catch (e) {
-      log("recovery helper failed", { sessionID: id, error: String(e) })
-      return
-    }
-    if ((activity.get(id) ?? 0) !== seen || !failed.has(id)) {
-      await reply(id, "refused", dispatch)
-      return
-    }
-    let answer = "indeterminate"
-    try {
-      const res = await client.session.promptAsync({
-        path: { id },
-        body: { messageID: dispatch.tag, parts: [{ type: "text", text: dispatch.wake }] },
-      })
-      if (res?.response?.status === 204) answer = "submitted"
-    } catch (e) {
-      log("recovery prompt failed", { sessionID: id, error: String(e) })
-    }
-    await reply(id, answer, dispatch)
-  }
-
-  // Load-time bootstrap: a resumed launch hands over the ONE session
-  // this process owns. Detached AND idle-verified — opencode startup
-  // must not block on the long-poll, and the arm must not fire while
-  // the resume's own prompt turn is still running.
-  const bootstrapId = process.env.CLANK_BOOTSTRAP_SESSION_ID
-  if (bootstrapId) {
-    const gen = activity.get(bootstrapId) ?? 0
-    void (async () => {
-      if (await isIdle(bootstrapId)) await arm(bootstrapId, "bootstrap", gen)
-    })().catch((e) => log("bootstrap failed", { sessionID: bootstrapId, error: String(e) }))
-  }
-
-  return {
-    "shell.env": async (input, output) => {
-      if (!input.sessionID) return
-      output.env.OPENCODE_SESSION_ID = input.sessionID
-      Object.assign(output.env, blanks())
-    },
-
-    event: async ({ event }) => {
-      const id = sessionOf(event)
-      if (!id) return
-      // Mark seen on EVERY event, including a first-ever idle —
-      // otherwise the idle's own housekeeping reads as a first
-      // sighting and starts a second wait behind the first.
-      const firstSighting = !seenSessions.has(id)
-      seenSessions.add(id)
-      if (event.type !== "session.idle") {
-        const info = event.properties?.info
-        if (
-          event.type?.startsWith("message.") &&
-          info?.role === "user" &&
-          info.id &&
-          !seenUserMessages.has(info.id)
-        ) {
-          seenUserMessages.add(info.id)
-          activity.set(id, (activity.get(id) ?? 0) + 1)
-          // The human prompting again is what ends the stop Esc began,
-          // and what takes a failed session back from recovery.
-          aborted.delete(id)
-          failed.delete(id)
-          turns.set(id, info.id)
-          void report(id, "started", info.id)
-        }
-        // An assistant message names its turn. A session error does not,
-        // so it is the running turn's only while that turn has not ended.
-        const [error, turn] =
-          event.type?.startsWith("message.") && info?.role === "assistant"
-            ? [info.error, info.parentID]
-            : event.type === "session.error" && !outcomes.has(turns.get(id))
-              ? [event.properties?.error, turns.get(id)]
-              : []
-        if (error?.name === "MessageAbortedError") ended(id, "interrupted", turn)
-        else if (error?.name) ended(id, "failed", turn, error)
-        if (event.type === "session.status" && event.properties?.status?.type === "retry") {
-          void report(id, "retry", turns.get(id))
-        }
-        // First sighting: this session may already be idle with work
-        // pending (plugin reload, a hand resume) — but arming on an
-        // arbitrary event can inject mid-turn, so the arm is gated on
-        // an explicit idle status AND the activity generation captured
-        // before the check.
-        if (firstSighting && !inflight.has(id)) {
-          const gen = activity.get(id) ?? 0
-          void (async () => {
-            if (await isIdle(id)) await arm(id, "first-sighting", gen)
-          })().catch((e) => log("first-sighting failed", { sessionID: id, error: String(e) }))
-        }
+      s.inflight = true
+      const seen = s.activity
+      let proc
+      try {
+        const dir = await directory(s)
+        if (!dir) return log("arm dropped: the session's directory is unknown", { sessionID: s.id, why })
+        if (disposed) return
+        log("arm", { sessionID: s.id, why })
+        proc = await clank(s, dir, [])
+      } finally {
+        // The guard covers ONLY the wait. It must be released before the
+        // injected turn runs: that turn's settle is what arms the NEXT
+        // wait, and a guard held across it makes the loop deliver once
+        // and go dormant (codex d7c8908).
+        s.inflight = false
+      }
+      if (disposed || !proc) return
+      if (proc.exitCode !== 0) {
+        return log("stop-hook did not exit 0", { sessionID: s.id, exitCode: proc.exitCode, error: proc.error && String(proc.error) })
+      }
+      const output = proc.stdout.trim()
+      if (output === RENEW_WAIT_WIRE) {
+        if (s.activity === seen && !s.aborted && !s.failed) armWhenIdle(s, "deadline")
         return
       }
-      ended(id, "completed", turns.get(id))
-      await arm(id, "idle")
-    },
-  }
-}
+      if (!output) {
+        const diagnostic = proc.stderr.trim()
+        if (diagnostic) log("diagnostic", { sessionID: s.id, diagnostic })
+        return
+      }
+      if (s.activity !== seen) return log("discard stale continuation", { sessionID: s.id })
+      if (s.aborted || s.failed) return log("discard after the turn was stopped", { sessionID: s.id })
+      log("inject", { sessionID: s.id })
+      try {
+        await ctx.session.prompt({ sessionID: s.id, text: output, delivery: "queue" })
+      } catch (e) {
+        log("inject failed", { sessionID: s.id, error: String(e) })
+      }
+    }
+
+    // Report what clank cannot read for itself. The answer to a failure
+    // says whether a recovery helper should wait for an authorized retry.
+    const observe = async (s, kind, turn, error) => {
+      const args = ["--observe", kind]
+      if (turn) args.push("--turn-id", turn)
+      if (error?.type) args.push("--class", error.type)
+      if (Number.isInteger(error?.status)) args.push("--status", String(error.status))
+      const dir = await directory(s)
+      if (!dir || disposed) return
+      const proc = await clank(s, dir, args)
+      try {
+        return JSON.parse(proc.stdout.trim() || "{}").recovery
+      } catch (e) {
+        log("observe failed", { sessionID: s.id, error: String(e) })
+      }
+    }
+
+    const report = (s, kind, turn, error) => {
+      const next = s.reports.then(() => observe(s, kind, turn, error))
+      s.reports = next.catch(() => {})
+      return next
+    }
+
+    const turnName = (s, turn) => s.tags.get(turn) ?? turn
+
+    const bind = (s, turn) => {
+      s.running.input = turn
+      s.latest = turn
+      // The person prompting again is what ends the stop an interruption
+      // began, and takes a failed session back.
+      s.aborted = false
+      s.failed = false
+      void report(s, "started", turnName(s, turn))
+    }
+
+    const settled = (s, kind, error) => {
+      const turn = s.running?.input
+      s.running = undefined
+      if (!turn) return
+      if (kind !== "failed") return void report(s, kind, turnName(s, turn))
+      void (async () => {
+        const recovery = await report(s, "failed", turnName(s, turn), error)
+        if (recovery === "helper" && s.latest === turn) await recoveryHelper(s)
+      })().catch((e) => log("failure report failed", { sessionID: s.id, error: String(e) }))
+    }
+
+    const reply = (s, dir, answer, dispatch) =>
+      clank(s, dir, ["--recovery-reply", answer, "--attempt", String(dispatch.n), "--opened-by", dispatch.opened_by])
+
+    // Park until clank authorizes one retry. The local activity check only
+    // drops a stale retry: the server admits the prompt later, so it is
+    // not a guarantee the session is still idle.
+    const recoveryHelper = async (s) => {
+      const seen = s.activity
+      const dir = await directory(s)
+      if (!dir || disposed) return
+      let dispatch
+      try {
+        const proc = await clank(s, dir, ["--recovery-helper"])
+        const out = proc.stdout.trim()
+        if (disposed || !out) return
+        dispatch = JSON.parse(out)
+      } catch (e) {
+        log("recovery helper failed", { sessionID: s.id, error: String(e) })
+        return
+      }
+      if (s.activity !== seen || !s.failed) return void (await reply(s, dir, "refused", dispatch))
+      const id = `msg_${dispatch.tag}`
+      s.tags.set(id, dispatch.tag)
+      let answer = "indeterminate"
+      try {
+        await ctx.session.prompt({ sessionID: s.id, id, text: dispatch.wake, delivery: "queue" })
+        answer = "submitted"
+      } catch (e) {
+        log("recovery prompt failed", { sessionID: s.id, error: String(e) })
+      }
+      await reply(s, dir, answer, dispatch)
+    }
+
+    const onEvent = (event) => {
+      const id = event?.data?.sessionID
+      if (typeof id !== "string" || !owns(id)) return
+      const s = session(id)
+      const first = !s.seen
+      s.seen = true
+      if (event.location?.directory) s.dir = event.location.directory
+      const data = event.data
+      switch (event.type) {
+        case "session.inbox.enqueued":
+          s.activity += 1
+          s.inputs.set(data.inboxID, data.item)
+          break
+        case "session.inbox.delivery.changed": {
+          const item = s.inputs.get(data.inboxID)
+          if (item) s.inputs.set(data.inboxID, { ...item, delivery: data.delivery })
+          break
+        }
+        case "session.inbox.delivered":
+          s.activity += 1
+          if (s.inputs.get(data.inboxID)?.type === "user") {
+            const queued = s.inputs.get(data.inboxID).delivery === "queue"
+            if (!s.running) s.pending.push(data.inboxID)
+            else if (!s.running.input) bind(s, data.inboxID)
+            else if (queued) s.pending.push(data.inboxID)
+            else s.running.absorbed.push(data.inboxID)
+          }
+          s.inputs.delete(data.inboxID)
+          break
+        case "session.execution.started":
+          s.activity += 1
+          s.running = { input: undefined, absorbed: [] }
+          if (s.pending.length) bind(s, s.pending.at(-1))
+          s.pending = []
+          break
+        case "session.execution.succeeded":
+          s.activity += 1
+          settled(s, "completed")
+          void arm(s, "settled").catch((e) => log("arm failed", { sessionID: id, error: String(e) }))
+          return
+        case "session.execution.failed":
+          s.activity += 1
+          settled(s, "failed", data.error)
+          s.failed = true
+          return
+        case "session.execution.interrupted":
+          s.activity += 1
+          if (data.reason === "shutdown") return
+          if (data.reason === "superseded") s.pending.push(...(s.running?.absorbed ?? []))
+          settled(s, "interrupted")
+          s.aborted = true
+          return
+        case "session.retry.scheduled":
+          void report(s, "retry", s.running?.input && turnName(s, s.running.input))
+          break
+      }
+      if (first && !s.inflight) armWhenIdle(s, "first-sighting")
+    }
+
+    const pump = async () => {
+      while (!disposed) {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+            if (disposed) break
+            try {
+              onEvent(event)
+            } catch (e) {
+              log("event handling failed", { type: event?.type, error: String(e) })
+            }
+          }
+        } catch (e) {
+          if (!disposed) log("event stream failed", { error: String(e) })
+        }
+        // A volatile stream that overflowed is resubscribed after a
+        // pause, so a broken stream cannot spin.
+        if (!disposed) await new Promise((r) => setTimeout(r, 1000))
+      }
+    }
+
+    await ctx.shell.hook("create.before", (shell) => {
+      Object.assign(shell.env, SHELL_BLANKS)
+    })
+
+    void pump()
+
+    const bootstrapId = process.env.CLANK_BOOTSTRAP_SESSION_ID
+    if (bootstrapId && owns(bootstrapId)) {
+      const s = session(bootstrapId)
+      s.seen = true
+      armWhenIdle(s, "bootstrap")
+    }
+
+    return () => {
+      disposed = true
+      abort.abort()
+      for (const [id, owner] of owners) if (owner === me) owners.delete(id)
+    }
+  },
+})
+
+export default makePlugin()

@@ -25,10 +25,9 @@ const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
 /// not export the id; those still use the newest session dir for cwd.
 const ENV_GROK_MARKER: &str = "GROK_AGENT";
 pub(crate) const ENV_GROK_SESSION: &str = "GROK_SESSION_ID";
-/// Injected by the clank opencode PLUGIN via opencode's `shell.env`
-/// hook — opencode itself exports no session id
-/// (opencode-agent-tool M0). Present iff the shell call carried the
-/// exact session id; the plugin never guesses.
+/// Exported by opencode 2.x itself into the shell of the bash tool it
+/// runs for a session; the clank plugin blanks it everywhere else, so it
+/// is present iff the shell belongs to that exact session.
 const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";
 pub(crate) const ENV_CLANK_AGENT: &str = "CLANK_AGENT";
 /// The session a RESUMED opencode launch owns, passed by
@@ -158,7 +157,7 @@ fn select_explicit_session(
     candidates: &[(&'static str, Tool, Option<String>)],
 ) -> Result<Option<(Tool, String)>, EnvError> {
     // A BLANK var reads as unset: environments that can only SET
-    // vars, never unset them (opencode's shell.env hook), scrub
+    // vars, never unset them (opencode's shell creation hook), scrub
     // foreign session vars by blanking, and a blank must neither
     // claim the session nor count as a conflict.
     let set: Vec<(&'static str, Tool, &String)> = candidates
@@ -603,7 +602,7 @@ mod tests {
 
     #[test]
     fn selector_treats_blank_vars_as_unset() {
-        // Scrub-by-blanking: opencode's shell.env hook can only SET
+        // Scrub-by-blanking: opencode's shell creation hook can only SET
         // vars, so the clank plugin blanks foreign session vars. A
         // blank neither claims the session nor conflicts.
         let out = select_explicit_session(&[
