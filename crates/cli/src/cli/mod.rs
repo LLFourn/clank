@@ -58,6 +58,7 @@ pub(crate) mod plan_mutation;
 pub mod plan_resolve;
 mod presentation;
 pub mod purge;
+pub(crate) mod purge_drop;
 pub(crate) mod question_state;
 pub mod queue;
 pub(crate) mod recovery;
@@ -2047,8 +2048,9 @@ pub struct PurgeArgs {
     /// with it. Refuses if `<name>` already exists.
     #[arg(long, value_name = "NAME")]
     pub into_branch: Option<String>,
-    /// Print the planned rewrite and exit 0 without creating any
-    /// commits or moving any refs.
+    /// Print the planned rewrite and exit 0 without moving any refs
+    /// or touching the index or worktree. With `--drop` it also
+    /// names the conflict a live run would stop at.
     #[arg(long = "dry-run", alias = "dry")]
     pub dry: bool,
     /// Collapse the plan-attributed range into a single commit
@@ -2068,9 +2070,11 @@ pub struct PurgeArgs {
     pub no_cache: bool,
     /// Drop EVERY commit attributed to the plan, including the
     /// implementation code — not just `.clank/` artifacts. The
-    /// plan AND its work both vanish from history. Refuses
-    /// foreign commits unconditionally (same policy as
-    /// `clank stash push --to-queue`). Does NOT save the plan body —
+    /// plan AND its work both vanish from history, wherever they
+    /// are in it; every other commit after them is kept, in order.
+    /// If one of those no longer applies without the plan, the drop
+    /// stops in a `git rebase` for you to resolve and `--continue`
+    /// (or `--abort`). Does NOT save the plan body —
     /// use `clank stash push --to-queue` if you want to re-queue it for
     /// another attempt. Mutually exclusive with `--all`,
     /// `--squash`, and `--amend`.

@@ -75,7 +75,9 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   message (to fix/improve the summary).
 - `clank stash push <plan>` / `clank stash pop <plan>` — set a plan's commits
   aside / restore them (reviews reset on restore); `clank purge --drop
-  <plan>` fully deletes a plan (commits + body)
+  <plan>` fully deletes a plan (commits + body) wherever it is in history,
+  keeping every later commit; a later commit that conflicts stops it in a
+  `git rebase` to resolve and `--continue`
 - roster: `clank agent add <name> [--tool claude|codex|grok|opencode] [--review
   commit|plan|final|gate|standby]` (by name from the global library, or `--tool`
   to define inline), `clank agent make-master <name>` (elevate an agent to

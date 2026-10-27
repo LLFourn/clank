@@ -3,14 +3,14 @@
 //!
 //! Fully local: folds the repo with `rebuild::rebuild_repo`, builds
 //! a typed rewrite preview via `crate::preview`, then feeds the
-//! manifest to the shared rewrite engine (`cli::rewrite`). No
-//! daemon required.
+//! manifest to the shared rewrite engine (`cli::rewrite`); `--drop`
+//! runs its own program instead (`cli::purge_drop`). No daemon
+//! required.
 
 use super::{PurgeArgs, repo_basename, resolve_repo};
 use crate::cli::rewrite::{RewriteOpts, run as run_rewrite};
 use crate::lifecycle::PlanKey;
 use crate::rebuild::CachePolicy;
-use clank_core::api::{RewriteCommit, RewriteDisposition};
 
 fn cache_policy(args: &PurgeArgs) -> CachePolicy {
     if args.no_cache {
@@ -87,30 +87,32 @@ async fn run_single(
         .await
         .map_err(|e| anyhow::anyhow!("rewrite preview failed: {e}"))?;
 
-    // `--drop` transform: every non-foreign plan-attributed commit
-    // becomes a `Drop`, so the implementation code goes away with
-    // the `.clank/` artifacts. Foreign commits refuse before we
-    // ever reach the engine. Plan Phase 2.
-    let commits_for_engine = if args.drop {
-        drop_safety_check(&preview.commits)?;
-        transform_all_to_drop(&preview.commits)
-    } else {
-        preview.commits.clone()
-    };
+    if args.drop {
+        let program = crate::cli::purge_drop::DropProgram::from_preview(repo, &preview)?;
+        if !args.dry {
+            eprintln!(
+                "{}",
+                drop_banner(
+                    &stem,
+                    program.dropped(),
+                    program.kept(),
+                    args.into_branch.as_deref()
+                )
+            );
+        }
+        return crate::cli::purge_drop::execute(
+            repo,
+            &program,
+            args.into_branch.as_deref(),
+            args.dry,
+        );
+    }
 
     // Said, not asked: the banner is the audit trail of what this
     // run does, on stderr, and the run does it (stash-does-what-you-
     // mean: no y/N anywhere in clank).
     if !args.dry {
-        let dropped_count = preview.commits.iter().filter(|c| !c.foreign).count();
-        eprintln!(
-            "{}",
-            if args.drop {
-                drop_banner(&stem, dropped_count, args.into_branch.as_deref())
-            } else {
-                single_banner(&stem, args.into_branch.as_deref())
-            }
-        );
+        eprintln!("{}", single_banner(&stem, args.into_branch.as_deref()));
     }
 
     let outcome = run_rewrite(RewriteOpts {
@@ -118,7 +120,7 @@ async fn run_single(
         intro_sha: preview.intro_sha.as_ref(),
         head_sha: &preview.head_sha,
         linear: preview.linear,
-        commits: &commits_for_engine,
+        commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
         squash: args.squash.as_deref(),
@@ -359,57 +361,14 @@ fn is_finish_diff(lines: &[String], plan_key: Option<&PlanKey>) -> bool {
     has_finished_add
 }
 
-/// Foreign-commit refusal under `--drop`. Mirrors the foreign
-/// arm of `cli::stash::safety_check`. The `Rewrite` tier is
-/// NOT enforced under `--drop` — the `--drop` flag itself is
-/// the opt-in to losing code (Phase 2, OQ1 tentative pick:
-/// skip the Rewrite-requires-force tier).
-fn drop_safety_check(commits: &[RewriteCommit]) -> anyhow::Result<()> {
-    let foreign = crate::preview::foreign_shas(commits);
-    if !foreign.is_empty() {
-        let list: Vec<String> = foreign.iter().map(|s| s.as_str().to_string()).collect();
-        anyhow::bail!(
-            "purge --drop refuses: foreign commit(s) interleaved in plan range: {}. \
-             Foreign commits are someone else's work; dropping them via this command \
-             would silently rewrite their history. Resolve via `git rebase -i` or \
-             coordinate with the foreign-commit author(s).",
-            list.join(", ")
-        );
-    }
-    Ok(())
-}
-
-/// Transform every non-foreign plan-attributed commit's
-/// disposition to `Drop`. Foreign commits are preserved as-is
-/// (gated out by `drop_safety_check` above; this is defensive).
-/// Mirrors `cli::stash.rs`'s transform.
-fn transform_all_to_drop(commits: &[RewriteCommit]) -> Vec<RewriteCommit> {
-    commits
-        .iter()
-        .map(|c| {
-            if c.foreign {
-                c.clone()
-            } else {
-                RewriteCommit {
-                    sha: c.sha.clone(),
-                    subject: c.subject.clone(),
-                    disposition: RewriteDisposition::Drop,
-                    foreign: false,
-                    strip_paths: c.strip_paths.clone(),
-                }
-            }
-        })
-        .collect()
-}
-
-fn drop_banner(stem: &str, dropped_count: usize, into_branch: Option<&str>) -> String {
+fn drop_banner(stem: &str, dropped: usize, kept: usize, into_branch: Option<&str>) -> String {
     let target = match into_branch {
         Some(b) => format!("a NEW branch `{b}` (current branch left untouched)"),
         None => "the CURRENT branch (history will be rewritten in place)".into(),
     };
     format!(
-        "Dropping all {dropped_count} commit(s) attributed to `{stem}` and writing \
-         rewritten history to {target}. \
+        "Dropping all {dropped} commit(s) attributed to `{stem}`, keeping the {kept} \
+         other commit(s) in its range, and writing rewritten history to {target}. \
          This deletes the implementation code, not just `.clank/` artifacts. \
          There is NO archived copy of the plan body anywhere — for that, use `clank stash --to-queue`."
     )
@@ -512,84 +471,6 @@ mod tests {
             msg.contains("--drop and --amend are mutually exclusive"),
             "expected --drop+--amend refusal; got: {msg}"
         );
-    }
-
-    #[test]
-    fn drop_safety_check_refuses_foreign_unconditionally() {
-        use clank_core::api::{RewriteCommit, RewriteDisposition};
-        use clank_core::ids::CommitSha;
-        let foreign = RewriteCommit {
-            sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
-            subject: "foreign".into(),
-            disposition: RewriteDisposition::KeepVerbatim,
-            foreign: true,
-            strip_paths: Vec::new(),
-        };
-        let err = drop_safety_check(&[foreign]).expect_err("must refuse");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("foreign") && msg.contains("git rebase"),
-            "diagnostic should mention foreign + git rebase; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn drop_safety_check_passes_all_drop_no_foreign() {
-        use clank_core::api::{RewriteCommit, RewriteDisposition};
-        use clank_core::ids::CommitSha;
-        let c = RewriteCommit {
-            sha: CommitSha::parse(&"b".repeat(40)).unwrap(),
-            subject: "plan".into(),
-            disposition: RewriteDisposition::Drop,
-            foreign: false,
-            strip_paths: Vec::new(),
-        };
-        drop_safety_check(&[c]).expect("non-foreign Drop should pass");
-    }
-
-    #[test]
-    fn drop_safety_check_passes_rewrite_non_foreign_without_force() {
-        // OQ1 pinned: --drop is the opt-in; Rewrite tier is NOT
-        // enforced under --drop. (Contrast with `clank stash push`
-        // which requires --force for non-foreign Rewrite.)
-        use clank_core::api::{RewriteCommit, RewriteDisposition};
-        use clank_core::ids::CommitSha;
-        let c = RewriteCommit {
-            sha: CommitSha::parse(&"c".repeat(40)).unwrap(),
-            subject: "mixed".into(),
-            disposition: RewriteDisposition::Rewrite,
-            foreign: false,
-            strip_paths: Vec::new(),
-        };
-        drop_safety_check(&[c])
-            .expect("Rewrite non-foreign must pass under --drop without a second force flag");
-    }
-
-    #[test]
-    fn transform_all_to_drop_preserves_foreign() {
-        use clank_core::api::{RewriteCommit, RewriteDisposition};
-        use clank_core::ids::CommitSha;
-        let plan = RewriteCommit {
-            sha: CommitSha::parse(&"d".repeat(40)).unwrap(),
-            subject: "plan".into(),
-            disposition: RewriteDisposition::Rewrite,
-            foreign: false,
-            strip_paths: Vec::new(),
-        };
-        let foreign = RewriteCommit {
-            sha: CommitSha::parse(&"e".repeat(40)).unwrap(),
-            subject: "foreign".into(),
-            disposition: RewriteDisposition::KeepVerbatim,
-            foreign: true,
-            strip_paths: Vec::new(),
-        };
-        let out = transform_all_to_drop(&[plan, foreign]);
-        assert_eq!(out[0].disposition, RewriteDisposition::Drop);
-        assert!(matches!(
-            out[1].disposition,
-            RewriteDisposition::KeepVerbatim
-        ));
-        assert!(out[1].foreign);
     }
 
     #[test]

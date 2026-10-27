@@ -971,3 +971,142 @@ pub fn cherry_pick(repo: &Path, sha: &str) -> anyhow::Result<bool> {
         .context("spawning git cherry-pick")?;
     Ok(status.success())
 }
+
+/// One commit's line in a [`rebase_dropping`] todo.
+pub enum RebaseStep<'a> {
+    Drop { sha: &'a str, subject: &'a str },
+    Pick { sha: &'a str, subject: &'a str },
+}
+
+/// The todo [`rebase_dropping`] hands git: each step in order, and after
+/// every pick an `exec` that removes `strip_paths` (literal paths, never
+/// patterns) from the index and worktree and, if that changed anything,
+/// amends the picked commit, keeping it even if that leaves it empty.
+/// With `first_pick_is_root`, the first pick is made a root commit first.
+/// The `exec` lines are self-contained, so a `git rebase --continue` run
+/// any time later still finishes them.
+pub fn drop_rebase_todo(
+    steps: &[RebaseStep<'_>],
+    strip_paths: &[String],
+    first_pick_is_root: bool,
+) -> String {
+    use crate::shell_quote::shell_quote;
+    let quoted: Vec<String> = strip_paths.iter().map(|p| shell_quote(p)).collect();
+    // git's own post-rewrite run maps a picked commit to the commit it
+    // made, which may be from before an `exec` replaced it (it is after a
+    // `--continue`), so each replacement reports the original's final
+    // commit itself. Only a replacement that happens does, or the hook
+    // would run once per commit.
+    let report = |sha: &str| {
+        format!(
+            "echo \"{sha} $(git rev-parse HEAD)\" | git hook run --ignore-missing \
+             --to-stdin=/dev/stdin post-rewrite -- rebase"
+        )
+    };
+    let mut todo = String::new();
+    let mut root_pending = first_pick_is_root;
+    for step in steps {
+        match step {
+            RebaseStep::Drop { sha, subject } => {
+                todo.push_str(&format!("drop {sha} {subject}\n"));
+            }
+            RebaseStep::Pick { sha, subject } => {
+                todo.push_str(&format!("pick {sha} {subject}\n"));
+                if std::mem::take(&mut root_pending) {
+                    // `--root` picks onto a placeholder empty commit of
+                    // git's, which it drops only when that first pick
+                    // applies cleanly; one committed by `--continue`
+                    // keeps it as a parent. The rewrite removes just the
+                    // header's parent line, so author, committer and
+                    // message survive byte for byte.
+                    todo.push_str(&format!(
+                        "exec if git rev-parse -q --verify HEAD^ >/dev/null; then git reset -q \
+                         --soft \"$(git cat-file commit HEAD | sed '2{{/^parent /d;}}' | git \
+                         hash-object -t commit -w --stdin)\" && {}; fi\n",
+                        report(sha),
+                    ));
+                }
+                if strip_paths.is_empty() {
+                    continue;
+                }
+                todo.push_str(&format!(
+                    "exec git --literal-pathspecs rm -q -f --ignore-unmatch -- {} && {{ git diff \
+                     --cached --quiet || {{ git commit -q --amend --no-edit --allow-empty \
+                     --no-verify --no-post-rewrite && {}; }}; }}\n",
+                    quoted.join(" "),
+                    report(sha),
+                ));
+            }
+        }
+    }
+    todo
+}
+
+/// `git rm -q -f --ignore-unmatch -- <paths>`, each path literal rather
+/// than a pattern: remove it from the index and worktree, resolving a
+/// conflict on it as a deletion; a path that is not tracked is skipped.
+pub fn remove_paths_if_tracked(repo: &Path, paths: &[String]) -> anyhow::Result<()> {
+    let mut args = vec![
+        "--literal-pathspecs",
+        "rm",
+        "-q",
+        "-f",
+        "--ignore-unmatch",
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    run(repo, &args)
+}
+
+/// How a [`rebase_dropping`] run ended.
+pub enum Rebased {
+    Finished,
+    /// git stopped with the rebase in progress, for the operator.
+    Stopped,
+}
+
+/// Run `git rebase --interactive` onto `onto` (`None`: `--root`) with
+/// `todo` (from [`drop_rebase_todo`]) as its todo, until it finishes or
+/// stops. Every option that could change what the todo means is pinned:
+/// no autostash or autosquash, no ref updates, and every commit kept —
+/// already empty, made empty, or a cherry-pick of one upstream. Why not
+/// gix: it has no rebase, and a stopped one must be git's own state for
+/// `git rebase --continue` / `--abort` to take over.
+pub fn rebase_dropping(repo: &Path, onto: Option<&str>, todo: &str) -> anyhow::Result<Rebased> {
+    let todo_path = crate::git_io::git_dir(repo)?.join("clank-drop-todo");
+    std::fs::write(&todo_path, todo).with_context(|| format!("write `{}`", todo_path.display()))?;
+    let editor = format!(
+        "cp {}",
+        crate::shell_quote::shell_quote(&todo_path.to_string_lossy())
+    );
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args([
+            "rebase",
+            "--interactive",
+            "--keep-empty",
+            "--empty=keep",
+            "--reapply-cherry-picks",
+            "--no-autostash",
+            "--no-autosquash",
+            "--no-update-refs",
+            "--no-rebase-merges",
+        ])
+        .arg(onto.unwrap_or("--root"))
+        .env("GIT_SEQUENCE_EDITOR", editor)
+        .stdin(std::process::Stdio::null());
+    let out = cmd.output().context("spawning git rebase");
+    let _ = std::fs::remove_file(&todo_path);
+    let out = out?;
+    if crate::git_io::operation_in_progress_at(repo)? == Some("git rebase") {
+        return Ok(Rebased::Stopped);
+    }
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rebase failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(Rebased::Finished)
+}

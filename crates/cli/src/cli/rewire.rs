@@ -16,8 +16,7 @@ pub async fn run(args: RewireArgs) -> anyhow::Result<()> {
     std::io::stdin()
         .read_to_string(&mut input)
         .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-    let pairs = parse_pairs(&input);
-    let copied = apply_pairs(&repo, &pairs)?;
+    let copied = rewire_hook_input(&repo, &input)?;
     if copied > 0 {
         eprintln!(
             "clank rewire: copied feedback for {copied} commit{}",
@@ -25,6 +24,12 @@ pub async fn run(args: RewireArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Migrate feedback for the `post-rewrite` hook's stdin (`<old> <new>
+/// [extra]` lines); returns how many files were copied.
+pub(crate) fn rewire_hook_input(repo: &Path, input: &str) -> anyhow::Result<usize> {
+    apply_pairs(repo, &parse_pairs(input))
 }
 
 /// Copy feedback for each `(old, new)` sha pair. Shared by the `post-rewrite`

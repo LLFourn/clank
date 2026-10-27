@@ -1288,6 +1288,53 @@ pub fn index_digest_at(repo: &Path) -> Result<Option<String>, GitIoError> {
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
+/// The paths with unmerged (conflict-stage) entries in the worktree's
+/// index, sorted. Empty when there is no index.
+pub fn unmerged_paths_at(repo: &Path) -> Result<Vec<String>, GitIoError> {
+    let path = git_dir(repo)?.join("index");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let index = gix::index::File::at(&path, gix::hash::Kind::Sha1, false, Default::default())
+        .map_err(|e| gix_err("unmerged_paths", format!("read `{}`: {e}", path.display())))?;
+    let mut paths: Vec<String> = index
+        .entries()
+        .iter()
+        .filter(|e| e.stage_raw() != 0)
+        .map(|e| e.path(&index).to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// The git operation this worktree is in the middle of — a rebase,
+/// merge, cherry-pick, revert, bisect or `am` — named for a message, or
+/// `None`. A multi-commit cherry-pick or revert that has committed its
+/// conflicted step still counts: its sequencer state outlives
+/// `CHERRY_PICK_HEAD`.
+pub fn operation_in_progress_at(repo: &Path) -> Result<Option<&'static str>, GitIoError> {
+    use gix::state::InProgress;
+    let r = open(repo)?;
+    let named = r.0.state().map(|s| match s {
+        InProgress::ApplyMailbox => "git am",
+        InProgress::ApplyMailboxRebase | InProgress::Rebase | InProgress::RebaseInteractive => {
+            "git rebase"
+        }
+        InProgress::Bisect => "git bisect",
+        InProgress::CherryPick | InProgress::CherryPickSequence => "git cherry-pick",
+        InProgress::Merge => "git merge",
+        InProgress::Revert | InProgress::RevertSequence => "git revert",
+    });
+    if named.is_some() {
+        return Ok(named);
+    }
+    Ok(git_dir(repo)?
+        .join("sequencer")
+        .is_dir()
+        .then_some("git cherry-pick or revert"))
+}
+
 /// Every non-directory path in the tree `tree_sha`.
 pub fn tree_files_at(
     repo: &Path,
