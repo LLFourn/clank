@@ -375,6 +375,9 @@ pub(crate) struct Descriptor {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DescribedBuild {
     pub(crate) running: String,
+    /// `None` from a monitor built before versions were embedded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
     pub(crate) installed_at: String,
     pub(crate) source: crate::build_stamp::Source,
 }
@@ -2926,8 +2929,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
         && let crate::build_stamp::Install::Replaced(other) = installation.look(running)
     {
         eprintln!(
-            "monitor: {} holds build {other}, not this one ({running}); not starting",
-            installation.path().display()
+            "monitor: {} holds build {}, not this one ({running}); not starting",
+            installation.path().display(),
+            other.stamp
         );
         return Ok(());
     }
@@ -2943,6 +2947,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     forget_dead_observations(&repo);
     let described = installed.as_ref().map(|r| DescribedBuild {
         running: running.to_string(),
+        version: Some(crate::build_stamp::VERSION.to_string()),
         installed_at: r.path.to_string_lossy().into_owned(),
         source: r.source,
     });
@@ -5089,7 +5094,7 @@ impl Tenure {
             self.retiring = true;
             return Settled::Stale {
                 running: build.running,
-                installed,
+                installed: installed.stamp,
             };
         }
         let found = self.lease.check();
@@ -5925,8 +5930,15 @@ pub(crate) struct Observation {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum Observed {
     Current,
-    Replaced { installed: String },
-    Unavailable { why: String },
+    Replaced {
+        installed: String,
+        /// `None` when the installed build embeds no version.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installed_version: Option<String>,
+    },
+    Unavailable {
+        why: String,
+    },
 }
 
 impl From<&crate::build_stamp::Install> for Observed {
@@ -5934,8 +5946,9 @@ impl From<&crate::build_stamp::Install> for Observed {
         use crate::build_stamp::Install;
         match install {
             Install::Current => Observed::Current,
-            Install::Replaced(stamp) => Observed::Replaced {
-                installed: stamp.to_string(),
+            Install::Replaced(build) => Observed::Replaced {
+                installed: build.stamp.to_string(),
+                installed_version: build.version.clone(),
             },
             Install::Unavailable(why) => Observed::Unavailable { why: why.clone() },
         }
@@ -6070,7 +6083,7 @@ fn describe_build(pid: i32, build: Option<&DescribedBuild>, observed: Option<&Ob
     };
     let state = match observed {
         Some(Observed::Current) => "current".to_string(),
-        Some(Observed::Replaced { installed }) => {
+        Some(Observed::Replaced { installed, .. }) => {
             format!("replaced by {installed}, retiring")
         }
         Some(Observed::Unavailable { why }) => format!("install path unavailable: {why}"),
@@ -16066,9 +16079,29 @@ mod build_tests {
         Stamp(stamp)
     }
 
+    /// Records written before versions were embedded still read, with
+    /// no version rather than a guessed one.
+    #[test]
+    fn a_record_from_before_versions_reads_without_one() {
+        let described: DescribedBuild = serde_json::from_str(
+            r#"{"running":"ab","installed_at":"/bin/clank","source":"invocation"}"#,
+        )
+        .unwrap();
+        assert_eq!(described.version, None);
+        let observed: Observed =
+            serde_json::from_str(r#"{"state":"replaced","installed":"ab"}"#).unwrap();
+        assert_eq!(
+            observed,
+            Observed::Replaced {
+                installed: "ab".into(),
+                installed_version: None
+            }
+        );
+    }
+
     fn install(path: &std::path::Path, stamp: Stamp) {
         let tmp = path.with_extension("new");
-        std::fs::write(&tmp, crate::build_stamp::executable_with(stamp)).unwrap();
+        std::fs::write(&tmp, crate::build_stamp::executable_with(stamp, "9.9.9")).unwrap();
         std::fs::rename(tmp, path).unwrap();
     }
 
@@ -16142,7 +16175,7 @@ mod build_tests {
         assert_eq!(published.get(), 0, "a stale build advertised");
         let seen = seen.lock().unwrap();
         assert!(
-            matches!(seen.as_slice(), [Install::Current, Install::Unavailable(_), Install::Replaced(s)] if *s == other())
+            matches!(seen.as_slice(), [Install::Current, Install::Unavailable(_), Install::Replaced(s)] if s.stamp == other())
         );
     }
 
@@ -16214,7 +16247,8 @@ mod build_tests {
         assert_eq!(
             observed.state,
             Observed::Replaced {
-                installed: other().to_string()
+                installed: other().to_string(),
+                installed_version: Some("9.9.9".into()),
             }
         );
         let _ = std::fs::remove_file(observation_path(repo.path(), old_pid));
@@ -16310,6 +16344,7 @@ mod build_tests {
         let me = std::process::id() as i32;
         let build = DescribedBuild {
             running: running().to_string(),
+            version: None,
             installed_at: "/bin/clank".into(),
             source: Source::Invocation,
         };
@@ -16342,6 +16377,7 @@ mod build_tests {
         observe(
             Observed::Replaced {
                 installed: other().to_string(),
+                installed_version: None,
             },
             crate::proc_identity::token_for(me),
         );

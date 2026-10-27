@@ -173,7 +173,7 @@ Examples:
 #[derive(Parser)]
 #[command(
     name = "clank",
-    version,
+    version = crate::build_stamp::VERSION,
     about = "Multi-agent peer review around plans",
     styles = STYLES
 )]
@@ -512,6 +512,15 @@ pub fn exit_code_for(err: &anyhow::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_prints_the_human_version() {
+        let err = Cli::try_parse_from(["clank", "--version"]).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            format!("clank {}\n", crate::build_stamp::VERSION)
+        );
+    }
 
     /// The README's checkable claims, asserted against clap itself.
     ///

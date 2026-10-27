@@ -1804,6 +1804,9 @@ fn serve<I: PaneIo>(
     mut rename: impl FnMut(&str, &str),
     mut reports: impl FnMut(Vec<Report>),
 ) {
+    if let Some(own) = state.tab.caller.clone() {
+        rename(&own, &format!("clank {}", crate::build_stamp::VERSION));
+    }
     worker_loop(rx, |batch| {
         reports(state.handle_with(batch, io, &mut rename, tabs))
     });
@@ -4283,6 +4286,35 @@ mod tests {
             );
         }
         reports
+    }
+
+    /// The worker names the TUI's own pane after the running version
+    /// before its first batch, and names no pane without one.
+    #[test]
+    fn the_worker_names_its_own_pane_by_version() {
+        for (caller, want) in [
+            (
+                Some("terminal_5"),
+                vec![(
+                    "terminal_5".to_string(),
+                    format!("clank {}", crate::build_stamp::VERSION),
+                )],
+            ),
+            (None, vec![]),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(WorkerMsg::Close).unwrap();
+            let mut renamed = Vec::new();
+            serve(
+                &rx,
+                &mut WorkerState::new(caller.map(str::to_string)),
+                &mut FakeIo::new(vec![]),
+                &mut NoTabs,
+                |id, name| renamed.push((id.to_string(), name.to_string())),
+                |_| {},
+            );
+            assert_eq!(renamed, want);
+        }
     }
 
     #[test]

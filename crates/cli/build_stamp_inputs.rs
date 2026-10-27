@@ -123,3 +123,68 @@ fn stamp_of(
     stamp.copy_from_slice(&digest[..16]);
     Ok(stamp)
 }
+
+/// The version a person reads for a build of `pkg` from `workspace`, and
+/// the git files a change to which can change it.
+///
+/// `pkg` alone for a release: no checkout, or a clean checkout whose
+/// HEAD carries the tag `pkg` or `v<pkg>`. Otherwise `pkg+<sha>`, with
+/// `.dirty` when a build input differs from HEAD.
+fn human_version(workspace: &std::path::Path, pkg: &str) -> (String, Vec<std::path::PathBuf>) {
+    let git = |args: &[&str]| -> Option<String> {
+        // A build run from a git hook inherits these, which would point
+        // the queries at another repo or index.
+        let out = std::process::Command::new("git")
+            .args(["--no-optional-locks", "-C"])
+            .arg(workspace)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    };
+    let dirs = git(&["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"]);
+    let mut dirs = dirs.iter().flat_map(|d| d.lines()).map(std::path::PathBuf::from);
+    let (Some(git_dir), Some(common)) = (dirs.next(), dirs.next()) else {
+        return (pkg.to_string(), Vec::new());
+    };
+    let mut watched = vec![
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        common.join("packed-refs"),
+        common.join("refs/tags"),
+    ];
+    if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD"))
+        && let Some(branch) = head.trim().strip_prefix("ref: ")
+    {
+        let loose = common.join(branch);
+        // A packed branch's first commit writes a loose ref, seen only
+        // as a change to its directory.
+        watched.push(match loose.parent() {
+            Some(dir) if !loose.exists() => dir.to_path_buf(),
+            _ => loose,
+        });
+    }
+    // Cargo reruns on every build for a watched path that is missing.
+    watched.retain(|p| p.exists());
+    let Some(sha) = git(&["rev-parse", "--short=8", "HEAD"]) else {
+        return (pkg.to_string(), watched);
+    };
+    let mut status = vec!["status", "--porcelain", "--", "crates"];
+    status.extend(STAMP_MANIFESTS);
+    let dirty = git(&status).is_none_or(|changes| !changes.is_empty());
+    let tagged = git(&["tag", "--points-at", "HEAD"]).is_some_and(|tags| {
+        tags.lines()
+            .any(|t| t == pkg || t.strip_prefix('v') == Some(pkg))
+    });
+    let version = match (tagged, dirty) {
+        (true, false) => pkg.to_string(),
+        (_, true) => format!("{pkg}+{sha}.dirty"),
+        (false, false) => format!("{pkg}+{sha}"),
+    };
+    (version, watched)
+}

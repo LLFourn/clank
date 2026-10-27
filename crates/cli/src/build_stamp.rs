@@ -10,7 +10,12 @@ include!(concat!(env!("OUT_DIR"), "/build_stamp.rs"));
 
 const MARKER_LEN: usize = 16;
 const END: [u8; 4] = *b"\x7fend";
-const LEN: usize = MARKER_LEN + 16 + END.len();
+/// Follows `END`, so a binary from before versions were embedded still
+/// reads as its stamp, with no version.
+const VERSION_TAG: [u8; 8] = *b"\x7fversion";
+const VERSION_CAP: usize = 64;
+const STAMPED: usize = MARKER_LEN + 16 + END.len();
+const LEN: usize = STAMPED + VERSION_TAG.len() + 1 + VERSION_CAP;
 
 const fn framed() -> [u8; LEN] {
     let marker = *b"\x7fclank-stamp-v1\x7f";
@@ -29,6 +34,22 @@ const fn framed() -> [u8; LEN] {
     while k < END.len() {
         out[MARKER_LEN + 16 + k] = END[k];
         k += 1;
+    }
+    let mut v = 0;
+    while v < VERSION_TAG.len() {
+        out[STAMPED + v] = VERSION_TAG[v];
+        v += 1;
+    }
+    let version = VERSION.as_bytes();
+    assert!(
+        version.len() <= VERSION_CAP,
+        "the version outgrows its frame"
+    );
+    out[STAMPED + VERSION_TAG.len()] = version.len() as u8;
+    let mut w = 0;
+    while w < version.len() {
+        out[STAMPED + VERSION_TAG.len() + 1 + w] = version[w];
+        w += 1;
     }
     out
 }
@@ -64,8 +85,16 @@ pub fn running() -> Stamp {
     Stamp(stamp)
 }
 
-/// The stamp in an executable's bytes: exactly one well-formed one.
-pub fn find(bytes: &[u8]) -> Result<Stamp, String> {
+/// A build as its executable says: its stamp, and its version where it
+/// embeds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Build {
+    pub stamp: Stamp,
+    pub version: Option<String>,
+}
+
+/// The build in an executable's bytes: exactly one well-formed stamp.
+pub fn find(bytes: &[u8]) -> Result<Build, String> {
     let framed = embedded();
     let marker = &framed[..MARKER_LEN];
     let mut found = bytes
@@ -85,7 +114,17 @@ pub fn find(bytes: &[u8]) -> Result<Stamp, String> {
     }
     let mut stamp = [0u8; 16];
     stamp.copy_from_slice(&body[..16]);
-    Ok(Stamp(stamp))
+    let version = body[16 + END.len()..]
+        .strip_prefix(&VERSION_TAG)
+        .and_then(|rest| {
+            let (&len, rest) = rest.split_first()?;
+            std::str::from_utf8(rest.get(..len as usize)?).ok()
+        })
+        .map(str::to_string);
+    Ok(Build {
+        stamp: Stamp(stamp),
+        version,
+    })
 }
 
 /// What the installation says about the running build.
@@ -93,7 +132,7 @@ pub fn find(bytes: &[u8]) -> Result<Stamp, String> {
 pub enum Install {
     Current,
     /// A different build is installed: proof this one is stale.
-    Replaced(Stamp),
+    Replaced(Build),
     /// Nothing could be established. Never treated as replacement.
     Unavailable(String),
 }
@@ -130,7 +169,7 @@ fn signature(path: &std::path::Path) -> std::io::Result<Signature> {
 #[derive(Debug)]
 pub struct Installation {
     path: std::path::PathBuf,
-    scanned: Option<(Signature, Result<Stamp, String>)>,
+    scanned: Option<(Signature, Result<Build, String>)>,
 }
 
 impl Installation {
@@ -175,8 +214,8 @@ impl Installation {
             }
         };
         match found {
-            Ok(stamp) if stamp == running => Install::Current,
-            Ok(stamp) => Install::Replaced(stamp),
+            Ok(build) if build.stamp == running => Install::Current,
+            Ok(build) => Install::Replaced(build),
             Err(why) => Install::Unavailable(format!("{shown}: {why}")),
         }
     }
@@ -277,13 +316,17 @@ pub fn rendezvous() -> Option<Rendezvous> {
     )
 }
 
-/// The bytes of an executable carrying `stamp`, for fixtures.
+/// The bytes of an executable carrying `stamp` and `version`, for
+/// fixtures.
 #[cfg(test)]
-pub fn executable_with(stamp: Stamp) -> Vec<u8> {
+pub fn executable_with(stamp: Stamp, version: &str) -> Vec<u8> {
     let mut bytes = b"preamble".to_vec();
     bytes.extend_from_slice(&embedded()[..MARKER_LEN]);
     bytes.extend_from_slice(&stamp.0);
     bytes.extend_from_slice(&END);
+    bytes.extend_from_slice(&VERSION_TAG);
+    bytes.push(version.len() as u8);
+    bytes.extend_from_slice(version.as_bytes());
     bytes.extend_from_slice(b"trailer");
     bytes
 }
@@ -445,14 +488,156 @@ mod tests {
             let b = stamp_of(ws.path(), &env(&[("CARGO_FEATURE_A", "BC")]), "r").unwrap();
             assert_ne!(a, b);
         }
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        }
+
+        fn sha(dir: &std::path::Path) -> String {
+            git(dir, &["rev-parse", "--short=8", "HEAD"])
+        }
+
+        fn checkout() -> tempfile::TempDir {
+            let ws = tree();
+            git(ws.path(), &["init", "-q", "-b", "main"]);
+            git(ws.path(), &["add", "."]);
+            git(ws.path(), &["commit", "-qm", "one"]);
+            ws
+        }
+
+        fn version(ws: &std::path::Path) -> String {
+            human_version(ws, "0.0.1").0
+        }
+
+        #[test]
+        fn a_build_outside_git_is_the_release() {
+            let ws = tree();
+            assert_eq!(human_version(ws.path(), "0.0.1"), ("0.0.1".into(), vec![]));
+        }
+
+        /// The sha follows HEAD; only a build input makes it dirty; only a
+        /// clean tree at a version tag reads as the release.
+        #[test]
+        fn a_checkout_is_its_commit_dirty_or_released() {
+            let ws = checkout();
+            let ws = ws.path();
+            let one = sha(ws);
+            assert_eq!(version(ws), format!("0.0.1+{one}"));
+
+            std::fs::write(ws.join("notes.md"), "not built").unwrap();
+            assert_eq!(version(ws), format!("0.0.1+{one}"), "a non-input");
+            std::fs::write(ws.join("crates/web/src/lib.rs"), "pub fn g() {}").unwrap();
+            assert_eq!(version(ws), format!("0.0.1+{one}.dirty"));
+            git(ws, &["checkout", "-q", "--", "crates"]);
+            std::fs::write(ws.join("crates/web/src/new.rs"), "").unwrap();
+            assert_eq!(version(ws), format!("0.0.1+{one}.dirty"), "untracked");
+            std::fs::remove_file(ws.join("crates/web/src/new.rs")).unwrap();
+            assert_eq!(version(ws), format!("0.0.1+{one}"));
+
+            git(ws, &["tag", "v0.0.2"]);
+            assert_eq!(version(ws), format!("0.0.1+{one}"), "another version's tag");
+            git(ws, &["tag", "-a", "-m", "release", "v0.0.1"]);
+            assert_eq!(version(ws), "0.0.1");
+            std::fs::write(ws.join("Cargo.lock"), "lock2").unwrap();
+            assert_eq!(
+                version(ws),
+                format!("0.0.1+{one}.dirty"),
+                "tagged but dirty"
+            );
+
+            git(ws, &["commit", "-qam", "two"]);
+            let two = sha(ws);
+            assert_ne!(one, two);
+            assert_eq!(
+                version(ws),
+                format!("0.0.1+{two}"),
+                "HEAD moved off the tag"
+            );
+            git(ws, &["checkout", "-q", "--detach", "v0.0.1"]);
+            assert_eq!(version(ws), "0.0.1", "detached at the tag");
+        }
+
+        /// What can move the version is watched, wherever git keeps it:
+        /// loose or packed, in a plain checkout or a linked worktree.
+        #[test]
+        fn the_version_reruns_on_what_moves_it() {
+            let ws = checkout();
+            let ws = ws.path();
+            git(ws, &["tag", "v0.0.1"]);
+            let dot = dunce::canonicalize(ws.join(".git")).unwrap();
+            let (_, watched) = human_version(ws, "0.0.1");
+            for want in ["HEAD", "index", "refs/heads/main", "refs/tags"] {
+                assert!(watched.contains(&dot.join(want)), "{want}: {watched:?}");
+            }
+
+            git(ws, &["pack-refs", "--all"]);
+            let (version, watched) = human_version(ws, "0.0.1");
+            assert_eq!(version, "0.0.1", "a packed tag");
+            for want in ["HEAD", "packed-refs", "refs/heads"] {
+                assert!(watched.contains(&dot.join(want)), "{want}: {watched:?}");
+            }
+
+            let linked = tempfile::tempdir().unwrap();
+            let linked = linked.path().join("wt");
+            git(
+                ws,
+                &["worktree", "add", "-q", "-b", "side"]
+                    .into_iter()
+                    .chain([linked.to_str().unwrap()])
+                    .collect::<Vec<_>>(),
+            );
+            std::fs::write(linked.join("crates/web/src/lib.rs"), "pub fn h() {}").unwrap();
+            git(&linked, &["commit", "-qam", "side"]);
+            let (version, watched) = human_version(&linked, "0.0.1");
+            assert_eq!(version, format!("0.0.1+{}", sha(&linked)));
+            let own = dunce::canonicalize(dot.join("worktrees/wt")).unwrap();
+            for want in [
+                own.join("HEAD"),
+                own.join("index"),
+                dot.join("refs/heads/side"),
+                dot.join("packed-refs"),
+            ] {
+                assert!(watched.contains(&want), "{want:?}: {watched:?}");
+            }
+        }
     }
 
     /// The test binary carries exactly one stamp, the one it is running.
     #[test]
     fn the_running_image_carries_its_stamp_once() {
         let me = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        assert_eq!(find(&me), Ok(running()));
+        assert_eq!(
+            find(&me),
+            Ok(Build {
+                stamp: running(),
+                version: Some(VERSION.to_string())
+            })
+        );
         assert_eq!(running(), Stamp(STAMP));
+    }
+
+    /// A build from before versions were embedded, as `installed` writes.
+    fn older(stamp: [u8; 16]) -> Build {
+        Build {
+            stamp: Stamp(stamp),
+            version: None,
+        }
     }
 
     fn installed(dir: &std::path::Path, name: &str, stamp: Option<[u8; 16]>) -> std::path::PathBuf {
@@ -481,7 +666,7 @@ mod tests {
         );
         assert_eq!(
             look(installed(dir.path(), "other", Some(other))),
-            Install::Replaced(Stamp(other))
+            Install::Replaced(older(other))
         );
         assert!(matches!(
             look(dir.path().join("missing")),
@@ -539,7 +724,7 @@ mod tests {
         std::fs::rename(replacement, &path).unwrap();
         assert_eq!(
             installation.look_with(me, read),
-            Install::Replaced(Stamp(other))
+            Install::Replaced(older(other))
         );
         assert_eq!(reads.get(), 2, "a rename is read again");
 
@@ -548,7 +733,7 @@ mod tests {
         assert!(matches!(failed, Install::Unavailable(_)));
         assert_eq!(
             installation.look_with(me, |p| std::fs::read(p)),
-            Install::Replaced(Stamp(other)),
+            Install::Replaced(older(other)),
             "a failed read is tried again with nothing changed"
         );
     }
@@ -593,7 +778,7 @@ mod tests {
         assert_eq!(installation.look(me), Install::Current);
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&b, &alias).unwrap();
-        assert_eq!(installation.look(me), Install::Replaced(Stamp(other)));
+        assert_eq!(installation.look(me), Install::Replaced(older(other)));
         std::fs::remove_file(&alias).unwrap();
         assert!(matches!(installation.look(me), Install::Unavailable(_)));
 

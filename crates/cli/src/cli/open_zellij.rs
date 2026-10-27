@@ -2969,8 +2969,7 @@ pub(crate) fn rename_pane_checked(id: &str, name: &str) -> Result<(), String> {
     // and the rename) or any zellij hiccup must not bleed an error line
     // onto the TUI, which the event-driven loop would leave until the
     // next watcher event (ruthless 9c38523).
-    let out = std::process::Command::new("zellij")
-        .args(["action", "rename-pane", "--pane-id", id, name])
+    let out = rename_pane_command(id, name)
         .output()
         .map_err(|e| format!("could not run zellij: {e}"))?;
     if out.status.success() {
@@ -2981,6 +2980,12 @@ pub(crate) fn rename_pane_checked(id: &str, name: &str) -> Result<(), String> {
         out.status,
         String::from_utf8_lossy(&out.stderr).trim()
     ))
+}
+
+fn rename_pane_command(id: &str, name: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("zellij");
+    command.args(["action", "rename-pane", "--pane-id", id, name]);
+    command
 }
 
 /// zellij is the workspace, so `clank open` without it is a setup
@@ -3995,6 +4000,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_pane_is_renamed_by_its_id() {
+        let command = rename_pane_command("terminal_5", "clank 1.0.0");
+        assert_eq!(command.get_program(), "zellij");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "action",
+                "rename-pane",
+                "--pane-id",
+                "terminal_5",
+                "clank 1.0.0"
+            ]
+        );
+    }
 
     fn reviewers(labels: &[&str]) -> Vec<String> {
         labels.iter().map(|s| s.to_string()).collect()

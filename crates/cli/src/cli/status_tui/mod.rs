@@ -8691,7 +8691,6 @@ pub(crate) mod tests {
                 .iter()
                 .map(|l| visible(l))
                 .find(|l| l.starts_with("monitor"))
-                .expect("a monitor row")
         };
         let every = REBUILD_MIN;
         let t0 = std::time::Instant::now();
@@ -8704,13 +8703,9 @@ pub(crate) mod tests {
             (
                 running.clone(),
                 Liveness::Gone { pid: 7705 },
-                "monitor  gone (pid 7705 exited)",
+                Some("monitor  stopped"),
             ),
-            (
-                Liveness::None,
-                running.clone(),
-                "monitor  pid 7705 · build unknown",
-            ),
+            (Liveness::None, running.clone(), None),
         ] {
             let mut snapshot = snap(None, vec![]);
             snapshot.monitor = before.clone();
@@ -8744,7 +8739,7 @@ pub(crate) mod tests {
                 &mut failures
             ));
             last_sig = sig;
-            assert_eq!(row(&snapshot), shown);
+            assert_eq!(row(&snapshot).as_deref(), shown);
 
             let settled = close_turn(&mut probe, t0 + every * 3, every, false, || health(&after));
             assert!(!settled.refresh_pending, "{after:?}: it flips once");

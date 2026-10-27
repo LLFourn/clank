@@ -25,10 +25,16 @@ fn main() {
         .unwrap_or_default();
     let env: Vec<(String, String)> = std::env::vars().collect();
     let stamp = stamp_of(&workspace, &env, &version).expect("the build inputs are readable");
+    let (human, watched) = human_version(&workspace, env!("CARGO_PKG_VERSION"));
+    for path in watched {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     std::fs::write(
         out.join("build_stamp.rs"),
-        format!("pub(crate) const STAMP: [u8; 16] = {stamp:?};\n"),
+        format!(
+            "pub(crate) const STAMP: [u8; 16] = {stamp:?};\npub const VERSION: &str = {human:?};\n"
+        ),
     )
     .unwrap();
 }

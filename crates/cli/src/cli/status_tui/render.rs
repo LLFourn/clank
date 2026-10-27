@@ -58,37 +58,31 @@ fn agent_mark(mode: clank_core::vocab::AutoMode, presence: Presence, lost: bool)
     }
 }
 
-/// The `monitor` gauge: its pid and build, dim, while its process runs;
-/// the warning colour whenever there is none to deliver a wake.
-pub(super) fn monitor_spans(monitor: &crate::cli::monitor::Liveness) -> Vec<Span> {
+/// The `monitor` row, only when something is wrong: a person learns to
+/// ignore a row that always reads the same.
+pub(super) fn monitor_spans(monitor: &crate::cli::monitor::Liveness) -> Option<Vec<Span>> {
     use crate::cli::monitor::{Liveness, Observed};
-    let warn = |text: &str| colored("33", text.to_string());
     let shown = match monitor {
         Liveness::Running {
-            pid,
             build,
-            observed,
+            observed: Some(Observed::Replaced {
+                installed_version, ..
+            }),
+            ..
         } => {
-            let build = match build {
-                Some(build) => {
-                    let state = match observed {
-                        Some(Observed::Current) => "current",
-                        Some(Observed::Replaced { .. }) => "replaced",
-                        Some(Observed::Unavailable { .. }) => "install unavailable",
-                        None => "not yet observed",
-                    };
-                    let id = build.running.get(..8).unwrap_or(&build.running);
-                    format!("{id} {state}")
-                }
-                None => "build unknown".to_string(),
-            };
-            dim(format!("pid {pid} · {build}"))
+            let named = |v: Option<&String>| v.map_or("an older build", |v| v.as_str()).to_string();
+            format!(
+                "running {}, installed {} — restart to update",
+                named(build.as_ref().and_then(|b| b.version.as_ref())),
+                named(installed_version.as_ref())
+            )
         }
-        Liveness::Gone { pid } => warn(&format!("gone (pid {pid} exited)")),
-        Liveness::Unknown(_) => warn("unknown · build unknown"),
-        Liveness::None => warn("none"),
+        Liveness::Running { .. } => return None,
+        Liveness::Gone { .. } => "stopped".to_string(),
+        Liveness::Unknown(_) => "status unknown".to_string(),
+        Liveness::None => "not running — nothing will wake agents".to_string(),
     };
-    vec![label("monitor"), shown]
+    Some(vec![label("monitor"), colored("33", shown)])
 }
 
 /// The `dirty` gauge: `+12` green, `−3` red (GitHub convention),
@@ -650,7 +644,7 @@ pub(super) fn scrollable_header(
     if let Some(d) = &snap.dirty {
         body.push(dirty_spans(d));
     }
-    body.push(monitor_spans(&snap.monitor));
+    body.extend(monitor_spans(&snap.monitor));
 
     // `done` — last finished, only when the repo is idle: PANEL-LESS
     // renders only (the finalize row in the log carries it —
@@ -6843,69 +6837,78 @@ mod tests {
         assert!(!dirty.contains("\x1b[32m") && !dirty.contains("\x1b[31m"));
     }
 
-    /// The `monitor` row in every state: pid and build, dim, while it
-    /// runs; the warning colour when nothing is there to wake anyone.
+    /// The `monitor` row says, in the warning colour, only what a person
+    /// can act on; a healthy monitor leaves no row, blank or otherwise.
     #[test]
-    fn the_monitor_row_shows_each_state() {
+    fn the_monitor_row_appears_only_when_something_is_wrong() {
         use crate::cli::monitor::{DescribedBuild, Liveness, Observed};
-        let build = DescribedBuild {
+        let build = |version: Option<&str>| DescribedBuild {
             running: "71e4c5c1aabbccdd00112233445566ff".into(),
+            version: version.map(str::to_string),
             installed_at: "/bin/clank".into(),
             source: crate::build_stamp::Source::Invocation,
         };
-        let running = |observed| Liveness::Running {
+        let running = |build, observed| Liveness::Running {
             pid: 7705,
-            build: Some(build.clone()),
+            build,
             observed,
         };
-        let cases = [
+        let replaced = |version: Option<&str>| {
+            Some(Observed::Replaced {
+                installed: "ffff".into(),
+                installed_version: version.map(str::to_string),
+            })
+        };
+        let warned = [
             (
-                running(Some(Observed::Current)),
-                "monitor  pid 7705 · 71e4c5c1 current",
-                false,
+                running(Some(build(Some("0.0.1+c5eaf416"))), replaced(Some("1.0.0"))),
+                "monitor  running 0.0.1+c5eaf416, installed 1.0.0 — restart to update",
             ),
             (
-                running(Some(Observed::Replaced {
-                    installed: "ffff".into(),
-                })),
-                "monitor  pid 7705 · 71e4c5c1 replaced",
-                false,
+                running(Some(build(None)), replaced(None)),
+                "monitor  running an older build, installed an older build — restart to update",
             ),
-            (
-                running(None),
-                "monitor  pid 7705 · 71e4c5c1 not yet observed",
-                false,
-            ),
-            (
-                Liveness::Running {
-                    pid: 7705,
-                    build: None,
-                    observed: None,
-                },
-                "monitor  pid 7705 · build unknown",
-                false,
-            ),
-            (
-                Liveness::Gone { pid: 11481 },
-                "monitor  gone (pid 11481 exited)",
-                true,
-            ),
+            (Liveness::Gone { pid: 11481 }, "monitor  stopped"),
             (
                 Liveness::Unknown("a proto 3 descriptor with no readable pid".into()),
-                "monitor  unknown · build unknown",
-                true,
+                "monitor  status unknown",
             ),
-            (Liveness::None, "monitor  none", true),
+            (
+                Liveness::None,
+                "monitor  not running — nothing will wake agents",
+            ),
         ];
-        for (monitor, want, warns) in cases {
-            for mut s in [snap(None, vec![]), two_agent_snap()] {
+        let healthy = [
+            running(Some(build(Some("1.0.0"))), Some(Observed::Current)),
+            running(Some(build(Some("1.0.0"))), None),
+            running(
+                Some(build(Some("1.0.0"))),
+                Some(Observed::Unavailable { why: "gone".into() }),
+            ),
+            running(None, None),
+        ];
+        for mut s in [snap(None, vec![]), two_agent_snap()] {
+            let mut warned_lines = Vec::new();
+            for (monitor, want) in &warned {
                 s.monitor = monitor.clone();
-                let line = render(&s, 40, 80)
-                    .into_iter()
-                    .find(|l| visible(l).starts_with("monitor"))
+                let lines = render(&s, 40, 80);
+                let at = lines
+                    .iter()
+                    .position(|l| visible(l).starts_with("monitor"))
                     .unwrap_or_else(|| panic!("a monitor row for {monitor:?}"));
-                assert_eq!(visible(&line), want);
-                assert_eq!(line.contains("\x1b[33m"), warns, "{line:?}");
+                assert_eq!(visible(&lines[at]), *want);
+                assert!(lines[at].contains("\x1b[33m"), "{:?}", lines[at]);
+                warned_lines.push((lines, at));
+            }
+            let (mut without, at) = warned_lines.pop().unwrap();
+            without.remove(at);
+            for monitor in &healthy {
+                s.monitor = monitor.clone();
+                assert_eq!(
+                    render(&s, 40, 80),
+                    without,
+                    "a healthy monitor left a row behind: {monitor:?}"
+                );
             }
         }
     }
