@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 
 [dependencies]
+memchr = "2"
 # Shared terminal width and grapheme boundaries for icons and row layout.
 unicode-width = "0.2"
 unicode-segmentation = "1"

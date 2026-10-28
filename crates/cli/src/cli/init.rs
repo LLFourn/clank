@@ -1242,6 +1242,7 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .arg("-C")
             .arg(dir)
             .args(args)

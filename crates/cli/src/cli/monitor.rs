@@ -414,20 +414,6 @@ pub(crate) fn beat_overdue(since_last: Duration, grace: Duration) -> bool {
     since_last > grace
 }
 
-/// Whether a client should stop trying to share and just do the work
-/// itself.
-///
-/// The watchdog covers a stalled fold in a process that still runs its
-/// threads. It does NOT cover a whole-process suspension or a watchdog
-/// that itself died: the flock stays held, so spawning again cannot
-/// acquire it, and no amount of retrying will (codex on adb5453). This
-/// is the bounded fallback for that — the agent degrades to today's
-/// self-contained wait rather than going silent, which is the one
-/// outcome that must never follow from this plan.
-pub(crate) fn give_up_sharing(attempts: u32, limit: u32) -> bool {
-    attempts >= limit
-}
-
 /// What one look at the fold decides.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Watch {
@@ -926,8 +912,8 @@ pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
 /// An OVERALL budget, not an idle timeout: a peer that dribbles a byte
 /// at a time would extend an inactivity timeout for as long as it
 /// liked, and a monitor that accepts and then says nothing would
-/// otherwise strand the client forever — `give_up_sharing` cannot help
-/// if `attach` never returns (codex on af1efd2).
+/// otherwise strand the client forever — no deadline outside it can
+/// help if `attach` never returns (codex on af1efd2).
 pub(crate) const ATTACH_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a client waits for any note before it stops sharing.
@@ -937,15 +923,12 @@ pub(crate) const ATTACH_BUDGET: Duration = Duration::from_secs(5);
 /// wedged, and both are the same answer to a client.
 pub(crate) const BEAT_GRACE: Duration = Duration::from_secs(20);
 
-/// How long a client gives a monitor it just started to come up.
-///
-/// Short on purpose. It is spent BEFORE the park, and a monitor that
-/// is not listening by then costs nothing: this wait watches locally
-/// and the process — which outlives every client — is there for the
-/// next one.
+/// What the handoff adds to `ATTACH_BUDGET`: the one deadline over
+/// finding, starting and attaching to a monitor is their sum.
 pub(crate) const SPAWN_SETTLE: Duration = Duration::from_millis(600);
 
-/// How many times a client tries to attach before watching for itself.
+/// How many steps `SPAWN_SETTLE` is cut into: a client waiting on a
+/// permit, a lease or a monitor it started looks again after each.
 pub(crate) const SHARE_ATTEMPTS: u32 = 4;
 
 /// A client's end of the connection.
@@ -1883,13 +1866,22 @@ pub(crate) fn repo_tag(repo: &std::path::Path) -> String {
 }
 
 /// Whether this repo's ownership became available./// Whether this repo's ownership became available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Ownership {
     /// The lease was taken and released, so the next monitor started
     /// can hold it.
     Ready,
     /// Still held when the deadline passed. Not permission.
     Busy,
+    /// The holder published while we waited, and this is how looking
+    /// at it ended.
+    ///
+    /// A lease held by nothing published is as often a monitor coming
+    /// UP as one going: it takes the lease before it binds and
+    /// publishes, and a debug build spends most of a second between the
+    /// two. Waiting only for the lease to free waits out the whole
+    /// deadline on a healthy monitor.
+    Answered(Attempt),
 }
 
 /// Wait, within one deadline, for this repo's ownership to free.
@@ -1904,7 +1896,7 @@ pub(crate) async fn wait_for_ownership(
     by: std::time::Instant,
     step: Duration,
 ) -> Ownership {
-    wait_for_ownership_by(repo, by, step, |r| acquire_lease(r).is_ok()).await
+    wait_for_ownership_by(repo, by, step, |r| acquire_lease(r).is_ok(), |_| None).await
 }
 
 /// Wait within one deadline using the caller's non-blocking ownership probe.
@@ -1914,11 +1906,15 @@ pub(crate) async fn wait_for_ownership(
 /// passing BEFORE anything is started. Taking the real lease is
 /// fast, so a test cannot arrange that gap by scheduling — and a
 /// guard nothing can drive is a guard nobody has checked.
+///
+/// `look` is asked, with what is left of the deadline, after every
+/// step the lease stays held; `Some` ends the wait.
 pub(crate) async fn wait_for_ownership_by(
     repo: &std::path::Path,
     by: std::time::Instant,
     step: Duration,
     took_it: impl Fn(&std::path::Path) -> bool,
+    mut look: impl FnMut(Duration) -> Option<Attempt>,
 ) -> Ownership {
     loop {
         // Expiry BEFORE readiness. Taking the lease first meant an
@@ -1936,6 +1932,13 @@ pub(crate) async fn wait_for_ownership_by(
         // Async, so a client waiting for a monitor to go does not park
         // the runtime thread it is waiting on.
         tokio::time::sleep(step.min(left)).await;
+        let left = by.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ownership::Busy;
+        }
+        if let Some(ended) = look(left) {
+            return Ownership::Answered(ended);
+        }
     }
 }
 
@@ -2073,7 +2076,6 @@ pub(crate) async fn attempt_by(
         by,
         budget,
         settle / limit,
-        limit,
         spawn,
         connect,
         took_it,
@@ -2091,7 +2093,6 @@ pub(crate) async fn attach_or_spawn_until(
     by: std::time::Instant,
     first: Duration,
     step: Duration,
-    limit: u32,
     spawn: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn Started>>,
     connect: impl Fn(
         &std::path::Path,
@@ -2108,7 +2109,8 @@ pub(crate) async fn attach_or_spawn_until(
     // Starting one would add a monitor that cannot own anything, and
     // doing it on every park is the cost this classification exists to
     // remove.
-    let mut why = match settled(look_at(repo, who.clone(), first.min(left), connect)) {
+    let look = |left| settled(look_at(repo, who.clone(), left, connect));
+    let mut why = match look(first.min(left)) {
         Ok(ended) => return ended,
         Err(why) => why,
     };
@@ -2126,18 +2128,30 @@ pub(crate) async fn attach_or_spawn_until(
     // creates the replacement once the lease finally frees.
     // ONE repair per repo, not one per waiting client. The permit is
     // taken before any lease polling and held through startup — if
-    // another client holds it, this one is not a second repairer and
-    // does its own work (codex on cf29219).
-    let permit = match take_repair_permit(repo) {
-        Repair::Acquired(permit) => permit,
-        Repair::Busy => {
-            return Attempt::Busy(format!("{why}, and another client is already starting one"));
-        }
-        // Not established that anybody is repairing — only that we
-        // cannot ask. Saying otherwise would be a guess reported as a
-        // fact.
-        Repair::Unavailable(gate) => {
-            return Attempt::Unproven(format!("{why}, and the repair gate is unusable: {gate}"));
+    // another client holds it, this one is not a second repairer
+    // (codex on cf29219). It looks for the repairer's monitor until the
+    // deadline instead: ending on the first refusal failed every client
+    // that arrived while one was starting.
+    let permit = loop {
+        match take_repair_permit(repo) {
+            Repair::Acquired(permit) => break permit,
+            Repair::Busy => match look_after(by, step, &look).await {
+                Some(Ok(ended)) => return ended,
+                Some(Err(next)) => why = next,
+                None => {
+                    return Attempt::Busy(format!(
+                        "{why}, and another client is already starting one"
+                    ));
+                }
+            },
+            // Not established that anybody is repairing — only that we
+            // cannot ask. Saying otherwise would be a guess reported as
+            // a fact.
+            Repair::Unavailable(gate) => {
+                return Attempt::Unproven(format!(
+                    "{why}, and the repair gate is unusable: {gate}"
+                ));
+            }
         }
     };
 
@@ -2147,14 +2161,23 @@ pub(crate) async fn attach_or_spawn_until(
     // than starting anything.
     let left = by.saturating_duration_since(std::time::Instant::now());
     if !left.is_zero() {
-        match settled(look_at(repo, who.clone(), left, connect)) {
+        match look(left) {
             Ok(ended) => return ended,
             Err(next) => why = next,
         }
     }
 
-    match wait_for_ownership_by(repo, by, step, took_it).await {
+    let ownership = wait_for_ownership_by(repo, by, step, took_it, |left| match look(left) {
+        Ok(ended) => Some(ended),
+        Err(next) => {
+            why = next;
+            None
+        }
+    })
+    .await;
+    match ownership {
         Ownership::Ready => {}
+        Ownership::Answered(ended) => return ended,
         // Still held when time ran out. This client does its own work;
         // a monitor that cannot own the repo helps nobody.
         Ownership::Busy => {
@@ -2180,23 +2203,12 @@ pub(crate) async fn attach_or_spawn_until(
         Err(e) => return Attempt::SpawnFailed(format!("{why}, and starting one failed: {e}")),
     }
 
-    let mut attempts = 1;
-    while !give_up_sharing(attempts, limit) {
-        let left = by.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        tokio::time::sleep(step.min(left)).await;
-        attempts += 1;
-        // What is LEFT of the one deadline, never a fresh budget: an
-        // attempt entering its handshake just before `by` could
-        // otherwise block for another whole `ATTACH_BUDGET`, and an
-        // outer check cannot make that bounded.
-        let left = by.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match settled(look_at(repo, who.clone(), left, connect)) {
+    // Bounded by the deadline alone. A retry count here gave the
+    // monitor about 450ms to read its installation, take the lease,
+    // bind and publish, which a debug build cannot do; and several
+    // callers have no local watch to fall back on.
+    while let Some(seen) = look_after(by, step, &look).await {
+        match seen {
             Ok(ended) => return ended,
             Err(next) => why = next,
         }
@@ -2209,6 +2221,29 @@ pub(crate) async fn attach_or_spawn_until(
         "started a monitor for {}, but {why}",
         repo.display()
     ))
+}
+
+/// Sleep one `step`, then `look` with what is LEFT of the one deadline;
+/// `None` once it has gone.
+///
+/// Never a fresh budget: an attempt entering its handshake just before
+/// `by` could otherwise block for another whole `ATTACH_BUDGET`, and an
+/// outer check cannot make that bounded.
+async fn look_after(
+    by: std::time::Instant,
+    step: Duration,
+    look: impl Fn(Duration) -> Result<Attempt, String>,
+) -> Option<Result<Attempt, String>> {
+    let left = by.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return None;
+    }
+    tokio::time::sleep(step.min(left)).await;
+    let left = by.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return None;
+    }
+    Some(look(left))
 }
 
 /// How often a fold subscriber looks up from its socket.
@@ -11667,9 +11702,11 @@ mod tests {
         assert!(acquire_lease(repo.path()).is_ok());
 
         let gone = std::time::Instant::now() - Duration::from_millis(1);
-        assert_eq!(
-            wait_for_ownership(repo.path(), gone, Duration::from_millis(5)).await,
-            Ownership::Busy,
+        assert!(
+            matches!(
+                wait_for_ownership(repo.path(), gone, Duration::from_millis(5)).await,
+                Ownership::Busy
+            ),
             "a free lease past the deadline is still not permission to start"
         );
     }
@@ -11695,7 +11732,7 @@ mod tests {
         // a handful of tries would never reach it.
         let by = std::time::Instant::now() + Duration::from_secs(3);
         let got = wait_for_ownership(repo.path(), by, Duration::from_millis(15)).await;
-        assert_eq!(got, Ownership::Ready);
+        assert!(matches!(got, Ownership::Ready), "{got:?}");
         releasing.await.unwrap();
 
         // And a lease that never frees is Busy rather than a wait
@@ -11703,10 +11740,10 @@ mod tests {
         let still = acquire_lease(repo.path()).unwrap();
         let began = std::time::Instant::now();
         let by = std::time::Instant::now() + Duration::from_millis(80);
-        assert_eq!(
+        assert!(matches!(
             wait_for_ownership(repo.path(), by, Duration::from_millis(15)).await,
             Ownership::Busy
-        );
+        ));
         assert!(began.elapsed() < Duration::from_secs(1));
         drop(still);
     }
@@ -11792,7 +11829,12 @@ mod tests {
         .await;
 
         match got {
-            Attached::Alone(why) => assert!(why.contains("ran out of time"), "{why}"),
+            // Under load the 40 ms deadline can lapse during the lease
+            // probe as well as after it; either way nothing may start.
+            Attached::Alone(why) => assert!(
+                why.contains("ran out of time") || why.contains("its lease is still held"),
+                "{why}"
+            ),
             other => panic!("nothing was started, so nothing can be shared: {other:?}"),
         }
         assert_eq!(
@@ -11817,14 +11859,19 @@ mod tests {
         let by = std::time::Instant::now() + Duration::from_millis(40);
 
         // Succeeds — but only after the deadline has gone.
-        let got = wait_for_ownership_by(repo.path(), by, Duration::from_millis(5), |_| {
-            std::thread::sleep(Duration::from_millis(60));
-            true
-        })
+        let got = wait_for_ownership_by(
+            repo.path(),
+            by,
+            Duration::from_millis(5),
+            |_| {
+                std::thread::sleep(Duration::from_millis(60));
+                true
+            },
+            |_| None,
+        )
         .await;
-        assert_eq!(
-            got,
-            Ownership::Ready,
+        assert!(
+            matches!(got, Ownership::Ready),
             "the probe did take it, which is what makes the guard after it necessary"
         );
         assert!(
@@ -12034,6 +12081,106 @@ mod tests {
         if let Some(h) = replacement.lock().unwrap().take() {
             h.join().unwrap();
         }
+    }
+
+    /// Publishes a welcoming monitor for `repo` after `delay`, as one
+    /// that is still reading its installation and binding does.
+    fn publishes_after(
+        repo: std::path::PathBuf,
+        delay: Duration,
+    ) -> std::thread::JoinHandle<(tempfile::TempDir, std::thread::JoinHandle<Option<Hello>>)> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            fake_monitor(&repo, Some(welcome_line()))
+        })
+    }
+
+    /// Far more steps than `SHARE_ATTEMPTS` at the settle these tests
+    /// pass, so only a wait bounded by the deadline reaches it.
+    const LATE: Duration = Duration::from_millis(300);
+    const SETTLE: Duration = Duration::from_millis(40);
+
+    /// A lease held with nothing published yet is a monitor coming up,
+    /// and the client attaches to it once it publishes.
+    #[tokio::test]
+    async fn a_client_waiting_on_a_held_lease_attaches_when_its_holder_publishes() {
+        let repo = repo_dir();
+        let lease = acquire_lease(repo.path()).expect("the starting monitor owns it");
+        let late = publishes_after(repo.path().to_path_buf(), LATE);
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("grok"),
+            Duration::from_secs(5),
+            SETTLE,
+            SHARE_ATTEMPTS,
+            forbidden,
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        assert!(matches!(got, Attached::Shared(_)), "{got:?}");
+        let (_dir, served) = late.join().unwrap();
+        served.join().unwrap();
+        drop(lease);
+    }
+
+    /// A client finding the repair permit held attaches to the
+    /// repairer's monitor once it publishes, and starts nothing.
+    #[tokio::test]
+    async fn a_client_finding_the_permit_held_attaches_to_the_repairers_monitor() {
+        let repo = repo_dir();
+        let me = unsafe { libc::getuid() };
+        let gate = match take_repair_permit_in(repo.path(), &runtime_dir(me), me) {
+            Repair::Acquired(p) => p,
+            other => panic!("the repairer takes it: {other:?}"),
+        };
+        let late = publishes_after(repo.path().to_path_buf(), LATE);
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("grok"),
+            Duration::from_secs(5),
+            SETTLE,
+            SHARE_ATTEMPTS,
+            forbidden,
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        assert!(matches!(got, Attached::Shared(_)), "{got:?}");
+        let (_dir, served) = late.join().unwrap();
+        served.join().unwrap();
+        drop(gate);
+    }
+
+    /// A client that started a monitor waits for it to publish until
+    /// the deadline, not for a count of looks.
+    #[tokio::test]
+    async fn a_client_attaches_to_the_monitor_it_started_however_many_looks_it_takes() {
+        let repo = repo_dir();
+        let late = std::sync::Mutex::new(None);
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("grok"),
+            Duration::from_secs(5),
+            SETTLE,
+            SHARE_ATTEMPTS,
+            |r| {
+                *late.lock().unwrap() = Some(publishes_after(r.to_path_buf(), LATE));
+                Ok(Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+
+        assert!(matches!(got, Attached::Shared(_)), "{got:?}");
+        let (_dir, served) = late.lock().unwrap().take().unwrap().join().unwrap();
+        served.join().unwrap();
     }
 
     /// A second contender does not become a second repairer.
@@ -12358,13 +12505,13 @@ mod tests {
         }
     }
 
-    /// A monitor that never comes up bounds the attempts.
+    /// A monitor that never comes up is given up on at the deadline.
     ///
-    /// A holder that is merely SUSPENDED keeps its lease, so retrying
-    /// cannot take it — the client must stop and watch for itself
-    /// rather than spend the park's budget asking again.
+    /// Not after a count of looks: that ended the wait before a debug
+    /// monitor could publish, and the client keeps looking until the
+    /// deadline instead.
     #[tokio::test]
-    async fn a_monitor_that_never_comes_up_bounds_the_attempts() {
+    async fn a_monitor_that_never_comes_up_is_given_up_on_at_the_deadline() {
         let repo = repo_dir();
         let dir = tempfile::tempdir().unwrap();
         // Published, but nothing is listening there: every attempt
@@ -12384,12 +12531,14 @@ mod tests {
         )
         .unwrap();
         let tries = std::sync::atomic::AtomicUsize::new(0);
+        let (budget, settle) = (Duration::from_millis(400), Duration::from_millis(80));
+        let began = std::time::Instant::now();
 
         let got = attach_or_spawn_by(
             repo.path(),
             agent("codex"),
-            ATTACH_BUDGET,
-            Duration::from_millis(80),
+            budget,
+            settle,
             SHARE_ATTEMPTS,
             |_| Ok(Box::new(NotStarted) as Box<dyn Started>),
             |path, deadline| {
@@ -12400,13 +12549,24 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(got, Attached::Alone(_)), "{got:?}");
-        assert_eq!(
-            tries.load(std::sync::atomic::Ordering::SeqCst),
-            SHARE_ATTEMPTS as usize + 1,
-            "bounded by the limit, not by the park's patience — plus the ONE re-read \
-             after taking the repair permit, which exists because a winner may have \
-             appeared while this client queued for it"
+        let took = began.elapsed();
+        match got {
+            Attached::Alone(why) => assert!(why.contains("started a monitor"), "{why}"),
+            other => panic!("nothing ever listened: {other:?}"),
+        }
+        assert!(
+            took >= budget + settle,
+            "it waited out the deadline: {took:?}"
+        );
+        assert!(
+            took < budget + settle + Duration::from_secs(2),
+            "and no longer: {took:?}"
+        );
+        // The initial look, the re-read after taking the permit, then
+        // one per step of `settle / SHARE_ATTEMPTS` until the deadline.
+        assert!(
+            tries.load(std::sync::atomic::Ordering::SeqCst) > SHARE_ATTEMPTS as usize + 1,
+            "it kept looking past the old count"
         );
     }
 
@@ -15406,20 +15566,6 @@ something to promote
             "and with nothing watching, a wake would promise a freshness \
              that is not coming"
         );
-    }
-
-    /// A client that cannot share must still be woken, by itself.
-    ///
-    /// The uncovered case is a suspended monitor holding the flock:
-    /// nothing evicts it and spawning cannot take the lease, so the
-    /// only safe end is to stop sharing. Silence is the one outcome
-    /// this plan may not produce.
-    #[test]
-    fn a_client_that_cannot_share_falls_back_rather_than_waiting() {
-        assert!(!give_up_sharing(0, 3));
-        assert!(!give_up_sharing(2, 3));
-        assert!(give_up_sharing(3, 3), "bounded, not endless");
-        assert!(give_up_sharing(9, 3));
     }
 
     /// Drive the watchdog over a SEQUENCE of ticks and say when it

@@ -97,11 +97,9 @@ pub struct Build {
 pub fn find(bytes: &[u8]) -> Result<Build, String> {
     let framed = embedded();
     let marker = &framed[..MARKER_LEN];
-    let mut found = bytes
-        .windows(MARKER_LEN)
-        .enumerate()
-        .filter(|(_, window)| *window == marker)
-        .map(|(at, _)| at);
+    // A byte-window scan of a ~160 MB debug executable takes seconds,
+    // long enough for a starting monitor to outlast its client's wait.
+    let mut found = memchr::memmem::find_iter(bytes, marker);
     let Some(at) = found.next() else {
         return Err("it carries no build stamp".into());
     };

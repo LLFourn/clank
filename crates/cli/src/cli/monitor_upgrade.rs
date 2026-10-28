@@ -604,7 +604,6 @@ fn start_with(
                 deadline,
                 super::monitor::ATTACH_BUDGET,
                 super::monitor::SPAWN_SETTLE / super::monitor::SHARE_ATTEMPTS,
-                super::monitor::SHARE_ATTEMPTS,
                 |repo| {
                     let started = spawn(repo);
                     if started.is_ok() {
