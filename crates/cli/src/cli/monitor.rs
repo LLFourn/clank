@@ -1340,6 +1340,13 @@ pub(crate) enum Seen {
     Newer(String),
     /// Nothing usable is published. Starting one is the answer.
     Vacant(String),
+    /// The monitor at the published address hung up without answering:
+    /// a process going down, or a retiring one dropping arrivals. Linux
+    /// releases a dying process's files highest fd first, so its client
+    /// connections close before its listener does, and a client that
+    /// reconnects in that window is reset where macOS would refuse it.
+    /// Repaired like a vacancy: the lease says when it has gone.
+    HungUp(String),
     /// An older peer answered, and has now been greeted by a newer
     /// client. Retirement is UNCONFIRMED: proto 3 and 4 cannot
     /// self-exit, and the lease is what settles it. `obsolete` is
@@ -1358,6 +1365,7 @@ impl From<Seen> for Attached {
             Seen::Theirs(why)
             | Seen::Newer(why)
             | Seen::Vacant(why)
+            | Seen::HungUp(why)
             | Seen::OlderPeer { why, .. }
             | Seen::Unproven(why) => Attached::Alone(why),
         }
@@ -1427,7 +1435,7 @@ fn settled(seen: Seen) -> Result<Attempt, String> {
         Seen::Newer(why) => Ok(Attempt::Newer(why)),
         Seen::Theirs(why) => Ok(Attempt::Theirs(why)),
         Seen::Unproven(why) => Ok(Attempt::Unproven(why)),
-        Seen::Vacant(why) | Seen::OlderPeer { why, .. } => Err(why),
+        Seen::Vacant(why) | Seen::HungUp(why) | Seen::OlderPeer { why, .. } => Err(why),
     }
 }
 
@@ -1585,13 +1593,21 @@ pub(crate) fn greet_at(
 
     let mut conn = Conn::over_reader(std::io::BufReader::new(stream));
     if let Err(e) = write_frame(conn.io.get_ref(), format!("{line}\n").as_bytes(), deadline) {
-        return Seen::Unproven(format!("cannot greet {}: {e}", socket));
+        let why = format!("cannot greet {}: {e}", socket);
+        return match hung_up(&e) {
+            true => Seen::HungUp(why),
+            false => Seen::Unproven(why),
+        };
     }
 
     let answer = match read_frame(&mut conn.io, &mut conn.partial, deadline) {
         Ok(answer) => answer,
         Err(e) => {
-            return Seen::Unproven(format!("the handshake with {} failed: {e}", socket));
+            let why = format!("the handshake with {} failed: {e}", socket);
+            return match hung_up(&e) {
+                true => Seen::HungUp(why),
+                false => Seen::Unproven(why),
+            };
         }
     };
     // Version before body here too: the descriptor said what the
@@ -1641,6 +1657,17 @@ pub(crate) fn greet_at(
         }
         Err(e) => Seen::Unproven(format!("the monitor's answer did not parse: {e}")),
     }
+}
+
+/// Whether a handshake error is the peer closing on us, as opposed to a
+/// deadline or a fault on our side.
+fn hung_up(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 /// The right to try a REPAIR of this repo's monitor, held while one
@@ -3537,8 +3564,8 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            // Dropped when retiring: the peer reads EOF and finds the
-            // successor.
+            // Dropped when retiring: the peer sees it hang up and finds
+            // the successor.
             Wake::Accepted(stream) => {
                 if owner {
                     let repo = repo.clone();
@@ -11181,6 +11208,91 @@ mod tests {
             "one start is enough when it works: the retry attaches rather than \
              starting again"
         );
+    }
+
+    /// A monitor that hangs up during the handshake is repaired, not
+    /// gone around.
+    ///
+    /// The published monitor accepts one connection and closes it unread,
+    /// then stops listening: what a client reconnecting to a monitor that
+    /// was just killed meets on Linux, where the listener outlives the
+    /// client connections by a few milliseconds and the hello is reset.
+    #[tokio::test]
+    async fn a_monitor_that_hangs_up_mid_handshake_is_replaced() {
+        let repo = repo_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_path(dir.path(), 4747).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        publish(
+            repo.path(),
+            &Descriptor {
+                proto: PROTO,
+                pid: 4747,
+                repo: repo.path().to_string_lossy().to_string(),
+                socket: path.to_string_lossy().to_string(),
+                build: None,
+            },
+        )
+        .unwrap();
+        let dying = std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let (_live, d) = unannounced_monitor(repo.path());
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+
+        let got = attach_or_spawn_by(
+            repo.path(),
+            agent("codex"),
+            ATTACH_BUDGET,
+            Duration::from_millis(200),
+            SHARE_ATTEMPTS,
+            |r| {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                publish(r, &d).map(|()| Box::new(NotStarted) as Box<dyn Started>)
+            },
+            connect_within,
+            |r| acquire_lease(r).is_ok(),
+        )
+        .await;
+        dying.join().unwrap();
+
+        assert!(matches!(got, Attached::Shared(_)), "{got:?}");
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A hang-up is told apart from a peer that never answers: only the
+    /// first says the monitor is going.
+    #[test]
+    fn a_hang_up_is_not_a_silence() {
+        let repo = repo_dir();
+        let deadline = || std::time::Instant::now() + Duration::from_millis(150);
+        let paired = |hang_up: bool| {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            ours.set_nonblocking(true).unwrap();
+            let theirs = (!hang_up).then_some(theirs);
+            move |_: &std::path::Path, _: std::time::Instant| {
+                let _ = &theirs;
+                ours.try_clone()
+            }
+        };
+        assert!(matches!(
+            greet_at(
+                "pair",
+                repo.path(),
+                agent("codex"),
+                deadline(),
+                paired(true)
+            ),
+            Seen::HungUp(_)
+        ));
+        assert!(matches!(
+            greet_at(
+                "pair",
+                repo.path(),
+                agent("codex"),
+                deadline(),
+                paired(false)
+            ),
+            Seen::Unproven(_)
+        ));
     }
 
     /// The runtime namespace is derived, not created, by a LOOKUP.

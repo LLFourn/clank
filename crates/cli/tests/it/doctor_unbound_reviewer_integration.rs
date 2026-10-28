@@ -451,7 +451,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
     let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = results
         .iter()
-        .find(|r| r.name.contains("agent: grok"))
+        .find(|r| r.name == "agent: grok")
         .expect("a grok agent line");
     assert!(
         line.message
@@ -476,7 +476,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
     let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
     let line = results
         .iter()
-        .find(|r| r.name.contains("agent: grok"))
+        .find(|r| r.name == "agent: grok")
         .expect("a grok agent line");
     assert!(
         line.message.contains("auto_mode=off (per-agent)"),

@@ -7,25 +7,14 @@ use crate::common;
 use clank::cli::teams_config::RosterRole;
 use common::TestEnv;
 use std::path::Path;
-use std::process::Command;
 
 fn git_out(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("git");
+    let out = common::git_command(repo).args(args).output().expect("git");
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .expect("git");
+    let status = common::git_command(repo).args(args).status().expect("git");
     assert!(status.success(), "git {args:?} failed");
 }
 

@@ -70,13 +70,23 @@ impl Drop for TestEnv {
     }
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+/// `git -C repo` carrying a test identity in its environment, so a
+/// commit in a clone or worktree the fixture never configured works on
+/// a runner with no global git identity.
+pub fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
-        .args(args)
-        .status()
-        .expect("spawn git");
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test");
+    command
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let status = git_command(repo).args(args).status().expect("spawn git");
     assert!(status.success(), "git {args:?} failed");
 }
 

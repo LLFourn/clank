@@ -426,7 +426,7 @@ fn classify(seen: Seen) -> Outcome {
         Seen::OlderPeer { why, .. } => Outcome::Refused(why),
         Seen::Shared(_) => Outcome::Current,
         Seen::Newer(_) => Outcome::Newer,
-        Seen::Theirs(why) | Seen::Unproven(why) => Outcome::Unproven(why),
+        Seen::Theirs(why) | Seen::HungUp(why) | Seen::Unproven(why) => Outcome::Unproven(why),
         Seen::Vacant(why) => Outcome::Unreachable(why),
     }
 }
