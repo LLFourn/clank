@@ -41,6 +41,14 @@ const QUIET_NOTIFICATIONS: &[&str] = &[
     "turn/plan/updated",
 ];
 
+/// Whether the browser's `wire` id names `id`. The page echoes the id
+/// as rendered JSON, so a string id arrives quoted; `Value`'s own
+/// `PartialEq<String>` would match only the unquoted text.
+#[allow(clippy::cmp_owned)]
+pub(crate) fn is_wire_id(id: &Value, wire: &str) -> bool {
+    id.to_string() == wire
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Request {
     /// The provider's server-request id, unrelated to our client RPC ids.
@@ -578,10 +586,10 @@ fn restore_delivery(feed: &Feed, label: &str, owner: &str, previous: &[Request])
                     && old.turn == request.turn
                     && old.item == request.item
                     && old.question == request.question
-            }) {
-                if request.delivery == Delivery::Pending && old.delivery != Delivery::Pending {
-                    request.delivery = old.delivery;
-                }
+            }) && request.delivery == Delivery::Pending
+                && old.delivery != Delivery::Pending
+            {
+                request.delivery = old.delivery;
             }
         }
     });
@@ -639,6 +647,7 @@ pub(super) fn answer_payload(
     Ok(json!({"id":request.id,"result":{"answers":answers}}))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_answer<S: AsyncRead + AsyncWrite + Unpin>(
     native: &mut Native<S>,
     feed: &Feed,
@@ -667,7 +676,7 @@ async fn send_answer<S: AsyncRead + AsyncWrite + Unpin>(
         .and_then(|w| {
             w.pending
                 .iter()
-                .find(|r| r.id.to_string() == ask.id && r.turn == ask.turn && r.item == ask.item)
+                .find(|r| is_wire_id(&r.id, &ask.id) && r.turn == ask.turn && r.item == ask.item)
         });
     let Some(request) = request else {
         let _ = reply.send(answer_reply(

@@ -70,13 +70,23 @@ impl Drop for TestEnv {
     }
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+/// `git -C repo` carrying a test identity in its environment, so a
+/// commit in a clone or worktree the fixture never configured works on
+/// a runner with no global git identity.
+pub fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
-        .args(args)
-        .status()
-        .expect("spawn git");
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test");
+    command
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let status = git_command(repo).args(args).status().expect("spawn git");
     assert!(status.success(), "git {args:?} failed");
 }
 
@@ -181,9 +191,18 @@ pub fn race_deadline(repo: &Path) -> Duration {
 /// Attaching watchers concurrently is what made these binaries flaky
 /// (four at once pushed every deadline past its limit). Hold this for
 /// the body of any test that spawns a wait.
-pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+pub fn serial() -> Serial {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    Serial {
+        _guard: SERIAL.lock().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// Held across a whole async test body, awaits included: each
+/// `#[tokio::test]` runs on its own runtime thread, so blocking another
+/// test's thread on it is the serialization, not a deadlock.
+pub struct Serial {
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 /// Assert a wait does NOT resolve: spawn it, sample after

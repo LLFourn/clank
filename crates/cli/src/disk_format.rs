@@ -155,7 +155,7 @@ mod tests {
         let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
         let author = AgentLabel::parse("alice").unwrap();
         assert_eq!(
-            canonical_feedback_path(&author, &sha, &[sha.clone()]),
+            canonical_feedback_path(&author, &sha, std::slice::from_ref(&sha)),
             PathBuf::from("agents/alice/feedback/abcdef0.md")
         );
     }
@@ -176,7 +176,7 @@ mod tests {
         let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
         let author = AgentLabel::parse("alice").unwrap();
         assert_eq!(
-            feedback_path_wire(&author, &sha, &[sha.clone()]),
+            feedback_path_wire(&author, &sha, std::slice::from_ref(&sha)),
             ".clank/agents/alice/feedback/abcdef0.md"
         );
     }
@@ -185,7 +185,7 @@ mod tests {
     fn canonical_and_parse_round_trip() {
         let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
         let author = AgentLabel::parse("alice").unwrap();
-        let built = canonical_feedback_path(&author, &sha, &[sha.clone()]);
+        let built = canonical_feedback_path(&author, &sha, std::slice::from_ref(&sha));
         let parsed = parse_feedback_path(&built).expect("round-trip parse");
         assert_eq!(parsed.author, author);
         assert_eq!(parsed.target_ref.as_str(), "abcdef0");

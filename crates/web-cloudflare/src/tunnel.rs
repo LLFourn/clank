@@ -531,10 +531,11 @@ impl Drop for CommandHandle {
         }
         // The pipes close with the group; the readers end on their
         // own, and an abort is the bound on one that does not.
-        for reader in [self.reader.take(), self.out_reader.take()] {
-            if let Some(r) = reader {
-                r.abort();
-            }
+        for reader in [self.reader.take(), self.out_reader.take()]
+            .into_iter()
+            .flatten()
+        {
+            reader.abort();
         }
     }
 }

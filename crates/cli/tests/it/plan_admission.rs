@@ -304,7 +304,7 @@ fn promotion_and_restore_share_admission_and_preserve_the_losing_input() {
             std::fs::read_to_string(repo.join("foo.rs")).unwrap(),
             "// foo implementation\n"
         );
-        assert!(promoted.unwrap_err().to_string().contains("already active"));
+        assert!(promoted.is_err_and(|e| e.to_string().contains("already active")));
     }
     let state =
         clank::rebuild::rebuild_repo_sync_with_policy(repo, clank::rebuild::CachePolicy::Use)

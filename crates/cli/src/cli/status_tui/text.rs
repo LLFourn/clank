@@ -987,7 +987,7 @@ mod tests {
                 let cut = truncate_to(&text, cols);
                 assert!(display_width(&cut) <= cols, "{icon:?} at {cols}: {cut:?}");
                 assert!(
-                    cut == "" || cut == "…" || cut.starts_with(icon),
+                    cut.is_empty() || cut == "…" || cut.starts_with(icon),
                     "partial icon: {cut:?}"
                 );
             }

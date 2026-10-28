@@ -237,10 +237,11 @@ impl Freshness {
                     None => (0, BTreeMap::new()),
                 };
                 for (pane, rev) in differing {
-                    if generation == sample.generation && captured.get(&pane) == Some(&rev) {
-                        if let Some(seen) = sampled.get(&pane) {
-                            outcome.stalled.insert(pane.clone(), seen.clone());
-                        }
+                    if generation == sample.generation
+                        && captured.get(&pane) == Some(&rev)
+                        && let Some(seen) = sampled.get(&pane)
+                    {
+                        outcome.stalled.insert(pane.clone(), seen.clone());
                     }
                 }
             }

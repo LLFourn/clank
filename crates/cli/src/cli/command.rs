@@ -1148,13 +1148,10 @@ mod tests {
 
     /// Every group's help, the top level included, as clap renders it
     /// at `width` columns, paired with the children it lists.
-    fn rendered_groups(width: usize) -> Vec<(String, String, Vec<(String, String)>)> {
-        fn walk(
-            c: &clap::Command,
-            path: &str,
-            width: usize,
-            out: &mut Vec<(String, String, Vec<(String, String)>)>,
-        ) {
+    type RenderedGroup = (String, String, Vec<(String, String)>);
+
+    fn rendered_groups(width: usize) -> Vec<RenderedGroup> {
+        fn walk(c: &clap::Command, path: &str, width: usize, out: &mut Vec<RenderedGroup>) {
             for sub in visible_children(c)
                 .into_iter()
                 .filter(|s| s.has_subcommands())
@@ -1220,7 +1217,7 @@ mod tests {
             for (name, about) in children {
                 let row = rendered
                     .lines()
-                    .find(|l| l.trim_start().split_whitespace().next() == Some(name.as_str()))
+                    .find(|l| l.split_whitespace().next() == Some(name.as_str()))
                     .unwrap_or_default();
                 if !row.contains(about.as_str()) {
                     long.push(format!("{path} {name}: {about}"));

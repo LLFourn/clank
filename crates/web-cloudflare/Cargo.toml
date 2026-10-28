@@ -2,6 +2,7 @@
 name = "clank-web-cloudflare"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.96"
 
 [features]
 test-support = []

@@ -761,7 +761,7 @@ mod tests {
         .await
         .unwrap();
         let text = handed.into_inner().unwrap().unwrap();
-        let mut parts = vec![
+        let mut parts = [
             format!("{VOICE}: {voice}@{first}"),
             format!("New events: command-bad@{bad}"),
         ];

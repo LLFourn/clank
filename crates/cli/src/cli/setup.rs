@@ -1053,6 +1053,7 @@ pub(crate) fn classify_asset_state(
 /// - matches the manifest's recorded hash → a known setup-written
 ///   OLDER version: upgrade WITHOUT `--force`
 /// - drifted (no provenance) → refuse unless `--force`
+///
 /// Every successful write records its hash, so the NEXT upgrade is
 /// silent. Pre-manifest files get one honest `--force` bridge:
 /// arbitrary existing content is never blessed into the manifest.
@@ -2022,9 +2023,11 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut launch = clank_core::agent_config::LaunchConfig::default();
-        launch.command = Some(program.to_string_lossy().into());
-        launch.args = vec!["--profile".into(), "test".into()];
+        let mut launch = clank_core::agent_config::LaunchConfig {
+            command: Some(program.to_string_lossy().into()),
+            args: vec!["--profile".into(), "test".into()],
+            ..Default::default()
+        };
         launch.env.insert(
             "HOME".into(),
             temp.path().join("home").to_string_lossy().into(),
@@ -3230,26 +3233,36 @@ mod tests {
         let alternate = "v2 other mode".to_string();
         let recorded = content_hash("v1");
         assert_eq!(
-            classify_asset_state("v2", expected, &[alternate.clone()], Some(&recorded)),
+            classify_asset_state(
+                "v2",
+                expected,
+                std::slice::from_ref(&alternate),
+                Some(&recorded)
+            ),
             AssetState::Current
         );
         assert_eq!(
             classify_asset_state(
                 "v2 other mode",
                 expected,
-                &[alternate.clone()],
+                std::slice::from_ref(&alternate),
                 Some(&recorded)
             ),
             AssetState::ModeAlternate
         );
         // What doctor calls old, setup overwrites: manifest match.
         assert_eq!(
-            classify_asset_state("v1", expected, &[alternate.clone()], Some(&recorded)),
+            classify_asset_state(
+                "v1",
+                expected,
+                std::slice::from_ref(&alternate),
+                Some(&recorded)
+            ),
             AssetState::OldSetup
         );
         // No record of it at all: drift, which refuses.
         assert_eq!(
-            classify_asset_state("v1", expected, &[alternate.clone()], None),
+            classify_asset_state("v1", expected, std::slice::from_ref(&alternate), None),
             AssetState::Drift
         );
         assert_eq!(
@@ -3510,7 +3523,7 @@ mod tests {
             tmp.path(),
             "SKILL.md",
             &asyncv,
-            &[legacy.clone()],
+            std::slice::from_ref(&legacy),
             false,
             false,
             &mut manifest,
@@ -3525,7 +3538,7 @@ mod tests {
             tmp.path(),
             "SKILL.md",
             &legacy,
-            &[asyncv.clone()],
+            std::slice::from_ref(&asyncv),
             false,
             false,
             &mut manifest,
@@ -3541,7 +3554,7 @@ mod tests {
             tmp.path(),
             "SKILL.md",
             &asyncv,
-            &[legacy.clone()],
+            std::slice::from_ref(&legacy),
             false,
             false,
             &mut manifest,
@@ -3556,7 +3569,7 @@ mod tests {
             tmp.path(),
             "SKILL.md",
             &asyncv,
-            &[legacy.clone()],
+            std::slice::from_ref(&legacy),
             false,
             true,
             &mut manifest,

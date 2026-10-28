@@ -404,10 +404,10 @@ pub(crate) fn interleave_with_plain<'a>(
         .collect();
     // Newest first; a stable sort keeps each list's own order on a tie.
     external.reverse();
-    external.sort_by(|a, b| b.0.cmp(&a.0));
+    external.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut history: Vec<TimelineItem<'a>> = events
         .iter()
-        .map(|event| TimelineItem::Repo(*event))
+        .map(|event| TimelineItem::Repo(event))
         .collect();
     history.extend(plain.iter().map(TimelineItem::Plain));
     let history_ts = |item: &TimelineItem<'_>| match item {
@@ -1942,7 +1942,7 @@ mod json_output_tests {
             DeliveryState::Acknowledged,
         ] {
             if state == DeliveryState::Woken {
-                log.append_presentations(&[key.clone()], 123, || true)
+                log.append_presentations(std::slice::from_ref(&key), 123, || true)
                     .unwrap();
             }
             if state == DeliveryState::Acknowledged {
@@ -3041,7 +3041,7 @@ mod tests {
             .set_modified(an_hour_ago)
             .unwrap();
 
-        let reviews = collect_reviews(dir.path(), &[sha.clone()]);
+        let reviews = collect_reviews(dir.path(), std::slice::from_ref(&sha));
         let [review] = reviews
             .get(sha.as_str())
             .map(Vec::as_slice)

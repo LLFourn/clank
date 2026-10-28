@@ -13,6 +13,7 @@ mod agent_setup_acceptance;
 mod agent_swap_integration;
 mod block_blast_radius;
 mod book_is_true;
+mod ci_workflow;
 mod clank_dir_boundary;
 mod claude_question_protocol;
 mod codex_question_protocol;

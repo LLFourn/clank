@@ -43,7 +43,7 @@ pub fn filename_mode(reviewable_shas: &[CommitSha]) -> FilenameMode {
 
 /// Pick the on-disk stem for `target_sha` given the scope's
 /// mode. Pure — the writer calls this; the reader doesn't.
-pub fn filename_stem<'a>(target_sha: &'a CommitSha, mode: FilenameMode) -> &'a str {
+pub fn filename_stem(target_sha: &CommitSha, mode: FilenameMode) -> &str {
     match mode {
         FilenameMode::Short => &target_sha.as_str()[..7.min(target_sha.as_str().len())],
         FilenameMode::Long => target_sha.as_str(),

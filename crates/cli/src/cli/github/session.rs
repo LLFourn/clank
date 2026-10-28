@@ -201,16 +201,15 @@ pub(crate) fn shared_session() -> std::sync::Arc<GithubSession<ReqwestSend>> {
         .clone()
 }
 
+#[cfg(test)]
+type AcquireForTests =
+    fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>;
+
 impl<S: HttpSend> GithubSession<S> {
     // `pub(crate)` so the CI reader's tests script this same session
     // rather than opening a second, differently-behaved one.
     #[cfg(test)]
-    pub(crate) fn for_tests(
-        http: S,
-        acquire: fn() -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>,
-        >,
-    ) -> Self {
+    pub(crate) fn for_tests(http: S, acquire: AcquireForTests) -> Self {
         Self {
             http,
             token: TokenCell::new(),

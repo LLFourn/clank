@@ -1094,7 +1094,7 @@ fn codex_candidates(dir: &Path, session_id: &str, out: &mut Vec<(PathBuf, std::t
 /// Several files for one id (a resumed session writes a new rollout)
 /// — the newest is the live one.
 fn pick_newest(mut found: Vec<(PathBuf, std::time::SystemTime)>) -> Option<PathBuf> {
-    found.sort_by(|a, b| b.1.cmp(&a.1));
+    found.sort_by_key(|a| std::cmp::Reverse(a.1));
     found.into_iter().next().map(|(p, _)| p)
 }
 

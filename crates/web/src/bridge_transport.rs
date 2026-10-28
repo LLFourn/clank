@@ -258,10 +258,11 @@ impl Connection {
                     tokio::select! { _ = writer_stop.changed() => return Ok(()), sent = sink.send(Message::Binary(packet.into())) => sent? };
                 }
             }.await;
-            if let Err(error) = result {
-                if !*writer_stop.borrow() && !error.downcast_ref().is_some_and(closed) {
-                    let _ = writer_error.try_send(error);
-                }
+            if let Err(error) = result
+                && !*writer_stop.borrow()
+                && !error.downcast_ref().is_some_and(closed)
+            {
+                let _ = writer_error.try_send(error);
             }
             let _ = writer_cancel.send(true);
         });
@@ -318,10 +319,10 @@ impl Connection {
                     }
                 }
             }.await;
-            if let Err(error) = result {
-                if !*reader_stop.borrow() {
-                    let _ = errors.try_send(error);
-                }
+            if let Err(error) = result
+                && !*reader_stop.borrow()
+            {
+                let _ = errors.try_send(error);
             }
             let _ = reader_cancel.send(true);
         });
@@ -442,7 +443,7 @@ mod tests {
             .unwrap();
         // Peer stops reading the outbound image and never Ends its own
         // transfer. Drop must cancel both tasks, which join codec jobs.
-        let tasks: Vec<_> = connection.tasks.drain(..).collect();
+        let tasks = std::mem::take(&mut connection.tasks);
         drop(connection);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             for task in tasks {

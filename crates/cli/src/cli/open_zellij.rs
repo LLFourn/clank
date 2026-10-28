@@ -1487,7 +1487,7 @@ fn agent_group_kdl(
         "    pane size=\"35%\" split_direction=\"{inner}\" {{\n"
     ));
     match stack {
-        ReviewerStack::Roster(reviewers) if reviewers.is_empty() => {}
+        ReviewerStack::Roster([]) => {}
         ReviewerStack::Roster(reviewers) => {
             out.push_str("        pane stacked=true {\n");
             for reviewer in reviewers {
@@ -3632,7 +3632,7 @@ mod tests {
         .unwrap_err();
         assert!(io.spawned().is_empty());
         let mut io = FakeOpenIo::with([query_output(1, "", "socket directory: permission denied")]);
-        open_all(&mut io, &source, &[source.clone()], &[], false)
+        open_all(&mut io, &source, std::slice::from_ref(&source), &[], false)
             .await
             .unwrap_err();
         assert!(io.spawned().is_empty());
@@ -3696,7 +3696,7 @@ mod tests {
             query_output(0, "clank-proj [Created 1m ago]\n", ""),
             query_output(0, "🔨 proj\n", ""),
         ]);
-        open_all(&mut io, &source, &[fork.clone()], &hosts, false)
+        open_all(&mut io, &source, std::slice::from_ref(&fork), &hosts, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3782,12 +3782,17 @@ mod tests {
         )
         .await
         .unwrap();
-        open_all(&mut io, &source, &[source.clone()], &[], true)
+        open_all(&mut io, &source, std::slice::from_ref(&source), &[], true)
             .await
             .unwrap();
-        open_current_targets(&mut io, &current_session(), &[source.clone()], true)
-            .await
-            .unwrap();
+        open_current_targets(
+            &mut io,
+            &current_session(),
+            std::slice::from_ref(&source),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(io.calls.is_empty());
         assert!(!layout_file_path(&source).exists());
     }
@@ -4308,7 +4313,8 @@ ttys004   zellij attach clank-foo
         let ru = "clank agent start ruthless --repo /r";
 
         // (name, codex geom, ruthless geom) — verbatim captures.
-        let live: [(&str, (u16, u16, u16, u16), (u16, u16, u16, u16)); 5] = [
+        type Geom = (u16, u16, u16, u16);
+        let live: [(&str, Geom, Geom); 5] = [
             (
                 "nonce-aware-coin-selection",
                 (116, 1, 62, 1),
@@ -4431,7 +4437,7 @@ ttys004   zellij attach clank-foo
             pane_columns: 62,
             pane_rows: 40,
         };
-        let panes = vec![
+        let panes = [
             pane("clank agent start codex --repo /r", 1),
             pane("clank agent start ruthless --repo /r", 9),
         ];
@@ -4463,7 +4469,7 @@ ttys004   zellij attach clank-foo
             pane_columns: 62,
             pane_rows: h,
         };
-        let panes = vec![
+        let panes = [
             pane("clank agent start codex --repo /r", 1, 1, 1),
             pane("clank agent start ruthless --repo /r", 7, 2, 93),
         ];
@@ -6578,15 +6584,17 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     async fn open_reports_an_open_repo_and_refuses_an_incomplete_scan() {
         let root = tempfile::tempdir().unwrap();
         let repo = openable_repo(root.path(), "proj");
-        let mut io = FakeOpenIo::default();
-        io.scan = scan_of(vec![pane_in(
-            "elsewhere",
-            4,
-            0,
-            "proj",
-            &agent(&repo, "codex"),
-            false,
-        )]);
+        let mut io = FakeOpenIo {
+            scan: scan_of(vec![pane_in(
+                "elsewhere",
+                4,
+                0,
+                "proj",
+                &agent(&repo, "codex"),
+                false,
+            )]),
+            ..Default::default()
+        };
         run_with(&mut io, &args(&repo), Some(current_session()))
             .await
             .unwrap();
@@ -6601,18 +6609,22 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         );
         assert!(!layout_file_path(&repo).exists());
 
-        let mut io = FakeOpenIo::default();
-        io.scan = SessionScan {
-            unanswered: vec!["stale one".into()],
+        let mut io = FakeOpenIo {
+            scan: SessionScan {
+                unanswered: vec!["stale one".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let error = run_with(&mut io, &args(&repo), None).await.unwrap_err();
         assert!(format!("{error:#}").contains("`stale one`"), "{error:#}");
         assert!(io.spawned().is_empty());
 
-        let mut io = FakeOpenIo::default();
-        io.scan = SessionScan {
-            listing_failed: true,
+        let mut io = FakeOpenIo {
+            scan: SessionScan {
+                listing_failed: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(run_with(&mut io, &args(&repo), None).await.is_err());

@@ -1308,8 +1308,8 @@ impl RepoState {
             }
             let latest_sha = reviewable.last().unwrap().clone();
             let latest_event = ps.commits.iter().rev().find(|e| e.sha == latest_sha);
-            let touched_code = latest_event.map_or(false, |e| e.touched_code);
-            let latest_touched_plan = latest_event.map_or(false, |e| e.touched_plan);
+            let touched_code = latest_event.is_some_and(|e| e.touched_code);
+            let latest_touched_plan = latest_event.is_some_and(|e| e.touched_plan);
 
             let entries = reviews.reviews_for(&latest_sha);
             // SINGLE gate-state decision: always `compute_gate`. When
@@ -1465,33 +1465,33 @@ impl RepoState {
         });
 
         let mut ad_hoc = Vec::new();
-        if policy.adhoc_feedback {
-            if let Some(event) = self.ad_hoc.last() {
-                let entries = reviews.reviews_for(&event.sha);
-                // An ad-hoc commit has no plan to "change", so it is
-                // never a plan-doc milestone (latest_touched_plan =
-                // false). The ad-hoc tier inversion is tracked
-                // separately (see plan: Out of scope).
-                let gate = compute_gate(
+        if policy.adhoc_feedback
+            && let Some(event) = self.ad_hoc.last()
+        {
+            let entries = reviews.reviews_for(&event.sha);
+            // An ad-hoc commit has no plan to "change", so it is
+            // never a plan-doc milestone (latest_touched_plan =
+            // false). The ad-hoc tier inversion is tracked
+            // separately (see plan: Out of scope).
+            let gate = compute_gate(
+                &entries,
+                &policy.commit_reviewers,
+                &policy.plan_reviewers,
+                &policy.final_reviewers,
+                false,
+            );
+            ad_hoc.push(AdHocWorkState {
+                sha: event.sha.clone(),
+                gate,
+                handover: stage_closures(
+                    Some(event.ts),
                     &entries,
                     &policy.commit_reviewers,
                     &policy.plan_reviewers,
                     &policy.final_reviewers,
                     false,
-                );
-                ad_hoc.push(AdHocWorkState {
-                    sha: event.sha.clone(),
-                    gate,
-                    handover: stage_closures(
-                        Some(event.ts),
-                        &entries,
-                        &policy.commit_reviewers,
-                        &policy.plan_reviewers,
-                        &policy.final_reviewers,
-                        false,
-                    ),
-                });
-            }
+                ),
+            });
         }
 
         WorkStatus {
@@ -3058,7 +3058,7 @@ mod tests {
         assert!(status.active_plan.is_some());
         assert_eq!(status.active_plan.as_ref().unwrap().plan, plan("a"));
         // Only the accepted run carries the correction.
-        for ps in &status.active_plan {
+        if let Some(ps) = &status.active_plan {
             assert_eq!(
                 ps.waiting_on,
                 WaitingOn::MasterToFixCommitTag,

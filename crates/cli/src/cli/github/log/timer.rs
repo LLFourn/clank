@@ -375,6 +375,7 @@ impl EventLog {
 
     /// Revalidate and append under the ack/compaction write lock. A complete
     /// unsynced prior append is synced before it can be published on retry.
+    #[cfg(test)]
     pub(crate) fn accept_recurring(
         &mut self,
         r: &Recurrence,
@@ -570,7 +571,7 @@ mod tests {
             ident: ident.clone(),
         };
         assert_eq!(
-            log.append_presentations(&[key.clone()], 125, || true)
+            log.append_presentations(std::slice::from_ref(&key), 125, || true)
                 .unwrap(),
             1
         );

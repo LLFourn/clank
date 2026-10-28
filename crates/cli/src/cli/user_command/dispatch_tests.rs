@@ -511,7 +511,8 @@ async fn nothing_decided_before_the_dump_or_the_pane_lock_is_trusted() {
 /// out, the binding moved. Nothing is typed.
 #[tokio::test]
 async fn the_checks_under_the_locks_see_what_changed_after_the_last_look() {
-    let changes: [(&str, fn(&Fake)); 3] = [
+    type Change = (&'static str, fn(&Fake));
+    let changes: [Change; 3] = [
         ("key changed", |f| {
             *f.trust.lock().unwrap() = one(&Signer::generate().key())
         }),

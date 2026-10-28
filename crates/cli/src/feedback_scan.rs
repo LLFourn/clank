@@ -159,7 +159,7 @@ mod tests {
             ".clank/agents/alice/feedback/abcdef0.md",
             "CONTINUE\n",
         );
-        let view = scan_feedback(repo, &[s1.clone()]).unwrap();
+        let view = scan_feedback(repo, std::slice::from_ref(&s1)).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 
@@ -188,7 +188,7 @@ mod tests {
             &format!(".clank/agents/alice/feedback/{}.md", s1.as_str()),
             "CONTINUE\n",
         );
-        let view = scan_feedback(repo, &[s1.clone()]).unwrap();
+        let view = scan_feedback(repo, std::slice::from_ref(&s1)).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 
@@ -202,7 +202,7 @@ mod tests {
             ".clank/agents/alice/feedback/deadbee.md",
             "CONTINUE\n",
         );
-        let view = scan_feedback(repo, &[s1.clone()]).unwrap();
+        let view = scan_feedback(repo, std::slice::from_ref(&s1)).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 0);
     }
 

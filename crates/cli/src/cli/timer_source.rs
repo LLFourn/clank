@@ -469,6 +469,192 @@ impl TimerSet {
     }
 }
 
+/// Wait without manufacturing an idle sleep when there are no deadlines.
+pub(crate) async fn deadline(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn accept(
+    dir: &Path,
+    key: &str,
+    source: &TimerSource,
+    due: u64,
+    sink: &EmissionSink,
+) -> std::io::Result<()> {
+    let Some(_lease) = IngestLease::try_acquire(dir, key)? else {
+        return Err(std::io::Error::other(
+            "ingest lease busy; retry on next owner wake",
+        ));
+    };
+    let mut log = EventLog::open(dir, key)?;
+    let ids = log.retained_timer_ids()?;
+    // Strict inspection precedes load: timer corruption is preserved rather
+    // than quarantined and reset as a replayable command source would be.
+    log.load();
+    let mut seen = Seen::at(dir, key);
+    seen.checkpoint(ids)?;
+    let id = format!("timer/{due}");
+    match seen.known(&id) {
+        Known::Yes => {
+            log.maybe_compact()?;
+            return Ok(());
+        }
+        Known::Damaged(why) => {
+            return Err(std::io::Error::other(format!(
+                "ambiguous timer identity; repair required: {why}"
+            )));
+        }
+        Known::No => {}
+    }
+    let mut item = WaitItem::TimerEvent {
+        presentation: None,
+        name: source.name.clone(),
+        recurrence: None,
+        id: id.clone(),
+        due_at: due,
+        content: source.content.clone().unwrap_or_default(),
+        selector: None,
+    };
+    let seq = log.append_interruptible_inbox(
+        Transport::Timer,
+        Some(&id),
+        None,
+        Some(due),
+        &item,
+        super::github::log::Interrupt::new(source.interrupt, source.interrupt_message.as_deref()),
+    )?;
+    let checkpoint = seen.record(&id);
+    item.set_presentation(log.presentation_key(
+        seq,
+        Transport::Timer,
+        Some(&id),
+        None,
+        Some(due),
+        &item,
+    ));
+    super::command_source::stamp_selector(&mut item, key, seq);
+    // A failed index write or closed sink cannot retract accepted WAL custody.
+    let _ = sink.send((item, Durability::Logged));
+    checkpoint?;
+    log.maybe_compact()?;
+    Ok(())
+}
+
+/// Disposable pending-log inventory. Discovery occurs on initial admission or
+/// watcher invalidation; healthy empty inventory performs no heartbeat I/O.
+pub(crate) struct Backlog {
+    dir: PathBuf,
+    invocation_keys: BTreeSet<String>,
+    pending: Option<BTreeSet<String>>,
+    recurring: BTreeMap<String, Vec<super::github::log::EventRow>>,
+    failures: BTreeMap<String, String>,
+    recover: bool,
+}
+
+impl Backlog {
+    pub(crate) fn new(dir: PathBuf, invocation_keys: BTreeSet<String>) -> Self {
+        Self {
+            dir,
+            invocation_keys,
+            pending: None,
+            recurring: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            recover: true,
+        }
+    }
+    pub(crate) fn invalidate(&mut self) {
+        self.pending = None;
+        self.recurring.clear();
+    }
+
+    pub(crate) fn inspection(mut self) -> Self {
+        self.recover = false;
+        self
+    }
+
+    pub(crate) fn owed(&mut self, shown: &mut HashSet<(String, u64, String)>) -> Vec<WaitItem> {
+        if self.pending.is_none() {
+            let mut keys = self.invocation_keys.clone();
+            match std::fs::read_dir(&self.dir) {
+                Ok(files) => {
+                    for file in files {
+                        let Ok(file) = file else { return Vec::new() };
+                        let path = file.path();
+                        if path.extension().is_some_and(|ext| ext == "jsonl")
+                            && let Some(key) = path.file_stem().and_then(|name| name.to_str())
+                            && key.starts_with("timer-config-")
+                        {
+                            keys.insert(key.to_owned());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // Do not cache a failed scan as an authoritative empty inbox.
+                // Existing owner wakes can retry after the read error clears.
+                Err(_) => return Vec::new(),
+            }
+            self.pending = Some(keys);
+        }
+        let mut items = Vec::new();
+        self.pending.as_mut().expect("initialized").retain(|key| {
+            if let Some(rows) = self.recurring.get(key) {
+                let fresh = rows
+                    .iter()
+                    .filter(|row| !shown.contains(&(key.clone(), row.seq, row.ident.clone())))
+                    .cloned()
+                    .collect();
+                items.extend(super::command_source::owed_from_log(
+                    fresh, key, None, shown,
+                ));
+                return !rows.is_empty();
+            }
+            if !self.dir.exists() {
+                return false;
+            }
+            let Ok(mut log) = EventLog::open(&self.dir, key) else {
+                return true;
+            };
+            let read = match log.read_timer_backlog(self.recover) {
+                Ok(Some(read)) => {
+                    self.failures.remove(key);
+                    read
+                }
+                result => {
+                    let failure = match result {
+                        Ok(None) => "corrupt timer custody; repair required".to_owned(),
+                        Err(error) => error.to_string(),
+                        Ok(Some(_)) => unreachable!(),
+                    };
+                    if self.failures.get(key) != Some(&failure) {
+                        eprintln!("wait: timer `{key}`: {failure}");
+                        self.failures.insert(key.clone(), failure);
+                    }
+                    return true;
+                }
+            };
+            let rows: Vec<_> = read
+                .rows
+                .into_iter()
+                .filter(|row| {
+                    row.transport == Transport::Timer
+                        && matches!(row.item, WaitItem::TimerEvent { .. })
+                        && !row.acked
+                })
+                .collect();
+            let pending = !rows.is_empty();
+            if log.is_recurring_key() {
+                self.recurring.insert(key.clone(), rows.clone());
+            }
+            items.extend(super::command_source::owed_from_log(rows, key, None, shown));
+            pending
+        });
+        items
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,191 +1416,5 @@ mod tests {
         timers.due();
         let mut backlog = Backlog::new(dir.path().to_owned(), BTreeSet::new());
         assert_eq!(backlog.owed(&mut HashSet::new()).len(), 1);
-    }
-}
-
-/// Wait without manufacturing an idle sleep when there are no deadlines.
-pub(crate) async fn deadline(at: Option<Instant>) {
-    match at {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
-fn accept(
-    dir: &Path,
-    key: &str,
-    source: &TimerSource,
-    due: u64,
-    sink: &EmissionSink,
-) -> std::io::Result<()> {
-    let Some(_lease) = IngestLease::try_acquire(dir, key)? else {
-        return Err(std::io::Error::other(
-            "ingest lease busy; retry on next owner wake",
-        ));
-    };
-    let mut log = EventLog::open(dir, key)?;
-    let ids = log.retained_timer_ids()?;
-    // Strict inspection precedes load: timer corruption is preserved rather
-    // than quarantined and reset as a replayable command source would be.
-    log.load();
-    let mut seen = Seen::at(dir, key);
-    seen.checkpoint(ids)?;
-    let id = format!("timer/{due}");
-    match seen.known(&id) {
-        Known::Yes => {
-            log.maybe_compact()?;
-            return Ok(());
-        }
-        Known::Damaged(why) => {
-            return Err(std::io::Error::other(format!(
-                "ambiguous timer identity; repair required: {why}"
-            )));
-        }
-        Known::No => {}
-    }
-    let mut item = WaitItem::TimerEvent {
-        presentation: None,
-        name: source.name.clone(),
-        recurrence: None,
-        id: id.clone(),
-        due_at: due,
-        content: source.content.clone().unwrap_or_default(),
-        selector: None,
-    };
-    let seq = log.append_interruptible_inbox(
-        Transport::Timer,
-        Some(&id),
-        None,
-        Some(due),
-        &item,
-        super::github::log::Interrupt::new(source.interrupt, source.interrupt_message.as_deref()),
-    )?;
-    let checkpoint = seen.record(&id);
-    item.set_presentation(log.presentation_key(
-        seq,
-        Transport::Timer,
-        Some(&id),
-        None,
-        Some(due),
-        &item,
-    ));
-    super::command_source::stamp_selector(&mut item, key, seq);
-    // A failed index write or closed sink cannot retract accepted WAL custody.
-    let _ = sink.send((item, Durability::Logged));
-    checkpoint?;
-    log.maybe_compact()?;
-    Ok(())
-}
-
-/// Disposable pending-log inventory. Discovery occurs on initial admission or
-/// watcher invalidation; healthy empty inventory performs no heartbeat I/O.
-pub(crate) struct Backlog {
-    dir: PathBuf,
-    invocation_keys: BTreeSet<String>,
-    pending: Option<BTreeSet<String>>,
-    recurring: BTreeMap<String, Vec<super::github::log::EventRow>>,
-    failures: BTreeMap<String, String>,
-    recover: bool,
-}
-
-impl Backlog {
-    pub(crate) fn new(dir: PathBuf, invocation_keys: BTreeSet<String>) -> Self {
-        Self {
-            dir,
-            invocation_keys,
-            pending: None,
-            recurring: BTreeMap::new(),
-            failures: BTreeMap::new(),
-            recover: true,
-        }
-    }
-    pub(crate) fn invalidate(&mut self) {
-        self.pending = None;
-        self.recurring.clear();
-    }
-
-    pub(crate) fn inspection(mut self) -> Self {
-        self.recover = false;
-        self
-    }
-
-    pub(crate) fn owed(&mut self, shown: &mut HashSet<(String, u64, String)>) -> Vec<WaitItem> {
-        if self.pending.is_none() {
-            let mut keys = self.invocation_keys.clone();
-            match std::fs::read_dir(&self.dir) {
-                Ok(files) => {
-                    for file in files {
-                        let Ok(file) = file else { return Vec::new() };
-                        let path = file.path();
-                        if path.extension().is_some_and(|ext| ext == "jsonl")
-                            && let Some(key) = path.file_stem().and_then(|name| name.to_str())
-                            && key.starts_with("timer-config-")
-                        {
-                            keys.insert(key.to_owned());
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                // Do not cache a failed scan as an authoritative empty inbox.
-                // Existing owner wakes can retry after the read error clears.
-                Err(_) => return Vec::new(),
-            }
-            self.pending = Some(keys);
-        }
-        let mut items = Vec::new();
-        self.pending.as_mut().expect("initialized").retain(|key| {
-            if let Some(rows) = self.recurring.get(key) {
-                let fresh = rows
-                    .iter()
-                    .filter(|row| !shown.contains(&(key.clone(), row.seq, row.ident.clone())))
-                    .cloned()
-                    .collect();
-                items.extend(super::command_source::owed_from_log(
-                    fresh, key, None, shown,
-                ));
-                return !rows.is_empty();
-            }
-            if !self.dir.exists() {
-                return false;
-            }
-            let Ok(mut log) = EventLog::open(&self.dir, key) else {
-                return true;
-            };
-            let read = match log.read_timer_backlog(self.recover) {
-                Ok(Some(read)) => {
-                    self.failures.remove(key);
-                    read
-                }
-                result => {
-                    let failure = match result {
-                        Ok(None) => "corrupt timer custody; repair required".to_owned(),
-                        Err(error) => error.to_string(),
-                        Ok(Some(_)) => unreachable!(),
-                    };
-                    if self.failures.get(key) != Some(&failure) {
-                        eprintln!("wait: timer `{key}`: {failure}");
-                        self.failures.insert(key.clone(), failure);
-                    }
-                    return true;
-                }
-            };
-            let rows: Vec<_> = read
-                .rows
-                .into_iter()
-                .filter(|row| {
-                    row.transport == Transport::Timer
-                        && matches!(row.item, WaitItem::TimerEvent { .. })
-                        && !row.acked
-                })
-                .collect();
-            let pending = !rows.is_empty();
-            if log.is_recurring_key() {
-                self.recurring.insert(key.clone(), rows.clone());
-            }
-            items.extend(super::command_source::owed_from_log(rows, key, None, shown));
-            pending
-        });
-        items
     }
 }

@@ -400,13 +400,13 @@ pub(crate) fn add(
     // The queue entry is the record now — consume the draft. Strictly
     // after the write so a failed write leaves the draft for a retry;
     // best-effort, since the add itself already succeeded.
-    if let Some(draft) = draft_to_consume {
-        if let Err(e) = std::fs::remove_file(&draft) {
-            eprintln!(
-                "note: could not remove consumed draft `{}`: {e}",
-                draft.display()
-            );
-        }
+    if let Some(draft) = draft_to_consume
+        && let Err(e) = std::fs::remove_file(&draft)
+    {
+        eprintln!(
+            "note: could not remove consumed draft `{}`: {e}",
+            draft.display()
+        );
     }
     Ok(dest)
 }

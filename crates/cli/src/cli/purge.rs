@@ -347,15 +347,14 @@ fn is_finish_diff(lines: &[String], plan_key: Option<&PlanKey>) -> bool {
                 return false;
             }
         }
-        if in_finished && sc != 'D' {
-            if let Some(stem) = relevant_path
+        if in_finished
+            && sc != 'D'
+            && let Some(stem) = relevant_path
                 .strip_prefix(".clank/finished/")
                 .and_then(|s| s.strip_suffix(".md"))
-            {
-                if plan_key.is_none_or(|k| k.as_str() == stem) {
-                    has_finished_add = true;
-                }
-            }
+            && plan_key.is_none_or(|k| k.as_str() == stem)
+        {
+            has_finished_add = true;
         }
     }
     has_finished_add

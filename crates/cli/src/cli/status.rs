@@ -208,7 +208,7 @@ pub(crate) struct AgentAutoRow {
 impl AgentAutoRow {
     /// The bound session the roster's tool has moved away from.
     pub(crate) fn superseded(&self) -> Option<&clank_core::Session> {
-        let configured = clank_core::Tool::from_str(&self.tool)?;
+        let configured = clank_core::Tool::from_name(&self.tool)?;
         crate::cli::agent::superseded_session(configured, self.session.as_ref())
     }
 }
@@ -582,6 +582,7 @@ impl StatusSnapshot {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_state(
         repo: &Path,
         basename: &str,
@@ -886,17 +887,17 @@ impl StatusSnapshot {
             );
         }
 
-        if self.active_plan.is_none() {
-            if let Some(fp) = &self.last_finished {
-                let _ = writeln!(out);
-                let _ = writeln!(
-                    out,
-                    "last finished: {} (finalized {}, duration {})",
-                    fp.plan.as_str(),
-                    short_sha(fp.finalized_at.as_str()),
-                    crate::age::duration(fp.duration_secs)
-                );
-            }
+        if self.active_plan.is_none()
+            && let Some(fp) = &self.last_finished
+        {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "last finished: {} (finalized {}, duration {})",
+                fp.plan.as_str(),
+                short_sha(fp.finalized_at.as_str()),
+                crate::age::duration(fp.duration_secs)
+            );
         }
 
         if !self.blocks.is_empty() {

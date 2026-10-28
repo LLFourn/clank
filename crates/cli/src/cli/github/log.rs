@@ -52,6 +52,10 @@ pub(crate) use message::{
 };
 pub(crate) use timer::recurring_progress;
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one per accepted timer fire, moved straight into the wait queue"
+)]
 #[derive(Debug)]
 pub(crate) enum RecurringTransition {
     Future(u64),
@@ -1475,6 +1479,7 @@ impl EventLog {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_inbox_record(
         &mut self,
         transport: Transport,
@@ -1495,12 +1500,11 @@ impl EventLog {
             reply_route,
             ..
         } = item
+            && (reply_route.is_none() || transport != Transport::Message || baseline)
         {
-            if reply_route.is_none() || transport != Transport::Message || baseline {
-                return Err(std::io::Error::other(
-                    "reply-required message needs a concrete route and a live message inbox",
-                ));
-            }
+            return Err(std::io::Error::other(
+                "reply-required message needs a concrete route and a live message inbox",
+            ));
         }
         let Some(seq) = self.next_seq else {
             return Err(std::io::Error::other(

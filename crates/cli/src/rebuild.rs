@@ -147,9 +147,9 @@ struct FoldOutput {
 /// side effect hidden inside the fold.
 ///
 /// `base_depth` is `state`'s depth before the first event; `tip_depth`
-/// is the depth of the overall fold target — greater than `base_depth
-/// + events.len()` when a later phase continues the same fold, so
-/// spacing is computed against the real tip.
+/// is the depth of the overall fold target — greater than
+/// `base_depth + events.len()` when a later phase continues the same
+/// fold, so spacing is computed against the real tip.
 fn fold_events(
     state: &mut RepoState,
     events: Vec<crate::disk_snapshot::CommitEvent>,

@@ -168,12 +168,12 @@ mod tests {
             item,
         })
         .unwrap();
-        log.append_presentations(&[a.clone()], 100, || true)
+        log.append_presentations(std::slice::from_ref(&a), 100, || true)
             .unwrap();
         log.append_checked_ack(a.seq, &a.ident).unwrap();
         for n in 0..DISPLAY_CAP {
             let key = append(&mut log, &format!("handled-{n}"));
-            log.append_presentations(&[key.clone()], 200, || true)
+            log.append_presentations(std::slice::from_ref(&key), 200, || true)
                 .unwrap();
             log.append_checked_ack(key.seq, &key.ident).unwrap();
         }
@@ -206,12 +206,12 @@ mod tests {
             let key = append(&mut log, "a");
             log.sync_fault.set(Some(boundary));
             assert!(
-                log.append_presentations(&[key.clone()], 100, || true)
+                log.append_presentations(std::slice::from_ref(&key), 100, || true)
                     .is_err()
             );
             log.sync_fault.set(Some(boundary));
             assert!(
-                log.append_presentations(&[key.clone()], 200, || true)
+                log.append_presentations(std::slice::from_ref(&key), 200, || true)
                     .is_err()
             );
             log.sync_fault.set(None);

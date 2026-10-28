@@ -358,24 +358,21 @@ impl Drop for Fixture {
         let runtime = PathBuf::from(format!("/tmp/clank-run-{}", unsafe { libc::getuid() }));
         let tag = blake3::hash(self.root.as_os_str().as_encoded_bytes()).to_hex()[..32].to_owned();
         let descriptor = runtime.join(format!("{tag}.json"));
-        if let Ok(bytes) = std::fs::read(&descriptor) {
-            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                if value["repo"].as_str() == self.root.to_str() {
-                    if let Some(pid) = value["pid"]
-                        .as_i64()
-                        .and_then(|p| i32::try_from(p).ok())
-                        .and_then(clank::signal::Pid::new)
-                    {
-                        clank::signal::signal_process(pid, libc::SIGTERM);
-                        if let Some(socket) = value["socket"].as_str() {
-                            let socket = Path::new(socket);
-                            if socket.file_name().and_then(|n| n.to_str())
-                                == Some(format!("{pid}.sock").as_str())
-                            {
-                                let _ = std::fs::remove_file(socket);
-                            }
-                        }
-                    }
+        if let Ok(bytes) = std::fs::read(&descriptor)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && value["repo"].as_str() == self.root.to_str()
+            && let Some(pid) = value["pid"]
+                .as_i64()
+                .and_then(|p| i32::try_from(p).ok())
+                .and_then(clank::signal::Pid::new)
+        {
+            clank::signal::signal_process(pid, libc::SIGTERM);
+            if let Some(socket) = value["socket"].as_str() {
+                let socket = Path::new(socket);
+                if socket.file_name().and_then(|n| n.to_str())
+                    == Some(format!("{pid}.sock").as_str())
+                {
+                    let _ = std::fs::remove_file(socket);
                 }
             }
         }
