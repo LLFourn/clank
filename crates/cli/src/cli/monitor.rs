@@ -8319,6 +8319,9 @@ mod recovery_tests {
             content: Some("scheduled work".into()),
         };
         crate::agent_store::update_agent_config(repo.path(), &codex, |config| {
+            // Auto's builtin default is off; without this the outcome
+            // follows the runner's ~/.clank/config.json.
+            config.auto_mode = Some(clank_core::AutoMode::On);
             config.wait_events = vec![clank_core::agent_config::WaitEventSource::Timer(
                 timer.clone(),
             )];
