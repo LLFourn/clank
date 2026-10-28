@@ -5,7 +5,7 @@ use clank_core::HookEvent;
 use clank_core::agent_config::LaunchConfig;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     pub review: ReviewConfig,
     /// `Some(cmd)` = hook set, `None` = explicitly disabled (null).
@@ -21,30 +21,12 @@ pub struct Config {
     pub recovery: RecoveryConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            review: ReviewConfig::default(),
-            hooks: BTreeMap::new(),
-            diff: DiffConfig::default(),
-            finish: FinishConfig::default(),
-            recovery: RecoveryConfig::default(),
-        }
-    }
-}
-
 /// Recovery config, from `.clank/config.json#/recovery`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecoveryConfig {
     /// Seconds between blind nudges of an agent that owes work and whose
     /// record cannot be read. `None` is `off`.
     pub blind_nudge: Option<u64>,
-}
-
-impl Default for RecoveryConfig {
-    fn default() -> Self {
-        Self { blind_nudge: None }
-    }
 }
 
 /// `off`, or a duration in clank's grammar; `0` is `off` too.
@@ -176,7 +158,7 @@ struct ReviewFile {
     require_commit_prefix: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HooksFile {
     entries: BTreeMap<String, serde_json::Value>,
 }
@@ -185,14 +167,6 @@ impl<'de> Deserialize<'de> for HooksFile {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let map: BTreeMap<String, serde_json::Value> = Deserialize::deserialize(deserializer)?;
         Ok(HooksFile { entries: map })
-    }
-}
-
-impl Default for HooksFile {
-    fn default() -> Self {
-        HooksFile {
-            entries: BTreeMap::new(),
-        }
     }
 }
 
@@ -431,13 +405,11 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
             present.insert("review.require_commit_prefix".to_string());
         }
     }
-    if let Some(hooks) = parsed.hooks {
-        for event in [HookEvent::Blocked] {
-            if let Some(v) = hooks.get(event) {
-                cfg.hooks.insert(event, v);
-                present.insert(format!("hooks.{}", event_to_key_name(event)));
-            }
-        }
+    if let Some(hooks) = parsed.hooks
+        && let Some(v) = hooks.get(HookEvent::Blocked)
+    {
+        cfg.hooks.insert(HookEvent::Blocked, v);
+        present.insert(format!("hooks.{}", event_to_key_name(HookEvent::Blocked)));
     }
     // Field-by-field diff layering: per OQ7 (clank-diff-editor),
     // repo-scope overrides user-scope at the field level. If

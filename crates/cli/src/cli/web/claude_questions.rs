@@ -54,7 +54,7 @@ pub(crate) struct Registry {
     tickets: Mutex<BTreeMap<String, Ticket>>,
 }
 fn key(h: &Hook) -> Option<String> {
-    Some(serde_json::to_string(&(&h.session_id, &h.prompt_id, h.tool_use_id.as_ref()?)).ok()?)
+    serde_json::to_string(&(&h.session_id, &h.prompt_id, h.tool_use_id.as_ref()?)).ok()
 }
 fn normalized(input: &Value) -> Value {
     let mut value = input.clone();
@@ -392,7 +392,7 @@ impl Registry {
                 t.label == ask.agent
                     && t.owner == ask.owner
                     && t.hook.session_id == ask.session
-                    && t.request.id.to_string() == ask.id
+                    && super::native_questions::is_wire_id(&t.request.id, &ask.id)
                     && t.request.turn == ask.turn
                     && t.request.item == ask.item
             }) else {
@@ -647,10 +647,8 @@ impl Registry {
         }
         // A written remote decision waits for PostToolUse. EOF before the
         // decision invalidates the request; a local completion is already closed.
-        if sent {
-            if let Some(held) = guard.as_mut() {
-                held.armed = false;
-            }
+        if sent && let Some(held) = guard.as_mut() {
+            held.armed = false;
         }
         drop(guard);
         Ok(())

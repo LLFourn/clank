@@ -336,7 +336,6 @@ pub(super) fn verb_of(w: &WaitingOn) -> &'static str {
 mod tests {
     use super::*;
     use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap, with_agents};
-    use crate::lifecycle::AgentLabel;
 
     #[test]
     fn master_is_active_follows_state_color_precedence() {

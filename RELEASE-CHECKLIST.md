@@ -13,8 +13,8 @@ item is queueable as written: plan name, problem, shape of the fix.
   `cargo install --path crates/cli --locked` (README.md:67-71).
   §2 lists what each channel costs; pick before queueing any of it.
 - **Platforms.** macOS arm64 is the only target built here. Linux has
-  code (`crates/cli/src/proc_identity/linux.rs`) but no build or test
-  run is on record: unverified. Windows: the code is unix-only, with
+  code (`crates/cli/src/proc_identity/linux.rs`) and a CI workflow, but
+  no build or test run on Linux is on record: unverified. Windows: the code is unix-only, with
   `cfg(not(unix))` stubs (`cli/run.rs:20`, `cli/agent.rs:1440`,
   `cli/init.rs:331`). Declare it a non-goal or say otherwise.
 - **Licence.** Which one (§1 `license-and-attribution`).
@@ -41,35 +41,48 @@ item is queueable as written: plan name, problem, shape of the fix.
   the CDLA-Permissive-2.0 and Unicode-3.0 crates. Add a `cargo deny`
   licence check to CI so a new dependency is checked automatically.
 
-- [ ] **`ci-gates-every-push`** — there is no `.github/workflows/`.
-  Reviewers run the gates by hand. Shape: one workflow on push/PR that
-  provisions **git, Node, and a C compiler** (`rquickjs`, a dev-dependency
-  in crates/cli/Cargo.toml) and runs `cargo fmt --all --check` (it passes
-  on 2026-10-27), `cargo clippy --workspace --all-targets` (whether it
-  passes today is unverified), `cargo test -p clank --lib`,
-  `cargo test -p clank --test it` (which holds every source-scanning gate,
-  `book_is_true` and the README/cli-audit tests in `cli::command`), and the
-  other crates' tests. Rules:
+- [ ] **`ci-gates-every-push`** — split by platform:
+  - [x] **Linux workflow implemented** (`.github/workflows/ci.yml`): one
+    `ubuntu-latest` x86_64 job on push and pull request. It provisions
+    git, Node and a C compiler (`rquickjs`, a dev-dependency in
+    crates/cli/Cargo.toml), installs the toolchain pinned in
+    `rust-toolchain.toml`, caches the registry and `target/`, and runs
+    `cargo fmt --all --check`, `cargo clippy --locked --workspace
+    --all-targets -- -D warnings`, `cargo test --locked -p clank --lib`,
+    `cargo test --locked -p clank --test it` and `cargo test --locked
+    --workspace --exclude clank`.
+  - [ ] **Linux validated.** No run of the workflow exists yet, so
+    whether clank builds and passes on Linux is still unverified. Check
+    this only when a green run exists, and cite it.
+  - [ ] macOS and other platforms: no CI job (macOS runners cost about
+    10x as much).
+
+  Rules the workflow keeps:
   - No silent green. `opencode_plugin_lifecycle.rs:14-24` fails when Node
     is missing unless `CLANK_SKIP_NODE_HARNESS=1` is set. CI provisions
-    Node and must not set that variable.
-  - Run the `it` harness in an environment with no agent-session
-    variables (`CLANK_AGENT` and the harness session ids). The harness
-    reads them and fails ownership checks when they are set.
+    Node and never sets that variable (`it/ci_workflow.rs` fails if the
+    workflow names it).
+  - Every test step unsets each variable in
+    `agent_env::SESSION_IDENTITY_VARS`. The harness reads them and fails
+    ownership checks when they are set. `it/ci_workflow.rs` holds the
+    workflow's list to the Rust one.
   - `#[ignore]` tests are deliberate opt-outs and do not run in this job:
     the live tunnel tests (`web-cloudflare/src/tunnel.rs:1068,1232,1262`)
     and the installed-harness acceptance tests
     (`it/claude_question_protocol.rs:7`, `it/codex_question_protocol.rs:337`,
     `cli/grok_setup_tests.rs:338`, `cli/grok_launch_tests.rs:342`,
-    `cli/web/claude_questions.rs:805`). The CI summary says they did not
-    run; it never counts them as passed.
-  - Decide whether `scripts/book/test_record.py` and
-    `scripts/check-timeline-ui.cjs` (needs Playwright) belong in CI or in
-    a manual release step, and write the choice down.
-  - Pin the toolchain (`rust-toolchain.toml`) and declare `rust-version`.
-    There is none today. The code uses let-chains
-    (`build_stamp_inputs.rs:161`), so the MSRV is at least 1.88; the exact
-    floor is unverified.
+    `cli/web/claude_questions.rs:805`). The job summary lists every
+    ignored test as not run; it never counts them as passed.
+  - Excluded from CI, run by hand in the release step instead:
+    `scripts/book/test_record.py` tests the book's screencast recorder,
+    a release tool for `book/` rather than clank itself; and
+    `scripts/check-timeline-ui.cjs` needs Playwright and a Chromium
+    download, which this job does not provision.
+  - The toolchain is pinned (`rust-toolchain.toml`, 1.99.1) and every
+    manifest declares `rust-version = "1.96"`. 1.96 is the dependency
+    floor (`kstring` 2.0.5, `oxc_*` 0.151 declare it); the whole
+    workspace, all targets, checks on 1.96.0, and 1.95.0 is refused
+    (2026-10-28).
 
 - [ ] **`version-tags-and-changelog`** — `clank --version` prints
   `0.0.1+8d05d296` (`build_stamp_inputs.rs:133-190`). It prints the bare

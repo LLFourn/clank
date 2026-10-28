@@ -232,15 +232,7 @@ pub(super) fn render_at(
             restartable(source, &snap.sources_live),
             &source_events(source, &snap.github_events),
         );
-        return render_source_page(
-            snap,
-            source,
-            &rows_of,
-            sel,
-            lift,
-            rows as usize,
-            cols as usize,
-        );
+        return render_source_page(snap, source, &rows_of, sel, lift, rows, cols);
     }
     if let Mode::SourceMembers { sel } = mode
         && let Some(group) = view.source_group
@@ -315,9 +307,9 @@ pub(super) fn render_at(
             }
             ConfirmAction::RestartSource => {
                 if let Some(source) = view.source_page.and_then(|r| r.find(&snap.sources)) {
-                    return render_restart_confirm(source, rows as usize, cols as usize);
+                    return render_restart_confirm(source, rows, cols);
                 }
-                return (vec![region_rule("restart", "", true, cols as usize)], 1);
+                return (vec![region_rule("restart", "", true, cols)], 1);
             }
             ConfirmAction::KillAttended => {
                 if let Some((a, att)) = view
@@ -2304,6 +2296,7 @@ pub(super) fn render_candidate_screen(
 /// States what is NOT known rather than blanking a field — a record
 /// with no pid cannot report liveness, and saying so is the honest
 /// answer that "cannot check" is not "ended".
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_wait_page(
     label: &str,
     att: &crate::cli::agent_state::Attended,

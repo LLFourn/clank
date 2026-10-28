@@ -760,7 +760,7 @@ mod tests {
     fn commit_ref_resolve_full_in_scope() {
         let full = CommitSha::parse(&"a".repeat(40)).unwrap();
         let r = CommitRef::parse(&"a".repeat(40)).unwrap();
-        assert_eq!(r.resolve_against(&[full.clone()]), Ok(full));
+        assert_eq!(r.resolve_against(std::slice::from_ref(&full)), Ok(full));
     }
 
     #[test]

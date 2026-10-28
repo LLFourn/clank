@@ -5741,9 +5741,9 @@ mod tests {
 
         // Existing content (including an explicit DISTRUST for beta)
         // survives verbatim; beta's entry is never overridden.
-        let seeded = format!(
+        let seeded =
             "model = \"gpt-5.5\"\n\n[projects.\"/repos/beta\"]\ntrust_level = \"untrusted\"\n"
-        );
+                .to_string();
         std::fs::write(&cfg, &seeded).unwrap();
         ensure_codex_project_trust(&home.path().join(".codex"), root_b).unwrap();
         assert_eq!(

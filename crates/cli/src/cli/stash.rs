@@ -1250,7 +1250,7 @@ mod drop_boundary_tests {
             .unwrap();
         let dir = rt.block_on(repo_with_a_stash());
         let p = dir.path().to_path_buf();
-        let (rec, want) = stashed(&p);
+        let (_rec, want) = stashed(&p);
 
         let held = lock_stash(&p).expect("the lock");
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

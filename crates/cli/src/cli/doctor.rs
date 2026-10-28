@@ -138,34 +138,35 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
     use clank_core::{AutoMode, Tool};
     let mut out = Vec::new();
     let mut profiles = Vec::new();
-    if let Some(repo) = repo {
-        if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, home) {
-            let mut members = vec![(set.master.clone(), set.master_desc.clone())];
-            members.extend(
-                set.members
-                    .iter()
-                    .map(|m| (m.label.clone(), m.desc.clone())),
-            );
-            for (label, desc) in members {
-                let cfg = match load_agent_config(repo, &label) {
-                    Ok(cfg) => cfg,
-                    Err(_) => continue, // repo checks already report invalid agent state
-                };
-                let tool = cfg
-                    .as_ref()
-                    .and_then(|c| c.session.as_ref())
-                    .map(|s| s.tool)
-                    .or_else(|| {
-                        super::fork::load_fork_spec(repo, &label)
-                            .ok()
-                            .flatten()
-                            .map(|s| s.tool)
-                    })
-                    .unwrap_or(desc.tool);
-                if tool != Tool::Grok {
-                    continue;
-                }
-                match super::grok_launch::Provider::resolve(desc.launch.as_ref(), repo) {
+    if let Some(repo) = repo
+        && let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, home)
+    {
+        let mut members = vec![(set.master.clone(), set.master_desc.clone())];
+        members.extend(
+            set.members
+                .iter()
+                .map(|m| (m.label.clone(), m.desc.clone())),
+        );
+        for (label, desc) in members {
+            let cfg = match load_agent_config(repo, &label) {
+                Ok(cfg) => cfg,
+                Err(_) => continue, // repo checks already report invalid agent state
+            };
+            let tool = cfg
+                .as_ref()
+                .and_then(|c| c.session.as_ref())
+                .map(|s| s.tool)
+                .or_else(|| {
+                    super::fork::load_fork_spec(repo, &label)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.tool)
+                })
+                .unwrap_or(desc.tool);
+            if tool != Tool::Grok {
+                continue;
+            }
+            match super::grok_launch::Provider::resolve(desc.launch.as_ref(), repo) {
                     Ok(provider) => {
                         let profile_home = provider.env.get("HOME").map(PathBuf::from)
                             .or_else(|| home.map(Path::to_owned))
@@ -177,17 +178,16 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
                     }
                     Err(_) => out.push(CheckResult::fail("repo", format!("Grok {label} profile"), "invalid managed session/cwd options or missing provider home; check this launch profile")),
                 }
-            }
         }
     }
     if profiles.is_empty() {
         let cwd = repo
             .map(Path::to_owned)
             .or_else(|| std::env::current_dir().ok());
-        if let Some(cwd) = cwd {
-            if let Ok(provider) = super::grok_launch::Provider::resolve(None, &cwd) {
-                profiles.push(("default".into(), cwd, provider, false));
-            }
+        if let Some(cwd) = cwd
+            && let Ok(provider) = super::grok_launch::Provider::resolve(None, &cwd)
+        {
+            profiles.push(("default".into(), cwd, provider, false));
         }
     }
     let mut probes = std::collections::BTreeMap::new();
@@ -708,7 +708,7 @@ fn check_gitignore_probe(repo: &Path, rel: &str, expect_tracked: bool) -> CheckR
         CheckResult::ok(
             SECTION,
             format!("gitignore probe: {rel}"),
-            format!("tracked (as expected)"),
+            "tracked (as expected)".to_string(),
         )
     }
 }
@@ -809,35 +809,34 @@ async fn user_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     use clank_core::Tool;
     let mut profiles = Vec::new();
     let mut out = Vec::new();
-    if let Some(repo) = repo {
-        if let Ok(Some(set)) =
+    if let Some(repo) = repo
+        && let Ok(Some(set)) =
             crate::agent_store::try_resolve_via_team_with(repo, Process.home().as_deref())
-        {
-            let mut members = vec![(set.master.clone(), set.master_desc.clone())];
-            members.extend(
-                set.members
-                    .iter()
-                    .map(|m| (m.label.clone(), m.desc.clone())),
-            );
-            for (label, desc) in members {
-                let cfg = match load_agent_config(repo, &label) {
-                    Ok(cfg) => cfg,
-                    Err(_) => continue,
-                };
-                let tool = cfg
-                    .as_ref()
-                    .and_then(|c| c.session.as_ref())
-                    .map(|s| s.tool)
-                    .or_else(|| {
-                        super::fork::load_fork_spec(repo, &label)
-                            .ok()
-                            .flatten()
-                            .map(|s| s.tool)
-                    })
-                    .unwrap_or(desc.tool);
-                if tool != Tool::Grok {
-                    profiles.push((label.to_string(), tool, desc.launch));
-                }
+    {
+        let mut members = vec![(set.master.clone(), set.master_desc.clone())];
+        members.extend(
+            set.members
+                .iter()
+                .map(|m| (m.label.clone(), m.desc.clone())),
+        );
+        for (label, desc) in members {
+            let cfg = match load_agent_config(repo, &label) {
+                Ok(cfg) => cfg,
+                Err(_) => continue,
+            };
+            let tool = cfg
+                .as_ref()
+                .and_then(|c| c.session.as_ref())
+                .map(|s| s.tool)
+                .or_else(|| {
+                    super::fork::load_fork_spec(repo, &label)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.tool)
+                })
+                .unwrap_or(desc.tool);
+            if tool != Tool::Grok {
+                profiles.push((label.to_string(), tool, desc.launch));
             }
         }
     }
@@ -966,10 +965,10 @@ async fn provider_user_checks(
                 } else {
                     root.join("hooks.json")
                 };
-                if tool == Tool::Claude {
-                    if let Some(check) = check_claude_loop_mode(&path, capable) {
-                        out.push(check);
-                    }
+                if tool == Tool::Claude
+                    && let Some(check) = check_claude_loop_mode(&path, capable)
+                {
+                    out.push(check);
                 }
                 out.push(check_hook_entry(
                     &path,
@@ -2524,7 +2523,8 @@ mod tests {
     fn broken_session_env_is_not_rescued_by_clank_agent() {
         let dir = init_git_repo();
         let repo = dir.path().to_path_buf();
-        let cases: [(&[(&str, &str)], &[&str]); 2] = [
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: [Case; 2] = [
             (
                 &[
                     ("CLANK_AGENT", "alice"),

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The it harness reads these and fails ownership checks when one is
+  # set. Must equal clank::agent_env::SESSION_IDENTITY_VARS; the
+  # ci_workflow gate in crates/cli/tests/it holds it to that.
+  SESSION_IDENTITY_VARS: CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID GROK_AGENT GROK_SESSION_ID CLANK_AGENT CLANK_BOOTSTRAP_SESSION_ID
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision git and a C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git build-essential
+
+      # The OpenCode plugin lifecycle harness fails without node, by design.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: clank lib tests
+        run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --lib
+
+      - name: clank integration tests
+        run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --test it
+
+      - name: other crates' tests
+        run: unset $SESSION_IDENTITY_VARS; cargo test --locked --workspace --exclude clank
+
+      - name: Report ignored tests as not run
+        if: always()
+        run: |
+          unset $SESSION_IDENTITY_VARS; cargo test --locked --workspace --all-targets -- --list --ignored > ignored.txt
+          {
+            echo "## Ignored tests: NOT run"
+            echo
+            echo "These \`#[ignore]\` tests are deliberate opt-outs. They did not run in this job and are not counted as passed."
+            echo
+            echo '```'
+            awk '/: test$/ { sub(/: test$/, ""); print }' ignored.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

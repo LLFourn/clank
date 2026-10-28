@@ -360,7 +360,7 @@ mod tests {
         let error = super::super::ack(
             &dir,
             super::super::read_all(&dir).unwrap(),
-            &[selector.clone()],
+            std::slice::from_ref(&selector),
         )
         .unwrap_err();
         assert!(error.to_string().contains("--reply"));

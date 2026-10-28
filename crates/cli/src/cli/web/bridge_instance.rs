@@ -228,6 +228,7 @@ impl BridgeInstance {
         Self::start_ready(repo, home, panes, table, how, Some(host), ready, session).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_ready(
         repo: PathBuf,
         home: Option<PathBuf>,

@@ -3523,13 +3523,12 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             // over, and the cutoff observes THIS task
                             // ending.
                             Ok(greeted) => {
-                                if let Err(returned) = joined.send(greeted) {
-                                    if let Greeted::Client(c) = returned.0
-                                        && let Some(writer) = c.writer
-                                    {
-                                        writer.abort();
-                                        let _ = writer.await;
-                                    }
+                                if let Err(returned) = joined.send(greeted)
+                                    && let Greeted::Client(c) = returned.0
+                                    && let Some(writer) = c.writer
+                                {
+                                    writer.abort();
+                                    let _ = writer.await;
                                 }
                             }
                             Err(e) => eprintln!("monitor: a client was not admitted: {e}"),
@@ -9323,7 +9322,7 @@ mod tests {
         let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let held = torn_down.clone();
 
-        let mut owned = OwnedTasks::default();
+        let owned = OwnedTasks::default();
         owned.greeting.push(tokio::spawn(async move {
             // Stands for everything a handshake owns while it runs.
             let _socket = Guard(held);
@@ -10523,7 +10522,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let only = home.path().join("only");
         let why = bind_listener_with(
-            &[only.clone()],
+            std::slice::from_ref(&only),
             4242,
             unsafe { libc::getuid() },
             &lease,
@@ -11227,7 +11226,7 @@ mod tests {
             "a namespace others can write is not evidence"
         );
         assert!(matches!(
-            look_at_in(&open, repo.path(), agent("codex"), budget, &spy),
+            look_at_in(&open, repo.path(), agent("codex"), budget, spy),
             Seen::Unproven(_)
         ));
 
@@ -11246,7 +11245,7 @@ mod tests {
             "an indirection is refused on the strength of the link, not its target"
         );
         assert!(matches!(
-            look_at_in(&link, repo.path(), agent("codex"), budget, &spy),
+            look_at_in(&link, repo.path(), agent("codex"), budget, spy),
             Seen::Unproven(_)
         ));
 
@@ -11255,7 +11254,7 @@ mod tests {
         assert_eq!(published_in(&absent, repo.path(), me), Published::Nothing);
         assert!(!absent.exists(), "a read must not create the namespace");
         assert!(matches!(
-            look_at_in(&absent, repo.path(), agent("codex"), budget, &spy),
+            look_at_in(&absent, repo.path(), agent("codex"), budget, spy),
             Seen::Vacant(_)
         ));
 
@@ -11271,7 +11270,7 @@ mod tests {
             published_in(&real, repo.path(), me),
             Published::Ours(_)
         ));
-        let _ = look_at_in(&real, repo.path(), agent("codex"), budget, &spy);
+        let _ = look_at_in(&real, repo.path(), agent("codex"), budget, spy);
         assert!(
             tries.load(SeqCst) > 0,
             "a trusted descriptor is an address, and gets knocked on"
@@ -13967,7 +13966,10 @@ mod tests {
         for host in std::mem::take(&mut hosted).into_values() {
             departing.extend(host.stop());
         }
-        while let Some(_) = futures_util::StreamExt::next(&mut departing).await {}
+        while futures_util::StreamExt::next(&mut departing)
+            .await
+            .is_some()
+        {}
         assert!(until(|| !alive(sibling)).await);
     }
 
@@ -14094,7 +14096,7 @@ mod tests {
         let mut hosted = std::collections::BTreeMap::new();
 
         // No client has connected, and the producer runs anyway.
-        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        let _ = reconcile_hosting(repo.path(), &mut hosted, &tx);
         assert_eq!(
             hosted.keys().map(|a| a.to_string()).collect::<Vec<_>>(),
             vec!["codex".to_string()],
@@ -14109,7 +14111,7 @@ mod tests {
         assert_eq!(first.len(), 1, "one source driver, no author forwarder");
 
         // An unrelated fold leaves a healthy producer alone.
-        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        let _ = reconcile_hosting(repo.path(), &mut hosted, &tx);
         let again: Vec<_> = hosted[&codex]
             .tasks
             .values()
@@ -14137,7 +14139,7 @@ mod tests {
             r#"{"agents":{"claude":{"tool":"claude","role":"master"}}}"#,
         )
         .unwrap();
-        reconcile_hosting(repo.path(), &mut hosted, &tx);
+        let _ = reconcile_hosting(repo.path(), &mut hosted, &tx);
         assert!(
             hosted.is_empty(),
             "a revoked agent's producer can serve nobody"
@@ -14457,7 +14459,7 @@ mod tests {
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
         let present = |clients: &mut Vec<Client>| {
-            serve_to(repo.path(), clients, &state, Some(&codex), &mut Vec::new());
+            let _ = serve_to(repo.path(), clients, &state, Some(&codex), &mut Vec::new());
         };
 
         // The first presentation owes it, and WAKES the client — which
@@ -14508,7 +14510,7 @@ mod tests {
         present(&mut clients);
         let note: Note = serde_json::from_str(after.recv().await.unwrap().trim_end()).unwrap();
         assert!(
-            matches!(note, Note::Beat { .. }),
+            matches!(note, Note::Beat),
             "an acked row is owed to nobody: {note:?}"
         );
     }
@@ -14581,7 +14583,7 @@ mod tests {
             farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
+        let _ = serve_to(
             repo.path(),
             &mut clients,
             &state,
@@ -14646,7 +14648,7 @@ mod tests {
             farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
+        let _ = serve_to(
             repo.path(),
             &mut clients,
             &state,
@@ -14727,7 +14729,7 @@ mod tests {
             farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
 
         let note: Note = serde_json::from_str(heard.recv().await.unwrap().trim_end()).unwrap();
         let Note::Items { items, .. } = note else {
@@ -14783,7 +14785,7 @@ mod tests {
             farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
 
         assert_eq!(
             pending,
@@ -14796,7 +14798,7 @@ mod tests {
         match note {
             Note::Done { what } => panic!("unexpected control answer: {what}"),
             Note::Refused { why } => panic!("unexpected refusal: {why}"),
-            Note::Beat { .. } => {}
+            Note::Beat => {}
             Note::Recover { .. } => panic!("a wait is never sent a recovery"),
             Note::Superseded => panic!("nothing superseded this wait"),
             Note::Verdict(frame) => panic!("a plain wait is never sent a verdict: {frame:?}"),
@@ -14918,7 +14920,7 @@ mod tests {
         let mut pending = Vec::new();
 
         // One ordinary wake.
-        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
         assert!(
             matches!(
                 serde_json::from_str::<Note>(heard.recv().await.unwrap().trim_end()).unwrap(),
@@ -14943,7 +14945,7 @@ mod tests {
             selector: None,
         };
         pending.push((claude.clone(), later.clone()));
-        serve_to(repo.path(), &mut clients, &state, None, &mut pending);
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut pending);
         assert_eq!(
             pending,
             vec![(claude.clone(), later.clone())],
@@ -15057,7 +15059,7 @@ mod tests {
             farewell: None,
         }];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
 
         let Note::Items { items, .. } =
             serde_json::from_str::<Note>(heard.recv().await.unwrap().trim_end()).unwrap()
@@ -15147,7 +15149,7 @@ mod tests {
         };
         let mut clients = vec![agent("codex", a), agent("claude", b)];
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
 
         let content = |line: String| -> Vec<String> {
             let Note::Items { items, .. } = serde_json::from_str(line.trim_end()).unwrap() else {
@@ -15283,7 +15285,7 @@ mod tests {
         ];
 
         let state = crate::repo_state::RepoState::empty(repo.path().to_path_buf());
-        serve_to(
+        let _ = serve_to(
             repo.path(),
             &mut clients,
             &state,
@@ -15308,7 +15310,7 @@ mod tests {
         // Unscoped, everybody is presented to — which is what a fold
         // tick does and why the scope is a parameter rather than the
         // rule.
-        serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
+        let _ = serve_to(repo.path(), &mut clients, &state, None, &mut Vec::new());
         assert!(unheard.try_recv().is_ok());
         assert!(observer.try_recv().is_ok());
     }
@@ -15772,7 +15774,7 @@ mod lease_tests {
             .await
             .unwrap()
             .unwrap();
-        let mut tasks = OwnedTasks::default();
+        let tasks = OwnedTasks::default();
         tasks.greeting.push(greeting);
         let (budget, settle) = (Duration::from_millis(325), Duration::from_millis(20));
 
@@ -16105,10 +16107,10 @@ mod build_tests {
         std::fs::rename(tmp, path).unwrap();
     }
 
-    fn noted() -> (
-        std::sync::Arc<std::sync::Mutex<Vec<Install>>>,
-        Box<dyn Fn(&Install) + Send>,
-    ) {
+    type Noted = std::sync::Arc<std::sync::Mutex<Vec<Install>>>;
+    type Note = Box<dyn Fn(&Install) + Send>;
+
+    fn noted() -> (Noted, Note) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let into = seen.clone();
         (

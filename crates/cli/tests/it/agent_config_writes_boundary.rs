@@ -24,8 +24,8 @@ use crate::common::{Production, crates_dir, rs_files};
 
 const STORE: &str = "agent_store.rs";
 
-/// Production sites that spell a config path without writing it, as
-/// (path under `crates/`, the trimmed line, why it is not a write).
+/// Production sites that spell a config path without writing an agent's
+/// config, as (path under `crates/`, the trimmed line, why).
 const READ_ONLY_SITES: &[(&str, &str, &str)] = &[
     (
         "cli/src/repo_watch.rs",
@@ -37,6 +37,11 @@ const READ_ONLY_SITES: &[(&str, &str, &str)] = &[
         "cli/src/cli/doctor.rs",
         "agent_config_path(repo, label).display(),",
         "names the file in a diagnostic",
+    ),
+    (
+        "user-config/src/lib.rs",
+        "home.join(\".clank\").join(\"config.json\")",
+        "the user's global `~/.clank/config.json`, not an agent's config",
     ),
 ];
 

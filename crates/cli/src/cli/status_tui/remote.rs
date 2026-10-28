@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(remote.link().await.as_deref(), Some(browser_url.as_str()));
         assert_eq!(
             rec.opened.lock().unwrap().as_slice(),
-            &[browser_url.clone()]
+            std::slice::from_ref(&browser_url)
         );
         assert!(remote.admin_state().await.unwrap().is_none());
         assert_eq!(

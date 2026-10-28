@@ -161,10 +161,10 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         other => other?,
     };
     if let Some(items) = result {
-        if let Some((author, binding)) = boundary {
-            if let Err(e) = binding.ensure_current(&repo, &author) {
-                return superseded_error(e, json);
-            }
+        if let Some((author, binding)) = boundary
+            && let Err(e) = binding.ensure_current(&repo, &author)
+        {
+            return superseded_error(e, json);
         }
         if items.is_empty() {
             if peek {
@@ -1997,14 +1997,14 @@ async fn run_leased_command_source(
                     None
                 }
             });
-    if let Some(dir) = state_dir.as_deref() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!(
-                "wait: command source `{}` state dir {}: {e}",
-                src.name,
-                dir.display()
-            );
-        }
+    if let Some(dir) = state_dir.as_deref()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!(
+            "wait: command source `{}` state dir {}: {e}",
+            src.name,
+            dir.display()
+        );
     }
     // LOAD, not read: this is what restores the sequence allocator
     // from the persisted records. `EventLog::open` starts it at 1,
@@ -2241,8 +2241,7 @@ async fn run_leased_command_source(
                                     while let Ok(Some(raw)) = lines.next_line().await {
                                         if let Some(what) =
                                             cs::ingest_line_with_route(&src, &seen, &raw, reply_route.as_ref())
-                                        {
-                                            if !cs::apply(
+                                            && !cs::apply(
                                                 what,
                                                 &key,
                                                 &mut log,
@@ -2251,7 +2250,6 @@ async fn run_leased_command_source(
                                             ) {
                                                 break;
                                             }
-                                        }
                                     }
                                 },
                             )
@@ -3021,10 +3019,10 @@ fn render_human(item: &WaitItem) -> String {
             if let Some(recurrence) = v.recurrence {
                 parts.push(crate::cli::events::recurrence_summary(recurrence));
             }
-            if let Some(g) = &v.github {
-                if let Some(n) = g.number {
-                    parts.push(format!("#{n}"));
-                }
+            if let Some(g) = &v.github
+                && let Some(n) = g.number
+            {
+                parts.push(format!("#{n}"));
             }
             // The WHOLE body, safe for a terminal. A single line keeps its
             // place in the row; more than one leaves the row and follows
@@ -4421,8 +4419,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_sources_ends_the_running_command_instead_of_detaching_it() {
-        let repo = tempfile::tempdir().unwrap();
-        let author = AgentLabel::parse("grok").unwrap();
+        let _repo = tempfile::tempdir().unwrap();
+        let _author = AgentLabel::parse("grok").unwrap();
         let source = command_source(
             "cleanup",
             &[

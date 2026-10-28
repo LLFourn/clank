@@ -668,24 +668,24 @@ impl RepoState {
         } else {
             None
         };
-        if let Some(reason) = rejection {
-            if intro.is_some() {
-                for intro in event
-                    .plan_touches
-                    .iter()
-                    .filter(|t| t.kind == TouchKind::Intro)
-                {
-                    self.warnings.push(RepoWarning {
-                        sha: event.sha.clone(),
-                        plan: Some(intro.plan.clone()),
-                        warning: Warning::RejectedPlanIntro {
-                            plan: intro.plan.clone(),
-                            reason: reason.clone(),
-                        },
-                    });
-                }
-                return Vec::new();
+        if let Some(reason) = rejection
+            && intro.is_some()
+        {
+            for intro in event
+                .plan_touches
+                .iter()
+                .filter(|t| t.kind == TouchKind::Intro)
+            {
+                self.warnings.push(RepoWarning {
+                    sha: event.sha.clone(),
+                    plan: Some(intro.plan.clone()),
+                    warning: Warning::RejectedPlanIntro {
+                        plan: intro.plan.clone(),
+                        reason: reason.clone(),
+                    },
+                });
             }
+            return Vec::new();
         }
 
         let was_adopted = self.adopted;
@@ -1000,6 +1000,7 @@ where
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.inner.iter()
     }
+    #[allow(clippy::len_without_is_empty, reason = "never empty by construction")]
     pub fn len(&self) -> usize {
         self.inner.len()
     }

@@ -800,7 +800,7 @@ fn render_full(
         )?;
         return Ok(());
     }
-    writeln!(writer, "id:        {}", display_id(&rows, s))?;
+    writeln!(writer, "id:        {}", display_id(rows, s))?;
     writeln!(writer, "source:    {}", s.source)?;
     writeln!(writer, "logged:    {} ago", age(s.row.at))?;
     writeln!(writer, "transport: {:?}", s.row.transport)?;
@@ -1186,7 +1186,7 @@ mod tests {
         assert!(describe(&required.row.item).contains("reply required"));
         let json = serde_json::to_value(json_row(&rows, required, &Default::default())).unwrap();
         assert_eq!(json["item"]["requires_reply"], true);
-        let err = ack(&dir, rows, &[selector.clone()])
+        let err = ack(&dir, rows, std::slice::from_ref(&selector))
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires a reply"), "{err}");
@@ -1823,7 +1823,10 @@ mod tests {
             seq: rows[0].row.seq,
             ident: rows[0].row.ident.clone(),
         };
-        assert_eq!(ack_members(repo, &[selected.clone()]).unwrap(), 1);
+        assert_eq!(
+            ack_members(repo, std::slice::from_ref(&selected)).unwrap(),
+            1
+        );
         let rows = read_all(&a).unwrap();
         let acked: Vec<bool> = rows.iter().map(|s| s.row.acked).collect();
         assert_eq!(
@@ -1894,7 +1897,7 @@ mod tests {
         write_watch_sidecar(&dir, &cli_only, SourceOrigin::Cli, &key(&cli_only));
 
         // State 1: configured prompt wins (from config, not disk).
-        let map = join_prompts(&[configured.clone()], &dir);
+        let map = join_prompts(std::slice::from_ref(&configured), &dir);
         assert_eq!(map.get(&key(&configured)).unwrap(), "configured intent");
         // State 3: CLI-only metadata visible alongside.
         assert_eq!(map.get(&key(&cli_only)).unwrap(), "cli intent");
@@ -1902,7 +1905,7 @@ mod tests {
         // State 2: the configured watch is DELETED from config — its
         // intent must NOT resurrect.
         let map = join_prompts(&[], &dir);
-        assert!(map.get(&key(&configured)).is_none(), "no resurrection");
+        assert!(!map.contains_key(&key(&configured)), "no resurrection");
         assert_eq!(map.get(&key(&cli_only)).unwrap(), "cli intent");
 
         // Self-heal: a pre-provenance sidecar for a config watch is
@@ -1913,7 +1916,7 @@ mod tests {
         )
         .unwrap();
         write_watch_sidecar(&dir, &configured, SourceOrigin::Config, &key(&configured));
-        assert!(join_prompts(&[], &dir).get(&key(&configured)).is_none());
+        assert!(!join_prompts(&[], &dir).contains_key(&key(&configured)));
 
         // A SCOPED CLI watch's prompt is found under the stem its rows
         // live under. `join_prompts` indexes by file stem and
@@ -1945,7 +1948,7 @@ mod tests {
 
         // CLI promptless re-arm removes the CLI sidecar.
         write_watch_sidecar(&dir, &gh("o/c", None), SourceOrigin::Cli, &key(&cli_only));
-        assert!(join_prompts(&[], &dir).get(&key(&cli_only)).is_none());
+        assert!(!join_prompts(&[], &dir).contains_key(&key(&cli_only)));
     }
 
     #[test]
@@ -1989,7 +1992,7 @@ mod tests {
         );
         assert_eq!(map.get(&key(&declared_prompted)).unwrap(), "from config");
         assert!(
-            map.get(&key(&declared_promptless)).is_none(),
+            !map.contains_key(&key(&declared_promptless)),
             "declared-promptless suppresses the stale sidecar"
         );
         assert_eq!(

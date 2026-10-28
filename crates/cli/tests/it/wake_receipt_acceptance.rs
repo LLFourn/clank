@@ -341,10 +341,10 @@ fn repo_tag(repo: &Path) -> String {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Some((pid, token)) = &self.producer {
-            if token.still_holds(*pid) {
-                clank::signal::signal_group(clank::signal::Pgid::new(*pid).unwrap(), libc::SIGKILL);
-            }
+        if let Some((pid, token)) = &self.producer
+            && token.still_holds(*pid)
+        {
+            clank::signal::signal_group(clank::signal::Pgid::new(*pid).unwrap(), libc::SIGKILL);
         }
         let prefix = format!("{}.", repo_tag(&self.repo));
         if let Ok(entries) = std::fs::read_dir(runtime_dir()) {

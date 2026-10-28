@@ -250,7 +250,7 @@ impl Tool {
 
     /// The inverse of [`Tool::as_str`], for the places that store a
     /// tool as the string it prints as.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_name(s: &str) -> Option<Self> {
         [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode]
             .into_iter()
             .find(|t| t.as_str() == s)

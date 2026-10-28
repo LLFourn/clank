@@ -93,22 +93,23 @@ fn flag_config_json_literal(body: &str, path: &Path) -> Option<String> {
     let bytes = body.as_bytes();
     let mut i = 0;
     while i + 3 < bytes.len() {
-        if &bytes[i..i + 3] == b"r#\"" && bytes.get(i + 3) == Some(&b'{') {
-            if let Some(close) = find_raw_string_close(body, i) {
-                let literal = &body[i + 3..close];
-                for field in FIELD_NAMES {
-                    if literal.contains(field) {
-                        let snippet: String = literal.chars().take(120).collect();
-                        return Some(format!(
-                            "JSON literal config-shaped write in `{}` near offset {}: `r#\"{}…\"#`. \
+        if &bytes[i..i + 3] == b"r#\""
+            && bytes.get(i + 3) == Some(&b'{')
+            && let Some(close) = find_raw_string_close(body, i)
+        {
+            let literal = &body[i + 3..close];
+            for field in FIELD_NAMES {
+                if literal.contains(field) {
+                    let snippet: String = literal.chars().take(120).collect();
+                    return Some(format!(
+                        "JSON literal config-shaped write in `{}` near offset {}: `r#\"{}…\"#`. \
                              Use the typed RepoConfigFile / UserConfigFile / AgentConfig struct \
                              instead; add `// allow-json-literal: <reason>` on the line above to \
                              opt out (deliberate alias / parser-fail-closed test).",
-                            path.display(),
-                            i,
-                            snippet,
-                        ));
-                    }
+                        path.display(),
+                        i,
+                        snippet,
+                    ));
                 }
             }
         }

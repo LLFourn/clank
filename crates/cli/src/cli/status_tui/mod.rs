@@ -3464,10 +3464,8 @@ pub(crate) async fn run_tui(
     // Explicit reopen outcomes are returned in request order. A TUI
     // keypress owns a slot too, so a simultaneous web request cannot
     // mistake the keypress's answer for its own.
-    let mut reopen_pending: std::collections::VecDeque<(
-        String,
-        Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
-    )> = Default::default();
+    type ReopenReply = Option<tokio::sync::oneshot::Sender<Result<String, String>>>;
+    let mut reopen_pending: std::collections::VecDeque<(String, ReopenReply)> = Default::default();
     let mut reopen_outcomes_pending = Vec::new();
     // The monitor's baseline is what the snapshot SHOWS, so a change
     // between the build and this line is still a change.
@@ -6205,7 +6203,7 @@ pub(crate) mod tests {
             DeliveryState::Acknowledged,
         ] {
             if state == DeliveryState::Woken {
-                log.append_presentations(&[key.clone()], 123, || true)
+                log.append_presentations(std::slice::from_ref(&key), 123, || true)
                     .unwrap();
             }
             if state == DeliveryState::Acknowledged {
@@ -6788,8 +6786,14 @@ pub(crate) mod tests {
         // stay quiet.
         let same = page.as_ref().unwrap().event.clone();
         let mut generation = 1;
-        let first = retarget_event_page(&mut page, &[same.clone()], tmp.path(), 0, &mut generation)
-            .expect("survives");
+        let first = retarget_event_page(
+            &mut page,
+            std::slice::from_ref(&same),
+            tmp.path(),
+            0,
+            &mut generation,
+        )
+        .expect("survives");
         let second = retarget_event_page(&mut page, &[same], tmp.path(), 0, &mut generation)
             .expect("survives");
         assert!(
@@ -7552,7 +7556,13 @@ pub(crate) mod tests {
             "the page says which repo it is about, in the repo's own name"
         );
 
-        let agents: Vec<(&str, &str, Option<(&str, &str, Option<i64>)>, bool)> = facts
+        type Agent<'a> = (
+            &'a str,
+            &'a str,
+            Option<(&'a str, &'a str, Option<i64>)>,
+            bool,
+        );
+        let agents: Vec<Agent> = facts
             .agents
             .iter()
             .map(|p| {
@@ -11347,7 +11357,7 @@ pub(crate) mod tests {
         let rows = panel_row_list(&s, 120);
         let queue_len = s.queue.len();
         if queue_len > 0 {
-            let want = 3 + 1 + 0; // A0, W0, A1, Add, Q0
+            let want = 3 + 1; // A0, W0, A1, Add, Q0
             assert_eq!(row_position(&rows, PanelRow::Queue(0)), want);
             assert_ne!(
                 row_position(&rows, PanelRow::Queue(0)),
@@ -11665,7 +11675,7 @@ pub(crate) mod tests {
 
         let mut s = two_agent_snap();
         let out_label = s.agents[1].label.clone();
-        let picker = vec![cand("ruthless"), cand("scout")];
+        let picker = [cand("ruthless"), cand("scout")];
         let in_label = picker[1].label.clone();
 
         s.agents.swap(0, 1);

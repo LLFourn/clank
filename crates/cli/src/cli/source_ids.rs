@@ -80,10 +80,10 @@ impl Seen {
         let mut files = std::collections::HashMap::new();
         for id in ids {
             let path = self.file(&id);
-            if let Some(other) = files.insert(path, id.clone()) {
-                if other != id {
-                    return Err(std::io::Error::other("source ID hash collision"));
-                }
+            if let Some(other) = files.insert(path, id.clone())
+                && other != id
+            {
+                return Err(std::io::Error::other("source ID hash collision"));
             }
             self.warm.insert(id.clone());
             if self.durable(&id) != Known::Yes {

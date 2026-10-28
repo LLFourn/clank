@@ -785,15 +785,9 @@ async fn pane_poll(
     let mut listed = clock();
     let mut tick = tokio::time::interval(poll.min(std::time::Duration::from_secs(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut sampling: Option<
-        std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Option<Option<std::collections::BTreeMap<String, Vec<String>>>>,
-                    > + Send,
-            >,
-        >,
-    > = None;
+    type Sample = Option<Option<std::collections::BTreeMap<String, Vec<String>>>>;
+    let mut sampling: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Sample> + Send>>> =
+        None;
     let mut backoff = RESTART_MIN;
     let mut restart_at: Option<Instant> = None;
     loop {
@@ -1512,7 +1506,8 @@ mod tests {
             async fn stop(self) {
                 let _ = self.cancel.send(true);
                 let _ = self.task.await;
-                if let Some(s) = self.subscription.lock().unwrap().take() {
+                let subscription = self.subscription.lock().unwrap().take();
+                if let Some(s) = subscription {
                     tokio::task::spawn_blocking(move || s.end()).await.unwrap();
                 }
             }

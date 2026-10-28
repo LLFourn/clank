@@ -627,7 +627,13 @@ mod tests {
         // Every pair + the three-way: the error lists exactly the
         // conflicting vars — never a claude/codex-shaped mislabel of
         // an opencode id (codex 5395a5d).
-        let pairs: [(Option<&str>, Option<&str>, Option<&str>, &[&str]); 4] = [
+        type Case<'a> = (
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+            &'a [&'a str],
+        );
+        let pairs: [Case; 4] = [
             (
                 Some("c"),
                 Some("x"),

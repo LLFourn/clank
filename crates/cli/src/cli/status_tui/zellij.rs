@@ -164,10 +164,8 @@ impl TabMirror {
         };
         let want = format!("{glyph} {base}");
         match tabs.iter().find(|(t, _)| t == id) {
-            Some((_, name)) if *name != want => {
-                if io.rename(*id, &want) {
-                    self.renamed = true;
-                }
+            Some((_, name)) if *name != want && io.rename(*id, &want) => {
+                self.renamed = true;
             }
             _ => {}
         }
@@ -2575,7 +2573,7 @@ mod tests {
             titles: rows
                 .iter()
                 .map(|(label, as_master, as_reviewer)| {
-                    let (emoji, role) = if *label == master {
+                    let (emoji, _role) = if *label == master {
                         (as_master, "master")
                     } else {
                         (as_reviewer, "reviewer")
@@ -3436,7 +3434,6 @@ mod tests {
                 glyphs: Some(glyphs(&[("claude", "M", "R"), ("codex", "M", "R")])),
                 reopens: Vec::new(),
                 probe: true,
-                ..Default::default()
             },
             &mut io,
             |_, _| {},
@@ -3733,8 +3730,8 @@ mod tests {
         tx.send(WorkerMsg::Roster(view(&["b"], None))).unwrap();
         tx.send(WorkerMsg::Glyphs(named("new"))).unwrap();
         drop(tx);
-        let log: Arc<Mutex<Vec<(Option<RosterView>, Option<Vec<String>>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        type Applied = (Option<RosterView>, Option<Vec<String>>);
+        let log: Arc<Mutex<Vec<Applied>>> = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
         let join = std::thread::spawn(move || {
             worker_loop(&rx, move |WorkerBatch { roster, glyphs, .. }| {

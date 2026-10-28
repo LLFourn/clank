@@ -1635,7 +1635,8 @@ impl Driver {
             .values()
             .flat_map(|w| {
                 let held = w.held_until.unwrap_or(0);
-                let episode = if w.owed {
+
+                if w.owed {
                     Some(held)
                 } else {
                     w.episode
@@ -1643,8 +1644,7 @@ impl Driver {
                         .filter(|e| e.live())
                         .and_then(|e| e.next_at)
                         .map(|at| at.max(held))
-                };
-                episode
+                }
             })
             .chain(self.pending.values().map(|(_, p)| p.due))
             .min()

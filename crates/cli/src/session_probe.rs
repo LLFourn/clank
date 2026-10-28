@@ -79,11 +79,12 @@ fn walk_for_session(dir: &Path, session_id: &str, depth: usize) -> bool {
             if walk_for_session(&path, session_id, depth - 1) {
                 return true;
             }
-        } else if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            if name.starts_with("rollout-") && name.ends_with(".jsonl") && name.contains(session_id)
-            {
-                return true;
-            }
+        } else if let Some(name) = path.file_name().and_then(|s| s.to_str())
+            && name.starts_with("rollout-")
+            && name.ends_with(".jsonl")
+            && name.contains(session_id)
+        {
+            return true;
         }
     }
     false

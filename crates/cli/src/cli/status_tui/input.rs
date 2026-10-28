@@ -2836,7 +2836,7 @@ mod tests {
         // that documented `a` as focus keeps it.
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
-        let agents = vec![agent_row("claude", RosterRole::Master, AutoMode::On)];
+        let agents = [agent_row("claude", RosterRole::Master, AutoMode::On)];
         assert_eq!(
             agent_panel_action(
                 0,
@@ -4629,7 +4629,7 @@ mod tests {
     fn agent_panel_action_routes_keys_by_row_and_role() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
-        let agents = vec![
+        let agents = [
             agent_row("claude", RosterRole::Master, AutoMode::On),
             agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];
@@ -4776,7 +4776,7 @@ mod tests {
     fn agent_panel_action_routes_queue_rows() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
-        let agents = vec![
+        let agents = [
             agent_row("claude", RosterRole::Master, AutoMode::On),
             agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];
@@ -4846,7 +4846,7 @@ mod tests {
     fn agent_panel_action_routes_stash_rows_before_queue_rows() {
         use crate::cli::teams_config::RosterRole;
         use clank_core::vocab::AutoMode;
-        let agents = vec![
+        let agents = [
             agent_row("claude", RosterRole::Master, AutoMode::On),
             agent_row("codex", RosterRole::Commit, AutoMode::Off),
         ];

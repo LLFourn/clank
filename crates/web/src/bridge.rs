@@ -101,10 +101,14 @@ pub enum SessionEvent {
     },
 }
 
+/// The view missed an event and must resubscribe for a fresh image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BroadcastGap;
+
 /// Apply the stream to one browser's view. A newer generation replaces
 /// the old image; an update cannot cross that boundary. `Err` means a
 /// broadcast gap, so the caller should subscribe with a fresh image.
-pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()> {
+pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), BroadcastGap> {
     let revision = match &event {
         SessionEvent::Snapshot { revision, .. }
         | SessionEvent::Update { revision, .. }
@@ -114,7 +118,7 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
         return Ok(());
     }
     if view.revision.checked_add(1) != Some(revision) {
-        return Err(());
+        return Err(BroadcastGap);
     }
     match event {
         SessionEvent::Snapshot {
@@ -123,7 +127,7 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
             ..
         } => {
             if generation < view.generation {
-                return Err(());
+                return Err(BroadcastGap);
             }
             view.generation = generation;
             view.snapshot = Some(snapshot);
@@ -133,15 +137,16 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
             generation, update, ..
         } => {
             let Some(previous) = view.snapshot.as_mut() else {
-                return Err(());
+                return Err(BroadcastGap);
             };
             if !view.connected
                 || view.generation != generation
                 || previous.sequence.checked_add(1) != Some(update.sequence)
             {
-                return Err(());
+                return Err(BroadcastGap);
             }
-            let state = crate::replay::merge(&previous.state, &update.state).map_err(|_| ())?;
+            let state =
+                crate::replay::merge(&previous.state, &update.state).map_err(|_| BroadcastGap)?;
             *previous = Snapshot {
                 sequence: update.sequence,
                 state,
@@ -149,7 +154,7 @@ pub fn apply_event(view: &mut SessionView, event: SessionEvent) -> Result<(), ()
         }
         SessionEvent::Disconnected { generation, .. } => {
             if generation < view.generation {
-                return Err(());
+                return Err(BroadcastGap);
             }
             view.generation = generation;
             view.connected = false;
@@ -690,7 +695,7 @@ impl Session {
             session: self.clone(),
             generation,
         };
-        let result = async {
+        async {
             send(&mut socket, &Wire::Ready { version: VERSION }).await?;
             let mut transport = crate::bridge_transport::Connection::new(socket);
             let sender = transport.outbound.clone();
@@ -757,8 +762,7 @@ impl Session {
             } }.await;
             transport.shutdown().await;
             run
-        }.await;
-        result
+        }.await
     }
 }
 

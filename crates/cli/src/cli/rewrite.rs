@@ -1505,7 +1505,7 @@ mod tests {
         let dir = init_repo();
         let repo = dir.path();
         write(repo, "base.txt", "base\n");
-        let base = commit(repo, "base");
+        let _base = commit(repo, "base");
         write(repo, ".clank/plans/foo.md", "# foo\n");
         let intro = commit(repo, "[foo] plan");
         write(repo, "work.txt", "one\n");

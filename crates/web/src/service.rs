@@ -839,10 +839,12 @@ mod tests {
         }
     }
 
+    type Upload = (String, Vec<u8>);
+
     struct Fixture {
         updates: broadcast::Sender<Update>,
         calls: Arc<TokioMutex<Vec<BrowserRequest>>>,
-        uploads: Arc<TokioMutex<Vec<(String, Vec<u8>)>>>,
+        uploads: Arc<TokioMutex<Vec<Upload>>>,
     }
 
     #[async_trait]

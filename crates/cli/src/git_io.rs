@@ -2035,10 +2035,10 @@ fn apply_diff_records(records: &[DiffRecord]) -> CommitChanges {
                 });
             } else if is_rename && old_is_plan && !new_is_plan {
                 if let Some(old_k) = old_key {
-                    if is_finished_path(&new_rel) {
-                        if let Some(fk) = plan_key_from_finished_path(&new_rel) {
-                            plans_finished_added.insert(fk);
-                        }
+                    if is_finished_path(&new_rel)
+                        && let Some(fk) = plan_key_from_finished_path(&new_rel)
+                    {
+                        plans_finished_added.insert(fk);
                     }
                     plan_touches.push(PlanTouch {
                         plan: old_k,

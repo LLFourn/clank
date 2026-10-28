@@ -2,6 +2,7 @@
 name = "clank-core"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.96"
 publish = false
 description = "Shared core types (closed-vocab enums + response DTOs + identifiers) for Clank. Pure data — no daemon, runtime, or framework dependencies. Compiles to wasm32 unchanged."
 

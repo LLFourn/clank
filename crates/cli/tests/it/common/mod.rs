@@ -181,9 +181,18 @@ pub fn race_deadline(repo: &Path) -> Duration {
 /// Attaching watchers concurrently is what made these binaries flaky
 /// (four at once pushed every deadline past its limit). Hold this for
 /// the body of any test that spawns a wait.
-pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+pub fn serial() -> Serial {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    Serial {
+        _guard: SERIAL.lock().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// Held across a whole async test body, awaits included: each
+/// `#[tokio::test]` runs on its own runtime thread, so blocking another
+/// test's thread on it is the serialization, not a deadlock.
+pub struct Serial {
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 /// Assert a wait does NOT resolve: spawn it, sample after

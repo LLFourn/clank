@@ -103,6 +103,7 @@ impl NonBlocking {
 
     /// `file`, made non-blocking. It must be this writer's own
     /// description: the mode is shared with every copy of it.
+    #[cfg(test)]
     pub(crate) fn own(file: std::fs::File) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         let fd = file.as_raw_fd();
@@ -181,11 +182,11 @@ impl Reader {
     /// Let it read until `by`, then stop it, and return only once it has
     /// ended either way.
     pub(crate) async fn finish_by(mut self, by: tokio::time::Instant) {
-        if let Some(task) = self.0.as_mut() {
-            if tokio::time::timeout_at(by, &mut *task).await.is_err() {
-                task.abort();
-                let _ = (&mut *task).await;
-            }
+        if let Some(task) = self.0.as_mut()
+            && tokio::time::timeout_at(by, &mut *task).await.is_err()
+        {
+            task.abort();
+            let _ = (&mut *task).await;
         }
         self.0 = None;
     }

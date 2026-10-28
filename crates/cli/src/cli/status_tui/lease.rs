@@ -146,7 +146,7 @@ pub(crate) fn probe(repo: &Path) -> (bool, Option<crate::cli::remote_control::Ho
 /// Take the lease, recording `holder` as its holder: a test standing
 /// in for a TUI that is another process.
 #[cfg(test)]
-pub(crate) fn hold_as(repo: &Path, holder: &crate::cli::remote_control::Holder) -> StatusLease {
+pub(super) fn hold_as(repo: &Path, holder: &crate::cli::remote_control::Holder) -> StatusLease {
     use std::io::Write;
     let lease = acquire(repo).unwrap();
     let mut file = std::fs::OpenOptions::new()

@@ -67,6 +67,10 @@ pub(crate) struct EmissionSink {
     report: Option<Report>,
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is tokio's SendError, handing the unsent emission back"
+)]
 impl EmissionSink {
     pub(crate) fn for_author(
         tx: UnboundedSender<(AgentLabel, Emission)>,
@@ -118,6 +122,10 @@ impl EmissionSink {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is tokio's SendError, handing the unsent emission back"
+)]
 impl From<UnboundedSender<Emission>> for EmissionSink {
     fn from(tx: UnboundedSender<Emission>) -> Self {
         Self {

@@ -500,6 +500,7 @@ impl Feed {
 
     /// A subscription line. Unknown kinds are kept out of the way,
     /// not treated as errors.
+    #[cfg(test)]
     pub(crate) fn event(&self, ev: SubscribeEvent) {
         self.event_at(None, ev);
     }
@@ -639,6 +640,7 @@ impl Feed {
     /// re-sent whole with its output attached — one id, one turn, so
     /// there is no separate attach message to arrive out of order.
     /// An id nobody has (a call older than the window) is nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tool_output(
         &self,
         agent: &str,
