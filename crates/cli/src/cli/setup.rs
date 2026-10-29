@@ -658,10 +658,9 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             &mut summary,
         )?;
     }
-    match opencode_support(opencode_executable(None, &std::env::current_dir()?).as_deref()) {
-        OpenCodeSupport::Supported(_) => {}
-        support => summary.push(format!("  OpenCode: {}", support.describe())),
-    }
+    let opencode =
+        opencode_support(opencode_executable(None, &std::env::current_dir()?).as_deref());
+    summary.push(format!("  OpenCode: {}", opencode.describe()));
     // Native initialize may create provider cache directories. A dry run must
     // not invoke it in the user's home; real setup probes once, never at idle.
     if args.dry_run {
@@ -677,12 +676,8 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         summary.push(line);
     }
 
-    if summary.is_empty() {
-        println!("clank setup: nothing to do (all assets already in place)");
-    } else {
-        for line in summary {
-            println!("{line}");
-        }
+    for line in summary {
+        println!("{line}");
     }
     if args.dry_run {
         println!("(dry-run — no changes written)");
@@ -2494,17 +2489,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(ci.contains("not recoverable"), "{ci}");
-        assert!(ci.contains("sees the CURRENT result"), "{ci}");
         assert!(
             ci.contains("announced once"),
             "and that an unchanged build stays quiet: {ci}",
         );
-        // The two claims a reader could act on wrongly: that
-        // something watches between waits (nothing does), and that a
-        // cue always means an immediate read (a storm is dropped).
+        // The two claims a reader could act on wrongly: that a
+        // conclusion between polls is kept (it is gone), and that a cue
+        // always means an immediate read (a storm is dropped).
         assert!(
-            ci.contains("as long as your `clank wait` does"),
-            "observation needs an armed wait: {ci}",
+            ci.contains("between two polls, or while no monitor ran"),
+            "only what a poll sees is kept: {ci}",
         );
         assert!(ci.contains("DROPPED, not queued"), "{ci}");
     }

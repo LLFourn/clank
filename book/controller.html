@@ -40,7 +40,7 @@
      "content": "Route each open PR to its team."}
   ]
 }</code></pre>
-<p>A timer fires once at <code>due_at</code>, an absolute time with an explicit UTC offset. With <code>repeat_every</code> it fires again at that fixed interval. That is elapsed time, not a calendar: 24 hours stays 24 hours across a daylight-saving change. If clank was not running when a timer came due, it catches up the next time a wait is armed. A recurring timer that missed many slots delivers one catch-up event for all of them, not a storm. Acknowledging that event covers every slot up to the moment you acknowledged it.</p>
+<p>A timer fires once at <code>due_at</code>, an absolute time with an explicit UTC offset. With <code>repeat_every</code> it fires again at that fixed interval. That is elapsed time, not a calendar: 24 hours stays 24 hours across a daylight-saving change. If the repo’s monitor was not running when a timer came due, it catches up when the monitor next starts. A recurring timer that missed many slots delivers one catch-up event for all of them, not a storm. Acknowledging that event covers every slot up to the moment you acknowledged it.</p>
 
 <h3 id="commands">Command sources</h3>
 <pre><code>{"kind": "command", "name": "deploys",
@@ -60,7 +60,7 @@
 <ul>
   <li><strong><code>prompt</code></strong> is your standing instruction for that watch. It is shown with every event the watch produces, telling the agent what reacting means.</li>
   <li><strong>Your own actions don’t wake you</strong>, unless you set <code>"include_own_actions": true</code>. The exception is <code>review_submitted</code>, which is never filtered, because a submitted review is the thing a team waits on.</li>
-  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. A wait sees the current result. A red build that turned green while nothing was armed is simply gone.</li>
+  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. The repo’s monitor polls them for every agent on the roster, whether or not that agent is waiting, and a conclusion it sees stays in the inbox until acknowledged. What it never sees is lost: a red build that turned green between two polls, or while no monitor was running, is simply gone.</li>
 </ul>
 <p>A source polls by default. Add <code>"delivery": "realtime"</code> for push-speed wakes through GitHub’s webhook forwarding. Polling keeps running underneath as the backstop. What each needs:</p>
 <div class="table-scroll">

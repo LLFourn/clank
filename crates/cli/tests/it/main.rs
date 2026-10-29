@@ -32,7 +32,6 @@ mod inbox_wakes;
 mod no_json_literal_config_writes;
 mod no_ngrok;
 mod no_orphan_doc_comments;
-mod open_integration;
 mod opencode_plugin_lifecycle;
 mod pick_integration;
 mod plan_admission;

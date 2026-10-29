@@ -106,7 +106,7 @@ pub struct ConfigArgs {
     #[arg(short = 'j', long, global = true)]
     pub json: bool,
     /// Write to the USER-scope config (`~/.clank/config.json`) instead of the
-    /// repo's `.clank/config.json`. Only affects `set`; reads always show the
+    /// repo's `.clank/config.json`. Only affects writes; reads always show the
     /// effective merged value (repo shadows user).
     #[arg(long, global = true)]
     pub global: bool,
@@ -161,8 +161,9 @@ pub enum ConfigKey {
     /// Squash a plan into one commit when it finishes
     ///
     /// Rewrites the current branch in place, so published history changes
-    /// if it was already pushed. bool, default: false. `clank finish
-    /// --no-squash` skips it for one finish.
+    /// if it was already pushed. bool, default: false, though `clank setup`
+    /// sets it to true in your user config unless you have set it. `clank
+    /// finish --no-squash` skips it for one finish.
     #[command(name = "finish.autosquash", alias = "finish_autosquash")]
     FinishAutosquash(ConfigKeyArgs),
     /// Nudge an agent whose state clank cannot read
@@ -475,9 +476,6 @@ pub struct OpenArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum OpenCmd {
-    /// Report what `clank open` would do for a path, without opening anything
-    #[command(hide = true)]
-    Dry(OpenDryArgs),
     /// Open the workspace, the same as bare `clank open`
     ///
     /// Generates a zellij layout (KDL) for the master and reviewer panes
@@ -492,16 +490,6 @@ pub enum OpenCmd {
     /// would-be-spawned argv on stderr instead of shelling out.
     #[command(hide = true)]
     Zellij(OpenZellijArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct OpenDryArgs {
-    /// Path to inspect. Its repo is the one containing it, so there
-    /// is no `--repo`. Echoed back verbatim as `requested_path`.
-    pub path: String,
-    /// Emit the response as JSON.
-    #[arg(short = 'j', long)]
-    pub json: bool,
 }
 
 #[derive(Args, Debug, Default, Clone, PartialEq, Eq)]
@@ -662,9 +650,9 @@ pub struct WaitArgs {
     /// One-shot, non-blocking probe: report whether the caller has
     /// actionable work RIGHT NOW and return immediately — never enter the
     /// watcher loop. Unlike a real wait it is SIDE-EFFECT-FREE: it fires no
-    /// lifecycle or idle hooks and promotes nothing. Emits the same output
-    /// Exits 3 with a no-work diagnostic when idle. Used by SessionStart
-    /// to check for pending work without blocking.
+    /// lifecycle or idle hooks and promotes nothing. Prints the same items
+    /// as a real wait; exits 3 with a no-work diagnostic when idle. Used by
+    /// SessionStart to check for pending work without blocking.
     #[arg(long)]
     pub peek: bool,
     /// Skip the on-disk state cache.
@@ -1135,10 +1123,10 @@ pub struct StopHookArgs {
     /// hook stdin JSON (which IS the agent's cwd at stop time).
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// SessionStart handler (claude-asyncrewake-work-loop): mint a
-    /// new wait generation (revoking stale waiters) and surface any
-    /// pending work as additionalContext. Installed alongside the
-    /// asyncrewake Stop entry; never fails a session start.
+    /// SessionStart handler: binds the session clank launched (and
+    /// rebinds after `/clear`) and surfaces pending work as
+    /// additionalContext. Installed for claude in either loop mode and
+    /// for codex; never fails a session start.
     #[arg(long)]
     pub session_start: bool,
     /// Claude's PostCompact handler: a compaction can end the parked

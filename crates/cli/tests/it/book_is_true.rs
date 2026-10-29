@@ -253,6 +253,27 @@ fn broken_links(root: &Path) -> Vec<String> {
     bad
 }
 
+/// Every link into clank's source on GitHub naming a file `repo` lacks.
+fn missing_source_files(root: &Path, repo: &Path) -> Vec<String> {
+    const SOURCE: &str = "https://github.com/LLFourn/clank/blob/master/";
+    let attr = re(r#"\bhref\s*=\s*"([^"]*)""#);
+    let mut bad = Vec::new();
+    for page in files_with_ext(root, "html") {
+        let html = without_comments(&read(&page));
+        for c in attr.captures_iter(&html) {
+            let target = c.unwrap().get(1).unwrap().as_str().to_string();
+            let Some(path) = target.strip_prefix(SOURCE) else {
+                continue;
+            };
+            let path = path.split('#').next().unwrap();
+            if !repo.join(path).exists() {
+                bad.push(format!("{}: `{target}`: no such file", rel(root, &page)));
+            }
+        }
+    }
+    bad
+}
+
 /// Every `data-cast` scene with no `casts/<scene>.js`.
 fn missing_casts(root: &Path) -> Vec<String> {
     let attr = re(r#"\bdata-cast\s*=\s*(?:"([^"]*)"|'([^']*)')"#);
@@ -407,6 +428,7 @@ fn the_book_is_true() {
     let failures: Vec<String> = [
         commands,
         broken_links(&root),
+        missing_source_files(&root, root.parent().expect("book/ has a parent")),
         missing_casts(&root),
         network_loads(&root),
         scrub,
@@ -561,6 +583,26 @@ fn a_missing_or_escaping_link_fails() {
     );
     let bad = broken_links(dir.path());
     assert_eq!(bad.len(), 2, "{bad:?}");
+}
+
+/// A link to a source file the checkout does not have fails.
+#[test]
+fn a_link_to_a_missing_source_file_fails() {
+    let dir = fixture();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+    std::fs::write(repo.path().join("docs/kept.md"), "").unwrap();
+    let blob = "https://github.com/LLFourn/clank/blob/master";
+    edit(
+        dir.path(),
+        "guide.html",
+        "back</a>",
+        &format!(r#"back</a><a href="{blob}/docs/kept.md#x">kept</a>"#),
+    );
+    assert!(missing_source_files(dir.path(), repo.path()).is_empty());
+    edit(dir.path(), "guide.html", "docs/kept.md", "GONE.md");
+    let bad = missing_source_files(dir.path(), repo.path());
+    assert_eq!(bad.len(), 1, "{bad:?}");
 }
 
 /// A `data-cast` with no recording fails.

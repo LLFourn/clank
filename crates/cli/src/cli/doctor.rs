@@ -408,8 +408,8 @@ pub fn repo_checks(
             out.push(CheckResult::warn(
                 SECTION,
                 "agents",
-                "this repo has no agents configured; run `clank agent add <name>` + \
-                 `clank agent make-master <name>` (or `clank init --team <name>`) to register agents"
+                "this repo has no agents configured; run `clank agent add <name>` (the first \
+                 agent becomes master) or `clank init --team <name>` to register agents"
                     .to_string(),
             ));
             return out;
@@ -488,7 +488,7 @@ pub fn repo_checks(
                 format!("agent: {}", label.as_str()),
                 format!(
                     "registered {role_str} `{}` has no `.clank/agents/{}/config.json` yet; \
-                     run `clank as {}` from inside the agent's session to bind",
+                     start it with `clank agent start {}`, which binds it",
                     label.as_str(),
                     label.as_str(),
                     label.as_str(),
@@ -537,7 +537,7 @@ pub fn repo_checks(
                 format!("agent: {}", label.as_str()),
                 format!(
                     "{base_msg} — registered {role_str} is unbound; \
-                     run `clank as {}` from inside the agent's session to bind",
+                     start it with `clank agent start {}`, which binds it",
                     label.as_str()
                 ),
             )
@@ -616,7 +616,7 @@ pub(crate) fn claude_mode_drift(installed_async: bool, capable: bool) -> Option<
         ),
         (false, true) => Some(
             "this Claude Code supports asyncRewake but the installed Stop hook is \
-             the legacy background-arm loop; run `clank setup` to upgrade"
+             the legacy synchronous loop; run `clank setup` to upgrade"
                 .to_string(),
         ),
         _ => None,
@@ -653,7 +653,7 @@ fn check_claude_loop_mode(settings: &Path, capable: Option<bool>) -> Option<Chec
             if installed_async {
                 "asyncrewake (matches installed Claude Code)"
             } else {
-                "legacy background-arm (matches installed Claude Code)"
+                "legacy synchronous (matches installed Claude Code)"
             },
         ),
     })
@@ -1229,9 +1229,12 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
                     None => out.push(CheckResult::ok(
                         SECTION,
                         "env",
-                        "not running inside an agent (no CLAUDE_CODE_SESSION_ID / \
-                         CODEX_THREAD_ID)"
-                            .to_string(),
+                        format!(
+                            "not running inside an agent (no {})",
+                            crate::agent_env::SESSION_VARS
+                                .map(|(var, _)| var)
+                                .join(" / ")
+                        ),
                     )),
                 }
                 d

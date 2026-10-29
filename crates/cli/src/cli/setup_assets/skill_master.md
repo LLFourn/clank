@@ -162,15 +162,20 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
   shell (write `["sh","-c","…"]` for one). Each event lands in your
   inbox like a github event and re-wakes you until acked; re-emitting
   an id is harmless. Keep any cursor in `$CLANK_SOURCE_STATE_DIR`.
+- `{"kind":"timer","name":"label","due_at":"2026-10-04T09:00:00+11:00",
+  "content":"…"}` — wakes you with a `timer_event` at that deadline (an
+  RFC3339 time with its offset); add `"repeat_every":"24h"` to repeat.
+  Missed deadlines catch up on the next arm.
 
-React to a `github_event` / `command_event` like any other work item:
-do the triage (`gh` for PRs/issues, your own tools for command events),
-then re-arm and STOP. Github events land in a per-agent INBOX first
-(`.clank/agents/<label>/events/`) and re-wake you until you mark them
-handled: `clank events list` shows the unhandled backlog, `clank
-events ack <id>` closes an item out — react, then ack, every time.
-Events that fired while no wait was armed are caught up on the next
-arm. The `clank-github` skill carries the full inbox flow.
+React to a `github_event` / `command_event` / `timer_event` like any
+other work item: do the triage (`gh` for PRs/issues, your own tools for
+the rest), then STOP as your work loop above says. These events land in
+a per-agent INBOX first (`.clank/agents/<label>/events/`) and re-wake
+you until you mark them handled: `clank events list` shows the
+unhandled backlog, `clank events ack <id>` closes an item out — react,
+then ack, every time.
+Sources run in the repo's monitor whether or not you are waiting, so
+an event that fires while you work is waiting in the inbox when you stop. The `clank-github` skill carries the full inbox flow.
 
 ### Reading feedback
 

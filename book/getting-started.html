@@ -42,11 +42,11 @@ clank doctor</code></pre>
 <p><code>clank setup</code> installs, at user level:</p>
 <ul>
   <li>the role skills <code>clank-master</code>, <code>clank-reviewer</code> and <code>clank-standby</code>, plus <code>clank-github</code>, for each tool;</li>
-  <li>clank’s Stop and SessionStart hooks, merged into Claude Code’s <code>settings.json</code> and Codex’s <code>hooks.json</code>;</li>
+  <li>clank’s Stop and SessionStart hooks, merged into Claude Code’s <code>settings.json</code> and Codex’s <code>hooks.json</code>, plus, for Claude Code, a PostCompact hook and the hooks that track its questions to you;</li>
   <li>Grok’s native hooks, in <code>~/.grok/hooks/clank.json</code>;</li>
   <li>the opencode plugin, which carries its work loop.</li>
 </ul>
-<p>The hooks are how an agent gets woken, and the skills are how it learns its job. Run <code>clank setup</code> again after every upgrade. <code>clank setup --dry-run</code> shows what would change first, and <code>clank setup --force</code> overwrites skill files you have edited.</p>
+<p>The hooks are how an agent gets woken, and the skills are how it learns its job. Run <code>clank setup</code> again after every upgrade, because a release can add a hook. The PostCompact hook is one: when Claude Code compacts an idle session, it ends the wait the Stop hook was holding, and the hook arms it again. Without it, the agent hears about new work only when clank nudges it. <code>clank setup --dry-run</code> shows what would change first, and <code>clank setup --force</code> overwrites skill files you have edited.</p>
 <p><code>clank doctor</code> checks the repo, your user-level install and the current session, and prints OK, WARN or FAIL with what to do about each. It exits non-zero on any FAIL. It is the first thing to run whenever something seems off.</p>
 
 <h2 id="init">Give a repo a roster</h2>

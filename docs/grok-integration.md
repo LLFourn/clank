@@ -1,10 +1,7 @@
 # Grok integration
 
 Clank uses Grok's native session ID and the ordinary repository monitor. There
-is no tool-call registration handshake. The previous adapter has been retired:
-its tool rewriting, hidden correlation flags, registration records, leases,
-notification sockets and registration deadline are removed. Old design notes
-are historical descriptions, not requirements of the current integration.
+is no tool-call registration handshake.
 
 ## End-to-end flow
 
@@ -14,10 +11,14 @@ are historical descriptions, not requirements of the current integration.
    before interactive launch. It is not an idle helper or delivery transport.
 2. The native SessionStart hook binds Grok's actual `sessionId` to the launched
    `CLANK_AGENT`. A lookup-only session cannot silently claim another label.
-3. At genuine main-session turn end, the native Stop hook reads `backgroundTasks`.
-   If an ordinary background `clank wait` is running, Stop allows the turn to end.
-   Otherwise it requests one terminal tool call with `block_until_ms: 0` and no
-   positive timeout. It neither starts a process nor changes the tool arguments.
+3. At a main-session turn end (`reason: end_turn`; subagent stops are ignored),
+   the native Stop hook reports to the repo's monitor whether `backgroundTasks`
+   shows a running `clank wait` and whether this Stop is a continuation
+   (`stopHookActive`). The monitor decides: nothing if a wait is running, this is
+   the continuation, or the drive gate (auto off, a block) says so; otherwise
+   Stop blocks with the request to run `clank wait` as one background terminal
+   task (`block_until_ms: 0`, no positive timeout). The hook never rewrites a
+   tool call or waits for work itself.
 4. The wait gets Grok's native `GROK_SESSION_ID`, its agent binding and the launch
    repository. Bare `clank wait` and `clank wait --repo <the same repository>` are
    equivalent. An automatic wait cannot change its author or move to another
@@ -51,8 +52,8 @@ replacement. Each connection cleans up its own resources; closing an old socket
 cannot release some other socket's ownership. A binding change refuses old
 connections, and the wait independently checks the binding before delivery.
 
-Stop's `stopHookActive` flag limits arming to one request within a continuation
-turn. An immediately completed wait may already be absent from the task snapshot;
+The monitor never asks again in a continuation (`stopHookActive`), so arming is
+one request per turn. An immediately completed wait may already be absent from the task snapshot;
 Stop lets that continuation end so Grok can deliver its completion. A failed wait
 is visible through its tool result and is not repeatedly relaunched by Stop.
 An omitted native task snapshot is a visible adapter error, not proof of idleness.
@@ -71,19 +72,17 @@ and is idempotent. Validation detects obsolete owned entries so launch repair ca
 replace a stale profile automatically. Custom `GROK_HOME` and launch profiles use
 that profile's actual configuration home, rather than an unrelated default home.
 
-Install the reviewed binary and run normal Clank setup for each affected Grok
-profile. Existing provider processes may retain their loaded hook configuration;
-end/cancel their old background wait and restart those sessions if the provider
-has not reloaded the new hooks. Do not copy an old generated command into the
-new CLI. Leftover files from the removed adapter are not read by current Clank
-and do not confer ownership; discard those inactive legacy files during the
-one-time upgrade after the old tasks have ended, never while a legacy task owns
-its lease. No compatibility adapter continues the retired protocol.
+Run `clank setup` (or `clank setup --grok-agent <label> --repo <repo>` for a
+custom profile) after upgrading; `clank agent start` also repairs a missing or
+outdated profile before it launches Grok. Existing provider processes may retain
+their loaded hook configuration; end their old background wait and restart those
+sessions if the provider has not reloaded the new hooks.
 
 ## Provider evidence and validation limits
 
-The previously inspected supported baseline is Grok 1.0.46, public source pinned
-at `2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`. ACP initialize advertises native
+Clank accepts Grok 1.x from 1.0.46; other major versions are refused until
+validated. The inspected baseline is Grok 1.0.46, public source pinned at
+`2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8`. ACP initialize advertises native
 Stop decision support; neither that advertisement nor a version proves that an
 authenticated model consumes background completion notifications. Notifications
 must be enabled in the actual Grok session.
@@ -93,10 +92,7 @@ native `stopHookActive` continuation flag. The terminal-tool source's current
 contract maps `block_until_ms: 0` directly to background execution and returns
 `BackgroundTaskStarted` from that path, independently of whether the command has
 already completed. This is not an inline foreground-return path that Clank must
-hold open. Older pinned two-knob tool contracts explicitly ignore `block_until_ms`;
-those configurations need their actual background parameter instead and are not
-proved compatible by a CLI version alone. No observed provider failure has
-justified retaining a Clank-specific registration acknowledgement.
+hold open.
 
 Relevant upstream sources:
 

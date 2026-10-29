@@ -8,8 +8,10 @@ commit by default; reviewers sign off; the plan finalizes into a sealed record.
 use clank, and real recordings. Open `book/index.html` in a browser; it works
 offline. This README is the reference.
 
-Everything lives in `.clank/` and `git`. No daemon, no server, no
-database — the review history IS the commit history.
+Everything durable lives in `.clank/` and `git`. No server, no
+database — the review history IS the commit history. One background process
+per repo, the monitor, starts on its own when an agent waits or a TUI opens;
+it watches the repo for every agent and holds nothing you would lose.
 
 ```
         master                                    reviewers
@@ -46,6 +48,9 @@ not chase them.
   - **plan** — reviews at the plan stage (the intro / plan revisions).
   - **final** — reviews when the work is believed complete.
   - **gate** — folds into BOTH the plan- and final-stage reviews.
+
+  A **standby** agent reviews nothing; it is woken only for events and
+  messages.
 - Implement a plan in one complete commit unless it specifies internal named
   milestones with a strong justification for their review boundaries. Do not add
   milestones merely to excuse incremental implementation. Reviewers must request
@@ -64,6 +69,8 @@ not chase them.
 
 ## Install
 
+clank installs from source; there is no other channel yet.
+
 ```sh
 git clone https://github.com/LLFourn/clank
 cd clank
@@ -74,7 +81,28 @@ That puts `clank` and its `clank-web-cloudflare` host process on your
 `$PATH`. The TUI starts that sibling executable when you turn on the
 remote. Keep `--locked`: without it
 `cargo install` ignores the committed `Cargo.lock` and re-resolves
-every dependency to the newest semver-compatible version.
+every dependency to the newest semver-compatible version. The checkout
+pins its Rust toolchain in `rust-toolchain.toml`, which rustup picks up.
+`clank --version` prints `0.0.1+<sha>` for a checkout build (`.dirty`
+when the tree had changes), and the TUI names its pane `clank <version>`.
+
+clank is developed on macOS. A Linux CI job (`.github/workflows/ci.yml`)
+runs fmt, clippy and every test on each push, so Linux builds and passes
+the tests; nothing else is built or tested. It needs `git`, and
+[zellij](https://zellij.dev) for `clank open`.
+
+The version floors below are what the source checks for. The test suite
+runs against fixtures, not the installed agent tools, so a working
+first run on a given tool version has not been verified for every
+combination:
+
+- Claude Code: 2.1.223 or later for the async loop (older versions get
+  the legacy loop; see [How agents stay awake](#how-agents-stay-awake)).
+- Grok: 1.x, at least 1.0.46, advertising the native Stop decision gate.
+- OpenCode: 2.x.
+- Codex: no version check.
+- zellij: `zellij action override-layout`, which 0.45 lacks; `clank doctor`
+  checks for it.
 
 Then wire it into your agents (Claude Code, Codex CLI, Grok CLI,
 opencode — any or all):
@@ -86,12 +114,16 @@ clank doctor      # verify
 
 `setup` installs the role-split skills (`clank-master`,
 `clank-reviewer`, `clank-standby`, plus `clank-github`) into `~/.claude/`,
-`~/.codex/`, `~/.grok/`, and `~/.config/opencode/`, a `/clank` slash
-command for claude, the clank opencode plugin
+`~/.codex/`, `~/.grok/`, and `~/.config/opencode/` (or `$CLAUDE_CONFIG_DIR`,
+`$CODEX_HOME`, `$GROK_HOME`, `$OPENCODE_CONFIG_DIR` when set), a `/clank`
+slash command for claude, the clank opencode plugin
 (`~/.config/opencode/plugin/clank.js` — session binding + work loop),
-and merges its Stop and SessionStart hooks into claude's
-`settings.json` and codex's `hooks.json`, replacing any entry that
-runs `clank stop-hook`. Grok gets a native adapter at
+and merges its hooks into claude's `settings.json` (Stop, SessionStart,
+PostCompact for the async loop, and the `AskUserQuestion` question hook)
+and codex's `hooks.json` (Stop, SessionStart), replacing clank's own
+entries and keeping yours. Codex also gets a `clank` allow rule in
+`rules/default.rules`. Setup sets `finish.autosquash` to true in
+`~/.clank/config.json` unless you have set it. Grok gets a native adapter at
 `$GROK_HOME/hooks/clank.json` (default `~/.grok/hooks/clank.json`): SessionStart
 binds the session, Stop requests one ordinary background wait, and SessionEnd
 releases that session's binding. Setup removes the retired Clank-owned tool hooks
@@ -107,9 +139,10 @@ notifications or a model wake; doctor reports that distinction explicitly.
 Managed agent launches inspect and repair missing or older setup-owned integration
 for the provider they actually launch. This includes profile-specific HOME and
 configuration directories, and an existing global OpenCode plugin loaded alongside
-a custom profile. Locally edited integration files are preserved and reported;
-launch does not force an overwrite. Preview commands remain read-only. Repair runs
-at launch, with no idle polling or setup daemon.
+a custom profile. A locally edited integration file stops the launch with an
+error naming it, and nothing is repaired; restore it or run `clank setup --force`.
+Preview commands remain read-only. Repair runs at launch, with no idle polling or
+setup daemon.
 
 Claude launches also record workspace trust in the selected profile's user
 configuration before execution: `projects["<main checkout>"].hasTrustDialogAccepted`
@@ -126,8 +159,10 @@ asset paths. It probes the selected Claude executable for hook mode and the
 selected Grok executable for native capabilities. Diagnosis does not install
 anything; tools without a configured profile retain default user-scope checks.
 
-Re-run `clank setup` after upgrading the binary; `--force` refreshes
-skill files you have locally edited.
+Re-run `clank setup` after upgrading the binary: a new version can add
+hooks (Claude's PostCompact, for one), and only sessions clank launches
+repair them on their own. `clank doctor` warns about a missing one.
+`--force` refreshes skill files you have locally edited.
 
 ## Quickstart
 
@@ -163,7 +198,7 @@ stage with the reviewers stacked beside it, and each pane is a real
 agent CLI started in this repo. The arrangement is a layout composed
 from the roster: when the roster changes — an agent added, removed or
 promoted — the running `clank tui` applies the recomposed
-layout to the live tab (zellij 0.45's `override-layout`), so alt+[ /
+layout to the live tab (zellij's `override-layout`, which 0.45 lacks), so alt+[ /
 alt+] flip the CURRENT roster's arrangement, not the one from when
 the session was opened. The layout also hands Alt+arrows to the
 agents — codex edits its last message on Alt+Up — so in a clank
@@ -290,7 +325,8 @@ clank tui               # full-screen: the way you actually drive it
 ```
 
 The TUI is the primary interface once a team is running: agent rows
-with live state (`?` marks an agent whose pane is not open),
+with live state (`▶`/`⏸` auto on/off; `?` no pane open; `!` no pane, but
+its process still runs),
 per-agent pages (auto-mode, review tier, swap, reopen a closed pane,
 remove), the plan and its verdicts, queued plans, and github event
 pages. Under the queue, one `drafts: N` row lists `.clank/drafts/`; a draft's
@@ -310,25 +346,38 @@ A restart is a request to the monitor. It stops only that source's whole
 process group and starts it again, and is refused if the configuration it runs
 has changed since the page showed it. When an edited source configuration was
 rejected, the page says the monitor still runs the earlier one.
-`--watch` gives a live non-fullscreen view; `-j` emits JSON.
-Status JSON carries `active_plan` and `last_finished` as objects or `null`. A
-finished run carries `duration_secs`, recorded once from its accepted intro to
-finalize using Git author timestamps (clock reversals clamp to zero; squashed
-runs have the single commit as both boundaries). Log banners show one name per
-run across external events and loaded pages, with its recorded duration.
-HEAD tag diagnostics carry `unknown` and `extra_named` as a string or `null`;
-`untagged_touched` remains an array of actual files touched by the diff.
-The latter is shown when no active plan is selected. These replace the former
-`plans` and `finished_plans` arrays; `clank open` inspection also reports one
-optional `active_plan` name.
+The TUI shows a `monitor` row only when something is wrong: an older build
+still running (`restart to update`), stopped, not running, or unknown.
+`clank status` always prints its `monitor:` line.
+
+`clank status --watch` gives a live non-fullscreen view; `-j` emits JSON.
+Status JSON carries `active_plan` and `last_finished` as objects or `null`;
+`last_finished` is shown only when no plan is active. A finished run carries
+`duration_secs`, from its accepted intro to finalize by Git author time (clock
+reversals clamp to zero; a squashed run's one commit is both ends). HEAD tag
+corrections carry `unknown` and `extra_named` as a string or `null`, and
+`untagged_touched` as an array of files the diff touched.
+
+Status shows a commit warning only when it belongs to HEAD and amending that
+commit can repair it, such as introducing another plan while one is active or
+introducing several plans in one commit. Historical ignored introductions remain
+part of replay's provenance, but do not clutter CLI or TUI status.
+
+`clank log` marks each commit row in its gutter: `~` ad-hoc, `✎` planning,
+`⚒` implementation, `⚑` finish, and `⁂` for one commit that finishes several
+plans at once (a squash, or restored records), shown once with its subject and
+a count: `⁂ 44cc9b2 Restore the simulator plans (81 plans)`.
+`clank log --diagnostics` shows reconstruction evidence instead of the
+timeline, including the responsible commit and reason, even after later work
+retires it; `--json` emits typed records, and the usual range, `-n` and
+`--plan` filters apply (`-n 0` for the whole first-parent history).
 
 Enter selects whatever the cursor is on; every screen shows its own
 keys along the bottom. The `remote` row under the agent list is the
 remote: Space there (or `r` from the log view) is the switch. From a
 shell, `clank remote on|off` asks the repo's running `clank tui` to do
 the same, and `clank remote status` shows its state and address; on
-while on and off while off change nothing. A `clank tui` started
-before this existed cannot take these requests until it restarts. In the
+while on and off while off change nothing. In the
 default mode, the TUI starts a separate host process on the port the
 repo remembers in `.clank/config.json`, attaches this repo to it,
 and sends your browser in. Switching off, or closing the TUI, stops
@@ -433,7 +482,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `auto` | Per-agent auto-mode: `on` / `off` / `status` |
 | `tui` | The full-screen pane: the way you drive a running team (Enter on a github row opens the event page: preview, ack, open-in-browser; Enter on a block's question or its agent's row opens the block page to answer it) |
 | `status` | Repo state; `--watch` re-prints it as it changes, `-j` JSON |
-| `wait` | Block for work; `--peek`, `--for`, `--event` (see above) |
+| `wait` | Block for work; `--peek`, `--for`, `--event` (see Extra wake sources) |
 | `run` | Run a long command under clank, so clank knows it is in hand (see below) |
 | `attend` | Tell clank which background work you are waiting on: a subagent by name, or a running task by id and `--pid` (see below) |
 | `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply` (see below) |
@@ -474,14 +523,16 @@ itself or they exist for one-off upgrades. They still work:
   and never starts one. `monitor upgrade` replaces monitors from
   builds that predate self-retirement; run it once after upgrading from one.
 - `block migrate` flattens the legacy plan-scoped block layout.
-- `open dry <path> [--json]` reports what `clank open` would do for a path
-  without opening anything; `open-worktree.sh` reads its JSON.
 
 Older spellings still work, hidden: `block create` is `block ask`, `unblock`
 is `block answer`, `agent add --global --tool` and `agent remove --global`
 are `team agent add` and `team agent remove`, `open zellij` is `open`, `agent promote` is `agent make-master`, `team
-delete` is `team remove`, `attending` is `attend`, `--dry` is `--dry-run`
-and `html open --print-path` is `--print`.
+delete` is `team remove`, `attending` is `attend`, `--dry` is `--dry-run`,
+`html open --print-path` is `--print`, `shelve` / `unshelve` / `shelve clean`
+are `stash push` / `stash pop` / `stash drop`, `agent add --launch-cmd` /
+`--launch-arg` / `--launch-env` are `--cmd` / `-- …` / `--env`, `queue
+reprioritize` is `reprioritise`, `config <key> get` / `set <value>` are
+`config <key>` / `config <key> <value>`, and `status --tui` is `tui`.
 
 ### Messages: send, interrupt, nudge
 
@@ -502,6 +553,9 @@ Three levels, for three situations:
   nudge history.
 
 ### User commands
+
+**Not active yet:** until a human records the evidence described under
+*Evidence a human records* below, every request is refused at dispatch.
 
 Agents reach actions their permission checks deny but you are happy to do
 yourself: pushing a branch, opening a PR. The story site shows such a
@@ -673,24 +727,11 @@ work still wakes it.
 
 The request takes effect from the next turn-end, whose list of running
 work must show exactly one match. Each takes `--expect` (default 5m): if
-the work is still running past that, the agent is checked in on once,
-typed into its pane. Nothing is cancelled and nothing times out. The
+the work is still running past that, the work already shown wakes the
+agent again through its wait, and it is checked in on once in its pane
+where clank can type there. Nothing is cancelled and nothing times out. The
 harness's own notification that the task finished is still what wakes the
 agent when it ends. `clank attend --clear` withdraws it.
-
-Status shows a commit warning only when it belongs to HEAD and amending that
-commit can repair it, such as introducing another plan while one is active or
-introducing several plans in one commit. Historical ignored introductions remain
-part of replay's provenance, but do not clutter CLI or TUI status. Warning labels
-and wrapped text use the terminal's warning color independently of the state bar.
-
-Use `clank log --diagnostics` to inspect reconstruction evidence, including the
-responsible commit and reason, even after later successful work retires that
-evidence from current workflow state. This explicit view replaces the timeline;
-`--json` emits typed records, and the usual range, `-n` and `--plan` filters apply.
-Use `-n 0` for the whole first-parent history. No history rewrite or cache migration
-is needed, and ordinary log output remains unchanged. Live operational failures
-and HEAD tag corrections keep their existing status surfaces.
 
 ## Layout
 
@@ -701,8 +742,11 @@ and HEAD tag corrections keep their existing status surfaces.
 ├── queue/                          # queued plan bodies (NNN-<name>.md)
 ├── drafts/                         # staging area consumed by `queue add`
 ├── config.json                     # roster + repo config — local-only
+├── stash/                          # stashed plans
 ├── agents/<label>/
 │   ├── config.json                 # auto-mode, session binding, wait_events
+│   ├── events/                     # inbox WAL (see `clank events`)
+│   ├── nudges.jsonl                # nudge history
 │   └── feedback/<sha>.md           # this agent's review notes
 ├── cache/                          # local fold cache
 └── .gitignore                      # allow-lists the tracked paths
@@ -717,11 +761,16 @@ committed. Everything else is per-user state.
 ~/.grok/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
 ~/.config/opencode/skills/{clank-master,clank-reviewer,clank-standby,clank-github}/
 ~/.config/opencode/plugin/clank.js  # opencode binding + work-loop plugin
-~/.claude/settings.json             # claude Stop + SessionStart hooks merged in
+~/.claude/settings.json             # claude Stop, SessionStart, PostCompact + question hooks
 ~/.codex/hooks.json                 # codex Stop + SessionStart hooks merged in
-~/.grok/hooks/clank.json             # native lifecycle adapter; custom GROK_HOME supported
+~/.codex/rules/default.rules        # codex allow rule for `clank`
+~/.grok/hooks/clank.json            # grok SessionStart, Stop, SessionEnd adapter
 ~/.clank/config.json                # agent library, teams, hooks, defaults
+~/.clank/setup-manifest.json        # what setup wrote, so it can tell your edits from its own
 ```
+
+Each tool root honours its override: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+`GROK_HOME`, `OPENCODE_CONFIG_DIR` (else `$XDG_CONFIG_HOME/opencode`).
 
 ## How agents stay awake
 
@@ -734,12 +783,16 @@ auto-mode drives it:
   (2.1.223+), `clank setup` installs the ASYNC loop: the Stop hook
   itself parks the long-poll (no armed background task at all — the
   task manager can't reap what doesn't exist) and work WAKES the
-  session as a system reminder; a SessionStart companion mints the
-  waiter generation and delivers catch-up work after restarts. On
-  older installs the legacy loop remains: the hook nudges the agent
-  to keep a background `clank wait` armed and the wait's completion
-  wake carries the items. Setup decides ONCE per machine and
-  `clank doctor` flags drift.
+  session as a system reminder. A PostCompact companion (also
+  `asyncRewake`) parks the wait again after a compaction, which
+  otherwise ends it. A SessionStart companion, installed in either
+  mode, binds the session clank launched and delivers pending work as
+  context after restarts and `/clear`. On older Claude Code the Stop
+  hook parks the same wait synchronously, holding the turn open, and
+  continues the session with the items; no background wait is armed in
+  either mode. `clank setup` picks the mode from the installed Claude
+  Code's version, and `clank doctor` flags drift between that and the
+  installed hook.
 - **codex** — its Stop hook long-polls `clank wait` in-hook and blocks
   with the items (the poll parks until work, the hook-runner
   ceiling, or the hook's own death). Remote chat uses the local Codex
@@ -755,11 +808,10 @@ auto-mode drives it:
   `run_terminal_command` and `block_until_ms: 0` when needed. The wait connects
   directly to the shared monitor with the existing agent and session identity.
   The monitor rejects duplicate automatic waits; no tool arguments are rewritten.
-  Grok's background completion carries the next work turn. An idle wait adds no
-  helper, watcher or polling cadence. Setup migrates existing Clank-owned hooks
-  while preserving user hooks. Deterministic launch fixtures verify the wiring;
-  authenticated model completion acceptance remains a separate live check. See
-  [the integration contract](GROK-INTEGRATION.md).
+  Grok's background completion carries the next work turn, and SessionEnd
+  releases the binding. An idle wait adds no helper, watcher or polling cadence.
+  Setup migrates existing Clank-owned hooks while preserving user hooks. See
+  [the integration contract](docs/grok-integration.md).
 - **opencode** (2.x) — the clank plugin long-polls in-hook when a
   session's execution succeeds and prompts the items into it; the agent
   never arms anything. One OpenCode service hosts every session and
@@ -815,7 +867,10 @@ agent's session.
   - ending a turn does not discharge pending work;
   - the user's latest instruction, any explicit pause, and the stated reason for
     a rejected action are followed;
-  - a real dependency on the user belongs in `clank block ask <name> -m "…"`.
+  - background work is attended (`clank attend <name>`, `clank run`) rather
+    than waited out by ending the turn;
+  - what discharges each item, one line per item; a plan step that truly
+    depends on a person points to `clank block ask <name> -m "…"`.
 
   A block pauses review work only; messages and events are still delivered.
 - **Resets:** the count resets when the items, the session, or the blocks (which
@@ -834,6 +889,31 @@ show the same. While the question is pending, stall notices and failed-turn
 retries hold. The question is over when it is answered, dismissed or cancelled
 in the terminal, when its turn ends or fails, when a newer prompt begins, or
 when its session is no longer the agent's.
+
+### When nothing is delivering
+
+The monitor reads each agent's session record and recovers an agent that
+owes work but is not being reached. All of it is skipped while auto-mode is
+off, a question or block is pending, or the agent is attending work.
+
+- **Idle.** An agent whose turn ended with work still owed is nudged after a
+  settle time (3 minutes), then once more 15 minutes later, then shown as
+  waiting for you.
+- **Unwatched.** When the agent's parked wait ends without delivering
+  anything (its harness restarted, a compaction, a killed hook), `clank
+  status` shows it as `unwatched <age>` rather than working, and it is nudged
+  like an idle agent. Any new activity in its record, or a new wait, clears it.
+- **Silent.** A turn that reads as running but whose record has not grown for
+  `recovery.stall_warn` (default `40m`) is warned about (`silent 40m —
+  nudging in 5m`, in the status line and the timeline), then nudged once
+  `recovery.stall_nudge` later (default `5m`). The nudge's interrupt key can
+  stop a tool that really is still running; the warning is the chance to
+  prevent that. `off` turns either off: no watchdog, or a warning only.
+- **Unreadable.** An agent whose record cannot be read is nudged at most
+  once per `recovery.blind_nudge` interval (default `off`, leaving it to you).
+
+Set these with `clank config <key> <value>` for the repo, or with `--global`
+for every repo (`~/.clank/config.json`); a repo value shadows the global one.
 
 ## Extra wake sources
 
@@ -909,19 +989,14 @@ time: it catches up when Clank next arms. Clock movement backwards is rechecked 
 acceptance; a forward jump is observed at the currently armed monotonic deadline or
 next configuration rearm, without periodic clock checks.
 
-Install a timer-capable binary **before** adding timer definitions, on every client
-and monitor host. From this checkout use `cargo install --path crates/cli --locked`,
-then ensure `command -v clank` resolves to that installation. Existing configurations
-need no migration. Recurrence-capable clients use monitor protocol 9 and the existing
-exclusive monitor handoff. Deploy the current binary on every client/monitor host
-and retire or restart old monitors and waiters **before** enabling recurring
-definitions. Updating the binary does not update a process already running it.
-Earlier timer-capable binaries may ignore `repeat_every` and treat recurrence as
-one-shot, and old writers cannot preserve the new compacted coverage records.
-Mixed-version custody and downgrade are unsupported; disable recurrence and retain
-its WAL for a supporting binary before downgrading. This feature does not install
-or start an agent provider. Native timer sleeps add no polling; the existing bounded
-repository watcher uses `notify::PollWatcher`, and its cadence is unchanged.
+A timer does not install or start an agent provider. Native timer sleeps add no
+polling; the existing bounded repository watcher uses `notify::PollWatcher`, and its
+cadence is unchanged.
+
+After upgrading clank, restart long-lived monitors, waits and TUIs: updating the
+binary does not update a process already running it. A newer client asks an older
+monitor to retire. Mixed versions writing the same repo, and downgrades, are
+unsupported.
 
 - `clank wait --peek` — non-blocking, side-effect-free "is there work
   right now?" probe.
@@ -987,13 +1062,14 @@ repository watcher uses `notify::PollWatcher`, and its cadence is unchanged.
   (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes
   anyone, and stays *unhandled* — re-waking the agent on every arm —
   until acked with `clank events ack`. That makes delivery
-  at-least-once: events that fire while no wait is armed (agent
-  offline, wait killed, the gap before a re-arm) are caught up on the
-  next arm by reconciling GitHub's event feed against the inbox. CI
-  conclusions are the exception — they are not in that feed, they are
-  read from each watched PR's checks, so an arm sees the CURRENT
-  result: a build that went red and was replaced by a green one while
-  nothing was armed is not recoverable.
+  at-least-once. Sources run in the repo's monitor for every roster
+  agent whether or not it is waiting, and events that fired while no
+  monitor ran are caught up when it next starts by reconciling GitHub's
+  event feed against the inbox. CI conclusions are the exception —
+  they are not in that feed, they are polled from each watched PR's
+  checks, and a poll keeps only what it sees: a build that went red and
+  was replaced by a green one between polls, or while no monitor ran,
+  is not recoverable.
   `clank events list` / `show` inspect metadata; `events read` delivers content; the `clank-github` skill
   teaches agents the react-then-ack loop.
 
@@ -1133,8 +1209,7 @@ short local writer locks and no idle retry worker or polling. New replies do not
 inherit the original message's reply obligation.
 
 Reply-required messages use a version-2 inbox record that older readers cannot
-treat as plain-ackable work. Install supporting binaries on every custodian before
-using this feature; mixed old/new message-operation writers are unsupported.
+treat as plain-ackable work.
 
 Accepted replies appear in the timeline with a `✉` mail badge, their
 destination (`→ @agent`, with the repository's path when it is another one) and
@@ -1169,8 +1244,6 @@ Replies add no idle worker, watcher or periodic retry. An explicit command
 owns delivery and cleanup. A later explicit retry checks any saved callback
 owner by kernel process birth identity before ending a surviving process
 group; uncertain ownership refuses a new launch and names the record to inspect.
-Use updated Clank binaries for all agents, the monitor and the TUI before
-enabling required replies; an older client does not enforce this new policy.
 
 Events may request **best-effort interruption** while retaining normal inbox
 delivery. For a message:
@@ -1207,7 +1280,7 @@ That produces `Interrupted for new voice message: command-voice-7f9bc9f9@15`.
   source or its events. `clank doctor` and the monitor report it, as they do a
   missing one.
 - **The description is recorded with each event,** like `interrupt` itself.
-  `clank events show --json` shows it as `interrupt_hint`.
+  `clank events read <selector> --json` shows it as `interrupt_hint`.
 
 The monitor initiates requests without requiring an armed waiter. One recipient's
 pending eligible events coalesce into one request; the sender uses the same ledger
@@ -1240,10 +1313,7 @@ preserves ordinary delivery. There is at most one automatic attempt for each
 logical event; replay, reconnect and idle monitor beats do not retry it. A crash
 or deadline may leave an unconfirmed attempt, which also does not retry.
 `clank events show <selector> --json` includes `interrupt` and `interrupt_attempt`.
-The interruption path adds no watcher or idle polling. Upgrade all Clank clients
-and the monitor before enabling it. Monitor capability 10 includes this lifecycle;
-a newer client requests cooperative retirement of an older host. Refresh long-lived
-TUI clients as well so they share the replacement rather than keep local watchers. Claude
+The interruption path adds no watcher or idle polling. Claude
 uses terminal control. Grok's and OpenCode's panes are never typed into; OpenCode's
 server API has cancellation, but Clank has no verified attachable endpoint for a live
 TUI. No separate provider process/server is started to control a persisted session. Without a
@@ -1262,7 +1332,7 @@ does not mark them woken. Legacy acknowledged events get double ticks; pending
 legacy events remain `?` until a real wake or explicit read.
 
 Clank records the first wake for each exact inbox copy in its existing WAL.
-Generic Codex, Claude and OpenCode continuations, Claude SessionStart context,
+Generic Codex, Claude and OpenCode continuations, Claude and Codex SessionStart context,
 the native Grok background wait, and explicit event reads record
 successful delivery after flush and binding validation. Failed output or stale
 sessions leave the state unchanged. A crash or storage error after output can conservatively leave `?`;
@@ -1297,7 +1367,7 @@ A receipt means Clank successfully wrote and flushed a hook wake or an explicit
 `events read` containing the event. It does not prove that the provider accepted the continuation or that the
 model read or completed the instruction. It never acknowledges an event, submits
 an answer, or completes backend work. Receipt handlers should record delivery/read
-metadata only; for Anx, this must not invoke `anx ack` or `anx say --done`. Unfinished
+metadata only. Unfinished
 work remains owed and can still reach a replacement master.
 
 Clank invokes exactly the configured argv, without added arguments or an implicit
@@ -1340,7 +1410,7 @@ raw filesystem views are not instrumented: this is an explicit delivery boundary
 not proof of model cognition or enforcement against direct filesystem access.
 
 Supported presentations are generic Codex, Claude and OpenCode Stop-hook wakes,
-Claude SessionStart's actual additional-context output, and explicit `events read`.
+Claude's and Codex's SessionStart additional-context output, and explicit `events read`.
 Native Grok handoffs record local delivery evidence but do not dispatch backend
 receipt callbacks; arbitrary backend/file reads are outside this version. `events list`, `show`, `ack`,
 plain `wait`, and `wait --peek` do not notify. Peek includes pending configured source
@@ -1371,9 +1441,7 @@ already occupies stderr, so its latest callback diagnostic replaces
 `/tmp/clank-run-<uid>/<repo-tag>.wake-receipt-<author>.diagnostic`. The repo tag is the
 first 32 hex characters of BLAKE3 over the canonical repo path bytes. This file is
 only diagnostic evidence, never acknowledgement, completion or retry authority.
-Update the Clank CLI and restart existing monitors before enabling receipt handlers.
-An older monitor's missing execution context skips receipts with a diagnostic rather
-than guessing a backend directory. No existing source is opted in automatically.
+No existing source is opted in automatically.
 
 ## Troubleshooting
 
@@ -1383,13 +1451,14 @@ a real run):
 
 ```
 [repo]
-  OK   .clank/.gitignore: present at …/.clank/.gitignore
+  OK   .clank/.gitignore: up to date at …/.clank/.gitignore
   OK   agent: claude: …/config.json: auto_mode=on (per-agent), session=claude bound to …
 
 [user]
-  OK   ~/.claude/skills/clank-master/SKILL.md: matches embedded content
-  OK   ~/.claude/settings.json: claude Stop hook installed
-  OK   ~/.codex/hooks.json: codex Stop hook installed
+  OK   claude claude: …/.claude/skills/clank-master/SKILL.md: matches embedded content
+  OK   claude claude: …/.claude/settings.json: claude Stop hook installed
+  OK   claude claude: …/.claude/settings.json PostCompact: claude PostCompact hook installed
+  OK   codex codex: …/.codex/hooks.json: codex Stop hook installed
 
 [session]
   OK   env: running inside claude (session …)
@@ -1397,9 +1466,9 @@ a real run):
   OK   role: inferred role: master
 ```
 
-`WARN … drifted from embedded content` after an upgrade means the
-binary's embedded skills are newer than the installed files — run
-`clank setup --force`.
+`WARN … is an old setup version` after an upgrade: run `clank setup` (no
+`--force` needed). `WARN … drifted from embedded content` means the file
+was edited locally; `clank setup --force` overwrites it.
 
 An agent pane that says **`<label>` is already running in zellij
 session `…`, tab `…`** found another live pane named for the same

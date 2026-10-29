@@ -66,7 +66,6 @@
 </ul>
 
 <h2 id="not">What clank is not</h2>
-<aside class="note"><p><strong>The README’s tagline is out of date.</strong> It still says “no daemon”. There is a per-repo monitor now; this section says what it is.</p></aside>
 <p><strong>It is not an agent.</strong> It has no model of its own. It launches the agent CLIs you have installed, teaches them their role through skills and hooks that <code>clank setup</code> installs, and routes work to them.</p>
 <p><strong>It is not a hosted service.</strong> Plans, the roster, verdicts and the event inbox are files in your repo’s <code>.clank/</code> directory and in <code>~/.clank/</code>. There is no database and no account.</p>
 <p><strong>It does run one background process per repo: the monitor.</strong> The first <code>clank wait</code> or <code>clank tui</code> in a repo starts it. It watches the repo once on behalf of every agent and dashboard, hosts the event sources agents have configured, and decides what each agent’s turn-end means. You never install, start or configure it, and none of your durable state lives inside it. <a href="how-it-works.html#monitor">How it works</a> has the details.</p>

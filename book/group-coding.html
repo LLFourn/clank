@@ -48,8 +48,8 @@ clank queue promote my-feature</code></pre>
   <thead><tr><th scope="col">Tier</th><th scope="col">Reviews</th></tr></thead>
   <tbody>
     <tr><td><code>commit</code></td><td>Every reviewable commit, as it lands.</td></tr>
-    <tr><td><code>plan</code></td><td>The plan stage: the intro and any plan revisions.</td></tr>
-    <tr><td><code>final</code></td><td>The final stage, when the work is believed complete.</td></tr>
+    <tr><td><code>plan</code></td><td>The plan stage: the intro and any plan revisions, once the commit tier has passed them.</td></tr>
+    <tr><td><code>final</code></td><td>The final stage: a commit every commit-tier reviewer has marked <span class="stamp finished">FINISHED</span>.</td></tr>
     <tr><td><code>gate</code></td><td>Both the plan stage and the final stage.</td></tr>
     <tr><td><code>standby</code></td><td>Nothing. It is woken for everything else.</td></tr>
   </tbody>
@@ -70,7 +70,7 @@ clank queue promote my-feature</code></pre>
   <dt><span class="stamp finished">FINISHED</span></dt>
   <dd>The committable work the plan describes is done and ready to merge: code written, tests passing, review satisfied. A plan document alone is not finished unless the document is the whole deliverable. A step only a human can do, like a smoke test on a device, is recommended in the verdict, never waited on.</dd>
 </dl>
-<p>A single <span class="stamp changes">REQUEST_CHANGES</span> holds the plan, whatever the others said. The gate reaches finished when a reviewer writes <span class="stamp finished">FINISHED</span> and nobody has asked for changes. While a gate-tier reviewer still owes its verdict, the master waits. The master reads the verdicts with a command, not by opening the files:</p>
+<p>A single <span class="stamp changes">REQUEST_CHANGES</span> holds the plan, whatever the others said, and the master is sent back to it once every reviewer it was waiting on has written. The gate reaches finished when every commit-tier reviewer has written <span class="stamp finished">FINISHED</span>, and then every final- and gate-tier reviewer has too. While a plan-, final- or gate-tier reviewer still owes its verdict, the master waits. The master reads the verdicts with a command, not by opening the files:</p>
 <pre><code>clank feedback read --commit <var>sha</var>
 clank feedback read --plan</code></pre>
 <p>The second form reads the active plan’s whole cycle, oldest commit first, each with its verdicts.</p>
@@ -80,15 +80,15 @@ clank feedback read --plan</code></pre>
 <p>After every commit the master stops: after the implementation, after each review correction, after a plan revision, and after promoting a plan. clank wakes it again when the gate has moved. The <a href="for-agents.html">For agents</a> chapter has the rule from the agent’s side.</p>
 
 <h3 id="tags">Commit tags</h3>
-<p>An implementation commit’s subject starts with the plan it belongs to, as in <code>[my-feature] Retry failed fetches</code>. The tags on a commit must equal the set of active plans whose files it touches: no tag on an unrelated fix, and no missing or extra tag. If they don’t match, clank hands the master a correction to amend before anything else moves.</p>
+<p>An implementation commit’s subject starts with the plan it belongs to, as in <code>[my-feature] Retry failed fetches</code>. An unrelated fix carries no tag. A tag must name a real plan, and a commit that changes a plan’s file must be tagged with exactly that plan. If the latest commit breaks this, clank hands the master a correction to amend before anything else moves.</p>
 
 <h2 id="finish">Finishing a plan</h2>
 <p>When the gate reaches <span class="stamp finished">FINISHED</span>, the master is handed a finalize item, and only then does it run:</p>
 <pre><code>clank finish my-feature -m "Retry failed fetches with a capped backoff" \
   -m "CI flaked on every network blip, and an uncapped retry could stall a run for hours."</code></pre>
 <p>The message is required and is written as if the whole plan were one commit: what changed in the subject, why in the body. A bare subject is rejected. The plan moves to <code>.clank/finished/</code>. That is the seal.</p>
-<p>With <code>finish.autosquash</code> on, the plan’s commits also collapse into one commit carrying that message. It rewrites the current branch in place, so it is off by default:</p>
-<pre><code>clank config finish.autosquash true</code></pre>
+<p>With <code>finish.autosquash</code> on, the plan’s commits also collapse into one commit carrying that message. It rewrites the current branch in place, so on an already-pushed branch it rewrites published history. Unset, it is off, but <code>clank setup</code> turns it on in your user config unless you have set it yourself. A repo setting overrides yours, and <code>clank finish --no-squash</code> skips it for one finish. To turn it off:</p>
+<pre><code>clank config --global finish.autosquash false</code></pre>
 <p><code>clank finish my-feature --no-squash -m "…" -m "…"</code> keeps the individual commits for one finish, for example to keep a refactor bisectable. <code>--force</code> finishes without the gate’s say-so. That is the human’s escape hatch, not the master’s.</p>
 
 <h2 id="aside">Setting a plan aside</h2>
@@ -112,8 +112,8 @@ clank feedback read --plan</code></pre>
 <h2 id="watching">Watching it happen</h2>
 <pre><code>clank tui
 clank log --plan my-feature --oneline</code></pre>
-<p><code>clank tui</code> is the full-screen pane <code>clank open</code> puts beside the agents, and it is how you drive a running team. It shows each agent’s live state, the plan and its verdicts, the queue and drafts, event sources and the timeline, and it has a page for each agent with its auto-mode, tier and pane. Every screen lists its keys along the bottom.</p>
-<p><code>clank log</code> prints the same timeline: commits, reviews and GitHub events, newest first. <code>clank status --watch</code> re-prints the state as it changes, <code>clank diff my-feature</code> opens a plan’s diff in your editor, and <code>clank html open</code> renders the timeline as a static site.</p>
+<p><code>clank tui</code> is the full-screen pane <code>clank open</code> puts beside the agents, and it is how you drive a running team. It shows each agent’s live state, the plan and its verdicts, the queue and drafts, event sources and the timeline, and it has a page for each agent with its auto-mode, tier and pane. Every screen lists its keys along the bottom. Its pane is titled <code>clank</code> and the build it runs, such as <code>0.0.1+c5eaf416</code>, so you can see which version is driving the team. A <strong>monitor</strong> row appears only when something is wrong with the repo’s <a href="how-it-works.html#monitor">monitor</a>: it is not running, it stopped, its state cannot be read, or it is an older build than the one installed and needs a restart.</p>
+<p><code>clank log</code> prints the same timeline: commits, reviews and GitHub events, newest first. In <code>--oneline</code> form and in the TUI, a commit that finishes several plans at once, such as a squash or a restore of their records, is one row marked <code>⁂</code>, with the count after its subject: <code>(2 plans)</code>. <code>clank status --watch</code> re-prints the state as it changes, <code>clank diff my-feature</code> opens a plan’s diff in your editor, and <code>clank html open</code> renders the timeline as a static site.</p>
 
 <figure class="recording">
   <div class="cast" data-cast="tui-watch"></div>

@@ -10,7 +10,7 @@ item is queueable as written: plan name, problem, shape of the fix.
 - **Channels.** crates.io, prebuilt GitHub binaries (plus a `curl | sh`
   installer), Homebrew (a formula over the prebuilt binaries; no §2
   item until chosen), or a subset. Today the only path is clone +
-  `cargo install --path crates/cli --locked` (README.md:67-71).
+  `cargo install --path crates/cli --locked` (README.md, Install).
   §2 lists what each channel costs; pick before queueing any of it.
 - **Platforms.** macOS arm64 is the only target built here. Linux has
   code (`crates/cli/src/proc_identity/linux.rs`) and CI builds and tests
@@ -21,7 +21,7 @@ item is queueable as written: plan name, problem, shape of the fix.
 - **Licence.** Which one (§1 `license-and-attribution`).
 - **Supported harness versions.** Which versions the release claims
   (see the table in §1 `first-run-walk-per-harness`).
-- **Hidden aliases.** README.md:480 says older spellings "still work,
+- **Hidden aliases.** The README's command reference says older spellings "still work,
   hidden" (`block create`, `unblock`, `open zellij`, `agent promote`,
   …). A first public release has no users of them: drop them
   before release or keep them a release longer.
@@ -158,27 +158,22 @@ item is queueable as written: plan name, problem, shape of the fix.
   installed harness and records the versions that passed. That record is
   what the README states as supported.
 
-- [ ] **`docs-match-the-release`** — the README and the book are gated
-  (`it/book_is_true.rs`, and the README reference test in
-  `cli/command.rs:531`), but these are not:
-  - `clank setup`'s summary says "~/.claude, ~/.codex, ~/.grok"
-    (`cli/command.rs:195`), but setup also installs OpenCode
-    (`cli/setup.rs:297`).
-  - `open-worktree.sh` duplicates `clank fork create` plus
-    `clank open --fork`. Its header names `clank open --json`, which no
-    longer exists; it invokes the hidden `open dry --json`
-    (README.md:477-478). Delete the script, and `open dry` with it if
-    nothing else uses it.
-  - `GROK-INTEGRATION.md` is a top-level design note that README.md:762
-    links as "the integration contract". Fold it into the README or the
-    book, or move it under `docs/`.
-  - `docs/cli-audit.md` is kept true by tests (`cli/command.rs:880-960`),
-    but its follow-up plans have all finished (`.clank/finished/cli-*.md`).
-    Keep it as a record or delete it, along with its tests.
-  - `scripts/migrate-feedback-to-agents.sh` is a one-off from 2026-05-23
-    (6730f008). Delete it unless some pre-release repo still needs it.
-  - The README Install section (README.md:65-130) is rewritten for the
-    chosen channels.
+- [x] **`docs-match-the-release`** — README, every book chapter, the
+  installed skills, `--help`, setup's and doctor's text and the Grok
+  contract were read against the source and corrected. Resolved:
+  - `clank setup`'s summary names Claude, Codex, Grok and OpenCode, and
+    its run summary always reports OpenCode
+    (`cli::command::tests::setup_summary_names_every_tool_it_installs_for`).
+  - `open-worktree.sh` is deleted, and with it the hidden `open dry` and
+    its inspector, which nothing else called.
+  - `GROK-INTEGRATION.md` moved to `docs/grok-integration.md`, with the
+    retired-adapter history cut.
+  - `docs/cli-audit.md` and its tests are deleted: every follow-up it
+    named had finished (`.clank/finished/cli-*.md` keep the record).
+  - `scripts/migrate-feedback-to-agents.sh` is deleted.
+  - The README Install section documents the one channel that exists
+    (clone + `cargo install --locked`), the version floors the source
+    checks, and that no installed-harness run is verified.
 
 - [ ] **`security-review-for-release`** — what is known from the source:
   - Listeners bind to 127.0.0.1 only (`web-cloudflare/src/host.rs:89`).
@@ -256,7 +251,7 @@ item is queueable as written: plan name, problem, shape of the fix.
   74d7a8e5 (long help says what a command is for).
 - `readme-rewrite`: the pitch, mental model and demo moved into the book
   (3d379512). README.md:7-9 sends newcomers there, and the README is the
-  reference; Quickstart is at README.md:132.
+  reference; Quickstart is in README.md.
 - `tutorial-screencast-content`: six casts recorded from real runs
   (`book/casts/*.js`, `scripts/book/scenarios/`), 3d379512.
 - core/cli boundary holds: `crates/core/Cargo.toml` depends only on

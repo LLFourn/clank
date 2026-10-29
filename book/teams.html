@@ -37,7 +37,7 @@ clank init --team review-pair</code></pre>
 <h2 id="fork">Forking the team</h2>
 <pre><code>clank fork create retry-work</code></pre>
 <p>This creates a linked git worktree at <code>.clank/worktrees/retry-work</code> on a new branch of the same name, and gives it the team. Inside zellij it opens the fork as a new tab at once. Use <code>--no-open</code> to skip that.</p>
-<p>The agents in the fork don’t start blank. Each one’s session is forked from the one it has in the source repo: Claude through its own session fork, Codex through <code>codex fork</code>, and Grok by preparing its history in the new worktree before launch. So the forked team remembers the conversation that led to the fork. An agent with no session to fork starts fresh, but carries an orientation prompt telling it where it is. <code>--fresh</code> starts every agent that way on purpose.</p>
+<p>The agents in the fork don’t start blank. Each one’s session is forked from the one it has in the source repo: Claude through its own session fork, Codex through <code>codex fork</code>, OpenCode through its server’s session fork, and Grok by preparing its history in the new worktree before launch. So the forked team remembers the conversation that led to the fork. An agent with no session to fork starts fresh, but carries an orientation prompt telling it where it is. <code>--fresh</code> starts every agent that way on purpose.</p>
 
 <figure class="recording">
   <div class="cast" data-cast="fork-create"></div>

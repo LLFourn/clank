@@ -5,12 +5,11 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 - `plans/` — one `.md` per active plan; `finished/` — finalized plans
 - `queue/` — queued plan drafts awaiting promotion
 - `config.json` — local, gitignored repo config: the repo ROSTER as a
-  flat list of agents, each with a role (`master`, or a reviewer tier:
+  flat list of agents, each with a role (`master`, a reviewer tier:
   `commit` / `plan` / `final` / `gate` — gate folds into both the plan-
-  and final-stage reviews). NOT a single "master" setting.
+  and final-stage reviews — or `standby`). NOT a single "master" setting.
 - `agents/<label>/config.json` — per-agent local state, gitignored
   (session binding, auto-mode)
-- `agents/<label>/feedback/<sha>.md` — a reviewer's notes on a commit
 
 ## Always (every role)
 
@@ -22,7 +21,8 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
 - **Long background work**: shell work as `clank run --desc "two words"
   -- <cmd>`, a subagent with `clank attend "<name>"`. Past `--expect` (5m)
   you get one check-in. Its completion still wakes you: never poll it or
-  start a wait.
+  start a wait. Owing work, a turn silent 45m (default) is nudged, which
+  interrupts it.
 
 ## Core commands (run via {{SHELL}})
 

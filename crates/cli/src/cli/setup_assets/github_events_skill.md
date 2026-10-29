@@ -26,7 +26,7 @@ YOUR per-agent event inbox (a write-ahead log under
    clank events ack <id>        # ids from `clank events list`
    ```
 
-3. Re-arm your wait and stop.
+3. Stop, as your role skill's work loop says (it re-arms the wait).
 
 **Unacked events wake you again on every arm — by design.** The inbox
 is at-least-once: if your session crashes mid-reaction, or the wait
@@ -153,12 +153,11 @@ checks routinely come from several, plus the older commit statuses).
 
 Two consequences worth knowing:
 
-- **There is no backlog to catch up on.** An arm sees the CURRENT
-  result. A build that went red and was replaced by a green one while
-  nothing was armed is not recoverable — the red is simply gone.
-  Nothing watches on your behalf between waits: the watch runs for
-  exactly as long as your `clank wait` does, so an armed wait is the
-  only thing that can see a transition. `prs` does not change that —
+- **Only what a poll sees is kept.** The repo's monitor polls for
+  every roster agent whether or not it is waiting, and a conclusion it
+  sees stays in your inbox until acked. A build that went red and was
+  replaced by a green one between two polls, or while no monitor ran,
+  is not recoverable — the red is simply gone. `prs` does not change that —
   it bounds WHICH PRs are read, and so how many requests each poll
   costs.
 - **An unchanged build is silent.** The same conclusion on the same

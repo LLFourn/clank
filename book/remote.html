@@ -38,9 +38,9 @@ clank remote off</code></pre>
 <h2 id="door">The default host and its door</h2>
 <p>By default the TUI starts its own host process, <code>clank-web-cloudflare</code>, on a port the repo remembers, and sends your browser in. The page sits behind a door, and the key is one token. Press <kbd>Enter</kbd> on the remote row to open the remote page, which prints the token. Paste it into the door once on each device.</p>
 <ul>
-  <li><strong>The token</strong> is minted on first use and kept at user level, in <code>~/.clank/config.json</code> under <code>remote.token</code>. It is the same for every repo’s remote on this machine and survives restarts. <kbd>t</kbd> opens the token page, where <kbd>Enter</kbd> or <kbd>x</kbd> rotates it, which ends every session it opened.</li>
-  <li><strong>One-time links</strong> make pasting unnecessary. <kbd>o</kbd> on the row opens your browser through one. <kbd>p</kbd> shows one as a QR code for a phone’s camera. Each link works once, within five minutes.</li>
-  <li><strong>Sessions</strong> last thirty days and are stored hashed in <code>~/.clank/remote-sessions.json</code>. <kbd>s</kbd> opens the sessions page, which lists them. <kbd>Backspace</kbd> revokes the selected one, and its stream ends at once.</li>
+  <li><strong>The token</strong> is minted on first use and kept at user level, in <code>~/.clank/config.json</code> under <code>remote.token</code>. It is the same for every repo’s remote on this machine and survives restarts. <kbd>t</kbd> on the remote page opens the token page, where <kbd>Enter</kbd> or <kbd>x</kbd> rotates it, which ends every session it opened.</li>
+  <li><strong>One-time links</strong> make pasting unnecessary. <kbd>o</kbd>, on the row or the remote page, opens your browser through one. <kbd>p</kbd> on the remote page shows one as a QR code for a phone’s camera. Each link works once, within five minutes.</li>
+  <li><strong>Sessions</strong> last thirty days and are stored hashed in <code>~/.clank/remote-sessions.json</code>. <kbd>s</kbd> on the remote page opens the sessions page, which lists them. <kbd>Backspace</kbd> revokes the selected one, and its stream ends at once.</li>
 </ul>
 
 <h2 id="tunnel">Reaching it from a phone: tunnels</h2>

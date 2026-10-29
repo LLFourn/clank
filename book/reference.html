@@ -34,7 +34,7 @@ clank fork create --help</code></pre>
     <tr><td>Plans</td><td><code>clank queue</code>, <code>clank finish</code>, <code>clank unfinish</code>, <code>clank stash</code>, <code>clank pick</code>, <code>clank purge</code>, <code>clank rereview</code>, <code>clank diff</code>, <code>clank html</code></td><td><a href="group-coding.html#queue">Group coding</a>, <a href="teams.html#landing">Teams</a></td></tr>
     <tr><td>Review</td><td><code>clank feedback</code>, <code>clank block</code></td><td><a href="group-coding.html#verdicts">Verdicts</a>, <a href="group-coding.html#blocks">Blocks</a></td></tr>
     <tr><td>The team</td><td><code>clank agent</code>, <code>clank team</code>, <code>clank open</code>, <code>clank fork</code></td><td><a href="teams.html">Teams and forks</a></td></tr>
-    <tr><td>Talking</td><td><code>clank send</code>, <code>clank nudge</code>, <code>clank events</code></td><td><a href="controller.html#inbox">A controller repo</a></td></tr>
+    <tr><td>Talking</td><td><code>clank send</code>, <code>clank nudge</code>, <code>clank user-command</code>, <code>clank events</code></td><td><a href="controller.html#inbox">A controller repo</a></td></tr>
     <tr><td>Remote</td><td><code>clank remote</code></td><td><a href="remote.html">The remote</a></td></tr>
     <tr><td>Settings</td><td><code>clank config</code>, <code>clank export</code></td><td><a href="#config">Below</a></td></tr>
   </tbody>
@@ -42,15 +42,17 @@ clank fork create --help</code></pre>
 </div>
 
 <h2 id="config">Config keys</h2>
-<p><code>clank config</code> on its own lists every key with its value and where the value came from. Give a key and a value, as in <code>clank config diff.wait true</code>, to write the repo’s config. Add <code>--global</code> to write yours.</p>
+<p><code>clank config</code> on its own lists every key with its value and where the value came from. Give a key and a value, as in <code>clank config diff.wait true</code>, to write the repo’s config. Add <code>--global</code> to write yours, in <code>~/.clank/config.json</code>. A value set in the repo shadows yours.</p>
 <dl class="terms">
-  <dt><code>finish.autosquash</code></dt><dd>Collapse a plan into one commit when it finishes. It rewrites the current branch in place, so it is off by default.</dd>
+  <dt><code>finish.autosquash</code></dt><dd>Collapse a plan into one commit when it finishes. It rewrites the current branch in place. Unset it is off, but <code>clank setup</code> sets it to true in your user config unless you already set it.</dd>
   <dt><code>review.plan_feedback</code></dt><dd>Require review of a plan’s commits. On by default.</dd>
   <dt><code>review.adhoc_feedback</code></dt><dd>Also review commits outside any plan. Off by default.</dd>
-  <dt><code>review.require_commit_prefix</code></dt><dd>Require a <code>[<var>plan</var>]</code> or <code>[misc]</code> prefix on every commit subject.</dd>
+  <dt><code>review.require_commit_prefix</code></dt><dd>Require a <code>[<var>plan</var>]</code> or <code>[misc]</code> prefix on every commit subject. Off by default.</dd>
   <dt><code>hooks.blocked</code></dt><dd>A command to run when an agent raises a block.</dd>
   <dt><code>diff.editor.command</code>, <code>diff.wait</code></dt><dd>The editor <code>clank diff</code> opens, and whether it waits for it.</dd>
-  <dt><code>recovery.blind_nudge</code></dt><dd>Nudge an agent that owes work when clank cannot read its state. Off by default, which leaves such an agent to a person.</dd>
+  <dt><code>recovery.blind_nudge</code></dt><dd>Nudge an agent that owes work when clank cannot read its state, once it has been stuck this long, such as <code>40m</code>, and at most once for the same work. Off by default, which leaves such an agent to a person.</dd>
+  <dt><code>recovery.stall_warn</code></dt><dd>How long an agent’s running turn may stay silent, while it owes work, before clank shows it as silent. 40 minutes by default; <code>off</code> disables it.</dd>
+  <dt><code>recovery.stall_nudge</code></dt><dd>How long after that warning clank nudges the agent. The nudge may stop a tool that is still running. 5 minutes by default; <code>off</code> warns and never nudges.</dd>
 </dl>
 
 <h2 id="nudge">When a message cannot get through</h2>
@@ -60,7 +62,7 @@ clank fork create --help</code></pre>
 <ul>
   <li><a href="https://github.com/LLFourn/clank">The clank repository</a></li>
   <li><a href="https://github.com/LLFourn/clank/tree/master/crates/cli/src/cli/setup_assets">The shipped skills</a>, as <code>clank setup</code> installs them</li>
-  <li><a href="https://github.com/LLFourn/clank/blob/master/GROK-INTEGRATION.md">The Grok integration contract</a></li>
+  <li><a href="https://github.com/LLFourn/clank/blob/master/docs/grok-integration.md">The Grok integration contract</a></li>
 </ul>
 
     <nav class="next" aria-label="Start again">

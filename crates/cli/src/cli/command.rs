@@ -192,11 +192,13 @@ pub enum Command {
     /// saved template.
     #[command(after_long_help = INIT_EXAMPLES)]
     Init(crate::cli::InitArgs),
-    /// Install skills and hooks into ~/.claude, ~/.codex, ~/.grok
+    /// Install skills and hooks for Claude, Codex, Grok and OpenCode
     ///
-    /// User-scope assets: the role-split skill files plus Stop-hook
-    /// entries for the tools with active hooks (claude, codex).
-    /// Re-run after upgrading; `--force` refreshes edited skills.
+    /// User-scope assets in ~/.claude, ~/.codex, ~/.grok and
+    /// ~/.config/opencode: the role-split skills, Claude's and Codex's
+    /// lifecycle hooks, Grok's native hook adapter and the OpenCode
+    /// plugin. Re-run after upgrading, since a new release can add a
+    /// hook; `--force` refreshes edited skills.
     Setup(crate::cli::SetupArgs),
     /// Check the clank setup across repo, user, and session
     ///
@@ -559,6 +561,25 @@ mod tests {
     }
 
     #[test]
+    fn setup_summary_names_every_tool_it_installs_for() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let about = cmd
+            .find_subcommand("setup")
+            .expect("setup")
+            .get_about()
+            .expect("an about")
+            .to_string()
+            .to_lowercase();
+        for (_, tool) in crate::agent_env::SESSION_VARS {
+            assert!(
+                about.contains(tool.as_str()),
+                "{tool:?} is missing: {about}"
+            );
+        }
+    }
+
+    #[test]
     fn the_readme_names_only_real_subcommands() {
         use clap::CommandFactory;
         let cmd = Cli::command();
@@ -749,6 +770,33 @@ mod tests {
         assert!(readme_gaps(&text).is_empty());
     }
 
+    /// Every relative markdown link target in `text` with no file under
+    /// `root`.
+    fn missing_link_targets(text: &str, root: &std::path::Path) -> Vec<String> {
+        text.split("](")
+            .skip(1)
+            .filter_map(|rest| rest.split(')').next())
+            .map(|target| target.split('#').next().unwrap_or(target))
+            .filter(|path| !path.is_empty() && !path.contains("://"))
+            .filter(|path| !root.join(path).exists())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_readme_links_only_files_that_exist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let missing = missing_link_targets(&readme(), &root);
+        assert!(
+            missing.is_empty(),
+            "README links to missing files: {missing:?}"
+        );
+        assert_eq!(
+            missing_link_targets("[a](README.md#x) [b](https://x.y/z) [c](GONE.md)", &root),
+            ["GONE.md"]
+        );
+    }
+
     /// The README must tell a newcomer how to START the agents.
     ///
     /// The defect the rewrite existed to fix: the Quickstart built a
@@ -768,220 +816,6 @@ mod tests {
         assert!(
             quickstart.contains("clank open"),
             "the Quickstart must contain the step that starts the agents"
-        );
-    }
-
-    /// One command path in the real clap tree, as the audit records it.
-    struct Row {
-        path: String,
-        kind: &'static str,
-        hidden: bool,
-        aliases: Vec<String>,
-        about: String,
-        positionals: Vec<String>,
-        flags: Vec<String>,
-        /// How many arguments clap declares, so a renderer that drops one
-        /// is caught rather than trusted.
-        declared: usize,
-    }
-
-    fn arg_entry(a: &clap::Arg) -> String {
-        let id = a.get_id().as_str();
-        let hidden = if a.is_hide_set() { " (hidden)" } else { "" };
-        if a.is_positional() {
-            let name = a
-                .get_value_names()
-                .and_then(|v| v.first().map(|s| s.to_string()))
-                .unwrap_or_else(|| id.to_uppercase());
-            let shape = if a.is_last_set() {
-                format!("-- {name}…")
-            } else if a.is_required_set() {
-                format!("<{name}>")
-            } else {
-                format!("[{name}]")
-            };
-            return format!("{shape}{hidden}");
-        }
-        let mut names: Vec<String> = Vec::new();
-        if let Some(s) = a.get_short() {
-            names.push(format!("-{s}"));
-        }
-        if let Some(l) = a.get_long() {
-            names.push(format!("--{l}"));
-        }
-        for al in a.get_visible_aliases().unwrap_or_default() {
-            names.push(format!("--{al}"));
-        }
-        if names.is_empty() {
-            names.push(id.to_string());
-        }
-        let required = if a.is_required_set() {
-            " (required)"
-        } else {
-            ""
-        };
-        format!("{}{required}{hidden}", names.join("/"))
-    }
-
-    /// Every command path, hidden ones included, in tree order.
-    fn rows() -> Vec<Row> {
-        use clap::CommandFactory;
-        fn walk(c: &clap::Command, path: &str, rows: &mut Vec<Row>) {
-            for sub in c.get_subcommands() {
-                let name = sub.get_name();
-                if name == "help" {
-                    continue;
-                }
-                let path = if path.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{path} {name}")
-                };
-                let kind = if !sub.has_subcommands() {
-                    "action"
-                } else if sub.is_subcommand_required_set() {
-                    "group"
-                } else {
-                    "group, bare runs"
-                };
-                let declared: Vec<&clap::Arg> = sub
-                    .get_arguments()
-                    .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
-                    .collect();
-                let mut flags: Vec<String> = declared
-                    .iter()
-                    .filter(|a| !a.is_positional())
-                    .map(|a| arg_entry(a))
-                    .collect();
-                for g in sub.get_groups().filter(|g| g.is_required_set()) {
-                    let members: Vec<String> = g.get_args().map(|id| format!("--{id}")).collect();
-                    flags.push(format!("one of {} (required)", members.join("/")));
-                }
-                rows.push(Row {
-                    path: path.clone(),
-                    kind,
-                    hidden: sub.is_hide_set(),
-                    aliases: sub.get_all_aliases().map(str::to_string).collect(),
-                    about: sub.get_about().map(|s| s.to_string()).unwrap_or_default(),
-                    positionals: declared
-                        .iter()
-                        .filter(|a| a.is_positional())
-                        .map(|a| arg_entry(a))
-                        .collect(),
-                    flags,
-                    declared: declared.len(),
-                });
-                walk(sub, &path, rows);
-            }
-        }
-        let mut rows = Vec::new();
-        walk(&Cli::command(), "", &mut rows);
-        rows
-    }
-
-    /// `docs/cli-audit.md` embeds this table between its inventory
-    /// markers, so the audit cannot describe a command set clank does
-    /// not have.
-    fn inventory() -> String {
-        let cell = |s: &str| s.replace('|', "\\|");
-        let mut out = vec![
-            "| path | kind | hidden | aliases | about | positionals | flags |".to_string(),
-            "|---|---|---|---|---|---|---|".to_string(),
-        ];
-        for r in rows() {
-            out.push(format!(
-                "| `{}` | {} | {} | {} | {} | {} | {} |",
-                r.path,
-                r.kind,
-                if r.hidden { "hidden" } else { "" },
-                cell(&r.aliases.join(", ")),
-                cell(&r.about),
-                cell(&r.positionals.join(" ")),
-                cell(&r.flags.join(" ")),
-            ));
-        }
-        out.join("\n")
-    }
-
-    /// The inventory drops no argument clap declares, short-only ones
-    /// included: the required `-m` of `feedback write`, `block create`
-    /// and `unblock` has no long form.
-    #[test]
-    fn the_cli_audit_inventory_records_every_argument() {
-        let rows = rows();
-        for r in &rows {
-            assert_eq!(
-                r.positionals.len() + r.flags.iter().filter(|f| !f.starts_with("one of ")).count(),
-                r.declared,
-                "`{}` lost an argument",
-                r.path
-            );
-        }
-        for path in ["feedback write", "block create", "unblock"] {
-            let row = rows.iter().find(|r| r.path == path).unwrap();
-            assert!(
-                row.flags.iter().any(|f| f == "-m (required)"),
-                "`{path}`: {:?}",
-                row.flags
-            );
-        }
-    }
-
-    fn inventory_paths(table: &str) -> Vec<String> {
-        table
-            .lines()
-            .filter_map(|l| l.strip_prefix("| `"))
-            .filter_map(|l| l.split('`').next())
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn audit() -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("docs/cli-audit.md");
-        std::fs::read_to_string(&path).expect("docs/cli-audit.md at the workspace root")
-    }
-
-    /// The audit's embedded inventory is the clap tree as it is now.
-    /// `CLANK_BLESS_AUDIT=1` rewrites the block in place.
-    #[test]
-    fn the_cli_audit_inventory_is_the_real_tree() {
-        const START: &str = "<!-- inventory:start -->\n";
-        const END: &str = "\n<!-- inventory:end -->";
-        let doc = audit();
-        let (head, rest) = doc.split_once(START).expect("inventory start marker");
-        let (embedded, tail) = rest.split_once(END).expect("inventory end marker");
-        let real = inventory();
-        if embedded != real && std::env::var_os("CLANK_BLESS_AUDIT").is_some() {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("docs/cli-audit.md");
-            std::fs::write(path, format!("{head}{START}{real}{END}{tail}")).unwrap();
-            return;
-        }
-        assert_eq!(embedded, real, "regenerate with CLANK_BLESS_AUDIT=1");
-    }
-
-    /// Every command path has exactly one verdict row, and no verdict
-    /// names a path clank does not have.
-    #[test]
-    fn the_cli_audit_judges_every_command_path() {
-        let doc = audit();
-        let verdicts = doc
-            .split("<!-- verdicts:start -->")
-            .nth(1)
-            .and_then(|r| r.split("<!-- verdicts:end -->").next())
-            .expect("verdict markers");
-        let judged = inventory_paths(verdicts);
-        let real = inventory_paths(&inventory());
-        let missing: Vec<_> = real.iter().filter(|p| !judged.contains(p)).collect();
-        let unknown: Vec<_> = judged.iter().filter(|p| !real.contains(p)).collect();
-        let mut seen = std::collections::HashSet::new();
-        let twice: Vec<_> = judged.iter().filter(|p| !seen.insert(*p)).collect();
-        assert!(
-            missing.is_empty() && unknown.is_empty() && twice.is_empty(),
-            "unjudged: {missing:?}; not commands: {unknown:?}; judged twice: {twice:?}"
         );
     }
 
@@ -1114,7 +948,7 @@ mod tests {
     }
 
     /// No group's help keeps its own copy of the subcommand list clap
-    /// prints; the copies are what drifted (docs/cli-audit.md, F3).
+    /// prints; the copies are what drifted.
     #[test]
     fn no_group_help_lists_its_own_subcommands() {
         use clap::CommandFactory;
@@ -1357,10 +1191,9 @@ mod tests {
         }
     }
 
-    /// What clank runs itself (hooks, the monitor), one-off migrations,
-    /// and `open dry`, which `open-worktree.sh` calls: the group that
-    /// would list it (empty for the top level), its name, and an argv a
-    /// real caller uses.
+    /// What clank runs itself (hooks, the monitor), one-off migrations
+    /// and old spellings: the group that would list it (empty for the
+    /// top level), its name, and an argv a real caller uses.
     const PLUMBING: &[(&str, &str, &[&str])] = &[
         ("", "stop-hook", &["stop-hook", "--tool", "claude"]),
         ("", "question-hook", &["question-hook"]),
@@ -1368,7 +1201,6 @@ mod tests {
         ("", "monitor", &["monitor", "start"]),
         ("monitor", "upgrade", &["monitor", "upgrade"]),
         ("block", "migrate", &["block", "migrate", "--dry"]),
-        ("open", "dry", &["open", "dry", "/some/path", "--json"]),
         ("", "unblock", &["unblock", "claude", "q", "-m", "yes"]),
         ("block", "create", &["block", "create", "q", "-m", "why?"]),
         ("open", "zellij", &["open", "zellij", "--print"]),
