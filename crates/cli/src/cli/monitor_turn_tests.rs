@@ -681,6 +681,57 @@ struct Hook {
     child: std::thread::JoinHandle<()>,
 }
 
+/// The `clank wait --turn-end` child's own carry, on a thread of this
+/// process: it reads its owner from `owner`, prints frames to `frames`, and
+/// reaches the test's monitor over `ours`.
+fn carrier(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    owner: std::io::PipeReader,
+    mut frames: std::io::PipeWriter,
+    ours: std::os::unix::net::UnixStream,
+) -> std::thread::JoinHandle<()> {
+    let (repo, author) = (repo.to_path_buf(), author.clone());
+    ours.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let stream = std::sync::Mutex::new(Some(ours));
+                let attach = |who: Who| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Attached> + Send + '_>,
+                > {
+                    let stream = stream.lock().unwrap().take();
+                    let repo = repo.clone();
+                    Box::pin(async move {
+                        let Some(stream) = stream else {
+                            return Attached::Alone("connected once".into());
+                        };
+                        greet_at(
+                            "test-socket",
+                            &repo,
+                            who,
+                            std::time::Instant::now() + ATTACH_BUDGET,
+                            move |_, _| stream.try_clone(),
+                        )
+                        .into()
+                    })
+                };
+                crate::cli::turn_child::carry(
+                    &repo,
+                    &author,
+                    Some(SESSION.into()),
+                    crate::cli::turn_child::Owner::reading(owner),
+                    &mut frames,
+                    &attach,
+                )
+                .await;
+            })
+    })
+}
+
 impl Hook {
     /// Start the child carrying `report` over `ours`, the client end of a
     /// connection the test's monitor greets.
@@ -692,47 +743,9 @@ impl Hook {
     ) -> Self {
         use std::io::Write;
         let (owner_read, mut stdin) = std::io::pipe().unwrap();
-        let (frames_read, mut frames_write) = std::io::pipe().unwrap();
+        let (frames_read, frames_write) = std::io::pipe().unwrap();
         writeln!(stdin, "{}", serde_json::to_string(report).unwrap()).unwrap();
-        let (repo, author) = (repo.to_path_buf(), author.clone());
-        ours.set_nonblocking(true).unwrap();
-        let child = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let stream = std::sync::Mutex::new(Some(ours));
-                    let attach = |who: Who| -> std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Attached> + Send + '_>,
-                    > {
-                        let stream = stream.lock().unwrap().take();
-                        let repo = repo.clone();
-                        Box::pin(async move {
-                            let Some(stream) = stream else {
-                                return Attached::Alone("connected once".into());
-                            };
-                            greet_at(
-                                "test-socket",
-                                &repo,
-                                who,
-                                std::time::Instant::now() + ATTACH_BUDGET,
-                                move |_, _| stream.try_clone(),
-                            )
-                            .into()
-                        })
-                    };
-                    crate::cli::turn_child::carry(
-                        &repo,
-                        &author,
-                        Some(SESSION.into()),
-                        crate::cli::turn_child::Owner::reading(owner_read),
-                        &mut frames_write,
-                        &attach,
-                    )
-                    .await;
-                })
-        });
+        let child = carrier(repo, author, owner_read, frames_write, ours);
         Hook {
             stdin,
             frames: std::io::BufReader::new(frames_read),
@@ -1822,4 +1835,269 @@ async fn a_park_that_delivered_records_no_loss() {
         &mut recovery,
     );
     assert_eq!(turns.state(&author).unwrap().unwatched, None);
+}
+
+/// The hook's host for a PostCompact: Claude's payload on stdin, each
+/// carrier started in this process and its monitor end handed to the test,
+/// and the exit code kept.
+struct Compacting {
+    stdin: String,
+    spawner: Reaching,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit: Option<i32>,
+}
+
+struct Reaching(std::sync::mpsc::Sender<std::os::unix::net::UnixStream>);
+
+impl crate::cli::stop_hook::Spawn for Reaching {
+    fn spawn(
+        &self,
+        repo: &std::path::Path,
+        label: &AgentLabel,
+        _: &str,
+        _: clank_core::Tool,
+        report: &Report,
+    ) -> Result<crate::cli::stop_hook::OwnedWait, String> {
+        use tokio::net::unix::pipe;
+        let (owner_read, owner_write) = std::io::pipe().unwrap();
+        let (frames_read, frames_write) = std::io::pipe().unwrap();
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        carrier(repo, label, owner_read, frames_write, ours);
+        self.0.send(theirs).unwrap();
+        crate::cli::stop_hook::OwnedWait::over(
+            None,
+            Box::new(pipe::Sender::from_owned_fd(owner_write.into()).unwrap()),
+            Box::new(pipe::Receiver::from_owned_fd(frames_read.into()).unwrap()),
+            None,
+            report,
+        )
+    }
+}
+
+impl crate::cli::stop_hook::Host for Compacting {
+    fn input(&mut self) -> Result<clank_core::HookInput, String> {
+        serde_json::from_str(&self.stdin).map_err(|e| e.to_string())
+    }
+    fn spawner(&self) -> &dyn crate::cli::stop_hook::Spawn {
+        &self.spawner
+    }
+    fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write) {
+        (&mut self.stdout, &mut self.stderr)
+    }
+    fn exit(&mut self, code: i32) {
+        self.exit = Some(code);
+    }
+}
+
+/// The PostCompact entry `clank setup` installs, run from its own argv on
+/// Claude's payload over the idle-compaction record: its wait is admitted
+/// as the agent's one park, replacing the Stop's, and parks; work logged
+/// later is delivered on it, the hook exits 2, and its receipt commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_rearms_the_park_that_replaces_the_stops() {
+    let (repo, author, timer) = timer_repo();
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let root = dunce::canonicalize(repo.path()).unwrap();
+    let root = root.as_path();
+    let state = folded(root).await.unwrap();
+    let mut turns = Turns::new(root.to_path_buf());
+    let mut recovery = crate::cli::recovery::Driver::new("/".into(), "/nonexistent-home".into());
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let mut clients = Vec::new();
+    let hosted = Default::default();
+    let mut admit = |clients: &mut Vec<Client>, client: Client, turns: &mut Turns| {
+        let mut leaving = admit_into(
+            root,
+            clients,
+            client,
+            Some(&state),
+            &mut Vec::new(),
+            &hosted,
+        );
+        leaving.extend(tend(
+            root,
+            clients,
+            Some(&state),
+            &[],
+            &hosted,
+            turns,
+            &mut recovery,
+        ));
+        leaving
+    };
+
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut stop = Hook::carrying(root, &author, &stop_report(), ours);
+    let client = admitted(theirs, root, &heard_tx).await;
+    let mut leaving = admit(&mut clients, client, &mut turns);
+    leaving.extend(serve(root, &mut clients, &state, &mut turns));
+    let (parked, mut stop) = tokio::task::spawn_blocking(move || (stop.frame(), stop))
+        .await
+        .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park);
+
+    let profile = tempfile::tempdir().unwrap();
+    crate::cli::setup::install_provider(
+        &profile.path().join("home"),
+        clank_core::Tool::Claude,
+        profile.path(),
+        true,
+        false,
+        false,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(profile.path().join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    let [entry] = crate::cli::setup::clank_hook_entries(&settings, "PostCompact")[..] else {
+        panic!("one PostCompact entry: {settings}");
+    };
+    assert_eq!(entry["asyncRewake"], true, "{entry}");
+    let argv = shell_words::split(entry["command"].as_str().unwrap()).unwrap();
+    let crate::cli::command::Command::StopHook(args) =
+        <crate::cli::command::Cli as clap::Parser>::try_parse_from(argv)
+            .unwrap()
+            .command
+    else {
+        panic!("the entry runs stop-hook");
+    };
+    let transcript = root.join("t.jsonl");
+    std::fs::write(
+        &transcript,
+        include_str!("../../tests/fixtures/claude_idle_compaction.jsonl"),
+    )
+    .unwrap();
+    let (carriers, reached) = std::sync::mpsc::channel();
+    let mut host = Compacting {
+        stdin: serde_json::json!({
+            "session_id": SESSION,
+            "transcript_path": transcript,
+            "cwd": root,
+            "hook_event_name": "PostCompact",
+            "trigger": "auto",
+            "compact_summary": "summary",
+        })
+        .to_string(),
+        spawner: Reaching(carriers),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        exit: None,
+    };
+    let hook = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::cli::stop_hook::run(args, &mut host))
+            .unwrap();
+        host
+    });
+    let theirs = tokio::task::spawn_blocking(move || {
+        reached.recv_timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .expect("the PostCompact hook carries a wait");
+    let client = admitted(theirs, root, &heard_tx).await;
+    let conn = client.conn;
+    assert!(matches!(
+        client.report.as_ref().map(|r| &r.report),
+        Some(Report::Compacted { stop, .. })
+            if stop.place.turn.as_deref() == Some("39853d54-8cd0-40a0-ac97-a8fd8111f7a6")
+    ));
+    leaving.extend(admit(&mut clients, client, &mut turns));
+    assert_eq!(
+        clients.iter().map(|c| c.conn).collect::<Vec<_>>(),
+        [conn],
+        "one park per agent session: the newer"
+    );
+    let (replaced, stop) = tokio::task::spawn_blocking(move || (stop.frame(), stop))
+        .await
+        .unwrap();
+    assert_eq!(
+        replaced.verdict,
+        WireVerdict::Silent {
+            why: clank_core::SilentReason::StaleBinding
+        }
+    );
+    leaving.extend(serve(root, &mut clients, &state, &mut turns));
+    assert_eq!(clients.len(), 1, "the re-armed report parks");
+
+    log_timer_event(root, &timer);
+    let state = folded(root).await.unwrap();
+    leaving.extend(serve(root, &mut clients, &state, &mut turns));
+    assert!(clients.is_empty(), "the wake retires the report");
+    let said = loop {
+        match next_heard(&mut heard).await {
+            (from, said) if from == conn => break said,
+            _ => {}
+        }
+    };
+    let Heard::Line(line) = said else {
+        panic!("the hook's result comes before the close");
+    };
+    let result: TurnResult = serde_json::from_str(&line).unwrap();
+    assert!(matches!(result, TurnResult::Delivered { .. }), "{result:?}");
+    let from = conn;
+    let g = gathered(root, &author, &state);
+    let commit = turns.result(&author, from, result, &g).unwrap();
+    assert!(commit.is_some(), "the delivery commits its receipt");
+
+    let host = tokio::task::spawn_blocking(move || hook.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(host.exit, Some(clank_core::CLAUDE_CONTINUATION_EXIT));
+    assert!(
+        String::from_utf8_lossy(&host.stderr).contains("scheduled work"),
+        "{:?}",
+        String::from_utf8_lossy(&host.stderr)
+    );
+    stop.child.join().unwrap();
+    for writer in leaving {
+        let _ = writer.await;
+    }
+}
+
+/// A compaction's re-arm is the park again, not a Stop: it carries no
+/// listing, so the attendance the last Stop proved still quiets the work
+/// the session received, and its check-in is owed when it was.
+#[tokio::test]
+async fn a_compactions_rearm_keeps_what_the_attendance_quiets() {
+    let (repo, author, timer) = timer_repo();
+    let state = folded(repo.path()).await.unwrap();
+    let (mut turns, due) = attended(repo.path(), &author, &state);
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let g = gathered(repo.path(), &author, &state);
+    let shown = turns
+        .answer(&author, 2, &listing_the_sleeper(), true, &g)
+        .unwrap();
+    let presentation = shown.presentation().expect("the work is presented").clone();
+    turns
+        .result(&author, 2, TurnResult::Delivered { presentation }, &g)
+        .unwrap();
+
+    let Report::TurnEnd { stop, deadline, .. } = listing_the_sleeper() else {
+        unreachable!()
+    };
+    let rearm = Report::Compacted {
+        stop: clank_core::turn_policy::TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
+            ..stop
+        },
+        deadline,
+    };
+    let frame = turns.answer(&author, 3, &rearm, true, &g).unwrap();
+    assert_eq!(frame.verdict, WireVerdict::Park, "{frame:?}");
+    assert_eq!(turns.next_deadline(), Some(due));
 }

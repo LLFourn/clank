@@ -861,6 +861,9 @@ pub(super) fn inspect_provider(
                     async_mode: claude_async,
                 }),
                 Box::new(SessionStartHook),
+                Box::new(PostCompactHook {
+                    async_mode: claude_async,
+                }),
                 Box::new(ClaudeQuestionHook("PreToolUse")),
                 Box::new(ClaudeQuestionHook("PermissionRequest")),
                 Box::new(ClaudeQuestionHook("PostToolUse")),
@@ -1464,6 +1467,11 @@ trait HookKind {
     fn matcher(&self) -> Option<&'static str> {
         None
     }
+    /// Whether this mode has the entry at all. Without it, merging removes
+    /// clank's own and adds none.
+    fn installed(&self) -> bool {
+        true
+    }
 }
 
 /// The claude Stop entry. The delivery mode is ONE durable
@@ -1510,6 +1518,7 @@ fn install_claude_hooks(
 ) -> anyhow::Result<()> {
     merge_hook_into_settings(path, ClaudeHook { async_mode }, dry_run, summary)?;
     merge_hook_into_settings(path, SessionStartHook, dry_run, summary)?;
+    merge_hook_into_settings(path, PostCompactHook { async_mode }, dry_run, summary)?;
     for event in [
         "PreToolUse",
         "PermissionRequest",
@@ -1555,6 +1564,35 @@ impl HookKind for SessionStartHook {
     }
     fn timeout(&self) -> u64 {
         15
+    }
+}
+
+/// The asyncRewake park a compaction ended, armed again. Only beside the
+/// asyncrewake Stop entry: a legacy Stop holds its turn open, so nothing
+/// compacts while it waits, and a PostCompact that parked synchronously
+/// would hold the compaction instead. Claude has had PostCompact since
+/// 2.1.76, below the asyncRewake floor, so a legacy setup loses it.
+struct PostCompactHook {
+    async_mode: bool,
+}
+impl HookKind for PostCompactHook {
+    fn command(&self) -> &'static str {
+        "clank stop-hook --tool claude --post-compact"
+    }
+    fn tool_name(&self) -> &'static str {
+        "claude"
+    }
+    fn event(&self) -> &'static str {
+        "PostCompact"
+    }
+    fn status_message(&self) -> Option<&'static str> {
+        ClaudeHook { async_mode: true }.status_message()
+    }
+    fn async_rewake(&self) -> bool {
+        true
+    }
+    fn installed(&self) -> bool {
+        self.async_mode
     }
 }
 
@@ -1656,6 +1694,9 @@ fn merge_hook_into_settings(
 
     let removed = merge_hook_value(&mut value, path, &kind)?;
     let event = kind.event();
+    if !kind.installed() && removed == 0 {
+        return Ok(());
+    }
 
     if !dry_run {
         if let Some(parent) = path.parent() {
@@ -1667,7 +1708,11 @@ fn merge_hook_into_settings(
             .with_context(|| format!("writing `{}`", path.display()))?;
     }
 
-    let action = if removed > 0 { "merge" } else { "add  " };
+    let action = match (kind.installed(), removed) {
+        (false, _) => "remove",
+        (true, 0) => "add  ",
+        (true, _) => "merge",
+    };
     summary.push(format!(
         "  {action} {path} ({tool} {event} hook)",
         path = path.display(),
@@ -1685,13 +1730,16 @@ fn merge_hook_value(
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    let event = kind.event();
+    if !kind.installed() && obj.get("hooks").and_then(|h| h.get(event)).is_none() {
+        return Ok(0);
+    }
     let hooks = obj
         .entry("hooks".to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let hooks = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks` is not a JSON object"))?;
-    let event = kind.event();
     let wrappers = hooks
         .entry(event.to_string())
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -1710,6 +1758,13 @@ fn merge_hook_value(
         removed += taken;
         taken == 0 || !inner.is_empty()
     });
+    if !kind.installed() {
+        // An empty array left by the user is theirs; only one emptied here goes.
+        if removed > 0 && wrappers.is_empty() {
+            hooks.remove(event);
+        }
+        return Ok(removed);
+    }
 
     let entry = HookEntry {
         kind: "command",
@@ -3648,6 +3703,90 @@ mod tests {
         );
     }
 
+    /// A user's empty PostCompact array in a legacy profile is theirs: the
+    /// profile stays ready and setup leaves it be.
+    #[test]
+    fn a_users_empty_post_compact_array_keeps_a_legacy_profile_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".claude");
+        install_provider(&home, Tool::Claude, &root, false, false, false, &mut vec![]).unwrap();
+        let path = root.join("settings.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["hooks"]["PostCompact"] = serde_json::json!([]);
+        write_file(&path, &v.to_string());
+        assert!(inspect_provider(&home, Tool::Claude, &root, false).unwrap());
+        install_provider(&home, Tool::Claude, &root, false, false, false, &mut vec![]).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after, v);
+        assert!(inspect_provider(&home, Tool::Claude, &root, false).unwrap());
+    }
+
+    /// PostCompact is async-only: an upgrade adds it, a downgrade takes out
+    /// clank's own and nothing else, each is idempotent, a dry run writes
+    /// nothing, and SessionStart stays in both modes.
+    #[test]
+    fn the_post_compact_hook_follows_the_mode_and_leaves_user_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let read = || std::fs::read_to_string(&path).unwrap();
+        let parsed = || serde_json::from_str::<serde_json::Value>(&read()).unwrap();
+        let user = serde_json::json!({"type": "command", "command": "/my/compacted"});
+        let theirs = serde_json::json!({"matcher": "manual", "hooks": [user]});
+        let mixed = serde_json::json!({"custom": 7, "hooks": [
+            user,
+            {"type": "command", "command": "clank stop-hook --tool claude --post-compact"},
+        ]});
+        write_file(
+            &path,
+            &serde_json::json!({"keep": true, "hooks": {"PostCompact": [theirs, mixed]}})
+                .to_string(),
+        );
+
+        install_claude_hooks(&path, true, false, &mut Vec::new()).unwrap();
+        let upgraded = read();
+        install_claude_hooks(&path, true, false, &mut Vec::new()).unwrap();
+        assert_eq!(read(), upgraded, "an upgrade is idempotent");
+        let v = parsed();
+        let [ours] = clank_hook_entries(&v, "PostCompact")[..] else {
+            panic!("one clank PostCompact entry: {v}");
+        };
+        assert_eq!(ours["asyncRewake"], true);
+        assert_eq!(ours["timeout"], HOOK_TIMEOUT_SECS);
+
+        let mut summary = Vec::new();
+        install_claude_hooks(&path, false, true, &mut summary).unwrap();
+        assert_eq!(read(), upgraded, "a dry run writes nothing");
+        assert!(
+            summary
+                .iter()
+                .any(|l| l.contains("remove") && l.contains("PostCompact")),
+            "{summary:?}"
+        );
+
+        install_claude_hooks(&path, false, false, &mut Vec::new()).unwrap();
+        let downgraded = read();
+        install_claude_hooks(&path, false, false, &mut Vec::new()).unwrap();
+        assert_eq!(read(), downgraded, "a downgrade is idempotent");
+        let v = parsed();
+        assert!(clank_hook_entries(&v, "PostCompact").is_empty(), "{v}");
+        assert_eq!(
+            v["hooks"]["PostCompact"],
+            serde_json::json!([theirs, {"custom": 7, "hooks": [user]}])
+        );
+        assert_eq!(v["keep"], true);
+        assert_eq!(clank_hook_entries(&v, "SessionStart").len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+        install_claude_hooks(&path, true, false, &mut Vec::new()).unwrap();
+        install_claude_hooks(&path, false, false, &mut Vec::new()).unwrap();
+        let v = parsed();
+        assert!(v["hooks"].get("PostCompact").is_none(), "{v}");
+        assert_eq!(clank_hook_entries(&v, "SessionStart").len(), 1);
+    }
+
     #[test]
     fn question_hooks_are_owned_idempotent_and_leave_other_provider_hooks_in_place() {
         let temp = tempfile::tempdir().unwrap();
@@ -3746,7 +3885,7 @@ mod tests {
             );
             assert_eq!(v["hooks"][event].as_array().unwrap().len(), 2, "{v}");
         }
-        assert_eq!(summary.len(), 6, "{summary:?}");
+        assert_eq!(summary.len(), 7, "{summary:?}");
         assert!(
             summary[..2].iter().all(|l| l.contains("merge")),
             "{summary:?}"

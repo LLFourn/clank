@@ -482,7 +482,9 @@ pub async fn dispatch_with(
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::QuestionHook => crate::cli::web::claude_questions::run().await,
-        Command::StopHook(args) => crate::cli::stop_hook::run(args).await,
+        Command::StopHook(args) => {
+            crate::cli::stop_hook::run(args, &mut crate::cli::stop_hook::ProcessHost::new()).await
+        }
         Command::Setup(args) => crate::cli::setup::run(args).await,
         Command::Doctor(args) => crate::cli::doctor::run(args).await,
         Command::Config(args) => crate::cli::config::run(args).await,

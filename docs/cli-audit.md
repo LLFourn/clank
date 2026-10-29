@@ -584,6 +584,6 @@ Generated. Do not edit by hand.
 | `export` | action |  |  | Dump the repo's roster config as JSON |  | --repo |
 | `rereview` | action |  |  | Re-open review on a plan's latest reviewable commit | [PLAN] | --repo |
 | `rewire` | action | hidden |  | Remap feedback after a rebase or amend |  | --repo --from-stdin (required) |
-| `stop-hook` | action | hidden |  | The per-tool Stop-hook adapter |  | --tool (required) --repo --session-start --loop --observe --turn-id --class --status --recovery-helper --recovery-reply --attempt --opened-by --started |
+| `stop-hook` | action | hidden |  | The per-tool Stop-hook adapter |  | --tool (required) --repo --session-start --post-compact --loop --observe --turn-id --class --status --recovery-helper --recovery-reply --attempt --opened-by --started |
 | `question-hook` | action | hidden |  | Native Claude question hook adapter (installed by setup) |  |  |
 <!-- inventory:end -->

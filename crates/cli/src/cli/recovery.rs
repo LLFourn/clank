@@ -293,6 +293,7 @@ fn claude(v: &serde_json::Value, current: Option<&str>) -> Option<Fact> {
             id: None,
             outcome: Outcome::Completed,
         }),
+        "user" if claude_compact_summary(v) => None,
         "user" => {
             let id = string(v, "promptId")?;
             if Some(id.as_str()) == current {
@@ -329,6 +330,12 @@ fn claude(v: &serde_json::Value, current: Option<&str>) -> Option<Fact> {
         }
         _ => None,
     }
+}
+
+/// Claude's compaction summary: a `user` record under the promptId of the
+/// turn it followed, idle or not, that nobody prompted.
+pub(crate) fn claude_compact_summary(v: &serde_json::Value) -> bool {
+    v.get("isCompactSummary").and_then(|b| b.as_bool()) == Some(true)
 }
 
 /// Grok's `events.jsonl`. Its `turn_ended` carries no class and no turn:
@@ -5468,6 +5475,104 @@ pub(crate) mod tests {
             Some(Outcome::Interrupted)
         );
         assert_eq!(read(&[&go]), Some(Outcome::Running));
+    }
+
+    /// Claude 2.1.308's record of an idle compaction: a finished turn, the
+    /// `compact_boundary`, the summary as a `user` record under that turn's
+    /// promptId, and "Compacted while idle".
+    const IDLE_COMPACTION: &str = include_str!("../../tests/fixtures/claude_idle_compaction.jsonl");
+    const COMPACTED_TURN: &str = "39853d54-8cd0-40a0-ac97-a8fd8111f7a6";
+
+    fn compact_summary(id: &str) -> String {
+        format!(
+            r#"{{"type":"user","promptId":"{id}","isCompactSummary":true,"message":{{"content":"summary"}}}}"#
+        )
+    }
+
+    /// A summary starts no turn and ends none: a turn compacted mid-way is
+    /// still running when its next record is read from the summary on, and
+    /// a stopped or failed turn keeps its outcome.
+    #[test]
+    fn a_compaction_summary_starts_no_turn() {
+        let read = |lines: &[&str]| {
+            let mut r = RecordReader::new(Tool::Claude, "s1");
+            let mut s = Snapshot::default();
+            for l in lines {
+                if let Some(f) = r.read(l) {
+                    s.apply(f);
+                }
+            }
+            (s.latest().map(|t| t.outcome.clone()), s.anchored())
+        };
+        let go = user("P");
+        let summary = compact_summary("P");
+        let result = r#"{"type":"user","promptId":"P","message":{"content":[{"type":"tool_result","content":"x"}]}}"#;
+        let error = r#"{"type":"assistant","isApiErrorMessage":true,"error":"overloaded"}"#;
+        assert_eq!(read(&[DURATION, &summary]), (None, false));
+        assert_eq!(read(&[&summary, result]), (Some(Outcome::Running), true));
+        assert_eq!(
+            read(&[&go, INTERRUPTED, DURATION, &summary]),
+            (Some(Outcome::Interrupted), true)
+        );
+        assert_eq!(
+            read(&[&go, error, DURATION, &summary]),
+            (Some(Outcome::Failed("overloaded".into())), true)
+        );
+    }
+
+    /// The incident's record, with its compacted turn's prompt further back
+    /// than the first read-back window, as it was: the agent reads idle, so
+    /// with its park lost to the compaction recovery nudges it for the work
+    /// it owes. A person's prompt after the summary is a turn.
+    #[test]
+    fn an_idle_compaction_leaves_its_agent_idle_and_nudged() {
+        use crate::cli::agent_state::{Activity, load as published};
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("t.jsonl");
+        let (prompt, rest) = IDLE_COMPACTION.split_once('\n').unwrap();
+        let filler = format!(
+            r#"{{"type":"api-request-blob","pad":"{}"}}"#,
+            "x".repeat(1024)
+        );
+        append(&transcript, &[prompt]);
+        append(&transcript, &vec![filler.as_str(); 300]);
+        append(&transcript, &rest.lines().collect::<Vec<_>>());
+
+        let (_, _, snap) = bootstrap(&transcript, Tool::Claude, "session-one").unwrap();
+        assert_eq!(
+            snap.latest().map(|t| (t.id.as_str(), t.outcome.clone())),
+            Some((COMPACTED_TURN, Outcome::Completed))
+        );
+        let mut d = driver();
+        d.reconcile(
+            vec![facts(
+                "claude",
+                dir.path(),
+                &transcript,
+                "session-one",
+                true,
+                false,
+            )],
+            0,
+        );
+        assert_eq!(published(dir.path()).unwrap().activity, Activity::Idle);
+        let acts = d.due(IDLE_WAITS[0], |_, _| Gate::Go);
+        assert!(
+            matches!(acts.as_slice(), [Act::Dispatch { target, .. }] if target == COMPACTED_TURN),
+            "{acts:?}"
+        );
+
+        append(
+            &transcript,
+            &[
+                r#"{"type":"user","promptId":"8570df09-722c-4974-9d65-0e83d539048a","message":{"role":"user","content":"ping"},"version":"2.1.308"}"#,
+            ],
+        );
+        let (_, _, snap) = bootstrap(&transcript, Tool::Claude, "session-one").unwrap();
+        assert_eq!(
+            snap.latest().map(|t| t.outcome.clone()),
+            Some(Outcome::Running)
+        );
     }
 
     /// `ctx` for an agent that owes work and has no wait to take it.

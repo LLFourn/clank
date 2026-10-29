@@ -17,6 +17,11 @@ pub(crate) enum Report {
         #[serde(default)]
         questions: Vec<super::question_state::Observation>,
     },
+    /// Claude's PostCompact: a compaction ends the park the last Stop
+    /// armed, so the hook arms it again. It ends no turn and proves
+    /// nothing about the agent's questions or background work, so it is
+    /// stepped as the park it replaces.
+    Compacted { stop: TurnEndReport, deadline: Ms },
     SessionStart {
         tool: Tool,
         session: SessionId,
@@ -29,7 +34,7 @@ pub(crate) enum Report {
 impl Report {
     pub(crate) fn tool(&self) -> Tool {
         match self {
-            Report::TurnEnd { stop, .. } => stop.tool,
+            Report::TurnEnd { stop, .. } | Report::Compacted { stop, .. } => stop.tool,
             Report::SessionStart { tool, .. } => *tool,
             Report::Handoff { .. } => Tool::Grok,
         }
@@ -37,7 +42,7 @@ impl Report {
 
     pub(crate) fn session(&self) -> &SessionId {
         match self {
-            Report::TurnEnd { stop, .. } => &stop.session,
+            Report::TurnEnd { stop, .. } | Report::Compacted { stop, .. } => &stop.session,
             Report::SessionStart { session, .. } => session,
             Report::Handoff { handoff, .. } => &handoff.session,
         }
@@ -46,6 +51,7 @@ impl Report {
     pub(crate) fn deadline(&self) -> Ms {
         match self {
             Report::TurnEnd { deadline, .. }
+            | Report::Compacted { deadline, .. }
             | Report::SessionStart { deadline, .. }
             | Report::Handoff { deadline, .. } => *deadline,
         }
@@ -53,7 +59,7 @@ impl Report {
 
     /// A session start or a handoff is answered once: neither parks.
     pub(crate) fn parks(&self) -> bool {
-        matches!(self, Report::TurnEnd { .. })
+        matches!(self, Report::TurnEnd { .. } | Report::Compacted { .. })
     }
 }
 

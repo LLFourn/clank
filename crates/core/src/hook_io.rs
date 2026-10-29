@@ -48,7 +48,9 @@ pub struct HookInput {
     /// True iff this hook invocation is itself a continuation of a
     /// previous Stop-hook decision. The adapter does not act on
     /// this — claude's own 8-block cap (which resets on tool use
-    /// between fires) is the safety net for runaway loops.
+    /// between fires) is the safety net for runaway loops. Claude's
+    /// PostCompact, which carries the same common fields, sends none.
+    #[serde(default)]
     pub stop_hook_active: bool,
     #[serde(default)]
     pub last_assistant_message: Option<String>,

@@ -524,7 +524,7 @@ async fn a_verdict_is_read_from_a_live_child_and_answered_on_its_pipe() {
         };
         assert_eq!(frame, delivered(), "the parked frame is not terminal");
         assert!(
-            wait.child.try_wait().unwrap().is_none(),
+            wait.child.as_mut().unwrap().try_wait().unwrap().is_none(),
             "the verdict arrived before the child exited"
         );
         let turn = Turn {
@@ -562,10 +562,13 @@ async fn a_killed_hooks_child_reads_eof_and_no_result() {
         ..
     } = wait;
     drop(owner_end);
-    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
-        .await
-        .expect("the child exits on EOF")
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        child.as_mut().unwrap().wait(),
+    )
+    .await
+    .expect("the child exits on EOF")
+    .unwrap();
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "eof");
 }
 
@@ -807,6 +810,7 @@ async fn the_report_carries_the_stops_evidence() {
         Some(&repo),
         input,
         std::time::Instant::now(),
+        false,
         &recorder,
     )
     .await;
@@ -841,6 +845,7 @@ async fn the_report_carries_the_stops_evidence() {
         Some(&repo),
         hook_input("sess-unlisted"),
         std::time::Instant::now(),
+        false,
         &recorder,
     )
     .await;
@@ -863,6 +868,7 @@ async fn unresolved_identity_is_a_diagnostic() {
         Some(dir.path()),
         hook_input("sess-unbound"),
         std::time::Instant::now(),
+        false,
         &Unreachable,
     )
     .await;
@@ -912,6 +918,7 @@ async fn a_stop_from_a_worktree_subdirectory_reports_for_that_worktree() {
         None,
         input.clone(),
         std::time::Instant::now(),
+        false,
         &recorder,
     )
     .await;

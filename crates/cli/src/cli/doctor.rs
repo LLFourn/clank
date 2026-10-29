@@ -937,9 +937,8 @@ async fn provider_user_checks(
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .and_then(|value| installed_loop_mode(&value))
             .is_some_and(|mode| matches!(mode, Ok(Some(super::LoopModeArg::Asyncrewake))));
-        for asset in
-            super::setup::provider_asset_inventory(tool, capable.unwrap_or(installed_async))
-        {
+        let claude_async = capable.unwrap_or(installed_async);
+        for asset in super::setup::provider_asset_inventory(tool, claude_async) {
             let (domain, asset) = super::setup::provider_asset_location(&home, &root, tool, asset);
             out.push(check_setup_asset(
                 &domain,
@@ -980,6 +979,12 @@ async fn provider_user_checks(
                     tool.as_str(),
                     &format!("{} SessionStart", path.display()),
                 ));
+                if tool == Tool::Claude && claude_async {
+                    out.push(check_post_compact(
+                        &path,
+                        &format!("{} PostCompact", path.display()),
+                    ));
+                }
                 if tool == Tool::Codex {
                     let path = root.join("rules/default.rules");
                     out.push(check_codex_rule(&path, &path.display().to_string()));
@@ -1127,6 +1132,20 @@ fn check_session_start(path: &Path, tool: &str, display: &str) -> CheckResult {
             "no clank SessionStart hook in {tool} config: a {tool} session clank launches \
              is not bound, and one that runs `/clear` stops being tracked — run `clank setup`"
         ),
+    )
+}
+
+/// Claude's compaction ends the asyncrewake Stop's park, idle compaction
+/// included; without this companion nothing arms it again.
+fn check_post_compact(path: &Path, display: &str) -> CheckResult {
+    check_clank_hook(
+        path,
+        "PostCompact",
+        "claude",
+        display,
+        "no clank PostCompact hook in claude config: a compaction leaves the agent with no \
+         wait, so work reaches it only by a nudge — run `clank setup`"
+            .to_string(),
     )
 }
 
@@ -1837,6 +1856,33 @@ mod tests {
         assert!(rows.iter().all(|r| r.status == CheckStatus::Ok), "{rows:?}");
         assert_eq!(std::fs::read_to_string(calls).unwrap(), "selected\n");
         assert!(!home.join(".claude").exists());
+
+        let settings = root.join("settings.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        value["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostCompact")
+            .expect("setup installed a PostCompact hook");
+        std::fs::write(&settings, value.to_string()).unwrap();
+        let rows = provider_user_checks(
+            "selected",
+            clank_core::Tool::Claude,
+            Some(&launch),
+            temp.path(),
+            &ambient,
+        )
+        .await;
+        let missing: Vec<_> = rows
+            .iter()
+            .filter(|r| r.status != CheckStatus::Ok)
+            .collect();
+        assert!(
+            matches!(missing.as_slice(), [row] if row.name.ends_with("PostCompact")
+                && row.message.contains("no clank PostCompact hook")),
+            "{rows:?}"
+        );
     }
 
     #[tokio::test]

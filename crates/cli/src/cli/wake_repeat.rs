@@ -77,7 +77,9 @@ pub(crate) fn claude_boundary(transcript: &Path) -> Option<Boundary> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line.text) else {
             continue;
         };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+        if v.get("type").and_then(|t| t.as_str()) != Some("user")
+            || super::recovery::claude_compact_summary(&v)
+        {
             continue;
         }
         let Some(id) = v.get("promptId").and_then(|p| p.as_str()) else {

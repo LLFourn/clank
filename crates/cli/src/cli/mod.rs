@@ -1141,6 +1141,11 @@ pub struct StopHookArgs {
     /// asyncrewake Stop entry; never fails a session start.
     #[arg(long)]
     pub session_start: bool,
+    /// Claude's PostCompact handler: a compaction can end the parked
+    /// Stop wait, so this arms it again. Installed as an `asyncRewake` entry
+    /// beside the asyncrewake Stop entry.
+    #[arg(long, conflicts_with = "session_start")]
+    pub post_compact: bool,
     /// Delivery-loop mode, written into the installed entry by
     /// `clank setup` (claude-asyncrewake-work-loop). The hook obeys
     /// ITS OWN argv — never a runtime capability probe — so the

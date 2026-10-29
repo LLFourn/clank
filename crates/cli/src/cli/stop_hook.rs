@@ -30,6 +30,14 @@
 //! monitor reads the connection closing without a result as a failed
 //! emit. Nothing here reads or writes an agent's state.
 //!
+//! # A PostCompact (`--post-compact`)
+//!
+//! A compaction can end the parked Stop wait, and runs no Stop after
+//! it: an idle compaction on 2.1.308 left the agent with none. The same turn is carried again
+//! as a [`Report::Compacted`], under the same contracts; the monitor's
+//! newest wait for a session is its park, so this one, an older one and
+//! a later Stop's converge on one.
+//!
 //! # A SessionStart (`--session-start`)
 //!
 //! Bind the session clank launched to its label, or identify one it did
@@ -60,7 +68,7 @@ use clank_core::{
     SilentReason, Tool,
 };
 
-pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(args: StopHookArgs, host: &mut impl Host) -> anyhow::Result<()> {
     // Grok imports Claude hook files too. Suppress only Clank's imported
     // adapter; the native adapter below owns this lifecycle. Other user hooks
     // are unaffected. Never park Grok inside the Claude hook protocol.
@@ -80,12 +88,63 @@ pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
     // wait's deadline must be measured from here too.
     let started = std::time::Instant::now();
     let tool: Tool = args.tool.into();
-    let turn = match read_hook_stdin() {
-        Ok(input) => stop(tool, args.repo.as_deref(), input, started, &Spawner).await,
+    let turn = match host.input() {
+        Ok(input) => {
+            let repo = args.repo.as_deref();
+            stop(
+                tool,
+                repo,
+                input,
+                started,
+                args.post_compact,
+                host.spawner(),
+            )
+            .await
+        }
         Err(e) => Turn::said(HookOutcome::Diagnostic { message: e }),
     };
-    let code = emit_turn(turn, tool, &mut std::io::stdout(), &mut std::io::stderr()).await;
-    crate::cli::source_group::exit(code)
+    let (mut stdout, mut stderr) = host.streams();
+    let code = emit_turn(turn, tool, &mut stdout, &mut stderr).await;
+    host.exit(code);
+    Ok(())
+}
+
+/// What a Stop or PostCompact reads, starts, writes and ends with.
+pub(crate) trait Host {
+    fn input(&mut self) -> Result<HookInput, String>;
+    fn spawner(&self) -> &dyn Spawn;
+    fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write);
+    fn exit(&mut self, code: i32);
+}
+
+/// This process: its stdio, `clank wait --turn-end` children, its exit.
+pub(crate) struct ProcessHost {
+    stdout: std::io::Stdout,
+    stderr: std::io::Stderr,
+}
+
+impl ProcessHost {
+    pub(crate) fn new() -> Self {
+        ProcessHost {
+            stdout: std::io::stdout(),
+            stderr: std::io::stderr(),
+        }
+    }
+}
+
+impl Host for ProcessHost {
+    fn input(&mut self) -> Result<HookInput, String> {
+        read_hook_stdin()
+    }
+    fn spawner(&self) -> &dyn Spawn {
+        &Spawner
+    }
+    fn streams(&mut self) -> (&mut dyn std::io::Write, &mut dyn std::io::Write) {
+        (&mut self.stdout, &mut self.stderr)
+    }
+    fn exit(&mut self, code: i32) {
+        crate::cli::source_group::exit(code)
+    }
 }
 
 /// One Stop's answer: the outcome to frame, and the wait that carried it,
@@ -122,12 +181,13 @@ impl Binding {
     }
 }
 
-/// The Stop, from routing to the verdict.
+/// The Stop, or the park a compaction ended, from routing to the verdict.
 async fn stop(
     tool: Tool,
     repo_override: Option<&Path>,
     input: HookInput,
     started: std::time::Instant,
+    compacted: bool,
     spawner: &dyn Spawn,
 ) -> Turn {
     // Read now, before any waiting: where in the agent's record this Stop
@@ -157,21 +217,27 @@ async fn stop(
             why: SilentReason::StaleBinding,
         });
     }
-    let report = Report::TurnEnd {
-        stop: TurnEndReport {
-            tool,
-            session: input.session_id.clone(),
-            place: boundary
-                .map(|b| TurnPlace {
-                    turn: Some(b.turn),
-                    position: Some(b.position),
-                    human_turn: b.human,
-                })
-                .unwrap_or_default(),
-            tasks: TaskSnapshot::of(&input),
+    let stop = TurnEndReport {
+        tool,
+        session: input.session_id.clone(),
+        place: boundary
+            .map(|b| TurnPlace {
+                turn: Some(b.turn),
+                position: Some(b.position),
+                human_turn: b.human,
+            })
+            .unwrap_or_default(),
+        tasks: TaskSnapshot::of(&input),
+    };
+    let deadline = unix_ms(poll_deadline(started));
+    // A compaction ends no turn, so it is no evidence about questions.
+    let report = match compacted {
+        true => Report::Compacted { stop, deadline },
+        false => Report::TurnEnd {
+            stop,
+            deadline,
+            questions,
         },
-        deadline: unix_ms(poll_deadline(started)),
-        questions,
     };
     let mut life = super::hook_owner::lifetime_for(tool, &super::hook_owner::Native);
     let carried =
@@ -498,7 +564,7 @@ fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, session: &str, tool
 }
 
 /// What starts the child that carries a report.
-trait Spawn {
+pub(crate) trait Spawn {
     fn spawn(
         &self,
         repo: &Path,
@@ -534,11 +600,12 @@ impl Spawn for Spawner {
 /// constructed, and it is released only by [`Answer::answer`] or
 /// [`OwnedWait::shutdown`], after the result it carries is written.
 /// Closing it early would read as instant owner death.
-struct OwnedWait {
-    child: tokio::process::Child,
-    owner_end: tokio::process::ChildStdin,
+pub(crate) struct OwnedWait {
+    /// `None` for a carrier running in this process.
+    child: Option<tokio::process::Child>,
+    owner_end: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     /// The child's verdicts, one per line, read while it stays alive.
-    frames: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    frames: tokio::io::Lines<tokio::io::BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>>,
     stderr: tokio::task::JoinHandle<String>,
     /// Whether the report this child carries can park.
     parks: bool,
@@ -563,7 +630,25 @@ impl OwnedWait {
             .stdout
             .take()
             .ok_or_else(|| "hook: wait spawned without a stdout pipe".to_string())?;
-        let mut stderr = child.stderr.take();
+        let stderr = child.stderr.take();
+        Self::over(
+            Some(child),
+            Box::new(owner_end),
+            Box::new(stdout),
+            stderr.map(|e| Box::new(e) as _),
+            report,
+        )
+    }
+
+    /// The wait whose carrier is reached through these pipes: the owner
+    /// pipe it reads the report and result from, and the one it answers on.
+    pub(crate) fn over(
+        child: Option<tokio::process::Child>,
+        owner_end: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        frames: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        mut stderr: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
+        report: &Report,
+    ) -> Result<Self, String> {
         let stderr = tokio::spawn(async move {
             let mut text = String::new();
             if let Some(stderr) = stderr.as_mut() {
@@ -577,7 +662,7 @@ impl OwnedWait {
         Ok(OwnedWait {
             child,
             owner_end,
-            frames: tokio::io::BufReader::new(stdout).lines(),
+            frames: tokio::io::BufReader::new(frames).lines(),
             stderr,
             parks: report.parks(),
             pending_report: Some(line),
@@ -659,7 +744,9 @@ impl Run for OwnedWait {
             ..
         } = self;
         drop(owner_end);
-        let _ = tokio::time::timeout(ABANDON_GRACE, child.wait()).await;
+        if let Some(child) = child.as_mut() {
+            let _ = tokio::time::timeout(ABANDON_GRACE, child.wait()).await;
+        }
     }
 }
 

@@ -441,7 +441,9 @@ impl Turns {
             Report::Handoff { handoff, .. } => return Some(frame_of(g.handoff_verdict(handoff))),
             _ if g.owed.is_none() => return None,
             Report::TurnEnd { stop, .. } if first => Event::TurnEnd(stop.clone()),
-            Report::TurnEnd { stop, .. } => Event::Parked(stop.clone()),
+            Report::TurnEnd { stop, .. } | Report::Compacted { stop, .. } => {
+                Event::Parked(stop.clone())
+            }
             Report::SessionStart { session, .. } => Event::SessionStart(session.clone()),
         };
         let tool = report.tool();
