@@ -1695,8 +1695,8 @@ pub(super) fn log_row_spans(
             // Fixed width keeps subjects column-aligned.
             let g = marker.glyph().to_string();
             let icon = match marker {
-                RowMarker::Finish => colored("36", g), // cyan, like Finished
-                RowMarker::AdHoc => colored("33", g),  // yellow (unchanged)
+                RowMarker::Finish | RowMarker::Bulk => colored("36", g), // cyan, like Finished
+                RowMarker::AdHoc => colored("33", g),                    // yellow (unchanged)
                 _ => plain(g),
             };
             // A finished plan of one commit says its NAME here, in the
@@ -5998,6 +5998,7 @@ mod tests {
             RowMarker::Planning,
             RowMarker::Impl,
             RowMarker::Finish,
+            RowMarker::Bulk,
         ] {
             assert_eq!(
                 super::char_width(m.glyph()),

@@ -945,6 +945,9 @@ pub(crate) enum RowMarker {
     /// The plan's finalize commit (its message is now a real whole-plan
     /// summary, so the flag is what identifies it at a glance).
     Finish,
+    /// One commit that finishes several plans at once (a squash, restore
+    /// or import of their records).
+    Bulk,
 }
 
 impl RowMarker {
@@ -978,14 +981,15 @@ impl RowMarker {
             RowMarker::Planning => '✎',
             RowMarker::Impl => '⚒',
             RowMarker::Finish => '⚑',
+            RowMarker::Bulk => '⁂',
         }
     }
 
     /// ANSI color for the glyph in the colored CLI renderer (`""` = none).
     fn ansi(self) -> &'static str {
         match self {
-            RowMarker::Finish => C, // cyan, matching the Finished verdict
-            RowMarker::AdHoc => Y,  // yellow (unchanged from the old `~`)
+            RowMarker::Finish | RowMarker::Bulk => C, // cyan, matching the Finished verdict
+            RowMarker::AdHoc => Y,                    // yellow (unchanged from the old `~`)
             _ => "",
         }
     }
@@ -1103,7 +1107,7 @@ pub(crate) fn mark_run_ends(rows: &mut Vec<OnelineRow>, from: usize) {
         let finish = matches!(
             rows[i],
             OnelineRow::Commit {
-                marker: RowMarker::Finish,
+                marker: RowMarker::Finish | RowMarker::Bulk,
                 ..
             }
         );
@@ -1133,6 +1137,28 @@ pub(crate) fn mark_run_ends(rows: &mut Vec<OnelineRow>, from: usize) {
 /// inherit an earlier `foo`'s eligibility (codex on 5b1e87c).
 pub(crate) type StandsFor = std::collections::BTreeMap<String, String>;
 
+/// Commits that finish several plans at once (a squash, restore or import
+/// of their records), with how many. The fold emits one `PlanFinalized`
+/// per plan; the log draws one row per commit.
+fn bulk_finishes(events: &[&LogEvent]) -> std::collections::BTreeMap<String, usize> {
+    let mut finishes = std::collections::BTreeMap::new();
+    for e in events {
+        if let LogEvent::PlanFinalized { sha, .. } = e {
+            *finishes.entry(sha.as_str().to_string()).or_insert(0) += 1;
+        }
+    }
+    finishes.retain(|_, n| *n > 1);
+    finishes
+}
+
+/// Keeps a bulk commit's first event and drops the rest.
+fn first_of_each_bulk(
+    bulk: &std::collections::BTreeMap<String, usize>,
+) -> impl FnMut(&LogEvent) -> bool + '_ {
+    let mut seen = std::collections::BTreeSet::new();
+    move |e| !bulk.contains_key(e.sha().as_str()) || seen.insert(e.sha().clone())
+}
+
 /// Group the bounded Git window once and retain external event positions.
 pub(crate) fn oneline_items_rows(
     items: &[TimelineItem],
@@ -1148,6 +1174,8 @@ pub(crate) fn oneline_items_rows(
             _ => None,
         })
         .collect();
+    let bulk = bulk_finishes(&events);
+    let mut first_of_commit = first_of_each_bulk(&bulk);
     let mut git_rows = oneline_rows(&events, reviews, stands_for)
         .into_iter()
         .peekable();
@@ -1155,6 +1183,9 @@ pub(crate) fn oneline_items_rows(
     for item in items {
         match item {
             TimelineItem::Repo(event) => {
+                if !first_of_commit(event) {
+                    continue;
+                }
                 for row in git_rows.by_ref() {
                     let commit =
                         matches!(&row, OnelineRow::Commit { sha, .. } if sha == event.sha());
@@ -1268,8 +1299,28 @@ pub(crate) fn oneline_rows(
     stands_for: &StandsFor,
 ) -> Vec<OnelineRow> {
     use clank_core::repo_state::{UmbrellaKey, parse_subject, umbrella_sections};
+    let bulk = bulk_finishes(events);
+    let mut first_of_commit = first_of_each_bulk(&bulk);
+    let events: Vec<&LogEvent> = events
+        .iter()
+        .copied()
+        .filter(|e| first_of_commit(e))
+        .collect();
+    // A bulk commit is no member plan's: grouped under the one its event
+    // names, it would merge into an older run of that name.
+    let mut sections = Vec::new();
+    let mut rest = events.as_slice();
+    while let Some(i) = rest
+        .iter()
+        .position(|e| bulk.contains_key(e.sha().as_str()))
+    {
+        sections.extend(umbrella_sections(&rest[..i], true));
+        sections.push((UmbrellaKey::AdHoc, vec![rest[i]]));
+        rest = &rest[i + 1..];
+    }
+    sections.extend(umbrella_sections(rest, true));
     let mut out = Vec::new();
-    for (key, run) in umbrella_sections(events, true) {
+    for (key, run) in sections {
         let umbrella_plan = match &key {
             UmbrellaKey::Plan(p) => Some(p.as_str().to_string()),
             UmbrellaKey::AdHoc => None,
@@ -1352,12 +1403,20 @@ pub(crate) fn oneline_rows(
                     });
                 }
             }
+            let (marker, subject, stands_for) = match bulk.get(sha.as_str()) {
+                Some(n) => (RowMarker::Bulk, format!("{subject} ({n} plans)"), None),
+                None => (
+                    RowMarker::of(event),
+                    subject,
+                    stands_for.get(sha.as_str()).cloned(),
+                ),
+            };
             out.push(OnelineRow::Commit {
                 sha: sha.clone(),
                 at: event.ts(),
                 subject,
-                marker: RowMarker::of(event),
-                stands_for: stands_for.get(sha.as_str()).cloned(),
+                marker,
+                stands_for,
             });
         }
         // The name goes UNDER its run, because the list is newest-first
@@ -2220,6 +2279,44 @@ mod json_output_tests {
         }
     }
 
+    /// `clank log --oneline` has no fold map to hand the row producer, and
+    /// still draws a commit finishing several plans once, with no footers,
+    /// and history older than it keeps its place below a later event.
+    #[test]
+    fn print_oneline_draws_a_bulk_commit_once() {
+        use crate::lifecycle::{CommitSha, PlanKey};
+        let bulk = |plan: &str| LogEvent::PlanFinalized {
+            duration_secs: 0,
+            plan: PlanKey::parse(plan).unwrap(),
+            sha: CommitSha::parse(&"b".repeat(40)).unwrap(),
+            ts: 50,
+            subject: "Restore plans".into(),
+        };
+        let mut events = run("later", 200, 60, None);
+        events.extend([bulk("b"), bulk("a")]);
+        events.extend(run("old", 100, 5, Some(10)));
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        let gh = [gh(20, "between", false)];
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        print_oneline(&mut out, &interleave(&refs, &gh), dir.path(), &[], false).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap().lines().collect::<Vec<_>>(),
+            [
+                "⚒ 0000000 work",
+                "✎ 0000000 intro",
+                "later",
+                "⁂ bbbbbbb Restore plans (2 plans)",
+                "✓✓ 🐙 @claude  o/r#12 pr_comment/review  “between”",
+                RUN_END_RULE,
+                "⚑ 0000000 finish",
+                "⚒ 0000000 work",
+                "✎ 0000000 intro",
+                "old · 1m",
+            ]
+        );
+    }
+
     fn nudge(agent: &str, at: u64, attempt: &str) -> crate::cli::github::timeline::Nudge {
         crate::cli::github::timeline::Nudge {
             agent: agent.into(),
@@ -2580,6 +2677,47 @@ mod json_output_tests {
             1
         );
         assert!(oneline_plain_lines(&whole).contains(&RUN_END_RULE.to_string()));
+    }
+
+    /// A bulk restore naming a plan that also ran earlier is no part of
+    /// that run: the older plan keeps its own footer and duration, read
+    /// whole or a page at a time, whichever member the fold listed last.
+    #[test]
+    fn a_bulk_restore_leaves_an_older_run_of_a_member_name_its_footer() {
+        use crate::lifecycle::{CommitSha, PlanKey};
+        for members in [["b", "a"], ["a", "b"]] {
+            let mut events: Vec<LogEvent> = members
+                .iter()
+                .map(|plan| LogEvent::PlanFinalized {
+                    duration_secs: 0,
+                    plan: PlanKey::parse(plan).unwrap(),
+                    sha: CommitSha::parse(&"b".repeat(40)).unwrap(),
+                    ts: 400,
+                    subject: "Restore plans".into(),
+                })
+                .collect();
+            events.extend(run("b", 10, 100, Some(160)));
+            let lines = |rows: &[OnelineRow]| oneline_plain_lines(rows);
+            let whole = rows_of(&events, &[], &Default::default(), &Default::default());
+            let mut paged = rows_of(&events[..2], &[], &Default::default(), &Default::default());
+            extend_oneline_rows(
+                &mut paged,
+                rows_of(&events[2..], &[], &Default::default(), &Default::default()),
+            );
+            assert_eq!(lines(&paged), lines(&whole), "{members:?}");
+            assert_eq!(
+                lines(&whole),
+                [
+                    "⁂ bbbbbbb Restore plans (2 plans)",
+                    RUN_END_RULE,
+                    "⚑ 0000000 finish",
+                    "⚒ 0000000 work",
+                    "✎ 0000000 intro",
+                    "b · 1m",
+                ],
+                "{members:?}"
+            );
+        }
     }
 
     #[test]
@@ -3067,6 +3205,35 @@ mod tests {
         CommitSha::parse(&format!("{s:0<40}")).unwrap()
     }
 
+    fn bulk_finish(plans: &[&str], subject: &str) -> Vec<LogEvent> {
+        plans
+            .iter()
+            .map(|p| LogEvent::PlanFinalized {
+                duration_secs: 0,
+                plan: PlanKey::parse(p).unwrap(),
+                sha: sha("aa"),
+                ts: 2,
+                subject: subject.into(),
+            })
+            .collect()
+    }
+
+    /// A bulk commit's subject is its own: a `[plan]` tag naming one of its
+    /// plans is not the run's to strip.
+    #[test]
+    fn a_tagged_bulk_commit_keeps_its_subject() {
+        let events = bulk_finish(&["b", "a"], "[b] Restore plans");
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        assert_eq!(
+            oneline_plain_lines(&oneline_rows(
+                &refs,
+                &Default::default(),
+                &Default::default()
+            )),
+            ["⁂ aa00000 [b] Restore plans (2 plans)"]
+        );
+    }
+
     /// A finished plan of ONE commit loses its umbrella and says its
     /// name on the commit row. A plan with two keeps both.
     #[test]
@@ -3431,6 +3598,7 @@ mod tests {
             RowMarker::Planning,
             RowMarker::Impl,
             RowMarker::Finish,
+            RowMarker::Bulk,
         ] {
             assert_eq!(
                 m.glyph().to_string().chars().count(),

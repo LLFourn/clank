@@ -1921,6 +1921,97 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// One commit restoring many finished records is ONE row, marked and
+    /// counted, with no per-plan footer; the plan landed after it reads as
+    /// it would without it, and reading the window a page at a time gives
+    /// the rows the whole read gives.
+    #[tokio::test]
+    async fn a_commit_finishing_many_plans_is_one_row() {
+        use crate::cli::log::{OnelineRow, RowMarker};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit = |subject: &str| {
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", subject]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        let adopted = crate::lifecycle::CommitSha::parse(&commit("base")).unwrap();
+        std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+        let restored = ["sim-a", "sim-b", "sim-c", "sim-d", "simctl-up"];
+        for name in restored {
+            std::fs::write(
+                repo.join(format!(".clank/finished/{name}.md")),
+                format!("# {name}\n"),
+            )
+            .unwrap();
+        }
+        let bulk = commit("Restore the simulator line's clank plans");
+        std::fs::write(repo.join("README"), "tweak\n").unwrap();
+        let adhoc = commit("drive-by tweak");
+        std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
+        std::fs::write(repo.join(".clank/plans/later.md"), "# later\n").unwrap();
+        let intro = commit("[later] intro");
+        std::fs::write(repo.join("code.txt"), "work\n").unwrap();
+        let work = commit("[later] build it");
+
+        let state = crate::rebuild::rebuild_repo(repo).await.unwrap();
+        let stands = stands_for_plans(&state);
+
+        let whole = tui_log_with_events(repo, 30, Some(&adopted), &stands)
+            .await
+            .rows;
+        let mut paged = tui_log_with_events(repo, 2, Some(&adopted), &stands).await;
+        while let Some(next) = paged.next.take() {
+            let older = tui_log_page(repo, &next, 2, Some(&adopted), &stands).await;
+            crate::cli::log::extend_oneline_rows(&mut paged.rows, older.rows);
+            paged.next = older.next;
+        }
+        let short = |sha: &str| sha[..7].to_string();
+        let expected = vec![
+            format!("⚒ {} build it", short(&work)),
+            format!("✎ {} intro", short(&intro)),
+            "later".to_string(),
+            format!("~ {} drive-by tweak", short(&adhoc)),
+            crate::cli::log::RUN_END_RULE.to_string(),
+            format!(
+                "⁂ {} Restore the simulator line's clank plans (5 plans)",
+                short(&bulk)
+            ),
+        ];
+        for rows in [&whole, &paged.rows] {
+            assert_eq!(crate::cli::log::oneline_plain_lines(rows), expected);
+            let bulk_rows: Vec<_> = rows
+                .iter()
+                .filter(|r| matches!(r, OnelineRow::Commit { sha, .. } if sha.as_str() == bulk))
+                .collect();
+            assert!(
+                matches!(
+                    bulk_rows.as_slice(),
+                    [OnelineRow::Commit {
+                        marker: RowMarker::Bulk,
+                        stands_for: None,
+                        ..
+                    }]
+                ),
+                "{bulk_rows:?}"
+            );
+        }
+    }
+
     /// Which finished plans stand for themselves: the ones whose intro
     /// IS their finalize. Read from the fold, so a plan split across
     /// chunks or falling off the end of a page cannot look like one
