@@ -1170,6 +1170,11 @@ impl Tail {
         ))
     }
 
+    /// The file read, by inode, and how far.
+    pub(crate) fn at(&self) -> (u64, u64) {
+        (self.file.1, self.pos)
+    }
+
     pub(crate) fn poll(&mut self) -> std::io::Result<Polled> {
         use std::io::{Read, Seek, SeekFrom};
         use std::os::unix::fs::MetadataExt;

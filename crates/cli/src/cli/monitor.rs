@@ -54,6 +54,10 @@ mod grok_tests;
 #[path = "monitor_turn_tests.rs"]
 mod turn_tests;
 
+#[cfg(test)]
+#[path = "monitor_unwatched_tests.rs"]
+mod unwatched_tests;
+
 #[path = "monitor_keeper.rs"]
 pub(crate) mod keeper;
 
@@ -3289,6 +3293,17 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             beat = beats.recv() => Wake::Beat(beat.is_some()),
         };
         let owner = tenure.may_act(&republish);
+        if owner {
+            leaving.extend(tend(
+                &repo,
+                &mut clients,
+                folded_state.as_ref(),
+                &pending,
+                &hosted,
+                &mut turns,
+                &mut recovery,
+            ));
+        }
         // Which wakes are state changes a waiting user command is looked at
         // again on; its own store's changes are not, since a monitor writing
         // a record wakes itself.
@@ -3457,35 +3472,16 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             eprintln!("monitor: an unreadable frame after a report: {e}")
                         }
                     },
-                    Heard::Closed => {
-                        let (gone, kept): (Vec<Client>, Vec<Client>) = std::mem::take(&mut clients)
-                            .into_iter()
-                            .partition(|c| c.conn == conn);
-                        clients = kept;
-                        leaving.extend(gone.into_iter().filter_map(|c| c.writer));
-                        if let Some(author) = author {
-                            let g = gather(
-                                &repo,
-                                folded_state.as_ref(),
-                                &author,
-                                &hosted,
-                                &mut Default::default(),
-                                &pending,
-                            );
-                            turns.closed(&author, conn, &g);
-                            project(&mut recovery, &mut turns, &author, &g);
-                            leaving.extend(serve_reports(
-                                &repo,
-                                &mut clients,
-                                folded_state.as_ref(),
-                                Some(&author),
-                                &pending,
-                                &mut Default::default(),
-                                &hosted,
-                                &mut turns,
-                            ));
-                        }
-                    }
+                    Heard::Closed => leaving.extend(ended(
+                        conn,
+                        &repo,
+                        &mut clients,
+                        folded_state.as_ref(),
+                        &pending,
+                        &hosted,
+                        &mut turns,
+                        &mut recovery,
+                    )),
                 }
             }
             Wake::AuthorizeCheckIn(ask) => {
@@ -4167,9 +4163,7 @@ fn recovery_facts(
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let blind_nudge = crate::cli::config::load_with_home(repo, home.as_deref())
-        .recovery
-        .blind_nudge;
+    let config = crate::cli::config::load_with_home(repo, home.as_deref()).recovery;
     let mut facts = Vec::new();
     let mut bound = std::collections::BTreeSet::new();
     for author in roster_authors(repo) {
@@ -4213,8 +4207,7 @@ fn recovery_facts(
             turns.observed(&author, &g);
         }
         let quiet = turns.recovery_quiet(&author, &g);
-        let (attended, repeated) = turns.projection(&author, &g);
-        let asking = g.asking().map(str::to_string);
+        let projection = turns.projection(&author, &g);
         let role = crate::agent_store::resolve_role(repo, &author)
             .map(|r| r.to_string())
             .unwrap_or_default();
@@ -4227,14 +4220,11 @@ fn recovery_facts(
             delivering,
             obligated,
             role,
-            blind_nudge,
+            blind_nudge: config.blind_nudge,
+            stall: config.stall(),
             attending: obligated && quiet.is_some(),
-            asking: asking.is_some(),
-            projection: crate::cli::recovery::Projection {
-                attended,
-                asking,
-                repeated,
-            },
+            asking: projection.asking.is_some(),
+            projection,
         });
     }
     turns.retire_unbound(&bound);
@@ -4302,21 +4292,16 @@ fn owed_items(
 }
 
 /// Publish what the monitor holds of `author`'s turns: its attendance,
-/// question and repeat count.
+/// question, repeat count and lost park.
 fn project(
     recovery: &mut crate::cli::recovery::Driver,
     turns: &mut crate::cli::turn_custody::Turns,
     author: &AgentLabel,
     g: &crate::cli::turn_custody::Gathered,
 ) {
-    let (attended, repeated) = turns.projection(author, g);
     recovery.project(
         author,
-        crate::cli::recovery::Projection {
-            attended,
-            asking: g.asking().map(str::to_string),
-            repeated,
-        },
+        turns.projection(author, g),
         crate::cli::recovery::unix_now(),
     );
 }
@@ -5836,7 +5821,7 @@ fn admit_into(
     // admitting a replacement; no task token or cleanup by session-wide key.
     let mut live = Vec::new();
     for old in clients.drain(..) {
-        if old.out.is_closed() {
+        if old.out.is_closed() && old.who == client.who {
             if let Some(writer) = old.writer {
                 leaving.push(writer);
             }
@@ -7107,7 +7092,10 @@ fn serve_to_cached(
     // held for them.
     let mut delivered: Vec<AgentLabel> = Vec::new();
     for mut client in clients.drain(..) {
-        if client.report.is_some() {
+        // A wait whose socket closed is the loop's to end, not a send's.
+        if client.report.is_some()
+            || matches!(client.who, Served::Agent { .. }) && client.out.is_closed()
+        {
             keep.push(client);
             continue;
         }
@@ -7308,6 +7296,94 @@ fn gather(
     )
 }
 
+/// Each agent's waits held here are its deliverers, the newest its park;
+/// one whose socket closed under it has [`ended`]. And a lost park whose
+/// record recovery has seen move on is over.
+#[allow(clippy::too_many_arguments)]
+fn tend(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &[(AgentLabel, WaitItem)],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    for (author, unwatched) in recovery.watched_again() {
+        turns.watched_again(&author, unwatched);
+    }
+    let mut closed = Vec::new();
+    for c in clients.iter() {
+        let Served::Agent { author } = &c.who else {
+            continue;
+        };
+        // A wait admitted and closed within one round was still held and
+        // answered nothing, so it is registered before its close is judged.
+        if c.report.as_ref().is_none_or(|r| r.stepped) && client_refusal(repo, c).is_none() {
+            turns.watch(author, c.conn, || {
+                crate::cli::turn_custody::Gathered::of(repo, author, None)
+            });
+        }
+        if c.out.is_closed() {
+            closed.push(c.conn);
+        }
+    }
+    closed
+        .into_iter()
+        .flat_map(|conn| ended(conn, repo, clients, state, pending, hosted, turns, recovery))
+        .collect()
+}
+
+/// Connection `conn` ended. A deliverer the monitor still held, or one
+/// whose presentation it carried failed with it, answered nothing: if it
+/// was its agent's park, the park is lost. One answered is neither.
+#[allow(clippy::too_many_arguments)]
+fn ended(
+    conn: u64,
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &[(AgentLabel, WaitItem)],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    let (gone, kept): (Vec<Client>, Vec<Client>) = std::mem::take(clients)
+        .into_iter()
+        .partition(|c| c.conn == conn);
+    *clients = kept;
+    let held = gone.iter().find_map(|c| match &c.who {
+        Served::Agent { author } => Some(author.clone()),
+        _ => None,
+    });
+    let mut leaving: Vec<_> = gone.into_iter().filter_map(|c| c.writer).collect();
+    let Some(author) = held.or_else(|| turns.carrier(conn).cloned()) else {
+        return leaving;
+    };
+    let g = gather(
+        repo,
+        state,
+        &author,
+        hosted,
+        &mut Default::default(),
+        pending,
+    );
+    turns.closed(&author, conn, &g);
+    turns.lost(&author, conn, || recovery.read_to(&author), &g);
+    project(recovery, turns, &author, &g);
+    leaving.extend(serve_reports(
+        repo,
+        clients,
+        state,
+        Some(&author),
+        pending,
+        &mut Default::default(),
+        hosted,
+        turns,
+    ));
+    leaving
+}
+
 /// Step each held report — every author's, or `only`'s — and answer the
 /// ones whose verdict is terminal, retiring them. A parked report is told
 /// so once and then kept alive with beats.
@@ -7330,7 +7406,8 @@ fn serve_reports(
             keep.push(client);
             continue;
         };
-        if only.is_some_and(|only| only != author) {
+        // A park whose socket closed is the loop's to end, not a send's.
+        if only.is_some_and(|only| only != author) || reporting.stepped && client.out.is_closed() {
             keep.push(client);
             continue;
         }
@@ -7742,6 +7819,7 @@ mod recovery_tests {
                 role: "master".into(),
                 work: vec!["the timer".into()],
                 blind_nudge: None,
+                stall: None,
                 attending: false,
                 asking: false,
                 projection: Default::default(),

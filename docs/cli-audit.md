@@ -444,6 +444,8 @@ runtime text only. Verdicts: keep / fix doc / rename / merge / hide / remove.
 | `config diff.wait` | to set this value | human | H | keep | |
 | `config finish.autosquash` | to set this value | human | H | keep | |
 | `config recovery.blind_nudge` | to set this value | human | H | keep | |
+| `config recovery.stall_warn` | to set this value | human | H | keep | |
+| `config recovery.stall_nudge` | to set this value | human | H | keep | |
 | `export` | to get the raw roster JSON | human | R | keep | F2: raw shape differs from `agent list -j`; no internal caller, external use unknown |
 | `rereview` | to make reviewers look at a commit again | human | R | keep |  |
 | `rewire` | never by hand; the git hook runs it | hook | R | keep | hidden; `--from-stdin` required in clap |
@@ -577,6 +579,8 @@ Generated. Do not edit by hand.
 | `config diff.wait` | action |  | diff_wait | Whether `clank diff` waits for the editor | [VALUE] [THEN] (hidden) |  |
 | `config finish.autosquash` | action |  | finish_autosquash | Squash a plan into one commit when it finishes | [VALUE] [THEN] (hidden) |  |
 | `config recovery.blind_nudge` | action |  | recovery_blind_nudge | Nudge an agent whose state clank cannot read | [VALUE] [THEN] (hidden) |  |
+| `config recovery.stall_warn` | action |  | recovery_stall_warn | Warn when a running turn goes silent | [VALUE] [THEN] (hidden) |  |
+| `config recovery.stall_nudge` | action |  | recovery_stall_nudge | Nudge a stalled agent after its warning | [VALUE] [THEN] (hidden) |  |
 | `export` | action |  |  | Dump the repo's roster config as JSON |  | --repo |
 | `rereview` | action |  |  | Re-open review on a plan's latest reviewable commit | [PLAN] | --repo |
 | `rewire` | action | hidden |  | Remap feedback after a rebase or amend |  | --repo --from-stdin (required) |

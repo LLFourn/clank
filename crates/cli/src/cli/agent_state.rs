@@ -60,6 +60,9 @@ impl Observer {
 #[serde(tag = "is", content = "why", rename_all = "snake_case")]
 pub(crate) enum Activity {
     Working,
+    /// Its wait was lost without delivering, and its record has not moved
+    /// since.
+    Unwatched,
     Idle,
     Failed(String),
     /// Waiting on a person to answer its question.
@@ -94,6 +97,12 @@ pub(crate) enum Nudge {
     At(u64),
     /// A nudge or retry is out, and its turn not yet seen to finish.
     InFlight,
+    /// Its running turn has been silent since this unix second; the nudge
+    /// is due `at`, or never.
+    Silent {
+        since: u64,
+        at: Option<u64>,
+    },
     /// Clank has stopped: the reason its pending work waits for a person.
     WaitingForYou(String),
 }
@@ -376,6 +385,7 @@ fn brief(state: &AgentState, now: u64) -> String {
     let age = crate::cli::config::show_duration(now.saturating_sub(state.since));
     let mut out = match &state.activity {
         Activity::Working => format!("working {age}"),
+        Activity::Unwatched => format!("unwatched {age}"),
         Activity::Idle => format!("idle {age}"),
         Activity::Failed(class) => format!("failed ({class}) {age}"),
         Activity::Asking => format!("asking {age}"),
@@ -392,6 +402,13 @@ fn brief(state: &AgentState, now: u64) -> String {
             crate::cli::config::show_duration(at.saturating_sub(now))
         )),
         Nudge::InFlight => out.push_str(" · nudged"),
+        Nudge::Silent { since, at } => {
+            let show = crate::age::duration;
+            out.push_str(&format!(" · silent {}", show(now.saturating_sub(*since))));
+            if let Some(at) = at {
+                out.push_str(&format!(" — nudging in {}", show(at.saturating_sub(now))));
+            }
+        }
         Nudge::WaitingForYou(_) => out.push_str(" · waiting for you"),
     }
     out

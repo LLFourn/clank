@@ -250,3 +250,83 @@ async fn an_attending_groks_background_wait_delivers_a_new_event() {
         "{items:?}"
     );
 }
+
+/// Automatic Grok's wait registers no turn-end, and is its agent's park
+/// all the same: when its socket closes under it, whether or not a round
+/// registered it first, the round records the loss against the record
+/// recovery reads.
+#[tokio::test]
+async fn a_lost_automatic_wait_leaves_its_agent_unwatched() {
+    for registered_before_close in [true, false] {
+        lost_automatic_wait(registered_before_close).await;
+    }
+}
+
+async fn lost_automatic_wait(registered_before_close: bool) {
+    let (repo, author, session) = fixture();
+    let history = repo.path().join("history.jsonl");
+    std::fs::write(
+        history.with_file_name("events.jsonl"),
+        "{\"type\":\"turn_started\",\"turn_number\":1}\n",
+    )
+    .unwrap();
+    crate::agent_store::update_agent_config(repo.path(), &author, |config| {
+        config.session.as_mut().unwrap().transcript = Some(history.display().to_string());
+    })
+    .unwrap();
+    let binding = crate::agent_store::load_agent_config(repo.path(), &author)
+        .unwrap()
+        .unwrap()
+        .session
+        .unwrap();
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    recovery.reconcile(
+        vec![crate::cli::recovery::Facts {
+            agent_dir: crate::agent_store::agents_root(repo.path()).join(author.as_str()),
+            author: author.clone(),
+            session: binding,
+            auto: true,
+            work: vec![],
+            delivering: true,
+            obligated: false,
+            role: "master".into(),
+            blind_nudge: None,
+            stall: None,
+            attending: false,
+            asking: false,
+            projection: Default::default(),
+        }],
+        0,
+    );
+    let mut turns = crate::cli::turn_custody::Turns::new(repo.path().to_path_buf());
+    let mut round = |clients: &mut Vec<Client>, turns: &mut crate::cli::turn_custody::Turns| {
+        let _ = tend(
+            repo.path(),
+            clients,
+            None,
+            &[],
+            &Default::default(),
+            turns,
+            &mut recovery,
+        );
+    };
+    let (wait, peer) = connecting(repo.path(), &author, &session).await;
+    let closed = wait.out.clone();
+    let mut clients = vec![];
+    joining(repo.path(), &mut clients, wait);
+    if registered_before_close {
+        round(&mut clients, &mut turns);
+    }
+    drop(peer);
+    tokio::time::timeout(Duration::from_secs(1), closed.closed())
+        .await
+        .unwrap();
+    drop(closed);
+    round(&mut clients, &mut turns);
+    assert!(clients.is_empty());
+    assert!(
+        turns.state(&author).unwrap().unwatched.is_some(),
+        "registered before close: {registered_before_close}"
+    );
+}

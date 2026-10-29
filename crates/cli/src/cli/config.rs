@@ -21,12 +21,45 @@ pub struct Config {
     pub recovery: RecoveryConfig,
 }
 
-/// Recovery config, from `.clank/config.json#/recovery`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Recovery config, from `.clank/config.json#/recovery`. Each duration is
+/// in seconds, and `None` is `off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryConfig {
-    /// Seconds between blind nudges of an agent that owes work and whose
-    /// record cannot be read. `None` is `off`.
+    /// Between blind nudges of an agent that owes work and whose record
+    /// cannot be read.
     pub blind_nudge: Option<u64>,
+    /// How long a running turn's record may stay silent before a warning.
+    pub stall_warn: Option<u64>,
+    /// How long after that warning the stalled agent is nudged.
+    pub stall_nudge: Option<u64>,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            blind_nudge: None,
+            stall_warn: Some(40 * 60),
+            stall_nudge: Some(5 * 60),
+        }
+    }
+}
+
+impl RecoveryConfig {
+    pub(crate) fn stall(&self) -> Option<super::recovery::Stall> {
+        Some(super::recovery::Stall {
+            warn: self.stall_warn?,
+            nudge: self.stall_nudge,
+        })
+    }
+
+    fn field(&mut self, key: &str) -> Option<&mut Option<u64>> {
+        match key {
+            "recovery.blind_nudge" => Some(&mut self.blind_nudge),
+            "recovery.stall_warn" => Some(&mut self.stall_warn),
+            "recovery.stall_nudge" => Some(&mut self.stall_nudge),
+            _ => None,
+        }
+    }
 }
 
 /// `off`, or a duration in clank's grammar; `0` is `off` too.
@@ -112,6 +145,10 @@ struct ConfigFile {
 struct RecoveryFile {
     #[serde(default)]
     blind_nudge: Option<String>,
+    #[serde(default)]
+    stall_warn: Option<String>,
+    #[serde(default)]
+    stall_nudge: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -448,14 +485,20 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         cfg.finish.autosquash = v;
         present.insert("finish.autosquash".to_string());
     }
-    if let Some(raw) = parsed.recovery.and_then(|r| r.blind_nudge) {
+    let recovery = parsed.recovery.unwrap_or_default();
+    for (key, raw) in [
+        ("recovery.blind_nudge", recovery.blind_nudge),
+        ("recovery.stall_warn", recovery.stall_warn),
+        ("recovery.stall_nudge", recovery.stall_nudge),
+    ] {
+        let Some(raw) = raw else { continue };
         match parse_blind_nudge(&raw) {
             Ok(v) => {
-                cfg.recovery.blind_nudge = v;
-                present.insert("recovery.blind_nudge".to_string());
+                *cfg.recovery.field(key).expect("a recovery key") = v;
+                present.insert(key.to_string());
             }
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "clank config: bad recovery.blind_nudge; ignoring it");
+                tracing::warn!(path = %path.display(), error = %e, "clank config: bad {key}; ignoring it");
             }
         }
     }
@@ -528,6 +571,20 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         type_desc: "duration|off",
         default: "off",
         help: "Nudge an agent that owes work and whose record clank cannot read, at most once per stuck interval, checking again at this interval (doubling, up to 4h) while there is nowhere to send it; `off` leaves such an agent to a person",
+    },
+    KeyDef {
+        section: "recovery",
+        name: "stall_warn",
+        type_desc: "duration|off",
+        default: "40m",
+        help: "Warn when an agent that owes work has a running turn whose record has been silent this long; `off` disables the stall watchdog",
+    },
+    KeyDef {
+        section: "recovery",
+        name: "stall_nudge",
+        type_desc: "duration|off",
+        default: "5m",
+        help: "Nudge a stalled agent this long after its warning, once per quiet period (the nudge may stop a tool that is still running); `off` warns and never nudges",
     },
 ];
 
@@ -628,9 +685,11 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
             .unwrap_or(false)
             .to_string(),
         "finish.autosquash" => cfg.finish.autosquash.to_string(),
-        "recovery.blind_nudge" => cfg
+        "recovery.blind_nudge" | "recovery.stall_warn" | "recovery.stall_nudge" => cfg
             .recovery
-            .blind_nudge
+            .clone()
+            .field(key)
+            .and_then(|v| *v)
             .map_or_else(|| "off".to_string(), show_duration),
         _ => "unknown key".to_string(),
     }
@@ -656,6 +715,8 @@ fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
         "diff.editor.command" => Some(&["diff", "editor", "command"]),
         "finish.autosquash" => Some(&["finish", "autosquash"]),
         "recovery.blind_nudge" => Some(&["recovery", "blind_nudge"]),
+        "recovery.stall_warn" => Some(&["recovery", "stall_warn"]),
+        "recovery.stall_nudge" => Some(&["recovery", "stall_nudge"]),
         _ => None,
     }
 }
@@ -683,10 +744,12 @@ struct FinishJson {
     autosquash: bool,
 }
 
+/// Seconds, or `null` for `off`.
 #[derive(serde::Serialize)]
 struct RecoveryJson {
-    /// Seconds, or `null` for `off`.
     blind_nudge: Option<u64>,
+    stall_warn: Option<u64>,
+    stall_nudge: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -732,6 +795,8 @@ impl<'a> From<&'a Config> for ConfigJson<'a> {
             },
             recovery: RecoveryJson {
                 blind_nudge: cfg.recovery.blind_nudge,
+                stall_warn: cfg.recovery.stall_warn,
+                stall_nudge: cfg.recovery.stall_nudge,
             },
         }
     }
@@ -747,6 +812,8 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::DiffWait(_) => "diff.wait",
         ConfigKey::FinishAutosquash(_) => "finish.autosquash",
         ConfigKey::RecoveryBlindNudge(_) => "recovery.blind_nudge",
+        ConfigKey::RecoveryStallWarn(_) => "recovery.stall_warn",
+        ConfigKey::RecoveryStallNudge(_) => "recovery.stall_nudge",
     }
 }
 
@@ -759,7 +826,9 @@ pub(crate) fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         | ConfigKey::DiffEditorCommand(a)
         | ConfigKey::DiffWait(a)
         | ConfigKey::FinishAutosquash(a)
-        | ConfigKey::RecoveryBlindNudge(a) => a,
+        | ConfigKey::RecoveryBlindNudge(a)
+        | ConfigKey::RecoveryStallWarn(a)
+        | ConfigKey::RecoveryStallNudge(a) => a,
     }
 }
 
@@ -1674,6 +1743,8 @@ mod tests {
                 },
                 "recovery": {
                     "blind_nudge": null,
+                    "stall_warn": 2400,
+                    "stall_nudge": 300,
                 }
             })
         );
@@ -1764,6 +1835,45 @@ mod tests {
         assert!(
             !json_path_present(&p, &["finish", "autosquash"]),
             "missing key"
+        );
+    }
+
+    /// The stall keys default to 40m and 5m, and a repo's value replaces
+    /// the global one key by key, `off` included.
+    #[test]
+    fn recovery_stall_keys_layer_field_by_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let cfg = load_isolated(tmp.path()).recovery;
+        assert_eq!((cfg.stall_warn, cfg.stall_nudge), (Some(2400), Some(300)));
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"recovery":{"stall_warn":"30m","stall_nudge":"10m"}}"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"recovery":{"stall_nudge":"off"}}"#,
+        );
+        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        assert_eq!(
+            (cfg.recovery.stall_warn, cfg.recovery.stall_nudge),
+            (Some(1800), None)
+        );
+        assert_eq!(get_value(&cfg, "recovery.stall_warn"), "30m");
+        assert_eq!(get_value(&cfg, "recovery.stall_nudge"), "off");
+        let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path()));
+        let source = |key: &str| kvs.iter().find(|kv| kv.key == key).unwrap().source;
+        assert_eq!(source("recovery.stall_warn"), ValueSource::User);
+        assert_eq!(source("recovery.stall_nudge"), ValueSource::Repo);
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"recovery":{"stall_warn":"off"}}"#,
+        );
+        assert_eq!(
+            load_with_home(tmp.path(), Some(home.path()))
+                .recovery
+                .stall(),
+            None
         );
     }
 

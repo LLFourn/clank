@@ -944,6 +944,7 @@ mod tests {
                             role: "master".into(),
                             work: Vec::new(),
                             blind_nudge: None,
+                            stall: None,
                             attending: false,
                             asking: asking().is_some(),
                             projection: Default::default(),

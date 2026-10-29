@@ -144,7 +144,7 @@ fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
     let said = attend_name(&mut turns, "claude", "session-one", &g);
     assert!(said.contains("from your next turn-end"), "{said}");
     assert!(said.contains("after 10m"), "{said}");
-    let (shown, _) = turns.projection(&label("claude"), &g);
+    let shown = turns.projection(&label("claude"), &g).attended;
     assert!(shown.as_ref().is_some_and(|a| a.pending), "{shown:?}");
 
     let frame = turns
@@ -157,7 +157,7 @@ fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
         )
         .unwrap();
     assert_eq!(frame.verdict, WireVerdict::Park);
-    let (shown, _) = turns.projection(&label("claude"), &g);
+    let shown = turns.projection(&label("claude"), &g).attended;
     let shown = shown.expect("attending");
     assert!(shown.subagent && !shown.pending, "{shown:?}");
     assert_eq!(shown.task, "a25eee2eef81caf3e");
@@ -378,7 +378,7 @@ fn repeated_delivery_is_counted_by_delivery_and_escalates_with_its_duties() {
     let text = deliver(&mut turns, 5, true);
     assert!(text.contains("4 times unchanged"), "{text}");
     assert!(text.contains("`clank events ack messages@9`"), "{text}");
-    let (_, repeated) = turns.projection(&author, &g);
+    let repeated = turns.projection(&author, &g).repeated;
     assert_eq!(repeated, Some(4));
 }
 
@@ -402,7 +402,7 @@ fn a_count_below_the_threshold_is_not_shown() {
     turns
         .result(&author, 1, TurnResult::Delivered { presentation }, &g)
         .unwrap();
-    assert_eq!(turns.projection(&author, &g).1, None);
+    assert_eq!(turns.projection(&author, &g).repeated, None);
 }
 
 /// Only the connection that carried a presentation can answer for it.
@@ -533,7 +533,7 @@ fn a_silence_needs_no_route_and_a_lost_check_in_is_recorded() {
         "no pane was found".into(),
         &at_due,
     );
-    let (shown, _) = turns.projection(&author, &at_due);
+    let shown = turns.projection(&author, &at_due).attended;
     assert_eq!(
         shown.and_then(|a| a.check_in).as_deref(),
         Some("check-in undeliverable: no pane was found")

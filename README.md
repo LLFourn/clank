@@ -457,7 +457,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
 | `block` | Questions only the human can answer: an agent's `block ask`, the human's `block answer`, and `block clean` to tidy away delivered ones. The wake carrying an answer is its receipt; the agent acknowledges nothing |
-| `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge` |
+| `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge`, `recovery.stall_warn`, `recovery.stall_nudge` |
 | `export` | Dump the repo's roster config as JSON |
 
 Some commands are hidden from `clank --help` because clank runs them

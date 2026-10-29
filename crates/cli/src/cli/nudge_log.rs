@@ -26,6 +26,8 @@ pub(crate) enum Trigger {
     Idle { attempt: u32, of: u32 },
     /// `recovery.blind_nudge`: work owed and a record clank cannot read.
     Fallback { attempt: u32 },
+    /// `recovery.stall_warn`: work owed and a running turn gone silent.
+    Stall,
     /// A person's signed command (`clank user-command`), by its request id.
     UserCommand { id: String },
 }
@@ -44,6 +46,9 @@ pub(crate) enum Outcome {
     Reported,
     /// It may have reached the harness.
     Indeterminate { reason: String },
+    /// Not an attempt: the warning before a stall's nudge, `nudge_in`
+    /// seconds ahead or never.
+    Warned { silent: u64, nudge_in: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -66,6 +71,13 @@ impl Record {
             Outcome::Reported => "nudge reported by helper · wake unconfirmed".to_string(),
             Outcome::Refused { reason } => format!("nudge refused: {reason}"),
             Outcome::Indeterminate { reason } => format!("nudge indeterminate: {reason}"),
+            Outcome::Warned { silent, nudge_in } => {
+                let show = crate::age::duration;
+                return match nudge_in {
+                    Some(n) => format!("silent {} — nudging in {}", show(*silent), show(*n)),
+                    None => format!("silent {} — not nudging (stall_nudge off)", show(*silent)),
+                };
+            }
         };
         match &self.trigger {
             Trigger::Manual => format!("{what} · by hand"),
@@ -74,6 +86,7 @@ impl Record {
             }
             Trigger::Idle { attempt, of } => format!("{what} · idle {attempt}/{of}"),
             Trigger::Fallback { .. } => format!("{what} · blind, its record unreadable"),
+            Trigger::Stall => format!("{what} · its running turn went silent"),
             Trigger::UserCommand { id } => format!("{what} · user command {id}"),
         }
     }

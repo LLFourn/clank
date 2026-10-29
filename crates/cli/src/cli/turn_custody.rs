@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use clank_core::turn_policy::{
     AttendReply, AttendRequest, Attendance, CheckIn, CheckInRef, Effect, Event, Facts, Handoff,
     Liveness, Ms, Output, OwedItem, Persisted, PresentationId, Quiet, Request, ResultOutcome,
-    Selector, SessionState, ShellProof, SilentWhy, TaskKind, Verdict, Withheld,
+    Selector, SessionState, ShellProof, SilentWhy, TaskKind, Unwatched, Verdict, Withheld,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -268,6 +268,8 @@ pub(crate) struct CheckInDue {
 struct Custody {
     state: SessionState,
     carried: Option<Carried>,
+    /// The newest of its deliverers' connections: its park.
+    park: Option<u64>,
     stored: Option<Persisted>,
 }
 
@@ -316,6 +318,7 @@ impl Turns {
                 Custody {
                     state,
                     carried: None,
+                    park: None,
                     stored,
                 },
             );
@@ -324,6 +327,7 @@ impl Turns {
         if &custody.state.binding != bound {
             custody.state.rebind(bound.clone());
             custody.carried = None;
+            custody.park = None;
         }
         Some(custody)
     }
@@ -583,6 +587,65 @@ impl Turns {
         let _ = self.settle(author, g, Event::EmitFailed(id));
     }
 
+    /// Connection `conn` is one of `author`'s deliverers. The newest is its
+    /// park, and a new park means it is watched again.
+    pub(crate) fn watch(&mut self, author: &AgentLabel, conn: u64, g: impl FnOnce() -> Gathered) {
+        if self
+            .agents
+            .get(author)
+            .is_some_and(|c| c.park.is_some_and(|p| p >= conn))
+        {
+            return;
+        }
+        let Some(custody) = self.custody(author, &g()) else {
+            return;
+        };
+        if custody.park.is_some_and(|p| p >= conn) {
+            return;
+        }
+        custody.park = Some(conn);
+        custody.state.unwatched = None;
+        self.persist(author);
+    }
+
+    /// Deliverer `conn` ended unanswered. If it was `author`'s park,
+    /// nothing watches the agent: its record, read to `cursor` (inode,
+    /// offset), is the evidence recovery judges that by.
+    pub(crate) fn lost(
+        &mut self,
+        author: &AgentLabel,
+        conn: u64,
+        cursor: impl FnOnce() -> Option<(u64, u64)>,
+        g: &Gathered,
+    ) {
+        let Some(custody) = self.custody(author, g) else {
+            return;
+        };
+        if custody.park != Some(conn) {
+            return;
+        }
+        custody.state.unwatched = cursor().map(|(record, read)| Unwatched {
+            since: g.now,
+            record,
+            read,
+        });
+        self.persist(author);
+    }
+
+    /// Recovery saw `author`'s record move off `unwatched`'s cursor: that
+    /// loss is over, for good. A newer one is left alone.
+    pub(crate) fn watched_again(&mut self, author: &AgentLabel, unwatched: Unwatched) {
+        let Some(custody) = self
+            .agents
+            .get_mut(author)
+            .filter(|c| c.state.unwatched == Some(unwatched))
+        else {
+            return;
+        };
+        custody.state.unwatched = None;
+        self.persist(author);
+    }
+
     fn settle(
         &mut self,
         author: &AgentLabel,
@@ -753,23 +816,31 @@ impl Turns {
             .recovery_quiet(&facts(g, None, &owed, &Process))
     }
 
-    /// What status and the TUI show of `author`: its attendance and,
-    /// once it escalates, its repeat count.
+    /// What recovery, status and the TUI take of `author`: its attendance,
+    /// its question, once it escalates its repeat count, and a lost park.
     pub(crate) fn projection(
         &mut self,
         author: &AgentLabel,
         g: &Gathered,
-    ) -> (Option<super::agent_state::Attended>, Option<u32>) {
+    ) -> super::recovery::Projection {
+        let asking = g.asking().map(str::to_string);
         let Some(custody) = self.custody(author, g) else {
-            return (None, None);
+            return super::recovery::Projection {
+                asking,
+                ..Default::default()
+            };
         };
-        let repeated = custody
-            .state
-            .repeat
-            .as_ref()
-            .map(|r| r.count)
-            .filter(|n| *n >= clank_core::turn_policy::ESCALATE_AT);
-        (attended(&custody.state.attendance), repeated)
+        super::recovery::Projection {
+            attended: attended(&custody.state.attendance),
+            asking,
+            repeated: custody
+                .state
+                .repeat
+                .as_ref()
+                .map(|r| r.count)
+                .filter(|n| *n >= clank_core::turn_policy::ESCALATE_AT),
+            unwatched: custody.state.unwatched,
+        }
     }
 
     #[cfg(test)]

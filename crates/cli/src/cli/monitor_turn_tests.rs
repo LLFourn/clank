@@ -324,6 +324,7 @@ fn recovering(repo: &std::path::Path, author: &AgentLabel) -> crate::cli::recove
             obligated: false,
             role: "master".into(),
             blind_nudge: None,
+            stall: None,
             attending: false,
             asking: false,
             projection: Default::default(),
@@ -1426,7 +1427,7 @@ async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
                 assert!(typed.is_empty());
                 let why = done.outcome.expect_err("undeliverable");
                 turns.check_in_failed(&author, done.check_in, why, &at_due);
-                let (shown, _) = turns.projection(&author, &at_due);
+                let shown = turns.projection(&author, &at_due).attended;
                 assert!(
                     shown
                         .and_then(|a| a.check_in)
@@ -1644,4 +1645,181 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
     );
     assert!(clients.is_empty(), "a delivery retires the parked report");
     assert_eq!(turns.next_deadline(), None, "not due again");
+}
+
+/// `author`'s Claude record holds a prompt and an answer with no end
+/// marker: the record alone reads the turn as running.
+fn answered_without_an_end(repo: &std::path::Path, author: &AgentLabel) {
+    let record = repo.join("record.jsonl");
+    std::fs::write(
+        &record,
+        concat!(
+            r#"{"type":"user","promptId":"P","message":{"role":"user","content":"review it"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FINISHED"}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    crate::agent_store::update_agent_config(repo, author, |config| {
+        config.session.as_mut().unwrap().transcript = Some(record.display().to_string());
+    })
+    .unwrap();
+    crate::cli::recovery::tests::enable(
+        clank_core::Tool::Claude,
+        Some(crate::cli::recovery::Transport::Typed),
+    );
+}
+
+/// The incident through the monitor's own admission, reader and seams: a
+/// Stop parks, the round registers it, its hook dies having been handed
+/// nothing, and the close the reader hears leaves the agent unwatched,
+/// nudged once work is owed and the idle settle has passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_park_whose_hook_dies_leaves_its_agent_unwatched_and_nudged() {
+    let (repo, author, timer) = timer_repo();
+    answered_without_an_end(repo.path(), &author);
+    let state = folded(repo.path()).await.unwrap();
+    let mut recovery = recovering(repo.path(), &author);
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let hook = Hook::carrying(repo.path(), &author, &stop_report(), ours);
+    let client = admitted(theirs, repo.path(), &heard_tx).await;
+    let conn = client.conn;
+    let mut clients = vec![client];
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let _leaving = serve(repo.path(), &mut clients, &state, &mut turns);
+    let (parked, hook) = tokio::task::spawn_blocking(move || {
+        let mut hook = hook;
+        (hook.frame(), hook)
+    })
+    .await
+    .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park);
+    let round = |clients: &mut Vec<Client>,
+                 turns: &mut Turns,
+                 recovery: &mut crate::cli::recovery::Driver| {
+        tend(
+            repo.path(),
+            clients,
+            Some(&state),
+            &[],
+            &Default::default(),
+            turns,
+            recovery,
+        )
+    };
+    let _ = round(&mut clients, &mut turns, &mut recovery);
+
+    drop(hook.stdin);
+    hook.child.join().unwrap();
+    let (from, said) = next_heard(&mut heard).await;
+    assert_eq!((from, matches!(said, Heard::Closed)), (conn, true));
+    let _ = ended(
+        from,
+        repo.path(),
+        &mut clients,
+        Some(&state),
+        &[],
+        &Default::default(),
+        &mut turns,
+        &mut recovery,
+    );
+    assert!(turns.state(&author).unwrap().unwatched.is_some());
+
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let now = crate::cli::recovery::unix_now();
+    let facts = recovery_facts(
+        repo.path(),
+        &state,
+        &clients,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+        &mut turns,
+    );
+    recovery.reconcile(facts, now);
+    let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
+    assert_eq!(
+        crate::cli::agent_state::load(&dir).unwrap().activity,
+        crate::cli::agent_state::Activity::Unwatched
+    );
+    let nudges = |recovery: &mut crate::cli::recovery::Driver, at| {
+        recovery
+            .due(at, |_, _| crate::cli::recovery::Gate::Go)
+            .into_iter()
+            .filter(|a| matches!(a, crate::cli::recovery::Act::Dispatch { .. }))
+            .count()
+    };
+    assert_eq!(nudges(&mut recovery, now + 179), 0);
+    assert_eq!(nudges(&mut recovery, now + 180), 1);
+}
+
+/// A park the monitor answered with work its hook delivered records no
+/// loss when that hook's connection then closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_park_that_delivered_records_no_loss() {
+    let (repo, author, timer) = timer_repo();
+    answered_without_an_end(repo.path(), &author);
+    let state = folded(repo.path()).await.unwrap();
+    let mut recovery = recovering(repo.path(), &author);
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let hook = Hook::carrying(repo.path(), &author, &stop_report(), ours);
+    let client = admitted(theirs, repo.path(), &heard_tx).await;
+    let conn = client.conn;
+    let mut clients = vec![client];
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let _leaving = serve(repo.path(), &mut clients, &state, &mut turns);
+    let (parked, hook) = tokio::task::spawn_blocking(move || {
+        let mut hook = hook;
+        (hook.frame(), hook)
+    })
+    .await
+    .unwrap();
+    assert_eq!(parked.verdict, WireVerdict::Park);
+    let _ = tend(
+        repo.path(),
+        &mut clients,
+        Some(&state),
+        &[],
+        &Default::default(),
+        &mut turns,
+        &mut recovery,
+    );
+
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let _leaving = serve(repo.path(), &mut clients, &state, &mut turns);
+    let (woke, mut hook) = tokio::task::spawn_blocking(move || {
+        let mut hook = hook;
+        (hook.frame(), hook)
+    })
+    .await
+    .unwrap();
+    let presentation = woke.presentation().expect("presented").clone();
+    hook.answer(&TurnResult::Delivered { presentation });
+    let (from, Heard::Line(line)) = next_heard(&mut heard).await else {
+        panic!("the result");
+    };
+    let g = gathered(repo.path(), &author, &state);
+    turns
+        .result(&author, from, serde_json::from_str(&line).unwrap(), &g)
+        .unwrap();
+    drop(hook.stdin);
+    hook.child.join().unwrap();
+    let (from, said) = next_heard(&mut heard).await;
+    assert_eq!((from, matches!(said, Heard::Closed)), (conn, true));
+    let _ = ended(
+        from,
+        repo.path(),
+        &mut clients,
+        Some(&state),
+        &[],
+        &Default::default(),
+        &mut turns,
+        &mut recovery,
+    );
+    assert_eq!(turns.state(&author).unwrap().unwatched, None);
 }

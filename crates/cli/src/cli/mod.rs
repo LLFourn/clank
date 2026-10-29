@@ -172,6 +172,20 @@ pub enum ConfigKey {
     /// `off`, default: off.
     #[command(name = "recovery.blind_nudge", alias = "recovery_blind_nudge")]
     RecoveryBlindNudge(ConfigKeyArgs),
+    /// Warn when a running turn goes silent
+    ///
+    /// For an agent that owes work and whose running turn's record has
+    /// been silent this long. duration (30s, 40m, 1h) or `off`, default:
+    /// 40m.
+    #[command(name = "recovery.stall_warn", alias = "recovery_stall_warn")]
+    RecoveryStallWarn(ConfigKeyArgs),
+    /// Nudge a stalled agent after its warning
+    ///
+    /// Once per quiet period, this long after the warning; the nudge may
+    /// stop a tool that is still running. duration (30s, 40m, 1h) or
+    /// `off`, default: 5m.
+    #[command(name = "recovery.stall_nudge", alias = "recovery_stall_nudge")]
+    RecoveryStallNudge(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]

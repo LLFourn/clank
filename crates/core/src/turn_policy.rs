@@ -626,6 +626,17 @@ pub struct Persisted {
     /// it owes is quiet.
     #[serde(default)]
     pub received: Vec<String>,
+    #[serde(default)]
+    pub unwatched: Option<Unwatched>,
+}
+
+/// The current park ended without delivering, at `since`, when the agent's
+/// record (by inode) had been read to `read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unwatched {
+    pub since: Ms,
+    pub record: u64,
+    pub read: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,6 +664,7 @@ pub struct SessionState {
     /// `Delivered` with, sorted: the only work a qualifying attendance may
     /// quiet. Never wider than what is still owed.
     pub received: Vec<String>,
+    pub unwatched: Option<Unwatched>,
 }
 
 impl SessionState {
@@ -668,6 +680,7 @@ impl SessionState {
             resolved: None,
             next_seq: 0,
             received: Vec::new(),
+            unwatched: None,
         }
     }
 
@@ -681,6 +694,7 @@ impl SessionState {
             resolved: self.resolved.clone(),
             next_seq: self.next_seq,
             received: self.received.clone(),
+            unwatched: self.unwatched,
         }
     }
 
@@ -706,6 +720,7 @@ impl SessionState {
             resolved,
             next_seq: p.next_seq,
             received,
+            unwatched: p.unwatched,
         }
     }
 
