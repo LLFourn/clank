@@ -494,7 +494,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `finish` | Finalize a FINISHED plan (`-m` required; autosquash-aware) |
 | `unfinish` | Move a finalized plan back to active |
 | `rereview` | Make every reviewer review a plan's latest commit again |
-| `agent` | Roster: `add` / `make-master` / `remove` / `list` / `set-review` / `swap` / `launch` / `start` |
+| `agent` | Roster: `add` / `make-master` / `remove` / `list` / `set-review` / `swap` / `config` / `start` |
 | `team` | Your saved teams (`save` / `list` / `show` / `remove`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove`; `recover <agent> --child <id>` / `--forget` settles an OpenCode fork whose reply was lost |
 | `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
@@ -526,7 +526,7 @@ itself or they exist for one-off upgrades. They still work:
 
 Older spellings still work, hidden: `block create` is `block ask`, `unblock`
 is `block answer`, `agent add --global --tool` and `agent remove --global`
-are `team agent add` and `team agent remove`, `open zellij` is `open`, `agent promote` is `agent make-master`, `team
+are `team agent add` and `team agent remove`, `open zellij` is `open`, `agent promote` is `agent make-master`, `agent launch` is `agent config`, `team
 delete` is `team remove`, `attending` is `attend`, `--dry` is `--dry-run`,
 `html open --print-path` is `--print`, `shelve` / `unshelve` / `shelve clean`
 are `stash push` / `stash pop` / `stash drop`, `agent add --launch-cmd` /
@@ -834,7 +834,7 @@ clank agent add web --tool codex --review standby \
   --env CODEX_HOME=$HOME/.codex-web -- --no-daemon
 ```
 
-`clank agent launch <name>` shows an agent's launch profile and the command
+`clank agent config <name>` shows an agent's launch profile and the command
 `clank agent start` would run, even while the agent is running. Given `--cmd`,
 `--env` or `-- <args>`, what you write is the agent's whole new launch, with
 nothing kept from before; `--clear` goes back to the bare tool. The agent keeps

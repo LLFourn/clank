@@ -29,7 +29,7 @@ use clank_core::vocab::{AutoMode, Tool};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    AgentAddArgs, AgentArgs, AgentCmd, AgentLaunchArgs, AgentListArgs, AgentPromoteArgs,
+    AgentAddArgs, AgentArgs, AgentCmd, AgentConfigArgs, AgentListArgs, AgentPromoteArgs,
     AgentRemoveArgs, AgentSetReviewArgs, AgentStartArgs, AgentSwapArgs, resolve_repo,
 };
 use crate::shell_quote::shell_quote;
@@ -43,7 +43,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::Remove(a) => remove(a),
         AgentCmd::SetReview(a) => set_review(a),
         AgentCmd::Swap(a) => swap(a),
-        AgentCmd::Launch(a) => launch(a).await,
+        AgentCmd::Config(a) => launch(a).await,
     }
 }
 
@@ -2454,7 +2454,7 @@ fn launch_from_add(args: &AgentAddArgs) -> anyhow::Result<Option<LaunchConfig>> 
     ))
 }
 
-/// What `clank agent launch` was asked for.
+/// What `clank agent config` was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchRequest {
     Show,
@@ -2462,13 +2462,13 @@ enum LaunchRequest {
     Set(Option<LaunchConfig>),
 }
 
-/// `clank agent launch <name> [...]`: show the profile and the composed
+/// `clank agent config <name> [...]`: show the profile and the composed
 /// command, or change the profile in place first.
-async fn launch(args: AgentLaunchArgs) -> anyhow::Result<()> {
+async fn launch(args: AgentConfigArgs) -> anyhow::Result<()> {
     launch_with(args, session_holder::find).await
 }
 
-async fn launch_with(args: AgentLaunchArgs, find_holder: FindHolder) -> anyhow::Result<()> {
+async fn launch_with(args: AgentConfigArgs, find_holder: FindHolder) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -2499,9 +2499,9 @@ async fn launch_with(args: AgentLaunchArgs, find_holder: FindHolder) -> anyhow::
     .map(|_| ())
 }
 
-/// The change `agent launch` was asked for, or `None` to only show.
+/// The change `agent config` was asked for, or `None` to only show.
 /// What was written is the whole launch: nothing is kept from before.
-fn launch_request(args: &AgentLaunchArgs) -> anyhow::Result<LaunchRequest> {
+fn launch_request(args: &AgentConfigArgs) -> anyhow::Result<LaunchRequest> {
     if args.clear {
         return Ok(LaunchRequest::Set(None));
     }
@@ -2515,7 +2515,7 @@ fn launch_request(args: &AgentLaunchArgs) -> anyhow::Result<LaunchRequest> {
     )))
 }
 
-/// A launch profile as `agent launch` shows it.
+/// A launch profile as `agent config` shows it.
 fn describe_launch(tool: Tool, launch: Option<&LaunchConfig>) -> String {
     let Some(launch) = launch else {
         return format!("launch: the bare `{}`", tool.as_str());
@@ -3722,7 +3722,7 @@ mod tests {
         assert_eq!(parsed.agents[&claude].role, RosterRole::Master);
     }
 
-    // ── agent launch, and add's `--` ────────────────────────
+    // ── agent config, and add's `--` ────────────────────────
 
     fn parse(argv: &[&str]) -> Result<crate::cli::AgentCmd, clap::Error> {
         use clap::Parser as _;
@@ -3742,11 +3742,11 @@ mod tests {
         }
     }
 
-    fn launch_args(argv: &[&str]) -> AgentLaunchArgs {
-        let mut full = vec!["clank", "agent", "launch"];
+    fn launch_args(argv: &[&str]) -> AgentConfigArgs {
+        let mut full = vec!["clank", "agent", "config"];
         full.extend_from_slice(argv);
         match parse(&full).unwrap() {
-            crate::cli::AgentCmd::Launch(a) => a,
+            crate::cli::AgentCmd::Config(a) => a,
             other => panic!("{other:?}"),
         }
     }
@@ -3882,8 +3882,8 @@ mod tests {
         argv.extend(AWKWARD);
         assert_eq!(launch_args(&argv).tool_args, AWKWARD);
         for bad in [
-            &["clank", "agent", "launch", "web", "--clear", "--", "x"][..],
-            &["clank", "agent", "launch", "web", "--clear", "--env", "A=1"],
+            &["clank", "agent", "config", "web", "--clear", "--", "x"][..],
+            &["clank", "agent", "config", "web", "--clear", "--env", "A=1"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

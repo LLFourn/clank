@@ -37,7 +37,7 @@ pub(crate) fn validate_profile(launch: Option<&LaunchConfig>) -> anyhow::Result<
             !["--server", "--standalone"].contains(&flag),
             "an OpenCode fork cannot be prepared under a launch profile with `{flag}`: \
              `opencode api` would fork in a different session store than the one the \
-             pane opens. Change the profile with `clank agent launch`"
+             pane opens. Change the profile with `clank agent config`"
         );
     }
     Ok(())

@@ -1485,7 +1485,7 @@ mod tests {
     fn diff_editor_subfields_repo_args_replaces_user_args() {
         // Field-by-field doesn't deep-merge lists/maps — when
         // repo-scope DOES set args, it REPLACES the whole list.
-        // (Same as how `clank agent launch -- <args>` replaces them.)
+        // (Same as how `clank agent config -- <args>` replaces them.)
         // Codex's OQ7 reasoning: each field is independently
         // overridden when present in the layer.
         let tmp = tempfile::tempdir().unwrap();

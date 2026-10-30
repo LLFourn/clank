@@ -1293,8 +1293,10 @@ Examples:
     /// would run. Given `--cmd`, `--env` or `-- <args>`, that is the
     /// agent's whole new launch (nothing is kept from before); `--clear`
     /// is the bare tool. The agent keeps its role, session and pane, and
-    /// the change applies from its next start.
-    Launch(AgentLaunchArgs),
+    /// the change applies from its next start. (`agent launch` is the
+    /// old spelling.)
+    #[command(alias = "launch")]
+    Config(AgentConfigArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1403,7 +1405,7 @@ pub struct AgentAddArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct AgentLaunchArgs {
+pub struct AgentConfigArgs {
     /// Agent label.
     #[arg(value_name = "AGENT")]
     pub name: String,

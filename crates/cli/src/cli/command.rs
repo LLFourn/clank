@@ -1443,6 +1443,10 @@ mod tests {
         for (new, old) in [
             ("clank agent make-master codex", "clank agent promote codex"),
             (
+                "clank agent config web --clear",
+                "clank agent launch web --clear",
+            ),
+            (
                 "clank team remove pair --force",
                 "clank team delete pair --force",
             ),
@@ -1490,9 +1494,21 @@ mod tests {
         };
         let agent = help(&["agent"]);
         assert!(
-            listed(&agent, "make-master") && !listed(&agent, "promote"),
+            listed(&agent, "make-master")
+                && !listed(&agent, "promote")
+                && listed(&agent, "config")
+                && !listed(&agent, "launch"),
             "{agent}"
         );
+        let cli = <Cli as clap::CommandFactory>::command();
+        for sub in cli.find_subcommand("agent").unwrap().get_subcommands() {
+            assert_eq!(
+                sub.get_visible_aliases().count(),
+                0,
+                "`agent {}` advertises an old spelling",
+                sub.get_name()
+            );
+        }
         let team = help(&["team"]);
         assert!(
             listed(&team, "remove") && !listed(&team, "delete"),

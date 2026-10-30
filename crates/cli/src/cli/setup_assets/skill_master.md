@@ -88,7 +88,7 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   `clank agent remove <name>`, `clank agent list`
 - an agent's launch: `clank agent add <name> --tool codex [--env K=V] [--cmd X]
   -- <the tool's own args>`, everything after `--` exactly as typed to the tool.
-  `clank agent launch <name>` shows it and the command `agent start` runs;
+  `clank agent config <name>` shows it and the command `agent start` runs;
   given `--env`/`--cmd`/`-- <args>`, that is the whole new launch (nothing is
   kept), and `--clear` is the bare tool.
   Put MCP servers and feature switches in the tool's own config, or a per-agent

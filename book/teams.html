@@ -28,7 +28,7 @@
 <p>An <strong>agent description</strong> is a tool and how to launch it, with no role. Save one, then add it to any repo’s roster by name:</p>
 <pre><code>clank team agent add opus --tool claude -- --model opus
 clank agent add opus --review final</code></pre>
-<p>Everything after <code>--</code> is passed to the tool exactly as you would type it. Keep it to the few flags that pick a configuration. MCP servers and feature switches belong in the tool’s own config, or in a per-agent home set with <code>--env</code>. <code>clank agent launch opus</code> shows the launch an agent has and the command <code>clank agent start</code> would run.</p>
+<p>Everything after <code>--</code> is passed to the tool exactly as you would type it. Keep it to the few flags that pick a configuration. MCP servers and feature switches belong in the tool’s own config, or in a per-agent home set with <code>--env</code>. <code>clank agent config opus</code> shows the launch an agent has and the command <code>clank agent start</code> would run.</p>
 <p>A <strong>team</strong> is a saved roster. Save the one this repo has, and seed another repo from it:</p>
 <pre><code>clank team save review-pair
 clank init --team review-pair</code></pre>
