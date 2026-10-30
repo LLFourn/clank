@@ -77,11 +77,52 @@ struct Cell {
 /// cannot be bounded that way, or with nothing drawn under it, is
 /// unreadable.
 pub(crate) fn composer(tool: Tool, screen: &str) -> Composer {
+    read(tool, screen).0
+}
+
+/// A readable input as drawn: its rows of typed text and its width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Shown {
+    /// Empty for an empty input.
+    pub(crate) rows: Vec<Row>,
+    /// The columns of the rule or band the input is drawn under.
+    pub(crate) width: usize,
+}
+
+/// One row of a draft: what follows the prompt glyph and its space, or the
+/// continuation indent, with the padding after it dropped. Whitespace
+/// inside it is the draft's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub(crate) text: String,
+    /// The column after its last character.
+    pub(crate) end: usize,
+}
+
+/// What `tool`'s input on `screen` holds, row by row, or `None` when it is
+/// not an empty input or a draft whose rows can be read exactly.
+pub(crate) fn typed(tool: Tool, screen: &str) -> Option<Shown> {
+    read(tool, screen).1
+}
+
+/// Whether `screen` shows the hint Claude draws while a turn runs. Only
+/// Claude's: no other harness is sent a key that depends on it.
+pub(crate) fn claude_turn_running(screen: &str) -> bool {
+    let text: String = screen
+        .lines()
+        .filter_map(cells)
+        .flat_map(|l| l.into_iter().map(|c| c.c))
+        .collect();
+    text.to_lowercase().contains("esc to interrupt")
+}
+
+fn read(tool: Tool, screen: &str) -> (Composer, Option<Shown>) {
+    let unreadable = (Composer::Unreadable, None);
     let Some(glyph) = prompt(tool) else {
-        return Composer::Unreadable;
+        return unreadable;
     };
     let Some(lines) = screen.lines().map(cells).collect::<Option<Vec<_>>>() else {
-        return Composer::Unreadable;
+        return unreadable;
     };
     let text = |l: &[Cell]| l.iter().map(|c| c.c).collect::<String>();
     // Claude draws `!` where its prompt glyph was while in bash mode, so a
@@ -92,7 +133,7 @@ pub(crate) fn composer(tool: Tool, screen: &str) -> Composer {
         t.starts_with(glyph) || (tool == Tool::Claude && t.starts_with(SHELL))
     };
     let Some(start) = lines.iter().rposition(|l| opens(l)) else {
-        return Composer::Unreadable;
+        return unreadable;
     };
     let first = &lines[start];
     let at = first
@@ -119,34 +160,86 @@ pub(crate) fn composer(tool: Tool, screen: &str) -> Composer {
     // Without what is drawn above and below it, a prompt is history, or
     // the input is covered or cut off.
     let Some(spans) = spans.filter(|_| above) else {
-        return Composer::Unreadable;
+        return unreadable;
     };
     if shell {
-        return Composer::Shell;
+        return (Composer::Shell, None);
     }
     let rest = &lines[start + 1..start + 1 + spans];
+    let ceiling = &lines[start - 1];
+    let width = match tool {
+        Tool::Claude => ceiling
+            .iter()
+            .rposition(|c| !c.c.is_whitespace())
+            .map_or(0, |i| i + 1),
+        _ => ceiling.len(),
+    };
     let typed: Vec<&Cell> = first[at + 1..]
         .iter()
         .chain(rest.iter().flatten())
         .filter(|c| !c.c.is_whitespace())
         .collect();
+    let empty = Shown {
+        rows: Vec::new(),
+        width,
+    };
     if typed.is_empty() {
-        return Composer::Empty;
+        return (Composer::Empty, Some(empty));
     }
     if typed.iter().any(|c| !c.dim) {
         // Codex runs a line opening with `!` as a local shell command, so
         // text appended to such a draft would run with it.
         if tool == Tool::Codex && typed.first().is_some_and(|c| c.c == SHELL) {
-            return Composer::Shell;
+            return (Composer::Shell, None);
         }
-        return Composer::Draft;
+        return (Composer::Draft, rows(first, at, rest, width));
     }
     let continued = rest.iter().any(|l| !text(l).trim().is_empty());
     if !continued && placeholder(tool, text(&first[at + 1..]).trim()) {
-        Composer::Empty
+        (Composer::Empty, Some(empty))
     } else {
-        Composer::Unreadable
+        unreadable
     }
+}
+
+/// A draft's rows, the prompt glyph at column `at` of `first`. `None` when
+/// a continuation row draws anything left of the text's column, or dim
+/// text before typed text: neither can be placed exactly.
+fn rows(first: &[Cell], at: usize, rest: &[Vec<Cell>], width: usize) -> Option<Shown> {
+    let column = at + 2;
+    let lead = &first[at + 1..];
+    let skip = usize::from(lead.first().is_some_and(|c| c.c.is_whitespace()));
+    let mut rows = vec![row(&lead[skip..], at + 1 + skip)?];
+    for line in rest {
+        let indent = &line[..column.min(line.len())];
+        if indent.iter().any(|c| !c.c.is_whitespace()) {
+            return None;
+        }
+        rows.push(row(&line[indent.len()..], indent.len())?);
+    }
+    while rows.last().is_some_and(|r| r.text.is_empty()) {
+        rows.pop();
+    }
+    Some(Shown { rows, width })
+}
+
+/// The typed text of `cells`, drawn from column `from`: up to its last
+/// typed character, the harness's dim suggestion after it dropped.
+fn row(cells: &[Cell], from: usize) -> Option<Row> {
+    let Some(last) = cells.iter().rposition(|c| !c.dim && !c.c.is_whitespace()) else {
+        return Some(Row {
+            text: String::new(),
+            end: from,
+        });
+    };
+    let kept = &cells[..=last];
+    if kept.iter().any(|c| c.dim) {
+        return None;
+    }
+    Some(Row {
+        text: kept.iter().map(|c| c.c).collect(),
+        end: from + last + 1,
+    })
 }
 
 /// `line`'s characters with their dimness and background, or `None` when
@@ -227,10 +320,10 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// Codex's input on its band, a blank band row above and below it,
-    /// under some history, and its footer off the band.
+    /// Codex's input on its 40-column band, a blank band row above and
+    /// below it, under some history, and its footer off the band.
     pub(crate) fn codex(input: &[&str]) -> String {
-        let banded = |l: &str| format!("{BAND}{l}{BAND}   \u{1b}[49m");
+        let banded = |l: &str| format!("{BAND}{l:<40}\u{1b}[49m");
         let rows: Vec<String> = std::iter::once("")
             .chain(input.iter().copied())
             .chain(std::iter::once(""))
@@ -294,6 +387,81 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    /// A draft's rows are what follows the glyph or the continuation
+    /// indent, whitespace inside them kept, the padding and the harness's
+    /// dim suggestion after them dropped; an empty input has none; a row
+    /// drawn left of the text's column cannot be placed.
+    #[test]
+    fn a_drafts_rows_are_what_was_typed() {
+        let rows = |shown: Option<Shown>| {
+            shown.map(|s| {
+                s.rows
+                    .into_iter()
+                    .map(|r| (r.text, r.end))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let text = |s: &str| s.to_string();
+        assert_eq!(
+            rows(typed(
+                Tool::Claude,
+                &claude(&["❯ a long line  that", "  wrapped onto a second"])
+            )),
+            Some(vec![
+                (text("a long line  that"), 19),
+                (text("wrapped onto a second"), 23)
+            ])
+        );
+        assert_eq!(
+            rows(typed(
+                Tool::Claude,
+                &claude(&[&format!("❯ fix{DIM} the lint{RESET}")])
+            )),
+            Some(vec![(text("fix"), 5)])
+        );
+        assert_eq!(
+            rows(typed(
+                Tool::Codex,
+                &codex(&["› hi there", "", "    indented"])
+            )),
+            Some(vec![
+                (text("hi there"), 10),
+                (text(""), 2),
+                (text("  indented"), 12)
+            ])
+        );
+        assert_eq!(
+            typed(Tool::Claude, &claude(&["❯ "])).map(|s| s.rows),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            typed(Tool::Claude, &claude(&["❯ "])).map(|s| s.width),
+            Some(32)
+        );
+        assert_eq!(
+            typed(Tool::Codex, &codex(&["› "])).map(|s| s.width),
+            Some(40)
+        );
+        assert_eq!(typed(Tool::Claude, &claude(&["! ls"])), None);
+        assert_eq!(typed(Tool::Codex, "› \n never ends"), None);
+        assert_eq!(
+            typed(Tool::Claude, &claude(&["❯ draft", " x outside the text"])),
+            None
+        );
+    }
+
+    /// Claude's interrupt hint, wherever it is drawn and however styled,
+    /// says a turn runs; an idle screen has none.
+    #[test]
+    fn claudes_interrupt_hint_is_a_running_turn() {
+        let running = format!(
+            "✻ Thinking… (3s · {DIM}esc to interrupt{RESET})\n{}",
+            claude(&["❯ "])
+        );
+        assert!(claude_turn_running(&running));
+        assert!(!claude_turn_running(&claude(&["❯ "])));
     }
 
     /// Dim text is a placeholder only when it is a known one: anything

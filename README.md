@@ -546,11 +546,15 @@ Three levels, for three situations:
 - `clank nudge` is the recovery route for when the inbox cannot reach the
   agent at all: a wedged hook, a stale binding, a wake that never fires. It
   interrupts the agent's pane and types the message into its terminal,
-  reading no inbox and no binding. It is deliberately blunt: it does not
-  read the pane first, works for every tool, and submits whatever is
-  already in the input along with your message. Nothing waits to be
-  acknowledged, but each attempt and its outcome is kept in the agent's
-  nudge history.
+  reading no inbox and finding the pane by its name alone. Into Claude and
+  Codex it types the way every automatic writer does: it leaves alone a
+  draft that is not its own text, looks before pressing Enter, and calls the
+  message delivered only when the agent's own transcript records it (the
+  binding is read only to find that transcript). Grok and OpenCode, whose
+  input cannot be read, get the interrupt key, the message and Enter
+  unread. Nothing waits to be acknowledged, but each attempt and its
+  outcome (`submitted`, submitted with its start lost, refused, or
+  indeterminate) is kept in the agent's nudge history.
 
 ### User commands
 
@@ -697,7 +701,21 @@ dump reads the input as an ordinary prompt (Claude, Codex). Grok's and
 OpenCode's input cannot be read, so their panes are never typed into.
 Otherwise it is refused and an event wake stays pending. Codex's
 app-server and OpenCode's plugin take the same admitted text. `clank
-nudge` neutralises the same characters but skips the screen check.
+nudge` admits the same way into Claude and Codex, and types into Grok and
+OpenCode unread.
+
+**A prompt is typed, seen, then sent.** `clank nudge`, an interrupting
+event and recovery's typed sends type into Claude or Codex one way, under
+the pane's lock and within one deadline. The only text in the input clank
+acts on is its own: the message, whole or with its start lost. Anything
+else is refused before any key. Typed text that shows with its first
+characters missing is cleared with Ctrl-C and typed once more, but only
+while no turn runs. The message counts as delivered only when the agent's
+own record gains it after the attempt began: a Claude user turn or queued
+prompt, or a Codex user message, with the whole text. If Claude's input
+still shows the whole message a second after Enter, it gets one more Enter;
+Codex gets one submit key only. Anything less certain is indeterminate and
+never replayed.
 
 **Evidence a human records.** User commands are gated on an observation
 made in a throwaway pane against the installed harness, and stay refused

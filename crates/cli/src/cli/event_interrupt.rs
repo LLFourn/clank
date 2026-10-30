@@ -223,7 +223,7 @@ pub(crate) async fn run(repo: PathBuf, label: clank_core::ids::AgentLabel) {
         };
         let hint = super::pane_input::Admitted::new(&text);
         match super::pane_input::wake_for_events_async(target.input(), &hint).await {
-            Ok(()) => InterruptOutcome::Submitted,
+            Ok(_) => InterruptOutcome::Submitted,
             Err(super::pane_input::Unconfirmed::Refused(why)) => {
                 eprintln!("interrupt `{label}`: unavailable ({why}); normal delivery remains pending");
                 InterruptOutcome::Unavailable

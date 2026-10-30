@@ -4559,12 +4559,12 @@ pub(crate) trait Typist: Send + Sync + 'static {
         &self,
         target: crate::cli::pane_target::Target,
         text: String,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>> + Send,
-        >,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Submitted> + Send>>;
 }
+
+/// What typing a prompt into an agent's pane came to.
+pub(crate) type Submitted =
+    Result<crate::cli::pane_input::Delivered, crate::cli::open_zellij::PaneWrite>;
 
 /// The agent's zellij pane.
 struct Panes;
@@ -4589,11 +4589,7 @@ impl Typist for Panes {
         &self,
         target: crate::cli::pane_target::Target,
         text: String,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>> + Send,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Submitted> + Send>> {
         Box::pin(async move {
             let text = crate::cli::pane_input::Admitted::new(&text);
             crate::cli::pane_input::submit_async(target.input(), &text).await
@@ -4621,7 +4617,8 @@ async fn typed_send(
         return Answer::Unavailable;
     }
     match typist.submit(target, text).await {
-        Ok(()) => Answer::Submitted { started: None },
+        Ok(crate::cli::pane_input::Delivered::Altered) => Answer::Altered,
+        Ok(_) => Answer::Submitted { started: None },
         Err(crate::cli::open_zellij::PaneWrite::NotStarted(_)) => Answer::Unavailable,
         Err(crate::cli::open_zellij::PaneWrite::Unknown(_)) => Answer::Indeterminate,
     }
@@ -4652,6 +4649,7 @@ async fn deliver_check_in(
             Ok(Ok(())) => typist
                 .submit(target, due.text.clone())
                 .await
+                .map(|_| ())
                 .map_err(|e| match e {
                     crate::cli::open_zellij::PaneWrite::NotStarted(why) => {
                         format!("typing it did not start: {why}")
@@ -8011,6 +8009,8 @@ mod recovery_tests {
     struct Listed {
         scan: crate::cli::open_zellij::SessionScan,
         screen: Option<String>,
+        /// What typing comes to.
+        result: fn() -> Submitted,
         typed: std::sync::Mutex<Vec<(crate::cli::pane_target::Target, String)>>,
     }
 
@@ -8031,14 +8031,9 @@ mod recovery_tests {
             &self,
             target: crate::cli::pane_target::Target,
             text: String,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>>
-                    + Send,
-            >,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Submitted> + Send>> {
             self.typed.lock().unwrap().push((target, text));
-            Box::pin(async { Ok(()) })
+            Box::pin(std::future::ready((self.result)()))
         }
     }
 
@@ -8066,14 +8061,17 @@ mod recovery_tests {
 
     /// Claimed's codex master, owed a nudge and found only by its name in a
     /// listing of the repo's TUI pane in tab 0 of session `s` beside
-    /// `panes`: what the typed send answered, what it typed where, and the
-    /// agent's status line after.
+    /// `panes`, typing coming to `result`: what the typed send answered,
+    /// what it typed where, the agent's status line after, and its nudge
+    /// history.
     async fn nudged_among(
         panes: Vec<crate::cli::open_zellij::SessionPane>,
+        result: fn() -> Submitted,
     ) -> (
         Answer,
         Vec<(crate::cli::pane_target::Target, String)>,
         String,
+        Vec<crate::cli::nudge_log::Record>,
     ) {
         let mut c = Claimed::by_policy();
         let tui = format!("clank tui --repo {}", c.repo.path().display());
@@ -8086,6 +8084,7 @@ mod recovery_tests {
                 listing_failed: false,
             },
             screen: Some(CODEX_EMPTY.to_string()),
+            result,
             typed: Default::default(),
         };
         let Claimed {
@@ -8127,7 +8126,51 @@ mod recovery_tests {
         let agent_dir = crate::agent_store::agents_root(repo.path()).join("codex");
         let state = crate::cli::agent_state::load(&agent_dir).unwrap();
         let typed = typist.typed.into_inner().unwrap();
-        (answer, typed, crate::cli::agent_state::line(&state, 10_001))
+        let line = crate::cli::agent_state::line(&state, 10_001);
+        (answer, typed, line, crate::cli::nudge_log::read(&agent_dir))
+    }
+
+    fn whole() -> Submitted {
+        Ok(crate::cli::pane_input::Delivered::Whole)
+    }
+
+    /// What typing comes to reaches recovery as its answer and the nudge
+    /// history as its outcome: a known no-send as `Unavailable`, which
+    /// recovery retries; a prompt that may have landed as `Indeterminate`,
+    /// which it never replays; one recorded with its start lost as
+    /// `Altered`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_typed_sends_outcome_reaches_recovery_and_the_history() {
+        use crate::cli::nudge_log::Outcome;
+        use crate::cli::open_zellij::PaneWrite;
+        type Case = (fn() -> Submitted, Answer, fn(&Outcome) -> bool);
+        let cases: [Case; 3] = [
+            (
+                || Err(PaneWrite::NotStarted("a draft was in the way".into())),
+                Answer::Unavailable,
+                |o| matches!(o, Outcome::Refused { .. }),
+            ),
+            (
+                || Err(PaneWrite::Unknown("no record in time".into())),
+                Answer::Indeterminate,
+                |o| matches!(o, Outcome::Indeterminate { .. }),
+            ),
+            (
+                || Ok(crate::cli::pane_input::Delivered::Altered),
+                Answer::Altered,
+                |o| *o == Outcome::Altered,
+            ),
+        ];
+        for (result, expected, logged) in cases {
+            let (answer, typed, _, history) =
+                nudged_among(vec![listed_pane("s", 3, 0, "codex", None)], result).await;
+            assert_eq!(answer, expected);
+            assert_eq!(typed.len(), 1, "{expected:?}");
+            let [record] = history.as_slice() else {
+                panic!("{expected:?}: {history:?}");
+            };
+            assert!(logged(&record.outcome), "{expected:?}: {record:?}");
+        }
     }
 
     /// The incident: an idle master owing work, with no wait, that clank
@@ -8136,8 +8179,8 @@ mod recovery_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_idle_master_is_nudged_into_the_pane_named_by_its_label() {
         for title in ["codex", "💤 codex"] {
-            let (answer, typed, shown) =
-                nudged_among(vec![listed_pane("s", 3, 0, title, None)]).await;
+            let (answer, typed, shown, _) =
+                nudged_among(vec![listed_pane("s", 3, 0, title, None)], whole).await;
             assert_eq!(answer, Answer::Submitted { started: None }, "{title}");
             let [(target, text)] = typed.as_slice() else {
                 panic!("{title}: {typed:?}");
@@ -8175,7 +8218,7 @@ mod recovery_tests {
             ),
         ];
         for (panes, why) in cases {
-            let (answer, typed, shown) = nudged_among(panes).await;
+            let (answer, typed, shown, _) = nudged_among(panes, whole).await;
             assert!(
                 matches!(&answer, Answer::Unreachable(said) if said.contains(why)),
                 "{why}: {answer:?}"

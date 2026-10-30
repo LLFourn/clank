@@ -105,6 +105,8 @@ pub(crate) struct Target {
     pub(crate) session: String,
     pub(crate) pane: String,
     pub(crate) tool: Tool,
+    pub(crate) repo: PathBuf,
+    pub(crate) label: AgentLabel,
 }
 
 impl Target {
@@ -113,6 +115,8 @@ impl Target {
             session: &self.session,
             pane: &self.pane,
             tool: self.tool,
+            repo: &self.repo,
+            label: &self.label,
         }
     }
 }
@@ -136,5 +140,7 @@ pub(crate) fn target_in(
         session,
         pane,
         tool,
+        repo: repo.to_path_buf(),
+        label: label.clone(),
     })
 }

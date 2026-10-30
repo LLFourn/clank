@@ -741,6 +741,9 @@ pub(crate) enum Gate {
 pub(crate) enum Answer {
     /// Accepted. `started` when the transport knows the turn it began.
     Submitted { started: Option<String> },
+    /// Accepted with its start lost in typing: the harness recorded a
+    /// proper suffix of the text. Delivered, so never resent.
+    Altered,
     /// The target was not idle at the failed turn when it checked.
     Refused,
     /// The transport was not there to try; nothing was sent.
@@ -1268,21 +1271,22 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
     }
     let a = e.attempts.last_mut().expect("checked");
     match answer {
-        Answer::Submitted { started } if e.kind == Kind::Fallback => {
-            // With its record unreadable nothing can confirm it, so it is
-            // never sent again in this interval.
+        Answer::Submitted { .. } | Answer::Altered => {
             a.disposition = Disposition::Submitted;
-            a.started = started;
-            escalate(
-                &mut e,
-                ctx,
-                "a blind nudge was sent that clank cannot see the outcome of",
-            );
-        }
-        Answer::Submitted { started } => {
-            a.disposition = Disposition::Submitted;
-            a.started = started;
-            e.next_at = Some(a.claimed_at + CONFIRM_WITHIN);
+            if let Answer::Submitted { started } = answer {
+                a.started = started;
+            }
+            if e.kind == Kind::Fallback {
+                // With its record unreadable nothing can confirm it, so it
+                // is never sent again in this interval.
+                escalate(
+                    &mut e,
+                    ctx,
+                    "a blind nudge was sent that clank cannot see the outcome of",
+                );
+            } else {
+                e.next_at = Some(a.claimed_at + CONFIRM_WITHIN);
+            }
         }
         Answer::Refused => {
             a.disposition = Disposition::Refused;
@@ -1550,6 +1554,7 @@ impl Pending {
                 Outcome::Reported
             }
             Answer::Submitted { .. } => Outcome::Submitted,
+            Answer::Altered => Outcome::Altered,
             Answer::Refused => Outcome::Refused {
                 reason: "the agent was no longer idle at the failed turn".into(),
             },
@@ -2080,7 +2085,7 @@ impl Driver {
             if attempt.session == w.session {
                 match &answer {
                     Answer::Unreachable(why) => w.unreachable = Some(why.clone()),
-                    Answer::Submitted { .. } => w.unreachable = None,
+                    Answer::Submitted { .. } | Answer::Altered => w.unreachable = None,
                     _ => {}
                 }
             }
@@ -3366,6 +3371,25 @@ pub(crate) mod tests {
         let ep = answered(ep, 1, Answer::Indeterminate, &ctx(61, HELPER, None));
         assert_eq!(ep.state, State::Escalated);
         let (_, fx) = decide(Some(ep), &s, &ctx(5000, HELPER, GO));
+        assert!(acting(&fx).is_empty());
+    }
+
+    /// A prompt recorded with its start lost was delivered: it settles as a
+    /// submission does, and is not sent again.
+    #[test]
+    fn an_altered_answer_is_a_delivery() {
+        let s = snap([started("t1"), failed("t1", "server_error")]);
+        let ep = decide(None, &s, &ctx(0, HELPER, None)).0;
+        let ep = decide(ep, &s, &ctx(60, HELPER, GO)).0.unwrap();
+        let altered = answered(ep.clone(), 1, Answer::Altered, &ctx(61, HELPER, None));
+        let submitted = answered(
+            ep,
+            1,
+            Answer::Submitted { started: None },
+            &ctx(61, HELPER, None),
+        );
+        assert_eq!(altered, submitted);
+        let (_, fx) = decide(Some(altered), &s, &ctx(62, HELPER, GO));
         assert!(acting(&fx).is_empty());
     }
 

@@ -9,15 +9,17 @@
 //! unreviewed.
 //!
 //! So this shares nothing with the machinery it exists to bypass. It
-//! reads no hook, no inbox, no session binding and no wait — only the
-//! roster and the live pane listing — and it doesn't read the pane
-//! either: it presses the tool's interrupt key, types, and submits, for
-//! every tool. A draft in the input goes with it; that is the price of an
-//! escape hatch that always works.
+//! reads no hook, no inbox and no wait, and finds the pane by the roster
+//! and the live pane listing alone. Into Claude and Codex it types the
+//! way every writer does (`pane_input::nudge`): a draft that is not its
+//! own text is left alone,
+//! and what it reports is the harness's own record of the prompt. The
+//! session binding names that record and nothing else, so a stale one
+//! costs the confirmation, never the delivery.
 
 use super::{NudgeArgs, resolve_repo};
 use crate::cli::nudge_log::{Outcome, Record, Trigger};
-use crate::cli::pane_input::Unconfirmed;
+use crate::cli::pane_input::{Delivered, Unconfirmed};
 
 pub async fn run(args: NudgeArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -29,28 +31,37 @@ pub async fn run(args: NudgeArgs) -> anyhow::Result<()> {
         &body,
         &tried,
     );
-    println!("nudged `{to}` in {} ({})", repo.display(), tried?);
+    let (place, delivered) = tried?;
+    let altered = match delivered {
+        Delivered::Altered => ", its start lost in typing",
+        Delivered::Whole | Delivered::Unread => "",
+    };
+    println!("nudged `{to}` in {} ({place}{altered})", repo.display());
     Ok(())
 }
 
-/// The nudge itself; on success, where it went.
+/// The nudge itself; on success, where it went and how it arrived.
 async fn attempt(
     repo: &std::path::Path,
     to: &crate::lifecycle::AgentLabel,
     body: &str,
-) -> Result<String, Unconfirmed> {
+) -> Result<(String, Delivered), Unconfirmed> {
     let target = super::pane_target::discover(repo.to_path_buf(), to.clone())
         .await
         .map_err(|e| Unconfirmed::Refused(format!("{e:#}")))?;
     let body = crate::cli::pane_input::Admitted::new(body);
-    crate::cli::pane_input::nudge(target.input(), &body).await?;
-    Ok(format!("session {}, pane {}", target.session, target.pane))
+    let delivered = crate::cli::pane_input::nudge(target.input(), &body).await?;
+    Ok((
+        format!("session {}, pane {}", target.session, target.pane),
+        delivered,
+    ))
 }
 
 /// What the attempt's result lets the history say.
-fn outcome<T>(tried: &Result<T, Unconfirmed>) -> Outcome {
+fn outcome<T>(tried: &Result<(T, Delivered), Unconfirmed>) -> Outcome {
     match tried {
-        Ok(_) => Outcome::Submitted,
+        Ok((_, Delivered::Whole | Delivered::Unread)) => Outcome::Submitted,
+        Ok((_, Delivered::Altered)) => Outcome::Altered,
         Err(e @ (Unconfirmed::Empty | Unconfirmed::Refused(_))) => Outcome::Refused {
             reason: e.to_string(),
         },
@@ -62,7 +73,7 @@ fn outcome<T>(tried: &Result<T, Unconfirmed>) -> Outcome {
 
 /// Its failure is ignored: the nudge has already happened, or not, either
 /// way.
-fn record<T>(agent_dir: &std::path::Path, body: &str, tried: &Result<T, Unconfirmed>) {
+fn record<T>(agent_dir: &std::path::Path, body: &str, tried: &Result<(T, Delivered), Unconfirmed>) {
     let _ = crate::cli::nudge_log::append(
         agent_dir,
         &Record {
@@ -79,11 +90,14 @@ fn record<T>(agent_dir: &std::path::Path, body: &str, tried: &Result<T, Unconfir
 mod tests {
 
     /// A refusal before the terminal is a refusal; an unconfirmed
-    /// interrupt or message may have landed.
+    /// interrupt or message may have landed; a prompt recorded with its
+    /// start lost is delivered, altered.
     #[test]
     fn each_result_is_recorded_as_what_it_can_claim() {
-        let of = |r: Result<(), Unconfirmed>| outcome(&r);
-        assert_eq!(of(Ok(())), Outcome::Submitted);
+        let of = |r: Result<((), Delivered), Unconfirmed>| outcome(&r);
+        assert_eq!(of(Ok(((), Delivered::Whole))), Outcome::Submitted);
+        assert_eq!(of(Ok(((), Delivered::Unread))), Outcome::Submitted);
+        assert_eq!(of(Ok(((), Delivered::Altered))), Outcome::Altered);
         for refused in [Unconfirmed::Empty, Unconfirmed::Refused("no pane".into())] {
             assert!(matches!(of(Err(refused)), Outcome::Refused { .. }));
         }
@@ -111,14 +125,16 @@ mod tests {
         AgentLabel::parse(name).unwrap()
     }
 
-    /// The escape hatch must not consult what may be broken.
+    /// The escape hatch must not be routed by what may be broken.
     ///
     /// A stale session binding is one of the ways `clank send` fails,
     /// and the web bridge's `say` sends to `load_agent_config(..)
     /// .session.id` over the app-server — so a binding that still
     /// names a loaded thread would deliver somewhere else entirely and
     /// report success. No runtime test can watch for a call that is
-    /// not made, so this reads the module.
+    /// not made, so this reads the module. The binding that names the
+    /// record confirming the prompt is read by `prompt_record`, after
+    /// the pane is chosen.
     #[test]
     fn the_nudge_path_reads_no_session_binding() {
         let src = include_str!("nudge.rs");

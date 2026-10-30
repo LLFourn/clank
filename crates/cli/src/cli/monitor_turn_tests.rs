@@ -1318,6 +1318,8 @@ impl Typist for Recorded {
                     session: "test".into(),
                     pane: "terminal_1".into(),
                     tool: clank_core::Tool::Claude,
+                    repo: "/test".into(),
+                    label: AgentLabel::parse("test").unwrap(),
                 },
                 Some(EMPTY_INPUT.into()),
             ))
@@ -1328,13 +1330,10 @@ impl Typist for Recorded {
         &self,
         _target: crate::cli::pane_target::Target,
         text: String,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), crate::cli::open_zellij::PaneWrite>> + Send,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::cli::monitor::Submitted> + Send>>
+    {
         self.typed.lock().unwrap().push(text);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(crate::cli::pane_input::Delivered::Whole) })
     }
 }
 
