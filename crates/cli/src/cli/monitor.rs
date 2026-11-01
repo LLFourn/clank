@@ -4617,7 +4617,6 @@ async fn typed_send(
         return Answer::Unavailable;
     }
     match typist.submit(target, text).await {
-        Ok(crate::cli::pane_input::Delivered::Altered) => Answer::Altered,
         Ok(_) => Answer::Submitted { started: None },
         Err(crate::cli::open_zellij::PaneWrite::NotStarted(_)) => Answer::Unavailable,
         Err(crate::cli::open_zellij::PaneWrite::Unknown(_)) => Answer::Indeterminate,
@@ -8137,8 +8136,7 @@ mod recovery_tests {
     /// What typing comes to reaches recovery as its answer and the nudge
     /// history as its outcome: a known no-send as `Unavailable`, which
     /// recovery retries; a prompt that may have landed as `Indeterminate`,
-    /// which it never replays; one recorded with its start lost as
-    /// `Altered`.
+    /// which it never replays; one recorded as `Submitted`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_typed_sends_outcome_reaches_recovery_and_the_history() {
         use crate::cli::nudge_log::Outcome;
@@ -8155,11 +8153,9 @@ mod recovery_tests {
                 Answer::Indeterminate,
                 |o| matches!(o, Outcome::Indeterminate { .. }),
             ),
-            (
-                || Ok(crate::cli::pane_input::Delivered::Altered),
-                Answer::Altered,
-                |o| *o == Outcome::Altered,
-            ),
+            (whole, Answer::Submitted { started: None }, |o| {
+                *o == Outcome::Submitted
+            }),
         ];
         for (result, expected, logged) in cases {
             let (answer, typed, _, history) =

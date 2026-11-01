@@ -547,13 +547,12 @@ Three levels, for three situations:
   agent at all: a wedged hook, a stale binding, a wake that never fires. It
   interrupts the agent's pane and types the message into its terminal,
   reading no inbox and finding the pane by its name alone. Into Claude and
-  Codex it types the way every automatic writer does: it leaves alone a
-  draft that is not its own text, looks before pressing Enter, and calls the
-  message delivered only when the agent's own transcript records it (the
-  binding is read only to find that transcript). Grok and OpenCode, whose
-  input cannot be read, get the interrupt key, the message and Enter
-  unread. Nothing waits to be acknowledged, but each attempt and its
-  outcome (`submitted`, submitted with its start lost, refused, or
+  Codex it types the way every automatic writer does: it types only into an
+  empty input, presses Enter once, and calls the message delivered only
+  when the agent's own transcript records it (the binding is read only to
+  find that transcript). Grok and OpenCode, whose input cannot be read, get
+  the interrupt key, the message and Enter unread. Nothing waits to be
+  acknowledged, but each attempt and its outcome (`submitted`, refused, or
   indeterminate) is kept in the agent's nudge history.
 
 ### User commands
@@ -704,18 +703,19 @@ app-server and OpenCode's plugin take the same admitted text. `clank
 nudge` admits the same way into Claude and Codex, and types into Grok and
 OpenCode unread.
 
-**A prompt is typed, seen, then sent.** `clank nudge`, an interrupting
-event and recovery's typed sends type into Claude or Codex one way, under
-the pane's lock and within one deadline. The only text in the input clank
-acts on is its own: the message, whole or with its start lost. Anything
-else is refused before any key. Typed text that shows with its first
-characters missing is cleared with Ctrl-C and typed once more, but only
-while no turn runs. The message counts as delivered only when the agent's
-own record gains it after the attempt began: a Claude user turn or queued
-prompt, or a Codex user message, with the whole text. If Claude's input
-still shows the whole message a second after Enter, it gets one more Enter;
-Codex gets one submit key only. Anything less certain is indeterminate and
-never replayed.
+**A prompt is typed into an empty input and sent once.** `clank nudge`, an
+interrupting event and recovery's typed sends type into Claude or Codex one
+way, under the pane's lock and within one deadline. The input must read as
+empty; anything else, a draft of any kind included, is refused before any
+key. An interrupt goes to Codex always and to Claude only while its turn
+runs, since a key typed straight after an idle Claude's Esc is swallowed;
+after it, the input must still read as empty, or nothing more is typed. The
+message goes in after a space, so a key lost to a terminal race is that
+space, and a second later the submit key is pressed once. It counts as
+delivered only when the agent's own record gains it after the attempt
+began: a Claude user turn or queued prompt, or a Codex user message, with
+the whole text, its leading space kept or lost. Without that record it is
+indeterminate, and never replayed.
 
 **Evidence a human records.** User commands are gated on an observation
 made in a throwaway pane against the installed harness, and stay refused

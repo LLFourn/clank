@@ -11,8 +11,7 @@
 //! So this shares nothing with the machinery it exists to bypass. It
 //! reads no hook, no inbox and no wait, and finds the pane by the roster
 //! and the live pane listing alone. Into Claude and Codex it types the
-//! way every writer does (`pane_input::nudge`): a draft that is not its
-//! own text is left alone,
+//! way every writer does (`pane_input::nudge`): any draft is left alone,
 //! and what it reports is the harness's own record of the prompt. The
 //! session binding names that record and nothing else, so a stale one
 //! costs the confirmation, never the delivery.
@@ -31,12 +30,8 @@ pub async fn run(args: NudgeArgs) -> anyhow::Result<()> {
         &body,
         &tried,
     );
-    let (place, delivered) = tried?;
-    let altered = match delivered {
-        Delivered::Altered => ", its start lost in typing",
-        Delivered::Whole | Delivered::Unread => "",
-    };
-    println!("nudged `{to}` in {} ({place}{altered})", repo.display());
+    let (place, _) = tried?;
+    println!("nudged `{to}` in {} ({place})", repo.display());
     Ok(())
 }
 
@@ -60,8 +55,7 @@ async fn attempt(
 /// What the attempt's result lets the history say.
 fn outcome<T>(tried: &Result<(T, Delivered), Unconfirmed>) -> Outcome {
     match tried {
-        Ok((_, Delivered::Whole | Delivered::Unread)) => Outcome::Submitted,
-        Ok((_, Delivered::Altered)) => Outcome::Altered,
+        Ok(_) => Outcome::Submitted,
         Err(e @ (Unconfirmed::Empty | Unconfirmed::Refused(_))) => Outcome::Refused {
             reason: e.to_string(),
         },
@@ -90,14 +84,12 @@ fn record<T>(agent_dir: &std::path::Path, body: &str, tried: &Result<(T, Deliver
 mod tests {
 
     /// A refusal before the terminal is a refusal; an unconfirmed
-    /// interrupt or message may have landed; a prompt recorded with its
-    /// start lost is delivered, altered.
+    /// interrupt or message may have landed.
     #[test]
     fn each_result_is_recorded_as_what_it_can_claim() {
         let of = |r: Result<((), Delivered), Unconfirmed>| outcome(&r);
         assert_eq!(of(Ok(((), Delivered::Whole))), Outcome::Submitted);
         assert_eq!(of(Ok(((), Delivered::Unread))), Outcome::Submitted);
-        assert_eq!(of(Ok(((), Delivered::Altered))), Outcome::Altered);
         for refused in [Unconfirmed::Empty, Unconfirmed::Refused("no pane".into())] {
             assert!(matches!(of(Err(refused)), Outcome::Refused { .. }));
         }

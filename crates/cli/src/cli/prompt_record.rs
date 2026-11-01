@@ -6,7 +6,6 @@
 //! text; Codex's rollout records a `user_message`. Nothing else here says a
 //! prompt arrived.
 
-use super::pane_input::Delivered;
 use clank_core::Tool;
 use clank_core::ids::AgentLabel;
 use std::path::PathBuf;
@@ -295,19 +294,11 @@ fn claude_input(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Whether accepted `input` is `payload`: the whole of it, or a non-empty
-/// proper suffix of it, which only a write of `payload` that lost its start
-/// can produce. Anything else is someone else's prompt.
-pub(crate) fn attribute(payload: &str, input: &str) -> Option<Delivered> {
-    let got = unwrap_pasted(input);
-    let (got, sent) = (got.trim(), payload.trim());
-    if got == sent {
-        Some(Delivered::Whole)
-    } else if !got.is_empty() && got.len() < sent.len() && sent.ends_with(got) {
-        Some(Delivered::Altered)
-    } else {
-        None
-    }
+/// Whether accepted `input` is the whole of `payload`, its surrounding
+/// whitespace aside: clank types a space before it, which a terminal race
+/// may swallow. Anything else is someone else's prompt.
+pub(crate) fn is_payload(payload: &str, input: &str) -> bool {
+    unwrap_pasted(input).trim() == payload.trim()
 }
 
 /// `text` with Claude's paste wrapping taken off the way Claude takes it
@@ -590,37 +581,24 @@ mod tests {
         assert_eq!(unwrap_pasted(foreign), foreign);
     }
 
-    /// The whole text is the payload, a proper suffix of it is the payload
-    /// with its start lost, and anything else is not the payload, however
-    /// much of it agrees.
+    /// The whole text is the payload, with or without the space clank types
+    /// before it; anything with another character lost or changed is not,
+    /// however much of it agrees.
     #[test]
     fn a_record_is_attributed_by_its_whole_text() {
         let payload = "Experiment rules:\n- one\n- two";
-        assert_eq!(attribute(payload, payload), Some(Delivered::Whole));
-        assert_eq!(
-            attribute(payload, &pasted("1a09", payload)),
-            Some(Delivered::Whole)
-        );
-        assert_eq!(
-            attribute(payload, "xperiment rules:\n- one\n- two"),
-            Some(Delivered::Altered)
-        );
+        assert!(is_payload(payload, payload));
+        assert!(is_payload(payload, &format!(" {payload}")));
+        assert!(is_payload(payload, &pasted("1a09", payload)));
         for other in [
+            "xperiment rules:\n- one\n- two",
+            "Experiment rules:\n- one\n- tw",
             "Experiment rules:\n- one\n- three",
             "Experiment rules:",
             "Experiment rules:\n- one\n- two\n- more",
             "",
         ] {
-            assert_ne!(
-                attribute(payload, other),
-                Some(Delivered::Whole),
-                "{other:?}"
-            );
+            assert!(!is_payload(payload, other), "{other:?}");
         }
-        assert_eq!(
-            attribute(payload, "Experiment rules:\n- one\n- three"),
-            None
-        );
-        assert_eq!(attribute(payload, ""), None);
     }
 }

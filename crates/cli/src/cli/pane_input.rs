@@ -10,7 +10,7 @@
 //!   positively read as not in shell mode. A harness whose input cannot be
 //!   read (Grok, OpenCode) is typed into only by `clank nudge`.
 //! - A prompt typed into Claude or Codex by a nudge, an event wake or a
-//!   recovery send ([`deliver`]) touches no text but its own, and is
+//!   recovery send ([`deliver`]) is typed only into an empty input, and is
 //!   delivered only when the harness's own record says so.
 //! - Every write sequence holds the pane's one cross-process lock
 //!   ([`lock_pane`]) from its look through its last byte.
@@ -39,11 +39,14 @@ pub(crate) fn say_argvs(pane: &str, text: &str) -> Option<[Vec<String>; 2]> {
     if text.is_empty() {
         return None;
     }
-    let chars = ["action", "write-chars", "-p", pane, "--", text]
+    Some([chars_argv(pane, text), enter_argv(pane)])
+}
+
+fn chars_argv(pane: &str, text: &str) -> Vec<String> {
+    ["action", "write-chars", "-p", pane, "--", text]
         .iter()
         .map(|s| s.to_string())
-        .collect();
-    Some([chars, enter_argv(pane)])
+        .collect()
 }
 
 /// Kitty keyboard protocol's Enter press: CSI 13;1:1u. Codex's TUI
@@ -361,8 +364,9 @@ impl Target<'_> {
 ///
 /// What this order GUARANTEES is narrow and exact: clank's own interrupt
 /// never follows clank's own message. For an IDLE agent that is the whole
-/// fix, because the interrupt key is inert at an idle prompt for every
-/// provider below, so the message starts a turn nothing cancels.
+/// fix: an idle Claude is sent no interrupt key, and for every other
+/// provider below the key is inert at an idle prompt, so the message starts
+/// a turn nothing cancels.
 ///
 /// For a BUSY agent the terminal fallback is BEST-EFFORT, and says so. The
 /// message is typed straight after the interrupt key, with no fixed pause:
@@ -381,13 +385,13 @@ impl Target<'_> {
 ///   been verified.
 ///
 /// Interrupting an idle agent first is harmless for every provider clank
-/// drives, which is what makes this order safe. Taken from each
-/// installed binary's own help text, so the claim can be re-checked when
-/// one is upgraded:
+/// sends the key to idle, which is what makes this order safe. Taken from
+/// each installed binary's own help text, so the claim can be re-checked
+/// when one is upgraded:
 ///
-/// - Claude Code (Esc): interrupts a running turn. At an idle prompt one
-///   Esc arms a double-press that opens rewind; the typed message after
-///   it disarms that.
+/// - Claude Code (Esc): interrupts a running turn. Idle it is not inert: a
+///   key typed straight after it was seen swallowed, so it is sent only
+///   while Claude's own hint says a turn runs.
 /// - Codex (Esc): interrupts a running turn. Idle, one Esc arms "again to
 ///   edit previous message"; typing disarms it. Its quit is Ctrl+C, which
 ///   clank never sends it.
@@ -545,9 +549,6 @@ pub(crate) async fn wake_for_events_async(
 pub(crate) enum Delivered {
     /// The harness recorded the whole text.
     Whole,
-    /// The harness recorded a non-empty proper suffix of the text: its
-    /// start was lost in typing. Delivered, so never resent.
-    Altered,
     /// Typed into a harness whose input and record clank cannot read: only
     /// the transport accepted it.
     Unread,
@@ -587,35 +588,28 @@ fn unreadable(tool: Tool) -> String {
 
 /// The whole attempt, from its first look to its last read.
 const ATTEMPT: std::time::Duration = std::time::Duration::from_secs(8);
-/// How long typed text, or an input being cleared, has to show.
-const SHOWN_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long after the submit key the input is looked at again.
-const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Between the typed text and its submit key: an Enter pressed 0.6–0.8s
+/// after a harness started was seen lost, and this is past Codex's paste
+/// window too.
+const BEFORE_SUBMIT: std::time::Duration = std::time::Duration::from_secs(1);
 const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Past Codex's paste window, so its submit key is a key.
 const CODEX_PASTE_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Ctrl-C, which empties Claude's non-empty idle input and does nothing
-/// else (Claude Code 2.1.308).
-fn clear_argv(pane: &str) -> Vec<String> {
-    ["action", "write", "-p", pane, "3"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Type `text` into a Claude or Codex pane, submit it, and confirm it by
-/// the harness's own record, under the lock the caller holds. `interrupt`
-/// presses the tool's interrupt key first, after the first look.
+/// Type `text` into an empty Claude or Codex input, submit it once, and
+/// confirm it by the harness's own record, under the lock the caller
+/// holds. With `interrupt`, the tool's interrupt key goes first: to Codex
+/// always, to Claude only while its turn runs, since a key typed straight
+/// after an idle Claude's Esc is swallowed.
+///
+/// Any input but an empty one, before the text or after the interrupt, is
+/// left untouched. The text goes in after a space, so the one character a
+/// terminal race swallows is that space. A submit key is never pressed
+/// twice: once the first has gone, a draft in the input may be a person's.
 ///
 /// One deadline bounds the whole attempt: every read, write and pause ends
 /// by it, nothing is sent once it has passed, and nothing that finishes at
 /// or after it counts. A write cut off by it may have landed.
-///
-/// Only text that can be clank's own is acted on: the payload whole, or a
-/// non-empty proper suffix of it (its start lost on the way in). Any other
-/// draft is refused untouched. Claude's input is cleared with Ctrl-C only
-/// while no turn runs, since Ctrl-C would interrupt one.
 async fn deliver(
     term: &impl Terminal,
     receipts: &mut impl Receipts,
@@ -629,35 +623,22 @@ async fn deliver(
         payload: text.as_str(),
         deadline: tokio::time::Instant::now() + ATTEMPT,
         wrote: false,
-        cleared: false,
     };
-    let first = attempt.look(false).await;
-    match first.held {
-        Held::Empty | Held::Whole => {}
-        Held::Suffix if target.tool == Tool::Claude && (interrupt || !first.busy) => {}
-        Held::Suffix => return Err(attempt.fail("part of this text, which cannot be cleared now")),
-        Held::Arriving | Held::Other(_) => return Err(attempt.fail(first.held.what())),
-    }
+    let first = attempt.look().await;
+    attempt.empty(first)?;
     let marked = match attempt.within(receipts.mark()).await {
         Some(marked) => marked,
         None => Err("its record could not be read in time".into()),
     };
-    let now = if interrupt {
+    if interrupt && (target.tool != Tool::Claude || first.busy) {
         attempt.interrupt().await?;
-        attempt.look(false).await
-    } else {
-        first
-    };
-    match now.held {
-        Held::Whole => {}
-        Held::Empty => attempt.type_and_see().await?,
-        Held::Suffix if attempt.may_clear(&now) => {
-            attempt.clear().await?;
-            attempt.type_and_see().await?;
-        }
-        Held::Suffix => return Err(attempt.fail("part of this text, which cannot be cleared now")),
-        Held::Arriving | Held::Other(_) => return Err(attempt.fail(now.held.what())),
+        let now = attempt.look().await;
+        attempt.empty(now)?;
     }
+    attempt
+        .write(chars_argv(target.pane, &format!(" {}", text.as_str())))
+        .await?;
+    attempt.pause(BEFORE_SUBMIT).await;
     let submit = match (target.tool, interrupt) {
         // Tab, which Codex queues behind a running turn, where its Enter
         // would steer into it (`resume::EVIDENCE`).
@@ -665,9 +646,6 @@ async fn deliver(
         (Tool::Codex, true) => codex_submit_argv(target.pane),
         _ => enter_argv(target.pane),
     };
-    if target.tool == Tool::Codex {
-        attempt.pause(CODEX_PASTE_WINDOW).await;
-    }
     attempt.write(submit).await?;
     attempt.confirm(receipts, marked).await
 }
@@ -679,35 +657,10 @@ fn enter_argv(pane: &str) -> Vec<String> {
         .collect()
 }
 
-/// What the input shows, measured against the payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
-    Empty,
-    Whole,
-    /// A non-empty proper suffix of the payload: clank's own, its start
-    /// lost.
-    Suffix,
-    /// Part of the payload, still arriving.
-    Arriving,
-    /// Anything else, and why it is not clank's to touch.
-    Other(&'static str),
-}
-
-impl Held {
-    fn what(self) -> &'static str {
-        match self {
-            Held::Other(what) => what,
-            _ => FOREIGN,
-        }
-    }
-}
-
-const FOREIGN: &str = "text clank did not type (a draft was in the way)";
-
 /// One read of the pane.
 #[derive(Debug, Clone, Copy)]
 struct Look {
-    held: Held,
+    input: Composer,
     /// Claude's interrupt hint is on screen.
     busy: bool,
 }
@@ -719,10 +672,6 @@ struct Attempt<'a, T> {
     deadline: tokio::time::Instant,
     /// A byte may have reached the pane.
     wrote: bool,
-    /// Ctrl-C was sent. Claude takes a second Ctrl-C at an empty input as
-    /// its exit, and a stale frame can show text in an input already
-    /// emptied, so one attempt sends it once at most.
-    cleared: bool,
 }
 
 impl<T: Terminal> Attempt<'_, T> {
@@ -744,42 +693,36 @@ impl<T: Terminal> Attempt<'_, T> {
         tokio::time::sleep_until(self.deadline.min(tokio::time::Instant::now() + d)).await;
     }
 
-    /// After clank types, its own text may show behind the harness's
-    /// paste placeholders, or part-way in; before, only the literal text
-    /// can be clank's.
-    async fn look(&self, typed: bool) -> Look {
+    async fn look(&self) -> Look {
         let tool = self.target.tool;
         let Some(Some(screen)) = self.within(self.term.dump()).await else {
             return Look {
-                held: Held::Other("unreadable"),
+                input: Composer::Unreadable,
                 busy: false,
             };
         };
-        let held = match super::composer::typed(tool, &screen) {
-            Some(shown) => measure(&shown, self.payload, typed),
-            None if super::composer::composer(tool, &screen) == Composer::Shell => {
-                Held::Other("shell mode")
-            }
-            None => Held::Other("unreadable"),
-        };
         Look {
-            held,
+            input: super::composer::composer(tool, &screen),
             busy: tool == Tool::Claude && super::composer::claude_turn_running(&screen),
         }
     }
 
-    fn may_clear(&self, now: &Look) -> bool {
-        self.target.tool == Tool::Claude && !now.busy && !self.cleared
-    }
-
-    fn fail(&self, what: &str) -> Failed {
-        if self.wrote {
+    /// Whether `look` read the input as empty, and otherwise why nothing
+    /// more is typed.
+    fn empty(&self, look: Look) -> Result<(), Failed> {
+        let what = match look.input {
+            Composer::Empty => return Ok(()),
+            Composer::Draft => "a draft",
+            Composer::Shell => "shell mode",
+            Composer::Unreadable => "unreadable",
+        };
+        Err(if self.wrote {
             Failed::Indeterminate(format!(
-                "its input then held {what}; nothing more was typed"
+                "its input then read as {what}; nothing more was typed"
             ))
         } else {
-            Failed::NotSent(format!("its input holds {what}; nothing was typed"))
-        }
+            Failed::NotSent(format!("its input reads as {what}; nothing was typed"))
+        })
     }
 
     fn out_of_time(&self) -> Failed {
@@ -827,123 +770,36 @@ impl<T: Terminal> Attempt<'_, T> {
         }
     }
 
-    /// Type the payload once and wait for the input to show it whole. A
-    /// suffix, the start lost, is cleared and retyped once while no turn
-    /// runs. Text that never shows is not retyped: it may still arrive.
-    async fn type_and_see(&mut self) -> Result<(), Failed> {
-        let chars = say_argvs(self.target.pane, self.payload)
-            .expect("the text is not empty")
-            .into_iter()
-            .next()
-            .expect("the text");
-        self.write(chars.clone()).await?;
-        let mut typed_at = tokio::time::Instant::now();
-        loop {
-            let now = self.look(true).await;
-            match now.held {
-                Held::Whole => return Ok(()),
-                Held::Empty | Held::Arriving => {}
-                Held::Suffix if self.may_clear(&now) => {
-                    self.clear().await?;
-                    self.write(chars.clone()).await?;
-                    typed_at = tokio::time::Instant::now();
-                    continue;
-                }
-                Held::Suffix => {
-                    return Err(Failed::Indeterminate(
-                        "its input showed the text with its start lost, and could not be \
-                         cleared"
-                            .into(),
-                    ));
-                }
-                Held::Other(what) => {
-                    return Err(Failed::Indeterminate(format!(
-                        "after typing, its input read as {what}"
-                    )));
-                }
-            }
-            if self.expired() || tokio::time::Instant::now() >= typed_at + SHOWN_WITHIN {
-                return Err(Failed::Indeterminate(
-                    "the typed text did not show in its input in time; it may still arrive".into(),
-                ));
-            }
-            self.pause(POLL).await;
-        }
-    }
-
-    /// Ctrl-C, then wait for the input to read as empty.
-    async fn clear(&mut self) -> Result<(), Failed> {
-        self.cleared = true;
-        self.write(clear_argv(self.target.pane)).await?;
-        let sent = tokio::time::Instant::now();
-        loop {
-            match self.look(false).await.held {
-                Held::Empty => return Ok(()),
-                Held::Suffix => {}
-                other => {
-                    return Err(Failed::Indeterminate(format!(
-                        "clearing its input left {}",
-                        other.what()
-                    )));
-                }
-            }
-            if self.expired() || tokio::time::Instant::now() >= sent + SHOWN_WITHIN {
-                return Err(Failed::Indeterminate(
-                    "its input did not empty after Ctrl-C".into(),
-                ));
-            }
-            self.pause(POLL).await;
-        }
-    }
-
     /// Wait for the harness's record of the prompt, appended past the mark.
-    ///
-    /// Claude only: if no record has come and the input still shows the
-    /// whole text a settle delay after the submit key, Enter once more.
-    /// That rests on a key contract seen live (Claude Code 2.1.308), not on
-    /// the record's absence: Enter on an empty input does nothing, idle,
-    /// busy or with a prompt queued. So a second Enter after a stale frame
-    /// is a no-op, and after a lost first Enter it sends the text. Codex's
-    /// submit keys have no such contract, so it gets one.
+    /// Its absence is never answered with another key: the first may have
+    /// landed with its record late.
     async fn confirm(
         &mut self,
         receipts: &mut impl Receipts,
         marked: Result<(), String>,
     ) -> Result<Delivered, Failed> {
-        use super::prompt_record::{attribute, input};
+        use super::prompt_record::{input, is_payload};
+        if let Err(why) = marked {
+            return Err(Failed::Indeterminate(format!(
+                "submitted, but nothing can confirm it: {why}"
+            )));
+        }
         let tool = self.target.tool;
-        let submitted = tokio::time::Instant::now();
-        let mut resent = tool != Tool::Claude;
         loop {
-            if marked.is_ok() {
-                let lines = match self.within(receipts.read()).await {
-                    Some(read) => read.map_err(Failed::Indeterminate)?,
-                    None => {
-                        return Err(Failed::Indeterminate(
-                            "submitted, but its record could not be read in time".into(),
-                        ));
-                    }
-                };
-                let found = lines
-                    .iter()
-                    .filter_map(|line| input(tool, line))
-                    .find_map(|got| attribute(self.payload, &got));
-                if let Some(delivered) = found {
-                    return Ok(delivered);
+            let lines = match self.within(receipts.read()).await {
+                Some(read) => read.map_err(Failed::Indeterminate)?,
+                None => {
+                    return Err(Failed::Indeterminate(
+                        "submitted, but its record could not be read in time".into(),
+                    ));
                 }
-            }
-            if !resent && tokio::time::Instant::now() >= submitted + SETTLE {
-                resent = true;
-                if self.look(true).await.held == Held::Whole {
-                    self.write(enter_argv(self.target.pane)).await?;
-                }
-            }
-            if let Err(why) = &marked
-                && resent
+            };
+            if lines
+                .iter()
+                .filter_map(|line| input(tool, line))
+                .any(|got| is_payload(self.payload, &got))
             {
-                return Err(Failed::Indeterminate(format!(
-                    "submitted, but nothing can confirm it: {why}"
-                )));
+                return Ok(Delivered::Whole);
             }
             if self.expired() {
                 return Err(Failed::Indeterminate(
@@ -952,138 +808,6 @@ impl<T: Terminal> Attempt<'_, T> {
             }
             self.pause(POLL).await;
         }
-    }
-}
-
-/// How the input `shown` stands to `payload`, exactly: whitespace inside a
-/// row is the draft's own, and a row break stands for a line break in the
-/// payload, or for a space or nothing only where the row is too full to
-/// have gone on. With `typed`, the harness's paste placeholders stand for
-/// some of the payload, and a part of it may still be arriving.
-fn measure(shown: &super::composer::Shown, payload: &str, typed: bool) -> Held {
-    let Some(last) = shown.rows.len().checked_sub(1) else {
-        return Held::Empty;
-    };
-    let sent = payload.trim_end();
-    let mut pattern = Vec::new();
-    for (i, row) in shown.rows.iter().enumerate() {
-        if typed {
-            pattern.extend(pieces(&row.text));
-        } else if !row.text.is_empty() {
-            pattern.push(Tok::Lit(row.text.clone()));
-        }
-        if i < last {
-            let next = shown.rows[i + 1].text.split(' ').next().unwrap_or_default();
-            pattern.push(Tok::Break {
-                space: row.end + 1 + next.chars().count() > shown.width,
-                join: row.end >= shown.width,
-            });
-        }
-    }
-    let suffix = match pattern.first() {
-        Some(Tok::Lit(lead)) => starts(sent, lead).any(|i| i > 0 && glob(&pattern, &sent[i..])),
-        _ => false,
-    };
-    if glob(&pattern, sent) {
-        Held::Whole
-    } else if suffix {
-        Held::Suffix
-    } else if typed
-        && glob(
-            &[[Tok::Any(0)].as_slice(), &pattern, &[Tok::Any(0)]].concat(),
-            sent,
-        )
-    {
-        Held::Arriving
-    } else {
-        Held::Other(FOREIGN)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Tok {
-    Lit(String),
-    /// At least this many characters, unknown.
-    Any(usize),
-    /// A row break: a line break, or where the row was full, the space a
-    /// wrap took or nothing.
-    Break {
-        space: bool,
-        join: bool,
-    },
-}
-
-/// `text` as literal text and the paste placeholders Claude and Codex
-/// draw in place of a paste: `[Pasted text #N]`, `[Pasted text #N +K
-/// lines]`, `[Pasted Content N chars]`.
-fn pieces(text: &str) -> Vec<Tok> {
-    let mut toks = Vec::new();
-    let mut lit = String::new();
-    let mut rest = text;
-    while let Some(c) = rest.chars().next() {
-        if let Some(len) = placeholder(rest) {
-            if !lit.is_empty() {
-                toks.push(Tok::Lit(std::mem::take(&mut lit)));
-            }
-            toks.push(Tok::Any(1));
-            rest = &rest[len..];
-        } else {
-            lit.push(c);
-            rest = &rest[c.len_utf8()..];
-        }
-    }
-    if !lit.is_empty() {
-        toks.push(Tok::Lit(lit));
-    }
-    toks
-}
-
-/// The length of the paste placeholder `s` opens with.
-fn placeholder(s: &str) -> Option<usize> {
-    fn number(s: &str) -> Option<&str> {
-        let rest = s.trim_start_matches(|c: char| c.is_ascii_digit());
-        (rest.len() < s.len()).then_some(rest)
-    }
-    let rest = if let Some(r) = s.strip_prefix("[Pasted text #") {
-        let r = number(r)?;
-        let r = match r.strip_prefix(" +") {
-            Some(lines) => number(lines)?.strip_prefix(" lines")?,
-            None => r,
-        };
-        r.strip_prefix(']')?
-    } else {
-        number(s.strip_prefix("[Pasted Content ")?)?.strip_prefix(" chars]")?
-    };
-    Some(s.len() - rest.len())
-}
-
-/// Every place `lit` starts in `s`, overlapping ones included.
-fn starts<'a>(s: &'a str, lit: &'a str) -> impl Iterator<Item = usize> + 'a {
-    (0..=s.len()).filter(move |&i| s.is_char_boundary(i) && s[i..].starts_with(lit))
-}
-
-/// Whether `toks` spans the whole of `s`.
-fn glob(toks: &[Tok], s: &str) -> bool {
-    match toks.split_first() {
-        None => s.is_empty(),
-        Some((Tok::Lit(lit), rest)) => s.strip_prefix(lit.as_str()).is_some_and(|r| glob(rest, r)),
-        Some((Tok::Break { space, join }, rest)) => {
-            s.strip_prefix('\n').is_some_and(|r| glob(rest, r))
-                || (*space && s.strip_prefix(' ').is_some_and(|r| glob(rest, r)))
-                || (*join && glob(rest, s))
-        }
-        Some((Tok::Any(min), rest)) => match rest.split_first() {
-            None => s.chars().count() >= *min,
-            Some((Tok::Any(more), after)) => {
-                glob(&[[Tok::Any(min + more)].as_slice(), after].concat(), s)
-            }
-            Some((Tok::Lit(lit), _)) => {
-                starts(s, lit).any(|i| s[..i].chars().count() >= *min && glob(rest, &s[i..]))
-            }
-            Some((Tok::Break { .. }, _)) => (0..=s.len())
-                .filter(|&i| s.is_char_boundary(i) && s[..i].chars().count() >= *min)
-                .any(|i| glob(rest, &s[i..])),
-        },
     }
 }
 
@@ -1251,7 +975,6 @@ mod tests {
 
     const ENTER: &str = "13";
     const ESC: &str = "27";
-    const CTRL_C: &str = "3";
     const TAB: &str = "9";
     const KITTY_ENTER: &str = "27 91 49 51 59 49 58 49 117";
     /// What a write of text is recorded as among the keys.
@@ -1265,13 +988,11 @@ mod tests {
         }
     }
 
-    /// `text` in `tool`'s input, its lines as the harness draws them.
+    /// `text` in `tool`'s input, one row a line.
     fn input(tool: Tool, text: &str) -> String {
         let glyph = if tool == Tool::Claude { '❯' } else { '›' };
-        let width = if tool == Tool::Claude { 32 } else { 40 } - 2;
         let rows: Vec<String> = text
             .split('\n')
-            .flat_map(|line| wrapped(line, width))
             .enumerate()
             .map(|(i, row)| match i {
                 0 => format!("{glyph} {row}"),
@@ -1284,29 +1005,6 @@ mod tests {
         } else {
             codex(&rows)
         }
-    }
-
-    /// `line` in rows of `width` the way a terminal input wraps it: at the
-    /// last space that fits, the space taken by the break, and a word
-    /// longer than a row split where the row ends.
-    fn wrapped(line: &str, width: usize) -> Vec<String> {
-        let mut rows = vec![String::new()];
-        for (i, word) in line.split(' ').enumerate() {
-            let row = rows.last_mut().unwrap();
-            let len = row.chars().count();
-            if i > 0 && len + 1 + word.chars().count() <= width {
-                row.push(' ');
-            } else if i > 0 {
-                rows.push(String::new());
-            }
-            for c in word.chars() {
-                if rows.last().unwrap().chars().count() == width {
-                    rows.push(String::new());
-                }
-                rows.last_mut().unwrap().push(c);
-            }
-        }
-        rows
     }
 
     /// Claude's screen while a turn runs.
@@ -1335,13 +1033,13 @@ mod tests {
         }
 
         /// The text a well-behaved harness holds in its input now: the
-        /// last typed, until a submit key or Ctrl-C takes it.
+        /// last typed, until a submit key takes it.
         fn pending(&self) -> Option<String> {
             let mut held = None;
             for (_, argv) in &self.writes {
                 match key(argv).as_str() {
                     TEXT => held = Some(argv.last().unwrap().clone()),
-                    ENTER | TAB | KITTY_ENTER | CTRL_C => held = None,
+                    ENTER | TAB | KITTY_ENTER => held = None,
                     _ => {}
                 }
             }
@@ -1356,7 +1054,6 @@ mod tests {
                 match key(argv).as_str() {
                     TEXT => held = Some(argv.last().unwrap().clone()),
                     ENTER | TAB | KITTY_ENTER => accepted.extend(held.take()),
-                    CTRL_C => held = None,
                     _ => {}
                 }
             }
@@ -1570,19 +1267,13 @@ mod tests {
             }
         }
 
-        /// The keys this path sends before any text: the interrupt.
-        fn lead(self) -> Vec<String> {
-            match self {
-                Path::Submit => Vec::new(),
-                Path::Wake | Path::Nudge => vec![ESC.to_string()],
-            }
-        }
-
-        /// `keys` after this path's interrupt.
-        fn then(self, keys: &[&str]) -> Vec<String> {
-            let mut all = self.lead();
-            all.extend(keys.iter().map(|k| k.to_string()));
-            all
+        /// `keys` after the interrupt this path sends an idle `tool`.
+        fn then(self, tool: Tool, keys: &[&str]) -> Vec<String> {
+            let lead = match (self, tool) {
+                (Path::Submit, _) | (_, Tool::Claude) => None,
+                _ => Some(ESC),
+            };
+            lead.iter().chain(keys).map(|k| k.to_string()).collect()
         }
 
         fn submit_key(self, tool: Tool) -> &'static str {
@@ -1596,9 +1287,20 @@ mod tests {
 
     const PAYLOAD: &str = "Experiment rules: stay inside the scratch dir";
 
-    /// Interrupt, then the message, then its own submit key, for every
-    /// provider whose input can be read, and the harness's record of it
-    /// confirms it whole.
+    /// The text of every `write-chars` sent.
+    fn typed(h: &Harness) -> Vec<String> {
+        h.written
+            .borrow()
+            .iter()
+            .filter(|(_, a)| key(a) == TEXT)
+            .map(|(_, a)| a.last().unwrap().clone())
+            .collect()
+    }
+
+    /// For every provider whose input can be read: the message after a
+    /// space in one write, its own submit key once, a second after it, and
+    /// the harness's record of it confirms it. An idle Claude gets no
+    /// interrupt key; Codex gets one on every interrupting path.
     #[tokio::test(start_paused = true)]
     async fn every_path_types_once_submits_once_and_is_confirmed_by_the_record() {
         for tool in [Tool::Claude, Tool::Codex] {
@@ -1611,88 +1313,225 @@ mod tests {
                 );
                 assert_eq!(
                     h.keys(),
-                    path.then(&[TEXT, path.submit_key(tool)]),
+                    path.then(tool, &[TEXT, path.submit_key(tool)]),
+                    "{tool:?} {path:?}"
+                );
+                assert_eq!(typed(&h), [format!(" {PAYLOAD}")], "{tool:?} {path:?}");
+                let written = h.written.borrow();
+                let [.., (text_at, _), (submit_at, _)] = written.as_slice() else {
+                    panic!("{tool:?} {path:?}");
+                };
+                assert!(*submit_at - *text_at >= BEFORE_SUBMIT, "{tool:?} {path:?}");
+            }
+        }
+    }
+
+    /// Claude gets Esc only while its turn runs: busy, Esc then the text;
+    /// idle, the text alone. A path that never interrupts sends no Esc
+    /// either way.
+    #[tokio::test(start_paused = true)]
+    async fn claude_is_interrupted_only_while_its_turn_runs() {
+        for path in PATHS {
+            let h = Harness::new(Tool::Claude).screen(|s| {
+                let shown = s.pending().unwrap_or_default();
+                Some(match s.count(ESC) {
+                    0 => busy(&shown),
+                    _ => input(Tool::Claude, &shown),
+                })
+            });
+            assert_eq!(
+                path.send(&h, PAYLOAD).await,
+                Got::Delivered(Delivered::Whole),
+                "{path:?}"
+            );
+            let expected: &[&str] = match path {
+                Path::Submit => &[TEXT, ENTER],
+                Path::Wake | Path::Nudge => &[ESC, TEXT, ENTER],
+            };
+            assert_eq!(h.keys(), expected, "{path:?}");
+            let idle = Harness::new(Tool::Claude);
+            assert_eq!(
+                path.send(&idle, PAYLOAD).await,
+                Got::Delivered(Delivered::Whole)
+            );
+            assert_eq!(idle.keys(), [TEXT, ENTER], "{path:?}");
+        }
+    }
+
+    /// An input holding anything at all is refused untouched, before any
+    /// key: a person's words, the payload itself, the payload after the
+    /// space clank types, part of it, busy or idle.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_empty_input_gets_no_write_at_all() {
+        let spaced = format!(" {PAYLOAD}");
+        let drafts = ["half a thought", PAYLOAD, &spaced, &PAYLOAD[1..], "x"];
+        for draft in drafts {
+            for tool in [Tool::Claude, Tool::Codex] {
+                for running in [false, true] {
+                    for path in PATHS {
+                        let draft = draft.to_string();
+                        let h = Harness::new(tool).screen(move |_| {
+                            Some(match tool == Tool::Claude && running {
+                                true => busy(&draft),
+                                false => input(tool, &draft),
+                            })
+                        });
+                        assert_eq!(
+                            path.send(&h, PAYLOAD).await,
+                            Got::NotSent,
+                            "{tool:?} {path:?} {running}"
+                        );
+                        assert!(h.keys().is_empty(), "{tool:?} {path:?} {running}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The input reads as empty before the interrupt and not after it, a
+    /// draft, unreadable or shell mode: only the interrupt was sent, and
+    /// the outcome is an interrupt delivered, its message unconfirmed.
+    #[tokio::test(start_paused = true)]
+    async fn after_an_interrupt_only_an_empty_input_is_typed_into() {
+        for tool in [Tool::Claude, Tool::Codex] {
+            let afters = [
+                Some(input(tool, "a person's draft")),
+                None,
+                Some(match tool {
+                    Tool::Claude => "❯ old\n╭ Allow? ╮".to_string(),
+                    _ => "› \n never ends".to_string(),
+                }),
+                Some(match tool {
+                    Tool::Claude => claude(&["! "]),
+                    _ => codex(&["› !git"]),
+                }),
+            ];
+            for after in afters {
+                for path in [Path::Wake, Path::Nudge] {
+                    let shown = after.clone();
+                    let h = Harness::new(tool).screen(move |s| match s.count(ESC) {
+                        0 if tool == Tool::Claude => Some(busy("")),
+                        0 => Some(input(tool, "")),
+                        _ => shown.clone(),
+                    });
+                    let text = Admitted::new(PAYLOAD);
+                    let tried = match path {
+                        Path::Wake => {
+                            interrupt_and_submit_on(&h, &mut reading(&h), target(tool), &text).await
+                        }
+                        _ => interrupt_then_type(&h, &mut reading(&h), target(tool), &text).await,
+                    };
+                    assert!(
+                        matches!(tried, Err(Unconfirmed::Submit(_))),
+                        "{tool:?} {path:?} {after:?}: {tried:?}"
+                    );
+                    assert_eq!(h.keys(), [ESC], "{tool:?} {path:?} {after:?}");
+                }
+            }
+        }
+    }
+
+    /// The record holds the payload with the space clank typed, or with
+    /// that space lost: either is this attempt's.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_with_or_without_the_leading_space_confirms() {
+        for keep in [true, false] {
+            for path in PATHS {
+                let h = Harness::new(Tool::Claude).records(move |s| {
+                    s.accepted()
+                        .iter()
+                        .map(|t| claude_user(if keep { t } else { &t[1..] }))
+                        .collect()
+                });
+                assert_eq!(
+                    path.send(&h, PAYLOAD).await,
+                    Got::Delivered(Delivered::Whole),
+                    "{keep} {path:?}"
+                );
+            }
+        }
+    }
+
+    /// A record of the payload with any character but the leading space
+    /// lost confirms nothing, and nothing is sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_missing_another_character_confirms_nothing() {
+        let cuts: [fn(&str) -> String; 3] = [
+            |t| t[2..].to_string(),
+            |t| format!(" {}", &t[2..]),
+            |t| t[..t.len() - 1].to_string(),
+        ];
+        for cut in cuts {
+            for path in PATHS {
+                let h = Harness::new(Tool::Claude)
+                    .records(move |s| s.accepted().iter().map(|t| claude_user(&cut(t))).collect());
+                assert_eq!(path.send(&h, PAYLOAD).await, Got::Indeterminate, "{path:?}");
+                assert_eq!(h.keys(), [TEXT, ENTER], "{path:?}");
+            }
+        }
+    }
+
+    /// The first submit key taken, its record late, and a person's draft in
+    /// the input meanwhile: no second key is sent and the draft is left
+    /// alone. The record arriving in time confirms; never arriving, the
+    /// outcome is indeterminate.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_record_and_a_new_draft_get_no_second_key() {
+        for tool in [Tool::Claude, Tool::Codex] {
+            for (late, got) in [
+                (Duration::from_secs(4), Got::Delivered(Delivered::Whole)),
+                (Duration::from_secs(60), Got::Indeterminate),
+            ] {
+                for path in PATHS {
+                    let submit = path.submit_key(tool);
+                    let h = Harness::new(tool)
+                        .screen(move |s| {
+                            Some(match s.count(submit) {
+                                0 => input(tool, &s.pending().unwrap_or_default()),
+                                _ => input(tool, "a person's own draft"),
+                            })
+                        })
+                        .records(move |s| match s.since(submit) {
+                            Some(t) if t >= late => {
+                                s.accepted().iter().map(|t| record(tool, t)).collect()
+                            }
+                            _ => Vec::new(),
+                        });
+                    assert_eq!(path.send(&h, PAYLOAD).await, got, "{tool:?} {path:?}");
+                    assert_eq!(
+                        h.keys(),
+                        path.then(tool, &[TEXT, submit]),
+                        "{tool:?} {path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The submit key lost, the text still in the input: the outcome is
+    /// indeterminate and the key is not pressed again.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_submit_key_is_not_replayed() {
+        for tool in [Tool::Claude, Tool::Codex] {
+            for path in PATHS {
+                let h = Harness::new(tool)
+                    .screen(move |s| {
+                        let typed = s.count(TEXT) > 0;
+                        Some(input(tool, if typed { PAYLOAD } else { "" }))
+                    })
+                    .records(|_| Vec::new());
+                assert_eq!(path.send(&h, PAYLOAD).await, Got::Indeterminate);
+                assert_eq!(
+                    h.keys(),
+                    path.then(tool, &[TEXT, path.submit_key(tool)]),
                     "{tool:?} {path:?}"
                 );
             }
         }
     }
 
-    /// A frame still showing the empty input after the text was typed is
-    /// waited past, not typed into again.
-    #[tokio::test(start_paused = true)]
-    async fn a_stale_empty_input_is_waited_past() {
-        for path in PATHS {
-            let h = Harness::new(Tool::Claude).screen(|s| {
-                let late = s
-                    .since(TEXT)
-                    .is_some_and(|t| t < Duration::from_millis(500));
-                let shown = s.pending().filter(|_| !late).unwrap_or_default();
-                Some(input(Tool::Claude, &shown))
-            });
-            assert_eq!(
-                path.send(&h, PAYLOAD).await,
-                Got::Delivered(Delivered::Whole)
-            );
-            assert_eq!(h.keys(), path.then(&[TEXT, ENTER]), "{path:?}");
-        }
-    }
-
-    /// Text that shows only after its budget may still arrive, so it is
-    /// neither submitted nor retyped.
-    #[tokio::test(start_paused = true)]
-    async fn text_shown_too_late_is_not_retyped() {
-        for path in PATHS {
-            let h = Harness::new(Tool::Claude).screen(|s| {
-                let late = s.since(TEXT).is_some_and(|t| t < Duration::from_secs(5));
-                let shown = s.pending().filter(|_| !late).unwrap_or_default();
-                Some(input(Tool::Claude, &shown))
-            });
-            assert_eq!(path.send(&h, PAYLOAD).await, Got::Indeterminate, "{path:?}");
-            assert_eq!(h.keys(), path.then(&[TEXT]), "{path:?}");
-        }
-    }
-
-    /// The first character lost on the way in, while idle: the rest is
-    /// clank's own, so it is cleared and the text typed once more.
-    #[tokio::test(start_paused = true)]
-    async fn a_lost_first_character_while_idle_is_cleared_and_retyped() {
-        for path in PATHS {
-            let h = Harness::new(Tool::Claude).screen(|s| {
-                let shown = match s.pending() {
-                    Some(t) if s.count(TEXT) == 1 => t[1..].to_string(),
-                    other => other.unwrap_or_default(),
-                };
-                Some(input(Tool::Claude, &shown))
-            });
-            assert_eq!(
-                path.send(&h, PAYLOAD).await,
-                Got::Delivered(Delivered::Whole)
-            );
-            assert_eq!(
-                h.keys(),
-                path.then(&[TEXT, CTRL_C, TEXT, ENTER]),
-                "{path:?}"
-            );
-        }
-    }
-
-    /// The same while a turn runs: Ctrl-C would interrupt it, so nothing
-    /// is cleared and the outcome is indeterminate.
-    #[tokio::test(start_paused = true)]
-    async fn a_lost_first_character_while_a_turn_runs_sends_no_ctrl_c() {
-        let h = Harness::new(Tool::Claude).screen(|s| {
-            Some(busy(
-                &s.pending().map(|t| t[1..].to_string()).unwrap_or_default(),
-            ))
-        });
-        assert_eq!(Path::Submit.send(&h, PAYLOAD).await, Got::Indeterminate);
-        assert_eq!(h.keys(), [TEXT]);
-    }
-
     /// A record agreeing on the first line and not a later one is someone
-    /// else's prompt: the input emptying does not confirm this one, and it
-    /// is not resent.
+    /// else's prompt, and nothing is sent again.
     #[tokio::test(start_paused = true)]
     async fn a_record_matching_only_the_first_line_confirms_nothing() {
         let payload = "first line\nsecond line";
@@ -1704,61 +1543,7 @@ mod tests {
                     .collect()
             });
             assert_eq!(path.send(&h, payload).await, Got::Indeterminate, "{path:?}");
-            assert_eq!(h.keys(), path.then(&[TEXT, ENTER]), "{path:?}");
-        }
-    }
-
-    /// The first Enter taken while the frame still shows the text, and its
-    /// record written only after the settle delay: one more Enter at most,
-    /// and one confirmation.
-    #[tokio::test(start_paused = true)]
-    async fn a_late_record_behind_a_stale_frame_takes_at_most_one_more_enter() {
-        let h = Harness::new(Tool::Claude)
-            .screen(|s| {
-                let stale = s
-                    .since(ENTER)
-                    .is_some_and(|t| t < Duration::from_millis(1500));
-                let shown = match s.writes.iter().any(|(_, a)| key(a) == ENTER) {
-                    true if stale => PAYLOAD.to_string(),
-                    true => String::new(),
-                    false => s.pending().unwrap_or_default(),
-                };
-                Some(input(Tool::Claude, &shown))
-            })
-            .records(|s| {
-                let first = s.writes.iter().find(|(_, a)| key(a) == ENTER);
-                first
-                    .filter(|(t, _)| s.at >= *t + Duration::from_millis(1200))
-                    .map(|_| vec![claude_user(PAYLOAD)])
-                    .unwrap_or_default()
-            });
-        assert_eq!(
-            Path::Submit.send(&h, PAYLOAD).await,
-            Got::Delivered(Delivered::Whole)
-        );
-        assert_eq!(h.keys(), [TEXT, ENTER, ENTER]);
-    }
-
-    /// The Enter lost, the whole text still in the input: Claude gets one
-    /// more Enter; Codex, on its Tab and its kitty Enter alike, none.
-    #[tokio::test(start_paused = true)]
-    async fn a_lost_submit_key_is_pressed_once_more_on_claude_only() {
-        for tool in [Tool::Claude, Tool::Codex] {
-            for path in PATHS {
-                let h = Harness::new(tool)
-                    .screen(move |s| {
-                        let typed = s.writes.iter().any(|(_, a)| key(a) == TEXT);
-                        Some(input(tool, if typed { PAYLOAD } else { "" }))
-                    })
-                    .records(|_| Vec::new());
-                assert_eq!(path.send(&h, PAYLOAD).await, Got::Indeterminate);
-                let submit = path.submit_key(tool);
-                let expected: &[&str] = match tool {
-                    Tool::Claude => &[TEXT, submit, ENTER],
-                    _ => &[TEXT, submit],
-                };
-                assert_eq!(h.keys(), path.then(expected), "{tool:?} {path:?}");
-            }
+            assert_eq!(h.keys(), [TEXT, ENTER], "{path:?}");
         }
     }
 
@@ -1771,7 +1556,7 @@ mod tests {
                 .before(&[claude_user(PAYLOAD), claude_enqueue(PAYLOAD)])
                 .records(|_| Vec::new());
             assert_eq!(path.send(&h, PAYLOAD).await, Got::Indeterminate, "{path:?}");
-            assert_eq!(h.keys(), path.then(&[TEXT, ENTER]), "{path:?}");
+            assert_eq!(h.keys(), [TEXT, ENTER], "{path:?}");
         }
     }
 
@@ -1839,21 +1624,6 @@ mod tests {
         assert_eq!(h.keys(), [TEXT, ENTER]);
     }
 
-    /// A record of the text with its start lost is this attempt's, altered.
-    #[tokio::test(start_paused = true)]
-    async fn a_suffix_recorded_is_delivered_altered() {
-        for path in PATHS {
-            let h = Harness::new(Tool::Claude)
-                .records(|s| s.accepted().iter().map(|t| claude_user(&t[1..])).collect());
-            assert_eq!(
-                path.send(&h, PAYLOAD).await,
-                Got::Delivered(Delivered::Altered),
-                "{path:?}"
-            );
-            assert_eq!(h.keys(), path.then(&[TEXT, ENTER]), "{path:?}");
-        }
-    }
-
     /// A record that shrinks, or a binding that changes, mid-attempt: what
     /// follows cannot be attributed to it.
     #[tokio::test(start_paused = true)]
@@ -1881,85 +1651,6 @@ mod tests {
         );
     }
 
-    /// The whole payload already in the input is sent with the submit key,
-    /// not typed again.
-    #[tokio::test(start_paused = true)]
-    async fn a_draft_of_the_whole_payload_gets_only_the_submit_key() {
-        for path in PATHS {
-            let h = Harness::new(Tool::Claude)
-                .screen(|s| {
-                    Some(input(
-                        Tool::Claude,
-                        if s.count(ENTER) > 0 { "" } else { PAYLOAD },
-                    ))
-                })
-                .records(|s| match s.count(ENTER) {
-                    0 => Vec::new(),
-                    _ => vec![claude_user(PAYLOAD)],
-                });
-            assert_eq!(
-                path.send(&h, PAYLOAD).await,
-                Got::Delivered(Delivered::Whole)
-            );
-            assert_eq!(h.keys(), path.then(&[ENTER]), "{path:?}");
-        }
-    }
-
-    /// A proper suffix of the payload in an idle input, short or long, is
-    /// clank's own leftover: cleared, then the text typed.
-    #[tokio::test(start_paused = true)]
-    async fn a_suffix_draft_while_idle_is_cleared_then_typed() {
-        for cut in [PAYLOAD.len() - 3, 1] {
-            for path in PATHS {
-                let h = Harness::new(Tool::Claude).screen(move |s| {
-                    let shown = match s.count(CTRL_C) {
-                        0 => PAYLOAD[cut..].to_string(),
-                        _ => s.pending().unwrap_or_default(),
-                    };
-                    Some(input(Tool::Claude, &shown))
-                });
-                assert_eq!(
-                    path.send(&h, PAYLOAD).await,
-                    Got::Delivered(Delivered::Whole)
-                );
-                assert_eq!(
-                    h.keys(),
-                    path.then(&[CTRL_C, TEXT, ENTER]),
-                    "{cut} {path:?}"
-                );
-            }
-        }
-    }
-
-    /// A draft that is not clank's own text is refused untouched, before
-    /// any key: the payload with more after it, a suffix with a character
-    /// changed, a person's own words, and the payload with a space
-    /// dropped, doubled, moved or turned into a line break.
-    #[tokio::test(start_paused = true)]
-    async fn a_foreign_draft_is_refused_with_no_key_sent() {
-        let changed = format!("q{}", &PAYLOAD[2..]);
-        let more = format!("{PAYLOAD} and more");
-        let dropped = PAYLOAD.replacen(' ', "", 1);
-        let doubled = PAYLOAD.replacen(' ', "  ", 1);
-        let moved = PAYLOAD.replacen("stay inside", "stayi nside", 1);
-        let broken = PAYLOAD.replacen(' ', "\n", 1);
-        let drafts = [&more, &changed, &dropped, &doubled, &moved, &broken];
-        for draft in drafts.iter().map(|d| d.as_str()).chain(["half a thought"]) {
-            for tool in [Tool::Claude, Tool::Codex] {
-                for path in PATHS {
-                    let draft = draft.to_string();
-                    let h = Harness::new(tool).screen(move |_| Some(input(tool, &draft)));
-                    assert_eq!(
-                        path.send(&h, PAYLOAD).await,
-                        Got::NotSent,
-                        "{tool:?} {path:?}"
-                    );
-                    assert!(h.keys().is_empty(), "{tool:?} {path:?}");
-                }
-            }
-        }
-    }
-
     /// How long `path` took, and what it came to, bounded well past the
     /// attempt so a send that outlives it fails rather than hangs.
     async fn timed(path: Path, h: &Harness) -> (Duration, Option<Got>) {
@@ -1970,14 +1661,14 @@ mod tests {
         (start.elapsed(), got)
     }
 
-    /// A terminal taking three seconds a read and a write: the attempt ends
+    /// A terminal taking four seconds a read and a write: the attempt ends
     /// by its deadline, never sends its submit key, and claims nothing.
     #[tokio::test(start_paused = true)]
     async fn a_slow_terminal_never_gets_a_submit_key_past_the_deadline() {
         for tool in [Tool::Claude, Tool::Codex] {
             for path in PATHS {
                 let mut h = Harness::new(tool);
-                h.lag = Some(Duration::from_secs(3));
+                h.lag = Some(Duration::from_secs(4));
                 let (took, got) = timed(path, &h).await;
                 assert!(took <= ATTEMPT, "{tool:?} {path:?}: {took:?}");
                 assert_eq!(got, Some(Got::Indeterminate), "{tool:?} {path:?}");
@@ -2020,21 +1711,8 @@ mod tests {
         assert_eq!(h.keys(), [TEXT, ENTER]);
     }
 
-    /// An input that cannot be read after the text was typed is
-    /// indeterminate: the text may be there.
-    #[tokio::test(start_paused = true)]
-    async fn an_input_unreadable_mid_attempt_is_indeterminate() {
-        for path in PATHS {
-            let h = Harness::new(Tool::Claude)
-                .screen(|s| (s.count(TEXT) == 0).then(|| input(Tool::Claude, "")));
-            assert_eq!(path.send(&h, PAYLOAD).await, Got::Indeterminate, "{path:?}");
-            assert_eq!(h.keys(), path.then(&[TEXT]), "{path:?}");
-        }
-    }
-
-    /// Without a binding to read, nothing can confirm the prompt: Claude's
-    /// second Enter still rests on its key contract, and the outcome is
-    /// indeterminate.
+    /// Without a binding to read, nothing can confirm the prompt: the
+    /// outcome is indeterminate, and nothing is sent again.
     #[tokio::test(start_paused = true)]
     async fn without_a_record_nothing_is_confirmed() {
         struct Unbound;
@@ -2059,64 +1737,6 @@ mod tests {
             "{tried:?}"
         );
         assert_eq!(h.keys(), [TEXT, ENTER]);
-    }
-
-    /// `text` as `tool`'s input shows it.
-    fn shown(tool: Tool, text: &str) -> crate::cli::composer::Shown {
-        crate::cli::composer::typed(tool, &input(tool, text)).unwrap()
-    }
-
-    /// The harness's paste placeholders stand for some of the payload once
-    /// clank has typed it, never before; a part of it is still arriving.
-    #[test]
-    fn placeholders_stand_for_typed_text_only() {
-        let sent = "aaa bbb ccc ddd";
-        let of = |text: &str, typed| measure(&shown(Tool::Claude, text), sent, typed);
-        assert_eq!(of("[Pasted text #1 +3 lines] ddd", true), Held::Whole);
-        assert_eq!(of("[Pasted Content 12 chars]", true), Held::Whole);
-        assert_eq!(of("aa[Pasted text #2] ccc", true), Held::Arriving);
-        assert_eq!(of("[Pasted text #1]", false), Held::Other(FOREIGN));
-        assert_eq!(of("aa bbb ccc ddd", true), Held::Suffix);
-        assert_eq!(of("aaa bb", true), Held::Arriving);
-        assert_eq!(of("aaa bb", false), Held::Other(FOREIGN));
-        assert_eq!(of("[Pasted text #1] eee", true), Held::Other(FOREIGN));
-    }
-
-    /// Whitespace inside a row is the draft's own, and a row break is a
-    /// space or nothing only where the row was too full to go on: a draft
-    /// with its spaces moved, doubled, dropped, or broken into lines is not
-    /// the payload, while the payload wrapped is.
-    #[test]
-    fn whitespace_is_measured_exactly() {
-        let sent = "run tests now";
-        for tool in [Tool::Claude, Tool::Codex] {
-            let of = |text: &str| measure(&shown(tool, text), sent, false);
-            assert_eq!(of(sent), Held::Whole, "{tool:?}");
-            assert_eq!(of("un tests now"), Held::Suffix, "{tool:?}");
-            for other in [
-                "runtests now",
-                "run  tests now",
-                "ru ntests now",
-                "run tests\nnow",
-                "run\ntests now",
-                "untests now",
-            ] {
-                assert_eq!(of(other), Held::Other(FOREIGN), "{tool:?} {other:?}");
-            }
-        }
-        let long = "a line long enough that the input must wrap it over its rows";
-        let word = "x".repeat(70);
-        for tool in [Tool::Claude, Tool::Codex] {
-            assert!(shown(tool, long).rows.len() > 1, "{tool:?}");
-            assert_eq!(measure(&shown(tool, long), long, false), Held::Whole);
-            assert_eq!(measure(&shown(tool, &word), &word, false), Held::Whole);
-            let squeezed = long.replacen(' ', "", 1);
-            assert_eq!(
-                measure(&shown(tool, &squeezed), long, false),
-                Held::Other(FOREIGN),
-                "{tool:?}"
-            );
-        }
     }
 
     /// An interrupt whose delivery is UNKNOWN is not called safe to
@@ -2162,23 +1782,32 @@ mod tests {
     /// follows it: an unconfirmed MESSAGE would invite a resend.
     #[tokio::test]
     async fn a_failed_interrupt_write_is_an_interrupt_failure_and_types_nothing() {
-        for path in [Path::Wake, Path::Nudge] {
-            let mut h = Harness::new(Tool::Claude);
-            h.answer = Box::new(|_| {
-                Err(PaneWrite::Unknown(
-                    "terminal input transport timed out; acceptance is unknown".into(),
-                ))
-            });
-            let text = Admitted::new("hello");
-            let error = match path {
-                Path::Wake => {
-                    interrupt_and_submit_on(&h, &mut reading(&h), target(Tool::Claude), &text).await
+        for (tool, screen) in [
+            (Tool::Claude, busy("")),
+            (Tool::Codex, input(Tool::Codex, "")),
+        ] {
+            for path in [Path::Wake, Path::Nudge] {
+                let shown = screen.clone();
+                let mut h = Harness::new(tool).screen(move |_| Some(shown.clone()));
+                h.answer = Box::new(|_| {
+                    Err(PaneWrite::Unknown(
+                        "terminal input transport timed out; acceptance is unknown".into(),
+                    ))
+                });
+                let text = Admitted::new("hello");
+                let error = match path {
+                    Path::Wake => {
+                        interrupt_and_submit_on(&h, &mut reading(&h), target(tool), &text).await
+                    }
+                    _ => interrupt_then_type(&h, &mut reading(&h), target(tool), &text).await,
                 }
-                _ => interrupt_then_type(&h, &mut reading(&h), target(Tool::Claude), &text).await,
+                .unwrap_err();
+                assert_eq!(h.keys(), [ESC], "{tool:?} {path:?}: only the interrupt");
+                assert!(
+                    matches!(error, Unconfirmed::Interrupt(_)),
+                    "{tool:?} {path:?}"
+                );
             }
-            .unwrap_err();
-            assert_eq!(h.keys(), [ESC], "{path:?}: only the interrupt");
-            assert!(matches!(error, Unconfirmed::Interrupt(_)), "{path:?}");
         }
     }
 
@@ -2239,7 +1868,8 @@ mod tests {
     }
 
     /// Every ordinary sequence types the ADMITTED text: a raw `!` line and
-    /// a CR handed in arrive encoded, LF kept.
+    /// a CR handed in arrive encoded, LF kept, after the space a prompt
+    /// typed by `deliver` opens with.
     #[tokio::test(start_paused = true)]
     async fn every_ordinary_sequence_types_the_admitted_text() {
         let raw = "!git push\rnext\nline";
@@ -2253,7 +1883,11 @@ mod tests {
                 .iter()
                 .find(|(_, a)| key(a) == TEXT)
                 .cloned();
-            assert_eq!(typed.unwrap().1.last().unwrap(), expect, "{tool:?}");
+            assert_eq!(
+                typed.unwrap().1.last().unwrap(),
+                &format!(" {expect}"),
+                "{tool:?}"
+            );
         }
         let say = fake(idle(Tool::Claude));
         say_on(&say, "7", Tool::Claude, &Admitted::new(raw))

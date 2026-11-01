@@ -32,20 +32,19 @@ pub(crate) enum Trigger {
     UserCommand { id: String },
 }
 
-/// What the attempt could tell. Only `Submitted` and `Altered` mean the
-/// text arrived: for Claude and Codex by the harness's own record of it,
-/// for a harness that keeps none by the transport's acceptance. Neither
-/// says the agent read it.
+/// What the attempt could tell. Only `Submitted` means the text arrived:
+/// for Claude and Codex by the harness's own record of it, for a harness
+/// that keeps none by the transport's acceptance. It does not say the
+/// agent read it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Outcome {
     /// Nothing reached the harness.
     Refused { reason: String },
-    /// It arrived.
+    /// It arrived. `altered` is how older records said it arrived with
+    /// its start lost.
+    #[serde(alias = "altered")]
     Submitted,
-    /// It arrived with its start lost in typing: the harness recorded a
-    /// proper suffix of the text.
-    Altered,
     /// A recovery helper said it was submitting the wake. It says so before
     /// it exits to wake the harness, so the wake itself is unconfirmed.
     Reported,
@@ -73,7 +72,6 @@ impl Record {
     pub(crate) fn summary(&self) -> String {
         let what = match &self.outcome {
             Outcome::Submitted => "nudged".to_string(),
-            Outcome::Altered => "nudged, its start lost in typing".to_string(),
             Outcome::Reported => "nudge reported by helper · wake unconfirmed".to_string(),
             Outcome::Refused { reason } => format!("nudge refused: {reason}"),
             Outcome::Indeterminate { reason } => format!("nudge indeterminate: {reason}"),
@@ -186,6 +184,17 @@ mod tests {
         assert_eq!(read[1].attempt, "b");
     }
 
+    /// A record written as `altered` by an older clank reads back as the
+    /// delivery it was.
+    #[test]
+    fn an_older_altered_record_reads_back_as_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"at":1,"attempt":"a","trigger":{"kind":"manual"},"text":"x","outcome":{"kind":"altered"}}"#;
+        std::fs::write(path(dir.path()), format!("{line}\n")).unwrap();
+        let [record] = read(dir.path()).try_into().unwrap();
+        assert_eq!(record.outcome, Outcome::Submitted);
+    }
+
     /// A record torn inside a character costs only itself.
     #[test]
     fn a_record_torn_inside_a_character_costs_only_itself() {
@@ -237,11 +246,6 @@ mod tests {
         assert_eq!(
             r.summary(),
             "nudge reported by helper · wake unconfirmed · retry 2/3 after overloaded"
-        );
-        r.outcome = Outcome::Altered;
-        assert!(
-            r.summary()
-                .starts_with("nudged, its start lost in typing · retry")
         );
         r.outcome = Outcome::Indeterminate {
             reason: "the interrupt was not confirmed".into(),
