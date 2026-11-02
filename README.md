@@ -838,8 +838,15 @@ auto-mode drives it:
   turn but the plugin never reported it — usually an OpenCode that did not
   load the plugin. Launch
   repair also upgrades an existing setup-owned global copy, preserving local
-  edits through the usual non-force ownership checks. The launch profile carries the model:
-  `clank agent add kimi --tool opencode -- --model moonshotai/kimi-k3`.
+  edits through the usual non-force ownership checks. OpenCode 2.x's interactive
+  command takes no `--model`. A session keeps the model it was started
+  on, but the shared background service ignores a per-agent config. So
+  an agent that must start new sessions on its own model runs its own
+  server, with the model in its environment:
+  `clank agent add kimi --tool opencode --env
+  'OPENCODE_CONFIG_CONTENT={"model":"moonshotai/kimi-k3"}' -- --standalone`.
+  It resumes the agent's existing session, history included, but `clank
+  fork` refuses such a profile.
 
 ### An agent's launch
 
