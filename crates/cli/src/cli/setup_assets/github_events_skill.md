@@ -58,7 +58,11 @@ watched repos collide — the error message shows the qualified forms).
 
 ## Saying what to watch
 
-Two shapes. The flat one names kinds and scopes them with `prs` /
+Add a watch with `clank events watch add '<json>'`; `clank events
+watch list` numbers your sources and `clank events watch remove <n>`
+removes one. Never edit `config.json` by hand: `add` refuses, with
+nothing written, anything your next arm would refuse. The JSON is a
+github source in one of two shapes. The flat one names kinds and scopes them with `prs` /
 `branches`:
 
 ```json

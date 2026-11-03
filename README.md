@@ -485,7 +485,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see Extra wake sources) |
 | `run` | Run a long command under clank, so clank knows it is in hand (see below) |
 | `attend` | Tell clank which background work you are waiting on: a subagent by name, or a running task by id and `--pid` (see below) |
-| `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply` (see below) |
+| `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply`; the agent's standing wake sources: `watch list` / `watch add` / `watch remove` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
 | `user-command` | Deliver a person's site-signed command into the asking agent's terminal as `! <command>`: `trust-key` / `untrust-key` / `keys` / `submit` / `status` (see below) |
@@ -942,18 +942,36 @@ for every repo (`~/.clank/config.json`); a repo value shadows the global one.
 
 ## Extra wake sources
 
+An agent's standing wake sources (`wait_events` in its config) are managed
+with `clank events watch`:
+
+```sh
+clank events watch add '{"kind":"github","repo":"o/r","watch":[{"pr":{"events":["ci_passed","ci_failed"]}}]}'
+clank events watch list          # numbered from 1; -j prints the config JSON
+clank events watch remove 2
+```
+
+`add` takes one source in the JSON shape `clank wait --event` takes, and
+`--author <label>` names another agent than the session's own. A source an
+arm would refuse, beside the ones already configured, is refused with the
+arm's message and nothing is written; so is an exact duplicate. `remove`
+removes the entry `list` numbers, whatever the state of the others, so it
+can repair a config an arm refuses. The edit takes the same lock as every
+other write of the agent's config. There is no edit in place: remove and add
+again. Whether the source keeps its log then follows its identity, not the
+removal: a command source is its `name`, so a new argv under the same name
+keeps its history; a github watch is its repo and what it admits, so
+changing only its `prompt`, `poll_interval` or `delivery` keeps its log,
+while changing its events, scope or `include_own_actions` starts a fresh one.
+
 ### Scheduled and recurring events
 
-An agent can declare a native timer in `.clank/agents/<label>/config.json`:
+An agent can declare a native timer:
 
-```json
-{
-  "wait_events": [
-    {"kind":"timer", "name":"check-deploy",
-     "due_at":"2026-10-04T09:00:00+11:00",
-     "content":"Check the deployment and report the result."}
-  ]
-}
+```sh
+clank events watch add '{"kind":"timer", "name":"check-deploy",
+  "due_at":"2026-10-04T09:00:00+11:00",
+  "content":"Check the deployment and report the result."}'
 ```
 
 Timers default to one-shot occurrences, with a nonempty name and an absolute RFC3339
@@ -1027,8 +1045,8 @@ unsupported.
   right now?" probe.
 - `clank wait --for commit|finished|stopped` — OBSERVE a repo (often a
   foreign one via `--repo`) instead of waiting for your own work.
-- **Extra wake sources** (`wait_events` in the agent's config, or
-  repeatable `--event '<json>'`): `github` entries watch any repo
+- **Extra wake sources** (`clank events watch add '<json>'`, or
+  repeatable `--event '<json>'` for one wait): `github` entries watch any repo
   (PRs opened/updated/merged, comments, issues, branch pushes — your
   own actions filtered by default — and CI conclusions,
   `ci_passed` / `ci_failed`), and `command` entries run an argv that

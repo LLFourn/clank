@@ -17,6 +17,7 @@ use clank_core::wait::WaitItem;
 mod operation;
 mod read;
 mod reply;
+mod watch;
 use reply::ack_with_reply;
 
 pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
@@ -43,6 +44,7 @@ pub async fn run(args: super::EventsArgs) -> anyhow::Result<()> {
             show_metadata(rows, &a.id, a.json)
         }
         super::EventsCmd::Read(a) => read::run(a).await,
+        super::EventsCmd::Watch(a) => watch::run(a.command),
         super::EventsCmd::Reply(a) => {
             let (dir, _) = events_context(a.repo.as_deref(), a.author.as_deref())?;
             let rows = read_all(&dir)?;
@@ -64,13 +66,7 @@ fn events_context(
     repo: Option<&Path>,
     author: Option<&str>,
 ) -> anyhow::Result<(PathBuf, std::collections::HashMap<String, String>)> {
-    let repo = super::resolve_repo(repo)?;
-    let author = match author {
-        Some(raw) => {
-            AgentLabel::parse(raw).map_err(|e| anyhow::anyhow!("invalid --author `{raw}`: {e}"))?
-        }
-        None => crate::agent_env::resolve_identity_from_env(&repo)?,
-    };
+    let (repo, author) = resolve_author(repo, author)?;
     // Before the WAL is read, not after: a message still sitting in the
     // old file inbox belongs in this listing, and the reader is where a
     // person finds out it exists.
@@ -92,6 +88,22 @@ fn events_context(
         };
     let prompts = join_prompts(&githubs, &dir);
     Ok((dir, prompts))
+}
+
+/// The repo and the agent an `events` command acts for: `--author`,
+/// else the session's binding.
+fn resolve_author(
+    repo: Option<&Path>,
+    author: Option<&str>,
+) -> anyhow::Result<(PathBuf, AgentLabel)> {
+    let repo = super::resolve_repo(repo)?;
+    let author = match author {
+        Some(raw) => {
+            AgentLabel::parse(raw).map_err(|e| anyhow::anyhow!("invalid --author `{raw}`: {e}"))?
+        }
+        None => crate::agent_env::resolve_identity_from_env(&repo)?,
+    };
+    Ok((repo, author))
 }
 
 /// The source-key → prompt map, two tiers: the agent config is
