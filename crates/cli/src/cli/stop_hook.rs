@@ -339,7 +339,14 @@ fn session_started(
     use crate::agent_env::Start;
     let sid = clank_core::ids::SessionId::parse(&input.session_id).ok()?;
     let label = match crate::agent_env::session_start(repo, tool, &sid, launched_as) {
-        Ok(Start::Bound(label)) => return Some((label, tool)),
+        Ok(Start::Bound(label)) => {
+            if tool == Tool::Claude
+                && let Err(e) = crate::agent_store::resume_checked_in(repo, &label, &sid)
+            {
+                eprintln!("clank: cannot record that this resume checked in: {e:#}");
+            }
+            return Some((label, tool));
+        }
         Ok(Start::Unbound | Start::HeldElsewhere) => return None,
         Ok(Start::Bootstrap(label)) => label,
         Err(e) => {

@@ -52,6 +52,20 @@ pub struct AgentConfig {
     /// at arm time; a config edit takes effect on the next re-arm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wait_events: Vec<WaitEventSource>,
+    /// A resume `clank agent start` launched that its session has not yet
+    /// confirmed: Claude's SessionStart hook clears it. One left standing
+    /// past the check-in window has the next start forget the binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_pending: Option<ResumePending>,
+}
+
+/// An unconfirmed resume of `session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumePending {
+    pub session: SessionId,
+    /// RFC3339 UTC instant of the first unconfirmed attempt; a retry of
+    /// the same session keeps it, so retries do not extend the window.
+    pub at: String,
 }
 
 /// One extra wake source (extra-wait-events). Tagged sum type so the
@@ -1140,6 +1154,7 @@ mod tests {
                 transcript: None,
             }),
             wait_events: Vec::new(),
+            resume_pending: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();

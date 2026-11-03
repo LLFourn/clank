@@ -199,6 +199,7 @@ async fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         Purpose::Start,
         session_holder::find,
         &super::opencode_fork::Cli,
+        exec_composed,
     )
     .await
     .map(|_| ())
@@ -260,6 +261,9 @@ enum Purpose {
 /// [`session_holder::find`], or a test's answer.
 type FindHolder = fn(Option<&Session>, &AgentLabel, &Path, String) -> Holder;
 
+/// What runs a composed launch: [`exec_composed`], or a test's recorder.
+type Exec = fn(ComposedLaunch, Option<&Path>) -> anyhow::Result<()>;
+
 /// Refuse to start an agent with no bound session when a live pane in the
 /// repo's workspace already runs it, or may.
 fn refuse_a_second_fresh_copy(
@@ -290,6 +294,7 @@ async fn start_with(
     purpose: Purpose,
     find_holder: FindHolder,
     opencode: &dyn super::opencode_fork::Api,
+    exec: Exec,
 ) -> anyhow::Result<Option<ComposedLaunch>> {
     let print = args.print || purpose == Purpose::Preview;
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -343,6 +348,7 @@ async fn start_with(
     // entry must still get codex launch side effects; codex ff3ca44).
     let mut grok_checked = false;
     let mut consume_fork = false;
+    let mut await_check_in = None;
     let (mut composed, launch_tool) = match bound_session {
         // A seeded fork spec (clank fork) takes precedence over the
         // plain bootstrap on first launch: fork the source session
@@ -435,94 +441,121 @@ async fn start_with(
                 }
             }
         }
-        Some(session) => match match (
-            find_holder(
-                Some(session),
-                &label,
-                &repo,
-                launch_program(Tool::Claude, desc.launch.as_ref()),
-            ),
-            purpose,
-        ) {
-            (
+        Some(session) => {
+            let holder = match (
+                find_holder(
+                    Some(session),
+                    &label,
+                    &repo,
+                    launch_program(Tool::Claude, desc.launch.as_ref()),
+                ),
+                purpose,
+            ) {
+                (
+                    Holder::Pane {
+                        session: held_in,
+                        tab,
+                    },
+                    Purpose::Preview,
+                ) => {
+                    eprintln!(
+                        "`{label}` is running now in zellij session `{held_in}`, tab `{tab}`; \
+                     this is what its next start runs"
+                    );
+                    Holder::Nobody
+                }
+                (
+                    Holder::Uncertain {
+                        session: held_in,
+                        why,
+                    },
+                    Purpose::Preview,
+                ) => {
+                    eprintln!(
+                        "`{label}` may be running now in zellij session `{held_in}` ({why}); this \
+                     is what its next start runs"
+                    );
+                    Holder::Nobody
+                }
+                (holder, _) => holder,
+            };
+            let now = time::OffsetDateTime::now_utc();
+            let unconfirmed = !print
+                && session.tool == Tool::Claude
+                && never_checked_in(
+                    cfg.as_ref().and_then(|c| c.resume_pending.as_ref()),
+                    session,
+                    now,
+                    &holder,
+                );
+            match holder {
                 Holder::Pane {
                     session: held_in,
                     tab,
-                },
-                Purpose::Preview,
-            ) => {
-                eprintln!(
-                    "`{label}` is running now in zellij session `{held_in}`, tab `{tab}`; \
-                     this is what its next start runs"
-                );
-                Holder::Nobody
-            }
-            (
-                Holder::Uncertain {
-                    session: held_in,
-                    why,
-                },
-                Purpose::Preview,
-            ) => {
-                eprintln!(
-                    "`{label}` may be running now in zellij session `{held_in}` ({why}); this \
-                     is what its next start runs"
-                );
-                Holder::Nobody
-            }
-            (holder, _) => holder,
-        } {
-            Holder::Pane {
-                session: held_in,
-                tab,
-            } => anyhow::bail!(
-                "`{label}` is already running in zellij session `{held_in}`, tab `{tab}`. \
+                } => anyhow::bail!(
+                    "`{label}` is already running in zellij session `{held_in}`, tab `{tab}`. \
                  This pane would resume the same {} conversation a second time, which {} \
                  refuses. Close that pane, or attach to that session instead \
                  (`zellij attach {held_in}`).",
-                session.tool.as_str(),
-                session.tool.as_str(),
-            ),
-            Holder::Uncertain {
-                session: held_in,
-                why,
-            } => anyhow::bail!(
-                "`{label}` may already be running in zellij session `{held_in}`: {why}. This \
+                    session.tool.as_str(),
+                    session.tool.as_str(),
+                ),
+                Holder::Uncertain {
+                    session: held_in,
+                    why,
+                } => anyhow::bail!(
+                    "`{label}` may already be running in zellij session `{held_in}`: {why}. This \
                  pane could resume the same {} conversation a second time. Rename that pane \
                  to one agent's label, then retry.",
-                session.tool.as_str(),
-            ),
-            Holder::ClaudeBackground { short_id } => (
-                compose_attach_launch(session.tool, &label, desc.launch.as_ref(), &short_id),
-                session.tool,
-            ),
-            Holder::Nobody => {
-                if !print {
+                    session.tool.as_str(),
+                ),
+                Holder::ClaudeBackground { short_id } => (
+                    compose_attach_launch(session.tool, &label, desc.launch.as_ref(), &short_id),
+                    session.tool,
+                ),
+                Holder::Nobody if unconfirmed => {
                     super::setup::ensure_launch_setup(&repo, session.tool, desc.launch.as_ref())
                         .await?;
+                    (
+                        start_fresh_after_unconfirmed(&repo, &label, &desc, session, now)?,
+                        Tool::Claude,
+                    )
                 }
-                if session.tool == Tool::Grok {
-                    let provider =
-                        super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
-                    super::grok_launch::validate_resume(&provider, &repo, session.id.as_str())?;
+                Holder::Nobody => {
+                    if !print {
+                        super::setup::ensure_launch_setup(
+                            &repo,
+                            session.tool,
+                            desc.launch.as_ref(),
+                        )
+                        .await?;
+                    }
+                    if session.tool == Tool::Claude {
+                        await_check_in = Some(session.id.clone());
+                    }
+                    if session.tool == Tool::Grok {
+                        let provider =
+                            super::grok_launch::Provider::resolve(desc.launch.as_ref(), &repo)?;
+                        super::grok_launch::validate_resume(&provider, &repo, session.id.as_str())?;
+                    }
+                    let orientation = unlaunched_opencode_child(&repo, &label, session)?;
+                    consume_fork = orientation.is_some();
+                    let prompt = orientation
+                        .map(|spec| spec.prompt)
+                        .or_else(|| start_prompt(&desc, cfg.as_ref(), session.tool));
+                    (
+                        compose_launch(
+                            &repo,
+                            &label,
+                            session,
+                            desc.launch.as_ref(),
+                            prompt.as_deref(),
+                        ),
+                        session.tool,
+                    )
                 }
-                let orientation = unlaunched_opencode_child(&repo, &label, session)?;
-                consume_fork = orientation.is_some();
-                let prompt = orientation
-                    .map(|spec| spec.prompt)
-                    .or_else(|| start_prompt(&desc, cfg.as_ref(), session.tool));
-                (
-                    compose_launch(
-                        &repo,
-                        &label,
-                        session,
-                        desc.launch.as_ref(),
-                        prompt.as_deref(),
-                    ),
-                    session.tool,
-                )
             }
-        },
+        }
     };
 
     if print {
@@ -586,9 +619,57 @@ async fn start_with(
     // Failed setup or trust preparation must leave the one-shot fork retryable.
     let workdir = matches!(launch_tool, Tool::Grok | Tool::Claude).then_some(repo.as_path());
     launch_consuming_fork(&repo, &label, consume_fork, || {
-        exec_composed(composed, workdir)
+        if let Some(session) = &await_check_in
+            && let Err(e) = crate::agent_store::arm_resume(
+                &repo,
+                &label,
+                session,
+                time::OffsetDateTime::now_utc(),
+            )
+        {
+            eprintln!("clank: cannot record this resume as awaiting its check-in: {e:#}");
+        }
+        exec(composed, workdir)
     })
     .map(|()| None)
+}
+
+/// Whether the last resume of `bound` never checked in, so this start
+/// forgets it: its marker is for `bound`, at least
+/// [`crate::agent_store::CHECK_IN_WITHIN`] old, and nobody holds it.
+/// A policy, not proof the conversation is gone.
+fn never_checked_in(
+    marker: Option<&clank_core::agent_config::ResumePending>,
+    bound: &Session,
+    now: time::OffsetDateTime,
+    holder: &Holder,
+) -> bool {
+    *holder == Holder::Nobody && crate::agent_store::resume_unconfirmed(marker, &bound.id, now)
+}
+
+/// The bootstrap launch that replaces `session`, judged
+/// [`never_checked_in`]. The judgment is re-made under the binding lock
+/// as the binding is cleared; if anything changed since, nothing is
+/// cleared and nothing launches.
+fn start_fresh_after_unconfirmed(
+    repo: &Path,
+    label: &AgentLabel,
+    desc: &AgentDescription,
+    session: &Session,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<ComposedLaunch> {
+    let id = session.id.as_str();
+    if !crate::agent_store::release_unconfirmed_resume(repo, label, &session.id, now)? {
+        anyhow::bail!(
+            "`{label}`'s Claude session {id} changed while this start judged it never started, \
+             so it was kept; run `clank agent start {label}` again"
+        );
+    }
+    eprintln!(
+        "`{label}`'s Claude session {id} never started (no check-in from its last resume); \
+         starting a fresh one"
+    );
+    compose_bootstrap_launch(repo, label, desc)
 }
 
 /// Consume the fork intent, then hand over to `run`. The launched process
@@ -2494,6 +2575,7 @@ async fn launch_with(args: AgentConfigArgs, find_holder: FindHolder) -> anyhow::
         Purpose::Preview,
         find_holder,
         &super::opencode_fork::Cli,
+        exec_composed,
     )
     .await
     .map(|_| ())
@@ -4017,6 +4099,7 @@ mod tests {
             Purpose::Start,
             running_in_a_pane,
             &NoApiCalls,
+            never_launched,
         )
         .await
         .unwrap_err();
@@ -4104,6 +4187,10 @@ mod tests {
 
     struct NoApiCalls;
 
+    fn never_launched(c: ComposedLaunch, _: Option<&Path>) -> anyhow::Result<()> {
+        panic!("this start must launch nothing, launched {c:?}")
+    }
+
     impl crate::cli::opencode_fork::Api for NoApiCalls {
         fn call(
             &self,
@@ -4153,6 +4240,7 @@ mod tests {
             purpose,
             nobody_runs_it,
             &NoApiCalls,
+            never_launched,
         )
         .await
         .unwrap()
@@ -6148,5 +6236,350 @@ mod tests {
                 "x · tester — orient",
             ]
         );
+    }
+
+    const SUCCESSOR: &str = "0f3e5c2a-1b4d-4e6f-8a9b-0c1d2e3f4a5b";
+
+    fn instant(s: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    fn marker(session: &str, at: &str) -> clank_core::agent_config::ResumePending {
+        clank_core::agent_config::ResumePending {
+            session: SessionId::parse(session).unwrap(),
+            at: at.into(),
+        }
+    }
+
+    fn bound_claude(id: &str) -> Session {
+        Session {
+            id: SessionId::parse(id).unwrap(),
+            tool: Tool::Claude,
+            updated_at: "2026-11-03T00:00:00Z".into(),
+            transcript: Some("/t/a.jsonl".into()),
+        }
+    }
+
+    #[test]
+    fn a_resume_is_forgotten_only_when_its_own_marker_is_old_and_nobody_holds_it() {
+        let bound = bound_claude(OLD_SESSION);
+        let now = instant("2026-11-03T00:01:00Z");
+        let pane = Holder::Pane {
+            session: "s".into(),
+            tab: "t".into(),
+        };
+        let uncertain = Holder::Uncertain {
+            session: "s".into(),
+            why: "w".into(),
+        };
+        let old = marker(OLD_SESSION, "2026-11-03T00:00:00Z");
+        for (marker, holder, forgotten, why) in [
+            (Some(&old), &Holder::Nobody, true, "60s old, nobody"),
+            (
+                Some(&marker(OLD_SESSION, "2026-11-03T00:00:01Z")),
+                &Holder::Nobody,
+                false,
+                "younger",
+            ),
+            (
+                Some(&marker(SUCCESSOR, "2026-11-03T00:00:00Z")),
+                &Holder::Nobody,
+                false,
+                "another id",
+            ),
+            (Some(&old), &pane, false, "a live holder"),
+            (Some(&old), &uncertain, false, "an uncertain holder"),
+            (None, &Holder::Nobody, false, "no marker"),
+        ] {
+            assert_eq!(
+                never_checked_in(marker, &bound, now, holder),
+                forgotten,
+                "{why}"
+            );
+        }
+    }
+
+    thread_local! {
+        static LAUNCHED: std::cell::RefCell<Vec<ComposedLaunch>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_launch(c: ComposedLaunch, _: Option<&Path>) -> anyhow::Result<()> {
+        LAUNCHED.with(|l| l.borrow_mut().push(c));
+        Ok(())
+    }
+
+    fn launched() -> Vec<ComposedLaunch> {
+        LAUNCHED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// A git repo whose `browser2` is a Claude agent launched through a
+    /// stand-in that only answers `--version`, with its home and profile
+    /// in the tempdir: a real start there runs everything but the exec.
+    fn claude_agent() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_plumbing::init_repo(repo.path()).unwrap();
+        let program = repo.path().join("claude-stand-in");
+        std::fs::write(&program, "#!/bin/sh\nprintf '2.1.0 (Claude Code)\\n'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = serde_json::json!({
+            "command": program,
+            "env": {
+                "HOME": repo.path().join("home"),
+                "CLAUDE_CONFIG_DIR": repo.path().join("profile"),
+            },
+        });
+        seed_repo_config(
+            repo.path(),
+            &serde_json::json!({ "agents": {
+                "claude": { "tool": "claude", "role": "master" },
+                "browser2": { "tool": "claude", "role": "standby", "launch": launch },
+            } })
+            .to_string(),
+        );
+        repo
+    }
+
+    fn browser2() -> AgentLabel {
+        AgentLabel::parse("browser2").unwrap()
+    }
+
+    /// Bind `browser2` to `id`, its transcript recorded when `checked_in`.
+    fn bind_claude(repo: &Path, id: &str, checked_in: bool) {
+        let sid = SessionId::parse(id).unwrap();
+        crate::agent_store::bind_session_to_agent(repo, &browser2(), Tool::Claude, &sid).unwrap();
+        if checked_in {
+            crate::agent_store::record_transcript(repo, &browser2(), &sid, "/t/a.jsonl").unwrap();
+        }
+    }
+
+    fn set_marker(repo: &Path, m: Option<clank_core::agent_config::ResumePending>) {
+        crate::agent_store::update_agent_config(repo, &browser2(), |c| c.resume_pending = m)
+            .unwrap();
+    }
+
+    fn stored(repo: &Path) -> AgentConfig {
+        load_agent_config(repo, &browser2()).unwrap().unwrap()
+    }
+
+    async fn start_browser2(repo: &Path, print: bool) -> Option<ComposedLaunch> {
+        start_with(
+            AgentStartArgs {
+                name: "browser2".into(),
+                repo: Some(repo.to_path_buf()),
+                print,
+            },
+            Purpose::Start,
+            nobody_runs_it,
+            &NoApiCalls,
+            record_launch,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn resumes(c: &ComposedLaunch, id: &str) -> bool {
+        c.args.windows(2).any(|w| w[0] == "--resume" && w[1] == id)
+    }
+
+    fn ago(secs: i64) -> String {
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_real_bound_claude_start_arms_its_resume() {
+        let repo = claude_agent();
+        bind_claude(repo.path(), OLD_SESSION, true);
+        assert_eq!(start_browser2(repo.path(), false).await.map(|_| ()), None);
+        let [launch] = &launched()[..] else {
+            panic!("one launch")
+        };
+        assert!(resumes(launch, OLD_SESSION), "{launch:?}");
+        let armed = stored(repo.path()).resume_pending.unwrap();
+        assert_eq!(armed.session.as_str(), OLD_SESSION);
+    }
+
+    #[tokio::test]
+    async fn a_binding_with_no_recorded_transcript_is_resumed_unarmed() {
+        let repo = claude_agent();
+        bind_claude(repo.path(), OLD_SESSION, false);
+        start_browser2(repo.path(), false).await;
+        assert!(resumes(&launched()[0], OLD_SESSION));
+        assert_eq!(stored(repo.path()).resume_pending, None);
+    }
+
+    /// A retry inside the window resumes again, and does not push the
+    /// window back.
+    #[tokio::test]
+    async fn a_young_marker_resumes_and_keeps_its_first_attempt() {
+        let repo = claude_agent();
+        bind_claude(repo.path(), OLD_SESSION, true);
+        let first = marker(OLD_SESSION, &ago(10));
+        set_marker(repo.path(), Some(first.clone()));
+        start_browser2(repo.path(), false).await;
+        assert!(resumes(&launched()[0], OLD_SESSION));
+        assert_eq!(stored(repo.path()).resume_pending, Some(first));
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_never_checked_in_is_forgotten_and_starts_fresh() {
+        let repo = claude_agent();
+        bind_claude(repo.path(), OLD_SESSION, true);
+        set_marker(repo.path(), Some(marker(OLD_SESSION, &ago(120))));
+        start_browser2(repo.path(), false).await;
+        let [launch] = &launched()[..] else {
+            panic!("one launch")
+        };
+        assert!(
+            !launch
+                .args
+                .iter()
+                .any(|a| a == "--resume" || a == OLD_SESSION),
+            "{launch:?}"
+        );
+        assert_eq!(
+            launch.env_overrides.get("CLANK_AGENT").map(String::as_str),
+            Some("browser2")
+        );
+        let after = stored(repo.path());
+        assert_eq!((after.session, after.resume_pending), (None, None));
+    }
+
+    #[tokio::test]
+    async fn print_neither_judges_nor_arms() {
+        let repo = claude_agent();
+        bind_claude(repo.path(), OLD_SESSION, true);
+        let before = stored(repo.path());
+        let shown = start_browser2(repo.path(), true).await.unwrap();
+        assert!(resumes(&shown, OLD_SESSION));
+        assert_eq!(stored(repo.path()), before, "unarmed");
+        set_marker(repo.path(), Some(marker(OLD_SESSION, &ago(120))));
+        let before = stored(repo.path());
+        let shown = start_browser2(repo.path(), true).await.unwrap();
+        assert!(resumes(&shown, OLD_SESSION), "not judged: {shown:?}");
+        assert_eq!(stored(repo.path()), before, "nothing cleared");
+        assert!(launched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fork_launch_arms_nothing() {
+        let repo = claude_agent();
+        crate::cli::fork::save_fork_spec(
+            repo.path(),
+            &browser2(),
+            &crate::cli::fork::ForkSpec {
+                opencode: None,
+                tool: Tool::Claude,
+                from_session: Some(SUCCESSOR.into()),
+                prompt: "forked".into(),
+                grok: None,
+            },
+        )
+        .unwrap();
+        start_browser2(repo.path(), false).await;
+        let launch = &launched()[0];
+        assert!(
+            launch.args.iter().any(|a| a.contains("forked")),
+            "{launch:?}"
+        );
+        assert!(!crate::cli::fork::fork_spec_path(repo.path(), &browser2()).exists());
+        assert_eq!(
+            load_agent_config(repo.path(), &browser2())
+                .unwrap()
+                .and_then(|c| c.resume_pending),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbound_start_leaves_a_standing_marker() {
+        let repo = claude_agent();
+        let left = marker(OLD_SESSION, &ago(120));
+        set_marker(repo.path(), Some(left.clone()));
+        start_browser2(repo.path(), false).await;
+        assert!(!resumes(&launched()[0], OLD_SESSION));
+        assert_eq!(stored(repo.path()).resume_pending, Some(left));
+    }
+
+    /// Bound to `OLD_SESSION`, armed at 00:00:00, judged at 00:01:00:
+    /// `race` lands between that judgment and the release, which must
+    /// then clear nothing and launch nothing.
+    fn a_change_after_the_judgment(race: impl FnOnce(&Path)) -> (AgentConfig, AgentConfig) {
+        let repo = tempfile::tempdir().unwrap();
+        bind_claude(repo.path(), OLD_SESSION, true);
+        crate::agent_store::arm_resume(
+            repo.path(),
+            &browser2(),
+            &SessionId::parse(OLD_SESSION).unwrap(),
+            instant("2026-11-03T00:00:00Z"),
+        )
+        .unwrap();
+        let now = instant("2026-11-03T00:01:00Z");
+        let judged = stored(repo.path());
+        let session = judged.session.clone().unwrap();
+        assert!(never_checked_in(
+            judged.resume_pending.as_ref(),
+            &session,
+            now,
+            &Holder::Nobody
+        ));
+        race(repo.path());
+        let raced = stored(repo.path());
+        let err = start_fresh_after_unconfirmed(
+            repo.path(),
+            &browser2(),
+            &desc(Tool::Claude),
+            &session,
+            now,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("changed"), "{err:#}");
+        (raced, stored(repo.path()))
+    }
+
+    #[test]
+    fn a_rebind_after_the_judgment_is_neither_cleared_nor_superseded() {
+        let (raced, after) = a_change_after_the_judgment(|repo| bind_claude(repo, SUCCESSOR, true));
+        assert_eq!(after.session.as_ref().unwrap().id.as_str(), SUCCESSOR);
+        assert_eq!(after, raced);
+    }
+
+    #[test]
+    fn a_check_in_after_the_judgment_keeps_the_binding() {
+        let (raced, after) = a_change_after_the_judgment(|repo| {
+            crate::agent_store::resume_checked_in(
+                repo,
+                &browser2(),
+                &SessionId::parse(OLD_SESSION).unwrap(),
+            )
+            .unwrap();
+        });
+        assert_eq!(after.resume_pending, None);
+        assert_eq!(after.session.as_ref().unwrap().id.as_str(), OLD_SESSION);
+        assert_eq!(after, raced);
+    }
+
+    #[test]
+    fn a_fresh_arm_after_the_judgment_keeps_the_binding() {
+        let (raced, after) = a_change_after_the_judgment(|repo| {
+            let sid = SessionId::parse(OLD_SESSION).unwrap();
+            crate::agent_store::resume_checked_in(repo, &browser2(), &sid).unwrap();
+            crate::agent_store::arm_resume(
+                repo,
+                &browser2(),
+                &sid,
+                instant("2026-11-03T00:00:30Z"),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            after.resume_pending,
+            Some(marker(OLD_SESSION, "2026-11-03T00:00:30Z"))
+        );
+        assert_eq!(after.session.as_ref().unwrap().id.as_str(), OLD_SESSION);
+        assert_eq!(after, raced);
     }
 }

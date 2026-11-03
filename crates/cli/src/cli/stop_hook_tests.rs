@@ -1306,3 +1306,82 @@ async fn a_session_starts_context_is_answered_after_its_flush() {
     assert!(writer.bytes.is_empty());
     assert_eq!(answered.got(), Some(None));
 }
+
+fn arm_resume_of(repo: &Path, label: &str, session: &str) {
+    let label = AgentLabel::parse(label).unwrap();
+    let sid = clank_core::ids::SessionId::parse(session).unwrap();
+    crate::agent_store::record_transcript(repo, &label, &sid, "/t/a.jsonl").unwrap();
+    assert!(
+        crate::agent_store::arm_resume(repo, &label, &sid, time::OffsetDateTime::now_utc())
+            .unwrap()
+    );
+}
+
+fn resume_pending(repo: &Path, label: &str) -> Option<String> {
+    let label = AgentLabel::parse(label).unwrap();
+    crate::agent_store::load_agent_config(repo, &label)
+        .unwrap()
+        .and_then(|c| c.resume_pending)
+        .map(|p| p.session.as_str().to_string())
+}
+
+#[test]
+fn a_resumed_claude_session_checks_in_at_its_start() {
+    let dir = init_repo();
+    let repo = dir.path();
+    let sid = "742f6a04-f174-409a-ab01-419a16c5f372";
+    bind_tool(repo, "claude", sid, Tool::Claude);
+    arm_resume_of(repo, "claude", sid);
+    let got = session_started(repo, Tool::Claude, &start_input(sid, "resume"), None);
+    assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("claude"));
+    assert_eq!(resume_pending(repo, "claude"), None);
+}
+
+/// The marker is for the session the label was bound to when it was
+/// armed; the session bound since checking in says nothing about that one.
+#[test]
+fn another_sessions_check_in_leaves_the_marker() {
+    let dir = init_repo();
+    let repo = dir.path();
+    let (armed, successor) = (
+        "742f6a04-f174-409a-ab01-419a16c5f372",
+        "0f3e5c2a-1b4d-4e6f-8a9b-0c1d2e3f4a5b",
+    );
+    bind_tool(repo, "claude", armed, Tool::Claude);
+    arm_resume_of(repo, "claude", armed);
+    bind_tool(repo, "claude", successor, Tool::Claude);
+    let got = session_started(repo, Tool::Claude, &start_input(successor, "resume"), None);
+    assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("claude"));
+    assert_eq!(resume_pending(repo, "claude"), Some(armed.into()));
+}
+
+#[test]
+fn a_bootstrap_start_leaves_the_marker() {
+    let dir = init_repo();
+    let repo = dir.path();
+    let (armed, fresh) = (
+        "742f6a04-f174-409a-ab01-419a16c5f372",
+        "0f3e5c2a-1b4d-4e6f-8a9b-0c1d2e3f4a5b",
+    );
+    let claude = bind_tool(repo, "claude", armed, Tool::Claude);
+    roster_agent(repo, &claude, Tool::Claude);
+    arm_resume_of(repo, "claude", armed);
+    crate::agent_store::release_binding(
+        repo,
+        &claude,
+        &clank_core::ids::SessionId::parse(armed).unwrap(),
+    )
+    .unwrap();
+    let got = session_started(
+        repo,
+        Tool::Claude,
+        &start_input(fresh, "startup"),
+        Some(&claude),
+    );
+    assert_eq!(got.as_ref().map(|(l, _)| l.as_str()), Some("claude"));
+    assert_eq!(
+        bound_session(repo, "claude"),
+        Some((Tool::Claude, fresh.into()))
+    );
+    assert_eq!(resume_pending(repo, "claude"), Some(armed.into()));
+}

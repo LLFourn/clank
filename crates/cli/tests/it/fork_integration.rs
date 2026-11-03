@@ -40,6 +40,7 @@ fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &
             transcript: None,
         }),
         wait_events: Vec::new(),
+        resume_pending: None,
     };
     clank::agent_store::update_agent_config(env.repo(), &l, |stored| *stored = cfg).unwrap();
     write_transcript(env.home(), tool, id);
@@ -431,6 +432,7 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
                 transcript: None,
             }),
             wait_events: Vec::new(),
+            resume_pending: None,
         };
         clank::agent_store::update_agent_config(&b, &l, |stored| *stored = cfg).unwrap();
     }

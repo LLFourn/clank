@@ -12,7 +12,7 @@ use anyhow::Context;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use clank_core::agent_config::{AgentConfig, Session};
+use clank_core::agent_config::{AgentConfig, ResumePending, Session};
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
 
@@ -698,6 +698,102 @@ pub fn record_transcript(
             return false;
         };
         bound.transcript = Some(transcript.to_string());
+        true
+    })
+}
+
+/// How long a resumed Claude session has to check in (its SessionStart
+/// hook) before the next start forgets it.
+pub const CHECK_IN_WITHIN: time::Duration = time::Duration::seconds(60);
+
+/// Whether `pending` records a resume of `bound` that has gone
+/// [`CHECK_IN_WITHIN`] without checking in. An unreadable `at` is not
+/// evidence of anything.
+pub fn resume_unconfirmed(
+    pending: Option<&ResumePending>,
+    bound: &SessionId,
+    now: OffsetDateTime,
+) -> bool {
+    pending.is_some_and(|p| {
+        &p.session == bound
+            && OffsetDateTime::parse(&p.at, &Rfc3339).is_ok_and(|at| now - at >= CHECK_IN_WITHIN)
+    })
+}
+
+/// Record, before `session` is resumed, that it has yet to check in.
+/// A marker already standing for `session` is kept, so the window runs
+/// from the first unconfirmed attempt. Only a binding with a recorded
+/// transcript is armed: that field is written by the same hook that
+/// checks in, so for any other binding silence proves nothing.
+pub fn arm_resume(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+    now: OffsetDateTime,
+) -> anyhow::Result<bool> {
+    let at = now.format(&Rfc3339).context("formatting timestamp")?;
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        let hook_ran = cfg
+            .session
+            .as_ref()
+            .is_some_and(|s| &s.id == session && s.transcript.is_some());
+        if !hook_ran {
+            return false;
+        }
+        if cfg
+            .resume_pending
+            .as_ref()
+            .is_none_or(|p| &p.session != session)
+        {
+            cfg.resume_pending = Some(ResumePending {
+                session: session.clone(),
+                at,
+            });
+        }
+        true
+    })
+}
+
+/// `session` checked in: clear its unconfirmed resume, and only its.
+pub fn resume_checked_in(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+) -> anyhow::Result<bool> {
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        if cfg
+            .resume_pending
+            .as_ref()
+            .is_none_or(|p| &p.session != session)
+        {
+            return false;
+        }
+        cfg.resume_pending = None;
+        true
+    })
+}
+
+/// Unbind `session` from `label` with its unconfirmed resume, only while
+/// the whole judgment still holds under the lock: `session` is bound and
+/// [`resume_unconfirmed`]. A judgment made before a rebind, a check-in or
+/// a fresh arm landed is refused (`false`), never acted on.
+pub fn release_unconfirmed_resume(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+    now: OffsetDateTime,
+) -> anyhow::Result<bool> {
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        if cfg.session.as_ref().is_none_or(|s| &s.id != session)
+            || !resume_unconfirmed(cfg.resume_pending.as_ref(), session, now)
+        {
+            return false;
+        }
+        cfg.session = None;
+        cfg.resume_pending = None;
         true
     })
 }
@@ -1414,5 +1510,96 @@ mod tests {
         set_auto_mode(repo.path(), &lbl, AutoMode::On).unwrap();
         let cfg = load_agent_config(repo.path(), &lbl).unwrap().unwrap();
         assert_eq!(cfg.auto_mode, Some(AutoMode::On));
+    }
+
+    const RESUMED: &str = "742f6a04-f174-409a-ab01-419a16c5f372";
+    const SUCCESSOR: &str = "0f3e5c2a-1b4d-4e6f-8a9b-0c1d2e3f4a5b";
+
+    fn sid(s: &str) -> SessionId {
+        SessionId::parse(s).unwrap()
+    }
+
+    fn at(s: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(s, &Rfc3339).unwrap()
+    }
+
+    fn pending(repo: &Path, l: &AgentLabel) -> Option<ResumePending> {
+        load_agent_config(repo, l)
+            .unwrap()
+            .and_then(|c| c.resume_pending)
+    }
+
+    #[test]
+    fn a_config_from_before_the_marker_parses_and_the_marker_round_trips() {
+        let old: AgentConfig = serde_json::from_str(&format!(
+            r#"{{ "session": {{ "id": "{RESUMED}", "tool": "claude", "updated_at": "x" }} }}"#
+        ))
+        .unwrap();
+        assert_eq!(old.resume_pending, None);
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("resume_pending")
+        );
+        let armed = AgentConfig {
+            resume_pending: Some(ResumePending {
+                session: sid(RESUMED),
+                at: "2026-11-03T00:00:00Z".into(),
+            }),
+            ..old
+        };
+        let back: AgentConfig =
+            serde_json::from_str(&serde_json::to_string(&armed).unwrap()).unwrap();
+        assert_eq!(back, armed);
+    }
+
+    #[test]
+    fn only_a_binding_whose_hook_recorded_a_transcript_is_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        let now = at("2026-11-03T00:00:00Z");
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        assert!(!arm_resume(repo, &l, &sid(RESUMED), now).unwrap());
+        assert_eq!(pending(repo, &l), None);
+        assert!(record_transcript(repo, &l, &sid(RESUMED), "/t/a.jsonl").unwrap());
+        assert!(!arm_resume(repo, &l, &sid(SUCCESSOR), now).unwrap());
+        assert_eq!(pending(repo, &l), None, "not the bound session");
+        assert!(arm_resume(repo, &l, &sid(RESUMED), now).unwrap());
+        assert_eq!(
+            pending(repo, &l),
+            Some(ResumePending {
+                session: sid(RESUMED),
+                at: "2026-11-03T00:00:00Z".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn re_arming_the_same_session_keeps_the_first_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        record_transcript(repo, &l, &sid(RESUMED), "/t/a.jsonl").unwrap();
+        arm_resume(repo, &l, &sid(RESUMED), at("2026-11-03T00:00:00Z")).unwrap();
+        arm_resume(repo, &l, &sid(RESUMED), at("2026-11-03T00:00:50Z")).unwrap();
+        assert_eq!(pending(repo, &l).unwrap().at, "2026-11-03T00:00:00Z");
+        assert!(resume_unconfirmed(
+            pending(repo, &l).as_ref(),
+            &sid(RESUMED),
+            at("2026-11-03T00:01:00Z")
+        ));
+    }
+
+    #[test]
+    fn a_check_in_clears_only_its_own_sessions_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        record_transcript(repo, &l, &sid(RESUMED), "/t/a.jsonl").unwrap();
+        arm_resume(repo, &l, &sid(RESUMED), at("2026-11-03T00:00:00Z")).unwrap();
+        assert!(!resume_checked_in(repo, &l, &sid(SUCCESSOR)).unwrap());
+        assert!(pending(repo, &l).is_some());
+        assert!(resume_checked_in(repo, &l, &sid(RESUMED)).unwrap());
+        assert_eq!(pending(repo, &l), None);
     }
 }

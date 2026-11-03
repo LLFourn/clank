@@ -19,6 +19,7 @@ fn skeleton(
         auto_mode: Some(auto_mode),
         session,
         wait_events: Vec::new(),
+        resume_pending: None,
     }
 }
 
@@ -442,6 +443,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
                 "11111111-2222-3333-4444-555555555555",
             )),
             wait_events: Vec::new(),
+            resume_pending: None,
         },
     );
     // Seed the user-global default-on in the test HOME.
@@ -471,6 +473,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
                 "11111111-2222-3333-4444-555555555555",
             )),
             wait_events: Vec::new(),
+            resume_pending: None,
         },
     );
     let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()), None);
