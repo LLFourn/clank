@@ -1421,11 +1421,12 @@ mod tests {
                 } else {
                     "exit 0"
                 };
-                let child = std::process::Command::new("/bin/sh")
-                    .args(["-c", script])
-                    .stdout(std::process::Stdio::piped())
-                    .spawn()
-                    .ok()?;
+                let child = crate::proc_run::start(
+                    crate::proc_run::Spec::new("/bin/sh")
+                        .args(["-c", script])
+                        .stdout(crate::proc_run::Out::Piped),
+                )
+                .ok()?;
                 Some(SubscribeChild::from_child(child))
             }
             fn say(&self, _: &str, _: &str) -> anyhow::Result<()> {

@@ -1143,8 +1143,10 @@ mod tests {
         }
         impl Started for ExitsLater {
             fn reap(self: Box<Self>) {
-                let _ = self.exit.recv();
-                let _ = self.reaped.send(());
+                std::thread::spawn(move || {
+                    let _ = self.exit.recv();
+                    let _ = self.reaped.send(());
+                });
             }
         }
         let repo = super::super::TempRepo::new();

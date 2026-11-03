@@ -76,7 +76,6 @@ fn lock_path(repo: &Path) -> std::path::PathBuf {
 /// lock is the gate; the file is only how the refusal names a place.
 pub(super) fn acquire(repo: &Path) -> Result<StatusLease, String> {
     use std::io::Write;
-    use std::os::fd::AsRawFd;
     let path = lock_path(repo);
     crate::cli::monitor::ensure_runtime_dir()?;
     let file = match std::fs::OpenOptions::new()
@@ -103,9 +102,12 @@ pub(super) fn acquire(repo: &Path) -> Result<StatusLease, String> {
             ));
         }
     };
-    // SAFETY: valid owned fd; flock has no memory effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    if !clank_user_config::lease::take(&file).map_err(|e| {
+        format!(
+            "cannot lock this repo's status lease at {}: {e}",
+            path.display()
+        )
+    })? {
         return Err(busy_message(read_holder(&path)));
     }
     let mut file = file;
@@ -128,8 +130,9 @@ pub(crate) fn probe(repo: &Path) -> (bool, Option<crate::cli::remote_control::Ho
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (true, None),
         Err(_) => return (false, None),
     };
-    // SAFETY: valid owned fd; flock has no memory effects.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+    // One attempt: callers re-ask on every wake to their own deadline,
+    // and a held lease is their common case.
+    if clank_user_config::lease::take_now(&file).unwrap_or(false) {
         // SAFETY: as above; the lock is released before anyone else
         // could be told this repo has no owner.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };

@@ -232,21 +232,11 @@ impl Store {
             return Ok(None);
         };
         let file = open_lock(&dir, id)?;
-        match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(()) => Ok(Some(Held {
-                dir,
-                id: id.clone(),
-                _file: file,
-            })),
-            Err(e)
-                if e.downcast_ref::<std::io::Error>()
-                    .and_then(std::io::Error::raw_os_error)
-                    == Some(libc::EWOULDBLOCK) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
+        Ok(clank_user_config::lease::take(&file)?.then_some(Held {
+            dir,
+            id: id.clone(),
+            _file: file,
+        }))
     }
 
     /// `id`'s record as it stands, read without its lock (for `status`).

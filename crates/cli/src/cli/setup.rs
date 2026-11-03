@@ -611,18 +611,30 @@ pub(super) async fn probe_launch_claude(
     launch: Option<&clank_core::agent_config::LaunchConfig>,
     cwd: &Path,
 ) -> anyhow::Result<bool> {
-    let mut command = tokio::process::Command::new(
+    use crate::proc_run::{Out, RunError, Spec};
+    let mut command = Spec::new(
         launch
             .and_then(|l| l.command.as_deref())
             .unwrap_or("claude"),
     );
     if let Some(launch) = launch {
-        command.args(&launch.args).envs(&launch.env);
+        command = command.args(&launch.args).envs(&launch.env);
     }
-    command.arg("--version").current_dir(cwd).kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
-        .await
-        .context("selected Claude version probe timed out")??;
+    let output = match crate::proc_run::run(
+        command
+            .arg("--version")
+            .cwd(cwd)
+            .stdout(Out::Capture { cap: 1 << 20 })
+            .stderr(Out::Capture { cap: 1 << 20 }),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    {
+        Err(e @ RunError::Timeout { .. }) => {
+            return Err(e).context("selected Claude version probe timed out");
+        }
+        other => other?,
+    };
     anyhow::ensure!(
         output.status.success(),
         "selected Claude version probe failed"
@@ -1611,10 +1623,16 @@ pub(crate) fn claude_asyncrewake_capable(version_output: &str) -> bool {
 /// Probe the installed Claude Code. `None` = no binary / unreadable
 /// version — setup stays on the legacy loop (conservative).
 pub(crate) fn probe_claude_asyncrewake() -> Option<bool> {
-    let out = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .ok()?;
+    const CLAUDE_VERSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    use crate::proc_run::{Out, Spec};
+    let out = crate::proc_run::run_blocking(
+        Spec::new("claude")
+            .arg("--version")
+            .stdout(Out::Capture { cap: 1 << 20 })
+            .stderr(Out::Capture { cap: 1 << 20 }),
+        CLAUDE_VERSION_BUDGET,
+    )
+    .ok()?;
     out.status
         .success()
         .then(|| claude_asyncrewake_capable(&String::from_utf8_lossy(&out.stdout)))

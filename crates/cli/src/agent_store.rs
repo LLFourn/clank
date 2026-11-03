@@ -1018,23 +1018,13 @@ mod tests {
     /// wait right now. Non-blocking: a fresh open of the lock file is a
     /// separate flock owner even within this process.
     fn domain_is_held(repo: &Path, l: &AgentLabel) -> bool {
-        use std::os::fd::AsRawFd;
         let path = agents_root(repo).join(l.as_str()).join("binding.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .unwrap();
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return false;
-        }
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EWOULDBLOCK)
-        );
-        true
+        !clank_user_config::lease::take(&file).unwrap()
     }
 
     fn github_source(repo: &str) -> clank_core::agent_config::WaitEventSource {

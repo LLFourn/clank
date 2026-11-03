@@ -21,6 +21,7 @@ pub mod owner_sentinel;
 pub mod preview;
 pub mod priority_dir;
 pub mod proc_identity;
+pub mod proc_run;
 pub mod repo_watch;
 pub mod shell_quote;
 pub mod signal;

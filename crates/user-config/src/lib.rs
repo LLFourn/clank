@@ -8,6 +8,8 @@
 //! atomic rename alone does not prevent that: it orders whole-file
 //! replacements, not read-modify-write cycles.
 
+pub mod lease;
+
 use anyhow::Context;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};

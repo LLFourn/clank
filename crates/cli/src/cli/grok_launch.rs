@@ -235,7 +235,6 @@ fn legacy_source(root: &Path, id: &str) -> anyhow::Result<Option<PathBuf>> {
 /// Nonblocking preparation lock. Contention is reported, never polled, and no
 /// async task blocks on flock. Descriptor closes on exec and on cancellation.
 fn lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
     let path = super::monitor::runtime_path(repo, &format!("grok-prepare-{label}.lock"));
@@ -248,11 +247,11 @@ fn lock(repo: &Path, label: &AgentLabel) -> anyhow::Result<std::fs::File> {
         file.metadata()?.is_file(),
         "Grok preparation lease is not a regular file"
     );
-    // SAFETY: valid owned fd. LOCK_NB guarantees this never parks the runtime.
+    // Never parks the runtime for long: a held lease is believed
+    // after the take's short patience.
     anyhow::ensure!(
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "Grok fork preparation is already owned or could not be locked: {}",
-        std::io::Error::last_os_error()
+        clank_user_config::lease::take(&file)?,
+        "Grok fork preparation is already owned"
     );
     Ok(file)
 }
@@ -399,35 +398,35 @@ pub(super) async fn initialize(provider: &Provider, repo: &Path) -> anyhow::Resu
     acp_rpc(provider, repo, None, Duration::from_secs(10)).await
 }
 
+/// The ACP helper: in a group of its own, with no agent identity —
+/// profile overrides cannot smuggle the interactive label into
+/// preparation.
+fn acp_spec(provider: &Provider, repo: &Path) -> crate::proc_run::Spec {
+    use crate::proc_run::{Group, Identity, Out, Spec, Stdin};
+    Spec::new(&provider.program)
+        .args(&provider.args)
+        .args(["agent", "--no-leader", "stdio"])
+        .cwd(repo)
+        .envs(&provider.env)
+        .env("GROK_DISABLE_AUTOUPDATER", "1")
+        .identity(Identity::Forbid)
+        .stdin(Stdin::Piped)
+        .stdout(Out::Piped)
+        .stderr(Out::Piped)
+        .group(Group::New)
+}
+
 async fn acp_rpc(
     provider: &Provider,
     repo: &Path,
     followup: Option<(&str, Value)>,
     budget: Duration,
 ) -> anyhow::Result<Value> {
-    let mut command = tokio::process::Command::new(&provider.program);
-    command
-        .args(&provider.args)
-        .args(["agent", "--no-leader", "stdio"])
-        .current_dir(repo)
-        .envs(&provider.env)
-        .env("GROK_DISABLE_AUTOUPDATER", "1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    // Profile overrides cannot smuggle the interactive label into preparation.
-    for key in crate::agent_env::SESSION_IDENTITY_VARS {
-        command.env_remove(key);
-    }
-    let mut child = command
-        .spawn()
+    let mut child = crate::proc_run::start(acp_spec(provider, repo))
         .with_context(|| format!("starting Grok ACP preparation with `{}`", provider.program))?;
-    let mut group = super::wait::GroupKill::over(child.id());
-    let mut input = child.stdin.take().unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut error = child.stderr.take().unwrap();
+    let mut input = child.take_stdin_async().context("piped stdin")?;
+    let mut output = BufReader::new(child.take_stdout_async().context("piped stdout")?);
+    let mut error = child.take_stderr_async().context("piped stderr")?;
     let mut tail = super::wait::RingTail::new(4096);
     let mut total = 0;
     let result = tokio::time::timeout(budget, async {
@@ -451,9 +450,7 @@ async fn acp_rpc(
             drained = &mut errors => { drained?; conversation.await },
         }
     }).await;
-    group.terminate();
-    let _ = child.start_kill();
-    let reaped = tokio::time::timeout(Duration::from_millis(200), child.wait()).await;
+    let reaped = child.terminate_async(Duration::from_millis(200)).await;
     let result = result
         .map_err(|_| anyhow::anyhow!("Grok ACP preparation timed out after {budget:?}"))
         .and_then(|r| r);
@@ -464,7 +461,7 @@ async fn acp_rpc(
         )
     })?;
     anyhow::ensure!(
-        matches!(reaped, Ok(Ok(_))),
+        reaped,
         "Grok ACP helper could not be reaped within cleanup deadline"
     );
     Ok(result)

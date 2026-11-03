@@ -2305,12 +2305,32 @@ fn subprocess_err(
     }
 }
 
+/// A read of the repo by `git`; generous, since a patch read may be large.
+const GIT_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The most a whole-output git read may print. Larger is an error, never
+/// a cut patch.
+const GIT_READ_CAP: usize = 512 << 20;
+
+fn git_read(
+    repo: &Path,
+    args: &[&str],
+) -> Result<crate::proc_run::Output, crate::proc_run::RunError> {
+    use crate::proc_run::{Group, Out, Spec};
+    crate::proc_run::run_blocking(
+        Spec::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdout(Out::Capture { cap: GIT_READ_CAP })
+            .stderr(Out::Ring { bytes: 64 << 10 })
+            .group(Group::New),
+        GIT_READ_BUDGET,
+    )
+}
+
 fn read_git_stdout(repo: &Path, args: &[&str]) -> Result<Vec<u8>, GitIoError> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
+    let out = git_read(repo, args)
         .map_err(|e| subprocess_err(format!("git {}", args.join(" ")), None, e))?;
     if !out.status.success() {
         return Err(subprocess_err(
@@ -2342,12 +2362,7 @@ pub fn diff_tree_name_status(repo: &Path, detect_renames: bool) -> Result<Vec<St
 
 /// The tip sha of `branch` in `repo`, if it exists.
 pub fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--verify", "--quiet", branch])
-        .output()
-        .ok()?;
+    let out = git_read(repo, &["rev-parse", "--verify", "--quiet", branch]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2372,15 +2387,12 @@ pub fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
 /// Stays `git`: gix has no revwalk-with-boundary equivalent of
 /// `rev-list --not --all` yet.
 pub fn commits_unreachable_from_refs(repo: &Path, tip: &str) -> Result<usize, GitIoError> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-list", "--count", tip, "--not", "--all"])
-        .output()
-        .map_err(|e| GitIoError::Parse {
+    let out = git_read(repo, &["rev-list", "--count", tip, "--not", "--all"]).map_err(|e| {
+        GitIoError::Parse {
             context: "git rev-list".into(),
             detail: e.to_string(),
-        })?;
+        }
+    })?;
     if !out.status.success() {
         return Err(GitIoError::Parse {
             context: "git rev-list".into(),
@@ -2400,13 +2412,9 @@ pub fn commits_unreachable_from_refs(repo: &Path, tip: &str) -> Result<usize, Gi
 /// matching gitignore source) if git ignores `rel`, else `None`. The
 /// path needn't exist; git matches patterns. `None` on spawn failure.
 pub fn check_ignore(repo: &Path, rel: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["check-ignore", "-v"])
-        .arg(repo.join(rel))
-        .output()
-        .ok()?;
+    let path = repo.join(rel);
+    let path = path.to_string_lossy();
+    let out = git_read(repo, &["check-ignore", "-v", &path]).ok()?;
     if out.status.code() != Some(0) {
         return None;
     }
@@ -2593,40 +2601,34 @@ fn parse_numstat_z(text: &str) -> std::collections::BTreeMap<String, Counts> {
 ///
 /// The point is that the REST IS NEVER HELD: `git show` of a commit
 /// that deleted a hundred megabytes would otherwise be buffered whole
-/// before anyone could decline to use it. Reads `cap + 1` so output
-/// landing exactly on the cap is not reported as cut, then closes the
-/// pipe and kills AND REAPS the child — dropping a `Child` does
-/// neither, which leaves a producer writing into a closed pipe or a
-/// zombie behind it.
+/// before anyone could decline to use it. Output landing exactly on the
+/// cap is not reported as cut; past it, the child is killed and reaped.
 pub fn bounded_git_stdout(
     repo: &Path,
     args: &[&str],
     cap: usize,
 ) -> Result<BoundedOutput, GitIoError> {
-    use std::io::Read as _;
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| subprocess_err(format!("git {}", args.join(" ")), None, e))?;
-    let mut buf = Vec::new();
-    if let Some(stdout) = child.stdout.as_mut() {
-        // cap + 1: the extra byte is how "exactly the cap" is told
-        // apart from "more than the cap".
-        let _ = stdout.take(cap as u64 + 1).read_to_end(&mut buf);
+    use crate::proc_run::{Out, RunError, Spec, Stdin};
+    let ran = crate::proc_run::run_blocking(
+        Spec::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdin(Stdin::Inherit)
+            .stdout(Out::Capture { cap }),
+        GIT_READ_BUDGET,
+    );
+    match ran {
+        Ok(out) => Ok(BoundedOutput {
+            bytes: out.stdout,
+            truncated: false,
+        }),
+        Err(RunError::Overflow { kept, .. }) => Ok(BoundedOutput {
+            bytes: kept,
+            truncated: true,
+        }),
+        Err(e) => Err(subprocess_err(format!("git {}", args.join(" ")), None, e)),
     }
-    drop(child.stdout.take());
-    let _ = child.kill();
-    let _ = child.wait();
-    let truncated = buf.len() > cap;
-    buf.truncate(cap);
-    Ok(BoundedOutput {
-        bytes: buf,
-        truncated,
-    })
 }
 
 /// One file's patch, at most `cap` bytes of it.

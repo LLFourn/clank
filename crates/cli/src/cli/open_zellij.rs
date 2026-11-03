@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+use crate::proc_run::{self, Group, Out, RunError, Spec, Stdin};
+
 use super::OpenZellijArgs;
 use super::{repo_basename, resolve_repo};
 
@@ -199,96 +201,87 @@ fn display_argv(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// Explicit-open queries are bounded in time and memory. Drain both streams
-/// concurrently with wait, without reader tasks, threads or an idle worker.
-/// An oversized stdout is unknown, never a truncated listing authorizing tabs.
+/// Explicit-open queries are bounded in time and memory. An oversized
+/// stdout is unknown, never a truncated listing authorizing tabs.
 async fn run_open_query(
     argv: &[String],
     budget: std::time::Duration,
 ) -> anyhow::Result<QueryOutput> {
-    use tokio::io::AsyncReadExt;
-    const STDOUT_CAP: usize = 1024 * 1024;
-    const STDERR_CAP: usize = 4096;
-    let mut command = tokio::process::Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("could not run `{}`", display_argv(argv)))?;
-    let mut group = super::wait::GroupKill::over(child.id());
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut bytes = Vec::new();
-    let mut oversized = false;
-    let mut tail = super::wait::RingTail::new(STDERR_CAP);
-    let result = tokio::time::timeout(budget, async {
-        let out = async {
-            let mut buf = [0; 8192];
-            loop {
-                let n = stdout.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                let keep = n.min(STDOUT_CAP - bytes.len());
-                bytes.extend_from_slice(&buf[..keep]);
-                oversized |= keep != n;
-            }
-            Ok::<_, std::io::Error>(())
-        };
-        let err = async {
-            let mut buf = [0; 8192];
-            loop {
-                let n = stderr.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                tail.push(&buf[..n]);
-            }
-            Ok::<_, std::io::Error>(())
-        };
-        tokio::try_join!(child.wait(), out, err).map(|(status, _, _)| status)
+    let out = proc_run::run(query_spec(Spec::new(&argv[0]).args(&argv[1..])), budget).await;
+    query_output(argv, out, budget)
+}
+
+const QUERY_STDOUT_CAP: usize = 1024 * 1024;
+const QUERY_STDERR_CAP: usize = 4096;
+
+/// How long a zellij call made off the open path gets: a `list-panes`
+/// was measured at ~1.1s, and a reconcile pass must never wait on a
+/// server that does not answer.
+const ZELLIJ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn query_spec(spec: Spec) -> Spec {
+    spec.stdout(Out::Capture {
+        cap: QUERY_STDOUT_CAP,
     })
-    .await;
-    // Includes descendants retaining pipe writers after their parent exits.
-    group.terminate();
-    if !matches!(result, Ok(Ok(_))) {
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await;
-    }
-    let stderr = tail.into_string();
-    let status = match result {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => anyhow::bail!(
-            "`{}` failed: {error}; stderr (last {STDERR_CAP} bytes): {stderr}",
+    .stderr(Out::Ring {
+        bytes: QUERY_STDERR_CAP,
+    })
+    .group(Group::New)
+}
+
+fn query_output(
+    argv: &[String],
+    out: Result<proc_run::Output, RunError>,
+    budget: std::time::Duration,
+) -> anyhow::Result<QueryOutput> {
+    let out = match out {
+        Ok(out) => out,
+        Err(RunError::Spawn(e)) => {
+            return Err(e).with_context(|| format!("could not run `{}`", display_argv(argv)));
+        }
+        Err(e @ RunError::Overflow { .. }) => anyhow::bail!(
+            "`{}`: {e}; stdout exceeded {QUERY_STDOUT_CAP} bytes; listing is unknown",
             display_argv(argv)
         ),
-        Err(_) => anyhow::bail!(
-            "`{}` timed out after {budget:?}; stderr (last {STDERR_CAP} bytes): {stderr}",
-            display_argv(argv)
+        Err(e @ RunError::Timeout { .. }) => anyhow::bail!(
+            "`{}` timed out after {budget:?}; stderr (last {QUERY_STDERR_CAP} bytes): {}",
+            display_argv(argv),
+            e.stderr()
+        ),
+        Err(e) => anyhow::bail!(
+            "`{}` {e}; stderr (last {QUERY_STDERR_CAP} bytes): {}",
+            display_argv(argv),
+            e.stderr()
         ),
     };
-    if oversized {
-        anyhow::bail!(
-            "`{}` exited {status}, but stdout exceeded {STDOUT_CAP} bytes; listing is unknown; stderr (last {STDERR_CAP} bytes): {stderr}",
-            display_argv(argv)
-        );
-    }
-    let stdout = String::from_utf8(bytes).with_context(|| {
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stdout = String::from_utf8(out.stdout).with_context(|| {
         format!(
             "`{}` returned non-UTF-8 stdout; listing is unknown; stderr: {stderr}",
             display_argv(argv)
         )
     })?;
     Ok(QueryOutput {
-        status,
+        status: out.status,
         stdout,
         stderr,
     })
+}
+
+/// Replaceable per thread, so a test can stand in for a zellij that hangs.
+fn zellij_program() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(stand_in) = tests::ZELLIJ_STAND_IN.with(|s| s.borrow().clone()) {
+        return stand_in.into();
+    }
+    "zellij".into()
+}
+
+fn zellij_sync(args: &[&str]) -> Result<proc_run::Output, RunError> {
+    proc_run::run_blocking(
+        query_spec(Spec::new(zellij_program()).args(args)),
+        ZELLIJ_BUDGET,
+    )
 }
 
 fn lookup_context(target: &SessionTarget, subject: &str) -> String {
@@ -538,15 +531,19 @@ fn resolve_tabs(targets: &[(PathBuf, String)]) -> anyhow::Result<Vec<TabSpec>> {
 /// code the user can see.
 fn spawn_zellij(argv: &[String]) -> anyhow::Result<()> {
     let what = spawn_kind(argv);
-    let status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .with_context(|| {
-            format!(
-                "could not start zellij to {what}. `clank doctor` reports whether \
+    let status = proc_run::interactive(
+        Spec::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdin::Inherit)
+            .stdout(Out::Inherit)
+            .stderr(Out::Inherit),
+    )
+    .with_context(|| {
+        format!(
+            "could not start zellij to {what}. `clank doctor` reports whether \
                  zellij is installed and reachable."
-            )
-        })?;
+        )
+    })?;
     if !status.success() {
         anyhow::bail!(
             "zellij failed to {what} (exit {status}) — its own error is printed \
@@ -1008,10 +1005,7 @@ fn listed_sessions(listing: &str) -> impl Iterator<Item = ListedSession<'_>> {
 /// A non-zero exit is an answer only for the recognized no-sessions
 /// response. Other exits and spawn failures mean nothing was learned.
 fn zellij_list_sessions_checked() -> Option<String> {
-    let out = std::process::Command::new("zellij")
-        .args(["list-sessions", "-n"])
-        .output()
-        .ok()?;
+    let out = zellij_sync(&["list-sessions", "-n"]).ok()?;
     interpret_listing(
         out.status.success(),
         &String::from_utf8_lossy(&out.stdout),
@@ -1364,15 +1358,23 @@ fn layout_term_size() -> (u16, u16) {
 /// and escape-sequence size queries are answered with PANE dimensions
 /// — the very trap this exists to avoid.
 fn zellij_client_window_size() -> Option<(u16, u16)> {
-    let out = std::process::Command::new("ps")
-        .args(["-axo", "tty=,command="])
-        .output()
-        .ok()?;
+    let out = proc_run::run_blocking(
+        Spec::new("ps")
+            .args(["-axo", "tty=,command="])
+            .stdout(Out::Capture { cap: PS_CAP })
+            .group(Group::New),
+        PS_BUDGET,
+    )
+    .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
     let tty = pick_zellij_client_tty(&text, session.as_deref())?;
     crate::cli::term::winsize_of_tty(&format!("/dev/{tty}"))
 }
+
+/// Every process's command line, on a loaded machine.
+const PS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const PS_CAP: usize = 16 << 20;
 
 /// Pure picker over `ps -axo tty=,command=` lines: the tty of the
 /// zellij CLIENT attached to `session`. A client line is one whose
@@ -2089,17 +2091,15 @@ pub(crate) fn current_session() -> Option<String> {
 /// The remote runs wherever the TUI was started and asks about the
 /// session it was pointed at.
 pub(crate) fn snapshot_panes_in(session: &str) -> Option<Vec<ZellijPane>> {
-    let out = std::process::Command::new("zellij")
-        .args([
-            "--session",
-            session,
-            "action",
-            "list-panes",
-            "--json",
-            "--command",
-        ])
-        .output()
-        .ok()?;
+    let out = zellij_sync(&[
+        "--session",
+        session,
+        "action",
+        "list-panes",
+        "--json",
+        "--command",
+    ])
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2165,24 +2165,17 @@ pub(crate) fn subscribe_argv(session: &str, panes: &[String]) -> Option<Vec<Stri
 
 /// A running `zellij subscribe`, killed when dropped: it is a child
 /// of ours and must not outlive us.
-pub(crate) struct SubscribeChild(std::process::Child);
+pub(crate) struct SubscribeChild(proc_run::Managed);
 
 impl SubscribeChild {
     /// A test's own process standing in for `zellij subscribe`.
     #[cfg(test)]
-    pub(crate) fn from_child(child: std::process::Child) -> Self {
+    pub(crate) fn from_child(child: proc_run::Managed) -> Self {
         Self(child)
     }
 
     pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.0.stdout.take()
-    }
-}
-
-impl Drop for SubscribeChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.0.take_stdout()
     }
 }
 
@@ -2190,12 +2183,7 @@ impl Drop for SubscribeChild {
 /// panes, or when zellij could not be started.
 pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<SubscribeChild> {
     let argv = subscribe_argv(session, panes)?;
-    std::process::Command::new("zellij")
-        .args(&argv)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    proc_run::start(Spec::new(zellij_program()).args(&argv).stdout(Out::Piped))
         .ok()
         .map(SubscribeChild)
 }
@@ -2250,9 +2238,8 @@ pub(crate) async fn write_pane_action_classified(
     pane: &str,
     argv: &[String],
 ) -> Result<(), PaneWrite> {
-    let mut command = tokio::process::Command::new("zellij");
-    command.args(["--session", session]).args(argv);
-    run_pane_write(&mut command, std::time::Duration::from_secs(3))
+    let spec = Spec::new("zellij").args(["--session", session]).args(argv);
+    run_pane_write(spec, std::time::Duration::from_secs(3))
         .await
         .map(|_| ())
         .map_err(|e| match e {
@@ -2262,58 +2249,27 @@ pub(crate) async fn write_pane_action_classified(
 }
 
 async fn run_pane_write(
-    command: &mut tokio::process::Command,
+    spec: Spec,
     budget: std::time::Duration,
 ) -> Result<std::process::ExitStatus, PaneWrite> {
-    use tokio::io::AsyncReadExt;
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|e| PaneWrite::NotStarted(format!("starting terminal input transport: {e}")))?;
-    let mut group = super::wait::GroupKill::over(child.id());
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut tail = super::wait::RingTail::new(4096);
-    let result = tokio::time::timeout(budget, async {
-        let mut sink = tokio::io::sink();
-        let out = tokio::io::copy(&mut stdout, &mut sink);
-        let err = async {
-            let mut bytes = [0; 8192];
-            loop {
-                let count = stderr.read(&mut bytes).await?;
-                if count == 0 {
-                    break;
-                }
-                tail.push(&bytes[..count]);
-            }
-            Ok::<_, std::io::Error>(())
-        };
-        tokio::try_join!(child.wait(), out, err).map(|(status, _, _)| status)
-    })
+    let ran = proc_run::run(
+        spec.stderr(Out::Ring { bytes: 4096 }).group(Group::New),
+        budget,
+    )
     .await;
-    group.terminate();
-    if !matches!(result, Ok(Ok(_))) {
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await;
-    }
-    match result {
-        Ok(Ok(status)) if status.success() => Ok(status),
-        Ok(Ok(status)) => Err(PaneWrite::Unknown(format!(
-            "terminal input transport exited {status}; stderr: {}",
-            tail.into_string()
+    match ran {
+        Ok(out) if out.status.success() => Ok(out.status),
+        Ok(out) => Err(PaneWrite::Unknown(format!(
+            "terminal input transport exited {}; stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
         ))),
-        Ok(Err(error)) => Err(PaneWrite::Unknown(format!(
-            "terminal input transport failed: {error}; acceptance is unknown; stderr: {}",
-            tail.into_string()
+        Err(RunError::Spawn(e)) => Err(PaneWrite::NotStarted(format!(
+            "starting terminal input transport: {e}"
         ))),
-        Err(_) => Err(PaneWrite::Unknown(format!(
-            "terminal input transport timed out after {budget:?}; acceptance is unknown; stderr: {}",
-            tail.into_string()
+        Err(e) => Err(PaneWrite::Unknown(format!(
+            "terminal input transport {e}; acceptance is unknown; stderr: {}",
+            e.stderr()
         ))),
     }
 }
@@ -2730,7 +2686,7 @@ fn unreadable_sessions(list_output: &str) -> Vec<String> {
 /// an agent launch cannot wait on that. Dropping a session means its
 /// panes are not seen, which fails OPEN (no holder found).
 pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> SessionScan {
-    scan_sessions(deadline, zellij_list_sessions_checked, start_list_panes)
+    scan_sessions(deadline, zellij_list_sessions_checked, list_panes_of)
 }
 
 /// Scoped async discovery for event/nudge control. Every query owns its client
@@ -2777,25 +2733,10 @@ pub(crate) async fn panes_in_all_sessions_async(deadline: std::time::Duration) -
     assemble_scan(Some(outcomes))
 }
 
-/// [`panes_in_all_sessions`] with the session listing supplied, so the
-/// blind case is reachable in a test. `None` means the listing could
-/// not be run; `Some("")` means it ran and found nothing, and the two
-/// must not converge.
-/// One session's `list-panes` in flight.
-struct Pending {
-    session: String,
-    child: std::process::Child,
-    reader: std::thread::JoinHandle<Vec<u8>>,
-}
-
-/// Start `list-panes` for `session`. `None` when the process could not
-/// be started at all, which is a session whose panes are UNKNOWN.
-fn start_list_panes(session: &str) -> Option<Pending> {
-    use std::io::Read;
-    use std::process::Stdio;
-
-    let mut child = std::process::Command::new("zellij")
-        .args([
+/// `session`'s panes, or `None` when they could not be learned in time.
+fn list_panes_of(session: &str, deadline: std::time::Duration) -> Option<Vec<ZellijPane>> {
+    let out = proc_run::run_blocking(
+        query_spec(Spec::new(zellij_program()).args([
             "-s",
             session,
             "action",
@@ -2803,31 +2744,24 @@ fn start_list_panes(session: &str) -> Option<Pending> {
             "--json",
             "--command",
             "--tab",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    // Drained on its own thread so a listing larger than the pipe
-    // buffer cannot wedge the child before it exits.
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    Some(Pending {
-        session: session.to_string(),
-        child,
-        reader,
-    })
+        ])),
+        deadline,
+    )
+    .ok()?;
+    out.status
+        .success()
+        .then(|| serde_json::from_slice(&out.stdout).ok())
+        .flatten()
 }
 
+/// [`panes_in_all_sessions`] with the session listing and each
+/// session's query supplied, so the blind case is reachable in a test.
+/// `None` means the listing could not be run; `Some("")` means it ran
+/// and found nothing, and the two must not converge.
 fn scan_sessions(
     deadline: std::time::Duration,
     list: impl FnOnce() -> Option<String>,
-    start: impl Fn(&str) -> Option<Pending>,
+    query: impl Fn(&str, std::time::Duration) -> Option<Vec<ZellijPane>> + Sync,
 ) -> SessionScan {
     let Some(listing) = list() else {
         return assemble_scan(None);
@@ -2838,46 +2772,20 @@ fn scan_sessions(
         .into_iter()
         .map(|line| (line, None))
         .collect();
-    let mut pending: Vec<Pending> = Vec::new();
-    for session in live_session_names(&listing) {
-        match start(&session) {
-            Some(p) => pending.push(p),
-            None => outcomes.push((session, None)),
-        }
-    }
-
-    let started = std::time::Instant::now();
-    loop {
-        let mut i = 0;
-        while i < pending.len() {
-            match pending[i].child.try_wait() {
-                Ok(Some(status)) => {
-                    let done = pending.swap_remove(i);
-                    let listed = match done.reader.join() {
-                        Ok(buf) if status.success() => {
-                            serde_json::from_slice::<Vec<ZellijPane>>(&buf).ok()
-                        }
-                        _ => None,
-                    };
-                    outcomes.push((done.session, listed));
-                }
-                Ok(None) => i += 1,
-                Err(_) => {
-                    let gone = pending.swap_remove(i);
-                    outcomes.push((gone.session, None));
-                }
-            }
-        }
-        if pending.is_empty() || started.elapsed() >= deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    for mut late in pending {
-        let _ = late.child.kill();
-        let _ = late.child.wait();
-        outcomes.push((late.session, None));
-    }
+    let query = &query;
+    let answered: Vec<Listed> = std::thread::scope(|scope| {
+        let asked: Vec<_> = live_session_names(&listing)
+            .into_iter()
+            .map(|session| {
+                scope.spawn(move || {
+                    let panes = query(&session, deadline);
+                    (session, panes)
+                })
+            })
+            .collect();
+        asked.into_iter().filter_map(|a| a.join().ok()).collect()
+    });
+    outcomes.extend(answered);
     assemble_scan(Some(outcomes))
 }
 
@@ -2907,24 +2815,18 @@ fn new_pane_argv(label: &str, repo: &str) -> Vec<String> {
 /// Whether zellij accepted the rename. Accepted is not applied: a
 /// caller that needs the name reads it back.
 pub(crate) fn rename_tab(id: u32, name: &str) -> bool {
-    // `.output()` (NOT `.status()`): capture + discard the child's
-    // stdout/stderr so a rename error never bleeds onto the alt-screen
-    // the TUI owns. The loop is event-driven, so an inherited error
-    // line would PERSIST until the next watcher event, not flicker
-    // (ruthless 9c38523).
-    std::process::Command::new("zellij")
-        .args(["action", "rename-tab-by-id", &id.to_string(), name])
-        .output()
+    // Captured, never inherited: a rename error must not bleed onto the
+    // alt-screen the TUI owns. The loop is event-driven, so an inherited
+    // error line would PERSIST until the next watcher event, not
+    // flicker (ruthless 9c38523).
+    zellij_sync(&["action", "rename-tab-by-id", &id.to_string(), name])
         .is_ok_and(|out| out.status.success())
 }
 
 /// This session's tabs by stable id, with their names; `None` when the
 /// listing fails or does not parse.
 pub(crate) fn list_tabs() -> Option<Vec<(u32, String)>> {
-    let out = std::process::Command::new("zellij")
-        .args(["action", "list-tabs", "--json"])
-        .output()
-        .ok()?;
+    let out = zellij_sync(&["action", "list-tabs", "--json"]).ok()?;
     out.status
         .success()
         .then(|| parse_tabs(&out.stdout))
@@ -2964,13 +2866,11 @@ pub(crate) fn rename_pane(id: &str, name: &str) {
 
 /// Rename the pane `id` in this session, or say what zellij answered.
 pub(crate) fn rename_pane_checked(id: &str, name: &str) -> Result<(), String> {
-    // `.output()` (NOT `.status()`): isolate the child's stdout/stderr
-    // from the alt-screen — a stale pane id (closed between list-panes
-    // and the rename) or any zellij hiccup must not bleed an error line
-    // onto the TUI, which the event-driven loop would leave until the
-    // next watcher event (ruthless 9c38523).
-    let out = rename_pane_command(id, name)
-        .output()
+    // Captured, never inherited: a stale pane id (closed between
+    // list-panes and the rename) or any zellij hiccup must not bleed an
+    // error line onto the TUI, which the event-driven loop would leave
+    // until the next watcher event (ruthless 9c38523).
+    let out = zellij_sync(&rename_pane_args(id, name))
         .map_err(|e| format!("could not run zellij: {e}"))?;
     if out.status.success() {
         return Ok(());
@@ -2982,10 +2882,8 @@ pub(crate) fn rename_pane_checked(id: &str, name: &str) -> Result<(), String> {
     ))
 }
 
-fn rename_pane_command(id: &str, name: &str) -> std::process::Command {
-    let mut command = std::process::Command::new("zellij");
-    command.args(["action", "rename-pane", "--pane-id", id, name]);
-    command
+fn rename_pane_args<'a>(id: &'a str, name: &'a str) -> [&'a str; 5] {
+    ["action", "rename-pane", "--pane-id", id, name]
 }
 
 /// zellij is the workspace, so `clank open` without it is a setup
@@ -3037,11 +2935,9 @@ pub fn placement_capability() -> PlacementCapability {
     // build can report a version AHEAD of the latest release, so
     // version arithmetic answers a different question than "does this
     // binary have the action".
-    match std::process::Command::new("zellij")
-        .args(["action", "override-layout", "--help"])
-        .output()
-    {
-        Err(_) => PlacementCapability::NoZellij,
+    match zellij_sync(&["action", "override-layout", "--help"]) {
+        Err(RunError::Spawn(_)) => PlacementCapability::NoZellij,
+        Err(_) => PlacementCapability::ClientTooOld,
         Ok(o) if o.status.success() => PlacementCapability::ClientSupports,
         Ok(_) => PlacementCapability::ClientTooOld,
     }
@@ -3052,11 +2948,7 @@ pub fn placement_capability() -> PlacementCapability {
 /// roster mutation already persisted) nor bleed onto a pane. Returns
 /// stdout on success.
 fn zellij_action(args: &[&str]) -> Option<Vec<u8>> {
-    let out = std::process::Command::new("zellij")
-        .arg("action")
-        .args(args)
-        .output()
-        .ok()?;
+    let out = zellij_sync(&[&["action"], args].concat()).ok()?;
     out.status.success().then_some(out.stdout)
 }
 
@@ -3368,6 +3260,61 @@ fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    thread_local! {
+        /// What this thread's zellij calls run instead of zellij.
+        pub(super) static ZELLIJ_STAND_IN: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The reconcile worker's zellij calls each return within their
+    /// budget when zellij never answers, rather than wedge the worker.
+    #[test]
+    fn every_reconcile_zellij_call_returns_within_its_budget_when_zellij_hangs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hang = dir.path().join("zellij");
+        std::fs::write(&hang, "#!/bin/sh\nexec sleep 300\n").unwrap();
+        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o700)).unwrap();
+        type Call = (&'static str, fn() -> bool);
+        let calls: Vec<Call> = vec![
+            ("rename_pane_checked", || {
+                super::rename_pane_checked("terminal_1", "x").is_err()
+            }),
+            ("rename_tab", || !super::rename_tab(1, "x")),
+            ("list_tabs", || super::list_tabs().is_none()),
+            ("list_agent_panes", || super::list_agent_panes().is_none()),
+            ("snapshot_panes_in", || {
+                super::snapshot_panes_in("s").is_none()
+            }),
+            ("list_sessions", || {
+                super::zellij_list_sessions_checked().is_none()
+            }),
+            ("current_tab", || {
+                super::zellij_action(&["current-tab-info"]).is_none()
+            }),
+        ];
+        let started = std::time::Instant::now();
+        let threads: Vec<_> = calls
+            .into_iter()
+            .map(|(name, call)| {
+                let hang = hang.clone();
+                std::thread::spawn(move || {
+                    ZELLIJ_STAND_IN.with(|s| *s.borrow_mut() = Some(hang));
+                    let failed = call();
+                    (name, failed, started.elapsed())
+                })
+            })
+            .collect();
+        for thread in threads {
+            let (name, failed, took) = thread.join().unwrap();
+            assert!(failed, "{name} reported success from a hung zellij");
+            assert!(
+                took < super::ZELLIJ_BUDGET + std::time::Duration::from_secs(5),
+                "{name} took {took:?}"
+            );
+        }
+    }
 
     /// The name clank gives the pane a test describes by its launch
     /// command; empty for any other command.
@@ -3812,12 +3759,11 @@ mod tests {
 
     #[tokio::test]
     async fn pane_write_discards_stdout_and_retains_failure_tail() {
-        let mut command = tokio::process::Command::new("sh");
-        command.args([
+        let command = Spec::new("sh").args([
             "-c",
             "head -c 100000 /dev/zero; printf transport-refused >&2; exit 7",
         ]);
-        let error = run_pane_write(&mut command, std::time::Duration::from_secs(3))
+        let error = run_pane_write(command, std::time::Duration::from_secs(3))
             .await
             .unwrap_err();
         let diagnostic = format!("{error:#}");
@@ -3831,10 +3777,9 @@ mod tests {
 
     #[tokio::test]
     async fn pane_write_deadline_covers_descendants_retaining_output_pipes() {
-        let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", "sleep 30 & exit 0"]);
+        let command = Spec::new("sh").args(["-c", "sleep 30 & exit 0"]);
         let started = std::time::Instant::now();
-        let error = run_pane_write(&mut command, std::time::Duration::from_millis(150))
+        let error = run_pane_write(command, std::time::Duration::from_millis(150))
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("acceptance is unknown"));
@@ -3851,7 +3796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_query_times_out_even_when_a_descendant_retains_the_pipes() {
+    async fn open_query_is_unknown_at_once_when_a_descendant_retains_the_pipes() {
         let argv = [
             "/bin/sh",
             "-c",
@@ -3859,6 +3804,25 @@ mod tests {
         ]
         .map(str::to_string);
         let started = std::time::Instant::now();
+        let error = run_open_query(&argv, std::time::Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("not known to be whole") && text.contains("socket query stalled"),
+            "{text}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn open_query_times_out() {
+        let argv = [
+            "/bin/sh",
+            "-c",
+            "printf 'socket query stalled\n' >&2; exec /bin/sleep 30",
+        ]
+        .map(str::to_string);
         let error = run_open_query(&argv, std::time::Duration::from_millis(500))
             .await
             .unwrap_err();
@@ -3867,7 +3831,6 @@ mod tests {
             text.contains("timed out") && text.contains("socket query stalled"),
             "{text}"
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[tokio::test]
@@ -3896,10 +3859,10 @@ mod tests {
     #[test]
     fn a_scan_that_could_not_list_is_blind_not_empty() {
         let quick = std::time::Duration::from_millis(1);
-        let blind = scan_sessions(quick, || None, |_| None);
+        let blind = scan_sessions(quick, || None, |_, _| None);
         assert!(blind.listing_failed, "nothing was learned");
 
-        let empty = scan_sessions(quick, || Some(String::new()), |_| None);
+        let empty = scan_sessions(quick, || Some(String::new()), |_, _| None);
         assert!(
             !empty.listing_failed,
             "the listing answered: there are none"
@@ -3916,7 +3879,7 @@ mod tests {
         let scan = scan_sessions(
             std::time::Duration::from_millis(1),
             || Some("alpha [Created 1s ago]\nbeta [Created 1s ago]\n".to_string()),
-            |_| None,
+            |_, _| None,
         );
         assert_eq!(
             scan.unanswered,
@@ -4008,10 +3971,8 @@ mod tests {
 
     #[test]
     fn a_pane_is_renamed_by_its_id() {
-        let command = rename_pane_command("terminal_5", "clank 1.0.0");
-        assert_eq!(command.get_program(), "zellij");
         assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
+            rename_pane_args("terminal_5", "clank 1.0.0"),
             [
                 "action",
                 "rename-pane",
@@ -6729,7 +6690,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         let scan = scan_sessions(
             std::time::Duration::from_millis(10),
             || Some(listing.to_string()),
-            |_| None,
+            |_, _| None,
         );
         assert!(
             scan.unanswered.contains(&"garbled".to_string())

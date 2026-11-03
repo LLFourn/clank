@@ -431,7 +431,7 @@ fn collect_inclusions(
     }
 }
 
-fn is_cfg_test(a: &syn::Attribute) -> bool {
+pub fn is_cfg_test(a: &syn::Attribute) -> bool {
     a.path().is_ident("cfg")
         && matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
 }

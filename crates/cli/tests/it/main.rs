@@ -35,6 +35,7 @@ mod no_orphan_doc_comments;
 mod opencode_plugin_lifecycle;
 mod pick_integration;
 mod plan_admission;
+mod process_boundary;
 mod rereview_integration;
 mod signal_boundary;
 mod standby_wakes;

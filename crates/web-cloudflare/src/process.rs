@@ -26,15 +26,20 @@ struct Ready<'a> {
     public_url: Option<&'a str>,
 }
 
-#[tokio::main]
-pub async fn main() {
-    if let Err(error) = run().await {
+/// The host process, starting any tunnel command through `spawn`.
+pub fn main(spawn: std::sync::Arc<dyn tunnel::Spawn>) {
+    let outcome = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| runtime.block_on(run(spawn)));
+    if let Err(error) = outcome {
         let _ = write_line(&serde_json::json!({"error":format!("{error:#}")}));
         std::process::exit(1);
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(spawn: std::sync::Arc<dyn tunnel::Spawn>) -> anyhow::Result<()> {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     let mut line = String::new();
     anyhow::ensure!(stdin.read_line(&mut line)? > 0, "startup pipe closed");
@@ -62,7 +67,7 @@ async fn run() -> anyhow::Result<()> {
             let home = home
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("a tunnel needs HOME"))?;
-            let (provider, grace) = tunnel::configured(Some(home))?
+            let (provider, grace) = tunnel::configured(Some(home), spawn)?
                 .ok_or_else(|| anyhow::anyhow!("no remote tunnel configured"))?;
             let mut setup = tunnel::Start {
                 provider,

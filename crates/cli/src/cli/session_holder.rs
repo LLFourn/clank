@@ -99,15 +99,19 @@ pub(crate) fn find(
 
 /// `claude agents --json` needs no TTY. Any failure is an empty listing.
 pub(crate) fn claude_agents_listing(program: String) -> Vec<ClaudeSession> {
-    std::process::Command::new(program)
-        .args(["agents", "--json"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| parse_claude_agents(&o.stdout))
-        .unwrap_or_default()
+    const CLAUDE_AGENTS_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    use crate::proc_run::{Group, Out, Spec};
+    crate::proc_run::run_blocking(
+        Spec::new(program)
+            .args(["agents", "--json"])
+            .stdout(Out::Capture { cap: 16 << 20 })
+            .group(Group::New),
+        CLAUDE_AGENTS_BUDGET,
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| parse_claude_agents(&o.stdout))
+    .unwrap_or_default()
 }
 
 /// A pane holds `label` when it is a live pane named `label` in the

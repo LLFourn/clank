@@ -362,7 +362,6 @@ struct Lease {
 }
 impl Lease {
     fn acquire(path: &Path) -> std::io::Result<Option<Self>> {
-        use std::os::fd::AsRawFd;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -370,16 +369,7 @@ impl Lease {
             .write(true)
             .open(path)?;
         // Locks are never unlinked: the open inode is dispatch authority.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 {
-            return Ok(Some(Self { _file: file }));
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            Ok(None)
-        } else {
-            Err(error)
-        }
+        Ok(clank_user_config::lease::take(&file)?.then_some(Self { _file: file }))
     }
 }
 

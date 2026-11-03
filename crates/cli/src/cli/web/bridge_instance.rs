@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
@@ -30,7 +30,7 @@ pub(crate) struct AdminState {
 }
 
 struct OwnedHost {
-    child: Child,
+    child: crate::proc_run::Managed,
     input: ChildStdin,
 }
 
@@ -54,12 +54,12 @@ impl OwnedHost {
     async fn stop(mut self) {
         let _ = self.input.write_all(b"shutdown\n").await;
         drop(self.input);
-        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+        if tokio::time::timeout(Duration::from_secs(5), self.child.wait_async())
             .await
             .is_err()
         {
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+            self.child.kill();
+            let _ = self.child.wait_async().await;
         }
     }
 }
@@ -588,7 +588,7 @@ impl Drop for BridgeInstance {
         self.questions.stop();
         let _ = self.cancel.send(true);
         if let Some(host) = self.host.as_mut() {
-            let _ = host.child.start_kill();
+            host.child.kill();
         }
         #[cfg(test)]
         if let Some(fixture) = self.fixture.take()
@@ -648,19 +648,15 @@ async fn start_host(
     tunnel_grace: Option<Duration>,
     abandoned: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<(OwnedHost, Ready)> {
-    let mut command = Command::new(&binary);
+    use crate::proc_run::{Out, Spec, Stdin};
+    let mut command = Spec::new(&binary).stdin(Stdin::Piped).stdout(Out::Piped);
     if let Some(home) = home {
-        command.env("HOME", home);
+        command = command.env("HOME", home);
     }
-    let mut child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+    let mut child = crate::proc_run::start(command)
         .map_err(|error| anyhow::anyhow!("starting `{}`: {error}", binary.display()))?;
-    let mut input = child.stdin.take().expect("piped child stdin");
-    let output = child.stdout.take().expect("piped child stdout");
+    let mut input = child.take_stdin_async().expect("piped child stdin");
+    let output = child.take_stdout_async().expect("piped child stdout");
     let start = serde_json::json!({"session":session,"port":port,"tunnel":tunnel_grace.is_some()});
     let ready = async {
         input.write_all(format!("{start}\n").as_bytes()).await?;
@@ -701,8 +697,8 @@ async fn start_host(
     let ready = match ready {
         Ok(ready) => ready,
         Err(error) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            child.kill();
+            let _ = child.wait_async().await;
             return Err(error);
         }
     };

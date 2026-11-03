@@ -537,6 +537,23 @@ impl IngestLease {
         events_dir: &Path,
         source_key: &str,
     ) -> std::io::Result<Option<IngestLease>> {
+        Self::taking(events_dir, source_key, clank_user_config::lease::take)
+    }
+
+    /// [`IngestLease::try_acquire`] in one attempt, for a caller that
+    /// polls it and must not park its runtime thread in between.
+    pub(crate) fn try_acquire_now(
+        events_dir: &Path,
+        source_key: &str,
+    ) -> std::io::Result<Option<IngestLease>> {
+        Self::taking(events_dir, source_key, clank_user_config::lease::take_now)
+    }
+
+    fn taking(
+        events_dir: &Path,
+        source_key: &str,
+        take: fn(&std::fs::File) -> std::io::Result<bool>,
+    ) -> std::io::Result<Option<IngestLease>> {
         std::fs::create_dir_all(events_dir)?;
         let path = events_dir.join(format!("{source_key}.ingest.lock"));
         let file = std::fs::OpenOptions::new()
@@ -545,16 +562,7 @@ impl IngestLease {
             .read(true)
             .write(true)
             .open(&path)?;
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(Some(IngestLease { _file: file }));
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(None);
-        }
-        Err(err)
+        Ok(take(&file)?.then_some(IngestLease { _file: file }))
     }
 }
 

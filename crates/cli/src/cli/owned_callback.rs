@@ -2,7 +2,6 @@
 //! this module owns only stdin, child/group lifetime and recovery identity.
 use anyhow::Context;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 pub(crate) struct Request<'a> {
@@ -25,32 +24,23 @@ pub(crate) async fn deliver(
             "backend callback recovery exhausted its invocation budget; retry on a later invocation"
         );
     }
-    let mut command = tokio::process::Command::new(&request.argv[0]);
-    command
+    use crate::proc_run::{Group, Out, Spec, Stdin};
+    let command = Spec::new(&request.argv[0])
         .args(&request.argv[1..])
-        .current_dir(request.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    match request.state_dir {
-        Some(dir) => {
-            command.env("CLANK_SOURCE_STATE_DIR", dir);
-        }
-        None => {
-            command.env_remove("CLANK_SOURCE_STATE_DIR");
-        }
-    }
-    let mut child = command.spawn().context("cannot start backend callback")?;
-    let mut group = crate::cli::wait::GroupKill::over(child.id());
-    let pgid = group.0;
+        .cwd(request.cwd)
+        .stdin(Stdin::Piped)
+        .stderr(Out::Piped)
+        .group(Group::New);
+    let command = match request.state_dir {
+        Some(dir) => command.env("CLANK_SOURCE_STATE_DIR", dir),
+        None => command.env_remove("CLANK_SOURCE_STATE_DIR"),
+    };
+    let mut child = crate::proc_run::start(command).context("cannot start backend callback")?;
+    let pgid = child.pgid();
     let result = tokio::time::timeout_at(call_deadline, async {
         // No request bytes reach a child that cannot be recognised after our
         // caller is SIGKILLed. ProcToken uses kernel birth identity, not ps.
-        let pid = child
-            .id()
-            .context("backend callback exited before it could be owned")?;
+        let pid = child.pid();
         let token = crate::proc_identity::token_for(pid as i32)
             .context("cannot capture callback process identity")?;
         save_owner(
@@ -60,8 +50,8 @@ pub(crate) async fn deliver(
                 token,
             },
         )?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        let mut stdin = child.take_stdin_async().context("piped stdin")?;
+        let mut stderr = child.take_stderr_async().context("piped stderr")?;
         let write = async move {
             stdin.write_all(request.stdin).await?;
             drop(stdin); // EOF is part of the protocol; shutdown alone need not close a pipe.
@@ -79,10 +69,14 @@ pub(crate) async fn deliver(
             }
             std::io::Result::Ok(tail.into_string())
         };
-        let (write, tail, status) = tokio::join!(write, read, child.wait());
+        let (write, tail, exited) = tokio::join!(write, read, child.exited_async());
         write?;
         let tail = tail?;
-        let status = status?;
+        exited?;
+        // Descendants are ended even if their parent exited zero, while
+        // its unreaped zombie still holds the group's id.
+        child.kill();
+        let status = child.wait()?;
         if !status.success() {
             anyhow::bail!(
                 "backend callback exited {status}: {}",
@@ -92,11 +86,10 @@ pub(crate) async fn deliver(
         Ok(())
     })
     .await;
-    // End descendants even if their parent exited zero. Reserve time for the
-    // reap inside the same absolute deadline, with no orphaned detached task.
-    group.terminate();
-    let _ = child.start_kill();
-    let reaped = tokio::time::timeout_at(deadline, child.wait()).await;
+    // Reserve time for the reap inside the same absolute deadline, with no
+    // orphaned detached task.
+    child.kill();
+    let reaped = tokio::time::timeout_at(deadline, child.wait_async()).await;
     if !matches!(reaped, Ok(Ok(_))) {
         anyhow::bail!("backend callback cleanup exceeded its deadline; acceptance is uncertain");
     }

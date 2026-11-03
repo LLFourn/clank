@@ -1867,7 +1867,6 @@ pub(crate) fn repair_permit(
     repo: &std::path::Path,
     dir: &std::path::Path,
 ) -> Result<Option<RepairPermit>, String> {
-    use std::os::fd::AsRawFd;
     let path = dir.join(format!("{}.repair", repo_tag(repo)));
     // Never unlinked: the held fd and its flock ARE the state, and
     // removing the file on release would let the next caller create a
@@ -1879,9 +1878,10 @@ pub(crate) fn repair_permit(
         .write(true)
         .open(&path)
         .map_err(|e| format!("cannot open the repair gate at {}: {e}", path.display()))?;
-    // SAFETY: valid owned fd; flock has no memory effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    Ok((rc == 0).then_some(RepairPermit { _file: file }))
+    // One attempt: its caller polls it to a deadline on a runtime thread.
+    let taken = clank_user_config::lease::take_now(&file)
+        .map_err(|e| format!("cannot lock the repair gate at {}: {e}", path.display()))?;
+    Ok(taken.then_some(RepairPermit { _file: file }))
 }
 
 /// A stable digest of a canonical repo path.
@@ -1927,7 +1927,7 @@ pub(crate) async fn wait_for_ownership(
     by: std::time::Instant,
     step: Duration,
 ) -> Ownership {
-    wait_for_ownership_by(repo, by, step, |r| acquire_lease(r).is_ok(), |_| None).await
+    wait_for_ownership_by(repo, by, step, |r| acquire_lease_now(r).is_ok(), |_| None).await
 }
 
 /// Wait within one deadline using the caller's non-blocking ownership probe.
@@ -1984,35 +1984,31 @@ pub(crate) async fn wait_for_ownership_by(
 /// winner and return, and ours then loses the lease and exits with
 /// nobody left watching for it.
 ///
-/// A trait rather than the `Child` itself because no test here may
-/// start a binary, and `std::process::Child` cannot be constructed
-/// without one — so this is the only shape in which a test can own a
-/// started monitor at all.
+/// A trait rather than the started child itself because no test here
+/// may start a binary — so this is the only shape in which a test can
+/// own a started monitor at all.
 pub(crate) trait Started: Send + 'static {
-    /// Wait for it, WITHOUT killing it: the monitor must outlive the
+    /// Hand its wait to something that outlives this call, WITHOUT
+    /// killing it and without blocking: the monitor must outlive the
     /// client that started it. That is the whole point of spawning
     /// rather than binding.
     fn reap(self: Box<Self>);
 }
 
-struct Spawned(std::process::Child);
+struct Spawned(crate::proc_run::Managed);
 
 impl Started for Spawned {
-    fn reap(mut self: Box<Self>) {
-        let _ = self.0.wait();
+    fn reap(self: Box<Self>) {
+        self.0.detach();
     }
 }
 
-/// Hand a started monitor to a waiter that outlives this call.
-///
-/// A thread, because the wait must survive attachment success,
-/// fallback and cancellation alike — anything owned by the retry loop
-/// is released exactly when the monitor is least likely to have exited
-/// yet. It blocks in `waitpid` for as long as the monitor lives, which
-/// costs no CPU, and dies with the client, at which point the kernel
-/// reparents the monitor to init and reaps it there.
+/// Hand a started monitor to a waiter that outlives this call: the
+/// wait must survive attachment success, fallback and cancellation
+/// alike — anything owned by the retry loop is released exactly when
+/// the monitor is least likely to have exited yet.
 fn supervise(started: Box<dyn Started>) {
-    std::thread::spawn(move || started.reap());
+    started.reap();
 }
 
 /// Attach to this repo's monitor, starting one if none is running.
@@ -2050,7 +2046,7 @@ pub(crate) async fn attempt_with(
         SHARE_ATTEMPTS,
         spawn,
         connect_within,
-        |r| acquire_lease(r).is_ok(),
+        |r| acquire_lease_now(r).is_ok(),
     )
     .await
 }
@@ -2465,8 +2461,6 @@ pub(crate) fn core_wakes(
 /// not the parent — so it needs [`supervise`] to reap it, and only the
 /// client's own exit reparents it to init.
 pub(crate) fn spawn_monitor(repo: &std::path::Path) -> std::io::Result<Box<dyn Started>> {
-    use std::os::unix::process::CommandExt;
-
     let installed = match crate::build_stamp::rendezvous() {
         Some(rendezvous) => rendezvous,
         None => crate::build_stamp::Rendezvous {
@@ -2474,12 +2468,7 @@ pub(crate) fn spawn_monitor(repo: &std::path::Path) -> std::io::Result<Box<dyn S
             source: crate::build_stamp::Source::Fallback,
         },
     };
-    monitor_command(&installed, repo)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
+    crate::proc_run::start(monitor_command(&installed, repo).group(crate::proc_run::Group::New))
         .map(|child| Box::new(Spawned(child)) as Box<dyn Started>)
 }
 
@@ -2489,15 +2478,13 @@ pub(crate) fn spawn_monitor(repo: &std::path::Path) -> std::io::Result<Box<dyn S
 fn monitor_command(
     installed: &crate::build_stamp::Rendezvous,
     repo: &std::path::Path,
-) -> std::process::Command {
-    let mut command = std::process::Command::new(&installed.path);
-    command
+) -> crate::proc_run::Spec {
+    crate::proc_run::Spec::new(&installed.path)
         .args(["monitor", "start", "--repo"])
         .arg(repo)
         .arg("--installed-at")
         .arg(&installed.path)
-        .args(["--installed-from", installed.source.as_str()]);
-    command
+        .args(["--installed-from", installed.source.as_str()])
 }
 
 /// Held for the life of the monitor. Dropping it — including by dying —
@@ -2648,8 +2635,25 @@ fn acquire_lease_with(
     me: u32,
     between: impl Fn(&std::path::Path),
 ) -> Result<MonitorLease, LeaseError> {
-    use std::os::fd::AsRawFd;
+    acquire_lease_taking(dir, path, me, between, clank_user_config::lease::take)
+}
 
+/// [`acquire_lease`] in one attempt, for a caller polling it to its own
+/// deadline: a patient take would park the runtime thread polling it.
+fn acquire_lease_now(repo: &std::path::Path) -> Result<MonitorLease, LeaseError> {
+    let me = unsafe { libc::getuid() };
+    let dir = runtime_dir(me);
+    let path = runtime_path_in(&dir, repo, "lock");
+    acquire_lease_taking(&dir, path, me, |_| {}, clank_user_config::lease::take_now)
+}
+
+fn acquire_lease_taking(
+    dir: &std::path::Path,
+    path: std::path::PathBuf,
+    me: u32,
+    between: impl Fn(&std::path::Path),
+    take: fn(&std::fs::File) -> std::io::Result<bool>,
+) -> Result<MonitorLease, LeaseError> {
     if let Err(why) = ensure_dir(dir, me) {
         return Err(LeaseError::Unverifiable(format!(
             "cannot use this uid's runtime directory: {why}"
@@ -2670,21 +2674,20 @@ fn acquire_lease_with(
                 ))
             })?;
         between(&path);
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let e = std::io::Error::last_os_error();
-            return Err(if e.kind() == std::io::ErrorKind::WouldBlock {
-                LeaseError::Busy(format!(
+        match take(&file) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(LeaseError::Busy(format!(
                     "another monitor already owns this repo: its lease at {} is held",
                     path.display()
-                ))
-            } else {
-                LeaseError::Unverifiable(format!(
+                )));
+            }
+            Err(e) => {
+                return Err(LeaseError::Unverifiable(format!(
                     "cannot lock the monitor lease at {}: {e}",
                     path.display()
-                ))
-            });
+                )));
+            }
         }
         let held = file.metadata().map(|md| FileId::of(&md)).map_err(|e| {
             LeaseError::Unverifiable(format!(
@@ -11280,8 +11283,10 @@ mod tests {
 
     impl Started for ExitsLater {
         fn reap(self: Box<Self>) {
-            let _ = self.exit.recv();
-            let _ = self.reaped.send(());
+            std::thread::spawn(move || {
+                let _ = self.exit.recv();
+                let _ = self.reaped.send(());
+            });
         }
     }
 
@@ -11646,10 +11651,10 @@ mod tests {
             .write(true)
             .open(&legacy)
             .unwrap();
-        use std::os::fd::AsRawFd;
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(old.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(rc, 0, "a pre-cutover binary takes the old path");
+        assert!(
+            clank_user_config::lease::take(&old).unwrap(),
+            "a pre-cutover binary takes the old path"
+        );
         assert!(
             acquire_lease(repo.path()).is_ok(),
             "and this one takes the new one regardless — which is why a pre-cutover \
@@ -16119,8 +16124,7 @@ mod lease_tests {
         use crate::cli::source_group::{self, tests::sh};
         let owners = source_group::tests::owners();
         let dir = tempfile::tempdir().unwrap();
-        let mut command = sh("trap '' TERM; echo $$ > ready; exec sleep 300");
-        command.current_dir(dir.path());
+        let command = sh("trap '' TERM; echo $$ > ready; exec sleep 300").cwd(dir.path());
         let lease = std::sync::Arc::new(
             crate::cli::github::log::IngestLease::try_acquire(dir.path(), "src")
                 .unwrap()
@@ -16133,12 +16137,12 @@ mod lease_tests {
             "src",
             lease,
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut command,
+            command,
         )
         .await
         .unwrap();
         let host = tokio::spawn(async move {
-            let _ = child.wait().await;
+            let _ = child.wait_async().await;
             let _ = tokio::task::spawn_blocking(move || group.retire()).await;
         });
         let stubborn = source_group::tests::pid_in(&dir.path().join("ready")).await;
@@ -16195,8 +16199,7 @@ mod lease_tests {
         script: &str,
     ) -> tokio::task::JoinHandle<()> {
         use crate::cli::source_group::{self, tests::sh};
-        let mut command = sh(script);
-        command.current_dir(dir);
+        let command = sh(script).cwd(dir);
         let lease = std::sync::Arc::new(
             crate::cli::github::log::IngestLease::try_acquire(dir, "src")
                 .unwrap()
@@ -16209,12 +16212,12 @@ mod lease_tests {
             "src",
             lease,
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut command,
+            command,
         )
         .await
         .unwrap();
         let host = tokio::spawn(async move {
-            let _ = child.wait().await;
+            let _ = child.wait_async().await;
             let _ = tokio::task::spawn_blocking(move || group.retire()).await;
         });
         source_group::tests::pid_in(&dir.join("ready")).await;

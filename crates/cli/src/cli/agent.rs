@@ -1478,65 +1478,34 @@ fn composed_line(c: &ComposedLaunch) -> String {
     line
 }
 
-/// A fresh agent launch must not INHERIT another agent's identity:
-/// agent sessions export their session vars to every shell, so a
-/// tool started from inside one (or from a pane server that kept
-/// them) sees the parent's identity and either dies in
-/// ConflictingSessions or silently binds as the parent — observed
-/// live with opencode under a claude shell (opencode-agent-tool M1).
-/// Each tool re-exports its own identity to its children, so
-/// scrubbing is always safe. Profile env follows; Grok composition removes
-/// foreign identity overrides and pins a known child's own ID.
-fn scrub_inherited_identity(cmd: &mut std::process::Command) {
-    for var in crate::agent_env::SESSION_IDENTITY_VARS {
-        cmd.env_remove(var);
-    }
-}
-
-#[cfg(unix)]
-/// The directory and environment a launch runs in: shared by its exec and
-/// by the version asked of it just before.
-fn launch_context(cmd: &mut std::process::Command, c: &ComposedLaunch, repo: Option<&Path>) {
-    if let Some(repo) = repo {
-        cmd.current_dir(repo);
-    }
-    scrub_inherited_identity(cmd);
-    for (k, v) in &c.env_overrides {
-        cmd.env(k, v);
+/// The command a launch execs: its directory, and an environment that
+/// does not INHERIT another agent's identity. Agent sessions export
+/// their session vars to every shell, so a tool started from inside one
+/// (or from a pane server that kept them) sees the parent's identity
+/// and either dies in ConflictingSessions or silently binds as the
+/// parent — observed live with opencode under a claude shell
+/// (opencode-agent-tool M1). Each tool re-exports its own identity to
+/// its children, so scrubbing is always safe. Profile env follows; Grok
+/// composition removes foreign identity overrides and pins a known
+/// child's own ID.
+fn launch_spec(c: &ComposedLaunch, repo: Option<&Path>) -> crate::proc_run::Spec {
+    use crate::proc_run::{Identity, Out, Spec, Stdin};
+    let spec = Spec::new(&c.program)
+        .args(&c.args)
+        .identity(Identity::ScrubInherited)
+        .envs(&c.env_overrides)
+        .stdin(Stdin::Inherit)
+        .stdout(Out::Inherit)
+        .stderr(Out::Inherit);
+    match repo {
+        Some(repo) => spec.cwd(repo),
+        None => spec,
     }
 }
 
 fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(&c.program);
-    cmd.args(&c.args);
-    launch_context(&mut cmd, &c, repo);
-    // `exec` replaces the current process; the only return
-    // value is the io::Error if exec itself fails (e.g.
-    // command-not-found, permissions).
-    let err = cmd.exec();
+    let err = crate::proc_run::exec(launch_spec(&c, repo));
     Err(anyhow::anyhow!("failed to exec `{}`: {err}", c.program))
-}
-
-#[cfg(not(unix))]
-fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
-    // Non-unix fallback: spawn + wait. Process replacement isn't
-    // available on Windows; the calling shell sees clank exit
-    // with the child's status.
-    let mut cmd = std::process::Command::new(&c.program);
-    if let Some(repo) = repo {
-        cmd.current_dir(repo);
-    }
-    cmd.args(&c.args);
-    scrub_inherited_identity(&mut cmd);
-    let status = cmd
-        .envs(c.env_overrides.iter())
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
-    if !status.success() {
-        anyhow::bail!("`{}` exited with status {}", c.program, status);
-    }
-    Ok(())
 }
 
 // ── clank agent add / promote / remove ────────────────────
@@ -5552,37 +5521,94 @@ mod tests {
         );
     }
 
+    /// Hosts the launch cases in a fresh process of this test binary,
+    /// whose environment the parent sets and whose exec cannot take the
+    /// test runner with it.
     #[test]
-    fn launches_scrub_every_inherited_identity_var() {
-        // The child env must not carry ANOTHER agent's identity
-        // (observed live: opencode under a claude shell bound the
-        // claude session — opencode-agent-tool M1). Asserted at the
-        // Command level via get_envs: scrubbed vars map to None
-        // (explicit removal), and a deliberate launch.env override
-        // applied after still wins.
-        let mut cmd = std::process::Command::new("true");
-        scrub_inherited_identity(&mut cmd);
-        cmd.env("CLAUDE_CODE_SESSION_ID", "deliberate");
-        let envs: std::collections::BTreeMap<_, _> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
-            .collect();
-        for var in [
-            "CODEX_THREAD_ID",
-            "OPENCODE_SESSION_ID",
-            "GROK_AGENT",
-            "CLANK_AGENT",
-        ] {
-            assert_eq!(
-                envs.get(std::ffi::OsStr::new(var)),
-                Some(&None),
-                "{var} must be removed"
-            );
+    fn launch_case_host() {
+        if !crate::proc_run::tests::is_child() {
+            return;
         }
-        assert_eq!(
-            envs.get(std::ffi::OsStr::new("CLAUDE_CODE_SESSION_ID")),
-            Some(&Some("deliberate".into()))
+        let said = match std::env::var("CLANK_LAUNCH_CASE").unwrap().as_str() {
+            "env" => {
+                let c = ComposedLaunch {
+                    program: "/usr/bin/env".into(),
+                    args: Vec::new(),
+                    env_overrides: [("CLANK_AGENT".to_string(), "intended".to_string())]
+                        .into_iter()
+                        .collect(),
+                };
+                let out = crate::proc_run::run_blocking(
+                    launch_spec(&c, None).stdout(crate::proc_run::Out::Capture { cap: 1 << 20 }),
+                    std::time::Duration::from_secs(20),
+                )
+                .unwrap();
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .collect::<Vec<_>>()
+                    .join("|")
+            }
+            "exec" => {
+                let repo = tempfile::tempdir().unwrap();
+                let name = label("kimi");
+                let spec = crate::cli::fork::ForkSpec {
+                    grok: None,
+                    tool: Tool::OpenCode,
+                    from_session: Some("ses_039d60658ffe0RPgue3noZ0Qqf".into()),
+                    prompt: "Review the parallel fork plan.".into(),
+                    opencode: None,
+                };
+                crate::cli::fork::save_fork_spec(repo.path(), &name, &spec).unwrap();
+                let failed = launch_consuming_fork(repo.path(), &name, true, || {
+                    exec_composed(
+                        ComposedLaunch {
+                            program: "/nonexistent/clank-launch-fixture".into(),
+                            args: Vec::new(),
+                            env_overrides: Default::default(),
+                        },
+                        None,
+                    )
+                });
+                let kept = crate::cli::fork::take_fork_spec(repo.path(), &name).unwrap();
+                format!(
+                    "failed={} kept={}",
+                    failed.is_err(),
+                    kept.is_some_and(|k| k.prompt == spec.prompt)
+                )
+            }
+            other => panic!("no case {other}"),
+        };
+        println!("RESULT:{said}");
+    }
+
+    /// A real launch, from a process that inherited other agents'
+    /// identities: none of them reach the program, and the identity the
+    /// launch sets does.
+    #[test]
+    fn a_launch_carries_its_own_identity_and_no_inherited_one() {
+        let mut env: Vec<(&str, &str)> = crate::agent_env::SESSION_IDENTITY_VARS
+            .iter()
+            .map(|var| (*var, "inherited-foreign"))
+            .collect();
+        env.push(("CLANK_LAUNCH_CASE", "env"));
+        let said = crate::proc_run::tests::in_child("cli::agent::tests::launch_case_host", &env);
+        let vars: Vec<&str> = said.split('|').collect();
+        assert!(vars.contains(&"CLANK_AGENT=intended"), "{said}");
+        assert!(
+            !vars.iter().any(|v| v.ends_with("=inherited-foreign")),
+            "an inherited identity reached the launch: {said}"
         );
+    }
+
+    /// The real exec, of a program that does not exist: it returns its
+    /// error, and the fork intent it consumed is put back.
+    #[test]
+    fn a_failed_exec_restores_the_consumed_fork_intent() {
+        let said = crate::proc_run::tests::in_child(
+            "cli::agent::tests::launch_case_host",
+            &[("CLANK_LAUNCH_CASE", "exec")],
+        );
+        assert_eq!(said, "failed=true kept=true");
     }
 
     fn desc_with(tool: Tool, launch: Option<LaunchConfig>) -> AgentDescription {

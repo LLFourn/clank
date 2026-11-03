@@ -56,7 +56,7 @@ const PANE_MUTATIONS: &[&str] = &[
 /// legal in the spawner only.
 fn spawn_violation(line: &str) -> Option<String> {
     let code = line.split("//").next().unwrap_or("");
-    if code.contains(r#"Command::new("zellij")"#) {
+    if code.contains(r#"Command::new("zellij")"#) || code.contains(r#"Spec::new("zellij")"#) {
         return Some("raw `zellij` subprocess".to_string());
     }
     // "Am I inside zellij" has ONE definition, `open_zellij::
@@ -154,6 +154,10 @@ fn scanner_catches_both_ways_around_the_seam() {
         line_violation(r#"    let _ = std::process::Command::new("zellij").arg("action");"#)
             .is_some(),
         "a raw spawn is a violation"
+    );
+    assert!(
+        line_violation(r#"    let _ = proc_run::Spec::new("zellij").arg("action");"#).is_some(),
+        "so is one built through the process layer"
     );
     assert!(
         line_violation("    crate::cli::open_zellij::add_reviewer_pane(repo, label);").is_some(),

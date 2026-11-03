@@ -1,7 +1,6 @@
 //! Real CLI producer -> WAL -> wait -> hook -> callback contracts. These
 //! need the subprocess boundary; no providers, terminals or live accounts.
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -310,10 +309,7 @@ impl Fixture {
             .write(true)
             .open(path)
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        assert!(clank_user_config::lease::take(&file).unwrap());
         file
     }
     async fn assert_receipt(&self, producer: &Value) {

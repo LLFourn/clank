@@ -16,11 +16,16 @@ async fn acquire_github_token() -> anyhow::Result<String> {
     if let Some(t) = env_token(|k| std::env::var(k).ok()) {
         return Ok(t);
     }
-    let out = tokio::process::Command::new("gh")
-        .args(["auth", "token"])
-        .kill_on_drop(true)
-        .output()
-        .await?;
+    const GH_TOKEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    use crate::proc_run::{Out, Spec};
+    let out = crate::proc_run::run(
+        Spec::new("gh")
+            .args(["auth", "token"])
+            .stdout(Out::Capture { cap: 64 << 10 })
+            .stderr(Out::Ring { bytes: 4096 }),
+        GH_TOKEN_BUDGET,
+    )
+    .await?;
     if !out.status.success() {
         anyhow::bail!(
             "no GH_TOKEN/GITHUB_TOKEN and `gh auth token` failed: {}",
@@ -232,8 +237,8 @@ impl<S: HttpSend> GithubSession<S> {
     }
 
     /// One acquisition under the deadline. Timing out DROPS the
-    /// acquire future — the `gh auth token` child dies by its
-    /// `kill_on_drop` config, never outliving the deadline.
+    /// acquire future — the `gh auth token` child dies with the dropped
+    /// run, never outliving the deadline.
     async fn token_within_deadline(&self) -> anyhow::Result<String> {
         match tokio::time::timeout(
             self.acquire_timeout,
@@ -459,7 +464,7 @@ pub(super) mod tests {
     }
 
     /// Set-on-drop probe: the deadline must CANCEL (drop) the owned
-    /// acquire future — production's `kill_on_drop` on the gh child
+    /// acquire future — the gh child dying with its dropped run
     /// rides exactly that drop, so the drop IS the invariant to pin
     /// (codex 78d6592: no external binaries, no unix-only kill).
     static ACQUIRE_DROPPED: std::sync::atomic::AtomicBool =
@@ -494,7 +499,7 @@ pub(super) mod tests {
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             ACQUIRE_DROPPED.load(std::sync::atomic::Ordering::SeqCst),
-            "the deadline must drop the acquire future (kill_on_drop rides this)"
+            "the deadline must drop the acquire future (the child's cleanup rides this)"
         );
     }
 

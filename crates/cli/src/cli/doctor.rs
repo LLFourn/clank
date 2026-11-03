@@ -1416,16 +1416,23 @@ fn opencode_last_settle(data: Option<&Path>, session: &str) -> OpenCodeSettle {
     {
         return OpenCodeSettle::Unknown(format!("`{session}` is not an OpenCode session id"));
     }
-    let out = std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .args(["-cmd", ".timeout 1000"])
-        .arg(format!("file:{}?mode=ro", db.display()))
-        .arg(format!(
-            "select coalesce(time_idle, ''), coalesce(idle_outcome, '') \
-             from session_v2 where id = '{session}'"
-        ))
-        .stdin(std::process::Stdio::null())
-        .output();
+    // Its own `.timeout 1000` bounds the lock wait; this bounds the rest.
+    const SQLITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    use crate::proc_run::{Group, Out, RunError, Spec};
+    let out = crate::proc_run::run_blocking(
+        Spec::new("sqlite3")
+            .arg("-readonly")
+            .args(["-cmd", ".timeout 1000"])
+            .arg(format!("file:{}?mode=ro", db.display()))
+            .arg(format!(
+                "select coalesce(time_idle, ''), coalesce(idle_outcome, '') \
+                 from session_v2 where id = '{session}'"
+            ))
+            .stdout(Out::Capture { cap: 1 << 20 })
+            .stderr(Out::Ring { bytes: 4096 })
+            .group(Group::New),
+        SQLITE_BUDGET,
+    );
     let out = match out {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
@@ -1434,7 +1441,14 @@ fn opencode_last_settle(data: Option<&Path>, session: &str) -> OpenCodeSettle {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        Err(e) => return OpenCodeSettle::Unknown(format!("sqlite3 is not available: {e}")),
+        Err(RunError::Spawn(e)) => {
+            return OpenCodeSettle::Unknown(format!("sqlite3 is not available: {e}"));
+        }
+        Err(e) => {
+            return OpenCodeSettle::Unknown(format!(
+                "sqlite3 could not read OpenCode's store: {e}"
+            ));
+        }
     };
     parse_settle_row(&String::from_utf8_lossy(&out.stdout))
 }

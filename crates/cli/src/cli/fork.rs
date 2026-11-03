@@ -1163,19 +1163,26 @@ fn parse_worktrees(porcelain: &str) -> Vec<(&str, &str)> {
 /// repo). Missing/unauthenticated gh, or any failure → None (the
 /// prompt degrades to "reviewing PR #N").
 fn gh_pr_title(source: &Path, pr: u32) -> Option<String> {
-    let out = std::process::Command::new("gh")
-        .current_dir(source)
-        .args([
-            "pr",
-            "view",
-            &pr.to_string(),
-            "--json",
-            "title",
-            "-q",
-            ".title",
-        ])
-        .output()
-        .ok()?;
+    const GH_PR_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    use crate::proc_run::{Group, Out, Spec};
+    let out = crate::proc_run::run_blocking(
+        Spec::new("gh")
+            .cwd(source)
+            .args([
+                "pr",
+                "view",
+                &pr.to_string(),
+                "--json",
+                "title",
+                "-q",
+                ".title",
+            ])
+            .stdout(Out::Capture { cap: 1 << 20 })
+            .stderr(Out::Ring { bytes: 4096 })
+            .group(Group::New),
+        GH_PR_BUDGET,
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }

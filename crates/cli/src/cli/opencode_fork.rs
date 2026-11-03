@@ -72,6 +72,9 @@ pub(crate) trait Api {
 
 pub(crate) struct Cli;
 
+/// One `opencode api` call: the program boots its server first.
+const OPENCODE_API_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 impl Api for Cli {
     fn call(
         &self,
@@ -80,23 +83,37 @@ impl Api for Cli {
         session: &str,
         body: Option<Value>,
     ) -> Result<Value, CallError> {
-        let mut cmd = std::process::Command::new(&backend.program);
-        cmd.args(["api", method, "--param", &format!("sessionID={session}")])
-            .current_dir(&backend.cwd)
-            .stdin(std::process::Stdio::null());
+        use crate::proc_run::{Group, Identity, Out, RunError, Spec};
+        let mut cmd = Spec::new(&backend.program)
+            .args(["api", method, "--param", &format!("sessionID={session}")])
+            .cwd(&backend.cwd);
         if let Some(body) = body {
-            cmd.args(["-d", &body.to_string()]);
+            cmd = cmd.args(["-d", &body.to_string()]);
         }
-        for var in crate::agent_env::SESSION_IDENTITY_VARS {
-            cmd.env_remove(var);
-        }
-        cmd.envs(&backend.env);
-        let out = cmd.output().map_err(|e| {
-            CallError::Refused(
-                anyhow::Error::from(e)
-                    .context(format!("running `{} api {method}`", backend.program)),
-            )
-        })?;
+        let ran = crate::proc_run::run_blocking(
+            cmd.identity(Identity::ScrubInherited)
+                .envs(&backend.env)
+                .stdout(Out::Capture { cap: 64 << 20 })
+                .stderr(Out::Capture { cap: 1 << 20 })
+                .group(Group::New),
+            OPENCODE_API_BUDGET,
+        );
+        let out = match ran {
+            Ok(out) => out,
+            Err(RunError::Spawn(e)) => {
+                return Err(CallError::Refused(
+                    anyhow::Error::from(e)
+                        .context(format!("running `{} api {method}`", backend.program)),
+                ));
+            }
+            // It ran: whatever it was asked to change may have changed.
+            Err(e) => {
+                return Err(CallError::Unknown(anyhow::Error::from(e).context(format!(
+                    "running `{} api {method}` for {session}",
+                    backend.program
+                ))));
+            }
+        };
         let printed: Option<Value> = serde_json::from_slice(&out.stdout).ok();
         let failed = || {
             anyhow::anyhow!(

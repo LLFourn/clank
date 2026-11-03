@@ -437,14 +437,13 @@ fn stop_report() -> Report {
 /// child's stdin early would give every carried report instant EOF.
 #[tokio::test]
 async fn the_owner_handle_is_held_for_the_whole_wait() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
+    let cmd = Spec::new("/bin/sh")
+        .arg("-c")
         .arg("cat >/dev/null")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut owned = OwnedWait::spawn(&mut cmd, &stop_report()).expect("sh spawns with a pipe");
+        .stdin(Stdin::Piped)
+        .stdout(Out::Piped)
+        .stderr(Out::Piped);
+    let mut owned = OwnedWait::spawn(cmd, &stop_report()).expect("sh spawns with a pipe");
     let running = tokio::spawn(async move { owned.verdict_until(std::future::pending()).await });
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let exited = running.is_finished();
@@ -459,16 +458,15 @@ async fn the_owner_handle_is_held_for_the_whole_wait() {
 async fn owner_loss_closes_the_pipe_and_collects_the_wait_after_its_own_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("cleaned-up");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
+    let cmd = Spec::new("/bin/sh")
+        .arg("-c")
         .arg(format!(
             "cat >/dev/null; sleep 0.2; touch '{}'",
             marker.display()
         ))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stdin(Stdin::Piped)
+        .stdout(Out::Piped)
+        .stderr(Out::Piped);
     let (mut life, end) = Lifetime::signalled();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     tokio::spawn(async move {
@@ -476,7 +474,7 @@ async fn owner_loss_closes_the_pipe_and_collects_the_wait_after_its_own_shutdown
         let _ = end.send(());
     });
     let got = await_verdict_under_deadline(deadline, Tool::Codex, true, &mut life, || {
-        OwnedWait::spawn(&mut cmd, &stop_report())
+        OwnedWait::spawn(cmd, &stop_report())
     })
     .await;
     assert!(owner_gone(&got));
@@ -489,24 +487,22 @@ async fn owner_loss_closes_the_pipe_and_collects_the_wait_after_its_own_shutdown
 /// A shell standing in for the `clank wait --turn-end` child: it reads
 /// the report, sends `frames` one per line, then writes whatever result
 /// arrives on its stdin — or `eof` — to `out` before it exits.
-fn child(frames: &[Frame], out: &Path) -> Command {
+fn child(frames: &[Frame], out: &Path) -> Spec {
     let lines: Vec<String> = frames
         .iter()
         .map(|f| serde_json::to_string(f).unwrap())
         .collect();
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
+    Spec::new("/bin/sh")
+        .arg("-c")
         .arg(format!(
             "read report; printf '%s\\n' \"$FRAMES\"; if read result; then printf '%s' \"$result\" \
              > '{0}'; else printf eof > '{0}'; fi",
             out.display()
         ))
         .env("FRAMES", lines.join("\n"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    cmd
+        .stdin(Stdin::Piped)
+        .stdout(Out::Piped)
+        .stderr(Out::Piped)
 }
 
 /// The hook side of the handshake: a verdict is read while the child is
@@ -517,8 +513,8 @@ async fn a_verdict_is_read_from_a_live_child_and_answered_on_its_pipe() {
     for (flush_fails, want) in [(false, "delivered"), (true, "emit_failed")] {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("result");
-        let mut cmd = child(&[Frame::bare(WireVerdict::Park), delivered()], &out);
-        let mut wait = OwnedWait::spawn(&mut cmd, &stop_report()).unwrap();
+        let cmd = child(&[Frame::bare(WireVerdict::Park), delivered()], &out);
+        let mut wait = OwnedWait::spawn(cmd, &stop_report()).unwrap();
         let Ran::Verdict(Ok(frame)) = wait.verdict_until(std::future::pending()).await else {
             panic!("a verdict");
         };
@@ -551,8 +547,8 @@ async fn a_verdict_is_read_from_a_live_child_and_answered_on_its_pipe() {
 async fn a_killed_hooks_child_reads_eof_and_no_result() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("result");
-    let mut cmd = child(&[delivered()], &out);
-    let mut wait = OwnedWait::spawn(&mut cmd, &stop_report()).unwrap();
+    let cmd = child(&[delivered()], &out);
+    let mut wait = OwnedWait::spawn(cmd, &stop_report()).unwrap();
     let Ran::Verdict(Ok(_)) = wait.verdict_until(std::future::pending()).await else {
         panic!("a verdict");
     };
@@ -564,7 +560,7 @@ async fn a_killed_hooks_child_reads_eof_and_no_result() {
     drop(owner_end);
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        child.as_mut().unwrap().wait(),
+        child.as_mut().unwrap().wait_async(),
     )
     .await
     .expect("the child exits on EOF")
@@ -576,14 +572,13 @@ async fn a_killed_hooks_child_reads_eof_and_no_result() {
 /// carries what it said.
 #[tokio::test]
 async fn a_child_that_ends_without_a_verdict_is_diagnostic() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c")
+    let cmd = Spec::new("/bin/sh")
+        .arg("-c")
         .arg("read report; echo 'monitor refused' >&2")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut wait = OwnedWait::spawn(&mut cmd, &stop_report()).unwrap();
+        .stdin(Stdin::Piped)
+        .stdout(Out::Piped)
+        .stderr(Out::Piped);
+    let mut wait = OwnedWait::spawn(cmd, &stop_report()).unwrap();
     let Ran::Verdict(Err(message)) = wait.verdict_until(std::future::pending()).await else {
         panic!("a failure");
     };

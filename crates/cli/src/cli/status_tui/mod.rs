@@ -2449,13 +2449,10 @@ fn open_in_browser(repo: &std::path::Path, target: &HtmlTarget) {
         HtmlTarget::Stash(name) => (HtmlOpenTarget::Stash(name.as_str()), false),
     };
     let argv = crate::cli::html::html_open_argv(repo, open_target, rebuild);
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe)
-            .args(&argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+    if let Ok(exe) = std::env::current_exe()
+        && let Ok(opening) = crate::proc_run::start(crate::proc_run::Spec::new(exe).args(&argv))
+    {
+        opening.detach();
     }
 }
 
@@ -3337,7 +3334,12 @@ pub(crate) async fn run_tui(
         .reopen_through(web_reopen)
         .tunnel_from({
             let home = home.clone();
-            std::sync::Arc::new(move || crate::cli::web::tunnel::configured(home.as_deref()))
+            std::sync::Arc::new(move || {
+                crate::cli::web::tunnel::configured(
+                    home.as_deref(),
+                    std::sync::Arc::new(crate::proc_run::TunnelSpawn),
+                )
+            })
         })
     };
     served.armed(runtime.unavailable.clone(), &remote);

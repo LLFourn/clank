@@ -538,10 +538,7 @@ impl Drop for Broker {
 }
 impl Registry {
     pub(crate) fn start(self: &Arc<Self>) -> Result<Broker> {
-        use std::os::unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            io::AsRawFd,
-        };
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         crate::cli::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
         let path = crate::cli::monitor::runtime_path(&self.repo, "claude-questions.sock");
         let lease = std::fs::OpenOptions::new()
@@ -561,7 +558,7 @@ impl Registry {
             "untrusted Claude question lease"
         );
         ensure!(
-            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            clank_user_config::lease::take(&lease)?,
             "a Claude question broker already owns this repo"
         );
         match std::fs::remove_file(&path) {

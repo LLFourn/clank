@@ -274,20 +274,19 @@ fn reserve_in(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("opening pane lock `{}`", path.display()))?;
-    let op = match how {
-        Reserve::Wait => libc::LOCK_EX,
-        Reserve::Defer => libc::LOCK_EX | libc::LOCK_NB,
-    };
+    if how == Reserve::Defer {
+        let taken = clank_user_config::lease::take(&file)
+            .with_context(|| format!("locking `{}`", path.display()))?;
+        return Ok(taken.then_some(PaneLock { _file: file }));
+    }
     loop {
         // SAFETY: valid owned fd; flock has no memory effects.
-        if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
             return Ok(Some(PaneLock { _file: file }));
         }
         let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EWOULDBLOCK) if how == Reserve::Defer => return Ok(None),
-            _ => return Err(error).with_context(|| format!("locking `{}`", path.display())),
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error).with_context(|| format!("locking `{}`", path.display()));
         }
     }
 }

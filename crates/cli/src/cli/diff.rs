@@ -11,7 +11,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::Context;
 
@@ -386,10 +385,8 @@ fn print_composed(c: &ComposedDiffLaunch) {
     eprintln!("wait: {}", c.wait);
 }
 
-#[cfg(unix)]
 async fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
-
+    use crate::proc_run::{Group, Spec};
     if c.wait {
         // --wait: install a SIGINT handler that forwards to the
         // child PID and continues waiting (per OQ6 of the plan
@@ -399,51 +396,40 @@ async fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
         return wait_with_sigint_forward(c).await;
     }
 
-    // Fire-and-forget: detach stdio, spawn, drop. The child
-    // outlives clank.
-    let mut cmd = Command::new(&c.program);
-    cmd.args(&c.args);
-    for (k, v) in &c.env_overrides {
-        cmd.env(k, v);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Make the child immune to clank's SIGINT — start a new
-    // session so it doesn't share clank's controlling tty
-    // signal target.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
+    // Fire-and-forget: detached stdio, in a session of its own so it
+    // is immune to clank's SIGINT and outlives clank.
+    crate::proc_run::start(
+        Spec::new(&c.program)
+            .args(&c.args)
+            .envs(&c.env_overrides)
+            .group(Group::Session),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?
+    .detach();
     Ok(())
 }
 
-#[cfg(unix)]
 async fn wait_with_sigint_forward(c: ComposedDiffLaunch) -> anyhow::Result<()> {
-    use tokio::process::Command as TokioCommand;
+    use crate::proc_run::{Out, Spec, Stdin};
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut cmd = TokioCommand::new(&c.program);
-    cmd.args(&c.args);
-    for (k, v) in &c.env_overrides {
-        cmd.env(k, v);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
-    let child_id = child.id();
+    let mut child = crate::proc_run::start(
+        Spec::new(&c.program)
+            .args(&c.args)
+            .envs(&c.env_overrides)
+            .stdin(Stdin::Inherit)
+            .stdout(Out::Inherit)
+            .stderr(Out::Inherit),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
+    let child_id = child.pid();
 
     let mut sigint = signal(SignalKind::interrupt())
         .map_err(|e| anyhow::anyhow!("failed to install SIGINT handler: {e}"))?;
 
     loop {
         tokio::select! {
-            status = child.wait() => {
+            status = child.wait_async() => {
                 let status = status
                     .map_err(|e| anyhow::anyhow!("waiting on `{}`: {e}", c.program))?;
                 if !status.success() {
@@ -461,35 +447,10 @@ async fn wait_with_sigint_forward(c: ComposedDiffLaunch) -> anyhow::Result<()> {
             _ = sigint.recv() => {
                 // The editor decides its own cleanup, so this forwards
                 // and keeps waiting rather than tearing down.
-                if let Some(pid) = child_id.and_then(|p| crate::signal::Pid::new(p as i32)) {
+                if let Some(pid) = crate::signal::Pid::new(child_id as i32) {
                     crate::signal::signal_process(pid, libc::SIGINT);
                 }
             }
         }
     }
-}
-
-#[cfg(not(unix))]
-async fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
-    // Non-unix fallback: no signal-forwarding semantics. Windows'
-    // SIGINT story is different (CTRL_C events vs unix signals);
-    // we get the default behavior for now and can revisit if a
-    // Windows user reports breakage.
-    let mut cmd = Command::new(&c.program);
-    cmd.args(&c.args);
-    for (k, v) in &c.env_overrides {
-        cmd.env(k, v);
-    }
-    if c.wait {
-        let status = cmd
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
-        if !status.success() {
-            std::process::exit(status.code().unwrap_or(1));
-        }
-        return Ok(());
-    }
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
-    Ok(())
 }

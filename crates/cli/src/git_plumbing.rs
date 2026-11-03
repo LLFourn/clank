@@ -7,8 +7,40 @@
 //! write (e.g. an original commit's author for a replay).
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context as _;
+
+use crate::proc_run::{self, Group, Out, Spec, Stdin};
+
+/// Anything that can run the user's git hooks (commit, rebase, checkout,
+/// cherry-pick, worktree add): hooks may run a test suite.
+const GIT_HOOKED_BUDGET: Duration = Duration::from_secs(60 * 60);
+
+/// A network fetch, over whatever transport and credential prompt the
+/// user's git is configured with.
+const GIT_FETCH_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// What a captured git mutation may print: refs, trees, porcelain
+/// listings and messages, never content.
+const GIT_OUTPUT_CAP: usize = 64 << 20;
+
+fn git(repo: &Path) -> Spec {
+    Spec::new("git").arg("-C").arg(repo)
+}
+
+fn output(spec: Spec, budget: Duration) -> anyhow::Result<proc_run::Output> {
+    let what = spec.display();
+    proc_run::run_blocking(
+        spec.stdout(Out::Capture {
+            cap: GIT_OUTPUT_CAP,
+        })
+        .stderr(Out::Ring { bytes: 64 << 10 })
+        .group(Group::New),
+        budget,
+    )
+    .with_context(|| format!("running `{what}`"))
+}
 
 fn open(repo: &Path) -> anyhow::Result<gix::Repository> {
     gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))
@@ -151,14 +183,12 @@ impl ScratchIndex {
         ))))
     }
 
-    fn git(&self, repo: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-        Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("GIT_INDEX_FILE", &self.0)
-            .output()
-            .with_context(|| format!("spawning git {}", args.join(" ")))
+    fn git(&self, repo: &Path, args: &[&str]) -> anyhow::Result<proc_run::Output> {
+        output(
+            git(repo).args(args).env("GIT_INDEX_FILE", &self.0),
+            GIT_HOOKED_BUDGET,
+        )
+        .with_context(|| format!("spawning git {}", args.join(" ")))
     }
 
     fn git_ok(&self, repo: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -247,7 +277,7 @@ pub fn move_worktree(
     Ok(Moved::Done(scratch))
 }
 
-fn said(out: &std::process::Output) -> Vec<String> {
+fn said(out: &proc_run::Output) -> Vec<String> {
     let mut lines: Vec<String> = String::from_utf8_lossy(&out.stderr)
         .lines()
         .map(str::trim)
@@ -699,17 +729,11 @@ pub fn delete_ref_at(repo: &Path, full_name: &str, expect: Option<&str>) -> anyh
 // the history-rewrite engine drives. They stay `git` subprocesses, but
 // live HERE behind the boundary so callers never spawn `git` directly.
 
-use std::process::Command;
-
 /// Run `git -C <repo> <args>`, erroring on non-zero exit. PRIVATE — the
 /// shared spawn helper for the typed operations below; callers use the
 /// typed fns so they never construct raw git argv (gix-not-git-gate).
 fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
+    let status = on_the_terminal(run_spec(repo, args))
         .with_context(|| format!("spawning git {}", args.join(" ")))?;
     if !status.success() {
         anyhow::bail!(
@@ -719,6 +743,21 @@ fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// [`run`]'s command: the terminal's own stdio, which user hooks may
+/// use, in the terminal's process group.
+fn run_spec(repo: &Path, args: &[&str]) -> Spec {
+    git(repo)
+        .args(args)
+        .stdin(Stdin::Inherit)
+        .stdout(Out::Inherit)
+        .stderr(Out::Inherit)
+        .group(Group::Inherit)
+}
+
+fn on_the_terminal(spec: Spec) -> anyhow::Result<std::process::ExitStatus> {
+    Ok(proc_run::run_blocking(spec, GIT_HOOKED_BUDGET)?.status)
 }
 
 /// `git reset --hard --quiet <rev>` — re-sync the worktree to `rev`. A
@@ -735,13 +774,15 @@ fn run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
 /// [`cherry_pick`]). Why not gix: gix has no cherry-pick; the 3-way
 /// merge orchestration is exactly what the subprocess provides.
 pub fn cherry_pick_no_commit(repo: &Path, shas: &[&str]) -> anyhow::Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cherry-pick", "-n"])
-        .args(shas)
-        .status()
-        .context("spawning git cherry-pick -n")?;
+    let status = on_the_terminal(
+        git(repo)
+            .args(["cherry-pick", "-n"])
+            .args(shas)
+            .stdin(Stdin::Inherit)
+            .stdout(Out::Inherit)
+            .stderr(Out::Inherit),
+    )
+    .context("spawning git cherry-pick -n")?;
     Ok(status.success())
 }
 
@@ -750,11 +791,7 @@ pub fn cherry_pick_no_commit(repo: &Path, shas: &[&str]) -> anyhow::Result<bool>
 /// extensions a cherry-pick left in it) is the subprocess's job; gix's
 /// index-to-tree write path isn't proven on linked worktrees.
 pub fn write_index_tree(repo: &Path) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("write-tree")
-        .output()
+    let out = output(git(repo).arg("write-tree"), GIT_HOOKED_BUDGET)
         .context("spawning git write-tree")?;
     if !out.status.success() {
         anyhow::bail!(
@@ -822,25 +859,25 @@ pub fn amend_no_edit(repo: &Path) -> anyhow::Result<()> {
 /// clone + fresh-checkout path isn't proven here yet; subprocess
 /// like [`worktree_add`].
 pub fn clone_local(source: &Path, dest: &Path, name: &str, base_sha: &str) -> anyhow::Result<()> {
-    let out = Command::new("git")
-        .arg("clone")
-        .arg("--quiet")
-        .arg(source)
-        .arg(dest)
-        .output()
-        .context("spawning git clone")?;
+    let out = output(
+        Spec::new("git")
+            .args(["clone", "--quiet"])
+            .arg(source)
+            .arg(dest),
+        GIT_HOOKED_BUDGET,
+    )
+    .context("spawning git clone")?;
     if !out.status.success() {
         anyhow::bail!(
             "git clone failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dest)
-        .args(["checkout", "--quiet", "-b", name, base_sha])
-        .output()
-        .context("spawning git checkout in the clone")?;
+    let out = output(
+        git(dest).args(["checkout", "--quiet", "-b", name, base_sha]),
+        GIT_HOOKED_BUDGET,
+    )
+    .context("spawning git checkout in the clone")?;
     if !out.status.success() {
         // This call created `dest` (the caller cloned into a path it
         // verified absent) — remove it, or the next invocation finds
@@ -859,14 +896,14 @@ pub fn clone_local(source: &Path, dest: &Path, name: &str, base_sha: &str) -> an
 /// `git worktree add -b <name> <dest> <base>` — gix has no worktree
 /// creation.
 pub fn worktree_add(source: &Path, name: &str, dest: &Path, base: &str) -> anyhow::Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["worktree", "add", "-b", name])
-        .arg(dest)
-        .arg(base)
-        .output()
-        .context("spawning git worktree add")?;
+    let out = output(
+        git(source)
+            .args(["worktree", "add", "-b", name])
+            .arg(dest)
+            .arg(base),
+        GIT_HOOKED_BUDGET,
+    )
+    .context("spawning git worktree add")?;
     if !out.status.success() {
         anyhow::bail!(
             "git worktree add failed: {}",
@@ -887,15 +924,11 @@ pub fn worktree_add(source: &Path, name: &str, dest: &Path, base: &str) -> anyho
 /// through, so callers get git's guard for free even when their own
 /// checks are bypassed.
 pub fn worktree_remove(repo: &Path, path: &Path, force: bool) -> anyhow::Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo).args(["worktree", "remove"]);
+    let mut spec = git(repo).args(["worktree", "remove"]);
     if force {
-        cmd.arg("--force");
+        spec = spec.arg("--force");
     }
-    let out = cmd
-        .arg(path)
-        .output()
-        .context("spawning git worktree remove")?;
+    let out = output(spec.arg(path), GIT_HOOKED_BUDGET).context("spawning git worktree remove")?;
     if !out.status.success() {
         anyhow::bail!(
             "git worktree remove failed: {}",
@@ -906,12 +939,11 @@ pub fn worktree_remove(repo: &Path, path: &Path, force: bool) -> anyhow::Result<
 }
 
 pub fn worktree_list_porcelain(repo: &Path) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .context("spawning git worktree list")?;
+    let out = output(
+        git(repo).args(["worktree", "list", "--porcelain"]),
+        GIT_HOOKED_BUDGET,
+    )
+    .context("spawning git worktree list")?;
     if !out.status.success() {
         anyhow::bail!(
             "`git worktree list` failed: {}",
@@ -927,12 +959,11 @@ pub fn worktree_list_porcelain(repo: &Path) -> anyhow::Result<String> {
 /// user's git credentials for free. So this is a deliberate cost/auth
 /// call, not a gix limitation — reconsiderable if we take on gix net.
 pub fn fetch_refspec(source: &Path, refspec: &str) -> anyhow::Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["fetch", "origin", refspec])
-        .output()
-        .context("spawning git fetch")?;
+    let out = output(
+        git(source).args(["fetch", "origin", refspec]),
+        GIT_FETCH_BUDGET,
+    )
+    .context("spawning git fetch")?;
     if !out.status.success() {
         anyhow::bail!(
             "`git fetch origin {refspec}` failed: {}",
@@ -944,12 +975,11 @@ pub fn fetch_refspec(source: &Path, refspec: &str) -> anyhow::Result<()> {
 
 /// `git checkout -b <branch> <sha>` — working-tree checkout stays git.
 pub fn checkout_new_branch(repo: &Path, branch: &str, sha: &str) -> anyhow::Result<()> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["checkout", "-b", branch, sha])
-        .output()
-        .context("spawning git checkout")?;
+    let out = output(
+        git(repo).args(["checkout", "-b", branch, sha]),
+        GIT_HOOKED_BUDGET,
+    )
+    .context("spawning git checkout")?;
     if !out.status.success() {
         anyhow::bail!(
             "git checkout failed: {}",
@@ -963,12 +993,14 @@ pub fn checkout_new_branch(repo: &Path, branch: &str, sha: &str) -> anyhow::Resu
 /// (git leaves the cherry-pick in progress for the caller to resolve),
 /// `true` on success. Working-tree replay stays git.
 pub fn cherry_pick(repo: &Path, sha: &str) -> anyhow::Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cherry-pick", "--allow-empty", sha])
-        .status()
-        .context("spawning git cherry-pick")?;
+    let status = on_the_terminal(
+        git(repo)
+            .args(["cherry-pick", "--allow-empty", sha])
+            .stdin(Stdin::Inherit)
+            .stdout(Out::Inherit)
+            .stderr(Out::Inherit),
+    )
+    .context("spawning git cherry-pick")?;
     Ok(status.success())
 }
 
@@ -1079,9 +1111,7 @@ pub fn rebase_dropping(repo: &Path, onto: Option<&str>, todo: &str) -> anyhow::R
         "cp {}",
         crate::shell_quote::shell_quote(&todo_path.to_string_lossy())
     );
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo)
+    let spec = git(repo)
         .args([
             "rebase",
             "--interactive",
@@ -1094,9 +1124,8 @@ pub fn rebase_dropping(repo: &Path, onto: Option<&str>, todo: &str) -> anyhow::R
             "--no-rebase-merges",
         ])
         .arg(onto.unwrap_or("--root"))
-        .env("GIT_SEQUENCE_EDITOR", editor)
-        .stdin(std::process::Stdio::null());
-    let out = cmd.output().context("spawning git rebase");
+        .env("GIT_SEQUENCE_EDITOR", editor);
+    let out = output(spec, GIT_HOOKED_BUDGET).context("spawning git rebase");
     let _ = std::fs::remove_file(&todo_path);
     let out = out?;
     if crate::git_io::operation_in_progress_at(repo)? == Some("git rebase") {
@@ -1109,4 +1138,20 @@ pub fn rebase_dropping(repo: &Path, onto: Option<&str>, todo: &str) -> anyhow::R
         );
     }
     Ok(Rebased::Finished)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proc_run::{Group, Out, Stdin};
+
+    /// User hooks may talk to the terminal, and a terminal job in a
+    /// group of its own would be stopped for reading it.
+    #[test]
+    fn a_git_run_keeps_the_terminals_stdio_and_group() {
+        let spec = super::run_spec(std::path::Path::new("/repo"), &["commit"]);
+        assert!(matches!(spec.get_stdin(), Stdin::Inherit));
+        assert_eq!(spec.get_stdout(), Out::Inherit);
+        assert_eq!(spec.get_stderr(), Out::Inherit);
+        assert_eq!(spec.get_group(), Group::Inherit);
+    }
 }

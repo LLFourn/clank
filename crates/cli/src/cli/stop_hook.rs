@@ -56,7 +56,6 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
 use super::{StopHookArgs, resolve_cwd_repo, resolve_repo};
@@ -527,8 +526,8 @@ fn session_start_payload(items_text: &str) -> serde_json::Value {
 }
 
 use super::hook_owner::Lifetime;
+use crate::proc_run::{Identity, Out, Spec, Stdin};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 /// Argv for the child that carries a report. Separate from the spawn so
 /// the shape can be asserted without launching anything. It carries no
@@ -549,25 +548,21 @@ fn wait_argv(repo: &Path, label: &AgentLabel, session: &str) -> Vec<String> {
     ]
 }
 
-fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, session: &str, tool: Tool) -> Command {
-    let mut cmd = Command::new(exe);
-    cmd.args(wait_argv(repo, label, session))
-        // Piped stdin IS the ownership channel, and the report's way in.
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    for key in crate::agent_env::SESSION_IDENTITY_VARS {
-        cmd.env_remove(key);
-    }
+fn wait_command(exe: &Path, repo: &Path, label: &AgentLabel, session: &str, tool: Tool) -> Spec {
     let key = match tool {
         Tool::Claude => "CLAUDE_CODE_SESSION_ID",
         Tool::Codex => "CODEX_THREAD_ID",
         Tool::OpenCode => "OPENCODE_SESSION_ID",
         Tool::Grok => "GROK_AGENT",
     };
-    cmd.env(key, session);
-    cmd
+    Spec::new(exe)
+        .args(wait_argv(repo, label, session))
+        // Piped stdin IS the ownership channel, and the report's way in.
+        .stdin(Stdin::Piped)
+        .stdout(Out::Piped)
+        .stderr(Out::Piped)
+        .identity(Identity::ScrubInherited)
+        .env(key, session)
 }
 
 /// What starts the child that carries a report.
@@ -595,8 +590,7 @@ impl Spawn for Spawner {
         report: &Report,
     ) -> Result<OwnedWait, String> {
         let exe = std::env::current_exe().map_err(|e| format!("hook: current_exe failed: {e}"))?;
-        let mut cmd = wait_command(&exe, repo, label, session, tool);
-        OwnedWait::spawn(&mut cmd, report)
+        OwnedWait::spawn(wait_command(&exe, repo, label, session, tool), report)
     }
 }
 
@@ -609,7 +603,7 @@ impl Spawn for Spawner {
 /// Closing it early would read as instant owner death.
 pub(crate) struct OwnedWait {
     /// `None` for a carrier running in this process.
-    child: Option<tokio::process::Child>,
+    child: Option<crate::proc_run::Managed>,
     owner_end: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     /// The child's verdicts, one per line, read while it stays alive.
     frames: tokio::io::Lines<tokio::io::BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>>,
@@ -624,20 +618,18 @@ impl OwnedWait {
     /// Spawn `cmd` and hand it `report` on its first stdin line, requiring
     /// the ownership pipe: a child without one is a hard error rather than
     /// a silently unowned wait.
-    fn spawn(cmd: &mut Command, report: &Report) -> Result<Self, String> {
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("hook: spawning wait failed: {e}"))?;
-        let owner_end = child.stdin.take().ok_or_else(|| {
+    fn spawn(cmd: Spec, report: &Report) -> Result<Self, String> {
+        let mut child =
+            crate::proc_run::start(cmd).map_err(|e| format!("hook: spawning wait failed: {e}"))?;
+        let owner_end = child.take_stdin_async().ok_or_else(|| {
             "hook: wait spawned without a stdin pipe — the ownership sentinel would be absent, \
              so refusing to run it"
                 .to_string()
         })?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout_async()
             .ok_or_else(|| "hook: wait spawned without a stdout pipe".to_string())?;
-        let stderr = child.stderr.take();
+        let stderr = child.take_stderr_async();
         Self::over(
             Some(child),
             Box::new(owner_end),
@@ -650,7 +642,7 @@ impl OwnedWait {
     /// The wait whose carrier is reached through these pipes: the owner
     /// pipe it reads the report and result from, and the one it answers on.
     pub(crate) fn over(
-        child: Option<tokio::process::Child>,
+        child: Option<crate::proc_run::Managed>,
         owner_end: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         frames: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         mut stderr: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
@@ -752,7 +744,7 @@ impl Run for OwnedWait {
         } = self;
         drop(owner_end);
         if let Some(child) = child.as_mut() {
-            let _ = tokio::time::timeout(ABANDON_GRACE, child.wait()).await;
+            let _ = tokio::time::timeout(ABANDON_GRACE, child.wait_async()).await;
         }
     }
 }

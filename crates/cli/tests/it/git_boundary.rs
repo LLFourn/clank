@@ -16,7 +16,7 @@ const LAYER_FILES: &[&str] = &["git_io.rs", "git_plumbing.rs"];
 
 /// What (if anything) a production line illegally names.
 fn line_violation(line: &str) -> Option<&'static str> {
-    if line.contains("Command::new(\"git\")") {
+    if line.contains("Command::new(\"git\")") || line.contains("Spec::new(\"git\")") {
         return Some("raw `git` subprocess");
     }
     // `use gix::…` and `gix::…` call sites both contain `gix::`.
@@ -83,6 +83,10 @@ fn scanner_flags_prod_and_exempts_test_code() {
     // Production raw git / gix → flagged.
     assert_eq!(
         count("fn f() { std::process::Command::new(\"git\"); }\n"),
+        1
+    );
+    assert_eq!(
+        count("fn f() { crate::proc_run::Spec::new(\"git\"); }\n"),
         1
     );
     assert_eq!(count("use gix::Repository;\n"), 1);

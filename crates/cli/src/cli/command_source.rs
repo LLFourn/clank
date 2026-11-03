@@ -1582,17 +1582,21 @@ pub(crate) fn record_producer(
 /// that is not a guess is the one the record's own era made: this
 /// process's rendering against the stored string.
 pub(crate) fn look(pid: i32) -> Look {
+    const PS_LOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
     // `Theirs` is not `Gone`: a pid that exists and is somebody else's
     // must not be read as a spent record, and `ps` below is what says
     // whether it is the incarnation we recorded.
     if crate::signal::probe_process(pid) == crate::signal::Probe::Gone {
         return Look::Gone;
     }
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-o", "pgid=,lstart=", "-p"])
-        .arg(pid.to_string())
-        .output()
-    else {
+    let Ok(out) = crate::proc_run::run_blocking(
+        crate::proc_run::Spec::new("ps")
+            .args(["-o", "pgid=,lstart=", "-p"])
+            .arg(pid.to_string())
+            .stdout(crate::proc_run::Out::Capture { cap: 4096 })
+            .group(crate::proc_run::Group::New),
+        PS_LOOK_BUDGET,
+    ) else {
         return Look::Unknown;
     };
     if !out.status.success() {

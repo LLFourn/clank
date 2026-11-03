@@ -27,7 +27,7 @@ pub async fn run(_args: RunArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
+    use crate::proc_run::{Out, Spec, Stdin};
     let repo = resolve_repo(args.repo.as_deref())?;
     let (attend, clear) = requests(&args, &repo)?;
     let (program, rest) = args
@@ -38,7 +38,13 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         Box::pin(crate::cli::attend::submit(&repo, control))
     };
     let err = launch(attend, clear, &submit, || {
-        std::process::Command::new(program).args(rest).exec()
+        crate::proc_run::exec(
+            Spec::new(program)
+                .args(rest)
+                .stdin(Stdin::Inherit)
+                .stdout(Out::Inherit)
+                .stderr(Out::Inherit),
+        )
     })
     .await;
     Err(anyhow::anyhow!("cannot run `{program}`: {err}"))

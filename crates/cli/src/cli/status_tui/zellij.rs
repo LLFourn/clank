@@ -14,10 +14,20 @@ use crate::cli::open_zellij::agent_pane_title;
 use crate::cli::status::StatusSnapshot;
 use clank_core::Tool;
 
+/// Every process's command line and environment, on a loaded machine.
+const PS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const PS_CAP: usize = 64 << 20;
+
 fn process_table() -> std::io::Result<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-axwwE", "-o", "pid=,command="])
-        .output()?;
+    use crate::proc_run::{Group, Out, Spec};
+    let out = crate::proc_run::run_blocking(
+        Spec::new("ps")
+            .args(["-axwwE", "-o", "pid=,command="])
+            .stdout(Out::Capture { cap: PS_CAP })
+            .group(Group::New),
+        PS_BUDGET,
+    )
+    .map_err(std::io::Error::other)?;
     if !out.status.success() {
         return Err(std::io::Error::other("ps failed"));
     }

@@ -172,6 +172,9 @@ async fn run_migrate(args: BlockMigrateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The user's `blocked` hook may page someone and wait on the answer.
+const BLOCK_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let author = match args.author.as_deref() {
@@ -190,17 +193,19 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
 
     let config = crate::cli::config::load(&repo);
     if let Some(Some(cmd)) = config.hooks.get(&clank_core::HookEvent::Blocked) {
-        let mut child = std::process::Command::new("sh");
-        child
-            .arg("-c")
-            .arg(cmd)
-            .env("CLANK_EVENT", "blocked")
-            .env("CLANK_AGENT", author.as_str())
-            .env("CLANK_BLOCK_NAME", &args.name)
-            .env("CLANK_REPO", &*repo.to_string_lossy())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit());
-        let _ = child.status();
+        use crate::proc_run::{Out, Spec, Stdin};
+        let _ = crate::proc_run::run_blocking(
+            Spec::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("CLANK_EVENT", "blocked")
+                .env("CLANK_AGENT", author.as_str())
+                .env("CLANK_BLOCK_NAME", &args.name)
+                .env("CLANK_REPO", &*repo.to_string_lossy())
+                .stdin(Stdin::Inherit)
+                .stderr(Out::Inherit),
+            BLOCK_HOOK_BUDGET,
+        );
     }
 
     println!(

@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
 use clank_core::feedback_body::FeedbackBody;
 use clank_core::ids::CommitSha;
@@ -2465,7 +2464,7 @@ fn fmt_ts(ts: i64) -> String {
 /// The platform's opener, as a command with nothing to open yet. The
 /// CLI runs it in the foreground; the TUI runs it off its loop with
 /// its output kept off the raw screen (codex on 1764612).
-pub(crate) fn opener() -> anyhow::Result<Command> {
+pub(crate) fn opener() -> anyhow::Result<crate::proc_run::Spec> {
     #[cfg(target_os = "macos")]
     let prog = "open";
     #[cfg(target_os = "linux")]
@@ -2477,14 +2476,20 @@ pub(crate) fn opener() -> anyhow::Result<Command> {
         anyhow::bail!("no known opener for this platform");
     }
     #[allow(unreachable_code)]
-    Ok(Command::new(prog))
+    Ok(crate::proc_run::Spec::new(prog))
 }
 
 pub(crate) fn launch_opener(path: &Path) -> anyhow::Result<()> {
+    use crate::proc_run::{Out, Stdin};
     let path_str = path.to_string_lossy().to_string();
-    let mut cmd = opener().map_err(|e| anyhow::anyhow!("{e}; open `{path_str}` manually"))?;
+    let cmd = opener().map_err(|e| anyhow::anyhow!("{e}; open `{path_str}` manually"))?;
     let prog = cmd.get_program().to_string_lossy().into_owned();
-    let status = cmd.arg(&path_str).status()?;
+    let status = crate::proc_run::interactive(
+        cmd.arg(&path_str)
+            .stdin(Stdin::Inherit)
+            .stdout(Out::Inherit)
+            .stderr(Out::Inherit),
+    )?;
     if !status.success() {
         anyhow::bail!("`{prog} {path_str}` exited non-zero");
     }

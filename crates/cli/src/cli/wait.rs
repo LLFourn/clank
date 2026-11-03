@@ -18,7 +18,6 @@
 //! event.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -1746,7 +1745,7 @@ pub(crate) async fn run_command_source_with(
     let mut presented: std::collections::HashSet<(u64, String)> = Default::default();
     let mut warned_tail = false;
     loop {
-        match crate::cli::github::log::IngestLease::try_acquire(&store_dir, &key) {
+        match crate::cli::github::log::IngestLease::try_acquire_now(&store_dir, &key) {
             Ok(Some(lease)) => {
                 run_leased_command_source(
                     &src,
@@ -2131,13 +2130,12 @@ async fn run_leased_command_source(
         deferral_warned = false;
 
         let started = std::time::Instant::now();
-        let mut cmd = tokio::process::Command::new(&src.command[0]);
-        cmd.args(&src.command[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let cmd = crate::proc_run::Spec::new(&src.command[0])
+            .args(&src.command[1..])
+            .stdout(crate::proc_run::Out::Piped)
+            .stderr(crate::proc_run::Out::Piped);
         // Its own directory, for whatever it needs to remember.
-        match state_dir.as_deref() {
+        let cmd = match state_dir.as_deref() {
             Some(dir) => cmd.env("CLANK_SOURCE_STATE_DIR", dir),
             None => cmd.env_remove("CLANK_SOURCE_STATE_DIR"),
         };
@@ -2149,7 +2147,7 @@ async fn run_leased_command_source(
             &key,
             lease.clone(),
             grace,
-            &mut cmd,
+            cmd,
         )
         .await
         {
@@ -2173,17 +2171,15 @@ async fn run_leased_command_source(
         ));
         if let Some((owned, mut child)) = launched {
             let mut run = Run::Owned(owned);
-            if let Some(pid) = child.id() {
-                tx.report(
-                    &key,
-                    crate::cli::event_source::Lifecycle::Running {
-                        pid,
-                        since: crate::cli::github::log::now_epoch(),
-                    },
-                );
-            }
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
+            tx.report(
+                &key,
+                crate::cli::event_source::Lifecycle::Running {
+                    pid: child.pid(),
+                    since: crate::cli::github::log::now_epoch(),
+                },
+            );
+            let stdout = child.take_stdout_async();
+            let stderr = child.take_stderr_async();
             let reading = owners.reading(cs::producer_path(&store_dir, &key));
             // Diagnostics, not events: kept as this run's bounded tail for
             // its failure event, and echoed only to a person watching a
@@ -2225,7 +2221,7 @@ async fn run_leased_command_source(
                             Ok(Some(raw)) => raw,
                             _ => break,
                         },
-                        _ = child.wait() => {
+                        _ = child.wait_async() => {
                             // Best-effort: take whatever is already
                             // buffered, then stop. Bounded, so a
                             // chatty descendant cannot hold the run
@@ -2286,7 +2282,7 @@ async fn run_leased_command_source(
             let status = loop {
                 tokio::select! {
                     _ = stop.requested(), if !run.is_stopping() => run = run.stopped(grace),
-                    status = child.wait() => break status.ok(),
+                    status = child.wait_async() => break status.ok(),
                 }
             };
             exit = status.and_then(|status| status.code());
@@ -4957,9 +4953,9 @@ mod tests {
                 ])
                 .env(HOST_FIXTURE, dir)
                 .env(HOST_MODE, mode)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .process_group(0)
                 .spawn()
                 .unwrap();
@@ -5126,7 +5122,7 @@ mod tests {
                 &key,
                 lease,
                 crate::cli::command_source::DEFAULT_STOP_GRACE,
-                &mut host::sh(&format!(
+                host::sh(&format!(
                     "echo $$ > '{}'; exec sleep 300",
                     oldfile.display()
                 )),

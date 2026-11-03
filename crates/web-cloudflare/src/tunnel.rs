@@ -84,6 +84,7 @@ pub const NGROK_RETIRED: &str = "the `ngrok` provider is gone: it wanted an acco
 /// start gets.
 pub fn configured(
     home: Option<&Path>,
+    spawn: std::sync::Arc<dyn Spawn>,
 ) -> anyhow::Result<Option<(std::sync::Arc<dyn Provider>, std::time::Duration)>> {
     let Some(home) = home else { return Ok(None) };
     let cfg = crate::door::read_user_config(home)?;
@@ -106,6 +107,7 @@ pub fn configured(
             run,
             url,
             url_contains,
+            spawn,
         }),
     };
     Ok(Some((provider, TUNNEL_GRACE)))
@@ -278,7 +280,29 @@ impl Handle for QuickHandle {
 
 // ---- command ----
 
+/// Starts a tunnel command: stdin null, stdout and stderr piped, in a
+/// process group of its own that is killed when the returned child is
+/// dropped unreaped. Injected because this crate cannot reach the
+/// owner of process spawning, which lives in `clank`.
+pub trait Spawn: Send + Sync {
+    fn spawn(&self, program: &str, args: &[String]) -> std::io::Result<Spawned>;
+}
+
+/// A started tunnel command and its two output pipes.
+pub struct Spawned {
+    pub pid: u32,
+    pub stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    pub stderr: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    pub child: Box<dyn Started>,
+}
+
+pub trait Started: Send + Sync {
+    /// Resolves once it exits, reaping it.
+    fn wait(&mut self) -> BoxFuture<'_, std::io::Result<std::process::ExitStatus>>;
+}
+
 pub struct Command {
+    spawn: std::sync::Arc<dyn Spawn>,
     run: Vec<String>,
     /// `None` when the child is the one who learns the hostname.
     url: Option<String>,
@@ -287,7 +311,9 @@ pub struct Command {
 }
 
 struct CommandHandle {
-    child: tokio::process::Child,
+    child: Box<dyn Started>,
+    /// `None` once reaped: the group id may then name a stranger.
+    pid: Option<u32>,
     /// What the child announced on stdout. Kept apart from stderr:
     /// one is where an endpoint is announced, the other is where
     /// diagnostics go, and the reason must not be read out of the
@@ -324,31 +350,21 @@ impl Provider for Command {
             // Its own process group: a wrapper's forwarding child is
             // the tunnel too, and stop ends the whole group, not the
             // one process that was spawned (codex on 6f60efa).
-            let mut child = tokio::process::Command::new(program)
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                // BOTH are announcement channels: cloudflared says
-                // its hostname on stderr, the ssh services on
-                // stdout, and a command that says it on the one we
-                // discarded looked like a command that said nothing.
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .process_group(0)
-                .kill_on_drop(true)
-                .spawn()
+            // BOTH are announcement channels: cloudflared says its
+            // hostname on stderr, the ssh services on stdout, and a
+            // command that says it on the one we discarded looked like a
+            // command that said nothing.
+            let spawned = self
+                .spawn
+                .spawn(program, args)
                 .map_err(|e| anyhow::anyhow!("tunnel command `{program}`: {e}"))?;
             let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let stdout = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-            let reader = child
-                .stderr
-                .take()
-                .map(|pipe| tail_into(pipe, stderr.clone()));
-            let out_reader = child
-                .stdout
-                .take()
-                .map(|pipe| tail_into(pipe, stdout.clone()));
+            let reader = Some(tail_into(spawned.stderr, stderr.clone()));
+            let out_reader = Some(tail_into(spawned.stdout, stdout.clone()));
             let handle = CommandHandle {
-                child,
+                child: spawned.child,
+                pid: Some(spawned.pid),
                 stdout,
                 stderr,
                 reader,
@@ -473,7 +489,7 @@ impl Handle for CommandHandle {
     fn stop(self: Box<Self>) -> BoxFuture<'static, Option<String>> {
         Box::pin(async move {
             let mut this = *self;
-            if let Some(group) = this.child.id().and_then(|pid| Pgid::new(pid as i32)) {
+            if let Some(group) = this.pid.and_then(|pid| Pgid::new(pid as i32)) {
                 signal_group(group, libc::SIGTERM);
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), this.child.wait())
                     .await;
@@ -491,6 +507,7 @@ impl Handle for CommandHandle {
                 }
             }
             let _ = this.child.wait().await;
+            this.pid = None;
             // The reader ends at the pipe's EOF; one held open past
             // the bound by a process that left the group is aborted
             // and joined, not left behind.
@@ -519,7 +536,7 @@ impl Drop for CommandHandle {
     /// that was spawned and leaves a wrapper's forwarding child and
     /// its pipes behind (codex on 49e387f).
     fn drop(&mut self) {
-        if let Some(group) = self.child.id().and_then(|pid| Pgid::new(pid as i32)) {
+        if let Some(group) = self.pid.and_then(|pid| Pgid::new(pid as i32)) {
             signal_group(group, libc::SIGTERM);
             let gone = std::time::Instant::now() + std::time::Duration::from_millis(500);
             while group_alive(group) && std::time::Instant::now() < gone {
@@ -606,7 +623,6 @@ impl Lease {
     /// every open file until it execs, this one included.
     pub fn take(home: &Path, identity: &str) -> anyhow::Result<Self> {
         use std::io::Write;
-        use std::os::fd::AsRawFd;
         let path = lease_path(home, identity);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -620,12 +636,11 @@ impl Lease {
             .map_err(|e| anyhow::anyhow!("opening `{}`: {e}", path.display()))?;
         let mut tries = 0;
         loop {
-            // SAFETY: valid owned fd; flock has no memory effects.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            if clank_user_config::lease::take(&file)? {
                 break;
             }
             tries += 1;
-            if tries >= 10 {
+            if tries >= 2 {
                 let holder = std::fs::read(&path)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<Holder>(&b).ok())
@@ -968,6 +983,43 @@ async fn end(handle: Box<dyn Handle>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Starts the tunnel command as production does, without `clank`.
+    struct Fixture;
+
+    struct FixtureChild(tokio::process::Child);
+
+    impl super::Started for FixtureChild {
+        fn wait(
+            &mut self,
+        ) -> futures_util::future::BoxFuture<'_, std::io::Result<std::process::ExitStatus>>
+        {
+            Box::pin(self.0.wait())
+        }
+    }
+
+    impl super::Spawn for Fixture {
+        fn spawn(&self, program: &str, args: &[String]) -> std::io::Result<super::Spawned> {
+            let mut child = tokio::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()?;
+            Ok(super::Spawned {
+                pid: child.id().unwrap_or(0),
+                stdout: Box::new(child.stdout.take().expect("piped")),
+                stderr: Box::new(child.stderr.take().expect("piped")),
+                child: Box::new(FixtureChild(child)),
+            })
+        }
+    }
+
+    fn fixture() -> std::sync::Arc<dyn super::Spawn> {
+        std::sync::Arc::new(Fixture)
+    }
+
     use super::*;
     use crate::origin::{alone_on_its_connection, repaired};
     use std::time::Duration;
@@ -1077,6 +1129,7 @@ mod tests {
             .unwrap();
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: vec![
                     "cloudflared".to_string(),
                     "tunnel".to_string(),
@@ -1192,6 +1245,7 @@ mod tests {
         let (quit, abort) = tokio::sync::watch::channel(false);
         let mut up = Start {
             provider: std::sync::Arc::new(Command {
+                spawn: fixture(),
                 run: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -1381,6 +1435,7 @@ mod tests {
 
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -1403,6 +1458,7 @@ mod tests {
 
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -1506,11 +1562,13 @@ mod tests {
     fn the_endpoint_identity_is_the_host_whoever_names_it() {
         // Two spellings of one endpoint: case, and a trailing slash.
         let shouted = Command {
+            spawn: fixture(),
             run: vec![],
             url: Some("https://Clank.Example.com".into()),
             url_contains: None,
         };
         let command = Command {
+            spawn: fixture(),
             run: vec![],
             url: Some("https://clank.example.com/".into()),
             url_contains: None,
@@ -1606,6 +1664,7 @@ mod tests {
         let (url, _srv) = fake_public("n1", true, false).await;
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: run("forwarding {port}"),
                 url: Some(url.clone()),
                 url_contains: None,
@@ -1630,6 +1689,7 @@ mod tests {
         let grandchild = home.path().join("pid2");
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -1664,6 +1724,7 @@ mod tests {
         std::fs::remove_file(&grandchild).unwrap();
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -1697,6 +1758,7 @@ mod tests {
         let (buffered, _srv2) = fake_public("n1", false, true).await;
         let mut up = start(
             Command {
+                spawn: fixture(),
                 run: run("warming up"),
                 url: Some(buffered),
                 url_contains: None,
@@ -1872,6 +1934,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (url, _srv) = fake_public("n1", true, false).await;
         let provider = Command {
+            spawn: fixture(),
             run: vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -1907,6 +1970,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (url, _srv) = fake_public("n1", true, false).await;
         let provider = Command {
+            spawn: fixture(),
             run: vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -1941,6 +2005,7 @@ mod tests {
         let pidfile = home.path().join("pid");
         let grandchild = home.path().join("pid2");
         let provider = Command {
+            spawn: fixture(),
             run: vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -1990,6 +2055,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let pidfile = home.path().join("pid");
         let provider = Command {
+            spawn: fixture(),
             run: vec![
                 "sh".to_string(),
                 "-c".to_string(),
@@ -2123,7 +2189,7 @@ mod tests {
         assert!(Quick.reservation().is_none());
 
         let home = tempfile::tempdir().unwrap();
-        assert!(configured(Some(home.path())).unwrap().is_none());
+        assert!(configured(Some(home.path()), fixture()).unwrap().is_none());
         let write = |tunnel: TunnelSection| {
             let mut cfg = crate::door::read_user_config(home.path()).unwrap();
             let mut remote: crate::config::RemoteSection = cfg
@@ -2142,7 +2208,7 @@ mod tests {
             url: Some("https://c.example.com".into()),
             url_contains: None,
         });
-        let (p, grace) = configured(Some(home.path())).unwrap().unwrap();
+        let (p, grace) = configured(Some(home.path()), fixture()).unwrap().unwrap();
         assert_eq!(p.reservation().as_deref(), Some("https://c.example.com"));
         assert_eq!(grace, TUNNEL_GRACE);
 
@@ -2152,7 +2218,7 @@ mod tests {
         write(TunnelSection::Ngrok {
             domain: "clank.ngrok.app".into(),
         });
-        let why = err_of(configured(Some(home.path())));
+        let why = err_of(configured(Some(home.path()), fixture()));
         assert!(why.contains("quick"), "the accountless one: {why}");
         assert!(
             why.contains("ngrok\", \"http"),

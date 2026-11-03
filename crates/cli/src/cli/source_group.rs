@@ -21,10 +21,10 @@
 
 use crate::cli::command_source::{self as cs, Producer, Retired};
 use crate::cli::github::log::IngestLease;
+use crate::proc_run::{Managed, Spec};
 use crate::signal::{Pgid, Pid};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -232,12 +232,7 @@ impl Owners {
     /// and note it as a child to reap. Refused once retirement has
     /// taken the group: a consumer started into a group being ended is
     /// one nothing would account for.
-    fn spawn_into(
-        &self,
-        id: u64,
-        pgid: Pgid,
-        command: &mut tokio::process::Command,
-    ) -> std::io::Result<tokio::process::Child> {
+    fn spawn_into(&self, id: u64, pgid: Pgid, command: Spec) -> std::io::Result<Managed> {
         let mut table = self.table();
         if table.closing {
             return Err(std::io::Error::other(Closed));
@@ -245,9 +240,8 @@ impl Owners {
         let Some(entry) = table.live.get_mut(&id).filter(|entry| !entry.deferred) else {
             return Err(std::io::Error::other("its group is being retired"));
         };
-        command.process_group(pgid.get());
-        let child = command.spawn()?;
-        if let Some(pid) = child.id().and_then(|pid| Pid::new(pid as i32)) {
+        let child = crate::proc_run::start(command.group(crate::proc_run::Group::Join(pgid)))?;
+        if let Some(pid) = Pid::new(child.pid() as i32) {
             entry.children.push(pid);
         }
         Ok(child)
@@ -703,7 +697,9 @@ impl Drop for Owned {
 
 /// (a) An anchor leading a group of its own, unrecorded and unarmed.
 pub(crate) struct Spawned {
-    anchor: tokio::process::Child,
+    /// Killed with its group if dropped before a record hands its wait
+    /// to the registry.
+    anchor: Managed,
     pgid: Pgid,
     activation: std::io::PipeWriter,
     /// The host's own copy of the anchor's read end. A write to a pipe
@@ -719,16 +715,16 @@ impl Spawned {
     pub(crate) fn spawn(program: &[String]) -> std::io::Result<Self> {
         let (reader, activation) = std::io::pipe()?;
         let held_reader = reader.try_clone()?;
-        let anchor = tokio::process::Command::new(&program[0])
-            .args(&program[1..])
-            .stdin(Stdio::from(reader))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()?;
+        use crate::proc_run::{Group, Out, Stdin};
+        let anchor = crate::proc_run::start(
+            Spec::new(&program[0])
+                .args(&program[1..])
+                .stdin(Stdin::Fd(reader.into()))
+                .stdout(Out::Piped)
+                .group(Group::New),
+        )?;
         let pgid = anchor
-            .id()
-            .and_then(|pid| Pgid::new(pid as i32))
+            .pgid()
             .ok_or_else(|| std::io::Error::other("the anchor has no pid to lead a group by"))?;
         Ok(Self {
             anchor,
@@ -741,7 +737,7 @@ impl Spawned {
     /// (b) Admitted and recorded in one step that a retirement cannot
     /// interleave with.
     pub(crate) fn record(
-        self,
+        mut self,
         owners: &'static Owners,
         store_dir: &Path,
         key: &str,
@@ -755,7 +751,7 @@ impl Spawned {
             pgid: self.pgid.get(),
             birth,
         };
-        let owned = owners.admit(
+        let admitted = owners.admit(
             Entry {
                 path: cs::producer_path(store_dir, key),
                 record,
@@ -768,7 +764,13 @@ impl Spawned {
             self.pgid,
             store_dir,
             key,
-        )?;
+        );
+        // Admitted, the registry signals and collects the group, the
+        // anchor included; refused, it is still this handle's to end.
+        if !matches!(&admitted, Err(e) if refused(e)) {
+            self.anchor.release_to_group_owner();
+        }
+        let owned = admitted?;
         Ok(Recorded {
             owned,
             anchor: self.anchor,
@@ -778,7 +780,8 @@ impl Spawned {
     }
 
     #[cfg(test)]
-    fn abandon(self) -> tokio::process::Child {
+    fn abandon(mut self) -> Managed {
+        self.anchor.release_to_group_owner();
         self.anchor
     }
 }
@@ -786,7 +789,7 @@ impl Spawned {
 /// (b) A recorded group led by an anchor that has not been armed.
 pub(crate) struct Recorded {
     owned: Owned,
-    anchor: tokio::process::Child,
+    anchor: Managed,
     activation: std::io::PipeWriter,
     held_reader: std::io::PipeReader,
 }
@@ -807,7 +810,7 @@ impl Recorded {
             mut activation,
             held_reader,
         } = self;
-        let Some(ack) = anchor.stdout.take() else {
+        let Some(ack) = anchor.take_stdout_async() else {
             return Err("the anchor has no acknowledgement channel".into());
         };
         let written = activation.write_all(token);
@@ -838,16 +841,16 @@ impl Recorded {
     }
 
     #[cfg(test)]
-    fn abandon(self) -> tokio::process::Child {
+    fn abandon(self) -> Managed {
         self.owned.abandon();
         self.anchor
     }
 
     #[cfg(test)]
-    fn abandon_after_activating(mut self, token: &[u8]) -> tokio::process::Child {
+    fn abandon_after_activating(mut self, token: &[u8]) -> Managed {
         use std::io::Write;
         self.activation.write_all(token).unwrap();
-        self.anchor.stdout.take();
+        self.anchor.take_stdout();
         self.abandon()
     }
 }
@@ -856,7 +859,7 @@ impl Recorded {
 pub(crate) struct Armed {
     owned: Owned,
     #[cfg(test)]
-    anchor: tokio::process::Child,
+    anchor: Managed,
 }
 
 impl Armed {
@@ -866,10 +869,7 @@ impl Armed {
     /// Spawned by the host rather than by the anchor, so it starts with
     /// default dispositions instead of inheriting the anchor's ignored
     /// TERM.
-    pub(crate) fn spawn(
-        self,
-        command: &mut tokio::process::Command,
-    ) -> std::io::Result<(Owned, tokio::process::Child)> {
+    pub(crate) fn spawn(self, command: Spec) -> std::io::Result<(Owned, Managed)> {
         let child = self
             .owned
             .owners
@@ -878,7 +878,7 @@ impl Armed {
     }
 
     #[cfg(test)]
-    fn abandon(self) -> tokio::process::Child {
+    fn abandon(self) -> Managed {
         self.owned.abandon();
         self.anchor
     }
@@ -893,8 +893,8 @@ pub(crate) async fn launch(
     key: &str,
     lease: Arc<IngestLease>,
     grace: Duration,
-    command: &mut tokio::process::Command,
-) -> Result<(Owned, tokio::process::Child), LaunchError> {
+    command: Spec,
+) -> Result<(Owned, Managed), LaunchError> {
     if owners.closing() {
         return Err(LaunchError::Closed);
     }
@@ -1035,14 +1035,8 @@ pub(crate) mod tests {
         });
     }
 
-    pub(crate) fn sh(script: &str) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .args(["-c", script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command
+    pub(crate) fn sh(script: &str) -> Spec {
+        Spec::new("sh").args(["-c", script])
     }
 
     fn fake_anchor(script: &str) -> Vec<String> {
@@ -1084,7 +1078,7 @@ pub(crate) mod tests {
     async fn a_host_that_dies_before_the_record_leaves_an_anchor_that_ends_itself() {
         let dir = tempfile::tempdir().unwrap();
         let mut anchor = Spawned::spawn(&anchor_program()).unwrap().abandon();
-        let status = tokio::time::timeout(Duration::from_secs(10), anchor.wait())
+        let status = tokio::time::timeout(Duration::from_secs(10), anchor.wait_async())
             .await
             .expect("an unarmed anchor must end on EOF, with no successor's help")
             .unwrap();
@@ -1109,7 +1103,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let mut anchor = recorded.abandon();
-        tokio::time::timeout(Duration::from_secs(10), anchor.wait())
+        tokio::time::timeout(Duration::from_secs(10), anchor.wait_async())
             .await
             .expect("the unarmed anchor ends on EOF")
             .unwrap();
@@ -1210,7 +1204,7 @@ pub(crate) mod tests {
         for (case, program, token, deadline) in cases {
             let dir = tempfile::tempdir().unwrap();
             let marker = dir.path().join("ran");
-            let mut command = sh(&format!("touch '{}'", marker.display()));
+            let command = sh(&format!("touch '{}'", marker.display()));
             let out = launch(
                 owners(),
                 &Arming {
@@ -1222,7 +1216,7 @@ pub(crate) mod tests {
                 "src",
                 lease(dir.path(), "src"),
                 crate::cli::command_source::DEFAULT_STOP_GRACE,
-                &mut command,
+                command,
             )
             .await;
             assert!(out.is_err(), "{case}: launched");
@@ -1254,7 +1248,7 @@ pub(crate) mod tests {
             let dir = dir.path().to_path_buf();
             let marker = marker.clone();
             tokio::spawn(async move {
-                let mut command = sh(&format!("touch '{}'; exec sleep 300", marker.display()));
+                let command = sh(&format!("touch '{}'; exec sleep 300", marker.display()));
                 launch(
                     owners(),
                     &Arming {
@@ -1265,7 +1259,7 @@ pub(crate) mod tests {
                     "src",
                     lease(&dir, "src"),
                     crate::cli::command_source::DEFAULT_STOP_GRACE,
-                    &mut command,
+                    command,
                 )
                 .await
             })
@@ -1300,13 +1294,13 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_later_child_cannot_keep_an_unarmed_anchor_alive() {
         let spawned = Spawned::spawn(&anchor_program()).unwrap();
-        let mut bystander = sh("exec sleep 300").kill_on_drop(true).spawn().unwrap();
+        let mut bystander = crate::proc_run::start(sh("exec sleep 300")).unwrap();
         let mut anchor = spawned.abandon();
-        tokio::time::timeout(Duration::from_secs(10), anchor.wait())
+        tokio::time::timeout(Duration::from_secs(10), anchor.wait_async())
             .await
             .expect("the anchor saw no EOF: a later child holds its write end")
             .unwrap();
-        bystander.kill().await.unwrap();
+        bystander.kill();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1345,12 +1339,8 @@ pub(crate) mod tests {
         assert_eq!(group_of(pgid), Group::Empty);
     }
 
-    async fn launched(
-        owners: &'static Owners,
-        dir: &Path,
-        script: &str,
-    ) -> (Owned, tokio::process::Child) {
-        let mut command = sh(script);
+    async fn launched(owners: &'static Owners, dir: &Path, script: &str) -> (Owned, Managed) {
+        let command = sh(script);
         launch(
             owners,
             &Arming::standard(),
@@ -1358,7 +1348,7 @@ pub(crate) mod tests {
             "src",
             lease(dir, "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut command,
+            command,
         )
         .await
         .unwrap()
@@ -1379,7 +1369,7 @@ pub(crate) mod tests {
         assert_eq!(unsafe { libc::getpgid(pid) }, owned.pgid().get());
 
         crate::signal::signal_process(Pid::new(pid).unwrap(), libc::SIGTERM);
-        tokio::time::timeout(Duration::from_secs(10), child.wait())
+        tokio::time::timeout(Duration::from_secs(10), child.wait_async())
             .await
             .expect("the anchor's ignored TERM leaked into the command")
             .unwrap();
@@ -1399,7 +1389,7 @@ pub(crate) mod tests {
             )
             .await;
             let descendant = pid_in(&pidfile).await;
-            child.wait().await.unwrap();
+            child.wait_async().await.unwrap();
             assert_eq!(crate::signal::probe_process(descendant), Probe::Ours);
             let record: Producer = serde_json::from_slice(
                 &std::fs::read(cs::producer_path(dir.path(), "src")).unwrap(),
@@ -1510,7 +1500,7 @@ pub(crate) mod tests {
             RELEASED.store(true, Ordering::Release);
         });
         let marker = dir.path().join("ran");
-        let spawned = armed.spawn(&mut sh(&format!("touch '{}'", marker.display())));
+        let spawned = armed.spawn(sh(&format!("touch '{}'", marker.display())));
         shutdown.await.unwrap();
         assert!(
             spawned.is_err(),
@@ -1771,7 +1761,7 @@ pub(crate) mod tests {
 
         let late = tempfile::tempdir().unwrap();
         let marker = late.path().join("ran");
-        let mut command = sh(&format!("touch '{}'", marker.display()));
+        let command = sh(&format!("touch '{}'", marker.display()));
         let out = launch(
             owners,
             &Arming::standard(),
@@ -1779,7 +1769,7 @@ pub(crate) mod tests {
             "src",
             lease(late.path(), "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut command,
+            command,
         )
         .await;
         assert!(
@@ -1792,9 +1782,9 @@ pub(crate) mod tests {
 
     /// A host's loop around one launched producer: when its command
     /// exits, the group is retired, as `wait`'s host does.
-    fn hosted(owned: Owned, mut child: tokio::process::Child) -> tokio::task::JoinHandle<()> {
+    fn hosted(owned: Owned, mut child: Managed) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let _ = child.wait().await;
+            let _ = child.wait_async().await;
             let _ = tokio::task::spawn_blocking(move || owned.retire()).await;
         })
     }
@@ -1816,8 +1806,8 @@ pub(crate) mod tests {
             "trap '' TERM; echo $$ > pid; while :; do sleep 0.1; done",
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let mut command = sh(script);
-            command.current_dir(dir.path());
+            let command = sh(script);
+            let command = command.cwd(dir.path());
             let (owned, child) = launch(
                 owners,
                 &Arming::standard(),
@@ -1825,7 +1815,7 @@ pub(crate) mod tests {
                 "src",
                 lease(dir.path(), "src"),
                 crate::cli::command_source::DEFAULT_STOP_GRACE,
-                &mut command,
+                command,
             )
             .await
             .unwrap();
@@ -1856,7 +1846,7 @@ pub(crate) mod tests {
             "src",
             lease(late.path(), "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut sh("exec sleep 300"),
+            sh("exec sleep 300"),
         )
         .await;
         assert!(relaunched.is_err(), "a draining host started new work");
@@ -1907,11 +1897,11 @@ pub(crate) mod tests {
     async fn a_drain_waits_for_work_the_root_left_running() {
         let owners = owners();
         let dir = tempfile::tempdir().unwrap();
-        let mut command = sh(
+        let command = sh(
             "sh -c 'trap \"\" TERM; echo $$ > worker; sleep 2; touch done' & \
              trap 'exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done",
         );
-        command.current_dir(dir.path());
+        let command = command.cwd(dir.path());
         let (owned, child) = launch(
             owners,
             &Arming::standard(),
@@ -1919,7 +1909,7 @@ pub(crate) mod tests {
             "src",
             lease(dir.path(), "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut command,
+            command,
         )
         .await
         .unwrap();
@@ -1948,9 +1938,9 @@ pub(crate) mod tests {
     async fn work_still_running_at_the_cutoff_is_reported_killed() {
         let owners = owners();
         let dir = tempfile::tempdir().unwrap();
-        let mut command = sh("sh -c 'trap \"\" TERM; echo $$ > worker; sleep 30' & \
+        let command = sh("sh -c 'trap \"\" TERM; echo $$ > worker; sleep 30' & \
              trap 'exit 0' TERM; echo $$ > pid; while :; do sleep 0.1; done");
-        command.current_dir(dir.path());
+        let command = command.cwd(dir.path());
         let (owned, child) = launch(
             owners,
             &Arming::standard(),
@@ -1958,7 +1948,7 @@ pub(crate) mod tests {
             "src",
             lease(dir.path(), "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut command,
+            command,
         )
         .await
         .unwrap();
@@ -1989,8 +1979,8 @@ pub(crate) mod tests {
         let owners = owners();
         let grace = |script: &str, grace: Duration| {
             let dir = tempfile::tempdir().unwrap();
-            let mut command = sh(script);
-            command.current_dir(dir.path());
+            let command = sh(script);
+            let command = command.cwd(dir.path());
             async move {
                 let (owned, child) = launch(
                     owners,
@@ -1999,7 +1989,7 @@ pub(crate) mod tests {
                     "src",
                     lease(dir.path(), "src"),
                     grace,
-                    &mut command,
+                    command,
                 )
                 .await
                 .unwrap();
@@ -2068,7 +2058,7 @@ pub(crate) mod tests {
         let mut dirs = Vec::new();
         for grace in [Duration::from_millis(300), Duration::from_secs(30)] {
             let dir = tempfile::tempdir().unwrap();
-            let mut command = sh("exec sleep 300");
+            let command = sh("exec sleep 300");
             launch(
                 owners,
                 &Arming::standard(),
@@ -2076,7 +2066,7 @@ pub(crate) mod tests {
                 "src",
                 lease(dir.path(), "src"),
                 grace,
-                &mut command,
+                command,
             )
             .await
             .unwrap()
@@ -2132,7 +2122,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_registry_refuses_as_closed_not_failed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut missing = tokio::process::Command::new("/nonexistent/producer");
+        let missing = Spec::new("/nonexistent/producer");
         let failed = launch(
             owners(),
             &Arming::standard(),
@@ -2140,7 +2130,7 @@ pub(crate) mod tests {
             "src",
             lease(dir.path(), "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut missing,
+            missing,
         )
         .await;
         assert!(
@@ -2161,7 +2151,7 @@ pub(crate) mod tests {
             "src",
             lease(other.path(), "src"),
             crate::cli::command_source::DEFAULT_STOP_GRACE,
-            &mut sh("exec sleep 300"),
+            sh("exec sleep 300"),
         )
         .await;
         assert!(matches!(out, Err(LaunchError::Closed)), "{:?}", out.err());
@@ -2213,7 +2203,7 @@ pub(crate) mod tests {
                     "src",
                     lease(&dir, "src"),
                     crate::cli::command_source::DEFAULT_STOP_GRACE,
-                    &mut sh("exec sleep 300"),
+                    sh("exec sleep 300"),
                 )
                 .await
                 .err()

@@ -648,21 +648,25 @@ pub(super) fn qr_lines(text: &str) -> Vec<String> {
 /// something, and the TUI's raw screen is not where either belongs.
 pub(super) struct Browser;
 
+/// How long the platform opener gets to say whether it opened.
+const OPENER_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Opener for Browser {
     fn open(&mut self, url: &str, mut report: Report) {
         let url = url.to_string();
         std::thread::spawn(move || {
+            use crate::proc_run::{Out, RunError};
             let why = match crate::cli::html::opener() {
                 Err(e) => Some(e.to_string()),
-                Ok(mut cmd) => match cmd
-                    .arg(&url)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .output()
-                {
-                    Err(e) => Some(format!("{e}")),
+                Ok(cmd) => match crate::proc_run::run_blocking(
+                    cmd.arg(&url).stderr(Out::Ring { bytes: 4096 }),
+                    OPENER_BUDGET,
+                ) {
                     Ok(out) if out.status.success() => None,
+                    // A browser the opener started may hold its stderr
+                    // for as long as it runs; the opener's own answer is
+                    // its exit.
+                    Err(RunError::Incomplete { status, .. }) if status.success() => None,
                     Ok(out) => {
                         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                         Some(if err.is_empty() {
@@ -671,6 +675,7 @@ impl Opener for Browser {
                             err
                         })
                     }
+                    Err(e) => Some(format!("{e}")),
                 },
             };
             if let Some(why) = why {

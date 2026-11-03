@@ -130,21 +130,21 @@ pub(crate) trait Forwarder: Send + Sync + 'static {
 }
 
 /// Production forwarder: `gh webhook forward` in its own process
-/// group, killed with the supervisor (kill_on_drop + group kill);
+/// group, killed with the supervisor (dropping it ends the group);
 /// stderr captured so the terminal reason is USEFUL (a missing
 /// extension or admin refusal names itself).
 pub(super) struct GhForwarder;
 
 impl Forwarder for GhForwarder {
     async fn run(&self, repo: String, events: String, port: u16) -> String {
-        let mut cmd = tokio::process::Command::new("gh");
-        cmd.args(forwarder_argv(&repo, &events, port))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        run_forwarder_process(cmd).await
+        use crate::proc_run::{Group, Out, Spec};
+        run_forwarder_process(
+            Spec::new("gh")
+                .args(forwarder_argv(&repo, &events, port))
+                .stderr(Out::Piped)
+                .group(Group::New),
+        )
+        .await
     }
 }
 
@@ -154,19 +154,21 @@ impl Forwarder for GhForwarder {
 /// otherwise block before exit and the wait would never complete
 /// (codex 24c3355); the post-exit drain uses the same absolute
 /// deadline discipline as command sources.
-async fn run_forwarder_process(mut cmd: tokio::process::Command) -> String {
+async fn run_forwarder_process(spec: crate::proc_run::Spec) -> String {
     use tokio::io::AsyncReadExt;
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::proc_run::start(spec) {
         Ok(c) => c,
         Err(e) => return format!("failed to start: {e}"),
     };
-    let _group = crate::cli::wait::GroupKill::over(child.id());
-    let mut stderr = child.stderr.take();
+    let mut stderr = child.take_stderr_async();
     let mut tail = crate::cli::wait::RingTail::new(4096);
     let mut buf = [0u8; 1024];
     let status = loop {
         tokio::select! {
-            st = child.wait() => break st,
+            exited = child.exited_async() => {
+                child.kill();
+                break exited.and_then(|()| child.wait());
+            }
             r = async { stderr.as_mut().unwrap().read(&mut buf).await }, if stderr.is_some() => {
                 match r {
                     Ok(0) | Err(_) => stderr = None,
@@ -196,7 +198,7 @@ async fn run_forwarder_process(mut cmd: tokio::process::Command) -> String {
 }
 
 /// Aborts the relay's listener/supervisor tasks when the source dies —
-/// the forwarder child itself dies by kill_on_drop + group kill inside
+/// the forwarder child itself dies with its group when dropped inside
 /// the supervisor task.
 pub(super) struct RelayGuard(Vec<tokio::task::JoinHandle<()>>);
 impl Drop for RelayGuard {
@@ -474,18 +476,15 @@ mod tests {
         // capacity before exiting must still reach its terminal
         // reason — the concurrent tail read keeps the pipe drained.
         // 256 KiB of stderr ≫ any default pipe buffer.
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.args([
-            "-c",
-            "i=0; while [ $i -lt 4096 ]; do printf \
-             'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' >&2; \
-             i=$((i+1)); done; echo the-final-line >&2; exit 3",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
+        let cmd = crate::proc_run::Spec::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 4096 ]; do printf \
+                 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n' >&2; \
+                 i=$((i+1)); done; echo the-final-line >&2; exit 3",
+            ])
+            .stderr(crate::proc_run::Out::Piped)
+            .group(crate::proc_run::Group::New);
         let reason = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             run_forwarder_process(cmd),
