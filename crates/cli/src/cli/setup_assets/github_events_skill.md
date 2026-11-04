@@ -1,13 +1,13 @@
 ---
 name: clank-github
-description: Handle github_event wake items from clank's github wake sources — the event inbox, the react-then-ack loop, catch-up semantics, and realtime caveats. Load this when a clank wait wakes you with github_event items or when configuring github wait_events.
+description: Handle github_event wake items from clank's github wake sources — the event inbox, the react-then-ack loop, catch-up semantics, and webhook caveats. Load this when a clank wait wakes you with github_event items or when configuring github wait_events.
 ---
 
 # Clank github events
 
 `clank wait` can watch GitHub repos (`wait_events` entries with
 `"kind":"github"`). Every event those sources ingest — whether it
-arrived by polling or by the realtime webhook relay — is written to
+arrived by webhook or by a read of GitHub — is written to
 YOUR per-agent event inbox (a write-ahead log under
 `.clank/agents/<label>/events/`) BEFORE it is presented. Events stay
 **unhandled** there until you explicitly mark them handled.
@@ -125,10 +125,23 @@ its own-actions setting, keyed exactly as before.
 
 ## Catch-up semantics
 
-- Events that fire while NO wait is armed (agent offline, wait killed,
-  the gap between delivery and re-arm) are caught up on the next arm:
-  the first poll reconciles GitHub's event feed against the inbox and
-  presents what you missed.
+- Every watch listens by webhook. Each time it STARTS listening —
+  the monitor starting it, its forwarder restarting, a takeover from
+  another wait — it reads once in the background: the event feed is
+  reconciled against the inbox and presents what you missed, and a CI
+  watch reads every PR in scope's checks. A start counts only once
+  GitHub's `ping` for the new hook has arrived.
+- After that nothing is read on a timer unless the watch sets
+  `"poll_interval"` (e.g. `"5m"`): events come by webhook, CI is read
+  on cues. A failed read is retried until it succeeds; a healthy idle
+  watch makes no API calls.
+- **The stated gap.** GitHub's event feed lags real activity by 30
+  seconds to six hours, and a failed webhook delivery is not retried.
+  An action taken just before the watch started listening can be
+  missing from that start's catch-up and is never delivered by the new
+  hook (it predates it). That holds for every start, including the
+  forwarder restart when a watch widens what its repo subscribes to.
+  `poll_interval` closes it; nothing else does.
 - The feed only retains ~300 events; a longer outage logs one loud
   "may have been missed" warning — treat it as a cue to sweep the
   watched repo manually.
@@ -155,31 +168,42 @@ head is asked what its checks say, and the answer is reduced to one
 result for the PR (a check suite is one App's view, and a repo's
 checks routinely come from several, plus the older commit statuses).
 
+They are read when the watch starts listening and then when a
+webhook cue says they may have moved: a finished check suite, a commit
+status, or the PR's head moving. Cues that arrive close together are
+COALESCED, never dropped — they schedule one read at the end of a
+short window, which sees the state after the last of them. A read that
+fails is retried until it succeeds. The webhook is only a cue: the
+conclusion always comes from the same read, so a cue's read and a
+timer's read cannot tell you different things.
+
 Two consequences worth knowing:
 
-- **Only what a poll sees is kept.** The repo's monitor polls for
+- **Only what a read sees is kept.** The repo's monitor watches for
   every roster agent whether or not it is waiting, and a conclusion it
   sees stays in your inbox until acked. A build that went red and was
-  replaced by a green one between two polls, or while no monitor ran,
-  is not recoverable — the red is simply gone. `prs` does not change that —
-  it bounds WHICH PRs are read, and so how many requests each poll
-  costs.
+  replaced by a green one between two reads, or while no monitor ran,
+  is not recoverable — the red is simply gone. `prs` does not change
+  that — it bounds WHICH PRs are read, and so how many requests each
+  read costs.
 - **An unchanged build is silent.** The same conclusion on the same
   head is announced once; a new push is a new head and so a new
   result. A re-run going red → green → red announces red once, not
   twice.
 
-With `"delivery":"realtime"` a finished check suite makes the checks
-be read straight away instead of at the next poll — unless they were
-read moments ago. Cues arriving in quick succession are DROPPED, not
-queued (several apps finishing at once would otherwise buy a round of
-requests each), so a conclusion can still wait for the next scheduled
-read. The webhook is only a cue: the conclusion always comes from the
-same read, so realtime and polling watches cannot tell you different
-things.
+## Webhook notes
 
-## Realtime notes
-
-`"delivery":"realtime"` events are logged and deduped through the same
-inbox (the poll keeps running as the completeness backstop). A relay
-delivery and its poll copy are ONE event — one inbox entry, one ack.
+- The webhook needs `gh`, the `cli/gh-webhook` extension
+  (`gh extension install cli/gh-webhook`) and ADMIN on the repo, since
+  it creates a hook. Without them the watch is NOT listening: it says
+  why, on every retry, and the status panel shows it as degraded
+  (still polling, when `poll_interval` is set) or not listening
+  (nothing is read). Watching a repo you don't administer means
+  setting `poll_interval`.
+- GitHub allows one CLI forwarder per repo. Your monitor shares one
+  between every watch of a repo; a second clank monitor (another
+  repo, another machine) or your own `gh webhook forward` on the same
+  repo holds the slot instead, reported as exactly that, retried every
+  few minutes.
+- A webhook delivery and the feed's copy of the same action are ONE
+  event — one inbox entry, one ack.

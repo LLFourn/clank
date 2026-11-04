@@ -60,19 +60,19 @@
 <ul>
   <li><strong><code>prompt</code></strong> is your standing instruction for that watch. It is shown with every event the watch produces, telling the agent what reacting means.</li>
   <li><strong>Your own actions don’t wake you</strong>, unless you set <code>"include_own_actions": true</code>. The exception is <code>review_submitted</code>, which is never filtered, because a submitted review is the thing a team waits on.</li>
-  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. The repo’s monitor polls them for every agent on the roster, whether or not that agent is waiting, and a conclusion it sees stays in the inbox until acknowledged. What it never sees is lost: a red build that turned green between two polls, or while no monitor was running, is simply gone.</li>
+  <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. The repo’s monitor reads them for every agent on the roster, whether or not that agent is waiting, and a conclusion it sees stays in the inbox until acknowledged. What it never sees is lost: a red build that turned green between two reads, or while no monitor was running, is simply gone.</li>
 </ul>
-<p>A source polls by default. Add <code>"delivery": "realtime"</code> for push-speed wakes through GitHub’s webhook forwarding. Polling keeps running underneath as the backstop. What each needs:</p>
+<p>Every source listens through GitHub’s webhook forwarding. It reads GitHub once each time it starts listening, to catch up, and then only when a webhook says something moved. Add <code>"poll_interval": "5m"</code> for a background poll on top: GitHub’s event feed can lag by minutes to hours, so an action taken just before a watch starts listening can be missed without one. What each needs:</p>
 <div class="table-scroll">
 <table>
-  <thead><tr><th scope="col">Delivery</th><th scope="col">Needs</th></tr></thead>
+  <thead><tr><th scope="col">Path</th><th scope="col">Needs</th></tr></thead>
   <tbody>
-    <tr><td>Polling</td><td>A token from <code>GH_TOKEN</code> or <code>GITHUB_TOKEN</code>, or else one <code>gh auth token</code> call. With neither, the source waits and says so. It never polls unauthenticated.</td></tr>
-    <tr><td>Realtime</td><td>The <code>gh</code> binary, its <code>cli/gh-webhook</code> extension, and admin on the watched repo, because it creates a webhook. Without them the source falls back to polling and names the reason once.</td></tr>
+    <tr><td>Reads</td><td>A token from <code>GH_TOKEN</code> or <code>GITHUB_TOKEN</code>, or else one <code>gh auth token</code> call. With neither, the source waits and says so. It never reads unauthenticated.</td></tr>
+    <tr><td>Webhook</td><td>The <code>gh</code> binary, its <code>cli/gh-webhook</code> extension, and admin on the watched repo, because it creates a webhook. Without them the source is not listening: it says why on every retry, and keeps polling only if <code>poll_interval</code> is set.</td></tr>
   </tbody>
 </table>
 </div>
-<p>The <code>clank-github</code> skill carries the full vocabulary, catch-up rules and realtime caveats. Agents load it when GitHub events wake them.</p>
+<p>The <code>clank-github</code> skill carries the full vocabulary, catch-up rules and webhook caveats. Agents load it when GitHub events wake them.</p>
 
 <h2 id="inbox">The inbox: react, then ack</h2>
 <p>Every event a source delivers, and every message <code>clank send</code> delivers, goes into the recipient’s inbox, a log under its agent directory in <code>.clank/agents/</code>. It stays unhandled, and keeps waking its agent each time a wait is armed, until the agent acknowledges it. Delivery is therefore at least once. An event that fires while the agent is offline is waiting when it comes back, and one it half-handled before a crash comes round again.</p>

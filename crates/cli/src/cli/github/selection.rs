@@ -480,7 +480,6 @@ mod tests {
             branches: Vec::new(),
             prs: Vec::new(),
             prompt: None,
-            delivery: Default::default(),
         }
     }
 

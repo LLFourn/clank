@@ -1114,6 +1114,9 @@ fn source_word(
         Some(Some(Lifecycle::Settling { .. })) => "settling",
         Some(Some(Lifecycle::Stopped { .. })) => "stopped",
         Some(Some(Lifecycle::BackingOff { .. })) => "restarting",
+        Some(Some(Lifecycle::Listening)) => "listening",
+        Some(Some(Lifecycle::Degraded { polling: true, .. })) => "degraded",
+        Some(Some(Lifecycle::Degraded { polling: false, .. })) => "not listening",
     }
 }
 
@@ -1185,6 +1188,14 @@ pub(super) fn source_state(
         },
         (Some(Lifecycle::Settling { why }), _) => format!("settling: {why}"),
         (Some(Lifecycle::Stopped { why }), _) => format!("stopped: {why}"),
+        (Some(Lifecycle::Listening), _) => format!(
+            "listening · {}",
+            source.delivery.clone().unwrap_or_default()
+        ),
+        (Some(Lifecycle::Degraded { why, polling }), _) => match polling {
+            true => format!("degraded, polling only: {why}"),
+            false => format!("not listening, nothing is read: {why}"),
+        },
         (Some(Lifecycle::Running { pid, since }), _) => format!(
             "running · pid {pid} · {}",
             crate::age::short(crate::age::elapsed(*since as i64))
@@ -1347,10 +1358,11 @@ pub(super) fn render_source_page(
         Some(_) => fact("state", &timer_words(source, crate::age::now())),
         None => fact("state", &source_state(source, &snap.sources_live)),
     }
-    if source.delivery.is_some() {
+    if matches!(&source.config, clank_core::agent_config::WaitEventSource::Github(g) if g.poll_interval.is_some())
+    {
         fact(
             "",
-            "configured cadence: GitHub's X-Poll-Interval may make it poll less often",
+            "configured poll cadence: GitHub's X-Poll-Interval may make it poll less often",
         );
     }
     body.push(String::new());
@@ -9132,7 +9144,6 @@ mod tests {
                     branches: Vec::new(),
                     prs: Vec::new(),
                     prompt: None,
-                    delivery: Default::default(),
                 },
             ),
         )
@@ -9193,7 +9204,7 @@ mod tests {
             .find(|l| l.contains("frostsnap/frostsnap"))
             .unwrap();
         assert!(
-            row.contains("@claude ×3  poll every 120s (configured)"),
+            row.contains("@claude ×3  webhook, plus a poll every 120s"),
             "{row}"
         );
         assert!(!row.contains("hosted"), "{row}");
@@ -9223,7 +9234,8 @@ mod tests {
             assert!(
                 members
                     .iter()
-                    .any(|l| l.contains(&format!("@claude  {want}  poll every 120s"))),
+                    .any(|l| l
+                        .contains(&format!("@claude  {want}  webhook, plus a poll every 120s"))),
                 "{want}: {list:#?}"
             );
         }
@@ -9413,7 +9425,7 @@ mod tests {
         let both = hosted_watches(&[&fast, &slow]);
         assert_eq!(
             group_state(&[&fast, &slow], &both),
-            "1 poll every 30s (configured) · 1 poll every 60s (default)"
+            "1 webhook, plus a poll every 30s · 1 webhook, catching up each time it starts listening"
         );
         assert_eq!(source_state(&fast, &hosted_watches(&[&slow])), "not hosted");
         assert_eq!(
@@ -9426,7 +9438,43 @@ mod tests {
         account.sources[0].accepted = "an earlier config".into();
         assert_eq!(
             source_state(&fast, &Live::Monitor(account, producers)),
-            "poll every 30s (configured) · an edit was rejected; runs the earlier config"
+            "webhook, plus a poll every 30s · an edit was rejected; runs the earlier config"
+        );
+    }
+
+    /// A watch whose webhook is down never reads as a working one:
+    /// polling through it is degraded, and without a timer it says
+    /// nothing is read.
+    #[test]
+    fn a_watchs_webhook_health_is_what_its_state_says() {
+        use crate::cli::event_source::Lifecycle;
+        use crate::cli::source_status::Live;
+        use clank_core::agent_config::GithubEventKind::*;
+        let timed = watch("claude", &[PrUpdated], Some("30s"));
+        let state = |lifecycle: Lifecycle| {
+            let Live::Monitor(mut account, producers) = hosted_watches(&[&timed]) else {
+                unreachable!()
+            };
+            account.sources[0].lifecycle = Some(lifecycle);
+            source_state(&timed, &Live::Monitor(account, producers))
+        };
+        assert_eq!(
+            state(Lifecycle::Listening),
+            "listening · webhook, plus a poll every 30s"
+        );
+        assert_eq!(
+            state(Lifecycle::Degraded {
+                why: "needs admin on o/r to create a webhook".into(),
+                polling: true,
+            }),
+            "degraded, polling only: needs admin on o/r to create a webhook"
+        );
+        assert_eq!(
+            state(Lifecycle::Degraded {
+                why: "needs admin on o/r to create a webhook".into(),
+                polling: false,
+            }),
+            "not listening, nothing is read: needs admin on o/r to create a webhook"
         );
     }
 

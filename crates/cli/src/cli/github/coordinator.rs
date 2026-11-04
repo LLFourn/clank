@@ -1,16 +1,17 @@
-//! The emission gate, and the tick it guards.
+//! The emission gate, and the watch loop it guards.
 //!
 //! Two halves reach an agent through one door, and they are not the
 //! same kind of thing: the feed is a stream of id-bearing events that
-//! arrive once, the checks are a state re-read forever.
+//! arrive once, the checks are a state re-read on demand.
 //! [`Coordinator`] is the single place that decides whether a wake is
 //! news — one dedup horizon over action keys, one gate the relay
 //! waits behind — so neither half can emit behind the other's back.
 //!
-//! [`poll_loop`] is the tick. It drives [`FeedSide`] and
-//! [`ChecksSide`] on their own schedules, each with its own horizon
-//! and its own rate limit, and hands everything they produce to the
-//! coordinator.
+//! [`poll_loop`] is the watch. It is event driven: it reads GitHub
+//! when its transport starts listening (one catch-up), when a webhook
+//! cue says the checks may have moved, when unfinished work is due for
+//! a retry, and — only if `poll_interval` is set — on that timer. A
+//! healthy idle watch with no timer reads nothing.
 
 use clank_core::agent_config::GithubSource;
 
@@ -19,7 +20,7 @@ use super::feed::{
     Classified, EventFetcher, FeedHorizon, MAX_PAGES, PollDelta, SEEN_CAP, SeenSet,
     classify_webhook, effective_interval, poll_once, row_in_scope,
 };
-use super::relay::{RELAY_BUFFER_CAP, RelayInbox};
+use super::relay::{Heard, RELAY_BUFFER_CAP, RelayInbox};
 use super::selection::Selection;
 use super::session::LoginResolver;
 
@@ -27,20 +28,34 @@ use super::session::LoginResolver;
 ///
 /// They are a CUE, never a conclusion: one App's suite is not the
 /// PR's result, so what arrives is used to decide WHEN to re-read,
-/// and the read is the same one the poll does. That is what keeps a
-/// realtime watch and a polling watch from ever disagreeing.
-fn is_ci_cue(event_name: &str) -> bool {
-    matches!(event_name, "check_suite" | "status")
+/// and the read is the same one the catch-up does. That is what keeps
+/// a cue-driven read and a timer's read from ever disagreeing.
+pub(super) const CHECK_CUES: &[&str] = &["check_suite", "status"];
+
+/// The webhook that carries a PR's head moving — a build nobody has
+/// read yet. It is also an event in its own right for the PR kinds.
+pub(super) const HEAD_CHANGE: &str = "pull_request";
+
+pub(super) fn is_head_change(event_name: &str, payload: &serde_json::Value) -> bool {
+    event_name == HEAD_CHANGE
+        && matches!(
+            payload.get("action").and_then(|a| a.as_str()),
+            Some("opened" | "reopened" | "synchronize")
+        )
 }
 
-/// How close together a cue may make the checks be re-read.
+/// How close together cues may make the checks be re-read.
 ///
 /// Without it a busy PR — several apps, several pushes — turns every
 /// suite completion into a round of requests, and an unscoped watch
-/// pays that for every open PR at once. Cues inside the floor are
-/// dropped rather than queued: the next scheduled tick reads the same
-/// present state anyway.
+/// pays that for every open PR at once. A cue inside the window is
+/// never dropped: with no timer behind it, a dropped cue is a lost
+/// conclusion. It schedules ONE trailing read at the window's end,
+/// which sees the state after the last cue.
 const CI_RECHECK_FLOOR: std::time::Duration = std::time::Duration::from_secs(15);
+
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+const RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The feed half's collaborators: who to ask for events, and who
 /// resolves the login its own-action filter needs.
@@ -67,16 +82,25 @@ pub(crate) struct ChecksSide<'a, C: CiReader> {
 /// 1ddc0f6/afb7a35). First arrival with a given action key emits; the
 /// other path's copy drops at the gate. A KEYLESS wake (missing
 /// payload identity) is never deduped — emit-always is the safe
-/// degradation. The poll BASELINE owns the horizon: it seeds the key
-/// set and emits nothing, and relay deliveries BUFFER (bounded,
-/// drop-oldest) until a baseline has succeeded, then drain through
-/// the gate — realtime without a poll-established horizon could
-/// replay history.
+/// degradation. The feed BASELINE owns the horizon: it records
+/// pre-watch history and emits nothing, and relay deliveries BUFFER
+/// (bounded) until a baseline has succeeded, then drain through the
+/// gate.
+///
+/// A relay delivery is always LIVE — the hook it came through was
+/// created after the watch began listening — so history never
+/// suppresses it: an action the baseline recorded that the webhook
+/// also delivers wakes once (codex ac94279).
 pub(crate) struct Coordinator {
     interrupt: crate::cli::github::log::Interrupt,
     keys: SeenSet,
+    /// Keys this run's baseline recorded as history that no live path
+    /// has claimed yet.
+    history: std::collections::HashSet<String>,
     baseline_done: bool,
     buffered: std::collections::VecDeque<Classified>,
+    /// Deliveries the pre-baseline buffer evicted, not yet owed back.
+    evicted: u64,
     tx: crate::cli::event_source::EmissionSink,
     /// The write-ahead sink: every gate decision lands here BEFORE any
     /// emission (github-offline-catchup). Disabled for sources without
@@ -98,8 +122,10 @@ impl Coordinator {
         Self {
             interrupt: Default::default(),
             keys: SeenSet::new(SEEN_CAP),
+            history: Default::default(),
             baseline_done: false,
             buffered: std::collections::VecDeque::new(),
+            evicted: 0,
             tx,
             wal,
         }
@@ -130,7 +156,9 @@ impl Coordinator {
     fn gate(&mut self, mut c: Classified, transport: crate::cli::github::log::Transport) -> bool {
         // Keyless wakes skip the dedup entirely: never dedup.
         if let Some(k) = &c.key {
-            if self.keys.as_btree().contains(k) {
+            let live_over_history =
+                transport == crate::cli::github::log::Transport::Relay && self.history.remove(k);
+            if self.keys.contains(k) && !live_over_history {
                 // The other path emitted this action: this copy's
                 // durable decision is an observation.
                 self.wal.obs(c.feed_id.as_deref(), Some(k), false);
@@ -158,20 +186,25 @@ impl Coordinator {
         self.gate(c, crate::cli::github::log::Transport::Poll)
     }
 
-    /// The BASELINE poll's actions: seed the gate, emit nothing —
-    /// each action's durable record keeps its PAYLOAD as a
-    /// born-handled baseline inbox record so the timeline can show
-    /// pre-watch history (github-watch-resilience) — then drain any
-    /// pre-baseline relay backlog through the gate (pre-seeded keys
-    /// drop; genuinely-new actions emit once).
+    /// The BASELINE read's actions. The relay backlog drains through
+    /// the gate FIRST, so a live delivery is never pre-seeded as
+    /// handled; then the rest are recorded as history — born-handled
+    /// baseline records keeping their payload so the timeline can show
+    /// pre-watch history (github-watch-resilience) — and emit nothing.
     pub(crate) fn baseline(&mut self, baseline: Vec<Classified>) -> bool {
-        self.seed(baseline);
         self.baseline_done = true;
         while let Some(c) = self.buffered.pop_front() {
             if !self.gate(c, crate::cli::github::log::Transport::Relay) {
                 return false;
             }
         }
+        let history: Vec<Classified> = baseline
+            .into_iter()
+            .filter(|c| c.key.as_deref().is_none_or(|k| !self.keys.contains(k)))
+            .collect();
+        self.history
+            .extend(history.iter().filter_map(|c| c.key.clone()));
+        self.seed(history);
         true
     }
 
@@ -192,52 +225,247 @@ impl Coordinator {
     }
 
     /// A relay delivery: buffered until the baseline succeeds, gated
-    /// afterward.
+    /// afterward. The buffer is bounded; what it evicts is owed back
+    /// as a reconcile through [`take_evicted`](Self::take_evicted).
     pub(crate) fn deliver(&mut self, c: Classified) -> bool {
         if !self.baseline_done {
             if self.buffered.len() == RELAY_BUFFER_CAP {
                 self.buffered.pop_front();
-                eprintln!("wait: github relay backlog overflow pre-baseline; oldest dropped");
+                self.evicted += 1;
             }
             self.buffered.push_back(c);
             return true;
         }
         self.gate(c, crate::cli::github::log::Transport::Relay)
     }
+
+    pub(crate) fn take_evicted(&mut self) -> u64 {
+        std::mem::take(&mut self.evicted)
+    }
 }
 
-/// The transport-agnostic poll loop: the arm-time fetch establishes
-/// the baseline (emits nothing), then each tick emits new events.
-/// State — seen cursor, ETag, and the remembered server interval
-/// floor — persists across 304s and errors, so a failed tick never
-/// resets delta-from-now or drops below the server floor.
+/// Work a watch owes GitHub: owed until an attempt succeeds, retried
+/// with backoff meanwhile. A one-shot deadline that exists only while
+/// the work is pending — not a timer.
+#[derive(Default)]
+struct Owed {
+    owed: bool,
+    failures: u32,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl Owed {
+    fn owe(&mut self) {
+        self.owed = true;
+    }
+
+    /// When the work may run, if it is owed at all.
+    fn due(&self, not_before: Option<tokio::time::Instant>) -> Option<tokio::time::Instant> {
+        if !self.owed {
+            return None;
+        }
+        let at = match (self.retry_at, not_before) {
+            (Some(a), Some(b)) => a.max(b),
+            (a, b) => a.or(b).unwrap_or_else(tokio::time::Instant::now),
+        };
+        Some(at)
+    }
+
+    fn ready(&self, not_before: Option<tokio::time::Instant>) -> bool {
+        self.due(not_before)
+            .is_some_and(|at| at <= tokio::time::Instant::now())
+    }
+
+    /// The attempt takes the debt with it, so a reason to owe that
+    /// arrives while it runs owes one more attempt after it.
+    fn begin(&mut self) {
+        self.owed = false;
+    }
+
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+    }
+
+    fn failed(&mut self, e: &anyhow::Error, at_least: Option<std::time::Duration>) {
+        self.owed = true;
+        self.failures += 1;
+        let mut wait = RETRY_BASE
+            .saturating_mul(1 << self.failures.saturating_sub(1).min(16))
+            .min(RETRY_CAP)
+            .max(at_least.unwrap_or_default());
+        if let Some(limited) = e.downcast_ref::<crate::cli::github::session::RateLimited>() {
+            wait = wait.max(limited.retry_in);
+        }
+        self.retry_at = Some(tokio::time::Instant::now() + wait);
+    }
+}
+
+/// The feed's state across reads.
+struct FeedState {
+    horizon: FeedHorizon,
+    own_login: Option<String>,
+}
+
+/// One feed reconcile: resolve the own-action filter if it is needed
+/// and missing, then one [`poll_once`] against the cursor. `Ok(false)`
+/// means the wait is gone. A failed read keeps the committed cursor,
+/// so its retry re-reads from there.
+async fn read_feed<F: EventFetcher, R: LoginResolver>(
+    src: &GithubSource,
+    sel: &Selection,
+    side: &FeedSide<'_, F, R>,
+    state: &mut FeedState,
+    coordinator: &mut Coordinator,
+    wal: &crate::cli::github::log::SharedWal,
+) -> anyhow::Result<bool> {
+    // Never read unfiltered: filtering unavailable must NOT degrade to
+    // emitting the agent's own actions (codex a989653).
+    if sel.needs_own_login() && state.own_login.is_none() {
+        let login = side.login.resolve().await.map_err(|e| {
+            e.context(
+                "own-action filter needs the gh login; not reading the feed until it resolves",
+            )
+        })?;
+        state.own_login = Some(login);
+    }
+    let feed = &mut state.horizon;
+    let outcome = poll_once(
+        src,
+        &feed.seen.as_btree(),
+        feed.etag.as_deref(),
+        state.own_login.as_deref(),
+        side.fetcher,
+    )
+    .await;
+    // The server floor binds unconditionally — including on a 304
+    // and on a read whose deeper page FAILED (codex e9b8b66).
+    feed.floor = outcome.poll_interval.or(feed.floor);
+    match outcome.result? {
+        PollDelta::NotModified => {
+            wal.save_state(feed.etag.as_deref(), feed.floor, feed.established);
+        }
+        PollDelta::Fetched {
+            items,
+            new_ids,
+            overrun,
+        } => {
+            // Pagination can shift events across pages mid-read, so
+            // the SAME presentable event can appear in `items` twice.
+            // One event = one gate decision = one primary record
+            // (codex 7c9e7fe): keep each feed id's first occurrence.
+            let items = {
+                let mut seen_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut deduped = Vec::with_capacity(items.len());
+                for c in items {
+                    match &c.feed_id {
+                        Some(id) if !seen_ids.insert(id.clone()) => {}
+                        _ => deduped.push(c),
+                    }
+                }
+                deduped
+            };
+            // Durable observations for newly observed ids with no
+            // presentable item — exactly one atomic primary record
+            // per event: presentable ids get their inbox record at
+            // the emission gate instead (codex df3f1a7). Computed
+            // against the PRE-read cursor; pages can repeat an id
+            // within one read, so dedupe locally.
+            {
+                let presentable: std::collections::HashSet<&str> =
+                    items.iter().filter_map(|c| c.feed_id.as_deref()).collect();
+                let mut recorded: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for id in &new_ids {
+                    if !feed.seen.contains(id)
+                        && !presentable.contains(id.as_str())
+                        && recorded.insert(id)
+                    {
+                        wal.obs(Some(id), None, !feed.established);
+                    }
+                }
+            }
+            feed.seen.extend(new_ids);
+            // An ETag only from a COMPLETE read: conditioning the next
+            // one with a failed read's would 304 straight past the
+            // unread deeper pages' events.
+            feed.etag = outcome.etag.or(feed.etag.take());
+            // Overrun is meaningless at the baseline (which pages the
+            // whole bounded feed into the cursor by design); only a
+            // DELTA read that overran can have lost events.
+            if overrun && feed.established {
+                eprintln!(
+                    "wait: github {} — more than {MAX_PAGES} pages of new events since the \
+                     last read; older ones may have been missed",
+                    src.repo
+                );
+            }
+            // The FIRST successful read is baseline-only; a failed one
+            // does NOT count, so real history is never replayed as
+            // new.
+            if feed.established {
+                for c in items {
+                    if !coordinator.offer(c) {
+                        return Ok(false);
+                    }
+                }
+            } else if !coordinator.baseline(items) {
+                return Ok(false);
+            }
+            feed.established = true;
+            wal.save_state(feed.etag.as_deref(), feed.floor, feed.established);
+            wal.compact();
+        }
+    }
+    Ok(true)
+}
+
+/// The watch loop: present the warm backlog, then act on what the
+/// transport says and on what is owed.
 ///
-/// When the own-action filter is requested (`include_own_actions ==
-/// false`) the loop DOES NOT poll until the login resolves: filtering
-/// unavailable must NOT degrade to emitting the agent's own actions
-/// (which would self-wake it in a loop). It retries login on the poll
-/// cadence, warning each failure, and only begins polling once the
-/// filter is established (codex a989653). Generic over the fetcher +
-/// login resolver, so tested end-to-end without `gh`.
+/// - Each [`Heard::CatchUp`] is a new start of listening and owes one
+///   catch-up: a feed reconcile (the first one ever is the baseline)
+///   and, for a CI watch, one checks read of every PR in scope. What
+///   the feed still lags on at that moment is not in it, and the new
+///   hook will not deliver it either — the stated gap only
+///   `poll_interval` closes.
+/// - A delivery classifies and emits through the coordinator gate; a
+///   check cue, or a PR head change, owes a checks read instead
+///   (coalesced inside [`CI_RECHECK_FLOOR`]).
+/// - Intake overflow owes a reconcile.
+/// - Owed work is retried with backoff until it succeeds.
+/// - With `poll_interval` set, that timer owes both halves too.
+///
+/// The own-action filter is fail-closed: until the login resolves,
+/// the feed is not read and deliveries wait at ingress. Generic over
+/// the fetcher, login resolver and CI reader, so tested end-to-end
+/// without `gh`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     checks: ChecksSide<'_, C>,
     tx: &crate::cli::event_source::EmissionSink,
-    mut relay: Option<std::sync::Arc<RelayInbox>>,
+    relay: &RelayInbox,
+    key: &str,
     mut log: Option<crate::cli::github::log::EventLog>,
     suppress_backlog: std::collections::HashSet<(u64, String)>,
 ) {
     let sel = Selection::of(src);
-    let configured = src
+    let wants_ci = sel.wants_ci();
+    let poll_every = src
         .poll_interval
         .as_deref()
         .and_then(|s| crate::cli::wait::parse_duration_str(s).ok().flatten());
-    let mut feed = FeedHorizon {
-        seen: SeenSet::new(SEEN_CAP),
-        etag: None,
-        floor: None,
-        established: false,
+    let mut feed = FeedState {
+        horizon: FeedHorizon {
+            seen: SeenSet::new(SEEN_CAP),
+            etag: None,
+            floor: None,
+            established: false,
+        },
+        own_login: None,
     };
     // CI's horizon is its own object with its own file: read from the
     // PRs rather than the feed, established on its own terms, and
@@ -245,29 +473,13 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     // half's history establish the other and let eviction re-announce
     // unchanged builds (codex 7c132ec, ae48e92).
     let mut ci_horizon = crate::cli::github::ci::CiHorizon::load(checks.state.as_deref());
-    let mut own_login: Option<String> = None;
-    // Two schedules, independent on purpose (codex 9bfe171).
-    //
-    // `feed_due` is WHEN THE FEED POLLS NEXT, advanced only when it
-    // actually polls. A cue-driven tick skips the feed, so if it also
-    // pushed this out, cues arriving between the checks floor and the
-    // feed interval would starve the feed forever — and the feed is
-    // the completeness backstop for everything the relay drops.
-    //
-    // `last_checks_attempt` is PERMISSION TO LOOK AGAIN, advanced by
-    // every attempt whatever it returns. Advancing it only on success
-    // would let a broken checks endpoint retry on every queued cue,
-    // which is when a storm is least affordable.
-    let mut checks_only_tick = false;
-    let mut feed_due = tokio::time::Instant::now();
-    let mut last_checks_attempt: Option<tokio::time::Instant> = None;
 
     // Warm start (github-offline-catchup): rebuild both horizons from
     // the WAL and re-present the unhandled backlog IMMEDIATELY — an
     // agent arming with unhandled events is woken for them before any
     // network I/O (and before the own-login gate: the backlog was
     // already filtered when it was logged). A warm cursor makes the
-    // first fetch a RECONCILE — events that fired while no wait was
+    // catch-up a RECONCILE — events that fired while no wait was
     // armed emit instead of being swallowed by a fresh baseline.
     let mut warm_keys: Vec<String> = Vec::new();
     if let Some(l) = log.as_mut() {
@@ -329,7 +541,7 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
                 return; // wait gone
             }
         }
-        feed = FeedHorizon::restore(&loaded);
+        feed.horizon = FeedHorizon::restore(&loaded);
         warm_keys = loaded.action_keys;
     }
     let wal = crate::cli::github::log::SharedWal::new(log);
@@ -342,22 +554,49 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
     // statement about the FEED alone, and a log holding only checks
     // rows is no evidence for it (codex ae48e92).
     coordinator.remember_keys(warm_keys);
-    if feed.established {
+    if feed.horizon.established {
         coordinator.feed_established();
     }
 
+    let mut feed_work = Owed::default();
+    let mut checks_work = Owed::default();
+    // PERMISSION TO LOOK AGAIN, advanced by every attempt whatever it
+    // returns: advancing it only on success would let a broken checks
+    // endpoint be hit on every cue, which is when a storm is least
+    // affordable.
+    let mut checks_not_before: Option<tokio::time::Instant> = None;
+    let next_tick = |floor: Option<u64>| {
+        poll_every.map(|every| tokio::time::Instant::now() + effective_interval(every, floor))
+    };
+    let mut timer_due = next_tick(feed.horizon.floor);
+
+    // Whatever the lost deliveries were, the reads that would have
+    // followed them are owed: the feed's, and — since a lost delivery
+    // may have moved a PR — the checks'.
+    let overflowed = |dropped: u64, feed_work: &mut Owed, checks_work: &mut Owed| {
+        eprintln!(
+            "wait: github {} — {dropped} webhook deliveries overflowed intake; \
+             reconciling for them",
+            src.repo
+        );
+        wal.relay_overflow(dropped);
+        feed_work.owe();
+        if wants_ci {
+            checks_work.owe();
+        }
+    };
+
     loop {
-        // The CI read comes BEFORE the own-action gate below, and
-        // keeps its own horizon: a conclusion is nobody's action, so
-        // the filter that gate establishes has nothing to say about
-        // it, and waiting on a login it does not need would hold a
-        // red build behind an unrelated outage. Its failures are its
-        // own too — the feed's poll is unaffected either way.
-        if sel.wants_ci() {
-            let attempt = checks.reader.read().await;
-            last_checks_attempt = Some(tokio::time::Instant::now());
-            match attempt {
+        // The checks come BEFORE the feed and keep their own horizon:
+        // a conclusion is nobody's action, so the own-action filter
+        // has nothing to say about it, and waiting on a login it does
+        // not need would hold a red build behind an unrelated outage.
+        if wants_ci && checks_work.ready(checks_not_before) {
+            checks_work.begin();
+            checks_not_before = Some(tokio::time::Instant::now() + CI_RECHECK_FLOOR);
+            match checks.reader.read().await {
                 Ok(results) => {
+                    checks_work.succeeded();
                     let wakes = crate::cli::github::ci::wakes(&src.repo, &sel, &results);
                     let in_scope: std::collections::BTreeSet<u64> =
                         results.iter().map(|(pr, _)| pr.number).collect();
@@ -367,245 +606,116 @@ pub(crate) async fn poll_loop<F: EventFetcher, R: LoginResolver, C: CiReader>(
                         }
                     }
                     // A completed read is its OWN durability point:
-                    // waiting for the feed's tick to persist it would
-                    // put this half's memory back under the other's
+                    // waiting for the feed to persist it would put
+                    // this half's memory back under the other's
                     // availability.
                     ci_horizon.save(checks.state.as_deref());
                 }
-                Err(e) => eprintln!("wait: github {} ci read failed: {e}", src.repo),
+                Err(e) => {
+                    checks_work.failed(&e, None);
+                    eprintln!("wait: github {} ci read failed: {e:#}", src.repo);
+                }
             }
+            continue;
         }
-
-        if checks_only_tick {
-            // A cue moved the checks, not the feed: go back to
-            // waiting out the deadline the feed already had.
-            checks_only_tick = false;
-            if !drain_relay_window(
-                feed_due,
-                &mut relay,
-                src,
-                own_login.as_deref(),
-                &mut coordinator,
-                &mut checks_only_tick,
-                last_checks_attempt,
-            )
-            .await
-            {
-                return; // wait gone
+        if feed_work.ready(None) {
+            feed_work.begin();
+            match read_feed(src, &sel, &feed_side, &mut feed, &mut coordinator, &wal).await {
+                Ok(true) => feed_work.succeeded(),
+                Ok(false) => return, // wait gone
+                Err(e) => {
+                    // GitHub's X-Poll-Interval binds a retry too.
+                    let floor = feed.horizon.floor.map(std::time::Duration::from_secs);
+                    feed_work.failed(&e, floor);
+                    eprintln!("wait: github {} feed read failed: {e:#}", src.repo);
+                }
+            }
+            // The timer counts from the last read, under the floor
+            // that read just learned.
+            timer_due = next_tick(feed.horizon.floor);
+            let evicted = coordinator.take_evicted();
+            if evicted > 0 {
+                overflowed(evicted, &mut feed_work, &mut checks_work);
             }
             continue;
         }
 
-        // Establish the own-action filter before ANY poll when it's
-        // requested — never poll unfiltered.
-        if sel.needs_own_login() && own_login.is_none() {
-            match feed_side.login.resolve().await {
-                Ok(l) => own_login = Some(l),
-                Err(e) => {
-                    eprintln!(
-                        "wait: github {} — own-action filter needs the gh login ({e}); \
-                         not polling this source until it resolves",
-                        src.repo
-                    );
-                    // The relay inbox is bounded at INGRESS, so
-                    // deliveries simply wait in it while we retry —
-                    // no drain needed here (codex 840725c).
-                    tokio::time::sleep(effective_interval(configured, feed.floor)).await;
-                    continue;
-                }
-            }
-        }
-        let outcome = poll_once(
-            src,
-            &feed.seen.as_btree(),
-            feed.etag.as_deref(),
-            own_login.as_deref(),
-            feed_side.fetcher,
-        )
-        .await;
-        // The server floor binds unconditionally — including on a 304
-        // and on a tick whose deeper page FAILED (codex e9b8b66).
-        feed.floor = outcome.poll_interval.or(feed.floor);
-        match outcome.result {
-            Ok(PollDelta::NotModified) => {
-                // Nothing new, but the floor may have moved.
-                wal.save_state(feed.etag.as_deref(), feed.floor, feed.established);
-            }
-            Ok(PollDelta::Fetched {
-                items,
-                new_ids,
-                overrun,
-            }) => {
-                // Pagination can shift events across pages mid-tick, so
-                // the SAME presentable event can appear in `items`
-                // twice. One event = one gate decision = one primary
-                // record (codex 7c9e7fe): keep each feed id's first
-                // occurrence only (keyless items would otherwise
-                // double-emit; keyed ones would append inbox + obs).
-                let items = {
-                    let mut seen_ids: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    let mut deduped = Vec::with_capacity(items.len());
-                    for c in items {
-                        match &c.feed_id {
-                            Some(id) if !seen_ids.insert(id.clone()) => {}
-                            _ => deduped.push(c),
-                        }
-                    }
-                    deduped
-                };
-                // Durable observations for newly observed ids with no
-                // presentable item — exactly one atomic primary record
-                // per event: presentable ids get their inbox record at
-                // the emission gate instead (codex df3f1a7). Computed
-                // against the PRE-tick cursor; pages can repeat an id
-                // within one tick, so dedupe locally.
-                {
-                    let pre = feed.seen.as_btree();
-                    let presentable: std::collections::HashSet<&str> =
-                        items.iter().filter_map(|c| c.feed_id.as_deref()).collect();
-                    let mut recorded: std::collections::HashSet<&str> =
-                        std::collections::HashSet::new();
-                    for id in &new_ids {
-                        if !pre.contains(id)
-                            && !presentable.contains(id.as_str())
-                            && recorded.insert(id)
-                        {
-                            wal.obs(Some(id), None, !feed.established);
-                        }
-                    }
-                }
-                feed.seen.extend(new_ids);
-                feed.etag = outcome.etag.or(feed.etag);
-                // Overrun is meaningless at the baseline tick (which
-                // pages the whole bounded feed into the cursor by
-                // design); only a DELTA poll that overran can have lost
-                // events.
-                if overrun && feed.established {
-                    eprintln!(
-                        "wait: github {} — more than {MAX_PAGES} pages of new events since the \
-                         last poll; older ones may have been missed",
-                        src.repo
-                    );
-                }
-                // The FIRST successful fetch is baseline-only
-                // (delta-from-now); a failed arm-time fetch does NOT
-                // count, so real history is never replayed as new. The
-                // coordinator owns emission for BOTH paths: the
-                // baseline seeds its key gate, delta polls offer
-                // through it (a webhook that already emitted an action
-                // suppresses the poll's copy, and vice versa).
-                if feed.established {
-                    for c in items {
-                        if !coordinator.offer(c) {
-                            return; // wait gone
-                        }
-                    }
-                } else if !coordinator.baseline(items) {
-                    return; // wait gone
-                }
-                feed.established = true;
-                // A completed tick is the durability point for the
-                // cache metadata; failed ticks touch nothing.
-                wal.save_state(feed.etag.as_deref(), feed.floor, feed.established);
-                wal.compact();
-            }
-            Err(e) => {
-                // outcome.etag is deliberately DROPPED here: the tick
-                // didn't complete, so conditioning the next one with
-                // its ETag would 304 straight past the unread deeper
-                // pages' events. Retry the whole tick unconditioned.
-                eprintln!("wait: github {} poll failed: {e}", src.repo);
-            }
-        }
-        // Between ticks: the relay is the LATENCY path — deliveries
-        // classify and emit IMMEDIATELY (through the same coordinator
-        // gate) instead of waiting for the next poll. A closed relay
-        // falls back to polling alone, loudly, once; polling never
-        // stopped, so nothing is lost.
-        feed_due = tokio::time::Instant::now() + effective_interval(configured, feed.floor);
-        if !drain_relay_window(
-            feed_due,
-            &mut relay,
-            src,
-            own_login.as_deref(),
-            &mut coordinator,
-            &mut checks_only_tick,
-            last_checks_attempt,
-        )
-        .await
-        {
-            return; // wait gone
-        }
-    }
-}
-
-/// Wait out the inter-tick window, handling relay deliveries as they
-/// arrive. Returns false when the wait side is gone.
-///
-/// The relay is the LATENCY path — a delivery classifies and emits
-/// IMMEDIATELY through the same coordinator gate instead of waiting
-/// for the next poll. A closed relay falls back to polling alone,
-/// loudly, once; polling never stopped, so nothing is lost.
-///
-/// A CI cue is the exception: it carries no conclusion, so it ends the
-/// window instead of emitting, and the loop re-reads the checks.
-#[allow(clippy::too_many_arguments)]
-async fn drain_relay_window(
-    deadline: tokio::time::Instant,
-    relay: &mut Option<std::sync::Arc<RelayInbox>>,
-    src: &GithubSource,
-    own_login: Option<&str>,
-    coordinator: &mut Coordinator,
-    checks_only_tick: &mut bool,
-    last_checks_attempt: Option<tokio::time::Instant>,
-) -> bool {
-    let wants_ci = Selection::of(src).wants_ci();
-    loop {
-        let Some(inbox) = relay.as_ref() else {
-            tokio::time::sleep_until(deadline).await;
-            return true;
-        };
+        let deadline = [
+            wants_ci
+                .then(|| checks_work.due(checks_not_before))
+                .flatten(),
+            feed_work.due(None),
+            timer_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let deliveries = !sel.needs_own_login() || feed.own_login.is_some();
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return true,
-            delivery = inbox.recv() => match delivery {
-                Some((name, payload)) => {
-                    if is_ci_cue(&name) {
-                        // Not an event to present: a cue to look. Too
-                        // soon after the last look and there is
-                        // nothing to gain — the next scheduled read
-                        // sees the same present state.
-                        if wants_ci
-                            && last_checks_attempt
-                                .is_none_or(|t| t.elapsed() >= CI_RECHECK_FLOOR)
-                        {
-                            *checks_only_tick = true;
-                            return true;
-                        }
-                        continue;
+            () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if deadline.is_some() =>
+            {
+                if timer_due.is_some_and(|t| t <= tokio::time::Instant::now()) {
+                    feed_work.owe();
+                    if wants_ci {
+                        checks_work.owe();
                     }
+                    timer_due = next_tick(feed.horizon.floor);
+                }
+            }
+            heard = relay.next(deliveries) => match heard {
+                Heard::Listening => {
+                    tx.report(key, crate::cli::event_source::Lifecycle::Listening);
+                }
+                Heard::CatchUp => {
+                    feed_work.owe();
+                    if wants_ci {
+                        checks_work.owe();
+                    }
+                }
+                Heard::ChecksCue => {
+                    if wants_ci {
+                        checks_work.owe();
+                    }
+                }
+                Heard::Down(down) => {
+                    let why = down.cause.describe(&src.repo);
+                    let meanwhile = match poll_every {
+                        Some(every) => format!("polling every {}s meanwhile", every.as_secs()),
+                        None => "no poll_interval, so nothing is read until it is back".to_string(),
+                    };
+                    eprintln!(
+                        "wait: github {} — webhook not listening: {why}; {meanwhile}; \
+                         retrying in {}s",
+                        src.repo,
+                        down.retry_in.as_secs()
+                    );
+                    tx.report(
+                        key,
+                        crate::cli::event_source::Lifecycle::Degraded {
+                            why,
+                            polling: poll_every.is_some(),
+                        },
+                    );
+                }
+                Heard::Overflowed(dropped) => {
+                    overflowed(dropped, &mut feed_work, &mut checks_work)
+                }
+                Heard::Delivery((name, payload)) => {
                     if let Some(c) = classify_webhook(
                         &src.repo,
                         &name,
                         &payload,
-                        &Selection::of(src),
-                        own_login,
+                        &sel,
+                        feed.own_login.as_deref(),
                     ) && !coordinator.deliver(c)
                     {
-                        return false; // wait gone
+                        return; // wait gone
                     }
-                }
-                None => {
-                    // THE one fallback diagnostic (codex 4d77b83):
-                    // the supervisor records why, this line renders
-                    // it, nobody else prints.
-                    eprintln!(
-                        "wait: github {} — realtime relay ended ({}); \
-                         continuing on polling alone",
-                        src.repo,
-                        relay.as_ref().map(|i| i.reason()).unwrap_or_default()
-                    );
-                    *relay = None;
+                    let evicted = coordinator.take_evicted();
+                    if evicted > 0 {
+                        overflowed(evicted, &mut feed_work, &mut checks_work);
+                    }
                 }
             },
         }
@@ -628,7 +738,8 @@ mod tests {
     use crate::cli::github::feed::tests::{ScriptFetcher, classified, ev, gh_item, issue, ok, src};
     use crate::cli::github::feed::{GhFetcher, GhResponse};
     use crate::cli::github::log::tests::{open_log, wal_tempdir};
-    use crate::cli::github::relay::{Forwarder, start_relay};
+    use crate::cli::github::relay::tests::listening;
+    use crate::cli::github::relay::{RelayDown, RelayFailure};
     use crate::cli::github::session::tests::{FixedLogin, ScriptLogin};
     use crate::cli::github::session::{GithubSession, HttpSend, MiniResponse};
     use std::sync::Mutex;
@@ -659,71 +770,15 @@ mod tests {
         assert!(rows[1].interrupt);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn relay_start_failure_and_exit_route_one_reason_through_the_inbox() {
-        // The injected supervisor seam (codex 4d77b83): a scripted
-        // forwarder terminates with its reason; the inbox closes
-        // carrying it (the SINGLE diagnostic's payload), the poll
-        // catches the action the relay missed, and the guard's drop
-        // aborts the relay tasks.
-        struct ScriptForwarder(&'static str);
-        impl Forwarder for ScriptForwarder {
-            async fn run(&self, _repo: String, _events: String, _port: u16) -> String {
-                self.0.to_string()
-            }
-        }
-        let s = src(&[GithubEventKind::IssueOpened], false);
-        let (inbox, guard) = start_relay(&s, ScriptForwarder("extension missing"))
-            .await
-            .expect("listener binds");
-        // The forwarder terminated immediately: the inbox closes with
-        // the bounded reason.
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), inbox.recv())
-                .await
-                .expect("closes"),
-            None
-        );
-        assert_eq!(inbox.reason(), "extension missing");
-        // The poll still catches the action the dead relay never
-        // delivered (baseline, then the delta poll emits it).
-        let f = ScriptFetcher::new(vec![
-            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
-            Box::new(|_p, _e| Ok(ok(vec![issue("7", 7)], None, None))),
-        ]);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let loop_inbox = inbox.clone();
-        let handle = tokio::spawn(async move {
-            poll_loop(
-                &src(&[GithubEventKind::IssueOpened], false),
-                FeedSide {
-                    fetcher: &f,
-                    login: &FixedLogin("me"),
-                },
-                ChecksSide {
-                    reader: &NoCi,
-                    state: None,
-                },
-                &tx,
-                Some(loop_inbox),
-                None,
-                Default::default(),
-            )
-            .await;
-        });
-        let item = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv())
-            .await
-            .expect("poll-only recovery")
-            .expect("open");
-        let (WaitItem::GithubEvent { number, .. }, _) = item else {
-            unreachable!()
-        };
-        assert_eq!(number, Some(7));
-        handle.abort();
-        let _ = handle.await;
-        drop(guard);
+    /// The watch under test with the optional timer on: these tests
+    /// are about what successive reads do, which without a timer only
+    /// webhooks would cause.
+    fn timed_src(events: &[GithubEventKind], include_own: bool) -> GithubSource {
+        let mut s = src(events, include_own);
+        s.poll_interval = Some("60s".into());
+        s
     }
+
     // ── the coordinator: one emission owner, baseline horizon ──
 
     #[tokio::test]
@@ -742,9 +797,19 @@ mod tests {
         // A poll-only action (the relay missed it) still emits.
         assert!(c.offer(classified(3, Some("issue_opened#3"))));
         assert!(rx.try_recv().is_ok());
-        // A pre-baseline action delivered later by webhook → no wake.
+        // A webhook is live even for an action the baseline recorded
+        // as history: it wakes once, and only once.
         assert!(c.deliver(classified(1, Some("issue_opened#1"))));
-        assert!(rx.try_recv().is_err(), "baseline-seeded key drops");
+        assert!(
+            rx.try_recv().is_ok(),
+            "history never suppresses a live delivery"
+        );
+        assert!(c.deliver(classified(1, Some("issue_opened#1"))));
+        assert!(c.offer(classified(1, Some("issue_opened#1"))));
+        assert!(
+            rx.try_recv().is_err(),
+            "after which it is an ordinary duplicate"
+        );
         // KEYLESS wakes are never deduped.
         assert!(c.offer(classified(9, None)));
         assert!(c.offer(classified(9, None)));
@@ -761,18 +826,18 @@ mod tests {
         assert!(c.deliver(classified(1, Some("issue_opened#1"))));
         assert!(c.deliver(classified(5, Some("issue_opened#5"))));
         assert!(rx.try_recv().is_err(), "nothing emits pre-baseline");
-        // …then the baseline seeds (action 1 was visible at arm time)
-        // and the backlog drains through the gate: 1 drops, 5 emits.
-        assert!(c.baseline(vec![classified(1, Some("issue_opened#1"))]));
-        let emitted = rx.try_recv().expect("the genuinely-new action");
-        let (WaitItem::GithubEvent { number, .. }, _) = emitted else {
-            unreachable!()
-        };
-        assert_eq!(number, Some(5));
-        assert!(
-            rx.try_recv().is_err(),
-            "the pre-baseline action never wakes"
-        );
+        // …then drain BEFORE the baseline records its history, so
+        // action 1 — live, and also on the baseline page — is pending,
+        // while action 2, history only, is not.
+        assert!(c.baseline(vec![
+            classified(1, Some("issue_opened#1")),
+            classified(2, Some("issue_opened#2")),
+        ]));
+        let mut woke = Vec::new();
+        while let Ok((WaitItem::GithubEvent { number, .. }, _)) = rx.try_recv() {
+            woke.push(number.unwrap());
+        }
+        assert_eq!(woke, vec![1, 5], "each live action once; history never");
     }
 
     #[tokio::test]
@@ -793,6 +858,8 @@ mod tests {
         }
         assert_eq!(got.len(), RELAY_BUFFER_CAP, "bounded backlog");
         assert_eq!(*got.first().unwrap(), 3, "oldest dropped first");
+        assert_eq!(c.take_evicted(), 3, "and what went is owed back");
+        assert_eq!(c.take_evicted(), 0);
     }
 
     // ── bounded transport: deadlines at the ownership boundary ──
@@ -858,7 +925,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -896,7 +964,7 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(&[GithubEventKind::IssueOpened], false),
+                &timed_src(&[GithubEventKind::IssueOpened], false),
                 FeedSide {
                     fetcher: &f,
                     login: &FixedLogin("me"),
@@ -906,7 +974,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -942,7 +1011,7 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(&[GithubEventKind::CiFailed], true),
+                &timed_src(&[GithubEventKind::CiFailed], true),
                 FeedSide {
                     fetcher: &f,
                     login: &FixedLogin("me"),
@@ -952,7 +1021,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -998,7 +1068,7 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(
+                &timed_src(
                     &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
                     true,
                 ),
@@ -1011,7 +1081,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1048,7 +1119,7 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(
+                &timed_src(
                     &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
                     true,
                 ),
@@ -1061,7 +1132,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1102,7 +1174,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             poll_loop(
                 // include_own_actions = false: the gate is armed.
-                &src(&[GithubEventKind::CiFailed], false),
+                &timed_src(&[GithubEventKind::CiFailed], false),
                 FeedSide {
                     fetcher: &f,
                     login: &NoLogin,
@@ -1112,7 +1184,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1164,7 +1237,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1200,7 +1274,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1225,7 +1300,7 @@ mod tests {
         })]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s1 = src(&[GithubEventKind::IssueOpened], true);
+        let s1 = timed_src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run1 = tokio::spawn(async move {
             poll_loop(
@@ -1239,7 +1314,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1259,7 +1335,7 @@ mod tests {
         let f2 = ScriptFetcher::new(vec![]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s2 = src(
+        let s2 = timed_src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
         );
@@ -1276,7 +1352,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1325,7 +1402,8 @@ mod tests {
                         state: None,
                     },
                     &tx,
-                    None,
+                    &listening().inbox,
+                    "k",
                     Some(open_log(&d)),
                     Default::default(),
                 )
@@ -1348,6 +1426,7 @@ mod tests {
         let mut s = src(&[GithubEventKind::PrComment], true);
         s.prs = vec![7];
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         for number in [8u64, 7] {
             inbox.push((
                 "issue_comment".to_string(),
@@ -1375,7 +1454,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1439,7 +1519,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1503,7 +1584,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1540,7 +1622,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1562,8 +1645,8 @@ mod tests {
     async fn a_finished_suite_makes_the_checks_be_read_now() {
         // The cue carries no conclusion — one App's suite is not the
         // PR's result — so it ends the window and the loop re-reads.
-        // Same read as the poll's, which is what stops a realtime
-        // watch and a polling watch from disagreeing.
+        // Same read as the timer's, which is what stops a cue's read
+        // and a timer's read from disagreeing.
         let ci = ScriptCi::new(vec![
             vec![red(7, "head1", "fmt")],
             vec![red(7, "head2", "test")],
@@ -1573,6 +1656,7 @@ mod tests {
         let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
         let fetches = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
@@ -1589,7 +1673,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1647,13 +1732,14 @@ mod tests {
         let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
         let calls = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         inbox.push((
             "check_suite".to_string(),
             serde_json::json!({ "action": "completed" }),
         ));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s = src(&[GithubEventKind::IssueOpened], true);
+        let s = timed_src(&[GithubEventKind::IssueOpened], true);
         let loop_inbox = inbox.clone();
         let counter = reads.clone();
         let handle = tokio::spawn(async move {
@@ -1668,7 +1754,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1695,8 +1782,7 @@ mod tests {
     /// codex 9bfe171: a cue must not postpone the FEED. Cues spaced
     /// between the checks floor and the feed interval used to reset
     /// the deadline every time, so the feed never polled again — and
-    /// the feed is the completeness backstop for everything the relay
-    /// drops.
+    /// a watch's timer is the backstop for what the feed lags on.
     #[tokio::test(start_paused = true)]
     async fn a_stream_of_cues_does_not_starve_the_feed() {
         struct QuietCi;
@@ -1708,9 +1794,10 @@ mod tests {
         let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
         let fetches = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s = src(
+        let s = timed_src(
             &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
             true,
         );
@@ -1727,7 +1814,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1766,6 +1854,7 @@ mod tests {
         let attempts: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
         let f = ScriptFetcher::new(vec![]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
@@ -1783,7 +1872,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1822,6 +1912,7 @@ mod tests {
         let reads: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
         let f = ScriptFetcher::new(vec![]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::CiFailed], true);
@@ -1839,7 +1930,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -1877,6 +1969,7 @@ mod tests {
         // Arm 1: the feed baselines on an EMPTY feed and saves an
         // ETag; a webhook arrives and is emitted through the gate.
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         inbox.push((
             "issues".to_string(),
             serde_json::json!({
@@ -1905,7 +1998,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1955,7 +2049,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -1998,7 +2093,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2027,7 +2123,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2109,7 +2206,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2165,7 +2263,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2178,6 +2277,7 @@ mod tests {
         // Arm 2: the feed is still down and an issues webhook is
         // waiting. It must stay buffered.
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         inbox.push((
             "issues".to_string(),
             serde_json::json!({
@@ -2207,7 +2307,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2275,7 +2376,8 @@ mod tests {
                         state: None,
                     },
                     &tx,
-                    None,
+                    &listening().inbox,
+                    "k",
                     Some(open_log(&d)),
                     Default::default(),
                 )
@@ -2305,7 +2407,7 @@ mod tests {
         let f = ScriptFetcher::new(vec![]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s = src(&[GithubEventKind::CiFailed], true);
+        let s = timed_src(&[GithubEventKind::CiFailed], true);
         let d = dir.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
@@ -2319,7 +2421,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2370,7 +2473,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2398,7 +2502,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2438,7 +2543,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -2521,7 +2627,7 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(&[GithubEventKind::IssueOpened], false),
+                &timed_src(&[GithubEventKind::IssueOpened], false),
                 FeedSide {
                     fetcher: &f,
                     login: &login,
@@ -2531,7 +2637,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2584,7 +2691,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2629,7 +2737,7 @@ mod tests {
         let f2 = f.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(&[GithubEventKind::IssueOpened], false),
+                &timed_src(&[GithubEventKind::IssueOpened], false),
                 FeedSide {
                     fetcher: &*f2,
                     login: &FixedLogin("me"),
@@ -2639,7 +2747,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2667,7 +2776,7 @@ mod tests {
         // copy of the SAME action (same key) is suppressed by the
         // coordinator; a poll-only action still emits; and the relay
         // closing falls back to polling alone.
-        let s = src(&[GithubEventKind::IssueOpened], false);
+        let s = timed_src(&[GithubEventKind::IssueOpened], false);
         let f = ScriptFetcher::new(vec![
             // Tick 1: the baseline — issue #1 exists at arm time.
             Box::new(|_p, _e| Ok(ok(vec![issue("1", 1)], Some("\"e1\""), None))),
@@ -2689,6 +2798,7 @@ mod tests {
             }),
         ]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
@@ -2704,7 +2814,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2735,9 +2846,6 @@ mod tests {
             unreachable!()
         };
         assert_eq!(number, Some(3), "the poll's copy of #2 was suppressed");
-        // Relay closes → the loop continues on polling alone (script
-        // exhausted → 304s forever; the loop stays alive).
-        inbox.close();
         tokio::task::yield_now().await;
         assert!(rx.try_recv().is_err(), "no duplicate of #2 ever surfaced");
         handle.abort();
@@ -2762,6 +2870,7 @@ mod tests {
         // Fetcher: the (post-login) baseline is empty; then 304s.
         let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], None, None)))]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         // MORE than the cap of foreign deliveries + one self-authored,
         // all pushed while the login is still failing — the bound
         // applies at INGRESS (codex 840725c).
@@ -2793,7 +2902,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2840,6 +2950,7 @@ mod tests {
         }
         let f = ScriptFetcher::new(vec![]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
@@ -2855,7 +2966,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2893,13 +3005,17 @@ mod tests {
             Box::new(|_p, _e| Ok(ok(vec![issue("7", 7)], None, None))),
         ]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
-        inbox.close(); // dead before login ever resolves
+        inbox.started();
+        inbox.down(RelayDown {
+            cause: RelayFailure::NoPing,
+            retry_in: Duration::from_secs(5),
+        });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let loop_inbox = inbox.clone();
         let handle = tokio::spawn(async move {
             poll_loop(
-                &src(&[GithubEventKind::IssueOpened], false),
+                &timed_src(&[GithubEventKind::IssueOpened], false),
                 FeedSide {
                     fetcher: &f,
                     login: &login,
@@ -2909,7 +3025,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2953,7 +3070,8 @@ mod tests {
                     state: None,
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 None,
                 Default::default(),
             )
@@ -2996,7 +3114,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3030,7 +3149,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3098,7 +3218,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3160,9 +3281,10 @@ mod tests {
         ]));
         let calls = f.clone();
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s = src(&[GithubEventKind::IssueOpened], true);
+        let s = timed_src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let loop_inbox = inbox.clone();
         // A pre-baseline relay delivery: only a REAL baseline drains it.
@@ -3183,7 +3305,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3265,7 +3388,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3301,7 +3425,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3340,7 +3465,7 @@ mod tests {
         ]);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
-        let s = src(&[GithubEventKind::IssueOpened], true);
+        let s = timed_src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
         let run = tokio::spawn(async move {
             poll_loop(
@@ -3354,7 +3479,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3393,6 +3519,7 @@ mod tests {
         // Run 1: empty baseline, then a relay delivery emits issue #2.
         let f = ScriptFetcher::new(vec![Box::new(|_p, _e| Ok(ok(vec![], Some("\"e\""), None)))]);
         let inbox = std::sync::Arc::new(RelayInbox::new());
+        inbox.started();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s1 = src(&[GithubEventKind::IssueOpened], true);
@@ -3410,7 +3537,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                Some(loop_inbox),
+                &loop_inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3460,7 +3588,8 @@ mod tests {
                     state: Some(d.join("t.ci.json")),
                 },
                 &tx,
-                None,
+                &listening().inbox,
+                "k",
                 Some(open_log(&d)),
                 Default::default(),
             )
@@ -3478,5 +3607,1056 @@ mod tests {
         assert!(loaded.feed_ids.iter().any(|id| id == "77"));
         run2.abort();
         let _ = run2.await;
+    }
+
+    // ── the listening lifecycle (github-watches-are-event-driven) ──
+
+    use crate::cli::github::relay::tests::{FakeForwarder, Run, settle};
+    use crate::cli::github::relay::{
+        FORWARDING_ERROR, Subscription, Transports, webhook_event_names,
+    };
+
+    type Rollups = Vec<(ci::PrHead, ci::CiRollup)>;
+
+    /// A CI reader that answers from a script — then the last answer,
+    /// or nothing — records when it was asked, and can hold its next
+    /// read until released.
+    #[derive(Default)]
+    struct TestCi {
+        answers: Mutex<std::collections::VecDeque<Result<Rollups, &'static str>>>,
+        reads: Mutex<Vec<tokio::time::Instant>>,
+        hold: Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
+    }
+
+    impl TestCi {
+        fn answering(answers: Vec<Result<Rollups, &'static str>>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                answers: Mutex::new(answers.into()),
+                ..Default::default()
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.lock().unwrap().len()
+        }
+    }
+
+    impl CiReader for TestCi {
+        async fn read(&self) -> anyhow::Result<Rollups> {
+            self.reads.lock().unwrap().push(tokio::time::Instant::now());
+            let hold = self.hold.lock().unwrap().take();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            let mut answers = self.answers.lock().unwrap();
+            let next = match answers.len() {
+                0 => Ok(Vec::new()),
+                1 => answers.front().cloned().unwrap(),
+                _ => answers.pop_front().unwrap(),
+            };
+            next.map_err(|e| anyhow::anyhow!(e))
+        }
+    }
+
+    fn pending(number: u64, head: &str) -> (ci::PrHead, ci::CiRollup) {
+        (
+            ci::PrHead {
+                number,
+                head: head.into(),
+            },
+            ci::CiRollup::Pending,
+        )
+    }
+
+    /// How many feed READS happened: each starts with page 1.
+    fn feed_reads(f: &ScriptFetcher) -> usize {
+        f.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| *p == 1)
+            .count()
+    }
+
+    fn webhook_issue(n: u64) -> crate::cli::github::relay::RawDelivery {
+        (
+            "issues".into(),
+            serde_json::json!({"action":"opened","sender":{"login":"them"},"issue":{"number":n}}),
+        )
+    }
+
+    fn feed_issue(id: &str, n: u64) -> serde_json::Value {
+        serde_json::json!({"id":id,"type":"IssuesEvent","actor":{"login":"them"},
+            "payload":{"action":"opened","issue":{"number":n}}})
+    }
+
+    fn woke_numbers(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::cli::event_source::Emission>,
+    ) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok((WaitItem::GithubEvent { number, .. }, _)) = rx.try_recv() {
+            out.extend(number);
+        }
+        out
+    }
+
+    /// One watch under test, owning its subscription as the
+    /// supervisor does.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_watch<
+        L: LoginResolver + Send + Sync + 'static,
+        C: CiReader + Send + Sync + 'static,
+    >(
+        s: GithubSource,
+        fetcher: std::sync::Arc<ScriptFetcher>,
+        login: std::sync::Arc<L>,
+        reader: std::sync::Arc<C>,
+        sub: Subscription,
+        log: Option<crate::cli::github::log::EventLog>,
+        tx: crate::cli::event_source::EmissionSink,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            poll_loop(
+                &s,
+                FeedSide {
+                    fetcher: &*fetcher,
+                    login: &*login,
+                },
+                ChecksSide {
+                    reader: &*reader,
+                    state: None,
+                },
+                &tx,
+                &sub.inbox,
+                "k",
+                log,
+                Default::default(),
+            )
+            .await;
+        })
+    }
+
+    fn sink() -> (
+        crate::cli::event_source::EmissionSink,
+        tokio::sync::mpsc::UnboundedReceiver<crate::cli::event_source::Emission>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx.into(), rx)
+    }
+
+    fn inbox() -> std::sync::Arc<RelayInbox> {
+        std::sync::Arc::new(RelayInbox::new())
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+
+    /// The ordering and the idle contract together: nothing is read
+    /// before the relay proves itself, the catch-up is exactly one
+    /// feed reconcile and one checks read, and then a long quiet run
+    /// reads nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_catch_up_waits_for_proof_and_then_nothing_is_read() {
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let ci = TestCi::answering(vec![]);
+        let relay = inbox();
+        let (tx, _rx) = sink();
+        let run = spawn_watch(
+            src(
+                &[GithubEventKind::IssueOpened, GithubEventKind::CiFailed],
+                false,
+            ),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert_eq!(
+            (feed_reads(&f), ci.reads()),
+            (0, 0),
+            "nothing is read before the relay is proven ready"
+        );
+        relay.started();
+        settle().await;
+        assert_eq!((feed_reads(&f), ci.reads()), (1, 1), "one catch-up");
+        tokio::time::sleep(DAY).await;
+        assert_eq!(
+            (feed_reads(&f), ci.reads()),
+            (1, 1),
+            "a healthy idle watch with no timer reads nothing"
+        );
+        run.abort();
+    }
+
+    /// A forwarder that exits restarts, and the restart is a new start:
+    /// its catch-up delivers what fired while it was down, once, even
+    /// when the webhook later delivers the same action.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_catches_up_once_more_and_wakes_the_missed_event_once() {
+        let fake = FakeForwarder::default();
+        let transports = Transports::new(fake.clone());
+        let s = src(&[GithubEventKind::IssueOpened], false);
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![feed_issue("9", 9)], None, None))),
+            Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+        ]));
+        let (tx, mut rx) = sink();
+        let sub =
+            transports.subscribe("o/r", &webhook_event_names(&[GithubEventKind::IssueOpened]));
+        let run = spawn_watch(
+            s,
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            sub,
+            None,
+            tx,
+        );
+        settle().await;
+        assert_eq!(feed_reads(&f), 1);
+        fake.exit();
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        settle().await;
+        assert_eq!(fake.started(), 2, "restarted after its backoff");
+        assert_eq!(feed_reads(&f), 2, "exactly one more catch-up");
+        assert_eq!(woke_numbers(&mut rx), vec![9]);
+        fake.deliver(webhook_issue(9).0.as_str(), webhook_issue(9).1);
+        settle().await;
+        assert!(
+            woke_numbers(&mut rx).is_empty(),
+            "the webhook's copy is the same event"
+        );
+        tokio::time::sleep(DAY).await;
+        assert_eq!(feed_reads(&f), 2);
+        run.abort();
+    }
+
+    /// Two agents' watches and a differently scoped one of the same
+    /// repo: one forwarder, each delivery reaches exactly the watches
+    /// whose filter admits it, each logs and acks on its own, leaving
+    /// keeps the forwarder for the rest, and the last out stops it.
+    #[tokio::test(start_paused = true)]
+    async fn agents_share_one_forwarder_and_keep_their_own_logs() {
+        let fake = FakeForwarder::default();
+        let transports = Transports::new(fake.clone());
+        let opened = src(&[GithubEventKind::IssueOpened], false);
+        let mut closed = src(&[GithubEventKind::IssueClosed], false);
+        closed.include_own_actions = true;
+        let dirs: Vec<std::path::PathBuf> = (0..3).map(|_| wal_tempdir()).collect();
+        let mut rxs = Vec::new();
+        let mut runs = Vec::new();
+        for (i, s) in [opened.clone(), opened, closed].into_iter().enumerate() {
+            let (tx, rx) = sink();
+            rxs.push(rx);
+            let sub = transports.subscribe("o/r", &webhook_event_names(&Selection::of(&s).kinds()));
+            runs.push(spawn_watch(
+                s,
+                std::sync::Arc::new(ScriptFetcher::new(vec![Box::new(|_p, _e| {
+                    Ok(ok(vec![], None, None))
+                })])),
+                std::sync::Arc::new(FixedLogin("me")),
+                std::sync::Arc::new(NoCi),
+                sub,
+                Some(open_log(&dirs[i])),
+                tx,
+            ));
+        }
+        settle().await;
+        assert_eq!(fake.started(), 1, "one forwarder for the repo");
+        let (name, payload) = webhook_issue(5);
+        fake.deliver(&name, payload);
+        settle().await;
+        assert_eq!(woke_numbers(&mut rxs[0]), vec![5]);
+        assert_eq!(woke_numbers(&mut rxs[1]), vec![5]);
+        assert!(
+            woke_numbers(&mut rxs[2]).is_empty(),
+            "a closed-only watch does not admit it"
+        );
+
+        let unhandled = |dir: &std::path::Path| {
+            open_log(dir)
+                .read_rows()
+                .unwrap()
+                .unwrap()
+                .rows
+                .into_iter()
+                .filter(|r| !r.acked && !r.baseline)
+                .count()
+        };
+        let seq = open_log(&dirs[0]).read_rows().unwrap().unwrap().rows[0].seq;
+        open_log(&dirs[0]).append_ack(seq).unwrap();
+        assert_eq!(
+            (
+                unhandled(&dirs[0]),
+                unhandled(&dirs[1]),
+                unhandled(&dirs[2])
+            ),
+            (0, 1, 0),
+            "one agent's ack is its own"
+        );
+
+        runs.remove(0).abort();
+        settle().await;
+        let (name, payload) = webhook_issue(6);
+        fake.deliver(&name, payload);
+        settle().await;
+        assert_eq!(woke_numbers(&mut rxs[1]), vec![6], "the other still hears");
+        assert_eq!(fake.started(), 1, "and nothing restarted");
+        for run in runs {
+            run.abort();
+        }
+        settle().await;
+        assert_eq!(fake.alive(), 0, "the last one out stops the child");
+    }
+
+    /// A CI-only watch joining an issues-only one needs events the
+    /// forwarder does not carry: it restarts on the union — the head
+    /// changes and the check cues included — and both watches catch up.
+    #[tokio::test(start_paused = true)]
+    async fn a_ci_watch_joining_widens_the_forwarder_and_everyone_catches_up() {
+        let fake = FakeForwarder::default();
+        let transports = Transports::new(fake.clone());
+        let issues = src(&[GithubEventKind::IssueOpened], false);
+        let f1 = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let (tx1, _rx1) = sink();
+        let sub =
+            transports.subscribe("o/r", &webhook_event_names(&[GithubEventKind::IssueOpened]));
+        let r1 = spawn_watch(
+            issues,
+            f1.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            sub,
+            None,
+            tx1,
+        );
+        settle().await;
+        assert_eq!(feed_reads(&f1), 1);
+
+        let ci_only = src(&[GithubEventKind::CiFailed], true);
+        let ci = TestCi::answering(vec![]);
+        let (tx2, _rx2) = sink();
+        let sub = transports.subscribe("o/r", &webhook_event_names(&[GithubEventKind::CiFailed]));
+        let r2 = spawn_watch(
+            ci_only,
+            std::sync::Arc::new(ScriptFetcher::new(vec![])),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            sub,
+            None,
+            tx2,
+        );
+        settle().await;
+        let runs = fake.runs.lock().unwrap().clone();
+        assert_eq!(
+            runs,
+            vec![
+                "issues".to_string(),
+                "check_suite,issues,pull_request,status".to_string()
+            ]
+        );
+        assert_eq!(feed_reads(&f1), 2, "the old watch's new start");
+        assert_eq!(ci.reads(), 1, "the joiner's catch-up");
+        r1.abort();
+        r2.abort();
+    }
+
+    /// Someone else's forwarder holds the slot: never ready, named as a
+    /// conflict, and a watch with a timer keeps polling meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_slot_is_reported_and_a_timed_watch_keeps_polling() {
+        let fake = FakeForwarder::scripted(&vec![Run::SlotTaken; 8]);
+        let transports = Transports::new(fake.clone());
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let (ltx, mut lrx) = tokio::sync::mpsc::unbounded_channel();
+        let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+        let tx = crate::cli::event_source::EmissionSink::for_author(etx, label.clone())
+            .reporting(ltx, label, 1);
+        let s = timed_src(&[GithubEventKind::IssueOpened], false);
+        let sub =
+            transports.subscribe("o/r", &webhook_event_names(&[GithubEventKind::IssueOpened]));
+        let run = spawn_watch(
+            s,
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            sub,
+            None,
+            tx,
+        );
+        settle().await;
+        let (_, _, _, state) = lrx.try_recv().expect("the watch reports it");
+        let crate::cli::event_source::Lifecycle::Degraded { why, polling } = state else {
+            panic!("{state:?}");
+        };
+        assert!(
+            why.contains("another forwarder holds the webhook slot for o/r"),
+            "{why}"
+        );
+        assert!(!why.contains("admin"), "{why}");
+        assert!(polling);
+        tokio::time::sleep(Duration::from_secs(300) + Duration::from_millis(1)).await;
+        assert_eq!(feed_reads(&f), 5, "the timer polls through the conflict");
+        assert_eq!(fake.started(), 2, "one transport retry, minutes apart");
+        run.abort();
+    }
+
+    /// A child that stays alive but cannot hand deliveries over is
+    /// restarted, and its restart catches up.
+    #[tokio::test(start_paused = true)]
+    async fn a_forwarding_error_restarts_the_relay_and_catches_up() {
+        let fake = FakeForwarder::default();
+        let transports = Transports::new(fake.clone());
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let (tx, _rx) = sink();
+        let sub =
+            transports.subscribe("o/r", &webhook_event_names(&[GithubEventKind::IssueOpened]));
+        let run = spawn_watch(
+            src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            sub,
+            None,
+            tx,
+        );
+        settle().await;
+        assert_eq!(feed_reads(&f), 1);
+        fake.say(&format!(
+            "{FORWARDING_ERROR} Post \"http://127.0.0.1:1\": connection refused"
+        ));
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        settle().await;
+        assert_eq!(fake.started(), 2);
+        assert_eq!(feed_reads(&f), 2);
+        run.abort();
+    }
+
+    /// A login that answers only when the test says so.
+    struct HeldLogin(tokio::sync::Notify);
+    impl LoginResolver for HeldLogin {
+        async fn resolve(&self) -> anyhow::Result<String> {
+            self.0.notified().await;
+            Ok("me".into())
+        }
+    }
+
+    /// Deliveries the intake had to evict are owed back: a reconcile
+    /// runs for them and the event log says the relay overflowed.
+    #[tokio::test(start_paused = true)]
+    async fn an_intake_overflow_owes_a_reconcile_and_is_logged() {
+        let dir = wal_tempdir();
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let login = std::sync::Arc::new(HeldLogin(tokio::sync::Notify::new()));
+        let relay = inbox();
+        relay.started();
+        let (tx, _rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            login.clone(),
+            std::sync::Arc::new(NoCi),
+            Subscription::detached(relay.clone()),
+            Some(open_log(&dir)),
+            tx,
+        );
+        settle().await;
+        for n in 0..(RELAY_BUFFER_CAP as u64 + 3) {
+            relay.push(webhook_issue(n));
+        }
+        login.0.notify_one();
+        settle().await;
+        assert_eq!(feed_reads(&f), 2, "the catch-up, then the owed reconcile");
+        let text = std::fs::read_to_string(dir.join("t.jsonl")).unwrap();
+        assert!(
+            text.contains(r#""t":"relay_overflow""#) && text.contains(r#""dropped":3"#),
+            "{text}"
+        );
+        run.abort();
+    }
+
+    /// Cold start: an action delivered live — before the baseline or
+    /// after it — that the baseline page also holds wakes exactly
+    /// once; the page's pre-watch history does not.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_delivery_on_the_baseline_page_wakes_once() {
+        let dir = wal_tempdir();
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(
+                vec![
+                    feed_issue("105", 5),
+                    feed_issue("104", 4),
+                    feed_issue("103", 3),
+                ],
+                None,
+                None,
+            ))
+        })]));
+        let relay = inbox();
+        relay.started();
+        relay.push(webhook_issue(5));
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            Subscription::detached(relay.clone()),
+            Some(open_log(&dir)),
+            tx,
+        );
+        settle().await;
+        relay.push(webhook_issue(4));
+        relay.push(webhook_issue(5));
+        settle().await;
+        let mut woke = woke_numbers(&mut rx);
+        woke.sort();
+        assert_eq!(woke, vec![4, 5], "each live action once, history (3) never");
+        let rows = open_log(&dir).read_rows().unwrap().unwrap().rows;
+        let pending: Vec<_> = rows
+            .iter()
+            .filter(|r| !r.baseline && !r.acked)
+            .filter_map(|r| match &r.item {
+                WaitItem::GithubEvent { number, .. } => *number,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both live ones are pending in the log: {pending:?}"
+        );
+        run.abort();
+    }
+
+    /// Warm start: what the log does not hold is pending.
+    #[tokio::test(start_paused = true)]
+    async fn a_warm_catch_up_presents_what_the_log_lacks() {
+        let dir = wal_tempdir();
+        {
+            let mut log = open_log(&dir);
+            log.append_observation(Some("1"), None, true).unwrap();
+            log.save_state(None, None, true).unwrap();
+        }
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Ok(ok(vec![feed_issue("2", 2), feed_issue("1", 1)], None, None))
+        })]));
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::IssueOpened], false),
+            f,
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            listening(),
+            Some(open_log(&dir)),
+            tx,
+        );
+        settle().await;
+        assert_eq!(woke_numbers(&mut rx), vec![2]);
+        run.abort();
+    }
+
+    /// One catch-up is one logical reconcile: a failed attempt — the
+    /// login, the network, or half a page — is retried with no webhook
+    /// arriving, re-reads from the committed cursor, and stops once it
+    /// completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_catch_up_is_retried_until_it_completes() {
+        let dir = wal_tempdir();
+        {
+            let mut log = open_log(&dir);
+            log.append_observation(Some("1"), None, true).unwrap();
+            log.save_state(None, None, true).unwrap();
+        }
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![
+            Box::new(|_p, _e| Err(anyhow::anyhow!("network unreachable"))),
+            Box::new(|_p, _e| Ok(ok(vec![feed_issue("3", 3)], Some("\"half\""), None))),
+            Box::new(|_p, _e| Err(anyhow::anyhow!("page 2 failed"))),
+            Box::new(|_p, etag| {
+                assert!(
+                    etag.is_none(),
+                    "a half read's etag must not condition the retry"
+                );
+                Ok(ok(vec![feed_issue("3", 3), feed_issue("2", 2)], None, None))
+            }),
+            Box::new(|_p, _e| Ok(ok(vec![feed_issue("1", 1)], None, None))),
+        ]));
+        let login = std::sync::Arc::new(ScriptLogin(Mutex::new(
+            vec![Err(anyhow::anyhow!("gh down")), Ok("me".to_string())].into(),
+        )));
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            login,
+            std::sync::Arc::new(NoCi),
+            listening(),
+            Some(open_log(&dir)),
+            tx,
+        );
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let mut woke = woke_numbers(&mut rx);
+        woke.sort();
+        assert_eq!(woke, vec![2, 3], "each once, through the committed cursor");
+        let reads = feed_reads(&f);
+        assert_eq!(
+            reads, 3,
+            "login, network and the half page each cost one retry"
+        );
+        tokio::time::sleep(DAY).await;
+        assert_eq!(feed_reads(&f), reads, "and success ends the retrying");
+        run.abort();
+    }
+
+    /// A rate limit's reset is honoured: the retry waits it out rather
+    /// than backing off on its own, shorter, schedule.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_catch_up_waits_for_the_reset() {
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![Box::new(|_p, _e| {
+            Err(crate::cli::github::session::RateLimited {
+                url: "https://api.github.com/repos/o/r/events".into(),
+                retry_in: Duration::from_secs(600),
+            }
+            .into())
+        })]));
+        let (tx, _rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            listening(),
+            None,
+            tx,
+        );
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(599)).await;
+        assert_eq!(feed_reads(&f), 1, "not before the reset");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(feed_reads(&f), 2);
+        run.abort();
+    }
+
+    /// The last cue's read fails: it is read again until it succeeds,
+    /// with no further cue, and the conclusion arrives.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_cue_read_is_retried_without_another_cue() {
+        let ci = TestCi::answering(vec![
+            Ok(vec![pending(7, "h1")]),
+            Err("502"),
+            Err("502"),
+            Ok(vec![red(7, "h1", "test")]),
+        ]);
+        let relay = inbox();
+        relay.started();
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::CiFailed], true),
+            std::sync::Arc::new(ScriptFetcher::new(vec![])),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        relay.push((
+            "check_suite".into(),
+            serde_json::json!({"action":"completed"}),
+        ));
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(ci.reads(), 4);
+        assert_eq!(woke_numbers(&mut rx), vec![7]);
+        tokio::time::sleep(DAY).await;
+        assert_eq!(ci.reads(), 4, "pending work was the only reading");
+        run.abort();
+    }
+
+    /// A cue that lands while a read is in flight owes one more read.
+    #[tokio::test(start_paused = true)]
+    async fn a_cue_during_a_read_buys_one_more_read() {
+        let ci = TestCi::answering(vec![
+            Ok(vec![pending(7, "h1")]),
+            Ok(vec![red(7, "h1", "lint")]),
+        ]);
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        *ci.hold.lock().unwrap() = Some(hold.clone());
+        let relay = inbox();
+        relay.started();
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::CiFailed], true),
+            std::sync::Arc::new(ScriptFetcher::new(vec![])),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        assert_eq!(ci.reads(), 1, "in flight");
+        relay.push(("status".into(), serde_json::json!({"state":"failure"})));
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(ci.reads(), 2);
+        assert_eq!(woke_numbers(&mut rx), vec![7]);
+        run.abort();
+    }
+
+    /// N cues inside one rate window cost ONE trailing read, after the
+    /// last of them, and it reports a conclusion that changed between
+    /// the first cue and the last.
+    #[tokio::test(start_paused = true)]
+    async fn cues_inside_a_window_coalesce_into_one_trailing_read() {
+        let ci = TestCi::answering(vec![
+            Ok(vec![pending(7, "h1")]),
+            Ok(vec![red(7, "h1", "test")]),
+        ]);
+        let relay = inbox();
+        relay.started();
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(&[GithubEventKind::CiFailed], true),
+            std::sync::Arc::new(ScriptFetcher::new(vec![])),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        assert_eq!(ci.reads(), 1, "the catch-up");
+        let start = tokio::time::Instant::now();
+        let mut last_cue = start;
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            relay.push((
+                "check_suite".into(),
+                serde_json::json!({"action":"completed"}),
+            ));
+            last_cue = tokio::time::Instant::now();
+            settle().await;
+        }
+        assert_eq!(ci.reads(), 1, "nothing inside the window");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let reads = ci.reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), 2, "five cues, one trailing read");
+        assert!(
+            reads[1] >= last_cue,
+            "the trailing read follows the last cue"
+        );
+        assert_eq!(
+            woke_numbers(&mut rx),
+            vec![7],
+            "the changed conclusion is reported"
+        );
+        run.abort();
+    }
+
+    /// The stated gap: an action the catch-up's feed read did not have
+    /// yet, from before the hook, is never delivered without a timer,
+    /// and is by the first timer poll with one.
+    #[tokio::test(start_paused = true)]
+    async fn an_action_lagging_in_the_feed_needs_the_timer() {
+        for timed in [false, true] {
+            let f = std::sync::Arc::new(ScriptFetcher::new(vec![
+                Box::new(|_p, _e| Ok(ok(vec![feed_issue("1", 1)], None, None))),
+                Box::new(|_p, _e| Ok(ok(vec![], None, None))),
+                Box::new(|_p, _e| Ok(ok(vec![feed_issue("2", 2), feed_issue("1", 1)], None, None))),
+            ]));
+            let s = match timed {
+                true => timed_src(&[GithubEventKind::IssueOpened], false),
+                false => src(&[GithubEventKind::IssueOpened], false),
+            };
+            let (tx, mut rx) = sink();
+            let run = spawn_watch(
+                s,
+                f,
+                std::sync::Arc::new(FixedLogin("me")),
+                std::sync::Arc::new(NoCi),
+                listening(),
+                None,
+                tx,
+            );
+            settle().await;
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            let woke = woke_numbers(&mut rx);
+            match timed {
+                false => {
+                    tokio::time::sleep(DAY).await;
+                    assert!(
+                        woke.is_empty() && woke_numbers(&mut rx).is_empty(),
+                        "the stated gap"
+                    );
+                }
+                true => assert_eq!(woke, vec![2], "the first timer poll closes it"),
+            }
+            run.abort();
+        }
+    }
+
+    /// A relay that cannot start, with no timer: the diagnostic names
+    /// the cause, nothing is read, and the retry that succeeds catches
+    /// up once. With a timer, polling carries on meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_cannot_start_is_loud_and_reads_only_on_a_timer() {
+        for timed in [false, true] {
+            let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+            let relay = inbox();
+            let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+            let (ltx, mut lrx) = tokio::sync::mpsc::unbounded_channel();
+            let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+            let tx = crate::cli::event_source::EmissionSink::for_author(etx, label.clone())
+                .reporting(ltx, label, 1);
+            let s = match timed {
+                true => timed_src(&[GithubEventKind::IssueOpened], false),
+                false => src(&[GithubEventKind::IssueOpened], false),
+            };
+            let run = spawn_watch(
+                s,
+                f.clone(),
+                std::sync::Arc::new(FixedLogin("me")),
+                std::sync::Arc::new(NoCi),
+                Subscription::detached(relay.clone()),
+                None,
+                tx,
+            );
+            relay.down(RelayDown {
+                cause: RelayFailure::NoAdmin,
+                retry_in: Duration::from_secs(300),
+            });
+            settle().await;
+            let (_, _, _, state) = lrx.try_recv().expect("reported");
+            assert_eq!(
+                state,
+                crate::cli::event_source::Lifecycle::Degraded {
+                    why: "needs admin on o/r to create a webhook".into(),
+                    polling: timed,
+                }
+            );
+            tokio::time::sleep(Duration::from_secs(180) + Duration::from_millis(1)).await;
+            assert_eq!(feed_reads(&f), if timed { 3 } else { 0 });
+            relay.started();
+            settle().await;
+            assert_eq!(
+                feed_reads(&f),
+                if timed { 4 } else { 1 },
+                "the successful retry catches up"
+            );
+            run.abort();
+        }
+    }
+
+    /// The optional timer: N intervals give N polls on top of the
+    /// catch-up.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_interval_adds_exactly_its_polls() {
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let (tx, _rx) = sink();
+        let run = spawn_watch(
+            timed_src(&[GithubEventKind::IssueOpened], false),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            std::sync::Arc::new(NoCi),
+            listening(),
+            None,
+            tx,
+        );
+        settle().await;
+        tokio::time::sleep(Duration::from_secs(4 * 60) + Duration::from_millis(1)).await;
+        assert_eq!(feed_reads(&f), 1 + 4);
+        run.abort();
+    }
+
+    /// A final status cue arrives during a held checks read and is
+    /// followed by a full inbox of issues: the cue is not lost to the
+    /// eviction, the red build wakes this untimed watch, and once the
+    /// trailing read succeeds nothing more is read (codex 141f85d).
+    #[tokio::test(start_paused = true)]
+    async fn a_ci_cue_survives_an_unrelated_action_overflow() {
+        let ci = TestCi::answering(vec![
+            Ok(vec![pending(7, "h1")]),
+            Ok(vec![pending(7, "h1")]),
+            Ok(vec![red(7, "h1", "test")]),
+        ]);
+        let relay = inbox();
+        relay.started();
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(
+                &[GithubEventKind::CiFailed, GithubEventKind::IssueOpened],
+                true,
+            ),
+            std::sync::Arc::new(ScriptFetcher::new(vec![])),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        *ci.hold.lock().unwrap() = Some(hold.clone());
+        relay.push(("status".into(), serde_json::json!({"state":"pending"})));
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(ci.reads(), 2, "the held read");
+        relay.push(("status".into(), serde_json::json!({"state":"failure"})));
+        for n in 0..RELAY_BUFFER_CAP as u64 {
+            relay.push(webhook_issue(n));
+        }
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(ci.reads(), 3, "the cue still owes its checks read");
+        assert!(woke_numbers(&mut rx).contains(&7));
+        tokio::time::sleep(DAY).await;
+        assert_eq!(ci.reads(), 3, "and success returns the watch to idle");
+        run.abort();
+    }
+
+    /// A mixed watch whose own-login lookup never succeeds: its feed
+    /// stays fail-closed, but the checks need no login and their cues
+    /// are not held behind it (codex 141f85d).
+    #[tokio::test(start_paused = true)]
+    async fn ci_cues_do_not_wait_on_the_own_login() {
+        let ci = TestCi::answering(vec![
+            Ok(vec![pending(7, "h1")]),
+            Ok(vec![red(7, "h1", "test")]),
+        ]);
+        struct NoLogin;
+        impl LoginResolver for NoLogin {
+            async fn resolve(&self) -> anyhow::Result<String> {
+                anyhow::bail!("own login unavailable")
+            }
+        }
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let relay = inbox();
+        relay.started();
+        let (tx, mut rx) = sink();
+        let run = spawn_watch(
+            src(
+                &[GithubEventKind::CiFailed, GithubEventKind::IssueOpened],
+                false,
+            ),
+            f.clone(),
+            std::sync::Arc::new(NoLogin),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        assert_eq!(ci.reads(), 1);
+        relay.push(webhook_issue(3));
+        relay.push(("status".into(), serde_json::json!({"state":"failure"})));
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(
+            ci.reads(),
+            2,
+            "a failed own-login lookup cannot suppress a CI cue"
+        );
+        assert_eq!(
+            woke_numbers(&mut rx),
+            vec![7],
+            "and the issue stays fail-closed"
+        );
+        assert_eq!(feed_reads(&f), 0, "the feed is never read unfiltered");
+        tokio::time::sleep(DAY).await;
+        assert_eq!(ci.reads(), 2, "the checks return to idle");
+        run.abort();
+    }
+
+    /// The consumer is busy in a read while the transport proves a
+    /// start and then fails: the watch ends up reporting the failure,
+    /// never the stale start, and still runs the start's catch-up
+    /// (codex 141f85d).
+    #[tokio::test(start_paused = true)]
+    async fn a_start_then_a_failure_during_a_read_reports_the_failure() {
+        use crate::cli::event_source::Lifecycle;
+        let ci = TestCi::answering(vec![]);
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        *ci.hold.lock().unwrap() = Some(hold.clone());
+        let f = std::sync::Arc::new(ScriptFetcher::new(vec![]));
+        let relay = inbox();
+        relay.started();
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let (ltx, mut lrx) = tokio::sync::mpsc::unbounded_channel();
+        let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+        let tx = crate::cli::event_source::EmissionSink::for_author(etx, label.clone())
+            .reporting(ltx, label, 1);
+        let run = spawn_watch(
+            src(
+                &[GithubEventKind::CiFailed, GithubEventKind::IssueOpened],
+                true,
+            ),
+            f.clone(),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        assert_eq!(ci.reads(), 1, "busy in the first catch-up's checks read");
+        relay.started();
+        relay.down(RelayDown {
+            cause: RelayFailure::SlotConflict,
+            retry_in: Duration::from_secs(120),
+        });
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let mut last = None;
+        while let Ok((_, _, _, state)) = lrx.try_recv() {
+            last = Some(state);
+        }
+        assert!(
+            matches!(last, Some(Lifecycle::Degraded { polling: false, .. })),
+            "current health is down: {last:?}"
+        );
+        assert_eq!(
+            (feed_reads(&f), ci.reads()),
+            (2, 2),
+            "the queued start still owed its catch-up"
+        );
+        run.abort();
+    }
+
+    /// Lost deliveries owe the checks a read too: whatever went might
+    /// have been a reason to look.
+    #[tokio::test(start_paused = true)]
+    async fn an_overflow_owes_the_checks_a_read_as_well() {
+        let ci = TestCi::answering(vec![]);
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        *ci.hold.lock().unwrap() = Some(hold.clone());
+        let relay = inbox();
+        relay.started();
+        let (tx, _rx) = sink();
+        let run = spawn_watch(
+            src(
+                &[GithubEventKind::CiFailed, GithubEventKind::IssueOpened],
+                true,
+            ),
+            std::sync::Arc::new(ScriptFetcher::new(vec![])),
+            std::sync::Arc::new(FixedLogin("me")),
+            ci.clone(),
+            Subscription::detached(relay.clone()),
+            None,
+            tx,
+        );
+        settle().await;
+        for n in 0..(RELAY_BUFFER_CAP as u64 + 1) {
+            relay.push(webhook_issue(n));
+        }
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(ci.reads(), 2);
+        tokio::time::sleep(DAY).await;
+        assert_eq!(ci.reads(), 2);
+        run.abort();
     }
 }

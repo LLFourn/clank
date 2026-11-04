@@ -1885,7 +1885,7 @@ mod tests {
         // leftover); genuine CLI-only metadata stays visible.
         use crate::cli::event_source::SourceOrigin;
         use crate::cli::github::supervisor::write_watch_sidecar;
-        use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
+        use clank_core::agent_config::{GithubEventKind, GithubSource};
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
             interrupt: false,
@@ -1898,7 +1898,6 @@ mod tests {
             branches: Vec::new(),
             prs: Vec::new(),
             prompt: prompt.map(str::to_string),
-            delivery: Delivery::Poll,
         };
         let key = |g: &GithubSource| crate::cli::github::supervisor::source_key(g);
         let configured = gh("o/a", Some("configured intent"));
@@ -1965,7 +1964,7 @@ mod tests {
 
     #[test]
     fn join_prompts_two_tiers_config_wins_sidecar_covers_cli_sources() {
-        use clank_core::agent_config::{Delivery, GithubEventKind, GithubSource};
+        use clank_core::agent_config::{GithubEventKind, GithubSource};
         let dir = tempdir();
         let gh = |repo: &str, prompt: Option<&str>| GithubSource {
             interrupt: false,
@@ -1978,7 +1977,6 @@ mod tests {
             branches: Vec::new(),
             prs: Vec::new(),
             prompt: prompt.map(str::to_string),
-            delivery: Delivery::Poll,
         };
         let declared_prompted = gh("o/a", Some("from config"));
         let declared_promptless = gh("o/b", None);

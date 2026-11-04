@@ -595,9 +595,44 @@ pub fn repo_checks(
                 problem,
             ));
         }
+        if let Some(message) =
+            crate::agent_store::raw_agent_config(repo, label).and_then(|raw| ignored_delivery(&raw))
+        {
+            out.push(CheckResult::warn(
+                SECTION,
+                format!("agent: {label} github watches"),
+                message,
+            ));
+        }
     }
 
     out
+}
+
+/// What to say about github watches whose raw config still carries
+/// `delivery`, which every watch now ignores. Read from the bytes
+/// because the typed config has no such field to keep it in.
+fn ignored_delivery(raw: &[u8]) -> Option<String> {
+    let config: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let repos: Vec<String> = config
+        .get("wait_events")?
+        .as_array()?
+        .iter()
+        .filter(|s| s.get("kind").and_then(|k| k.as_str()) == Some("github"))
+        .filter(|s| s.get("delivery").is_some())
+        .map(|s| {
+            s.get("repo")
+                .and_then(|r| r.as_str())
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+    (!repos.is_empty()).then(|| {
+        format!(
+            "the `delivery` field on the watch of {} is ignored: every github watch now              listens by webhook, catches up when it starts, and polls only on its              `poll_interval`. Remove the field.",
+            repos.join(", ")
+        )
+    })
 }
 
 /// Probe whether git considers `rel` ignored. If `expect_tracked`,
@@ -2383,6 +2418,61 @@ mod tests {
             check.message.contains("`voice`") && check.message.contains("interrupt_message"),
             "{}",
             check.message
+        );
+    }
+
+    /// An agent config from before every watch was realtime: its
+    /// `delivery` is ignored on load and named here so it can go.
+    #[test]
+    fn repo_checks_name_an_ignored_delivery_field() {
+        use crate::cli::teams_config::{AgentDescription, RosterRole};
+        use clank_core::vocab::Tool;
+        let dir = init_git_repo();
+        let label = clank_core::ids::AgentLabel::parse("watcher").unwrap();
+        crate::cli::agent::add_repo_roster_agent(
+            dir.path(),
+            &label,
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+            RosterRole::Master,
+        )
+        .unwrap();
+        let path = agent_config_path(dir.path(), &label);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"wait_events":[{"kind":"github","repo":"o/r","events":["pr_opened"],"delivery":"poll"}]}"#,
+        )
+        .unwrap();
+        let cfg = load_agent_config(dir.path(), &label)
+            .expect("the old config loads")
+            .expect("present");
+        assert_eq!(cfg.wait_events.len(), 1);
+        let results = repo_checks(dir.path(), None, None);
+        let check = results
+            .iter()
+            .find(|r| r.name == "agent: watcher github watches")
+            .expect("the ignored field is reported");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.message.contains("`delivery`") && check.message.contains("o/r"),
+            "{}",
+            check.message
+        );
+
+        std::fs::write(
+            &path,
+            br#"{"wait_events":[{"kind":"github","repo":"o/r","events":["pr_opened"]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !repo_checks(dir.path(), None, None)
+                .iter()
+                .any(|r| r.name == "agent: watcher github watches"),
+            "a clean config says nothing",
         );
     }
 

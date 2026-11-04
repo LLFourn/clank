@@ -165,9 +165,17 @@ pub struct GithubSource {
     /// Empty only when [`watch`](Self::watch) says it instead.
     #[serde(default)]
     pub events: Vec<GithubEventKind>,
-    /// Poll cadence as a duration string (`"60s"`, `"5m"`), same form
-    /// as a duration string; validated at use site. The EFFECTIVE
-    /// interval is max(this, the server's `X-Poll-Interval`).
+    /// An OPTIONAL background poll on top of the webhook, as a
+    /// duration string (`"60s"`, `"5m"`); validated at use site.
+    /// Absent means no timer: the watch reads GitHub only when it
+    /// starts listening and when a webhook cue asks. Set, the
+    /// effective interval is max(this, the server's
+    /// `X-Poll-Interval`). It is the backstop for actions the feed
+    /// still lags on when the watch starts listening, and how to watch
+    /// a repo whose webhook can't be forwarded.
+    ///
+    /// A `delivery` field from older configs is ignored on read
+    /// (every watch is realtime now) and dropped on the next write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<String>,
     /// Whether events actored by the authenticated `gh` login wake
@@ -211,12 +219,6 @@ pub struct GithubSource {
     /// See [`WatchClause`] for why nothing translates between them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watch: Vec<WatchClause>,
-    /// How events arrive (github-http-client-and-realtime M2):
-    /// `poll` (default) or `realtime` — the webhook-forward relay
-    /// front-running the poll for latency, with the poll remaining
-    /// the completeness backstop. Unknown values fail loud.
-    #[serde(default)]
-    pub delivery: Delivery,
 }
 
 /// One clause of a nested watch (github-selectors): which objects,
@@ -461,15 +463,6 @@ impl GithubSource {
             .find(|c| c.selects().is_empty())
             .map(|c| format!("{}: its `{}` clause names no events", at(), c.object()))
     }
-}
-
-/// Delivery mode for a github source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Delivery {
-    #[default]
-    Poll,
-    Realtime,
 }
 
 /// The GitHub event sub-kinds `clank wait` can wake on.
@@ -1226,7 +1219,6 @@ mod tests {
             include_own_actions: false,
             branches: vec!["main".into()],
             prs: vec![7, 9],
-            delivery: Delivery::Realtime,
             prompt: None,
         });
         let json = serde_json::to_string(&src).unwrap();
@@ -1235,24 +1227,33 @@ mod tests {
         assert_eq!(back, src);
         // …and an OLD config (absent branches, original kinds) parses
         // unchanged with the empty-filter default.
-        // delivery absent = poll; unknown value fails loud.
-        assert!(
-            serde_json::from_str::<WaitEventSource>(
-                r#"{"kind":"github","repo":"o/r","events":[],"delivery":"carrier-pigeon"}"#
-            )
-            .is_err()
-        );
         let old = r#"{"kind":"github","repo":"o/r","events":["pr_opened","issue_comment"]}"#;
         let parsed: WaitEventSource = serde_json::from_str(old).unwrap();
         let WaitEventSource::Github(g) = parsed else {
             panic!("github kind");
         };
         assert!(g.branches.is_empty(), "absent branches = every branch");
-        assert_eq!(g.delivery, Delivery::Poll, "absent delivery = poll");
         assert_eq!(
             g.events,
             vec![GithubEventKind::PrOpened, GithubEventKind::IssueComment]
         );
+    }
+
+    /// Configs written before every watch was realtime still carry
+    /// `delivery`. They must load, whatever the value said, and say
+    /// the same thing as the config without it.
+    #[test]
+    fn an_old_delivery_field_loads_and_is_ignored() {
+        let bare = r#"{"kind":"github","repo":"o/r","events":["pr_opened"],"poll_interval":"2m"}"#;
+        let expect: WaitEventSource = serde_json::from_str(bare).unwrap();
+        for old in [
+            r#"{"kind":"github","repo":"o/r","events":["pr_opened"],"poll_interval":"2m","delivery":"poll"}"#,
+            r#"{"kind":"github","repo":"o/r","events":["pr_opened"],"poll_interval":"2m","delivery":"realtime"}"#,
+        ] {
+            let parsed: WaitEventSource = serde_json::from_str(old).expect("old config loads");
+            assert_eq!(parsed, expect, "{old}");
+            assert!(!serde_json::to_string(&parsed).unwrap().contains("delivery"));
+        }
     }
 
     #[test]

@@ -251,6 +251,10 @@ enum Record {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         baseline: bool,
     },
+    /// Deliveries were evicted at intake before this watch classified
+    /// them, so it owed the feed a reconcile. A diagnostic: it carries
+    /// no identity and decides nothing.
+    RelayOverflow { v: u64, at: u64, dropped: u64 },
     /// Secondary: marks an inbox seq handled. A PLAIN ack (no
     /// `ident`) covers every row of its seq; a DISCRIMINATED ack
     /// covers exactly the rows whose logical identity equals `ident`
@@ -317,6 +321,7 @@ impl Record {
             | Record::TimerProgress { v, .. }
             | Record::ReplyIntent { v, .. } => *v,
             Record::Interrupt { v, .. } | Record::Presentation { v, .. } => *v,
+            Record::RelayOverflow { v, .. } => *v,
         }
     }
 }
@@ -724,6 +729,10 @@ impl SharedWal {
         self.with(|log| log.append_observation(feed_id, action_key, baseline));
     }
 
+    pub(crate) fn relay_overflow(&self, dropped: u64) {
+        self.with(|log| log.append_relay_overflow(dropped));
+    }
+
     pub(crate) fn save_state(
         &self,
         etag: Option<&str>,
@@ -951,7 +960,7 @@ impl EventLog {
                         action_keys.push(k);
                     }
                 }
-                Record::Ack { .. } => {}
+                Record::Ack { .. } | Record::RelayOverflow { .. } => {}
                 Record::Interrupt { seq, .. }
                 | Record::Presentation { seq, .. }
                 | Record::MessageHistoryPruned { seq, .. } => {
@@ -1564,6 +1573,14 @@ impl EventLog {
         })
     }
 
+    pub(crate) fn append_relay_overflow(&mut self, dropped: u64) -> std::io::Result<()> {
+        self.append(&Record::RelayOverflow {
+            v: CURRENT_V,
+            at: now_epoch(),
+            dropped,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn append_ack(&mut self, seq: u64) -> std::io::Result<()> {
         self.append_ack_selector(seq, None)
@@ -1927,7 +1944,8 @@ impl EventLog {
                 }
                 Record::ReplyOperation { .. }
                 | Record::MessageReceipt { .. }
-                | Record::MessageHistoryPruned { .. } => {}
+                | Record::MessageHistoryPruned { .. }
+                | Record::RelayOverflow { .. } => {}
             }
         }
         let covered = |g: &CGroup| {
