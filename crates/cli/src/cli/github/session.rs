@@ -90,6 +90,47 @@ impl MiniResponse {
     }
 }
 
+/// GitHub said to stop until a reset: a typed error so a retry can
+/// wait out the deadline instead of hammering through it.
+#[derive(Debug)]
+pub(crate) struct RateLimited {
+    pub(crate) url: String,
+    pub(crate) retry_in: std::time::Duration,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "github {}: rate limited for {}s",
+            self.url,
+            self.retry_in.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// How long a response says to wait, if it is a rate limit: a
+/// secondary limit's `Retry-After`, or the primary limit's reset once
+/// `X-RateLimit-Remaining` is spent
+/// (https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+pub(super) fn rate_limit_wait(resp: &MiniResponse, now_epoch: u64) -> Option<std::time::Duration> {
+    if !matches!(resp.status, 403 | 429) {
+        return None;
+    }
+    if let Some(secs) = resp.header_u64("retry-after") {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    if resp.header_u64("x-ratelimit-remaining") == Some(0) {
+        let reset = resp.header_u64("x-ratelimit-reset")?;
+        return Some(std::time::Duration::from_secs(
+            reset.saturating_sub(now_epoch),
+        ));
+    }
+    None
+}
+
 /// The raw HTTP GET, injected so the session's auth behavior is
 /// testable without a network.
 pub(crate) trait HttpSend: Send + Sync {
@@ -276,16 +317,22 @@ impl<S: HttpSend> GithubSession<S> {
     /// than opening a second one (tui-github-event-content).
     pub(crate) async fn get(&self, url: &str, etag: Option<&str>) -> anyhow::Result<MiniResponse> {
         let token = self.token_within_deadline().await?;
-        let resp = self.send_within_deadline(url, &token, etag).await?;
-        if resp.status != 401 {
-            return Ok(resp);
-        }
-        // The token rotated: re-acquire and retry exactly once.
-        self.token.invalidate().await;
-        let token = self.token_within_deadline().await?;
-        let resp = self.send_within_deadline(url, &token, etag).await?;
+        let mut resp = self.send_within_deadline(url, &token, etag).await?;
         if resp.status == 401 {
-            anyhow::bail!("github {url}: 401 after token re-acquisition");
+            // The token rotated: re-acquire and retry exactly once.
+            self.token.invalidate().await;
+            let token = self.token_within_deadline().await?;
+            resp = self.send_within_deadline(url, &token, etag).await?;
+            if resp.status == 401 {
+                anyhow::bail!("github {url}: 401 after token re-acquisition");
+            }
+        }
+        if let Some(retry_in) = rate_limit_wait(&resp, crate::cli::github::log::now_epoch()) {
+            return Err(RateLimited {
+                url: url.to_string(),
+                retry_in,
+            }
+            .into());
         }
         Ok(resp)
     }
@@ -389,6 +436,45 @@ pub(super) async fn read_every_page<S: HttpSend>(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn a_rate_limit_says_how_long_to_wait() {
+        let resp = |status: u16, headers: &[(&str, &str)]| MiniResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: String::new(),
+        };
+        let now = 1_000;
+        assert_eq!(
+            rate_limit_wait(&resp(429, &[("retry-after", "30")]), now),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            rate_limit_wait(
+                &resp(
+                    403,
+                    &[
+                        ("x-ratelimit-remaining", "0"),
+                        ("x-ratelimit-reset", "1600")
+                    ]
+                ),
+                now
+            ),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(
+            rate_limit_wait(&resp(403, &[("x-ratelimit-remaining", "12")]), now),
+            None,
+            "a forbidden that is not a limit is not one"
+        );
+        assert_eq!(
+            rate_limit_wait(&resp(200, &[("retry-after", "30")]), now),
+            None
+        );
+    }
     use std::collections::VecDeque;
     use std::sync::Mutex;
 

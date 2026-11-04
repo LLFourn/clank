@@ -19,7 +19,7 @@ pub(crate) enum Durability {
 
 pub(crate) type Emission = (WaitItem, Durability);
 
-/// Where a command source's producer is in its run, as its host last saw
+/// Where a source is in its run, as its host last saw
 /// it. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -39,6 +39,14 @@ pub(crate) enum Lifecycle {
     /// monitor next hosts it.
     Stopped {
         why: String,
+    },
+    /// A github watch's webhook is proven listening.
+    Listening,
+    /// A github watch's webhook is not listening; `polling` says
+    /// whether its optional timer keeps it reading meanwhile.
+    Degraded {
+        why: String,
+        polling: bool,
     },
     /// Waiting to start it again after it ended or failed to start.
     BackingOff {

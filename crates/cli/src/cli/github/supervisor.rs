@@ -14,8 +14,8 @@ use crate::cli::event_source::SourceOrigin;
 
 use super::ci::{CiReader, GhCi};
 use super::coordinator::{ChecksSide, FeedSide, poll_loop};
-use super::feed::{EventFetcher, GhFetcher, effective_interval, row_in_scope};
-use super::relay::{GhForwarder, RelayGuard, RelayInbox, start_relay};
+use super::feed::{EventFetcher, GhFetcher, row_in_scope};
+use super::relay::{Subscription, shared_transports, webhook_event_names};
 use super::selection::Selection;
 use super::session::{GhLogin, LoginResolver, shared_session};
 
@@ -54,9 +54,8 @@ pub(crate) fn write_watch_sidecar(
 
 /// One github wake source: the production entry point. Every source
 /// in the process shares ONE host-scoped session (one token
-/// acquisition, one 401 story — codex f9807c3). `delivery: realtime`
-/// adds the webhook relay as the latency path; polling remains the
-/// completeness backstop either way.
+/// acquisition, one 401 story — codex f9807c3) and, per upstream repo,
+/// ONE webhook transport that its watches subscribe to.
 pub(crate) async fn run_github_source(
     src: GithubSource,
     tx: crate::cli::event_source::EmissionSink,
@@ -79,8 +78,8 @@ pub(crate) async fn run_github_source(
         session: session.clone(),
     };
     let login = GhLogin(session);
-    let realtime = src.delivery == clank_core::agent_config::Delivery::Realtime;
-    let src2 = src.clone();
+    let repo = src.repo.clone();
+    let names = webhook_event_names(&Selection::of(&src).kinds());
     source_supervisor(
         &src,
         FeedSide {
@@ -90,13 +89,7 @@ pub(crate) async fn run_github_source(
         &ci,
         &tx,
         events_dir,
-        move || async move {
-            if realtime {
-                start_relay(&src2, GhForwarder).await
-            } else {
-                None
-            }
-        },
+        move || shared_transports().subscribe(&repo, &names),
         key,
     )
     .await;
@@ -118,14 +111,20 @@ fn with_prompt(
     })
 }
 
+/// How often a follower re-reads the holder's log and retries the
+/// lease, when the watch has no `poll_interval` to borrow. These are
+/// local file reads, never GitHub's.
+const TAIL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The lease-gated source runtime (wal-single-ingest-writer): the
 /// INGEST LEASE is acquired before ANY transport exists — only the
-/// holder starts the relay or polls github; a non-holder TAILS the
-/// WAL, presenting logged unhandled entries on the poll cadence, and
-/// takes over (starting transports only then) when the holder dies.
+/// holder subscribes to the webhook or reads github; a non-holder
+/// TAILS the WAL, presenting logged unhandled entries, and takes over
+/// (subscribing only then, which is a new start of listening with its
+/// own catch-up) when the holder dies.
 /// Presentation never acknowledges: `clank wait` — leased or tailing
 /// — writes no ack records, ever.
-async fn source_supervisor<F, R, C, RF, RFut>(
+async fn source_supervisor<F, R, C, RF>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     reader: &C,
@@ -137,14 +136,12 @@ async fn source_supervisor<F, R, C, RF, RFut>(
     F: EventFetcher,
     R: LoginResolver,
     C: CiReader,
-    RF: FnOnce() -> RFut,
-    RFut: std::future::Future<Output = Option<(std::sync::Arc<RelayInbox>, RelayGuard)>>,
+    RF: FnOnce() -> Subscription,
 {
     // Ad-hoc unbound waits have no persistence dir: memory-only
     // ingest, lease-free — nothing durable to contend over.
     let Some(dir) = events_dir else {
-        let relay = relay_start().await;
-        let inbox = relay.as_ref().map(|(i, _)| i.clone());
+        let relay = relay_start();
         poll_loop(
             src,
             FeedSide {
@@ -156,7 +153,8 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                 state: None,
             },
             tx,
-            inbox,
+            &relay.inbox,
+            &key,
             None,
             Default::default(),
         )
@@ -187,11 +185,10 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                      polling without persistence",
                     src.repo
                 );
-                let relay = match relay_start.take() {
-                    Some(start) => start().await,
-                    None => None,
+                let Some(start) = relay_start.take() else {
+                    return;
                 };
-                let inbox = relay.as_ref().map(|(i, _)| i.clone());
+                let relay = start();
                 poll_loop(
                     src,
                     FeedSide {
@@ -203,7 +200,8 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                         state: ci_state(&dir, &key),
                     },
                     tx,
-                    inbox,
+                    &relay.inbox,
+                    &key,
                     None,
                     Default::default(),
                 )
@@ -223,11 +221,10 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                     None
                 }
             };
-            let relay = match relay_start.take() {
-                Some(start) => start().await,
-                None => None,
+            let Some(start) = relay_start.take() else {
+                return;
             };
-            let inbox = relay.as_ref().map(|(i, _)| i.clone());
+            let relay = start();
             poll_loop(
                 src,
                 FeedSide {
@@ -239,15 +236,16 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                     state: ci_state(&dir, &key),
                 },
                 tx,
-                inbox,
+                &relay.inbox,
+                &key,
                 log,
                 presented,
             )
             .await;
             drop(lease);
-            // RelayGuard drops here (and on task abort): listener +
-            // supervisor die with the source; the forwarder child by
-            // group kill.
+            // The subscription drops here (and on task abort); the
+            // last one off a repo stops its forwarder.
+            drop(relay);
             return;
         }
         if !warned_tail {
@@ -276,7 +274,7 @@ async fn source_supervisor<F, R, C, RF, RFut>(
                 }
             }
         }
-        tokio::time::sleep(effective_interval(configured, None)).await;
+        tokio::time::sleep(configured.unwrap_or(TAIL_INTERVAL)).await;
     }
 }
 
@@ -353,6 +351,7 @@ mod tests {
     use crate::cli::github::feed::tests::{ScriptFetcher, classified, ev, gh_item, ok, src};
     use crate::cli::github::feed::{GhResponse, tests::classify_event_flat};
     use crate::cli::github::log::tests::wal_tempdir;
+    use crate::cli::github::relay::tests::listening;
     use crate::cli::github::session::tests::FixedLogin;
 
     #[tokio::test(start_paused = true)]
@@ -412,9 +411,9 @@ mod tests {
                 &NoCi,
                 &tx,
                 Some(d),
-                move || async move {
+                move || {
                     rs.store(true, std::sync::atomic::Ordering::SeqCst);
-                    None
+                    listening()
                 },
                 source_key(&src(&[GithubEventKind::IssueOpened], true)),
             )
@@ -516,7 +515,7 @@ mod tests {
                 &NoCi,
                 &tx,
                 Some(d),
-                || async { None },
+                listening,
                 source_key(&s),
             )
             .await;
@@ -571,6 +570,33 @@ mod tests {
             panic!("github item");
         };
         assert_eq!(instructions.as_deref(), Some("triage and reply"));
+    }
+
+    /// A config written when watches chose a `delivery` keeps its log:
+    /// the field is ignored on read and was never part of the key.
+    /// The bytes are what such configs hold on disk.
+    #[test]
+    fn an_old_delivery_field_keeps_the_source_key() {
+        let key = |json: &str| {
+            let clank_core::agent_config::WaitEventSource::Github(g) =
+                serde_json::from_str(json).expect("an old config loads")
+            else {
+                panic!("github");
+            };
+            source_key(&g)
+        };
+        for old in [
+            br#"{"kind":"github","repo":"o/r","events":["issue_opened"],"delivery":"poll"}"#
+                .as_slice(),
+            br#"{"kind":"github","repo":"o/r","events":["issue_opened"],"delivery":"realtime"}"#,
+            br#"{"kind":"github","repo":"o/r","events":["issue_opened"]}"#,
+        ] {
+            assert_eq!(
+                key(std::str::from_utf8(old).unwrap()),
+                "github-o-r-4586904a",
+                "the key it always had",
+            );
+        }
     }
 
     #[test]

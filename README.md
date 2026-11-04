@@ -974,7 +974,7 @@ other write of the agent's config. There is no edit in place: remove and add
 again. Whether the source keeps its log then follows its identity, not the
 removal: a command source is its `name`, so a new argv under the same name
 keeps its history; a github watch is its repo and what it admits, so
-changing only its `prompt`, `poll_interval` or `delivery` keeps its log,
+changing only its `prompt` or `poll_interval` keeps its log,
 while changing its events, scope or `include_own_actions` starts a fresh one.
 
 ### Scheduled and recurring events
@@ -1095,37 +1095,77 @@ unsupported.
 
   The prompt is presentation config, never stored in the event log:
   editing it retitles the standing intent for already-logged
-  unhandled events (per-kind granularity = split the watch). `"delivery":"realtime"` upgrades
-  a github source from polling to push-speed webhook delivery, with
-  polling kept as the completeness backstop. This is the building
-  block for a "controller" repo whose agents manage other repos — the
-  `clank-master` skill documents the pattern.
+  unhandled events (per-kind granularity = split the watch). This is
+  the building block for a "controller" repo whose agents manage other
+  repos — the `clank-master` skill documents the pattern.
 
-  What the github sources need (`gh` is optional for polling):
-  - **Polling** talks to the REST API directly. The token comes from
-    `GH_TOKEN` / `GITHUB_TOKEN` if set — no `gh` needed at all — else
-    from one `gh auth token` call. With neither, the source waits
-    (loudly, fail-closed) rather than polling unauthenticated.
-  - **Realtime** requires the `gh` binary, the `cli/gh-webhook`
+  **How a github watch hears about things.** Every watch listens by
+  webhook (`gh webhook forward` into a loopback listener). It does not
+  poll by default:
+  - **It catches up once each time it starts listening** — when the
+    monitor starts it, after the forwarder restarts, and when a watch
+    takes over from another wait. The forwarder counts as listening
+    only once GitHub's `ping` for the fresh hook has reached clank;
+    then one background read reconciles GitHub's event feed against
+    the inbox, and a CI watch reads every PR in scope's checks once.
+  - **After that it reads nothing on a timer.** Feed events arrive by
+    webhook. CI conclusions are read when a cue says they may have
+    moved — a finished check suite, a commit status, a PR's head
+    moving — and cues that arrive close together share one read. A
+    healthy idle watch makes no API calls.
+  - **`"poll_interval": "5m"` adds an optional background poll** of
+    the feed and the checks on that interval, on top of the webhook.
+    It is also how to watch a repo you don't administer.
+  - **Unfinished work is retried until it succeeds** — a catch-up or a
+    cue's read that failed (login, network, half a page), deliveries
+    the intake had to evict, a rate limit's reset — and stops once it
+    does.
+
+  **What this does not catch without `poll_interval`.** GitHub's
+  repository event feed lags real activity by 30 seconds to six hours
+  (https://docs.github.com/en/rest/activity/events#list-repository-events),
+  and GitHub does not retry a failed webhook delivery. An action taken
+  shortly before a watch starts listening can therefore be missing from
+  that start's one catch-up read, and the new hook will not deliver it
+  either, because it predates the hook. Each catch-up is bounded by that
+  lag — including the restart a watch causes when it widens what its
+  repo's forwarder subscribes to. Set `poll_interval` to close the gap.
+
+  What the github sources need:
+  - **Reads** (the catch-up, cue reads and any timer) talk to the REST
+    API directly. The token comes from `GH_TOKEN` / `GITHUB_TOKEN` if
+    set, else from one `gh auth token` call. With neither, the source
+    waits (loudly, fail-closed) rather than reading unauthenticated.
+  - **The webhook** needs the `gh` binary, the `cli/gh-webhook`
     extension, and ADMIN on the watched repo (it creates a webhook).
-    When any of that is missing the source falls back to polling with
-    one diagnostic naming the reason — nothing is lost, wakes are
-    just poll-speed.
+    Without them the watch is not listening: it says why and how to
+    fix it, loudly and on every retry, and the status panel shows it
+    as degraded when `poll_interval` keeps it polling, or as not
+    listening when nothing does. It is never shown as a working
+    webhook.
+  - **One forwarder per repo.** GitHub lets one CLI forwarder hold a
+    repo's webhook slot at a time
+    (https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/using-the-github-cli-to-forward-webhooks-for-testing),
+    so a monitor runs one forwarder per upstream repo and shares it
+    between every agent's watches of that repo, each still filtering,
+    logging and acking on its own. Two clank monitors in different
+    repos that watch the same upstream conflict: the second reports
+    that another forwarder holds the slot, and retries every few
+    minutes.
   - The rest of clank's GitHub surface (`fork create --pr`) still
     shells `gh` directly.
 
   Every ingested github event lands in a per-agent **inbox**
   (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes
   anyone, and stays *unhandled* — re-waking the agent on every arm —
-  until acked with `clank events ack`. That makes delivery
+  until acked with `clank events ack`. That makes presentation
   at-least-once. Sources run in the repo's monitor for every roster
   agent whether or not it is waiting, and events that fired while no
-  monitor ran are caught up when it next starts by reconciling GitHub's
-  event feed against the inbox. CI conclusions are the exception —
-  they are not in that feed, they are polled from each watched PR's
-  checks, and a poll keeps only what it sees: a build that went red and
-  was replaced by a green one between polls, or while no monitor ran,
-  is not recoverable.
+  monitor ran are caught up when it next starts listening, within the
+  feed-lag limit above. CI conclusions are not in that feed: they are
+  read from each watched PR's checks, and a read keeps only what it
+  sees, so a build that went red and was replaced by a green one
+  between reads, or while no monitor ran, is not recoverable.
   `clank events list` / `show` inspect metadata; `events read` delivers content; the `clank-github` skill
   teaches agents the react-then-ack loop.
 

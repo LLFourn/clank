@@ -10,8 +10,8 @@
 /// A PR head's CI result: the reduction over every check reporting on
 /// it, the reader that fetches them, and what a watch remembers.
 mod ci;
-/// The emission gate every wake passes, and the tick that drives the
-/// feed and the checks on their own schedules.
+/// The emission gate every wake passes, and the event-driven watch
+/// loop that reads the feed and the checks when there is a reason to.
 mod coordinator;
 /// What an event means and which ones are new: both classifiers, the
 /// poll state machine, and the cursor a watch remembers.
@@ -20,8 +20,8 @@ pub(crate) use feed::configured_delivery;
 /// The per-agent write-ahead inbox every ingested event lands in
 /// before it is presented.
 pub(crate) mod log;
-/// The realtime relay: the forwarder, its loopback listener, and the
-/// bounded inbox deliveries wait in.
+/// The webhook transport: one forwarder per upstream repo, its
+/// loopback listener, and each watch's bounded inbox.
 mod relay;
 /// What a watch admits: the clauses its config desugars into, and
 /// the one predicate everything that filters an event asks.

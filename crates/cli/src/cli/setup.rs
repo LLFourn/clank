@@ -2512,13 +2512,13 @@ mod tests {
             "and that an unchanged build stays quiet: {ci}",
         );
         // The two claims a reader could act on wrongly: that a
-        // conclusion between polls is kept (it is gone), and that a cue
-        // always means an immediate read (a storm is dropped).
+        // conclusion between reads is kept (it is gone), and that a cue
+        // inside the window is lost (it is coalesced into one read).
         assert!(
-            ci.contains("between two polls, or while no monitor ran"),
-            "only what a poll sees is kept: {ci}",
+            ci.contains("between two reads, or while no monitor ran"),
+            "only what a read sees is kept: {ci}",
         );
-        assert!(ci.contains("DROPPED, not queued"), "{ci}");
+        assert!(ci.contains("COALESCED, never dropped"), "{ci}");
     }
 
     #[test]

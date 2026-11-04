@@ -698,6 +698,9 @@ impl SeenSet {
             cap,
         }
     }
+    pub(super) fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
     pub(super) fn as_btree(&self) -> BTreeSet<String> {
         self.set.iter().cloned().collect()
     }
@@ -883,38 +886,27 @@ pub(crate) async fn poll_once<F: EventFetcher>(
     }
 }
 
-/// The cadence a watch with no `poll_interval` polls at.
-pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
-
 /// How a github watch is configured to be delivered. Configured, not
 /// observed: the server's `X-Poll-Interval` may lengthen the polling,
-/// and a realtime watch keeps polling as its backstop and its fallback.
+/// and whether the webhook is listening right now is the monitor's
+/// live account, not this.
 pub(crate) fn configured_delivery(src: &clank_core::agent_config::GithubSource) -> String {
-    let poll = match src
+    match src
         .poll_interval
         .as_deref()
         .map(crate::cli::wait::parse_duration_str)
     {
-        None | Some(Ok(None)) => {
-            format!("poll every {}s (default)", DEFAULT_POLL_INTERVAL.as_secs())
-        }
-        Some(Ok(Some(d))) => format!("poll every {}s (configured)", d.as_secs()),
-        Some(Err(_)) => "poll interval unreadable".to_string(),
-    };
-    match src.delivery {
-        clank_core::agent_config::Delivery::Poll => poll,
-        clank_core::agent_config::Delivery::Realtime => format!("realtime, {poll} as backstop"),
+        None | Some(Ok(None)) => "webhook, catching up each time it starts listening".to_string(),
+        Some(Ok(Some(d))) => format!("webhook, plus a poll every {}s", d.as_secs()),
+        Some(Err(_)) => "webhook; poll interval unreadable".to_string(),
     }
 }
 
-/// The effective poll interval: the server's `X-Poll-Interval` is a
-/// FLOOR the client must obey, so take the max of it and the
-/// configured cadence (default 60s).
-pub(crate) fn effective_interval(
-    configured: Option<Duration>,
-    server_floor: Option<u64>,
-) -> Duration {
-    let configured = configured.unwrap_or(DEFAULT_POLL_INTERVAL);
+/// The optional timer's effective interval: the server's
+/// `X-Poll-Interval` is a FLOOR the client must obey, so take the max
+/// of it and the configured cadence. There is no default: a watch
+/// without `poll_interval` runs no timer at all.
+pub(crate) fn effective_interval(configured: Duration, server_floor: Option<u64>) -> Duration {
     let server = server_floor
         .map(Duration::from_secs)
         .unwrap_or(Duration::ZERO);
@@ -1073,7 +1065,6 @@ pub(super) mod tests {
             branches: Vec::new(),
             prs: Vec::new(),
             prompt: None,
-            delivery: clank_core::agent_config::Delivery::Poll,
         }
     }
 
@@ -1454,11 +1445,11 @@ pub(super) mod tests {
         assert!(!bt.contains("a"));
     }
 
-    /// A watch's delivery as configured: the default or its own
-    /// interval, and a realtime watch's polling backstop.
+    /// A watch's delivery as configured: always the webhook, and a
+    /// background poll only when one is asked for.
     #[test]
     fn a_watch_states_its_configured_delivery() {
-        let src = |interval: Option<&str>, delivery| clank_core::agent_config::GithubSource {
+        let src = |interval: Option<&str>| clank_core::agent_config::GithubSource {
             interrupt: false,
             interrupt_message: None,
             repo: "o/r".into(),
@@ -1469,40 +1460,32 @@ pub(super) mod tests {
             branches: Vec::new(),
             prs: Vec::new(),
             prompt: None,
-            delivery,
         };
-        use clank_core::agent_config::Delivery::{Poll, Realtime};
+        let webhook_only = "webhook, catching up each time it starts listening";
+        assert_eq!(configured_delivery(&src(None)), webhook_only);
+        assert_eq!(configured_delivery(&src(Some("0"))), webhook_only);
         assert_eq!(
-            configured_delivery(&src(None, Poll)),
-            "poll every 60s (default)"
+            configured_delivery(&src(Some("2m"))),
+            "webhook, plus a poll every 120s"
         );
         assert_eq!(
-            configured_delivery(&src(Some("0"), Poll)),
-            "poll every 60s (default)"
-        );
-        assert_eq!(
-            configured_delivery(&src(Some("2m"), Poll)),
-            "poll every 120s (configured)"
-        );
-        assert_eq!(
-            configured_delivery(&src(Some("120s"), Realtime)),
-            "realtime, poll every 120s (configured) as backstop"
-        );
-        assert_eq!(
-            configured_delivery(&src(Some("5x"), Poll)),
-            "poll interval unreadable"
+            configured_delivery(&src(Some("5x"))),
+            "webhook; poll interval unreadable"
         );
     }
 
     #[test]
     fn effective_interval_takes_the_server_floor() {
-        assert_eq!(effective_interval(None, None), Duration::from_secs(60));
         assert_eq!(
-            effective_interval(Some(Duration::from_secs(10)), Some(90)),
+            effective_interval(Duration::from_secs(10), Some(90)),
             Duration::from_secs(90)
         );
         assert_eq!(
-            effective_interval(Some(Duration::from_secs(120)), Some(60)),
+            effective_interval(Duration::from_secs(120), Some(60)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            effective_interval(Duration::from_secs(120), None),
             Duration::from_secs(120)
         );
     }
@@ -1535,7 +1518,6 @@ pub(super) mod tests {
             include_own_actions: true, // don't filter — assert full mapping
             branches: Vec::new(),
             prs: Vec::new(),
-            delivery: clank_core::agent_config::Delivery::Poll,
             prompt: None,
         };
         let (items, _ids) = map_page(&s, &raw, &BTreeSet::new(), None);

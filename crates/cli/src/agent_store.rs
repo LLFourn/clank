@@ -49,6 +49,12 @@ pub fn load_agent_config(repo: &Path, label: &AgentLabel) -> anyhow::Result<Opti
     load_json(&path).with_context(|| format!("reading `{}`", path.display()))
 }
 
+/// An agent config's bytes as stored, for diagnostics about what the
+/// typed config ignores on read. `None` when unreadable.
+pub(crate) fn raw_agent_config(repo: &Path, label: &AgentLabel) -> Option<Vec<u8>> {
+    std::fs::read(agent_config_path(repo, label)).ok()
+}
+
 /// The session bound to the agent whose directory is `agent_dir`.
 pub(crate) fn binding_in(agent_dir: &Path) -> anyhow::Result<Option<Session>> {
     Ok(load_json::<AgentConfig>(&config_in(agent_dir))?.and_then(|c| c.session))
@@ -1058,7 +1064,6 @@ mod tests {
             branches: Vec::new(),
             prs: Vec::new(),
             prompt: None,
-            delivery: Default::default(),
         })
     }
 
@@ -1490,7 +1495,6 @@ mod tests {
                     branches: Vec::new(),
                     prs: Vec::new(),
                     prompt: None,
-                    delivery: Default::default(),
                 },
             )],
             ..AgentConfig::default()
