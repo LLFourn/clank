@@ -883,6 +883,13 @@ already have it. Codex's shared app-server daemon runs every attached session's
 hooks and shell commands in the environment of the pane that first started it,
 so a session hosted there reads as that pane's agent.
 
+clank starts Claude with `CLAUDE_CODE_DISABLE_AGENT_VIEW=1`. Agent view's
+daemon moves a running conversation into a background worker and keeps a
+spare Claude warm in the agent's directory with the agent's environment, and
+that spare's start reads as the agent's. Remote Control has its own switch and
+keeps working. A launch's `--env CLAUDE_CODE_DISABLE_AGENT_VIEW=0` turns agent
+view back on for that agent.
+
 Keep the launch line to the few flags that select a configuration. Structured
 tool configuration (MCP servers, feature switches, allow-lists) belongs in the
 tool's own config file, or in a per-agent home (`--env CODEX_HOME=…`) when only
