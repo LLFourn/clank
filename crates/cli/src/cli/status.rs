@@ -184,9 +184,9 @@ pub(crate) struct AgentAutoRow {
     /// unbound — surfaced as a problem on the detail page, since an
     /// unbound agent can't receive work.
     pub(crate) session: Option<clank_core::Session>,
-    /// The background work the agent attends, as its monitor last
-    /// published it. Reported, never acted on.
-    pub(crate) attending: Option<crate::cli::agent_state::Attended>,
+    /// Every piece of background work the agent attends, as its monitor
+    /// last published them. Reported, never acted on.
+    pub(crate) attending: Vec<crate::cli::agent_state::Attended>,
     /// Why this agent's pending work is waiting for a person: its turn
     /// failed and the monitor will not, or can no longer, retry it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +210,15 @@ impl AgentAutoRow {
     pub(crate) fn superseded(&self) -> Option<&clank_core::Session> {
         let configured = clank_core::Tool::from_name(&self.tool)?;
         crate::cli::agent::superseded_session(configured, self.session.as_ref())
+    }
+
+    /// The attendance a wait page opens on: the first that covers its
+    /// work, else the first.
+    pub(crate) fn primary_wait(&self) -> Option<&crate::cli::agent_state::Attended> {
+        self.attending
+            .iter()
+            .find(|att| att.covers())
+            .or_else(|| self.attending.first())
     }
 }
 
@@ -311,7 +320,7 @@ fn roster_auto_rows(
             .map(|v| &v.state);
         let asking = current.and_then(|s| s.asking.clone());
         let repeated = current.and_then(|s| s.repeated);
-        let attending = current.and_then(|s| s.attending.clone());
+        let attending = current.map(|s| s.attending.clone()).unwrap_or_default();
         rows.push(AgentAutoRow {
             label: label.as_str().to_string(),
             role,
@@ -845,7 +854,7 @@ impl StatusSnapshot {
                     row.label
                 );
             }
-            if let Some(a) = &row.attending {
+            for a in &row.attending {
                 let _ = writeln!(
                     out,
                     "attending: {} → {}",
@@ -1394,19 +1403,20 @@ pub(crate) fn attendance_fingerprint(repo: &Path) -> u64 {
         .collect();
     labels.sort();
     for name in labels {
-        let Some(attended) =
+        let Some(state) =
             crate::cli::agent_state::load(&crate::agent_store::agents_root(repo).join(&name))
-                .and_then(|s| s.attending)
         else {
             continue;
         };
         name.hash(&mut h);
-        format!("{attended:?}").hash(&mut h);
-        attended
-            .pid
-            .zip(attended.token.as_ref())
-            .is_some_and(|(pid, token)| token.still_holds(pid))
-            .hash(&mut h);
+        for attended in &state.attending {
+            format!("{attended:?}").hash(&mut h);
+            attended
+                .pid
+                .zip(attended.token.as_ref())
+                .is_some_and(|(pid, token)| token.still_holds(pid))
+                .hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -2945,7 +2955,7 @@ mod dirty_and_wake_tests {
             state: None,
             asking: None,
             repeated: None,
-            attending,
+            attending: attending.into_iter().collect(),
         }
     }
 
@@ -2960,6 +2970,7 @@ mod dirty_and_wake_tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         }
     }
 
@@ -3129,7 +3140,7 @@ mod dirty_and_wake_tests {
                     suppressors: Vec::new(),
                     nudge: crate::cli::agent_state::Nudge::Nothing,
                     cannot_resume: None,
-                    attending: None,
+                    attending: Vec::new(),
                     asking: Some("Life monitor".into()),
                     repeated: Some(count),
                 },
@@ -3192,7 +3203,7 @@ mod dirty_and_wake_tests {
                 suppressors: Vec::new(),
                 nudge: Nudge::WaitingForYou("this kind of failure needs a person".into()),
                 cannot_resume: Some("no evidence".into()),
-                attending: None,
+                attending: Vec::new(),
                 asking: None,
                 repeated: None,
             },
@@ -3482,7 +3493,7 @@ mod dirty_and_wake_tests {
                         "tool": "claude",
                         "updated_at": "2026-09-22T00:00:00Z",
                     },
-                    "attending": null,
+                    "attending": [],
                 },
                 {
                     "label": "ruthless",
@@ -3491,7 +3502,7 @@ mod dirty_and_wake_tests {
                     "tool": "claude",
                     "invocation": "claude",
                     "session": null,
-                    "attending": null,
+                    "attending": [],
                 },
             ]),
             "the roster's tiers and the rest of what it holds"

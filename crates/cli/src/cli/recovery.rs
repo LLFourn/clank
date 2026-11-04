@@ -1350,7 +1350,7 @@ pub(crate) struct Facts {
 /// recovery knows of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Projection {
-    pub(crate) attended: Option<crate::cli::agent_state::Attended>,
+    pub(crate) attended: Vec<crate::cli::agent_state::Attended>,
     /// The pending question's header.
     pub(crate) asking: Option<String>,
     pub(crate) repeated: Option<u32>,

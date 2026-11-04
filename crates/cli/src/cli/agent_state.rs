@@ -25,9 +25,14 @@ pub(crate) struct AgentState {
     /// Why clank cannot nudge this agent itself, when it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cannot_resume: Option<String>,
-    /// The background work the agent attends, as the monitor holds it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) attending: Option<Attended>,
+    /// Every piece of background work the agent attends, as the monitor
+    /// holds it.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub(crate) attending: Vec<Attended>,
     /// The header of the question the agent is waiting on a person to
     /// answer, while one is pending in its bound session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,9 +171,49 @@ pub(crate) struct Attended {
     /// What became of its check-in, once it was due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) check_in: Option<String>,
+    /// Why it covers nothing now, while it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unqualified: Option<String>,
+}
+
+/// A state a monitor published before an agent could attend several
+/// things carries one attendance, not a list.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Attended>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<Attended>),
+        One(Box<Attended>),
+    }
+    Ok(
+        match <Option<Shape> as serde::Deserialize>::deserialize(d)? {
+            Some(Shape::Many(all)) => all,
+            Some(Shape::One(one)) => vec![*one],
+            None => Vec::new(),
+        },
+    )
 }
 
 impl Attended {
+    /// Whether it covers its work now: the monitor said so, and a run's
+    /// process is positively still there. A subagent has no process.
+    pub(crate) fn covers(&self) -> bool {
+        self.unqualified.is_none() && (self.subagent || self.process_alive() == Some(true))
+    }
+
+    /// One line for a detail page: what it attends, and its age against
+    /// its bound while it covers its work, else why it does not.
+    pub(crate) fn line(&self, now: time::OffsetDateTime) -> String {
+        match (&self.unqualified, self.covers()) {
+            (Some(why), _) => format!("○ {} — {why}", self.subject()),
+            (None, true) => match self.age(now) {
+                Some(age) => format!("⌛ {} · {age}", self.subject()),
+                None => format!("⌛ {}", self.subject()),
+            },
+            (None, false) => format!("○ {} — process ended", self.subject()),
+        }
+    }
+
     /// Whether the recorded process still exists, or `None` when there is
     /// no pid to ask about.
     pub(crate) fn process_alive(&self) -> Option<bool> {
@@ -184,8 +229,13 @@ impl Attended {
             Some(pid) => format!("{pid} ({})", self.task),
             None => self.task.clone(),
         };
-        if self.pending {
-            out.push_str(" · from the next turn-end");
+        match (&self.unqualified, self.pending) {
+            (_, true) => out.push_str(" · from the next turn-end"),
+            (Some(why), false) => {
+                out.push_str(" · ");
+                out.push_str(why);
+            }
+            (None, false) => {}
         }
         match (self.process_alive(), self.age(now)) {
             (Some(false), _) => out.push_str(" · stale, ended"),
@@ -245,7 +295,7 @@ impl Attended {
     /// cannot show as ongoing: a process not positively alive, which a
     /// subagent, having none, never is asked for.
     pub(crate) fn marker_fields(&self, now: time::OffsetDateTime) -> Option<MarkerFields<'_>> {
-        if !self.subagent && self.process_alive() != Some(true) {
+        if !self.covers() {
             return None;
         }
         Some(MarkerFields {
@@ -287,10 +337,12 @@ fn short_duration(d: time::Duration) -> String {
     crate::age::short(d.whole_seconds())
 }
 
-/// `label`'s attendance as its monitor last published it, read from disk
-/// now: for a decision that must not run against a lagging snapshot.
-pub(crate) fn attended_now(repo: &Path, label: &str) -> Option<Attended> {
-    load(&crate::agent_store::agents_root(repo).join(label))?.attending
+/// `label`'s attendances as its monitor last published them, read from
+/// disk now: for a decision that must not run against a lagging snapshot.
+pub(crate) fn attended_now(repo: &Path, label: &str) -> Vec<Attended> {
+    load(&crate::agent_store::agents_root(repo).join(label))
+        .map(|s| s.attending)
+        .unwrap_or_default()
 }
 
 pub(crate) fn load(agent_dir: &Path) -> Option<AgentState> {
@@ -463,7 +515,7 @@ mod tests {
             suppressors: Vec::new(),
             nudge: Nudge::Nothing,
             cannot_resume: None,
-            attending: None,
+            attending: Vec::new(),
             asking: None,
             repeated: None,
         }
@@ -601,6 +653,7 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
         assert_eq!(rec.age(now).as_deref(), Some("3m/5m"));
         rec.expect.as_mut().unwrap().since = at(720);
@@ -632,6 +685,7 @@ mod tests {
             subagent: true,
             pending: false,
             check_in: Some("check-in undeliverable: no pane".into()),
+            unqualified: None,
         };
         assert_eq!(
             rec.marker_fields(now).map(|f| f.subject),

@@ -187,6 +187,25 @@ pub fn clank_run_desc(command: &str) -> Option<String> {
         .filter(|d| !d.is_empty())
 }
 
+/// Whether this command line is a `clank wait`: clank's own waiter, which a
+/// harness may run as background work and which is never work to attend.
+pub fn clank_wait(command: &str) -> bool {
+    shell_tokens(command)
+        .split(|token| matches!(token, ShellToken::Boundary))
+        .any(|segment| {
+            let words: Vec<&str> = segment
+                .iter()
+                .filter_map(|token| match token {
+                    ShellToken::Word(word) => Some(word.as_str()),
+                    ShellToken::Boundary => None,
+                })
+                .collect();
+            let at = command_word_index(&words);
+            words.get(at).map(|w| program_basename(w)) == Some("clank")
+                && words.get(at + 1) == Some(&"wait")
+        })
+}
+
 fn program_basename(word: &str) -> &str {
     word.rsplit(['/', '\\']).next().unwrap_or(word)
 }
@@ -438,6 +457,16 @@ mod tests {
             None,
             "a run with no --desc of its own matches nothing"
         );
+    }
+
+    #[test]
+    fn clank_wait_recognises_the_invocation_not_the_words() {
+        assert!(clank_wait("clank wait"));
+        assert!(clank_wait("/Users/x/.cargo/bin/clank wait --author grok"));
+        assert!(clank_wait("cd /repo && exec clank wait"));
+        assert!(!clank_wait("echo clank wait"));
+        assert!(!clank_wait("clank run --desc wait -- clank-wait"));
+        assert!(!clank_wait("clank attend wait"));
     }
 
     #[test]

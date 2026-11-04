@@ -1120,7 +1120,7 @@ pub(super) fn capture_anchor(
         Some(PanelRow::Wait(i)) => agents
             .get(*i)
             .and_then(|a| {
-                a.attending.as_ref().map(|att| PanelAnchor::Wait {
+                a.primary_wait().map(|att| PanelAnchor::Wait {
                     label: a.label.clone(),
                     task: att.task.clone(),
                     at: att.at.clone(),
@@ -1170,8 +1170,8 @@ pub(super) fn rebind_anchor(
         PanelAnchor::Wait { label, task, at } => by_label(label).and_then(|i| {
             let same = agents[i]
                 .attending
-                .as_ref()
-                .is_some_and(|c| &c.task == task && &c.at == at);
+                .iter()
+                .any(|c| &c.task == task && &c.at == at);
             same.then(|| find(PanelRow::Wait(i)))
                 .flatten()
                 .or_else(|| find(PanelRow::Agent(i)))
@@ -4072,7 +4072,7 @@ mod tests {
             asking: None,
             repeated: None,
 
-            attending: None,
+            attending: Vec::new(),
         }];
         let mut shown = None;
         // Frame 1: entering the page from the panel, cursor on the
@@ -4928,7 +4928,10 @@ mod tests {
                         subagent: false,
                         pending: false,
                         check_in: None,
-                    }),
+                        unqualified: None,
+                    })
+                    .into_iter()
+                    .collect(),
             })
             .collect()
     }
@@ -4945,7 +4948,7 @@ mod tests {
 
         // Same agent, still attending — but a new instance.
         let mut after = rows_for(&["claude", "codex"], &[1]);
-        after[1].attending.as_mut().unwrap().at = "2026-08-24T09:00:00Z".to_string();
+        after[1].attending[0].at = "2026-08-24T09:00:00Z".to_string();
         assert_eq!(
             rebind_anchor(&anchor, &rows, &after, &[], &[], &[]),
             1,

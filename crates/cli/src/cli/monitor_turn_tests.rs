@@ -383,12 +383,21 @@ fn attended(
 }
 
 fn attend_sleeper(turns: &mut Turns, author: &AgentLabel, g: &crate::cli::turn_custody::Gathered) {
+    attend_named(turns, author, "sleeper", g);
+}
+
+fn attend_named(
+    turns: &mut Turns,
+    author: &AgentLabel,
+    name: &str,
+    g: &crate::cli::turn_custody::Gathered,
+) {
     turns
         .attend(
             author,
             clank_core::turn_policy::AttendRequest::Attend {
                 session: clank_core::SessionId::parse(SESSION).unwrap(),
-                selector: clank_core::turn_policy::Selector::Name("sleeper".into()),
+                selector: clank_core::turn_policy::Selector::Name(name.into()),
                 desc: None,
                 expect: 60_000,
                 shell: None,
@@ -403,7 +412,7 @@ fn ask_for(due: &crate::cli::turn_custody::CheckInDue) -> CheckInAsk {
     CheckInAsk {
         author: due.author.clone(),
         session: due.session.clone(),
-        check_in: due.check_in.clone(),
+        check_ins: due.check_ins.clone(),
         screen: (clank_core::Tool::Claude, Some(EMPTY_INPUT.into())),
         reply,
     }
@@ -411,8 +420,9 @@ fn ask_for(due: &crate::cli::turn_custody::CheckInDue) -> CheckInAsk {
 
 /// The last look reads the custody and the gates as they are when it is
 /// asked, not as they were when the check-in fired: auto turned off, a
-/// question or a block opened, the attendance cleared or replaced, each
-/// refuses the typing that would otherwise go ahead.
+/// question or a block opened, the attendance cleared or renewed, each
+/// refuses the typing that would otherwise go ahead. Attending something
+/// else beside it does not.
 #[tokio::test]
 async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
     let (repo, author, state) = owed_repo().await;
@@ -430,17 +440,17 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
     };
     let cases: [(&str, Option<&str>); 7] = [
         ("nothing", None),
-        ("renewal not yet resolved", None),
+        ("another entry beside it", None),
         ("auto off", Some("auto turned off")),
         ("question", Some("a question is pending")),
         ("block", Some("a block is pending")),
         (
             "clear",
-            Some("the attendance it was for was cleared or replaced"),
+            Some("the attendance it was for was cleared or renewed"),
         ),
         (
-            "replace",
-            Some("the attendance it was for was cleared or replaced"),
+            "renew",
+            Some("the attendance it was for was cleared or renewed"),
         ),
     ];
     for (change, refused) in cases {
@@ -475,15 +485,16 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
                         &author,
                         clank_core::turn_policy::AttendRequest::Clear {
                             session: clank_core::SessionId::parse(SESSION).unwrap(),
+                            which: clank_core::turn_policy::Clearing::All,
                         },
                         &now(),
                     )
                     .unwrap();
             }
-            "renewal not yet resolved" => {
-                attend_sleeper(&mut turns, &author, &now().at(due_at + 1))
+            "another entry beside it" => {
+                attend_named(&mut turns, &author, "other helper", &now().at(due_at + 1))
             }
-            "replace" => {
+            "renew" => {
                 attend_sleeper(&mut turns, &author, &now().at(due_at + 1));
                 turns
                     .answer(
@@ -491,7 +502,7 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
                         2,
                         &listing_the_sleeper(),
                         true,
-                        &now().at(due_at + 2),
+                        &now().at(due_at + 1),
                     )
                     .unwrap();
             }
@@ -499,8 +510,8 @@ async fn the_last_look_rechecks_the_attendance_and_every_gate_before_typing() {
         }
         let looked = may_check_in_now(repo.path(), &recovery, &mut turns, &now(), &ask_for(&due));
         assert_eq!(
-            looked,
-            refused.map_or(Ok(()), |why| Err(why.to_string())),
+            looked.map(|text| text.contains("\"sleeper\" has been running")),
+            refused.map_or(Ok(true), |why| Err(why.to_string())),
             "{change}"
         );
         crate::agent_store::set_auto_mode(repo.path(), &author, clank_core::AutoMode::On).unwrap();
@@ -545,14 +556,109 @@ async fn a_check_in_overtaken_during_dispatch_leaves_its_replacement_alone() {
     .await;
     assert!(typist.typed.lock().unwrap().is_empty(), "nothing is typed");
     let why = done.outcome.expect_err("refused at its last look");
-    assert!(why.contains("cleared or replaced"), "{why}");
-    turns.check_in_failed(&author, done.check_in, why, &g);
+    assert!(why.contains("cleared or renewed"), "{why}");
+    turns.check_in_failed(&author, done.check_ins, why, &g);
     assert_eq!(
         turns.projection(&author, &g),
         replacement,
         "the replacement keeps its own check-in"
     );
     assert!(turns.next_deadline().is_some_and(|at| at > due_at));
+}
+
+/// Two entries fall due together; one is renewed or cleared while the
+/// check-in is being typed. What is typed is the other's line alone: the
+/// stale one is not sent, and the one still owed is not lost with it.
+#[tokio::test]
+async fn a_grouped_check_in_types_only_the_entries_still_owed_it() {
+    let (repo, author, state) = owed_repo().await;
+    let recovery = recovering(repo.path(), &author);
+    let now = |at: u64| {
+        gather(
+            repo.path(),
+            Some(&state),
+            &author,
+            &Default::default(),
+            &mut Default::default(),
+            &[],
+        )
+        .at(at)
+    };
+    let both = Report::TurnEnd {
+        stop: clank_core::turn_policy::TurnEndReport {
+            tool: clank_core::Tool::Claude,
+            session: clank_core::SessionId::parse(SESSION).unwrap(),
+            place: Default::default(),
+            tasks: clank_core::turn_policy::TaskSnapshot::Known(
+                [("a1", "sleeper"), ("a2", "helper")]
+                    .into_iter()
+                    .map(|(id, name)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "type": "subagent", "status": "running",
+                            "description": name,
+                        }))
+                        .unwrap()
+                    })
+                    .collect(),
+            ),
+        },
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    };
+    for change in ["renew", "clear"] {
+        let _ = std::fs::remove_file(
+            crate::agent_store::agents_root(repo.path())
+                .join(author.as_str())
+                .join("turn.json"),
+        );
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let start = crate::cli::turn_custody::now_ms();
+        attend_sleeper(&mut turns, &author, &now(start));
+        attend_named(&mut turns, &author, "helper", &now(start));
+        turns.answer(&author, 1, &both, true, &now(start)).unwrap();
+        let due_at = turns.next_deadline().expect("both armed");
+        let due = turns.check_in(&author, &now(due_at)).expect("it fires");
+        assert_eq!(due.check_ins.len(), 2, "one check-in for both");
+        match change {
+            "renew" => {
+                attend_sleeper(&mut turns, &author, &now(due_at + 1));
+                turns
+                    .answer(&author, 2, &both, true, &now(due_at + 1))
+                    .unwrap();
+            }
+            _ => {
+                turns
+                    .attend(
+                        &author,
+                        clank_core::turn_policy::AttendRequest::Clear {
+                            session: clank_core::SessionId::parse(SESSION).unwrap(),
+                            which: clank_core::turn_policy::Clearing::Named("sleeper".into()),
+                        },
+                        &now(due_at + 1),
+                    )
+                    .unwrap();
+            }
+        }
+        let typist = std::sync::Arc::new(Recorded {
+            typed: Default::default(),
+            lost: false,
+        });
+        let g = now(due_at + 2);
+        let done = check_in_through(repo.path(), due, typist.clone(), |ask| {
+            may_check_in_now(repo.path(), &recovery, &mut turns, &g, ask)
+        })
+        .await;
+        assert!(done.outcome.is_ok(), "{change}: {:?}", done.outcome);
+        let typed = typist.typed.lock().unwrap().clone();
+        let [text] = typed.as_slice() else {
+            panic!("{change}: typed once: {typed:?}");
+        };
+        assert!(
+            text.contains("\"helper\" has been running"),
+            "{change}: {text}"
+        );
+        assert!(!text.contains("sleeper"), "{change}: {text}");
+    }
 }
 
 /// A repo whose master `claude` is bound to [`SESSION`] and owed one timer
@@ -1342,7 +1448,7 @@ async fn check_in_through(
     repo: &std::path::Path,
     due: crate::cli::turn_custody::CheckInDue,
     typist: std::sync::Arc<Recorded>,
-    look: impl FnOnce(&CheckInAsk) -> Result<(), String>,
+    look: impl FnOnce(&CheckInAsk) -> Result<String, String>,
 ) -> CheckedIn {
     let (asks, mut asked) = tokio::sync::mpsc::unbounded_channel();
     let (done, mut finished) = tokio::sync::mpsc::unbounded_channel();
@@ -1427,23 +1533,28 @@ async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
             typed: Default::default(),
             lost,
         });
-        let done = check_in_through(repo.path(), due.clone(), typist.clone(), |_| Ok(())).await;
+        let done = check_in_through(repo.path(), due.clone(), typist.clone(), |_| {
+            Ok("clank check-in: as the last look says".into())
+        })
+        .await;
         let typed = typist.typed.lock().unwrap().clone();
         match lost {
             false => {
                 assert!(done.outcome.is_ok());
-                assert_eq!(typed, vec![due.text.clone()], "typed once");
-                assert!(typed[0].contains("clank check-in"), "{typed:?}");
+                assert_eq!(
+                    typed,
+                    vec!["clank check-in: as the last look says".to_string()],
+                    "typed once, as the last look answered"
+                );
             }
             true => {
                 assert!(typed.is_empty());
                 let why = done.outcome.expect_err("undeliverable");
-                turns.check_in_failed(&author, done.check_in, why, &at_due);
+                turns.check_in_failed(&author, done.check_ins, why, &at_due);
                 let shown = turns.projection(&author, &at_due).attended;
                 assert!(
-                    shown
-                        .and_then(|a| a.check_in)
-                        .is_some_and(|c| c.starts_with("check-in undeliverable")),
+                    matches!(shown.as_slice(), [a] if a.check_in.as_deref().is_some_and(|c| c.starts_with("check-in undeliverable"))),
+                    "{shown:?}"
                 );
                 assert_eq!(
                     turns.recovery_quiet(&author, &at_due),
@@ -1458,10 +1569,8 @@ async fn a_qualifying_attendance_is_checked_in_on_by_typing_once() {
             let path = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
             let mut p: clank_core::turn_policy::Persisted =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            if let clank_core::turn_policy::Attendance::Standing { check_in, .. } =
-                &mut p.attendance
-            {
-                *check_in = clank_core::turn_policy::CheckIn::Armed;
+            for entry in &mut p.attendances {
+                entry.check_in = clank_core::turn_policy::CheckIn::Armed;
             }
             std::fs::write(&path, serde_json::to_vec(&p).unwrap()).unwrap();
         }
@@ -1479,11 +1588,10 @@ async fn a_check_in_its_last_look_refuses_is_not_typed() {
     let due = crate::cli::turn_custody::CheckInDue {
         author: AgentLabel::parse("claude").unwrap(),
         session: clank_core::SessionId::parse(SESSION).unwrap(),
-        check_in: clank_core::turn_policy::CheckInRef {
-            task_id: "a1".into(),
+        check_ins: vec![clank_core::turn_policy::CheckInRef {
+            key: clank_core::turn_policy::EntryKey::Task("a1".into()),
             since: 0,
-        },
-        text: "clank check-in".into(),
+        }],
     };
     let done = check_in_through(repo.path(), due, typist.clone(), |_| Err("refused".into())).await;
     assert!(done.outcome.is_err());
@@ -1502,10 +1610,10 @@ fn the_last_look_needs_a_harness_resumed_by_typing() {
     let ask = CheckInAsk {
         author: author.clone(),
         session: clank_core::SessionId::parse(SESSION).unwrap(),
-        check_in: clank_core::turn_policy::CheckInRef {
-            task_id: "a1".into(),
+        check_ins: vec![clank_core::turn_policy::CheckInRef {
+            key: clank_core::turn_policy::EntryKey::Task("a1".into()),
             since: 0,
-        },
+        }],
         screen: (clank_core::Tool::Claude, Some(String::new())),
         reply,
     };
@@ -1582,6 +1690,140 @@ async fn recovery_requests_are_carried_out_for_a_bound_session_only() {
         recovery_control(repo.path(), &mut recovery, &reply("session-gone"), 0).map(|(s, _)| s),
         Err("this session no longer holds the label".to_string())
     );
+}
+
+/// Attend and clear requests at the monitor's control seam: a second run
+/// with a `--desc` in use gets its own answer, distinct from any other
+/// refusal, a run's rollback clears only its own entry, and a name both a
+/// subagent and a run carry is refused rather than guessed.
+#[tokio::test]
+async fn attend_and_clear_requests_are_scoped_to_their_entry() {
+    let (repo, author, state) = owed_repo().await;
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let now = || {
+        gather(
+            repo.path(),
+            Some(&state),
+            &author,
+            &Default::default(),
+            &mut Default::default(),
+            &[],
+        )
+    };
+    let session = clank_core::SessionId::parse(SESSION).unwrap();
+    // Live processes: a run whose process is gone is forgotten before
+    // any request is weighed against it.
+    let proof = |pid: i32| {
+        crate::cli::turn_custody::shell_proof(
+            pid,
+            &crate::proc_identity::token_for(pid).expect("a live process"),
+        )
+    };
+    let (me, parent) = (
+        std::process::id() as i32,
+        std::os::unix::process::parent_id() as i32,
+    );
+    let run = |pid: i32| Control::Attend {
+        author: author.to_string(),
+        session: session.clone(),
+        selector: clank_core::turn_policy::Selector::RunDesc("test run".into()),
+        desc: Some("test run".into()),
+        expect_ms: 600_000,
+        shell: Some(proof(pid)),
+    };
+    let clear = |which| Control::Clear {
+        author: author.to_string(),
+        session: session.clone(),
+        which,
+    };
+    let control = |turns: &mut Turns, c: &Control| {
+        let wire: Control = serde_json::from_str(&serde_json::to_string(c).unwrap()).unwrap();
+        assert_eq!(&wire, c, "it travels whole");
+        turn_control(repo.path(), turns, &wire, |_| now()).map(|(_, said)| said)
+    };
+    assert!(
+        matches!(
+            control(
+                &mut turns,
+                &Control::Attend {
+                    author: author.to_string(),
+                    session: session.clone(),
+                    selector: clank_core::turn_policy::Selector::TaskId("b1".into()),
+                    desc: None,
+                    expect_ms: 600_000,
+                    shell: Some(proof(me)),
+                },
+            ),
+            Err(Note::Refused { .. })
+        ),
+        "a task id is only ever read back from old state, never asked for"
+    );
+    assert!(control(&mut turns, &run(me)).is_ok());
+    assert_eq!(
+        control(&mut turns, &run(parent)),
+        Err(Note::DescInUse {
+            desc: "test run".into()
+        })
+    );
+    let note: Note = serde_json::from_str(
+        &serde_json::to_string(&Note::DescInUse {
+            desc: "test run".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        note,
+        Note::DescInUse {
+            desc: "test run".into()
+        }
+    );
+    attend_named(&mut turns, &author, "test run", &now());
+    attend_named(&mut turns, &author, "sleeper", &now());
+    let entries = |turns: &Turns| turns.state(&author).unwrap().attendances.len();
+    assert_eq!(
+        entries(&turns),
+        3,
+        "a name renews no run until a listing shows the run is what it names"
+    );
+
+    attend_named(&mut turns, &author, "probe", &now());
+    assert!(
+        control(
+            &mut turns,
+            &Control::Attend {
+                author: author.to_string(),
+                session: session.clone(),
+                selector: clank_core::turn_policy::Selector::RunDesc("probe".into()),
+                desc: Some("probe".into()),
+                expect_ms: 600_000,
+                shell: Some(proof(parent)),
+            },
+        )
+        .is_ok()
+    );
+    let Err(Note::Refused { why }) = control(
+        &mut turns,
+        &clear(clank_core::turn_policy::Clearing::Named("probe".into())),
+    ) else {
+        panic!("a name both carry is refused");
+    };
+    assert!(
+        why.contains("\"probe\"") && why.contains("the `clank run` \"probe\""),
+        "{why}"
+    );
+    assert_eq!(entries(&turns), 5, "nothing changed");
+
+    assert_eq!(
+        control(
+            &mut turns,
+            &clear(clank_core::turn_policy::Clearing::Run(proof(parent)))
+        ),
+        Ok("no longer attending 1 thing; any check-in it owed is cancelled".into())
+    );
+    assert_eq!(entries(&turns), 4, "only the run's own entry");
+    assert!(control(&mut turns, &clear(clank_core::turn_policy::Clearing::All)).is_ok());
+    assert_eq!(entries(&turns), 0);
 }
 
 /// The loop's step at an attendance deadline serves the agent's parked

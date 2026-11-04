@@ -484,7 +484,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `status` | Repo state; `--watch` re-prints it as it changes, `-j` JSON |
 | `wait` | Block for work; `--peek`, `--for`, `--event` (see Extra wake sources) |
 | `run` | Run a long command under clank, so clank knows it is in hand (see below) |
-| `attend` | Tell clank which background work you are waiting on: a subagent by name, or a running task by id and `--pid` (see below) |
+| `attend` | Tell clank which subagent you are waiting on, by name; several can be attended at once (see below) |
 | `events` | Event inbox: `list` / `show` (metadata only) / `read` (content, recording delivery) / `ack` / `reply`; the agent's standing wake sources: `watch list` / `watch add` / `watch remove` (see below) |
 | `send` | Put a message in an agent's inbox (`--to <label>` or `--master`, `--repo` for another repo; `--interrupt` also tries to interrupt) |
 | `nudge` | Interrupt an agent and type a message into its terminal, for when `send` cannot be delivered |
@@ -736,20 +736,33 @@ the harness wakes the agent itself when the work completes (Claude). New
 work still wakes it.
 
 - `clank attend "<name>"` attends a subagent by its name.
-- `clank run --desc "two words" -- <command>` is the way for shell work.
+- `clank run --desc "two words" -- <command>` is the one way for shell work.
   Clank asks to attend the run, then becomes the command (same pid, stdio
-  and exit status), so the task's lifetime is the work's lifetime.
-- `clank attend <task-id> --desc "two words" --pid <pid>` attends shell
-  work that is already running. The task id is the harness's own, and the
-  live `--pid` is what lets clank tell the work is still running.
+  and exit status), so the task's lifetime is the work's lifetime. A shell
+  task's description is the harness's, not a handle, so `clank attend`
+  refuses a name that matches only shell work. Two attended runs cannot
+  share a `--desc`: the second is refused and its command does not run.
 
-The request takes effect from the next turn-end, whose list of running
-work must show exactly one match. Each takes `--expect` (default 5m): if
-the work is still running past that, the work already shown wakes the
-agent again through its wait, and it is checked in on once in its pane
-where clank can type there. Nothing is cancelled and nothing times out. The
-harness's own notification that the task finished is still what wakes the
-agent when it ends. `clank attend --clear` withdraws it.
+An agent attends several things at once. Each `attend` or `run` adds one
+entry, or renews the one already attending the same work, and never
+touches another; each has its own `--expect` and check-in. A request takes
+effect from the next turn-end, whose list of running work must show
+exactly one match. Each takes `--expect` (default 5m): if the work is
+still running past that, the work already shown wakes the agent again
+through its wait, and it is checked in on once in its pane where clank can
+type there; entries due together share one check-in. Nothing is cancelled
+and nothing times out. The harness's own notification that the task
+finished is still what wakes the agent when it ends. `clank attend "<name>"
+--expect 1h` renews an entry, a run's by its `--desc`; `clank attend
+--clear "<name>"` withdraws one, and `clank attend --clear` all of them.
+
+Ending a turn with live background work no entry covers wakes the agent
+with a notice naming each such task and how to attend it, at every
+turn-end until it is attended or done. Only work a command could attend
+counts: a subagent or shell task, on a harness that reports its background
+work and wakes the agent when it completes (Claude). `clank tui` shows
+every entry on the agent's row and its detail page, with the reason for
+any that covers nothing yet.
 
 ## Layout
 

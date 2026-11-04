@@ -19,10 +19,11 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
   or standby because the roster says so, not a flag.
 {{WORK_LOOP}}
 - **Long background work**: shell work as `clank run --desc "two words"
-  -- <cmd>`, a subagent with `clank attend "<name>"`. Past `--expect` (5m)
-  you get one check-in. Its completion still wakes you: never poll it or
-  start a wait. Owing work, a turn silent 45m (default) is nudged, which
-  interrupts it.
+  -- <cmd>`, a subagent with `clank attend "<name>"`; attend several at
+  once. Stopping with live work you don't attend wakes you. Past
+  `--expect` (5m): one check-in. Its completion still wakes you:
+  never poll it or start a wait. Owing work, a turn silent 45m (default)
+  is nudged, which interrupts it.
 
 ## Core commands (run via {{SHELL}})
 

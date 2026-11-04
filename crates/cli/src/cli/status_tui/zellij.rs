@@ -2665,7 +2665,7 @@ mod tests {
                 asking: None,
                 repeated: None,
 
-                attending: None,
+                attending: Vec::new(),
             })
             .collect();
         s.master = labels
@@ -3863,7 +3863,7 @@ mod tests {
                     asking: None,
                     repeated: None,
 
-                    attending: None,
+                    attending: Vec::new(),
                 },
                 crate::cli::status::AgentAutoRow {
                     label: "codex".into(),
@@ -3878,7 +3878,7 @@ mod tests {
                     asking: None,
                     repeated: None,
 
-                    attending: None,
+                    attending: Vec::new(),
                 },
             ];
             s.master = Some("claude".into());

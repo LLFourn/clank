@@ -2072,19 +2072,13 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct AttendArgs {
-    /// What you are waiting on: a subagent's name, or with `--pid` a
-    /// shell task's id as the tool reports it. Omit with `--clear` to
-    /// stop attending.
+    /// The subagent you are waiting on, by its name. Shell work is
+    /// attended by launching it with `clank run`; its `--desc` here renews
+    /// that run's expectation. With `--clear`, the one entry to clear.
     #[arg(value_name = "NAME")]
     pub selector: Option<String>,
-    /// PID of the shell work you are waiting on, which makes NAME its
-    /// task id. Its identity is recorded now, so a reused pid proves
-    /// nothing. Easier: launch the work through `clank run`.
-    #[arg(long, value_name = "PID")]
-    pub pid: Option<i32>,
     /// TWO WORDS for what you are waiting on — `--desc "test run"`. What
-    /// `clank tui` shows; required with `--pid`, and a subagent's name
-    /// otherwise.
+    /// `clank tui` shows; the subagent's name otherwise.
     #[arg(long, value_name = "TEXT")]
     pub desc: Option<String>,
     /// How long you expect this to take (`30s`, `5m`, `1h`; default
@@ -2094,7 +2088,8 @@ pub struct AttendArgs {
     #[arg(long, value_name = "DURATION", default_value = "5m",
           value_parser = crate::cli::attend::parse_expect)]
     pub expect: std::time::Duration,
-    /// Stop attending, and cancel the check-in it owes.
+    /// Stop attending NAME, or everything when no NAME is given, and
+    /// cancel the check-ins they owe.
     #[arg(long)]
     pub clear: bool,
     /// Agent label. Resolved from env when omitted.
