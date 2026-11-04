@@ -1296,13 +1296,27 @@ fn launch_env(
 /// opencode-composed copies setup installs to
 /// ~/.config/opencode/skills. Disabling the scan gives opencode the
 /// same per-tool skill model codex and grok already have.
+///
+/// claude: agent view's daemon moves a running conversation into a
+/// background worker and keeps a warm spare Claude in the agent's
+/// directory, carrying its `CLANK_AGENT`; the spare's SessionStart then
+/// takes the agent's binding though it never takes a turn
+/// (clank-agents-run-without-agent-view).
 fn tool_env_defaults(tool: Tool) -> std::collections::BTreeMap<String, String> {
     let mut env = std::collections::BTreeMap::new();
-    if tool == Tool::OpenCode {
-        env.insert("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".into(), "1".into());
+    match tool {
+        Tool::OpenCode => {
+            env.insert("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".into(), "1".into());
+        }
+        Tool::Claude => {
+            env.insert(DISABLE_AGENT_VIEW.into(), "1".into());
+        }
+        Tool::Codex | Tool::Grok => {}
     }
     env
 }
+
+const DISABLE_AGENT_VIEW: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
 
 /// Composed launch line: executable + argv + env additions.
 #[derive(Debug, Clone)]
@@ -2764,6 +2778,72 @@ mod tests {
                 s.tool
             );
         }
+    }
+
+    /// Every way clank starts Claude (resume, fresh, fork) runs it
+    /// without agent view; no other tool is given the variable.
+    #[test]
+    fn every_claude_launch_runs_without_agent_view() {
+        let fork = |tool| {
+            let spec = crate::cli::fork::ForkSpec {
+                opencode: None,
+                grok: None,
+                tool,
+                from_session: None,
+                prompt: "orient".into(),
+            };
+            compose_fork_launch(
+                &label("tester"),
+                &spec,
+                &desc_with(tool, None),
+                Path::new("/repo/.clank/worktrees/x"),
+                None,
+            )
+        };
+        for s in [
+            claude_session(),
+            codex_session(),
+            grok_session(),
+            opencode_session(),
+        ] {
+            let launches = [
+                compose_launch(Path::new("/repo"), &label("tester"), &s, None, None),
+                compose_bootstrap_launch(
+                    Path::new("/repo"),
+                    &label("tester"),
+                    &desc_with(s.tool, None),
+                )
+                .unwrap(),
+                fork(s.tool),
+            ];
+            for c in launches {
+                assert_eq!(
+                    c.env_overrides.get(DISABLE_AGENT_VIEW).map(String::as_str),
+                    (s.tool == Tool::Claude).then_some("1"),
+                    "{:?}: {:?}",
+                    s.tool,
+                    c.args
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_profile_can_turn_agent_view_back_on() {
+        let launch = LaunchConfig {
+            env: [(DISABLE_AGENT_VIEW.to_string(), "0".to_string())].into(),
+            ..Default::default()
+        };
+        let c = compose_bootstrap_launch(
+            Path::new("/repo"),
+            &label("tester"),
+            &desc_with(Tool::Claude, Some(launch)),
+        )
+        .unwrap();
+        assert_eq!(
+            c.env_overrides.get(DISABLE_AGENT_VIEW).map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]
@@ -5508,17 +5588,19 @@ mod tests {
             c.env_overrides.get("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
             Some(&"0".to_string())
         );
-        // Other tools carry no opencode default — only their own label.
-        let desc = desc_with(Tool::Claude, None);
-        let c = compose_bootstrap_launch(Path::new("/repo"), &label("phantom"), &desc)
+        for tool in [Tool::Claude, Tool::Codex, Tool::Grok] {
+            let c = compose_bootstrap_launch(
+                Path::new("/repo"),
+                &label("phantom"),
+                &desc_with(tool, None),
+            )
             .expect("compose");
-        assert_eq!(
-            c.env_overrides
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["CLANK_AGENT"]
-        );
+            assert!(
+                !c.env_overrides
+                    .contains_key("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
+                "{tool:?}"
+            );
+        }
     }
 
     /// Hosts the launch cases in a fresh process of this test binary,
