@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clank_core::turn_policy::{
-    AttendReply, AttendRequest, Attendance, CheckIn, CheckInRef, Effect, Event, Facts, Handoff,
-    Liveness, Ms, Output, OwedItem, Persisted, PresentationId, Quiet, Request, ResultOutcome,
-    Selector, SessionState, ShellProof, SilentWhy, TaskKind, Unwatched, Verdict, Withheld,
+    AttendReply, AttendRequest, CheckIn, CheckInRef, Effect, Entry, Event, Facts, Handoff,
+    Liveness, Ms, Output, OwedItem, Persisted, PresentationId, Qualifies, Quiet, ResultOutcome,
+    Selector, SessionState, ShellProof, SilentWhy, TaskKind, Unqualified, Unwatched, Verdict,
+    Withheld,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -255,14 +256,21 @@ impl Commit {
     }
 }
 
-/// The one check-in an attendance owes, to be typed through the agent's
-/// resume route.
+/// One check-in, for every entry that fell due together, to be typed
+/// through the agent's resume route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckInDue {
     pub(crate) author: AgentLabel,
     pub(crate) session: SessionId,
-    pub(crate) check_in: CheckInRef,
-    pub(crate) text: String,
+    pub(crate) check_ins: Vec<CheckInRef>,
+}
+
+/// Why an attend or clear request was not carried out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// Another attended `clank run` already holds this `--desc`.
+    DescInUse(String),
+    Other(String),
 }
 
 struct Custody {
@@ -458,7 +466,7 @@ impl Turns {
                 identities,
                 repeat,
                 escalated,
-                notice,
+                notices,
             } => {
                 let items: Vec<&WaitItem> = g
                     .owed
@@ -468,12 +476,11 @@ impl Turns {
                     .map(|(_, item)| item)
                     .collect();
                 let role = g.role.clone().unwrap_or(Role::Reviewer);
-                let mut text = super::wake_render::render_wait_items_ref(&items, author, role);
-                if let Report::TurnEnd { stop, .. } = report
-                    && let Some(recipe) = super::wake_render::live_work_recipe(&stop.tasks)
-                {
-                    text.push_str(&recipe);
-                }
+                let mut text = if items.is_empty() {
+                    String::new()
+                } else {
+                    super::wake_render::render_wait_items_ref(&items, author, role)
+                };
                 if escalated {
                     let duties: Vec<String> = items
                         .iter()
@@ -483,10 +490,11 @@ impl Turns {
                         text.push_str(&more);
                     }
                 }
-                if let Some(notice) = notice {
+                for notice in &notices {
                     text.push_str("\n\n");
-                    text.push_str(&super::wake_render::notice_text(&notice));
+                    text.push_str(&super::wake_render::notice_text(notice));
                 }
+                let text = text.trim_start().to_string();
                 // A session start's context earns receipts only where it
                 // reaches the model: Claude's.
                 let commits =
@@ -679,31 +687,49 @@ impl Turns {
         author: &AgentLabel,
         request: AttendRequest,
         g: &Gathered,
-    ) -> Result<String, String> {
+    ) -> Result<String, Refused> {
         let said = match &request {
             AttendRequest::Attend {
                 selector, expect, ..
             } => Some((selector.clone(), *expect)),
             AttendRequest::Clear { .. } => None,
         };
+        let attending = |verb: &str| {
+            let (selector, expect) = said.clone().expect("an attend names its selector");
+            format!(
+                "{verb} {}: while it is listed running, work you have already been shown stays \
+                 quiet and new work still wakes you; if it is still going after {} you are \
+                 checked in on once. Anything else you attend is unchanged.",
+                selector_words(&selector),
+                super::attend::duration_arg(expect / 1000),
+            )
+        };
         match self.step(author, g, None, Event::Attend(request)) {
             Some(Output::Attend(AttendReply::Accepted)) => {
-                let (selector, expect) = said.expect("an accepted attend names its selector");
-                Ok(format!(
-                    "attending {} from your next turn-end: while it is listed running, work \
-                     you have already been shown stays quiet and new work still wakes you; if \
-                     it is still going after {} you are checked in on once",
-                    selector_words(&selector),
-                    super::attend::duration_arg(expect / 1000),
-                ))
+                Ok(attending("from your next turn-end, attending"))
             }
-            Some(Output::Attend(AttendReply::Cleared { had: true })) => {
-                Ok("no longer attending; any check-in it owed is cancelled".into())
+            Some(Output::Attend(AttendReply::Renewed)) => Ok(attending("renewed: attending")),
+            Some(Output::Attend(AttendReply::Cleared { removed: 0 })) => {
+                Ok("that was not attended; nothing changed".into())
             }
-            Some(Output::Attend(AttendReply::Cleared { had: false })) => {
-                Ok("was not attending anything".into())
-            }
-            _ => Err("this session no longer holds the label, so nothing was recorded".into()),
+            Some(Output::Attend(AttendReply::Cleared { removed })) => Ok(format!(
+                "no longer attending {removed} {}; any check-in {} owed is cancelled",
+                if removed == 1 { "thing" } else { "things" },
+                if removed == 1 { "it" } else { "they" },
+            )),
+            Some(Output::Attend(AttendReply::Ambiguous(named))) => Err(Refused::Other(format!(
+                "that name is both {}; nothing changed. Clear or renew them by a name only \
+                 one has",
+                named
+                    .iter()
+                    .map(selector_words)
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ))),
+            Some(Output::Attend(AttendReply::DescInUse(desc))) => Err(Refused::DescInUse(desc)),
+            _ => Err(Refused::Other(
+                "this session no longer holds the label, so nothing was recorded".into(),
+            )),
         }
     }
 
@@ -724,45 +750,30 @@ impl Turns {
             .collect()
     }
 
-    /// Step `author`'s check-in at its deadline: the check-in to type, if
-    /// one is owed and the gates let it through.
+    /// Step `author`'s check-ins at their deadline: the one check-in to
+    /// type for every entry due, if any is owed and the gates let it
+    /// through.
     pub(crate) fn check_in(&mut self, author: &AgentLabel, g: &Gathered) -> Option<CheckInDue> {
-        let shell = match &self.custody(author, g)?.state.attendance {
-            Attendance::Standing { kind, shell, .. } => (kind.clone(), shell.clone()),
-            _ => return None,
-        };
+        self.custody(author, g)?;
         let Some(Output::Effects(effects)) = self.step(author, g, None, Event::CheckInDue) else {
             return None;
         };
         let session = self.agents.get(author)?.state.binding.clone();
         effects.into_iter().find_map(|e| match e {
-            Effect::CheckIn {
-                check_in,
-                desc,
-                elapsed,
-                expect,
-            } => Some(CheckInDue {
+            Effect::CheckIn(lines) => Some(CheckInDue {
                 author: author.clone(),
                 session: session.clone(),
-                text: super::wake_render::check_in_text(
-                    &check_in.task_id,
-                    desc.as_deref(),
-                    &shell.0,
-                    shell.1.as_ref().map(|p| p.pid),
-                    elapsed / 1000,
-                    expect / 1000,
-                ),
-                check_in,
+                check_ins: lines.into_iter().map(|l| l.check_in).collect(),
             }),
             _ => None,
         })
     }
 
-    /// The check-in fired for `check_in` could not be typed, and why.
+    /// The check-in fired for `check_ins` could not be typed, and why.
     pub(crate) fn check_in_failed(
         &mut self,
         author: &AgentLabel,
-        check_in: CheckInRef,
+        check_ins: Vec<CheckInRef>,
         why: String,
         g: &Gathered,
     ) {
@@ -770,24 +781,26 @@ impl Turns {
             author,
             g,
             None,
-            Event::CheckInUndeliverable { check_in, why },
+            Event::CheckInUndeliverable { check_ins, why },
         );
     }
 
-    /// The last look before the check-in fired for `check_in` is typed,
-    /// against `author`'s custody and gates as they are now.
+    /// The last look before the check-in fired for `check_ins` is typed,
+    /// against `author`'s custody and gates as they are now: the text for
+    /// the entries still owed it.
     pub(crate) fn may_type_check_in(
         &mut self,
         author: &AgentLabel,
-        check_in: &CheckInRef,
+        check_ins: &[CheckInRef],
         g: &Gathered,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let custody = self
             .custody(author, g)
             .ok_or("the session no longer holds the label")?;
         custody
             .state
-            .may_type_check_in(check_in, &facts(g, None, &[], &Process))
+            .may_type_check_in(check_ins, &facts(g, None, &[], &Process))
+            .map(|lines| super::wake_render::check_in_text(&lines))
     }
 
     /// The facts changed: an owed-work change ends the repeat episode.
@@ -832,8 +845,15 @@ impl Turns {
                 ..Default::default()
             };
         };
+        let owed = g.owed_now(Some(&custody.state));
+        let attended = custody
+            .state
+            .standing(&facts(g, None, &owed, &Process))
+            .into_iter()
+            .map(|(entry, qualifies)| attended(entry, &qualifies))
+            .collect();
         super::recovery::Projection {
-            attended: attended(&custody.state.attendance),
+            attended,
             asking,
             repeated: custody
                 .state
@@ -864,9 +884,13 @@ pub(crate) fn frame_of(verdict: Verdict) -> Frame {
             },
         }),
         Verdict::Park => Frame::bare(WireVerdict::Park),
-        Verdict::Notify(notice) => Frame::text(
+        Verdict::Notify(notices) => Frame::text(
             WireVerdict::Notify,
-            super::wake_render::notice_text(&notice),
+            notices
+                .iter()
+                .map(super::wake_render::notice_text)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
         ),
         Verdict::Failed(message) => Frame::bare(WireVerdict::Diagnostic { message }),
         Verdict::Deliver { .. } => Frame::bare(WireVerdict::Diagnostic {
@@ -885,85 +909,68 @@ fn rfc3339(ms: Ms) -> String {
         .unwrap_or_default()
 }
 
-fn attended(attendance: &Attendance) -> Option<super::agent_state::Attended> {
-    let token = |shell: &Option<ShellProof>| {
-        shell
-            .as_ref()
-            .and_then(|p| serde_json::from_str(&p.token).ok())
-    };
-    let expectation = |since: Ms, expect: Ms| super::agent_state::Expectation {
-        since: rfc3339(since),
-        secs: expect / 1000,
-    };
-    match attendance {
-        Attendance::None => None,
-        Attendance::Intent(Request {
-            selector,
-            desc,
-            since,
-            expect,
-            shell,
-        }) => Some(super::agent_state::Attended {
-            task: selector_text(selector),
-            expect: Some(expectation(*since, *expect)),
-            desc: desc.clone(),
-            pid: shell.as_ref().map(|p| p.pid),
-            token: token(shell),
-            at: rfc3339(*since),
-            subagent: matches!(selector, Selector::Name(_)),
-            pending: true,
-            check_in: None,
+/// One entry as status and the TUI show it, with why it covers nothing
+/// when it does not.
+fn attended(entry: &Entry, qualifies: &Qualifies) -> super::agent_state::Attended {
+    let shell = entry.shell.as_ref();
+    super::agent_state::Attended {
+        task: entry
+            .task()
+            .map_or_else(|| entry.selector.text().to_string(), str::to_string),
+        expect: Some(super::agent_state::Expectation {
+            since: rfc3339(entry.since),
+            secs: entry.expect / 1000,
         }),
-        Attendance::Standing {
-            task_id,
-            kind,
-            desc,
-            since,
-            expect,
-            shell,
-            check_in,
-            ..
-        } => Some(super::agent_state::Attended {
-            task: task_id.clone(),
-            expect: Some(expectation(*since, *expect)),
-            desc: desc.clone(),
-            pid: shell.as_ref().map(|p| p.pid),
-            token: token(shell),
-            at: rfc3339(*since),
-            subagent: *kind == TaskKind::Subagent,
-            pending: false,
-            check_in: match check_in {
-                CheckIn::Unarmed | CheckIn::Armed => None,
-                CheckIn::Fired => Some("checked in".into()),
-                CheckIn::Withheld(why) => Some(format!(
-                    "check-in withheld: {}",
-                    match why {
-                        Withheld::AutoOff => "auto off",
-                        Withheld::Asking => "a question was pending",
-                        Withheld::Blocked => "a block was pending",
-                    }
-                )),
-                CheckIn::Undeliverable(why) => Some(format!("check-in undeliverable: {why}")),
-            },
-        }),
+        desc: entry.desc.clone(),
+        pid: shell.map(|p| p.pid),
+        token: shell.and_then(|p| serde_json::from_str(&p.token).ok()),
+        at: rfc3339(entry.since),
+        subagent: match &entry.resolved {
+            Some(r) => r.kind == TaskKind::Subagent,
+            None => matches!(entry.selector, Selector::Name(_)),
+        },
+        pending: entry.resolved.is_none(),
+        check_in: match &entry.check_in {
+            CheckIn::Unarmed | CheckIn::Armed => None,
+            CheckIn::Fired => Some("checked in".into()),
+            CheckIn::Withheld(why) => Some(format!(
+                "check-in withheld: {}",
+                match why {
+                    Withheld::AutoOff => "auto off",
+                    Withheld::Asking => "a question was pending",
+                    Withheld::Blocked => "a block was pending",
+                }
+            )),
+            CheckIn::Undeliverable(why) => Some(format!("check-in undeliverable: {why}")),
+            CheckIn::ProcessGone => None,
+        },
+        unqualified: match qualifies {
+            Qualifies::Yes => None,
+            Qualifies::Ended => Some("ended".into()),
+            Qualifies::No(why) => Some(unqualified_text(why).into()),
+        },
     }
 }
 
-/// What a selector names, as a status row shows it.
-fn selector_text(selector: &Selector) -> String {
-    match selector {
-        Selector::TaskId(id) => id.clone(),
-        Selector::Name(name) => name.clone(),
-        Selector::RunDesc(desc) => desc.clone(),
+/// Why an entry covers nothing, as a status row says it.
+pub(crate) fn unqualified_text(why: &Unqualified) -> &'static str {
+    match why {
+        Unqualified::NotResolved => "not seen in a listing yet",
+        Unqualified::Uncorrelated => "waiting for a fresh listing",
+        Unqualified::NoCompletionWake => "this tool sends no completion wake",
+        Unqualified::NoProcessProof => "shell work not launched with clank run",
+        Unqualified::ProcessGone => "process gone",
+        Unqualified::UnknownKind => "neither a subagent nor shell work",
+        Unqualified::PastDeadline => "past its deadline",
     }
 }
 
 /// What a selector names, as a sentence says it.
 pub(crate) fn selector_words(selector: &Selector) -> String {
     match selector {
-        Selector::TaskId(id) => format!("task `{id}`"),
         Selector::Name(name) => format!("\"{name}\""),
         Selector::RunDesc(desc) => format!("the `clank run` \"{desc}\""),
+        Selector::TaskId(id) => format!("task `{id}`"),
     }
 }
 

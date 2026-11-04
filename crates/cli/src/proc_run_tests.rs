@@ -387,7 +387,7 @@ impl Drop for Bystander {
 /// The bug itself: a descendant keeps the inherited stdout open after
 /// the child exits. Waiting for EOF would wait for the descendant.
 #[test]
-fn a_descendant_holding_the_pipe_is_incomplete_at_once() {
+fn a_descendant_holding_the_pipe_is_incomplete_without_waiting_for_it() {
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("pid");
     let started = Instant::now();
@@ -418,7 +418,7 @@ fn a_descendant_holding_the_pipe_is_incomplete_at_once() {
 }
 
 #[tokio::test]
-async fn the_async_run_is_incomplete_at_once_too() {
+async fn the_async_run_is_incomplete_without_waiting_for_it_too() {
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("pid");
     let started = Instant::now();
@@ -439,14 +439,16 @@ async fn the_async_run_is_incomplete_at_once_too() {
     assert!(gone(read_pid(&pidfile)));
 }
 
-/// Decided by the pipe's state at exit, not after a timer: a writer
-/// that lets go 300ms later still leaves the output unknown.
+/// A writer that lets go a second past the patience still leaves the
+/// output unknown, and the run does not wait for it to.
 #[test]
-fn a_writer_that_lets_go_after_exit_is_still_incomplete() {
+fn a_writer_that_lets_go_after_the_patience_is_still_incomplete() {
+    let holds = HELD_PATIENCE + Duration::from_secs(1);
     for blocking in [true, false] {
-        let spec = sh("(sleep 0.3) & exit 0")
+        let spec = sh(&format!("(sleep {}) & exit 0", holds.as_secs_f64()))
             .stdout(Out::Capture { cap: 1 << 20 })
             .group(Group::New);
+        let started = Instant::now();
         let result = if blocking {
             run_blocking(spec, Duration::from_secs(10))
         } else {
@@ -458,7 +460,81 @@ fn a_writer_that_lets_go_after_exit_is_still_incomplete() {
             matches!(result, Err(RunError::Incomplete { .. })),
             "blocking={blocking}: {result:?}"
         );
+        assert!(
+            started.elapsed() >= HELD_PATIENCE && started.elapsed() < holds,
+            "blocking={blocking}: decided after {:?}",
+            started.elapsed()
+        );
     }
+}
+
+/// A writer that lets go well inside the patience, as a concurrent
+/// spawn's copy does, leaves the output whole, with what it wrote.
+#[test]
+fn a_writer_that_lets_go_within_the_patience_is_whole() {
+    for blocking in [true, false] {
+        let spec = sh("(sleep 0.05; echo late) &")
+            .stdout(Out::Capture { cap: 1 << 20 })
+            .group(Group::New);
+        let out = if blocking {
+            run_blocking(spec, Duration::from_secs(10))
+        } else {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(run(spec, Duration::from_secs(10)))
+        }
+        .unwrap_or_else(|e| panic!("blocking={blocking}: {e:?}"));
+        assert_eq!(out.stdout, b"late\n", "blocking={blocking}");
+    }
+}
+
+/// The failure on Linux CI: spawns on other threads hold copies of a
+/// run's pipe from their fork to their exec, and a run that judged its
+/// output at the instant of exit read those copies as holders. The
+/// spinners fork, as Linux's spawn does, so macOS reproduces it too: a
+/// `pre_exec` hook takes std off its `posix_spawn` path.
+#[test]
+fn concurrent_forks_never_make_a_run_incomplete() {
+    use std::os::unix::process::CommandExt;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinners: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut fork = std::process::Command::new("/usr/bin/true");
+                    // SAFETY: the hook does nothing.
+                    unsafe { fork.pre_exec(|| Ok(())) };
+                    fork.status().unwrap();
+                }
+            })
+        })
+        .collect();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut incomplete = 0;
+    for i in 0..1000 {
+        let spec = Spec::new("/bin/echo")
+            .arg("hi")
+            .stdout(Out::Capture { cap: 4096 });
+        let result = if i % 2 == 0 {
+            run_blocking(spec, Duration::from_secs(10))
+        } else {
+            runtime.block_on(run(spec, Duration::from_secs(10)))
+        };
+        match result {
+            Ok(out) => assert_eq!(out.stdout, b"hi\n"),
+            Err(RunError::Incomplete { .. }) => incomplete += 1,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for s in spinners {
+        s.join().unwrap();
+    }
+    assert_eq!(
+        incomplete, 0,
+        "{incomplete} run(s) read a passing copy as a holder"
+    );
 }
 
 /// One deadline for the whole run: an exit and its output found after

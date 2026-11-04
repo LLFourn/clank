@@ -1285,10 +1285,31 @@ pub(crate) fn resolve_wait_event_sources(
         .map(|s| (s, SourceOrigin::Config))
         .collect();
     for raw in cli_items {
-        let item: clank_core::agent_config::WaitEventSource = serde_json::from_str(raw)
-            .map_err(|e| anyhow::anyhow!("invalid --event `{raw}`: {e}"))?;
+        let item = parse_wait_event_source(raw).map_err(|e| e.context("invalid --event"))?;
         sources.push((item, SourceOrigin::Cli));
     }
+    validate_wait_event_sources(&sources)?;
+    Ok(sources)
+}
+
+/// One wake source from its JSON, the shape `wait_events` and
+/// `--event` share.
+pub(crate) fn parse_wait_event_source(
+    raw: &str,
+) -> anyhow::Result<clank_core::agent_config::WaitEventSource> {
+    serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("invalid wake source `{raw}`: {e}"))
+}
+
+/// Refuse a source list an arm could not run: the WHOLE list, since
+/// two individually valid sources can still collide on a timer name or
+/// a producer's storage key.
+pub(crate) fn validate_wait_event_sources(
+    sources: &[(
+        clank_core::agent_config::WaitEventSource,
+        crate::cli::event_source::SourceOrigin,
+    )],
+) -> anyhow::Result<()> {
+    use crate::cli::event_source::SourceOrigin;
     // Validate at ARM time so a bad source fails LOUD here, rather
     // than silently substituting a default deep in a poll loop
     // (codex ef1861a) or printing from inside a task that then
@@ -1299,7 +1320,7 @@ pub(crate) fn resolve_wait_event_sources(
     // One task owns a storage key's log and lease. Two sources resolving
     // to one key would be two tasks, and a host keyed by it keeps one.
     let mut producer_keys = std::collections::HashSet::new();
-    for (source, origin) in &sources {
+    for (source, origin) in sources {
         let produced_into = match source {
             clank_core::agent_config::WaitEventSource::Command(c) => Some(c.source_key()),
             clank_core::agent_config::WaitEventSource::Github(g) => {
@@ -1364,7 +1385,7 @@ pub(crate) fn resolve_wait_event_sources(
             }
         }
     }
-    Ok(sources)
+    Ok(())
 }
 
 /// One beat's items from BOTH routes, merged before anything decides.

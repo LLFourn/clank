@@ -207,7 +207,7 @@ pub(super) fn render_at(
         && let Some((a, att)) = snap
             .agents
             .get(agent)
-            .and_then(|a| a.attending.as_ref().map(|t| (a, t)))
+            .and_then(|a| page_wait(a, view.wait_page).map(|t| (a, t)))
     {
         let actions = wait_actions(att.killable_pid().is_some());
         let process = view
@@ -216,6 +216,7 @@ pub(super) fn render_at(
         return render_wait_page(
             &a.label,
             att,
+            &a.attending,
             process.map(|slot| &slot.state),
             process.and_then(|slot| slot.command.as_deref()),
             view.wait_scroll,
@@ -318,7 +319,7 @@ pub(super) fn render_at(
                         snap.agents
                             .iter()
                             .find(|a| a.label == p.label)
-                            .map(|a| (a, a.attending.as_ref()))
+                            .map(|a| (a, page_wait(a, Some(p))))
                     })
                     .and_then(|(a, att)| att.map(|t| (a, t)))
                 {
@@ -1447,17 +1448,23 @@ pub(super) fn agent_wait_view(snap: &StatusSnapshot, cols: usize) -> Vec<(bool, 
     snap.agents
         .iter()
         .map(|a| {
-            let fields = a.attending.as_ref().and_then(|att| att.marker_fields(now));
-            let marker = fields
-                .as_ref()
-                .and_then(|f| fit_marker(f, budget))
-                .or_else(|| {
-                    // A question it is waiting on a person to answer, where no
-                    // wait is being attended.
-                    let asking = format!("asking you — \"{}\"", a.asking.as_deref()?);
-                    (budget > 0).then(|| asking.chars().take(budget).collect())
-                });
-            (fields.is_some() || a.asking.is_some(), marker)
+            let covering: Vec<_> = a
+                .attending
+                .iter()
+                .filter_map(|att| att.marker_fields(now))
+                .collect();
+            let idle: Vec<(&str, &str)> = a
+                .attending
+                .iter()
+                .filter_map(|att| Some((att.subject(), att.unqualified.as_deref()?)))
+                .collect();
+            let marker = fit_markers(&covering, &idle, budget).or_else(|| {
+                // A question it is waiting on a person to answer, where no
+                // wait is being attended.
+                let asking = format!("asking you — \"{}\"", a.asking.as_deref()?);
+                (budget > 0).then(|| asking.chars().take(budget).collect())
+            });
+            (!covering.is_empty() || a.asking.is_some(), marker)
         })
         .collect()
 }
@@ -1469,9 +1476,74 @@ pub(super) fn drawable_waits(snap: &StatusSnapshot, cols: usize) -> Vec<usize> {
         .into_iter()
         .enumerate()
         .filter_map(|(i, (_, marker))| {
-            (marker.is_some() && snap.agents[i].attending.is_some()).then_some(i)
+            (marker.is_some() && !snap.agents[i].attending.is_empty()).then_some(i)
         })
         .collect()
+}
+
+/// The attendance the open wait page shows: the one it was opened on,
+/// while this agent still holds it, else the agent's primary.
+fn page_wait<'a>(
+    agent: &'a crate::cli::status::AgentAutoRow,
+    page: Option<&super::input::WaitPage>,
+) -> Option<&'a crate::cli::agent_state::Attended> {
+    page.and_then(|p| agent.attending.iter().find(|t| p.matches(&agent.label, t)))
+        .or_else(|| agent.primary_wait())
+}
+
+/// Every entry an agent attends, on its one marker line. A lone entry that
+/// covers its work is fitted by [`fit_marker`] alone. Several are joined,
+/// each shedding detail from the right in step until the line fits:
+/// pid, then age or reason. What still does not fit is counted, never
+/// silently dropped.
+fn fit_markers(
+    covering: &[crate::cli::agent_state::MarkerFields<'_>],
+    idle: &[(&str, &str)],
+    budget: usize,
+) -> Option<String> {
+    match (covering, idle) {
+        ([], []) => return None,
+        ([one], []) => return fit_marker(one, budget),
+        _ => {}
+    }
+    let segments = |level: usize| -> Vec<String> {
+        let covered = covering.iter().map(|f| {
+            let mut parts = vec![one_line(f.subject, budget).trim().to_string()];
+            if level < 2
+                && let Some(age) = &f.age
+            {
+                parts.push(age.clone());
+            }
+            if level < 1
+                && let Some(pid) = f.pid
+            {
+                parts.push(format!("pid {pid}"));
+            }
+            format!("⌛ {}", parts.join(" · "))
+        });
+        let waiting = idle.iter().map(|(subject, why)| {
+            let subject = one_line(subject, budget);
+            match level {
+                0 | 1 => format!("○ {} — {why}", subject.trim()),
+                _ => format!("○ {}", subject.trim()),
+            }
+        });
+        covered.chain(waiting).collect()
+    };
+    for level in 0..3 {
+        let line = segments(level).join("  ");
+        if display_width(&line) <= budget {
+            return Some(line);
+        }
+    }
+    let all = segments(2);
+    for shown in (1..all.len()).rev() {
+        let line = format!("{}  +{}", all[..shown].join("  "), all.len() - shown);
+        if display_width(&line) <= budget {
+            return Some(line);
+        }
+    }
+    covering.first().and_then(|f| fit_marker(f, budget))
 }
 
 /// The attendance line sits one step in from its agent. The agents
@@ -2300,6 +2372,7 @@ pub(super) fn render_candidate_screen(
 pub(super) fn render_wait_page(
     label: &str,
     att: &crate::cli::agent_state::Attended,
+    all: &[crate::cli::agent_state::Attended],
     process: Option<&super::wait_process::State>,
     command: Option<&super::wait_detail::Command>,
     scroll: usize,
@@ -2374,6 +2447,15 @@ pub(super) fn render_wait_page(
             &mut body,
             "cannot stop",
             &format!("cannot stop it: {why}"),
+            cols,
+        );
+    }
+    let now = time::OffsetDateTime::now_utc();
+    for (n, other) in all.iter().enumerate() {
+        push_wait_field(
+            &mut body,
+            if n == 0 { "attending" } else { "" },
+            &wait_detail::safe_text(&other.line(now)),
             cols,
         );
     }
@@ -3169,6 +3251,22 @@ pub(super) fn render_agent_detail(
             "",
             cols,
         )),
+    }
+    let attending_label = format!("{LEAD}attending ");
+    let indent = display_width(&attending_label);
+    let now = time::OffsetDateTime::now_utc();
+    for (n, att) in agent.attending.iter().enumerate() {
+        let text = super::wait_detail::safe_text(&att.line(now));
+        for (m, line) in wrap(&text, cols.saturating_sub(indent).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = match (n, m) {
+                (0, 0) => attending_label.clone(),
+                _ => " ".repeat(indent),
+            };
+            content.push(emit(&[dim(lead), plain(line)], "", cols));
+        }
     }
     if let Some(state) = &agent.state {
         let state_label = format!("{LEAD}state     ");
@@ -10878,7 +10976,7 @@ mod tests {
                 ..Default::default()
             },
         ));
-        s.agents[1].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[1].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: Some("cargo test".to_string()),
             token: None,
@@ -10889,7 +10987,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         let out = render(&s, 40, 80);
         let codex_row = visible(line_with(&out, "codex"));
         assert!(
@@ -11332,7 +11431,7 @@ mod tests {
                 suppressors: Vec::new(),
                 nudge: Nudge::WaitingForYou("resuming this harness is not enabled".into()),
                 cannot_resume: Some("no evidence".into()),
-                attending: None,
+                attending: Vec::new(),
                 asking: None,
                 repeated: None,
             },
@@ -11416,6 +11515,76 @@ mod tests {
         assert!(page.contains("stale: another session is bound"), "{page}");
     }
 
+    /// Two entries that cover their work and one that does not, as the
+    /// monitor publishes them. `at` that names no moment keeps the ages
+    /// out, so the rendering is fixed.
+    fn three_entries() -> Vec<crate::cli::agent_state::Attended> {
+        let entry = |task: &str, desc: &str, subagent: bool, why: Option<&str>| {
+            crate::cli::agent_state::Attended {
+                expect: None,
+                desc: Some(desc.into()),
+                token: None,
+                task: task.into(),
+                pid: (!subagent).then_some(i32::MAX),
+                at: "unknown".into(),
+                subagent,
+                pending: false,
+                check_in: None,
+                unqualified: why.map(str::to_string),
+            }
+        };
+        vec![
+            entry("a1", "reviewer sleeper", true, None),
+            entry("a2", "doc writer", true, None),
+            entry("b3", "test run", false, Some("process gone")),
+        ]
+    }
+
+    /// An agent attending three things shows three, on its row and its
+    /// detail page: the two that cover their work, and the one that does
+    /// not with the reason.
+    #[test]
+    fn every_entry_shows_on_the_row_and_the_detail_page() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = three_entries();
+        let lines = render(&s, 40, 100);
+        assert_eq!(
+            visible(line_with(&lines, "⌛")).trim_end(),
+            "  ⌛ reviewer sleeper  ⌛ doc writer  ○ test run — process gone"
+        );
+
+        let page: Vec<String> =
+            render_agent_detail(&s.agents[0], None, &[DetailAction::Back], 0, 40, 100)
+                .0
+                .iter()
+                .map(|l| visible(l).trim_end().to_string())
+                .filter(|l| l.contains("⌛") || l.contains("○"))
+                .collect();
+        assert_eq!(
+            page,
+            [
+                "   attending ⌛ reviewer sleeper",
+                "             ⌛ doc writer",
+                "             ○ test run — process gone",
+            ]
+        );
+    }
+
+    /// A row too narrow for every entry sheds detail in step, then counts
+    /// what it cannot show rather than dropping it.
+    #[test]
+    fn a_narrow_row_counts_the_entries_it_cannot_show() {
+        let mut s = two_agent_snap();
+        s.agents[0].attending = three_entries();
+        let at = |cols| {
+            visible(line_with(&render(&s, 40, cols), "⌛"))
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(at(50), "  ⌛ reviewer sleeper  ⌛ doc writer  ○ test run");
+        assert_eq!(at(40), "  ⌛ reviewer sleeper  ⌛ doc writer  +1");
+    }
+
     /// An attending agent is blocked, not working. The hourglass takes
     /// the spinner's place rather than joining it: an animated
     /// `working…` beside a wait marker asserts two states at once, and
@@ -11424,7 +11593,7 @@ mod tests {
     fn an_attending_agent_row_shows_the_hourglass_instead_of_a_verb() {
         let mut s = two_agent_snap();
         s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11434,7 +11603,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         let lines = render(&s, 40, 80);
         let agent = visible(line_with(&lines, "claude"));
         let wait = visible(line_with(&lines, "⌛"));
@@ -11454,7 +11624,7 @@ mod tests {
     #[test]
     fn an_ended_wait_renders_no_marker_and_keeps_the_record() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11465,7 +11635,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         let joined = render(&s, 40, 80).join("\n");
         assert!(
             !joined.contains("⌛"),
@@ -11473,7 +11644,7 @@ mod tests {
         );
         assert!(!joined.contains("stale"), "and says nothing about it");
         assert!(
-            s.agents[0].attending.is_some(),
+            !s.agents[0].attending.is_empty(),
             "rendering must not consume the record — the hook owns reaping"
         );
     }
@@ -11493,7 +11664,7 @@ mod tests {
     #[test]
     fn a_wait_that_cannot_be_checked_is_not_drawn() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11503,7 +11674,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         assert!(
             !render(&s, 40, 80).join("\n").contains("⌛"),
             "an uncheckable record must not be shown as an ongoing wait"
@@ -11512,7 +11684,7 @@ mod tests {
         // The control: give it a pid that IS alive and the wait draws,
         // so the assertion above is about checkability and not about a
         // snapshot that never drew a marker at all.
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11522,7 +11694,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         let wait = visible(line_with(&render(&s, 40, 80), "⌛"));
         assert!(
             wait.contains("b72qah60w"),
@@ -11560,10 +11733,11 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
 
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(att(Some("test run")));
+        s.agents[0].attending = vec![att(Some("test run"))];
         let wait = visible(line_with(&render(&s, 40, 120), "⌛"));
         assert!(
             wait.contains("test run"),
@@ -11578,7 +11752,7 @@ mod tests {
             "the pid still rides along when there is room: {wait}"
         );
 
-        s.agents[0].attending = Some(att(None));
+        s.agents[0].attending = vec![att(None)];
         let wait = visible(line_with(&render(&s, 40, 120), "⌛"));
         assert!(
             wait.contains("b72qah60w"),
@@ -11613,6 +11787,7 @@ mod tests {
                 subagent: false,
                 pending: false,
                 check_in: None,
+                unqualified: None,
             };
             let fields = att.marker_fields(now).expect("a live wait is drawn");
             let marker = fit_marker(&fields, 80).expect("80 columns is ample");
@@ -11641,6 +11816,7 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
         let fields = att.marker_fields(now).expect("a live wait is drawn");
         let marker = fit_marker(&fields, 80).unwrap();
@@ -11719,7 +11895,7 @@ mod tests {
     fn an_undrawable_wait_still_stops_the_agent_claiming_it_is_working() {
         let mut s = two_agent_snap();
         s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -11730,7 +11906,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         let lines = render(&s, 40, 80);
         let agent = visible(line_with(&lines, "claude"));
         assert!(
@@ -11745,7 +11922,7 @@ mod tests {
         // The control: remove the attendance and the verb returns, so
         // the assertion above is about the wiring, not a snapshot that
         // never had a verb.
-        s.agents[0].attending = None;
+        s.agents[0].attending = Vec::new();
         let agent = visible(line_with(&render(&s, 40, 80), "claude"));
         assert!(
             agent.contains("working") && agent.contains(SPINNER[0]),
@@ -11758,7 +11935,7 @@ mod tests {
     #[test]
     fn a_narrow_pane_draws_no_marker_line_at_all() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: Some("running the whole test suite".to_string()),
             token: None,
@@ -11768,7 +11945,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         // 11 columns: two to the indent, three to the glyph, leaving
         // six for the subject — one short of the floor once the
         // ellipsis takes its column.
@@ -11826,7 +12004,7 @@ mod tests {
     #[test]
     fn the_wait_gets_an_indented_line_under_a_flush_agent_row() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: Some("test run".to_string()),
             token: None,
@@ -11836,7 +12014,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         let lines = render(&s, 40, 80);
         let agent_at = lines
             .iter()
@@ -11876,12 +12055,13 @@ mod tests {
                 subagent: false,
                 pending: false,
                 check_in: None,
+                unqualified: None,
             }
         };
         let me = std::process::id() as i32;
         let body = |a: &crate::cli::agent_state::Attended| {
             let actions = wait_actions(a.killable_pid().is_some());
-            render_wait_page("claude", a, None, None, 0, &actions, 0, 40, 80)
+            render_wait_page("claude", a, &[], None, None, 0, &actions, 0, 40, 80)
                 .0
                 .iter()
                 .map(|l| visible(l))
@@ -11941,6 +12121,7 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
         let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
         let details = ProcessDetails {
@@ -11965,6 +12146,7 @@ mod tests {
             let body = render_wait_page(
                 "reviewer",
                 &att,
+                &[],
                 Some(&state),
                 None,
                 0,
@@ -12000,6 +12182,7 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
         let args = vec![
             format!("/{}界/tool", "directory/".repeat(30)).into(),
@@ -12025,6 +12208,7 @@ mod tests {
                     let (lines, total) = render_wait_page(
                         "reviewer",
                         &att,
+                        &[],
                         Some(&state),
                         Some(&command),
                         usize::MAX,
@@ -12067,6 +12251,7 @@ mod tests {
         let body = render_wait_page(
             "reviewer",
             &att,
+            &[],
             Some(&state),
             Some(&command),
             0,
@@ -12105,6 +12290,7 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
         let command = Command::encode(&["tool".into(), "two  spaces".into(), "".into()]);
         let error = Unavailable::Io(std::io::ErrorKind::PermissionDenied);
@@ -12121,6 +12307,7 @@ mod tests {
         let body = render_wait_page(
             "reviewer",
             &att,
+            &[],
             Some(&state),
             Some(&command),
             0,
@@ -12160,6 +12347,7 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         };
         let body = render_kill_confirm("claude", &att, 40, 80)
             .0
@@ -12198,7 +12386,7 @@ mod tests {
     #[test]
     fn an_attending_row_is_built_to_fit_its_pane() {
         let mut s = two_agent_snap();
-        s.agents[0].attending = Some(crate::cli::agent_state::Attended {
+        s.agents[0].attending = vec![crate::cli::agent_state::Attended {
             expect: None,
             desc: None,
             token: None,
@@ -12208,7 +12396,8 @@ mod tests {
             subagent: false,
             pending: false,
             check_in: None,
-        });
+            unqualified: None,
+        }];
         for cols in [18u16, 24, 40, 80] {
             for line in &render(&s, 40, cols) {
                 assert!(

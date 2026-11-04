@@ -12,9 +12,13 @@
 //!
 //! macOS spawns with `posix_spawn` and `POSIX_SPAWN_CLOEXEC_DEFAULT`,
 //! which closes inherited descriptors atomically in the kernel, with no
-//! pre-exec pass and no descriptor listing. It does not stop a spawn in
-//! flight briefly sharing this process's descriptors, flock leases
-//! included; `clank_user_config::lease::take` is what outwaits that.
+//! pre-exec pass and no descriptor listing.
+//!
+//! Nothing stops a spawn in flight, on any thread and either platform,
+//! briefly holding a copy of every descriptor this process has open
+//! until its exec closes them: flock leases, and the write end of
+//! another run's output pipe. `clank_user_config::lease::take` outwaits
+//! that for a lease, and [`HELD_PATIENCE`] for a run's output.
 //!
 //! Lifetimes, one entry point each: [`run`] / [`run_blocking`] for a
 //! bounded query or action, [`start`] for a child that is owned while
@@ -1162,8 +1166,8 @@ pub enum RunError {
         cap: usize,
         kept: Vec<u8>,
     },
-    /// It exited, but something still held an output pipe open, so
-    /// the output is not known to be whole.
+    /// It exited, but something still held an output pipe open
+    /// [`HELD_PATIENCE`] later, so the output is not known to be whole.
     Incomplete {
         status: ExitStatus,
         stderr: Vec<u8>,
@@ -1238,6 +1242,18 @@ enum Pumped {
 /// Reads one capture may take per pass, so a stream that never runs dry
 /// cannot starve the other stream or the deadline.
 const READS_PER_PASS: usize = 4;
+
+/// How long after the child's exit a capture that is empty but not at
+/// EOF is waited on before its writer is believed to be holding it.
+///
+/// A concurrent spawn on another thread holds a copy of the pipe's
+/// write end from its fork until its exec, so an instant check reads
+/// that passing copy as a holder (on Linux, std's fork path failed a
+/// dozen tests a CI run that way). The same reasoning and bound as
+/// `clank_user_config::lease::PATIENCE`: a copy lets go within it, a
+/// descendant that kept the pipe does not. The run's deadline still
+/// bounds it.
+pub const HELD_PATIENCE: Duration = Duration::from_millis(250);
 
 impl Sink {
     fn new(stream: Stream, out: Out, pipe: Option<OwnedFd>) -> io::Result<Option<Self>> {
@@ -1414,48 +1430,38 @@ impl Running {
         Ok(more)
     }
 
-    /// The child has exited: whether its output is whole is decided
-    /// first, while anything still holding a pipe still runs, and only
-    /// then is what is left of its group ended and the child reaped.
-    fn conclude(&mut self) -> Result<(ExitStatus, bool), RunError> {
+    /// The child has exited: wait until it is a zombie, so every byte
+    /// it wrote is in the pipes and its pid and group stay reserved
+    /// while completeness is decided. Returns the instant
+    /// [`HELD_PATIENCE`] runs out.
+    fn exited(&mut self) -> Result<Instant, RunError> {
         self.expired()?;
         self.child.await_zombie().map_err(RunError::Io)?;
-        let held = self.held()?;
-        self.expired()?;
-        self.child.kill();
-        let status = self.child.wait().map_err(RunError::Io)?;
-        Ok((status, held))
+        Ok(Instant::now() + HELD_PATIENCE)
     }
 
-    /// Every byte the exited child wrote is in the pipe, so each capture
-    /// is read to EOF, or found empty and still held by another writer.
-    fn held(&mut self) -> Result<bool, RunError> {
-        let mut decided = [false; 2];
-        let mut held = false;
+    /// Read every capture as far as it goes now. `Some(held)` once
+    /// decided: all at EOF is whole, and one still empty and held at
+    /// `patience` is held. `None` means wait for a capture or `patience`.
+    fn settle(&mut self, patience: Instant) -> Result<Option<bool>, RunError> {
         loop {
             self.expired()?;
-            for (slot, done) in self.sinks.iter_mut().zip(decided.iter_mut()) {
-                let Some(sink) = slot.as_mut().filter(|_| !*done) else {
-                    *done = true;
-                    continue;
-                };
-                match sink.pump().map_err(RunError::Io)? {
-                    Pumped::Eof => *done = true,
-                    Pumped::Open => {
-                        held = true;
-                        *done = true;
-                    }
-                    Pumped::More => {}
-                    Pumped::Overflow => {
-                        let sink = slot.take().expect("present");
-                        return Err(sink.overflow());
-                    }
-                }
-            }
-            if decided == [true; 2] {
-                return Ok(held);
+            if !self.pump_all()? {
+                break;
             }
         }
+        if !self.sinks.iter().flatten().any(Sink::open) {
+            return Ok(Some(false));
+        }
+        Ok((Instant::now() >= patience).then_some(true))
+    }
+
+    /// Called once completeness is decided: end what is left of the
+    /// group, then reap the child.
+    fn reap(&mut self) -> Result<ExitStatus, RunError> {
+        self.expired()?;
+        self.child.kill();
+        self.child.wait().map_err(RunError::Io)
     }
 
     fn finish(mut self, status: ExitStatus, held: bool) -> Result<Output, RunError> {
@@ -1481,8 +1487,9 @@ impl Running {
 
 /// Run `spec` to completion within `budget`, reading its captures
 /// while it runs. Complete means the child exited and every capture
-/// then read to EOF. The group it leads is killed once it exits, taking
-/// any descendant with it, and on any error; the child is reaped.
+/// then read to EOF within [`HELD_PATIENCE`]. The group it leads is
+/// killed once that is decided, taking any descendant with it, and on
+/// any error; the child is reaped.
 pub async fn run(spec: Spec, budget: Duration) -> Result<Output, RunError> {
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
@@ -1506,16 +1513,19 @@ pub async fn run(spec: Spec, budget: Duration) -> Result<Output, RunError> {
             );
         }
     }
+    let unwatch_closed = |watch: &mut [Option<AsyncFd<RawFd>>; 2], sinks: &[Option<Sink>; 2]| {
+        for (watched, sink) in watch.iter_mut().zip(sinks) {
+            if !sink.as_ref().is_some_and(Sink::open) {
+                *watched = None;
+            }
+        }
+    };
     let outcome = async {
         loop {
             r.expired()?;
             let more = r.pump_all()?;
             r.expired()?;
-            for (watched, sink) in watch.iter_mut().zip(&r.sinks) {
-                if !sink.as_ref().is_some_and(Sink::open) {
-                    *watched = None;
-                }
-            }
+            unwatch_closed(&mut watch, &r.sinks);
             if more {
                 tokio::task::yield_now().await;
                 continue;
@@ -1531,7 +1541,20 @@ pub async fn run(spec: Spec, budget: Duration) -> Result<Output, RunError> {
                 ready = readable(&watch[1]) => ready.map_err(RunError::Io)?,
             }
         }
-        r.conclude()
+        let patience = r.exited()?;
+        let held = loop {
+            if let Some(held) = r.settle(patience)? {
+                break held;
+            }
+            unwatch_closed(&mut watch, &r.sinks);
+            let until = tokio::time::Instant::from_std(patience).min(deadline);
+            tokio::select! {
+                _ = tokio::time::sleep_until(until) => {}
+                ready = readable(&watch[0]) => ready.map_err(RunError::Io)?,
+                ready = readable(&watch[1]) => ready.map_err(RunError::Io)?,
+            }
+        };
+        Ok((r.reap()?, held))
     }
     .await;
     drop(watch);
@@ -1588,7 +1611,21 @@ pub fn run_blocking(spec: Spec, budget: Duration) -> Result<Output, RunError> {
                 break;
             }
         }
-        r.conclude()
+        let patience = r.exited()?;
+        let held = loop {
+            if let Some(held) = r.settle(patience)? {
+                break held;
+            }
+            let mut fds: Vec<_> = r
+                .sinks
+                .iter()
+                .flatten()
+                .filter(|s| s.open())
+                .map(|s| pollfd(s.fd.as_raw_fd(), libc::POLLIN))
+                .collect();
+            poll_readable(&mut fds, patience.min(r.deadline)).map_err(RunError::Io)?;
+        };
+        Ok((r.reap()?, held))
     })();
     match outcome {
         Ok((status, held)) => r.finish(status, held),

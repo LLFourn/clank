@@ -127,7 +127,7 @@ fn doctor_warns_on_unbound_reviewer() {
         "warning should mention 'unbound'; got `{msg}`"
     );
     assert!(
-        msg.contains("clank as ruthless"),
+        msg.contains("clank agent start ruthless"),
         "warning should suggest the fix command; got `{msg}`"
     );
 }
@@ -268,8 +268,8 @@ fn doctor_warns_on_missing_skeleton() {
         "diagnostic should mention the missing skeleton path; got: {msg}"
     );
     assert!(
-        msg.contains("clank as"),
-        "diagnostic should mention `clank as` as the bind fix; got: {msg}"
+        msg.contains("clank agent start phantom"),
+        "diagnostic should name `clank agent start` as the bind fix; got: {msg}"
     );
 }
 

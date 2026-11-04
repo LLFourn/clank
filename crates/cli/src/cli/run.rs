@@ -21,7 +21,7 @@ use crate::cli::monitor::Control;
 pub async fn run(_args: RunArgs) -> anyhow::Result<()> {
     anyhow::bail!(
         "`clank run` needs `exec` to replace itself with the command, which this platform does \
-         not provide. Use `clank attend <task-id> --desc \"two words\" --pid <pid>` instead."
+         not provide."
     )
 }
 
@@ -37,7 +37,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let submit = |control: Control| -> Submitted<'_> {
         Box::pin(crate::cli::attend::submit(&repo, control))
     };
-    let err = launch(attend, clear, &submit, || {
+    let not_run = launch(attend, clear, &submit, || {
         crate::proc_run::exec(
             Spec::new(program)
                 .args(rest)
@@ -47,37 +47,54 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         )
     })
     .await;
-    Err(anyhow::anyhow!("cannot run `{program}`: {err}"))
+    Err(match not_run {
+        NotRun::Refused(why) => anyhow::anyhow!("{why}; `{program}` was not run"),
+        NotRun::Exec(err) => anyhow::anyhow!("cannot run `{program}`: {err}"),
+    })
 }
 
 /// A request on its way to the monitor, and its answer.
-type Submitted<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + 'a>>;
+type Submitted<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<String, crate::cli::attend::NotDone>> + 'a>,
+>;
+
+/// Why the command is not running.
+#[derive(Debug)]
+enum NotRun {
+    /// The monitor refused the attendance, so the command was never run.
+    Refused(crate::cli::attend::NotDone),
+    Exec(std::io::Error),
+}
 
 /// Ask for the attendance, then become the command. Only a FAILED exec
-/// returns, and then nothing is running: an attendance that was accepted
-/// is cleared, so nothing claims to be attended. An attendance the monitor
-/// would not take does not stop the work; the turn-ends are only noisier.
+/// returns once the command was tried, and then nothing is running: the
+/// entry this run registered is taken back by its own process proof, so
+/// nothing else the agent attends is touched. Only when no monitor took
+/// the request does the command run unattended; a monitor's refusal,
+/// such as a `--desc` another attended run holds, stops it before it runs.
 async fn launch<'a>(
     attend: Control,
     clear: Control,
     submit: &'a dyn Fn(Control) -> Submitted<'a>,
     exec: impl FnOnce() -> std::io::Error,
-) -> std::io::Error {
-    let attended = submit(attend).await;
-    if let Err(why) = &attended {
-        eprintln!("clank: this run is not attended ({why}); it runs anyway");
-    }
+) -> NotRun {
+    let attended = match submit(attend).await {
+        Ok(_) => true,
+        Err(crate::cli::attend::NotDone::NotTaken(why)) => {
+            eprintln!("clank: this run is not attended ({why}); it runs anyway");
+            false
+        }
+        Err(refused) => return NotRun::Refused(refused),
+    };
     let err = exec();
-    if attended.is_ok()
-        && let Err(why) = submit(clear).await
-    {
+    if attended && let Err(why) = submit(clear).await {
         eprintln!("clank: the failed run's attendance could not be cleared: {why}");
     }
-    err
+    NotRun::Exec(err)
 }
 
-/// The requests a run makes: to attend it, and to take that back.
+/// The requests a run makes: to attend it, and to take back exactly that
+/// entry.
 ///
 /// The process identity is THIS process's, and it stays correct across
 /// the exec: `exec` replaces the process image, not the process. The
@@ -104,6 +121,7 @@ fn requests(args: &RunArgs, repo: &std::path::Path) -> anyhow::Result<(Control, 
         );
     };
     let session = crate::cli::attend::session_of(repo, &label)?;
+    let proof = crate::cli::turn_custody::shell_proof(pid, &token);
     Ok((
         Control::Attend {
             author: label.to_string(),
@@ -111,11 +129,12 @@ fn requests(args: &RunArgs, repo: &std::path::Path) -> anyhow::Result<(Control, 
             selector: clank_core::turn_policy::Selector::RunDesc(desc.clone()),
             desc: Some(desc),
             expect_ms: args.expect.as_millis() as u64,
-            shell: Some(crate::cli::turn_custody::shell_proof(pid, &token)),
+            shell: Some(proof.clone()),
         },
         Control::Clear {
             author: label.to_string(),
             session,
+            which: clank_core::turn_policy::Clearing::Run(proof),
         },
     ))
 }
@@ -230,7 +249,15 @@ mod tests {
         assert_eq!(session.as_str(), "sess-run");
         let shell = shell.expect("its process proof");
         assert_eq!(shell.pid, std::process::id() as i32);
-        assert!(matches!(clear, Control::Clear { .. }));
+        assert_eq!(
+            clear,
+            Control::Clear {
+                author: "claude".into(),
+                session,
+                which: clank_core::turn_policy::Clearing::Run(shell),
+            },
+            "the rollback names this run's entry and no other"
+        );
     }
 
     #[test]
@@ -239,47 +266,110 @@ mod tests {
         assert!(requests(&run_args("   ", dir.path()), dir.path()).is_err());
     }
 
-    /// A command that cannot start leaves no intent: the attendance it
-    /// asked for first is taken back, and the error names the command.
-    #[tokio::test]
-    async fn a_failed_exec_clears_the_attendance_it_asked_for() {
-        let sent = std::cell::RefCell::new(Vec::new());
-        let submit = |c: Control| -> Submitted<'_> {
-            sent.borrow_mut().push(c);
-            Box::pin(async { Ok("ok".to_string()) })
+    fn run_controls() -> (Control, Control) {
+        let session = clank_core::SessionId::parse("sess-run").unwrap();
+        let proof = clank_core::turn_policy::ShellProof {
+            pid: 7003,
+            token: "mac1:7003:1".into(),
         };
-        let attend = Control::Attend {
-            author: "claude".into(),
-            session: clank_core::SessionId::parse("sess-run").unwrap(),
-            selector: clank_core::turn_policy::Selector::RunDesc("x".into()),
-            desc: None,
-            expect_ms: 1,
-            shell: None,
-        };
-        let clear = Control::Clear {
-            author: "claude".into(),
-            session: clank_core::SessionId::parse("sess-run").unwrap(),
-        };
-        let err = launch(attend.clone(), clear.clone(), &submit, || {
-            std::io::Error::from(std::io::ErrorKind::NotFound)
-        })
-        .await;
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert_eq!(*sent.borrow(), vec![attend.clone(), clear]);
+        (
+            Control::Attend {
+                author: "claude".into(),
+                session: session.clone(),
+                selector: clank_core::turn_policy::Selector::RunDesc("test run".into()),
+                desc: Some("test run".into()),
+                expect_ms: 1,
+                shell: Some(proof.clone()),
+            },
+            Control::Clear {
+                author: "claude".into(),
+                session,
+                which: clank_core::turn_policy::Clearing::Run(proof),
+            },
+        )
+    }
 
-        let refused = |c: Control| -> Submitted<'_> {
+    /// Drive `launch` against a monitor answering the attend with
+    /// `answer`: what was sent to it, whether the command was tried, and
+    /// why it is not running.
+    async fn launched(
+        answer: Result<String, crate::cli::attend::NotDone>,
+    ) -> (Vec<Control>, bool, NotRun) {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let execs = std::cell::Cell::new(false);
+        let submit = |c: Control| -> Submitted<'_> {
+            let first = sent.borrow().is_empty();
             sent.borrow_mut().push(c);
-            Box::pin(async { Err("no monitor".to_string()) })
+            let reply = if first {
+                answer.clone()
+            } else {
+                Ok("cleared".to_string())
+            };
+            Box::pin(async move { reply })
         };
-        sent.borrow_mut().clear();
-        launch(attend.clone(), attend.clone(), &refused, || {
+        let (attend, clear) = run_controls();
+        let not_run = launch(attend, clear, &submit, || {
+            execs.set(true);
             std::io::Error::from(std::io::ErrorKind::NotFound)
         })
         .await;
+        (sent.into_inner(), execs.get(), not_run)
+    }
+
+    /// A command that cannot start takes back exactly the entry it
+    /// registered, by its process proof, and the error names the exec.
+    #[tokio::test]
+    async fn a_failed_exec_clears_only_the_entry_it_registered() {
+        let (attend, clear) = run_controls();
+        let (sent, execed, not_run) = launched(Ok("attending".into())).await;
+        assert!(execed);
+        assert!(
+            matches!(&not_run, NotRun::Exec(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{not_run:?}"
+        );
+        assert_eq!(sent, vec![attend, clear]);
+    }
+
+    /// A `--desc` another attended run holds stops this one before it
+    /// runs: two tasks carrying it could never be told apart.
+    #[tokio::test]
+    async fn a_desc_in_use_is_refused_and_never_execs() {
+        let (sent, execed, not_run) = launched(Err(crate::cli::attend::NotDone::DescInUse(
+            "test run".into(),
+        )))
+        .await;
+        assert!(!execed, "the command is not run");
+        assert_eq!(sent.len(), 1, "nothing was registered, so nothing to clear");
+        let NotRun::Refused(why) = not_run else {
+            panic!("{not_run:?}");
+        };
         assert_eq!(
-            sent.borrow().len(),
+            why.to_string(),
+            "another `clank run` is already attended as `test run`; give this one a different \
+             --desc"
+        );
+    }
+
+    /// Only a request no monitor took still runs the command, unattended.
+    #[tokio::test]
+    async fn without_a_monitor_the_command_still_runs() {
+        let (sent, execed, not_run) = launched(Err(crate::cli::attend::NotDone::NotTaken(
+            "no monitor".into(),
+        )))
+        .await;
+        assert!(execed);
+        assert!(matches!(not_run, NotRun::Exec(_)));
+        assert_eq!(
+            sent.len(),
             1,
             "an attendance never accepted has nothing to clear"
         );
+
+        let (sent, execed, _) = launched(Err(crate::cli::attend::NotDone::Refused(
+            "this session no longer holds the label".into(),
+        )))
+        .await;
+        assert!(!execed, "a monitor's refusal stops the run");
+        assert_eq!(sent.len(), 1);
     }
 }

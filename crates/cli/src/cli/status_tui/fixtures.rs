@@ -28,7 +28,7 @@ pub(crate) fn agent_row(
         asking: None,
         repeated: None,
 
-        attending: None,
+        attending: Vec::new(),
     }
 }
 
@@ -170,7 +170,7 @@ pub(crate) fn with_agents(
             asking: None,
             repeated: None,
 
-            attending: None,
+            attending: Vec::new(),
         })
         .collect();
     s

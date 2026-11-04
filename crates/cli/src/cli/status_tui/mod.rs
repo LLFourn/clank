@@ -152,10 +152,7 @@ fn relocate_wait(
     agents: &[crate::cli::status::AgentAutoRow],
 ) -> Option<usize> {
     agents.iter().position(|a| {
-        a.label == page.label
-            && a.attending
-                .as_ref()
-                .is_some_and(|att| page.matches(&a.label, att))
+        a.label == page.label && a.attending.iter().any(|att| page.matches(&a.label, att))
     })
 }
 
@@ -245,12 +242,13 @@ fn resolve_kill_target(
         }
         Err(e) => return Err(format!("cannot read the roster: {e}")),
     }
-    let Some(att) = crate::cli::agent_state::attended_now(repo, &page.label) else {
+    let attending = crate::cli::agent_state::attended_now(repo, &page.label);
+    if attending.is_empty() {
         return Err(format!("`{}` is no longer attending anything", page.label));
-    };
-    if !page.matches(&page.label, &att) {
-        return Err("that wait was replaced by a different one".to_string());
     }
+    let Some(att) = attending.iter().find(|att| page.matches(&page.label, att)) else {
+        return Err("that wait was replaced by a different one".to_string());
+    };
     att.killable_pid().ok_or_else(|| {
         att.kill_blocker()
             .unwrap_or("it cannot be identified")
@@ -4339,10 +4337,11 @@ pub(crate) async fn run_tui(
                             continue;
                         }
                         Mode::WaitDetail { agent, sel } => {
-                            let att = snapshot
-                                .agents
-                                .get(agent)
-                                .and_then(|a| a.attending.as_ref());
+                            let att = snapshot.agents.get(agent).and_then(|a| {
+                                wait_page.as_ref().and_then(|page| {
+                                    a.attending.iter().find(|t| page.matches(&a.label, t))
+                                })
+                            });
                             let actions = crate::cli::status_tui::input::wait_actions(
                                 att.is_some_and(|a| a.killable_pid().is_some()),
                             );
@@ -4417,7 +4416,7 @@ pub(crate) async fn run_tui(
                                 PanelAction::OpenWait(agent) => {
                                     if let Some((label, att)) =
                                         snapshot.agents.get(agent).and_then(|a| {
-                                            a.attending.as_ref().map(|t| (a.label.clone(), t))
+                                            a.primary_wait().map(|t| (a.label.clone(), t))
                                         })
                                     {
                                         let page = WaitPage::new(&label, att);
@@ -11120,6 +11119,7 @@ pub(crate) mod tests {
             subagent: false,
             pending: false,
             check_in: None,
+            unqualified: None,
         }
     }
 
@@ -11151,7 +11151,7 @@ pub(crate) mod tests {
                 suppressors: Vec::new(),
                 nudge: crate::cli::agent_state::Nudge::Nothing,
                 cannot_resume: None,
-                attending: Some(att.clone()),
+                attending: vec![att.clone()],
                 asking: None,
                 repeated: None,
             },
@@ -11162,7 +11162,7 @@ pub(crate) mod tests {
         att: Option<crate::cli::agent_state::Attended>,
     ) -> crate::cli::status::StatusSnapshot {
         let mut s = two_agent_snap();
-        s.agents[0].attending = att;
+        s.agents[0].attending = att.into_iter().collect();
         s
     }
 
@@ -11387,7 +11387,7 @@ pub(crate) mod tests {
         );
 
         // Same agent, attending something else now.
-        s.agents[1].attending = Some(attended("t9", "2026-08-24T09:00:00Z", Some(me), true));
+        s.agents[1].attending = vec![attended("t9", "2026-08-24T09:00:00Z", Some(me), true)];
         assert_eq!(
             relocate_wait(&p, &s.agents),
             None,
@@ -11403,10 +11403,7 @@ pub(crate) mod tests {
         use crate::proc_identity::inspect::Inspection;
         let me = std::process::id() as i32;
         let mut snap = snap_attending(Some(attended("t1", "same", Some(me), true)));
-        let mut page = Some(WaitPage::new(
-            "claude",
-            snap.agents[0].attending.as_ref().unwrap(),
-        ));
+        let mut page = Some(WaitPage::new("claude", &snap.agents[0].attending[0]));
         let mut mode = Mode::WaitDetail { agent: 0, sel: 0 };
         let mut process = wait_process::Controller::default();
         process.request(page.as_ref().unwrap().clone());
@@ -11435,18 +11432,15 @@ pub(crate) mod tests {
         let me = std::process::id() as i32;
         for replacement in 0..3 {
             let mut snap = snap_attending(Some(attended("t1", "same", Some(me), true)));
-            let mut page = Some(WaitPage::new(
-                "claude",
-                snap.agents[0].attending.as_ref().unwrap(),
-            ));
+            let mut page = Some(WaitPage::new("claude", &snap.agents[0].attending[0]));
             let mut mode = Mode::WaitDetail { agent: 0, sel: 0 };
             let mut process = wait_process::Controller::default();
             process.request(page.as_ref().unwrap().clone());
             let job = process.take_job().unwrap();
             process.request(page.as_ref().unwrap().clone()); // pending explicit refresh
             match replacement {
-                0 => snap.agents[0].attending.as_mut().unwrap().pid = Some(42),
-                1 => snap.agents[0].attending.as_mut().unwrap().token = None,
+                0 => snap.agents[0].attending[0].pid = Some(42),
+                1 => snap.agents[0].attending[0].token = None,
                 _ => mode = Mode::AgentPanel { sel: 0 },
             }
             // Task and timestamp did not change: PID/birth changes still invalidate.

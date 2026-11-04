@@ -2791,16 +2791,19 @@ mod tests {
     }
 
     /// Every role on every tool is taught to hand long background work to
-    /// clank: `run` for shell work, `attend` by name for a subagent, and no
-    /// polling while it runs.
+    /// clank: `run` for shell work, `attend` by name for a subagent,
+    /// several at once, that unattended live work wakes it, and no polling
+    /// while it runs.
     #[test]
     fn every_skill_teaches_background_attendance() {
         for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
-            for role in [Role::Master, Role::Reviewer] {
+            for role in [Role::Master, Role::Reviewer, Role::Standby] {
                 let skill = compose_skill(role, tool);
                 for needle in [
                     "clank run --desc",
                     "clank attend \"<name>\"",
+                    "attend several at\n  once",
+                    "live work you don't attend wakes you",
                     "never poll it",
                 ] {
                     assert!(

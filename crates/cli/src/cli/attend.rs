@@ -1,18 +1,23 @@
-//! `clank attend <name>` — tell the monitor which background work this
-//! agent is waiting on, so work it has already been shown does not wake it
-//! again while that work runs. New work still wakes it.
+//! `clank attend <name>` — tell the monitor which subagent this agent is
+//! waiting on, so work it has already been shown does not wake it again
+//! while that work runs. New work still wakes it.
+//!
+//! An agent may attend several things at once; each request adds an entry
+//! or renews the one already attending the same work, and never touches
+//! another. Shell work is attended by launching it through `clank run`,
+//! which registers itself: a shell task's description is the tool's, not a
+//! handle, so a name that matches only shell work is refused.
 //!
 //! The request is an INTENT. The monitor resolves it against the next
-//! turn-end's listing of live background work: a subagent by its name, or
-//! shell work by its task id with the `--pid` of its process (or, simpler,
-//! work launched through `clank run`). Until a listing shows exactly one
-//! live match, nothing is quiet. Quiet lasts only while the work is listed
-//! running, its process (for shell work) still holds its identity, and the
-//! `--expect` deadline has not passed; at that deadline the agent is
-//! checked in on once. `clank attending` is the old spelling.
+//! turn-end's listing of live background work. Until a listing shows
+//! exactly one live match, nothing is quiet. Quiet lasts only while the
+//! work is listed running and the `--expect` deadline has not passed; at
+//! that deadline the agent is checked in on once. `clank attending` is the
+//! old spelling.
 
 use super::{AttendArgs, resolve_repo};
 use crate::cli::monitor::Control;
+use clank_core::turn_policy::{Clearing, Selector};
 
 pub async fn run(args: AttendArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -25,7 +30,7 @@ pub async fn run(args: AttendArgs) -> anyhow::Result<()> {
     let control = request(&args, &label, &session)?;
     let said = submit(&repo, control)
         .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     println!("{said}");
     Ok(())
 }
@@ -48,23 +53,28 @@ pub(crate) fn session_of(
 }
 
 /// The request `args` make for `label`'s `session`, or why it cannot be
-/// made. Shell work names its task id and the process that runs it: a pid
-/// alone is reused, so its identity is taken now, while it is known to be
-/// the process meant.
+/// made.
 pub(crate) fn request(
     args: &AttendArgs,
     label: &clank_core::ids::AgentLabel,
     session: &clank_core::SessionId,
 ) -> anyhow::Result<Control> {
     let author = label.to_string();
+    let name = args.selector.as_deref().map(str::trim);
     if args.clear {
+        let which = match name {
+            None => Clearing::All,
+            Some("") => anyhow::bail!("the name to clear is empty"),
+            Some(name) => Clearing::Named(name.to_string()),
+        };
         return Ok(Control::Clear {
             author,
             session: session.clone(),
+            which,
         });
     }
-    let Some(name) = args.selector.as_deref().map(str::trim) else {
-        anyhow::bail!("name the background work to attend, or `--clear` to stop attending");
+    let Some(name) = name else {
+        anyhow::bail!("name the subagent to attend, or `--clear` to stop attending");
     };
     if name.is_empty() {
         anyhow::bail!("the name to attend is empty");
@@ -73,51 +83,49 @@ pub(crate) fn request(
         .desc
         .as_deref()
         .map(normalise_desc)
-        .filter(|d| !d.is_empty());
-    let (selector, shell) = match args.pid {
-        None => (
-            clank_core::turn_policy::Selector::Name(name.to_string()),
-            None,
-        ),
-        Some(pid) => {
-            if pid <= 0 {
-                anyhow::bail!("--pid must be a real process id");
-            }
-            let Some(token) = crate::proc_identity::token_for(pid) else {
-                anyhow::bail!(
-                    "cannot identify pid {pid}: it may have already exited, or this platform \
-                     cannot answer. A pid alone is not an identity — the OS reuses them — so it \
-                     would prove nothing."
-                );
-            };
-            if desc.is_none() {
-                anyhow::bail!(
-                    "--desc is empty; give TWO WORDS for what you are waiting on, e.g. \
-                     `--desc \"test run\"`"
-                );
-            }
-            (
-                clank_core::turn_policy::Selector::TaskId(name.to_string()),
-                Some(crate::cli::turn_custody::shell_proof(pid, &token)),
-            )
-        }
-    };
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| name.to_string());
     Ok(Control::Attend {
         author,
         session: session.clone(),
-        desc: desc.or_else(|| match &selector {
-            clank_core::turn_policy::Selector::Name(name) => Some(name.clone()),
-            _ => None,
-        }),
-        selector,
+        selector: Selector::Name(name.to_string()),
+        desc: Some(desc),
         expect_ms: args.expect.as_millis() as u64,
-        shell,
+        shell: None,
     })
+}
+
+/// Why the monitor did not carry out a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotDone {
+    /// No monitor took the request, so nothing was recorded.
+    NotTaken(String),
+    /// Another attended `clank run` holds this `--desc`.
+    DescInUse(String),
+    /// The monitor refused it, and why.
+    Refused(String),
+}
+
+impl std::fmt::Display for NotDone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotTaken(why) => write!(
+                f,
+                "no monitor took the request ({why}), so nothing was recorded"
+            ),
+            Self::DescInUse(desc) => write!(
+                f,
+                "another `clank run` is already attended as `{desc}`; give this one a different \
+                 --desc"
+            ),
+            Self::Refused(why) => f.write_str(why),
+        }
+    }
 }
 
 /// Hand `control` to the repo's monitor, starting one if none is running,
 /// and give its answer.
-pub(crate) async fn submit(repo: &std::path::Path, control: Control) -> Result<String, String> {
+pub(crate) async fn submit(repo: &std::path::Path, control: Control) -> Result<String, NotDone> {
     let attached = crate::cli::monitor::attach_or_spawn_with(
         repo,
         crate::cli::monitor::Who::Control { request: control },
@@ -126,18 +134,17 @@ pub(crate) async fn submit(repo: &std::path::Path, control: Control) -> Result<S
     .await;
     let mut conn = match attached {
         crate::cli::monitor::Attached::Shared(conn) => conn,
-        crate::cli::monitor::Attached::Alone(why) => {
-            return Err(format!(
-                "no monitor took the request ({why}), so nothing was recorded"
-            ));
-        }
+        crate::cli::monitor::Attached::Alone(why) => return Err(NotDone::NotTaken(why)),
     };
     let deadline = std::time::Instant::now() + crate::cli::monitor::ATTACH_BUDGET;
     match conn.note(deadline) {
         Ok(crate::cli::monitor::Note::Done { what }) => Ok(what),
-        Ok(crate::cli::monitor::Note::Refused { why }) => Err(why),
-        Ok(other) => Err(format!("the monitor answered {other:?}")),
-        Err(e) => Err(format!("the monitor did not answer: {e}")),
+        Ok(crate::cli::monitor::Note::Refused { why }) => Err(NotDone::Refused(why)),
+        Ok(crate::cli::monitor::Note::DescInUse { desc }) => Err(NotDone::DescInUse(desc)),
+        Ok(other) => Err(NotDone::NotTaken(format!("the monitor answered {other:?}"))),
+        Err(e) => Err(NotDone::NotTaken(format!(
+            "the monitor did not answer: {e}"
+        ))),
     }
 }
 
@@ -183,7 +190,6 @@ pub(crate) fn normalise_desc(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clank_core::turn_policy::Selector;
 
     fn label() -> clank_core::ids::AgentLabel {
         clank_core::ids::AgentLabel::parse("claude").unwrap()
@@ -196,7 +202,6 @@ mod tests {
     fn args(name: Option<&str>, desc: Option<&str>) -> AttendArgs {
         AttendArgs {
             selector: name.map(str::to_string),
-            pid: None,
             expect: std::time::Duration::from_secs(300),
             desc: desc.map(str::to_string),
             clear: false,
@@ -205,33 +210,22 @@ mod tests {
         }
     }
 
-    fn me() -> i32 {
-        std::process::id() as i32
-    }
-
-    fn attend(
-        control: Control,
-    ) -> (
-        Selector,
-        Option<String>,
-        u64,
-        Option<clank_core::turn_policy::ShellProof>,
-    ) {
+    fn attend(control: Control) -> (Selector, Option<String>, u64) {
         match control {
             Control::Attend {
                 selector,
                 desc,
                 expect_ms,
-                shell,
+                shell: None,
                 ..
-            } => (selector, desc, expect_ms, shell),
+            } => (selector, desc, expect_ms),
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn a_subagent_is_attended_by_its_name_with_no_pid() {
-        let (selector, desc, expect, shell) = attend(
+    fn a_subagent_is_attended_by_its_name() {
+        let (selector, desc, expect) = attend(
             request(
                 &args(Some("capture-probe sleeper"), None),
                 &label(),
@@ -246,123 +240,57 @@ mod tests {
             "its name is its subject"
         );
         assert_eq!(expect, 300_000);
-        assert_eq!(shell, None);
+        let (_, desc, _) = attend(
+            request(
+                &args(Some("capture-probe sleeper"), Some("  probe run \n more")),
+                &label(),
+                &session(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(desc.as_deref(), Some("probe run"), "normalised, not raw");
     }
 
     #[test]
-    fn the_old_spelling_and_its_flags_still_parse() {
+    fn the_old_spelling_still_parses() {
         use clap::Parser;
-        let cli = crate::cli::command::Cli::try_parse_from([
-            "clank",
-            "attending",
-            "br9711ewy",
-            "--desc",
-            "test run",
-            "--pid",
-            "1",
-        ])
-        .expect("the hidden alias parses");
+        let cli = crate::cli::command::Cli::try_parse_from(["clank", "attending", "sleeper"])
+            .expect("the hidden alias parses");
         let crate::cli::command::Command::Attend(a) = cli.command else {
             panic!("not attend");
         };
-        assert_eq!(a.selector.as_deref(), Some("br9711ewy"));
-        assert_eq!(a.pid, Some(1));
+        assert_eq!(a.selector.as_deref(), Some("sleeper"));
     }
 
-    /// Shell work names its task id and the process it runs as, with the
-    /// identity taken now: the shape `clank attending <task> --desc --pid`
-    /// always had.
     #[test]
-    fn shell_work_is_attended_by_task_id_with_its_process_identity() {
-        let (selector, desc, _, shell) = attend(
+    fn clearing_clears_everything_or_the_one_it_names() {
+        let clear = |name: Option<&str>| {
             request(
                 &AttendArgs {
-                    pid: Some(me()),
-                    ..args(Some("br9711ewy"), Some("  test run  "))
+                    clear: true,
+                    ..args(name, None)
                 },
                 &label(),
                 &session(),
             )
-            .unwrap(),
-        );
-        assert_eq!(selector, Selector::TaskId("br9711ewy".into()));
-        assert_eq!(desc.as_deref(), Some("test run"), "normalised, not raw");
-        let shell = shell.expect("the process proof rides along");
-        assert_eq!(shell.pid, me());
-        let token: crate::proc_identity::ProcToken = serde_json::from_str(&shell.token).unwrap();
-        assert!(token.still_holds(me()));
-    }
-
-    #[test]
-    fn shell_work_needs_a_description_that_survives_normalising() {
-        for blank in [
-            None,
-            Some("   "),
-            Some("\u{7}\u{1b}"),
-            Some("\n first line lost"),
-        ] {
-            let err = request(
-                &AttendArgs {
-                    pid: Some(me()),
-                    ..args(Some("br9711ewy"), blank)
-                },
-                &label(),
-                &session(),
-            )
-            .expect_err("refused");
-            assert!(err.to_string().contains("--desc is empty"), "{err}");
-        }
-    }
-
-    #[test]
-    fn a_pid_that_cannot_be_identified_is_refused() {
-        let err = request(
-            &AttendArgs {
-                pid: Some(999_999_998),
-                ..args(Some("br9711ewy"), Some("test run"))
-            },
-            &label(),
-            &session(),
-        )
-        .expect_err("unidentifiable pid: refused");
-        assert!(err.to_string().contains("identity"), "{err}");
-    }
-
-    #[test]
-    fn an_over_long_description_is_kept_whole() {
-        let long = "cargo nextest run across every crate in the workspace ".repeat(8);
-        let (_, desc, _, _) = attend(
-            request(
-                &AttendArgs {
-                    pid: Some(me()),
-                    ..args(Some("br9711ewy"), Some(&long))
-                },
-                &label(),
-                &session(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(desc.as_deref(), Some(long.trim()));
-    }
-
-    #[test]
-    fn clearing_names_nothing() {
-        let control = request(
-            &AttendArgs {
-                clear: true,
-                ..args(None, None)
-            },
-            &label(),
-            &session(),
-        )
-        .unwrap();
+        };
         assert_eq!(
-            control,
+            clear(None).unwrap(),
             Control::Clear {
                 author: "claude".into(),
                 session: session(),
+                which: Clearing::All,
             }
         );
+        assert_eq!(
+            clear(Some(" test run ")).unwrap(),
+            Control::Clear {
+                author: "claude".into(),
+                session: session(),
+                which: Clearing::Named("test run".into()),
+            }
+        );
+        assert!(clear(Some("  ")).is_err());
         assert!(request(&args(None, None), &label(), &session()).is_err());
     }
 

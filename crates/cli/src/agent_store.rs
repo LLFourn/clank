@@ -87,17 +87,36 @@ pub fn update_agent_config(
     mutate_locked(&guard, edit)
 }
 
-/// The one config transaction: load under `guard`, edit, and replace
-/// the file only if the edit changed it. Taking the guard rather than
-/// the lock is what lets the binding transactions run their checks and
-/// side effects under the same acquisition without re-locking.
+/// [`update_agent_config`] for an edit that can refuse: a refusal
+/// leaves the file exactly as it was, absent included.
+pub fn try_update_agent_config<T>(
+    repo: &Path,
+    label: &AgentLabel,
+    edit: impl FnOnce(&mut AgentConfig) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let guard = BindingGuard::acquire(repo, label)?;
+    try_mutate_locked(&guard, edit)
+}
+
 fn mutate_locked<T>(
     guard: &BindingGuard,
     edit: impl FnOnce(&mut AgentConfig) -> T,
 ) -> anyhow::Result<T> {
+    try_mutate_locked(guard, |cfg| Ok(edit(cfg)))
+}
+
+/// The one config transaction: load under `guard`, edit, and replace
+/// the file only if the edit succeeded and changed it. Taking the guard
+/// rather than the lock is what lets the binding transactions run their
+/// checks and side effects under the same acquisition without
+/// re-locking.
+fn try_mutate_locked<T>(
+    guard: &BindingGuard,
+    edit: impl FnOnce(&mut AgentConfig) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let loaded = load_agent_config(guard.repo, guard.label)?;
     let mut cfg = loaded.clone().unwrap_or_default();
-    let out = edit(&mut cfg);
+    let out = edit(&mut cfg)?;
     #[cfg(test)]
     tests::inside_edit();
     if loaded.as_ref() != Some(&cfg) {

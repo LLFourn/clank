@@ -1138,7 +1138,7 @@ pub enum Discovery {
     /// Proven: no repository at the start directory or any parent.
     Absent,
     /// Discovery itself failed: unreadable or malformed git metadata, a
-    /// trust refusal, a ceiling or filesystem limit.
+    /// trust refusal, a ceiling.
     Failed(String),
 }
 
@@ -1151,17 +1151,28 @@ pub fn discover(start: &Path) -> Discovery {
             None => Discovery::Bare(r.git_dir().to_path_buf()),
         },
         // gix also reports no repository past a candidate it could not
-        // use, worktree pointer or bare git dir alike.
-        Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
-            ..
-        })) => match git_metadata_on_path(start, exists) {
-            Ok(None) => Discovery::Absent,
-            Ok(Some(found)) => Discovery::Failed(format!(
-                "`{}` looks like git metadata but is not a usable repository",
-                found.display()
-            )),
-            Err(e) => Discovery::Failed(e),
-        },
+        // use, worktree pointer or bare git dir alike. Stopping at a
+        // filesystem boundary is absence too: git's own discovery stops
+        // there, so no git command would find a repository above it.
+        Err(gix::discover::Error::Discover(
+            e @ (gix::discover::upwards::Error::NoGitRepository { .. }
+            | gix::discover::upwards::Error::NoGitRepositoryWithinFs { .. }),
+        )) => {
+            let limit = match &e {
+                gix::discover::upwards::Error::NoGitRepositoryWithinFs { limit, .. } => {
+                    Some(limit.as_path())
+                }
+                _ => None,
+            };
+            match git_metadata_on_path(start, limit, exists) {
+                Ok(None) => Discovery::Absent,
+                Ok(Some(found)) => Discovery::Failed(format!(
+                    "`{}` looks like git metadata but is not a usable repository",
+                    found.display()
+                )),
+                Err(e) => Discovery::Failed(e),
+            }
+        }
         Err(e) => Discovery::Failed(e.to_string()),
     }
 }
@@ -1181,12 +1192,13 @@ fn exists(path: &Path) -> std::io::Result<bool> {
 /// them still counts, while one stray file of those names does not.
 fn git_metadata_on_path(
     start: &Path,
+    limit: Option<&Path>,
     exists: impl Fn(&Path) -> std::io::Result<bool>,
 ) -> Result<Option<PathBuf>, String> {
     let probe = |path: PathBuf| {
         exists(&path).map_err(|e| format!("cannot inspect `{}`: {e}", path.display()))
     };
-    for dir in start.ancestors() {
+    for dir in start.ancestors().take_while(|d| Some(*d) != limit) {
         if probe(dir.join(".git"))? {
             return Ok(Some(dir.join(".git")));
         }
@@ -3119,6 +3131,25 @@ mod tests {
         );
     }
 
+    /// Metadata past a filesystem boundary belongs to a repository no
+    /// git command would discover from below it.
+    #[test]
+    fn metadata_past_the_filesystem_limit_is_not_looked_for() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let mount = root.path().join("mnt");
+        let start = mount.join("work");
+        std::fs::create_dir_all(&start).unwrap();
+        assert_eq!(
+            git_metadata_on_path(&start, None, |p| Ok(p.exists())),
+            Ok(Some(root.path().join(".git")))
+        );
+        assert_eq!(
+            git_metadata_on_path(&start, Some(root.path()), |p| Ok(p.exists())),
+            Ok(None)
+        );
+    }
+
     #[test]
     fn an_unreadable_path_entry_is_unknown_not_absent() {
         let dir = tempfile::tempdir().unwrap();
@@ -3129,8 +3160,11 @@ mod tests {
                 Ok(false)
             }
         };
-        assert!(git_metadata_on_path(dir.path(), denied).is_err());
-        assert_eq!(git_metadata_on_path(dir.path(), |_| Ok(false)), Ok(None));
+        assert!(git_metadata_on_path(dir.path(), None, denied).is_err());
+        assert_eq!(
+            git_metadata_on_path(dir.path(), None, |_| Ok(false)),
+            Ok(None)
+        );
     }
 
     #[test]

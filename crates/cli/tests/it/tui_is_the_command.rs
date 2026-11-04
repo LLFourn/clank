@@ -63,7 +63,9 @@ fn the_old_name_lives_only_in_the_alias_and_the_matcher() {
             .into_owned();
         for (n, line) in text.lines().enumerate() {
             let names_old = line.contains("status --tui") || line.contains("\"--tui\"");
-            if names_old && !may_name_status_tui(&rel) {
+            // The README's list of old spellings and what replaced them.
+            let documents_rename = rel == "README.md" && line.contains("`status --tui` is `tui`");
+            if names_old && !may_name_status_tui(&rel) && !documents_rename {
                 strays.push(format!("{rel}:{}: {}", n + 1, line.trim()));
             }
             if line.contains("clank web") && !rel.ends_with("tui_is_the_command.rs") {

@@ -187,10 +187,13 @@ pub(crate) enum Control {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shell: Option<clank_core::turn_policy::ShellProof>,
     },
-    /// Withdraw `author`'s attendance, and the check-in it owes.
+    /// Withdraw `which` of `author`'s attendances, and the check-ins they
+    /// owe.
     Clear {
         author: String,
         session: clank_core::SessionId,
+        #[serde(default)]
+        which: clank_core::turn_policy::Clearing,
     },
     /// A turn `author`'s harness reported for its own `session`, for
     /// recovery to read. Answered with how a retry would reach it.
@@ -255,6 +258,10 @@ pub(crate) enum Note {
     },
     /// A control request was carried out.
     Done { what: String },
+    /// An attend from `clank run` refused because another attended run
+    /// already holds its `--desc`: that command must not run, or neither
+    /// run could be told apart in the harness's listing.
+    DescInUse { desc: String },
     /// A turn-end verdict, for a connection carrying a report.
     Verdict(super::turn_wire::Frame),
     /// Proof of life, and nothing else.
@@ -3517,7 +3524,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         &mut Default::default(),
                         &pending,
                     );
-                    turns.check_in_failed(&done.author, done.check_in, why, &g);
+                    turns.check_in_failed(&done.author, done.check_ins, why, &g);
                     project(&mut recovery, &mut turns, &done.author, &g);
                 }
             }
@@ -3621,9 +3628,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         writer,
                     } => {
                         let answered = match &request {
-                            _ if !owner => {
-                                Err("this monitor no longer holds the repo's lease".to_string())
-                            }
+                            _ if !owner => Err(refused(
+                                "this monitor no longer holds the repo's lease".to_string(),
+                            )),
                             Control::Restart { author, key, .. } => {
                                 let restarted = restart_source(
                                     &repo,
@@ -3647,7 +3654,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                         );
                                     }
                                 }
-                                restarted
+                                restarted.map_err(refused)
                             }
                             Control::Observe { .. } | Control::RecoveryReply { .. } => {
                                 let (answered, acts) = match recovery_control(
@@ -3668,7 +3675,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                     &records,
                                     &mut owned,
                                 );
-                                answered
+                                answered.map_err(refused)
                             }
                             Control::Attend { .. } | Control::Clear { .. } => {
                                 let answered =
@@ -3698,7 +3705,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                         };
                         let note = match answered {
                             Ok(what) => Note::Done { what },
-                            Err(why) => Note::Refused { why },
+                            Err(note) => note,
                         };
                         if let Ok(line) = serde_json::to_string(&note) {
                             let _ = out.try_send(format!("{line}\n"));
@@ -4531,17 +4538,18 @@ fn last_look(
 struct CheckInAsk {
     author: AgentLabel,
     session: clank_core::SessionId,
-    /// The attendance the check-in was fired for.
-    check_in: clank_core::turn_policy::CheckInRef,
+    /// The entries the check-in was fired for.
+    check_ins: Vec<clank_core::turn_policy::CheckInRef>,
     /// The tool the roster gave the pane, and its screen as just read.
     screen: (clank_core::Tool, Option<String>),
-    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    /// The text to type, for the entries still owed it, or why none is.
+    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
 
 /// How a check-in's one typing went.
 struct CheckedIn {
     author: AgentLabel,
-    check_in: clank_core::turn_policy::CheckInRef,
+    check_ins: Vec<clank_core::turn_policy::CheckInRef>,
     outcome: Result<(), String>,
 }
 
@@ -4642,14 +4650,14 @@ async fn deliver_check_in(
         asks.send(CheckInAsk {
             author: due.author.clone(),
             session: due.session.clone(),
-            check_in: due.check_in.clone(),
+            check_ins: due.check_ins.clone(),
             screen: (target.tool, screen),
             reply,
         })
         .map_err(|_| "the monitor is gone".to_string())?;
         match answer.await {
-            Ok(Ok(())) => typist
-                .submit(target, due.text.clone())
+            Ok(Ok(text)) => typist
+                .submit(target, text)
                 .await
                 .map(|_| ())
                 .map_err(|e| match e {
@@ -4667,22 +4675,23 @@ async fn deliver_check_in(
     .await;
     let _ = done.send(CheckedIn {
         author: due.author,
-        check_in: due.check_in,
+        check_ins: due.check_ins,
         outcome,
     });
 }
 
 /// The last look before a check-in is typed: the session still bound to the
 /// tool the roster gave the pane, that harness resumed by typing, its input
-/// line empty, and, by `g` as gathered now, the attendance still the one
-/// the check-in was fired for with every wake gate open.
+/// line empty, and, by `g` as gathered now, every wake gate open. The text
+/// it answers with is for the entries still owed the check-in, as they
+/// stand now.
 fn may_check_in_now(
     repo: &std::path::Path,
     recovery: &crate::cli::recovery::Driver,
     turns: &mut crate::cli::turn_custody::Turns,
     g: &crate::cli::turn_custody::Gathered,
     ask: &CheckInAsk,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let (tool, screen) = &ask.screen;
     if !crate::agent_store::binding_matches(repo, &ask.author, *tool, ask.session.as_str()) {
         return Err("the session no longer holds the label".into());
@@ -4697,7 +4706,7 @@ fn may_check_in_now(
     {
         return Err("its input line is not empty".into());
     }
-    turns.may_type_check_in(&ask.author, &ask.check_in, g)
+    turns.may_type_check_in(&ask.author, &ask.check_ins, g)
 }
 
 /// Step every check-in due by `now`, gathering each agent as it is
@@ -7535,13 +7544,14 @@ fn recovery_control(
     }
 }
 
-/// Carry out an attend or clear request against `author`'s turn state.
+/// Carry out an attend or clear request against `author`'s turn state:
+/// what was done, or the note that refuses it.
 fn turn_control(
     repo: &std::path::Path,
     turns: &mut crate::cli::turn_custody::Turns,
     request: &Control,
     gathered: impl FnOnce(&AgentLabel) -> crate::cli::turn_custody::Gathered,
-) -> Result<(AgentLabel, String), String> {
+) -> Result<(AgentLabel, String), Note> {
     use clank_core::turn_policy::AttendRequest;
     let (author, request) = match request {
         Control::Attend {
@@ -7561,24 +7571,46 @@ fn turn_control(
                 shell: shell.clone(),
             },
         ),
-        Control::Clear { author, session } => (
+        Control::Clear {
+            author,
+            session,
+            which,
+        } => (
             author,
             AttendRequest::Clear {
                 session: session.clone(),
+                which: which.clone(),
             },
         ),
         Control::Restart { .. } | Control::Observe { .. } | Control::RecoveryReply { .. } => {
-            return Err("not a turn request".into());
+            return Err(refused("not a turn request".into()));
         }
     };
-    let author =
-        AgentLabel::parse(author).map_err(|e| format!("invalid author `{author}`: {e}"))?;
+    if let AttendRequest::Attend {
+        selector: clank_core::turn_policy::Selector::TaskId(_),
+        ..
+    } = &request
+    {
+        return Err(refused(
+            "attend a subagent by its name; shell work is attended by launching it with \
+             `clank run`"
+                .into(),
+        ));
+    }
+    let author = AgentLabel::parse(author)
+        .map_err(|e| refused(format!("invalid author `{author}`: {e}")))?;
     crate::agent_store::resolve_role(repo, &author)
-        .map_err(|e| format!("`{author}` is not on this repo's roster: {e:#}"))?;
+        .map_err(|e| refused(format!("`{author}` is not on this repo's roster: {e:#}")))?;
     let g = gathered(&author);
-    turns
-        .attend(&author, request, &g)
-        .map(|said| (author, said))
+    match turns.attend(&author, request, &g) {
+        Ok(said) => Ok((author, said)),
+        Err(crate::cli::turn_custody::Refused::DescInUse(desc)) => Err(Note::DescInUse { desc }),
+        Err(crate::cli::turn_custody::Refused::Other(why)) => Err(refused(why)),
+    }
+}
+
+fn refused(why: String) -> Note {
+    Note::Refused { why }
 }
 
 /// Send one note, and say whether that client may be kept.
@@ -8713,7 +8745,10 @@ mod recovery_tests {
             facts(&[])[0].attending,
             "a qualifying attendance holds recovery back over received work"
         );
-        assert!(facts(&[])[0].projection.attended.is_some(), "and is shown");
+        assert!(
+            !facts(&[])[0].projection.attended.is_empty(),
+            "and is shown"
+        );
         bind(clank_core::Tool::Codex, "session-three");
         assert!(
             !facts(&[])[0].attending,
@@ -8868,6 +8903,7 @@ mod recovery_tests {
                 &codex,
                 clank_core::turn_policy::AttendRequest::Clear {
                     session: clank_core::SessionId::parse("session-one").unwrap(),
+                    which: clank_core::turn_policy::Clearing::All,
                 },
                 &g,
             )
@@ -15195,6 +15231,7 @@ mod tests {
         match note {
             Note::Done { what } => panic!("unexpected control answer: {what}"),
             Note::Refused { why } => panic!("unexpected refusal: {why}"),
+            Note::DescInUse { desc } => panic!("unexpected refusal: {desc}"),
             Note::Beat => {}
             Note::Recover { .. } => panic!("a wait is never sent a recovery"),
             Note::Superseded => panic!("nothing superseded this wait"),

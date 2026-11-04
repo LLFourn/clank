@@ -372,15 +372,18 @@ pub enum Command {
     /// The old spelling of `block answer`.
     #[command(hide = true)]
     Unblock(crate::cli::UnblockArgs),
-    /// Tell clank which background work you are waiting on
+    /// Tell clank which subagent you are waiting on
     ///
     /// A subagent by its name (`clank attend "<name>"`); shell work is
-    /// best launched through `clank run`. While the work is listed running,
-    /// work you have already been shown does not wake you again; new work
-    /// still does. Say how long you expect it to take
-    /// (`--expect`, default 5m): if it is still running past that you are
-    /// checked in on once, so a hang cannot hold you asleep. Nothing is
-    /// cancelled.
+    /// attended by launching it through `clank run`. You can attend
+    /// several things at once: each attend adds one, or renews the one
+    /// already attending that work, and `--clear <name>` drops one. While
+    /// the work is listed running, work you have already been shown does
+    /// not wake you again; new work still does. Say how long you expect it
+    /// to take (`--expect`, default 5m): if it is still running past that
+    /// you are checked in on once, so a hang cannot hold you asleep.
+    /// Nothing is cancelled. Ending your turn with live background work
+    /// you are not attending wakes you with a notice naming it.
     #[command(alias = "attending")]
     Attend(crate::cli::AttendArgs),
     /// The full-screen pane for driving a running team
@@ -393,11 +396,13 @@ pub enum Command {
     ///
     /// Background this instead of the bare command:
     /// `clank run --desc "test run" -- cargo test`. Clank records what
-    /// it is attending, then BECOMES the command — same pid, same
-    /// stdio, same exit status — so the harness task's lifetime is the
-    /// work's lifetime and nothing has to be told when it finished.
-    /// `--expect 30m` says how long it should take; past that you are
-    /// checked in on once, and nothing is cancelled.
+    /// it is attending, beside anything else you attend, then BECOMES the
+    /// command — same pid, same stdio, same exit status — so the harness
+    /// task's lifetime is the work's lifetime and nothing has to be told
+    /// when it finished. `--expect 30m` says how long it should take; past
+    /// that you are checked in on once, and nothing is cancelled. Two
+    /// attended runs cannot share a `--desc`: the second is refused and
+    /// does not run.
     Run(crate::cli::RunArgs),
     /// Read or write clank config values
     ///

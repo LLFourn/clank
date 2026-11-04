@@ -886,6 +886,61 @@ pub enum EventsCmd {
     Show(EventsShowArgs),
     /// Read an event's content and record delivery to your bound agent.
     Read(EventsShowArgs),
+    /// List, add and remove the agent's standing wake sources.
+    Watch(EventsWatchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct EventsWatchArgs {
+    #[command(subcommand)]
+    pub command: EventsWatchCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum EventsWatchCmd {
+    /// Show the agent's wake sources, numbered from 1.
+    List(EventsWatchListArgs),
+    /// Add one wake source, in the JSON shape `clank wait --event` takes
+    ///
+    /// Refused, with nothing written, when an arm would refuse it.
+    Add(EventsWatchAddArgs),
+    /// Remove the wake source `watch list` numbers N.
+    Remove(EventsWatchRemoveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct EventsWatchTarget {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Agent whose wake sources these are (default: the session's binding).
+    #[arg(long, value_name = "AGENT")]
+    pub author: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsWatchListArgs {
+    #[command(flatten)]
+    pub target: EventsWatchTarget,
+    /// Print the sources as their config JSON.
+    #[arg(short = 'j', long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsWatchAddArgs {
+    #[command(flatten)]
+    pub target: EventsWatchTarget,
+    #[arg(value_name = "JSON")]
+    pub source: String,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsWatchRemoveArgs {
+    #[command(flatten)]
+    pub target: EventsWatchTarget,
+    #[arg(value_name = "N")]
+    pub n: usize,
 }
 
 #[derive(Args, Debug)]
@@ -2017,19 +2072,13 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct AttendArgs {
-    /// What you are waiting on: a subagent's name, or with `--pid` a
-    /// shell task's id as the tool reports it. Omit with `--clear` to
-    /// stop attending.
+    /// The subagent you are waiting on, by its name. Shell work is
+    /// attended by launching it with `clank run`; its `--desc` here renews
+    /// that run's expectation. With `--clear`, the one entry to clear.
     #[arg(value_name = "NAME")]
     pub selector: Option<String>,
-    /// PID of the shell work you are waiting on, which makes NAME its
-    /// task id. Its identity is recorded now, so a reused pid proves
-    /// nothing. Easier: launch the work through `clank run`.
-    #[arg(long, value_name = "PID")]
-    pub pid: Option<i32>,
     /// TWO WORDS for what you are waiting on — `--desc "test run"`. What
-    /// `clank tui` shows; required with `--pid`, and a subagent's name
-    /// otherwise.
+    /// `clank tui` shows; the subagent's name otherwise.
     #[arg(long, value_name = "TEXT")]
     pub desc: Option<String>,
     /// How long you expect this to take (`30s`, `5m`, `1h`; default
@@ -2039,7 +2088,8 @@ pub struct AttendArgs {
     #[arg(long, value_name = "DURATION", default_value = "5m",
           value_parser = crate::cli::attend::parse_expect)]
     pub expect: std::time::Duration,
-    /// Stop attending, and cancel the check-in it owes.
+    /// Stop attending NAME, or everything when no NAME is given, and
+    /// cancel the check-ins they owe.
     #[arg(long)]
     pub clear: bool,
     /// Agent label. Resolved from env when omitted.

@@ -145,7 +145,10 @@ fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
     assert!(said.contains("from your next turn-end"), "{said}");
     assert!(said.contains("after 10m"), "{said}");
     let shown = turns.projection(&label("claude"), &g).attended;
-    assert!(shown.as_ref().is_some_and(|a| a.pending), "{shown:?}");
+    assert!(
+        matches!(shown.as_slice(), [a] if a.pending && a.unqualified.as_deref() == Some("not seen in a listing yet")),
+        "{shown:?}"
+    );
 
     let frame = turns
         .answer(
@@ -158,8 +161,11 @@ fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
         .unwrap();
     assert_eq!(frame.verdict, WireVerdict::Park);
     let shown = turns.projection(&label("claude"), &g).attended;
-    let shown = shown.expect("attending");
+    let [shown] = shown.as_slice() else {
+        panic!("one entry: {shown:?}");
+    };
     assert!(shown.subagent && !shown.pending, "{shown:?}");
+    assert_eq!(shown.unqualified, None, "it covers its task");
     assert_eq!(shown.task, "a25eee2eef81caf3e");
     assert_eq!(shown.subject(), SUBAGENT);
     assert!(
@@ -519,23 +525,23 @@ fn a_silence_needs_no_route_and_a_lost_check_in_is_recorded() {
     let at_due = gathered(repo.path(), "claude", &[]).at(due);
     let check_in = turns.check_in(&author, &at_due).expect("owed");
     assert_eq!(check_in.session, sid("session-one"));
-    assert!(check_in.text.contains("check-in"), "{}", check_in.text);
+    let text = turns
+        .may_type_check_in(&author, &check_in.check_ins, &at_due)
+        .expect("the last look lets it through");
+    assert!(text.contains("check-in"), "{text}");
     assert!(
-        check_in
-            .text
-            .contains(&format!("clank attend '{SUBAGENT}' --expect 20m")),
-        "{}",
-        check_in.text
+        text.contains(&format!("clank attend '{SUBAGENT}' --expect 20m")),
+        "{text}"
     );
     turns.check_in_failed(
         &author,
-        check_in.check_in.clone(),
+        check_in.check_ins.clone(),
         "no pane was found".into(),
         &at_due,
     );
     let shown = turns.projection(&author, &at_due).attended;
     assert_eq!(
-        shown.and_then(|a| a.check_in).as_deref(),
+        shown.first().and_then(|a| a.check_in.as_deref()),
         Some("check-in undeliverable: no pane was found")
     );
     assert_eq!(turns.recovery_quiet(&author, &at_due), None);
@@ -892,7 +898,7 @@ fn alone_mode_is_never_quiet_on_attendance() {
     let alone = gathered(repo.path(), "claude", &[message("1")]);
     assert_eq!(
         alone.alone_verdict(&sid("session-one")),
-        Verdict::Notify(clank_core::turn_policy::Notice::MonitorUnavailable)
+        Verdict::Notify(vec![clank_core::turn_policy::Notice::MonitorUnavailable])
     );
     crate::agent_store::set_auto_mode(repo.path(), &author, AutoMode::Off).unwrap();
     let off = gathered(repo.path(), "claude", &[message("1")]);
@@ -1253,4 +1259,75 @@ fn a_parked_report_ends_while_a_user_command_waits_for_its_agent() {
     turns.set_user_commands(Default::default());
     let parked = turns.answer(&author, 1, &report, false, &g).unwrap();
     assert_eq!(parked.verdict, WireVerdict::Park);
+}
+
+/// A Stop that leaves live work nothing attends wakes the agent with the
+/// hook text naming it: shell work by the `clank run` it is, or as not
+/// attended, never by the tool's description of the shell command. The
+/// same listing, attended, parks.
+#[test]
+fn the_hook_names_unattended_live_work_and_never_by_its_shell_description() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]);
+    let listing = || {
+        TaskSnapshot::Known(vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "bash-1", "type": "shell", "status": "running",
+                "description": "Run the full integration test harness",
+                "command": "cargo test --test it",
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "id": "a25eee2eef81caf3e", "type": "subagent", "status": "running",
+                "description": SUBAGENT,
+            }))
+            .unwrap(),
+        ])
+    };
+    let frame = turns
+        .answer(
+            &author,
+            1,
+            &stop(Tool::Claude, "session-one", listing(), Some(1)),
+            true,
+            &g,
+        )
+        .unwrap();
+    assert!(
+        matches!(frame.verdict, WireVerdict::Deliver { .. }),
+        "a demand is a counted presentation: {:?}",
+        frame.verdict
+    );
+    let text = frame.rendered.unwrap_or_default();
+    assert!(
+        text.starts_with("clank: You have live background work"),
+        "{text}"
+    );
+    assert!(
+        text.contains("shell work (bash-1): not attended — relaunch it with `clank run"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("attend it with `clank attend \"{SUBAGENT}\"`")),
+        "{text}"
+    );
+    assert!(!text.contains("integration test harness"), "{text}");
+
+    attend_name(&mut turns, "claude", "session-one", &g);
+    let frame = turns
+        .answer(
+            &author,
+            2,
+            &stop(Tool::Claude, "session-one", listing(), Some(2)),
+            true,
+            &g,
+        )
+        .unwrap();
+    let text = frame.rendered.unwrap_or_default();
+    assert!(
+        !text.contains(SUBAGENT) && text.contains("bash-1"),
+        "only the task still uncovered: {text}"
+    );
 }
