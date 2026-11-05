@@ -70,7 +70,31 @@ not chase them.
 
 ## Install
 
-clank installs from source; there is no other channel yet.
+On macOS or Linux, the installer fetches a release's prebuilt binaries:
+
+```sh
+curl -fsSL https://llfourn.github.io/clank/install.sh | sh
+```
+
+It verifies the archive against the release's `SHA256SUMS` before it
+installs anything, and puts `clank` and `clank-web-cloudflare` in
+`~/.local/bin` (`CLANK_INSTALL_DIR` overrides it), saying so if that
+directory is not on your `$PATH`. `CLANK_VERSION=0.1.0` pins a release;
+otherwise it installs the latest. Release binaries exist for:
+
+- macOS on Apple silicon (`aarch64-apple-darwin`) and Intel
+  (`x86_64-apple-darwin`);
+- Linux on x86_64 and arm64 (`x86_64-unknown-linux-musl`,
+  `aarch64-unknown-linux-musl`). These are static musl builds, so there
+  is no glibc version floor. Clank watches its subprocesses through
+  `pidfd_open`, which needs Linux 5.3 or later. Releases are built and
+  smoke-tested on Ubuntu 24.04.
+
+Install with the script or with cargo. The macOS binaries are not signed
+or notarized: a file `curl` fetches is not quarantined, but one a
+browser downloads from the releases page is, and Gatekeeper blocks it.
+
+Or build from source:
 
 ```sh
 git clone https://github.com/LLFourn/clank
@@ -78,8 +102,8 @@ cd clank
 cargo install --path crates/cli --locked
 ```
 
-That puts `clank` and its `clank-web-cloudflare` host process on your
-`$PATH`. The TUI starts that sibling executable when you turn on the
+Either way you get `clank` and its `clank-web-cloudflare` host process.
+The TUI starts that sibling executable when you turn on the
 remote. Keep `--locked`: without it
 `cargo install` ignores the committed `Cargo.lock` and re-resolves
 every dependency to the newest semver-compatible version. The checkout
@@ -89,7 +113,10 @@ when the tree had changes), and the TUI names its pane `clank <version>`.
 
 clank is developed on macOS. A Linux CI job (`.github/workflows/ci.yml`)
 runs fmt, clippy and every test on each push, so Linux builds and passes
-the tests; nothing else is built or tested. It needs `git`, and
+the tests. A release tag (`.github/workflows/release.yml`) builds each
+release target on a runner of that OS and arch and checks that the
+binary runs and matches the tag; the test suite runs on Linux only. It
+needs `git`, and
 [zellij](https://zellij.dev) for `clank open`.
 
 The version floors below are what the source checks for. The test suite

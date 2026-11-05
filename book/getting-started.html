@@ -25,16 +25,20 @@
 
 <h2 id="needs">What you need</h2>
 <ul>
-  <li>git and a Rust toolchain, to build clank.</li>
+  <li>macOS or Linux, on arm64 or x86_64, for the prebuilt binaries; otherwise git and a Rust toolchain, to build clank.</li>
   <li><a href="https://zellij.dev">zellij</a>, the terminal workspace <code>clank open</code> lays the team out in.</li>
   <li>At least one agent CLI: Claude Code, Codex CLI, Grok CLI or opencode. Two different ones make a better team, because each reviews the other.</li>
 </ul>
 
 <h2 id="install">Install</h2>
+<p>On macOS or Linux, <a href="install.sh">the installer</a> downloads the latest release, checks it against the release’s checksums, and puts its binaries in <code>~/.local/bin</code>:</p>
+<pre><code>curl -fsSL https://llfourn.github.io/clank/install.sh | sh</code></pre>
+<p>Set <code>CLANK_INSTALL_DIR</code> to install elsewhere, or <code>CLANK_VERSION</code> to pick a release. The macOS binaries are not notarized, so install them with the script, not by downloading an archive in a browser.</p>
+<p>Or build from source:</p>
 <pre><code>git clone https://github.com/LLFourn/clank
 cd clank
 cargo install --path crates/cli --locked</code></pre>
-<p>That puts two programs on your <code>$PATH</code>: <code>clank</code>, and <code>clank-web-cloudflare</code>, the host process the <a href="remote.html">remote</a> starts. Keep <code>--locked</code>, so cargo builds against the committed <code>Cargo.lock</code> instead of re-resolving every dependency.</p>
+<p>Either way you get two programs: <code>clank</code>, and <code>clank-web-cloudflare</code>, the host process the <a href="remote.html">remote</a> starts. Keep <code>--locked</code>, so cargo builds against the committed <code>Cargo.lock</code> instead of re-resolving every dependency.</p>
 
 <h2 id="setup">Wire it into your agents</h2>
 <pre><code>clank setup
