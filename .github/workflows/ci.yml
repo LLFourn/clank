@@ -45,6 +45,17 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Install the pinned licence tools
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo install cargo-about --locked --features cli --version "$(cat scripts/notices/cargo-about.version)"
+
+      - name: cargo deny licences
+        run: cargo deny --locked check licenses
+
+      - name: Rust dependency notices are fresh
+        run: scripts/notices/check.sh
+
       - name: clank lib tests
         run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --lib
 

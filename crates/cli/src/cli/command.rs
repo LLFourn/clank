@@ -440,6 +440,9 @@ pub enum Command {
     /// Native Claude question hook adapter (installed by setup).
     #[command(hide = true)]
     QuestionHook,
+    /// Print the licences of clank and of everything built into it
+    #[command(hide = true)]
+    Licenses,
 }
 
 /// Run the parsed command. The bin's `main` owns process concerns —
@@ -489,6 +492,7 @@ pub async fn dispatch_with(
         Command::As(args) => crate::cli::as_cmd::run(args).await,
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::QuestionHook => crate::cli::web::claude_questions::run().await,
+        Command::Licenses => crate::cli::licenses::run(),
         Command::StopHook(args) => {
             crate::cli::stop_hook::run(args, &mut crate::cli::stop_hook::ProcessHost::new()).await
         }
@@ -1202,6 +1206,7 @@ mod tests {
     const PLUMBING: &[(&str, &str, &[&str])] = &[
         ("", "stop-hook", &["stop-hook", "--tool", "claude"]),
         ("", "question-hook", &["question-hook"]),
+        ("", "licenses", &["licenses"]),
         ("", "rewire", &["rewire", "--from-stdin"]),
         ("", "monitor", &["monitor", "start"]),
         ("monitor", "upgrade", &["monitor", "upgrade"]),

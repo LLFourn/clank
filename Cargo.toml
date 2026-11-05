@@ -2,6 +2,10 @@
 resolver = "3"
 members = ["crates/core", "crates/cli", "crates/web", "crates/web-cloudflare", "crates/user-config"]
 
+[workspace.package]
+license = "0BSD"
+repository = "https://github.com/LLFourn/clank"
+
 
 [profile.release]
 lto = "thin"

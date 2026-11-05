@@ -1629,3 +1629,13 @@ re-parented to launchd — so panes inside zellij are not covered by a
 grant to the terminal alone. Add `/opt/homebrew/bin/zellij` (⌘⇧G in
 the file picker) as well, then restart the sessions; `clank open`
 recreates one.
+
+## Licence
+
+Clank is licensed under [0BSD](LICENSE). The binary includes third-party
+web assets and Rust crates under their own licences:
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) covers the assets, and
+[crates/cli/notices/rust-dependencies.txt](crates/cli/notices/rust-dependencies.txt)
+gives every crate's licence text. `clank licenses` prints all of it.
+`scripts/notices/generate.sh` regenerates the crate list after a
+dependency change; CI fails until it does.

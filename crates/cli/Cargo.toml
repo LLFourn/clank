@@ -3,6 +3,23 @@ name = "clank"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.96"
+license.workspace = true
+repository.workspace = true
+description = "Multi-agent peer review around plans: a master implements each plan, reviewers sign off on every commit, all recorded in git."
+# `include` overrides .gitignore, so the browser harness's ignored npm
+# install is excluded by name.
+include = [
+    "/src/**",
+    "/tests/**",
+    "!/tests/browser/node_modules/**",
+    "!/tests/browser/package.json",
+    "!/tests/browser/package-lock.json",
+    "/build.rs",
+    "/build_stamp_inputs.rs",
+    "/LICENSE",
+    "/THIRD-PARTY-NOTICES.md",
+    "/notices/**",
+]
 
 [dependencies]
 memchr = "2"
