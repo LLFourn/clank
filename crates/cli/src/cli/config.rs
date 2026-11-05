@@ -1276,8 +1276,8 @@ mod tests {
             crate::init_facts::GitignoreState::Canonical
         );
         assert_eq!(
-            crate::init_facts::classify_post_rewrite_hook(tmp.path()),
-            crate::init_facts::HookState::Canonical
+            crate::git_io::post_rewrite_slot(tmp.path()).unwrap().state,
+            crate::post_rewrite::SlotState::Clank { current: true }
         );
         assert!(tmp.path().join(".clank/config.json").is_file());
     }

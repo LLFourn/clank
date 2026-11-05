@@ -1131,6 +1131,30 @@ pub fn common_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
     Ok(absolutize(repo, r.common_dir()))
 }
 
+/// The `post-rewrite` hook git would run for `worktree`, resolved as git
+/// does: `core.hooksPath` when set (relative to the worktree's top level,
+/// `/dev/null` meaning off), else the common dir's `hooks/`, which linked
+/// worktrees share.
+pub fn post_rewrite_slot(worktree: &Path) -> Result<crate::post_rewrite::HookSlot, GitIoError> {
+    use crate::post_rewrite::HooksDir;
+    let r =
+        gix::open(worktree).map_err(|e| gix_err(format!("open `{}`", worktree.display()), e))?;
+    let top = absolutize(
+        worktree,
+        r.workdir().ok_or_else(|| GitIoError::Gix {
+            context: "hooks".into(),
+            detail: format!("`{}` has no work tree", worktree.display()),
+        })?,
+    );
+    let dir = match r.config_snapshot().trusted_path("core.hooksPath") {
+        Some(Err(e)) => return Err(gix_err("core.hooksPath", e)),
+        Some(Ok(p)) if p.as_ref() == Path::new("/dev/null") => HooksDir::Off,
+        Some(Ok(p)) if !p.as_os_str().is_empty() => HooksDir::At(top.join(p)),
+        _ => HooksDir::At(absolutize(worktree, r.common_dir()).join("hooks")),
+    };
+    Ok(crate::post_rewrite::classify(top, dir))
+}
+
 /// What upward discovery from a directory found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Discovery {

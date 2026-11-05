@@ -18,6 +18,7 @@ pub mod git_plumbing;
 pub mod inbox;
 pub mod init_facts;
 pub mod owner_sentinel;
+pub mod post_rewrite;
 pub mod preview;
 pub mod priority_dir;
 pub mod proc_identity;

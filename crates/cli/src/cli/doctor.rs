@@ -859,40 +859,108 @@ fn check_clank_gitignore(repo: &Path) -> CheckResult {
 }
 
 /// `None` outside a git repository, where there is no hook to have.
-fn check_post_rewrite_hook(repo: &Path) -> Option<CheckResult> {
-    use crate::init_facts::{HookState, classify_post_rewrite_hook, post_rewrite_hook_path};
+pub(crate) fn check_post_rewrite_hook(repo: &Path) -> Option<CheckResult> {
+    use crate::post_rewrite::{
+        Disabled, LEFTHOOK_RECIPE, Recipe, SHELL_STANZA, SlotState, Wiring, wiring,
+    };
     const NAME: &str = "post-rewrite hook";
-    let path = post_rewrite_hook_path(repo)?;
-    Some(match classify_post_rewrite_hook(repo) {
-        HookState::Indeterminate => return None,
-        HookState::Canonical => {
-            CheckResult::ok("repo", NAME, format!("installed at {}", path.display()))
-        }
-        HookState::Missing => CheckResult::warn(
-            "repo",
-            NAME,
-            format!(
-                "missing at {}, so a rewrite strands review feedback — run `clank init`",
-                path.display()
-            ),
+    let slot = crate::git_io::post_rewrite_slot(repo).ok()?;
+    let path = slot.path();
+    let ok = |message: String| CheckResult::ok("repo", NAME, message);
+    let warn = |message: String| CheckResult::warn("repo", NAME, message);
+    let owner = match &slot.state {
+        SlotState::Linked { target } => format!("a symlink to {}", target.display()),
+        SlotState::Managed(manager) => manager.name().to_string(),
+        _ => "its owner".to_string(),
+    };
+    Some(match wiring(&slot) {
+        Wiring::Wired => match slot.state {
+            SlotState::Clank { current: false } | SlotState::ClankChaining { current: false } => {
+                warn(format!(
+                    "{} is an older clank hook — run `clank init`",
+                    path.display()
+                ))
+            }
+            SlotState::ClankChaining { .. }
+                if let Some(defect) = match crate::post_rewrite::chained_defect(&slot) {
+                    Ok(defect) => defect.map(|d| d.to_string()),
+                    Err(e) => Some(format!("cannot be inspected ({e:#})")),
+                } =>
+            {
+                warn(format!(
+                    "{} chains to {}, which {defect}, so the hook it replaced does not run",
+                    path.display(),
+                    slot.chained_path().display()
+                ))
+            }
+            SlotState::ClankChaining { .. } => ok(format!(
+                "installed at {}, chained to {}",
+                path.display(),
+                slot.chained_path().display()
+            )),
+            _ => ok(format!("installed at {}", path.display())),
+        },
+        Wiring::Delegated(by) => ok(format!(
+            "delegated: {} runs `clank rewire --from-stdin`",
+            by.display()
+        )),
+        Wiring::Off(Disabled::HooksOff) => warn(
+            "core.hooksPath is /dev/null, so git runs no hooks and review feedback \
+             will not follow a rebase or amend"
+                .to_string(),
         ),
-        HookState::Refreshable => CheckResult::warn(
-            "repo",
-            NAME,
-            format!(
-                "{} is an older clank hook — run `clank init`",
-                path.display()
-            ),
-        ),
-        HookState::Foreign => CheckResult::warn(
-            "repo",
-            NAME,
-            format!(
-                "{} is not clank's; chain `clank rewire --from-stdin` into it, \
-                 or replace it with `clank init --force-hooks`",
-                path.display()
-            ),
-        ),
+        Wiring::Off(Disabled::NotExecutable) => warn(format!(
+            "git will not run {}, which is not executable, so review feedback \
+             will not follow a rebase or amend",
+            path.display()
+        )),
+        Wiring::Unwired(Recipe::RunInit) if slot.state == SlotState::Missing => warn(format!(
+            "missing at {}, so a rewrite strands review feedback — run `clank init`",
+            path.display()
+        )),
+        Wiring::Unwired(Recipe::RunInit) => warn(format!(
+            "{} is not clank's — run `clank init` to chain it behind clank's hook",
+            path.display()
+        )),
+        Wiring::Unwired(Recipe::Shell(file)) => warn(format!(
+            "{} belongs to {owner} and does not run rewire; add this to the top of {}:\n{SHELL_STANZA}",
+            path.display(),
+            file.display()
+        )),
+        Wiring::Unwired(Recipe::Lefthook(config)) => warn(format!(
+            "{} belongs to lefthook and does not run rewire; add this to {}:\n{LEFTHOOK_RECIPE}",
+            path.display(),
+            config
+                .unwrap_or_else(|| slot.top.join("lefthook.yml"))
+                .display()
+        )),
+        Wiring::Unwired(Recipe::LefthookContended {
+            config,
+            competitors,
+        }) => warn(format!(
+            "lefthook gives post-rewrite's stdin to one `use_stdin` command only, and in {} \
+             {} already takes it, so lefthook cannot share it with clank; put this at the top \
+             of that command's script instead:\n{SHELL_STANZA}",
+            config.display(),
+            competitors
+                .iter()
+                .map(|c| format!("`{c}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Wiring::Unwired(Recipe::LefthookUndetermined { config, why }) => warn(format!(
+            "lefthook owns {}, but clank could not establish which post-rewrite commands \
+             take stdin from {} ({why}), so it cannot tell whether rewire is wired; lefthook \
+             gives the stream to `clank rewire --from-stdin` only when it is the sole \
+             `use_stdin` command:\n{LEFTHOOK_RECIPE}",
+            path.display(),
+            config.display()
+        )),
+        Wiring::Unwired(Recipe::PreCommit) => warn(format!(
+            "{} belongs to pre-commit, which has no supported way to share post-rewrite's \
+             stdin with clank, so review feedback will not follow a rebase or amend",
+            path.display()
+        )),
     })
 }
 
@@ -2351,7 +2419,7 @@ mod tests {
     #[test]
     fn repo_checks_flag_a_missing_ignore_and_a_missing_hook_independently() {
         let no_ignore = init_git_repo();
-        crate::cli::init::setup_repo_support(no_ignore.path(), false).unwrap();
+        crate::cli::init::setup_repo_support(no_ignore.path()).unwrap();
         std::fs::remove_file(no_ignore.path().join(".clank/.gitignore")).unwrap();
         let results = repo_checks(no_ignore.path(), None, None);
         let gi = check(&results, ".clank/.gitignore");
@@ -2360,9 +2428,13 @@ mod tests {
         assert_eq!(check(&results, "post-rewrite hook").status, CheckStatus::Ok);
 
         let no_hook = init_git_repo();
-        crate::cli::init::setup_repo_support(no_hook.path(), false).unwrap();
-        std::fs::remove_file(crate::init_facts::post_rewrite_hook_path(no_hook.path()).unwrap())
-            .unwrap();
+        crate::cli::init::setup_repo_support(no_hook.path()).unwrap();
+        std::fs::remove_file(
+            crate::git_io::post_rewrite_slot(no_hook.path())
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
         let results = repo_checks(no_hook.path(), None, None);
         assert_eq!(check(&results, ".clank/.gitignore").status, CheckStatus::Ok);
         let hook = check(&results, "post-rewrite hook");
@@ -2384,13 +2456,13 @@ mod tests {
             &["worktree", "add", "--quiet", wt.to_str().unwrap()],
         );
         let wt = dunce::canonicalize(&wt).unwrap();
-        crate::cli::init::setup_repo_support(&wt, false).unwrap();
+        crate::cli::init::setup_repo_support(&wt).unwrap();
         let common = dunce::canonicalize(main.path())
             .unwrap()
             .join(".git/hooks/post-rewrite");
         assert_eq!(
             std::fs::read_to_string(&common).unwrap(),
-            crate::init_facts::POST_REWRITE_BODY
+            crate::post_rewrite::POST_REWRITE_BODY
         );
         assert_eq!(
             check(&repo_checks(&wt, None, None), "post-rewrite hook").status,
@@ -2401,7 +2473,7 @@ mod tests {
         let results = repo_checks(&wt, None, None);
         let hook = check(&results, "post-rewrite hook");
         assert_eq!(hook.status, CheckStatus::Warn);
-        let reported = crate::init_facts::post_rewrite_hook_path(&wt).unwrap();
+        let reported = crate::git_io::post_rewrite_slot(&wt).unwrap().path();
         assert_eq!(
             dunce::canonicalize(reported.parent().unwrap()).unwrap(),
             common.parent().unwrap()

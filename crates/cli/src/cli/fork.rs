@@ -851,7 +851,7 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
 
     // A clone has its own git directory, so the source's hook does not
     // arrive with it, and the base may predate the managed ignore.
-    crate::cli::init::setup_repo_support(&dest, false)?;
+    crate::cli::init::setup_repo_support(&dest)?;
 
     // ── Seed the worktree's gitignored .clank/ ──
     // Repo config (team selection) is per-worktree + gitignored,

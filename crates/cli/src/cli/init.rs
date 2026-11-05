@@ -19,9 +19,8 @@ use std::path::Path;
 
 use super::InitArgs;
 
-use crate::init_facts::{
-    POST_REWRITE_BODY, POST_REWRITE_MARKER, clank_gitignore_body, classify_gitignore_body,
-};
+use crate::init_facts::{clank_gitignore_body, classify_gitignore_body};
+use crate::post_rewrite::{HookChange, Left};
 
 /// `clank init` is pure repo setup: scaffold `.clank/`, install
 /// the git hook, retire legacy Claude permissions, and optionally
@@ -32,7 +31,7 @@ use crate::init_facts::{
 /// assigns nothing).
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let repo = repo_for_init(args.repo.as_deref(), &std::env::current_dir()?)?;
-    let setup = setup_repo_support(&repo, args.force_hooks)?;
+    let setup = setup_repo_support(&repo)?;
     println!("set up clank in {}: {}", repo.display(), setup.summary());
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -66,15 +65,6 @@ pub enum GitignoreChange {
     UpToDate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HookChange {
-    Wrote,
-    Refreshed,
-    ForceOverwrote,
-    KeptForeign,
-    NoGitDir,
-}
-
 impl SupportSetup {
     /// One clause per file, in the order they were set up.
     pub fn summary(&self) -> String {
@@ -88,9 +78,16 @@ impl SupportSetup {
             .then_some("removed legacy clank permissions from .claude/settings.local.json");
         let hook = match self.hook {
             HookChange::Wrote => "installed the post-rewrite hook",
-            HookChange::Refreshed => "the post-rewrite hook is up to date",
-            HookChange::ForceOverwrote => "force-overwrote the post-rewrite hook",
-            HookChange::KeptForeign => "kept your existing post-rewrite hook",
+            HookChange::Refreshed => "refreshed the post-rewrite hook",
+            HookChange::UpToDate => "the post-rewrite hook is up to date",
+            HookChange::Chained => "chained your post-rewrite hook behind clank's",
+            HookChange::Left(Left::Delegated) => "your post-rewrite hook already runs clank rewire",
+            HookChange::Left(Left::Off(_)) => {
+                "left the disabled post-rewrite hook alone (see `clank doctor`)"
+            }
+            HookChange::Left(Left::Linked | Left::Managed(_)) => {
+                "left the post-rewrite hook to its owner (see `clank doctor`)"
+            }
             HookChange::NoGitDir => "no git directory for the post-rewrite hook",
         };
         [Some(gitignore), perms, Some(hook)]
@@ -105,12 +102,12 @@ impl SupportSetup {
 /// share: the `.clank/` scaffold and its `.gitignore`, the legacy
 /// Claude permission cleanup, and the `post-rewrite` hook. It never
 /// touches the roster. An unmanaged `.clank/.gitignore` is left as it is
-/// and fails setup; a foreign hook is kept, with a warning, unless
-/// `force_hooks`.
-pub fn setup_repo_support(repo: &Path, force_hooks: bool) -> anyhow::Result<SupportSetup> {
+/// and fails setup; the hook is installed as [`crate::post_rewrite::install`]
+/// allows.
+pub fn setup_repo_support(repo: &Path) -> anyhow::Result<SupportSetup> {
     let gitignore = write_scaffold(repo)?;
     let retired_claude_perms = migrate_claude_perms(repo)?;
-    let hook = write_post_rewrite_hook(repo, force_hooks)?;
+    let hook = crate::post_rewrite::install(repo)?;
     warn_if_globally_excluded(repo);
     Ok(SupportSetup {
         gitignore,
@@ -120,8 +117,7 @@ pub fn setup_repo_support(repo: &Path, force_hooks: bool) -> anyhow::Result<Supp
 }
 
 /// Repo support for a command about to write `.clank/config.json`: when
-/// the file does not exist yet, [`setup_repo_support`] without forcing
-/// the hook, announced. `None` when the repo already has a config.
+/// the file does not exist yet, [`setup_repo_support`], announced. `None` when the repo already has a config.
 pub fn support_before_first_config(repo: &Path) -> anyhow::Result<Option<SupportSetup>> {
     let config = repo.join(".clank/config.json");
     if config
@@ -130,7 +126,7 @@ pub fn support_before_first_config(repo: &Path) -> anyhow::Result<Option<Support
     {
         return Ok(None);
     }
-    let setup = setup_repo_support(repo, false)?;
+    let setup = setup_repo_support(repo)?;
     eprintln!(
         "initialized clank in {}: {}",
         repo.display(),
@@ -239,76 +235,6 @@ fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
         crate::agent_store::repo_config::read_prior(repo)?,
         crate::agent_store::repo_config::Prior::Valid(_)
     ))
-}
-
-/// Install the `post-rewrite` git hook so feedback files
-/// follow commits through rebases/amends. Resolves the real
-/// hook path via the shared (common) gitdir so this works in
-/// linked worktrees too (where `.git` is a file pointing at
-/// the worktree's gitdir; hooks live in the main repo's
-/// shared `.git/hooks/`). If a foreign hook exists, print a
-/// warning and leave it alone unless `force` is set.
-fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<HookChange> {
-    let Some(hook_path) = resolve_hook_path(repo, "post-rewrite") else {
-        return Ok(HookChange::NoGitDir);
-    };
-    if let Some(parent) = hook_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("creating hooks dir `{}`: {e}", parent.display()))?;
-    }
-    Ok(match std::fs::read_to_string(&hook_path) {
-        Ok(existing) if existing.contains(POST_REWRITE_MARKER) => {
-            // Already ours; refresh body in case it changed.
-            std::fs::write(&hook_path, POST_REWRITE_BODY)?;
-            set_executable(&hook_path)?;
-            HookChange::Refreshed
-        }
-        Ok(_) if force => {
-            std::fs::write(&hook_path, POST_REWRITE_BODY)?;
-            set_executable(&hook_path)?;
-            HookChange::ForceOverwrote
-        }
-        Ok(_) => {
-            eprintln!(
-                "warning: {} already exists with non-clank content; \
-                 leaving it alone. Pass `clank init --force-hooks` to overwrite, \
-                 or chain `clank rewire --from-stdin` into it manually.",
-                hook_path.display()
-            );
-            HookChange::KeptForeign
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&hook_path, POST_REWRITE_BODY)?;
-            set_executable(&hook_path)?;
-            HookChange::Wrote
-        }
-        Err(e) => return Err(e.into()),
-    })
-}
-
-/// Resolve `<git-common-dir>/hooks/<name>` via gix's common dir —
-/// shared across linked worktrees, so the hook lands in the main
-/// repo's `hooks/`.
-fn resolve_hook_path(repo: &Path, name: &str) -> Option<std::path::PathBuf> {
-    // `hooks/` is SHARED across linked worktrees → the common dir.
-    Some(
-        crate::git_io::common_dir(repo)
-            .ok()?
-            .join(format!("hooks/{name}")),
-    )
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn write_scaffold(repo: &Path) -> anyhow::Result<GitignoreChange> {
@@ -736,7 +662,6 @@ mod tests {
         let dir = init_repo();
         run(InitArgs {
             repo: Some(dir.path().to_path_buf()),
-            force_hooks: false,
             force: false,
             team: None,
         })
@@ -844,58 +769,6 @@ mod tests {
         assert!(probe(".clank/queue/500-foo.md"));
         assert!(probe(".clank/html/foo.html"));
         assert!(probe(".clank/worktrees/foo/.clank/config.json"));
-    }
-
-    #[test]
-    fn writes_post_rewrite_hook_when_absent() {
-        let dir = init_repo();
-        write_post_rewrite_hook(dir.path(), false).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".git/hooks/post-rewrite")).unwrap();
-        assert!(body.contains(POST_REWRITE_MARKER));
-        assert!(body.contains("clank rewire --from-stdin"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(".git/hooks/post-rewrite"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o755, "hook should be executable");
-        }
-    }
-
-    #[test]
-    fn writes_post_rewrite_hook_warns_on_foreign_content() {
-        let dir = init_repo();
-        let hook_path = dir.path().join(".git/hooks/post-rewrite");
-        std::fs::write(&hook_path, "#!/bin/sh\necho not clank\n").unwrap();
-        write_post_rewrite_hook(dir.path(), false).unwrap();
-        let body = std::fs::read_to_string(&hook_path).unwrap();
-        assert!(
-            !body.contains(POST_REWRITE_MARKER),
-            "foreign hook must NOT be overwritten without --force-hooks; body={body}"
-        );
-    }
-
-    #[test]
-    fn force_hooks_overwrites_foreign_content() {
-        let dir = init_repo();
-        let hook_path = dir.path().join(".git/hooks/post-rewrite");
-        std::fs::write(&hook_path, "#!/bin/sh\necho not clank\n").unwrap();
-        write_post_rewrite_hook(dir.path(), true).unwrap();
-        let body = std::fs::read_to_string(&hook_path).unwrap();
-        assert!(body.contains(POST_REWRITE_MARKER));
-    }
-
-    #[test]
-    fn writes_post_rewrite_hook_idempotent_on_our_marker() {
-        let dir = init_repo();
-        write_post_rewrite_hook(dir.path(), false).unwrap();
-        write_post_rewrite_hook(dir.path(), false).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".git/hooks/post-rewrite")).unwrap();
-        assert!(body.contains(POST_REWRITE_MARKER));
-        assert_eq!(body, POST_REWRITE_BODY);
     }
 
     // ── Plan: repo-agents-no-team ──
@@ -1227,7 +1100,7 @@ mod tests {
             );
             assert!(git(&repo, &["remote"]).stdout.is_empty());
             write_scaffold(&repo).unwrap();
-            write_post_rewrite_hook(&repo, false).unwrap();
+            crate::post_rewrite::install(&repo).unwrap();
             assert!(repo.join(".clank/.gitignore").is_file());
             assert!(repo.join(".git/hooks/post-rewrite").is_file());
         }

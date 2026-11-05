@@ -665,16 +665,16 @@ fn fork_without_roster_falls_back_to_the_default_team() {
 
 #[test]
 fn a_new_fork_gets_its_own_support_setup_whatever_its_roster_source() {
-    use clank::init_facts::{
-        GitignoreState, HookState, classify_clank_gitignore, classify_post_rewrite_hook,
-    };
+    use clank::init_facts::{GitignoreState, classify_clank_gitignore};
+    use clank::post_rewrite::SlotState;
+    let hook = |repo: &std::path::Path| clank::git_io::post_rewrite_slot(repo).unwrap().state;
     let env = source_with_bound_team();
     let mut args = fork_args(&env, "cloned");
     args.clone = true;
     let clone = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
     assert_eq!(
-        classify_post_rewrite_hook(&clone),
-        HookState::Canonical,
+        hook(&clone),
+        SlotState::Clank { current: true },
         "a clone installs its own hook"
     );
     assert_eq!(classify_clank_gitignore(&clone), GitignoreState::Canonical);
@@ -714,7 +714,7 @@ fn a_new_fork_gets_its_own_support_setup_whatever_its_roster_source() {
         cfg["agents"]["codex"]["role"], "master",
         "the template replaces the copied roster"
     );
-    assert_eq!(classify_post_rewrite_hook(&templated), HookState::Canonical);
+    assert_eq!(hook(&templated), SlotState::Clank { current: true });
 }
 
 #[test]
