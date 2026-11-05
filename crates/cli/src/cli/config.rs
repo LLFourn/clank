@@ -234,10 +234,10 @@ impl HooksFile {
 /// catchall preserves unknown top-level keys so a newer clank's
 /// config keys don't get wiped by an older clank's `agent add`.
 ///
-/// **NOTE**: the `apply_layer` path (the lossy read-only loader used
-/// by [`load`]) still uses its own private structs because it has
-/// different failure semantics. The two paths are NOT unified yet —
-/// see the queued `typed-config-dogfood` plan.
+/// **NOTE**: the `apply_layer` path (the read-only loader used by
+/// [`load`]) still uses its own private structs, which read only the
+/// settings it layers. The two paths are NOT unified yet — see the
+/// queued `typed-config-dogfood` plan.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct RepoConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,7 +305,7 @@ pub struct HooksSection {
 
 /// Round-trip variant of [`ReviewFile`] (which is Deserialize-only).
 /// Same field names + serde aliases so a config written by the
-/// round-trip path stays readable by the lossy `apply_layer` path.
+/// round-trip path stays readable by the `apply_layer` path.
 ///
 /// Legacy aliases `force_review_on_misc_commits` /
 /// `force_review_on_plan_commits` are accepted on deserialize
@@ -392,7 +392,10 @@ pub struct ReviewSection {
     pub require_commit_prefix: Option<bool>,
 }
 
-pub fn load(repo_root: &Path) -> Config {
+/// The effective config: the defaults, then the user's layer, then the
+/// repo's. A layer this build cannot read is an error, never skipped:
+/// skipping it would apply the wrong settings without saying so.
+pub fn load(repo_root: &Path) -> anyhow::Result<Config> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     load_with_home(repo_root, home.as_deref())
 }
@@ -400,34 +403,63 @@ pub fn load(repo_root: &Path) -> Config {
 /// Home-explicit [`load`] — for in-process callers (query cores,
 /// tests) that supply the home dir rather than reading `$HOME`.
 /// Plan: dogfood-init-setup-in-tests (Phase B).
-pub fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
+pub fn load_with_home(repo_root: &Path, home: Option<&Path>) -> anyhow::Result<Config> {
     let mut cfg = Config::default();
-    let _ = apply_layer(
-        &mut cfg,
-        home.map(|h| h.join(".clank/config.json")).as_deref(),
-    );
-    let _ = apply_layer(&mut cfg, Some(&repo_root.join(".clank/config.json")));
-    cfg
+    apply_layer(&mut cfg, user_layer(home)?)?;
+    apply_layer(&mut cfg, repo_layer(repo_root)?)?;
+    Ok(cfg)
 }
 
-fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
+/// A config layer as its owner read it, and the file it came from.
+struct Layer {
+    path: PathBuf,
+    doc: serde_json::Map<String, serde_json::Value>,
+}
+
+fn user_layer(home: Option<&Path>) -> anyhow::Result<Option<Layer>> {
+    let Some(home) = home else { return Ok(None) };
+    Ok(Some(Layer {
+        path: clank_user_config::path(home),
+        doc: clank_user_config::read(home)?,
+    }))
+}
+
+fn repo_layer(repo_root: &Path) -> anyhow::Result<Option<Layer>> {
+    Ok(
+        crate::agent_store::repo_config::read_document(repo_root)?.map(|doc| Layer {
+            path: crate::agent_store::repo_config::path(repo_root),
+            doc,
+        }),
+    )
+}
+
+/// Whether `doc` holds every setting this build layers in a form it
+/// reads: the check a config's owner makes before it admits an edit, so
+/// a setting the loader would refuse is never written beside a new one.
+pub(crate) fn check_layer(
+    path: &Path,
+    doc: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), clank_user_config::versioned::Refusal> {
+    apply_layer(
+        &mut Config::default(),
+        Some(Layer {
+            path: path.to_path_buf(),
+            doc: doc.clone(),
+        }),
+    )
+    .map(|_| ())
+}
+
+fn apply_layer(
+    cfg: &mut Config,
+    layer: Option<Layer>,
+) -> Result<BTreeSet<String>, clank_user_config::versioned::Refusal> {
     let mut present: BTreeSet<String> = BTreeSet::new();
-    let Some(path) = path else { return present };
-    let body = match std::fs::read_to_string(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return present,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "clank config: read failed; ignoring layer");
-            return present;
-        }
+    let Some(Layer { path, doc }) = layer else {
+        return Ok(present);
     };
-    let parsed: ConfigFile = match serde_json::from_str(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "clank config: malformed JSON; ignoring layer");
-            return present;
-        }
-    };
+    let parsed: ConfigFile = serde_json::from_value(serde_json::Value::Object(doc))
+        .map_err(|e| clank_user_config::versioned::Refusal::malformed(&path, e))?;
     if let Some(review) = parsed.review {
         if let Some(v) = review.adhoc_feedback {
             cfg.review.adhoc_feedback = v;
@@ -492,17 +524,13 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         ("recovery.stall_nudge", recovery.stall_nudge),
     ] {
         let Some(raw) = raw else { continue };
-        match parse_blind_nudge(&raw) {
-            Ok(v) => {
-                *cfg.recovery.field(key).expect("a recovery key") = v;
-                present.insert(key.to_string());
-            }
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "clank config: bad {key}; ignoring it");
-            }
-        }
+        let v = parse_blind_nudge(&raw).map_err(|e| {
+            clank_user_config::versioned::Refusal::malformed(&path, format!("{key}: {e}"))
+        })?;
+        *cfg.recovery.field(key).expect("a recovery key") = v;
+        present.insert(key.to_string());
     }
-    present
+    Ok(present)
 }
 
 // ── Key catalog ──────────────────────────────────────────────────────────────
@@ -616,22 +644,22 @@ pub struct KeyValue {
     pub description: &'static str,
 }
 
-pub fn resolve_key_values(repo_root: &Path) -> Vec<KeyValue> {
+pub fn resolve_key_values(repo_root: &Path) -> anyhow::Result<Vec<KeyValue>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     resolve_key_values_with_home(repo_root, home.as_deref())
 }
 
-fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<KeyValue> {
+fn resolve_key_values_with_home(
+    repo_root: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<KeyValue>> {
     let mut sources: BTreeMap<String, ValueSource> = BTreeMap::new();
 
     let mut user_cfg = Config::default();
-    let user_present = apply_layer(
-        &mut user_cfg,
-        home.map(|h| h.join(".clank/config.json")).as_deref(),
-    );
+    let user_present = apply_layer(&mut user_cfg, user_layer(home)?)?;
 
     let mut repo_cfg = user_cfg.clone();
-    let repo_present = apply_layer(&mut repo_cfg, Some(&repo_root.join(".clank/config.json")));
+    let repo_present = apply_layer(&mut repo_cfg, repo_layer(repo_root)?)?;
 
     for key in &repo_present {
         sources.insert(key.clone(), ValueSource::Repo);
@@ -640,7 +668,7 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
         sources.entry(key.clone()).or_insert(ValueSource::User);
     }
 
-    KEY_CATALOG
+    Ok(KEY_CATALOG
         .iter()
         .map(|def| {
             let key = format!("{}.{}", def.section, def.name);
@@ -653,7 +681,7 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
                 description: def.help,
             }
         })
-        .collect()
+        .collect())
 }
 
 fn hook_display(v: Option<&Option<String>>) -> String {
@@ -846,11 +874,11 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
 
     let Some(cmd) = &args.command else {
         if args.json {
-            let cfg = load(&repo);
+            let cfg = load(&repo)?;
             let obj = ConfigJson::from(&cfg);
             println!("{}", serde_json::to_string_pretty(&obj)?);
         } else {
-            let kvs = resolve_key_values(&repo);
+            let kvs = resolve_key_values(&repo)?;
             let key_w = kvs.iter().map(|kv| kv.key.len()).max().unwrap_or(0);
             let val_w = kvs.iter().map(|kv| kv.value.len()).max().unwrap_or(0);
             for kv in &kvs {
@@ -877,7 +905,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
 
     match kargs.value.as_deref() {
         None => {
-            let kvs = resolve_key_values(&repo);
+            let kvs = resolve_key_values(&repo)?;
             let kv = kvs.iter().find(|kv| kv.key == key);
             println!("key:     {}.{}", def.section, def.name);
             println!("type:    {}", def.type_desc);
@@ -906,9 +934,9 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 set_user_key(&home, path, value, def.type_desc)?;
             } else {
                 crate::cli::init::support_before_first_config(&repo)?;
-                set_key(&repo.join(".clank/config.json"), path, value, def.type_desc)?;
+                set_repo_key(&repo, path, value, def.type_desc)?;
             }
-            let kvs = resolve_key_values(&repo);
+            let kvs = resolve_key_values(&repo)?;
             if let Some(kv) = kvs.iter().find(|kv| kv.key == key) {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
             }
@@ -918,38 +946,29 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Thin repo-scope wrapper over [`set_key`] (used by tests).
-#[cfg(test)]
-fn set_repo_key(repo: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
-    set_key(&repo.join(".clank/config.json"), path, value, type_desc)
-}
-
-/// Read-modify-write a single key into the repo-scope `config_path`,
-/// creating the file + parent dir if absent. Preserves unknown keys. The
-/// user scope goes through [`set_user_key`] instead.
-fn set_key(config_path: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
-    let mut root: serde_json::Value = if config_path.exists() {
-        let body = std::fs::read_to_string(config_path)?;
-        serde_json::from_str(&body)?
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
-    };
-    let doc = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config.json is not a JSON object"))?;
-    set_in(doc, path, value, type_desc)?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::to_string_pretty(&root)?;
-    std::fs::write(config_path, body)?;
-    Ok(())
+/// Set a single key in the repo's `.clank/config.json`, creating it if
+/// absent, inside the one repo-config transaction. Preserves unknown
+/// keys.
+pub(crate) fn set_repo_key(
+    repo: &Path,
+    path: &[&str],
+    value: &str,
+    type_desc: &str,
+) -> anyhow::Result<()> {
+    crate::agent_store::repo_config::transact_document(repo, |doc| {
+        set_in(doc, path, value, type_desc)
+    })
 }
 
 /// Set a single key in the user-scope `~/.clank/config.json`, inside the
 /// one user-config transaction.
-fn set_user_key(home: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
-    clank_user_config::transact(home, |doc| set_in(doc, path, value, type_desc))
+pub(crate) fn set_user_key(
+    home: &Path,
+    path: &[&str],
+    value: &str,
+    type_desc: &str,
+) -> anyhow::Result<()> {
+    crate::cli::team::transact_user_config(home, |doc| set_in(doc, path, value, type_desc))
 }
 
 /// Set `path` in `doc` to `value` read as `type_desc`, creating
@@ -991,17 +1010,11 @@ fn set_in(
     Ok(())
 }
 
-/// True if `path` is PRESENT in `config_path` (any value, including `false`).
-/// A missing/unreadable/malformed file counts as absent.
-pub(crate) fn json_path_present(config_path: &Path, path: &[&str]) -> bool {
-    let Ok(body) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    let Ok(serde_json::Value::Object(doc)) = serde_json::from_str::<serde_json::Value>(&body)
-    else {
-        return false;
-    };
-    present_in(&doc, path)
+/// True if `path` is PRESENT in the user-scope config (any value,
+/// including `false`). A missing file counts as absent; one this build
+/// cannot read is an error.
+pub(crate) fn user_key_present(home: &Path, path: &[&str]) -> anyhow::Result<bool> {
+    Ok(present_in(&clank_user_config::read(home)?, path))
 }
 
 fn present_in(doc: &serde_json::Map<String, serde_json::Value>, path: &[&str]) -> bool {
@@ -1031,7 +1044,7 @@ pub(crate) fn set_user_key_if_absent(
     value: &str,
     type_desc: &str,
 ) -> anyhow::Result<bool> {
-    clank_user_config::transact(home, |doc| {
+    crate::cli::team::transact_user_config(home, |doc| {
         if present_in(doc, path) {
             return Ok(false);
         }
@@ -1087,7 +1100,7 @@ mod tests {
     }
 
     fn load_isolated(repo: &Path) -> Config {
-        load_with_home(repo, None)
+        load_with_home(repo, None).unwrap()
     }
 
     #[test]
@@ -1146,13 +1159,29 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_ignored_layer_falls_through_to_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_cfg = tmp.path().join(".clank/config.json");
+    fn a_layer_it_cannot_read_is_an_error_naming_the_file() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let repo_cfg = repo.path().join(".clank/config.json");
         write(&repo_cfg, "not valid json");
-        let cfg = load_isolated(tmp.path());
-        assert!(cfg.review.plan_feedback);
-        assert!(!cfg.review.adhoc_feedback);
+        let err = format!("{:#}", load_with_home(repo.path(), None).unwrap_err());
+        assert!(err.contains(&repo_cfg.display().to_string()), "{err}");
+        assert!(resolve_key_values_with_home(repo.path(), None).is_err());
+
+        std::fs::remove_file(&repo_cfg).unwrap();
+        let user_cfg = clank_user_config::path(home.path());
+        write(
+            &user_cfg,
+            r#"{"version": 2, "finish": {"autosquash": true}}"#,
+        );
+        let err = format!(
+            "{:#}",
+            load_with_home(repo.path(), Some(home.path())).unwrap_err()
+        );
+        assert!(
+            err.contains(&user_cfg.display().to_string()) && err.contains("newer clank"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1258,7 +1287,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
         set_repo_key(tmp.path(), &["review", "adhoc_feedback"], "false", "bool").unwrap();
-        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kvs = resolve_key_values_with_home(tmp.path(), None).unwrap();
         let kv = kvs
             .iter()
             .find(|kv| kv.key == "review.adhoc_feedback")
@@ -1274,7 +1303,7 @@ mod tests {
             &tmp.path().join(".clank/config.json"),
             r#"{"review": {"adhoc_feedback": false}}"#,
         );
-        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kvs = resolve_key_values_with_home(tmp.path(), None).unwrap();
         let kv = kvs
             .iter()
             .find(|kv| kv.key == "review.adhoc_feedback")
@@ -1315,7 +1344,7 @@ mod tests {
             &tmp.path().join(".clank/config.json"),
             r#"{"review": {"adhoc_feedback": true}}"#,
         );
-        let cfg = load_with_home(tmp.path(), None);
+        let cfg = load_with_home(tmp.path(), None).unwrap();
         assert!(cfg.diff.editor.is_none());
         assert!(cfg.diff.wait.is_none());
     }
@@ -1338,7 +1367,7 @@ mod tests {
                 }
             }"#,
         );
-        let cfg = load_with_home(tmp.path(), None);
+        let cfg = load_with_home(tmp.path(), None).unwrap();
         let editor = cfg.diff.editor.expect("editor present");
         assert_eq!(editor.command.as_deref(), Some("emacsclient"));
         assert_eq!(editor.args, vec!["-c".to_string(), "{patch_file}".into()]);
@@ -1352,7 +1381,7 @@ mod tests {
         // should report "false", not "null", so the user sees
         // the same value the consumer will use.
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = load_with_home(tmp.path(), None);
+        let cfg = load_with_home(tmp.path(), None).unwrap();
         assert_eq!(get_value(&cfg, "diff.wait"), "false");
     }
 
@@ -1385,7 +1414,7 @@ mod tests {
             &tmp.path().join(".clank/config.json"),
             r#"{"diff": {"editor": {"command": "emacsclient"}}}"#,
         );
-        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let cfg = load_with_home(tmp.path(), Some(home.path())).unwrap();
         let editor = cfg.diff.editor.expect("editor present");
         // Command overridden by repo-scope.
         assert_eq!(editor.command.as_deref(), Some("emacsclient"));
@@ -1420,7 +1449,7 @@ mod tests {
             &tmp.path().join(".clank/config.json"),
             r#"{"diff": {"editor": {"args": ["-B", "-C"]}}}"#,
         );
-        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let cfg = load_with_home(tmp.path(), Some(home.path())).unwrap();
         let editor = cfg.diff.editor.expect("editor present");
         // Command from user-scope (repo didn't set it).
         assert_eq!(editor.command.as_deref(), Some("vim"));
@@ -1453,7 +1482,7 @@ mod tests {
                 }
             }"#,
         );
-        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let cfg = load_with_home(tmp.path(), Some(home.path())).unwrap();
         let editor = cfg.diff.editor.expect("editor present");
         assert_eq!(editor.command.as_deref(), Some("emacsclient"));
         // wait was NOT overridden by repo-scope (repo-scope didn't
@@ -1462,28 +1491,28 @@ mod tests {
     }
 
     #[test]
-    fn diff_config_malformed_ignored_per_apply_layer_semantics() {
-        // Test 4: malformed JSON in the `diff` section logs a
-        // warning and cfg.diff falls back to default. Same lossy
-        // semantics as the rest of apply_layer (the entire layer
-        // is skipped if parse fails).
+    fn a_section_of_the_wrong_type_is_an_error_not_a_skipped_layer() {
         let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join(".clank/config.json"),
-            "{ this is not valid JSON",
+        let home = tempfile::tempdir().unwrap();
+        let user_cfg = clank_user_config::path(home.path());
+        write(&user_cfg, r#"{"finish": {"autosquash": "yes"}}"#);
+        let err = format!(
+            "{:#}",
+            load_with_home(tmp.path(), Some(home.path())).unwrap_err()
         );
-        let cfg = load_with_home(tmp.path(), None);
-        assert!(cfg.diff.editor.is_none());
-        assert!(cfg.diff.wait.is_none());
+        assert!(
+            err.contains(&user_cfg.display().to_string()) && err.contains("malformed"),
+            "{err}"
+        );
     }
 
     #[test]
     fn hooks_section_round_trips_through_apply_layer() {
         // typed-config-dogfood Phase 1 acceptance gate.
         // Writes via the typed RepoConfigFile + HooksSection path,
-        // reads via apply_layer (the lossy loader). The two paths
+        // reads via apply_layer (the layering loader). The two paths
         // MUST produce equivalent in-memory Config.hooks results
-        // — without this test, the round-trip and lossy paths
+        // — without this test, the round-trip and layering paths
         // could drift silently and most consumers go through
         // apply_layer.
         let tmp = tempfile::tempdir().unwrap();
@@ -1497,7 +1526,7 @@ mod tests {
         let path = tmp.path().join(".clank/config.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
-        let cfg = load_with_home(tmp.path(), None);
+        let cfg = load_with_home(tmp.path(), None).unwrap();
         assert_eq!(
             cfg.hooks.get(&HookEvent::Blocked),
             Some(&Some("echo hello".to_string())),
@@ -1675,11 +1704,10 @@ mod tests {
     #[test]
     fn set_key_if_absent_seeds_only_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join(".clank/config.json");
         let home = tmp.path();
         // Absent → writes, returns true.
         assert!(set_user_key_if_absent(home, &["finish", "autosquash"], "true", "bool").unwrap());
-        assert!(json_path_present(&p, &["finish", "autosquash"]));
+        assert!(user_key_present(home, &["finish", "autosquash"]).unwrap());
         assert!(load_isolated(tmp.path()).finish.autosquash);
         // Present (true) → no-op, returns false.
         assert!(!set_user_key_if_absent(home, &["finish", "autosquash"], "true", "bool").unwrap());
@@ -1733,10 +1761,7 @@ mod tests {
                 .join()
                 .unwrap();
             assert!(
-                json_path_present(
-                    &clank_user_config::path(home.path()),
-                    &["finish", "autosquash"]
-                ),
+                user_key_present(home.path(), &["finish", "autosquash"]).unwrap(),
                 "revoke={revoke}: the setting was lost"
             );
             let keys = trust_set(home.path());
@@ -1746,16 +1771,16 @@ mod tests {
     }
 
     #[test]
-    fn json_path_present_false_for_missing_file_and_key() {
+    fn user_key_present_false_for_missing_file_and_key() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join(".clank/config.json");
         assert!(
-            !json_path_present(&p, &["finish", "autosquash"]),
+            !user_key_present(tmp.path(), &["finish", "autosquash"]).unwrap(),
             "missing file"
         );
         write(&p, r#"{"review":{"adhoc_feedback":true}}"#);
         assert!(
-            !json_path_present(&p, &["finish", "autosquash"]),
+            !user_key_present(tmp.path(), &["finish", "autosquash"]).unwrap(),
             "missing key"
         );
     }
@@ -1776,14 +1801,14 @@ mod tests {
             &tmp.path().join(".clank/config.json"),
             r#"{"recovery":{"stall_nudge":"off"}}"#,
         );
-        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let cfg = load_with_home(tmp.path(), Some(home.path())).unwrap();
         assert_eq!(
             (cfg.recovery.stall_warn, cfg.recovery.stall_nudge),
             (Some(1800), None)
         );
         assert_eq!(get_value(&cfg, "recovery.stall_warn"), "30m");
         assert_eq!(get_value(&cfg, "recovery.stall_nudge"), "off");
-        let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path()));
+        let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path())).unwrap();
         let source = |key: &str| kvs.iter().find(|kv| kv.key == key).unwrap().source;
         assert_eq!(source("recovery.stall_warn"), ValueSource::User);
         assert_eq!(source("recovery.stall_nudge"), ValueSource::Repo);
@@ -1793,6 +1818,7 @@ mod tests {
         );
         assert_eq!(
             load_with_home(tmp.path(), Some(home.path()))
+                .unwrap()
                 .recovery
                 .stall(),
             None
@@ -1819,6 +1845,7 @@ mod tests {
         );
         assert!(
             load_with_home(tmp.path(), Some(home.path()))
+                .unwrap()
                 .finish
                 .autosquash,
             "repo true shadows global false"
@@ -1835,6 +1862,7 @@ mod tests {
         );
         assert!(
             load_with_home(tmp.path(), Some(home.path()))
+                .unwrap()
                 .finish
                 .autosquash,
             "global autosquash applies when repo doesn't set it"
@@ -1847,7 +1875,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
         set_repo_key(tmp.path(), &["finish", "autosquash"], "true", "bool").unwrap();
         assert!(load_isolated(tmp.path()).finish.autosquash);
-        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kvs = resolve_key_values_with_home(tmp.path(), None).unwrap();
         let kv = kvs.iter().find(|kv| kv.key == "finish.autosquash").unwrap();
         assert_eq!(kv.value, "true");
         assert_eq!(kv.source, ValueSource::Repo);
@@ -1865,7 +1893,6 @@ mod tests {
             ("45s", Some(45), "45s"),
             ("off", None, "off"),
             ("0", None, "off"),
-            ("soon", None, "off"),
         ] {
             write(
                 &tmp.path().join(".clank/config.json"),
@@ -1875,6 +1902,17 @@ mod tests {
             assert_eq!(cfg.recovery.blind_nudge, want, "{raw}");
             assert_eq!(get_value(&cfg, "recovery.blind_nudge"), shown, "{raw}");
         }
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"recovery":{"blind_nudge":"soon"}}"#,
+        );
+        let err = format!("{:#}", load_with_home(tmp.path(), None).unwrap_err());
+        assert!(err.contains("recovery.blind_nudge"), "{err}");
+        assert!(
+            set_repo_key(tmp.path(), &["diff", "wait"], "true", "bool").is_err(),
+            "no edit is admitted beside a setting no reader accepts"
+        );
+        std::fs::remove_file(tmp.path().join(".clank/config.json")).unwrap();
         set_repo_key(
             tmp.path(),
             &["recovery", "blind_nudge"],
@@ -1882,7 +1920,7 @@ mod tests {
             "duration|off",
         )
         .unwrap();
-        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kvs = resolve_key_values_with_home(tmp.path(), None).unwrap();
         let kv = kvs
             .iter()
             .find(|kv| kv.key == "recovery.blind_nudge")
@@ -1897,7 +1935,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         set_user_key(home.path(), &["finish", "autosquash"], "true", "bool").unwrap();
-        let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path()));
+        let kvs = resolve_key_values_with_home(tmp.path(), Some(home.path())).unwrap();
         let kv = kvs.iter().find(|kv| kv.key == "finish.autosquash").unwrap();
         assert_eq!(kv.value, "true");
         assert_eq!(kv.source, ValueSource::User, "global write is user-scope");
@@ -1910,7 +1948,7 @@ mod tests {
             &tmp.path().join(".clank/config.json"),
             r#"{"review": {"adhoc_feedback": true}}"#,
         );
-        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kvs = resolve_key_values_with_home(tmp.path(), None).unwrap();
         let kv = kvs
             .iter()
             .find(|kv| kv.key == "review.adhoc_feedback")

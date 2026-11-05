@@ -29,6 +29,7 @@ pub(crate) fn agent_row(
         repeated: None,
 
         attending: Vec::new(),
+        unreadable: None,
     }
 }
 
@@ -145,6 +146,7 @@ pub(crate) fn snap(active_plan: Option<PlanWorkState>, queue: Vec<&str>) -> Stat
         ad_hoc: Vec::new(),
         head_correction: None,
         warnings: Vec::new(),
+        config_errors: Vec::new(),
     }
 }
 
@@ -171,6 +173,7 @@ pub(crate) fn with_agents(
             repeated: None,
 
             attending: Vec::new(),
+            unreadable: None,
         })
         .collect();
     s

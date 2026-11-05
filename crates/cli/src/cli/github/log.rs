@@ -2600,6 +2600,80 @@ pub(crate) mod tests {
         assert!(next > seq, "{next} after {seq}");
     }
 
+    /// Frozen bytes (durable-formats-survive-upgrade): two v1 messages,
+    /// the first acked; a v2 message that requires a reply; a record from
+    /// a newer clank; and a final line a crash tore.
+    const FROZEN_MESSAGES: &str =
+        include_str!("../../../tests/fixtures/formats/events-messages.jsonl");
+
+    fn owed(log: &mut EventLog) -> (Vec<String>, Vec<(u64, bool)>, Vec<u64>) {
+        let loaded = log.load();
+        assert!(!loaded.log_quarantined, "foreign and torn, not corrupt");
+        assert_eq!(loaded.foreign, 1);
+        let mut keys = loaded.action_keys;
+        keys.sort();
+        let read = log.read_rows().unwrap().expect("readable");
+        let acks = read.rows.iter().map(|r| (r.seq, r.acked)).collect();
+        let replies = read
+            .rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.item,
+                    WaitItem::Message {
+                        requires_reply: true,
+                        reply_route: Some(route),
+                        ..
+                    } if route.agent.as_str() == "coordinator"
+                )
+            })
+            .map(|r| r.seq)
+            .collect();
+        (keys, acks, replies)
+    }
+
+    #[test]
+    fn a_frozen_message_log_keeps_its_keys_acks_obligation_and_foreign_record() {
+        let dir = tempdir();
+        std::fs::write(dir.join("messages.jsonl"), FROZEN_MESSAGES).unwrap();
+        let mut log = EventLog::open(&dir, "messages").unwrap();
+        let before = owed(&mut log);
+        assert_eq!(
+            before,
+            (
+                vec![
+                    "message#claude/00000000000000000000aa01".to_string(),
+                    "message#codex/00000000000000000000aa02".to_string(),
+                    "message#coordinator/00000000000000000000aa03".to_string(),
+                ],
+                vec![(1, true), (2, false), (3, false)],
+                vec![3],
+            )
+        );
+        let unhandled: Vec<u64> = log.load().unhandled.iter().map(|e| e.seq).collect();
+        assert_eq!(unhandled, [2, 3]);
+
+        log.lines = COMPACT_AT;
+        log.maybe_compact().unwrap();
+        let text = std::fs::read_to_string(dir.join("messages.jsonl")).unwrap();
+        assert!(
+            !text.contains("\"transp\n") && !text.ends_with("\"transp"),
+            "compaction rewrote the log without its torn tail: {text}"
+        );
+        let foreign = FROZEN_MESSAGES
+            .lines()
+            .find(|l| l.contains("a_record_from_a_newer_clank"))
+            .unwrap();
+        assert!(text.contains(foreign), "kept byte-verbatim: {text}");
+
+        let mut restarted = EventLog::open(&dir, "messages").unwrap();
+        assert_eq!(owed(&mut restarted), before);
+        let next = restarted
+            .append_inbox(Transport::Poll, Some("later"), None, None, &item(1))
+            .unwrap();
+        assert!(next > 4, "the foreign record keeps seq 4 reserved: {next}");
+    }
+
     #[test]
     fn roundtrip_unhandled_cursor_and_keys() {
         let dir = tempdir();

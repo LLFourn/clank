@@ -193,17 +193,10 @@ pub fn seed_bare(home: Option<&Path>, repo: &Path) -> anyhow::Result<()> {
 /// Whether the user config declares team `name`. An absent config is
 /// no team; an unreadable one is an error, never an empty roster.
 fn user_team_declared(home: &Path, name: &str) -> anyhow::Result<bool> {
-    let path = home.join(".clank/config.json");
-    let raw: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            anyhow::anyhow!("user-scope config {} is unreadable ({e})", path.display())
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context(format!("reading {}", path.display())));
-        }
-    };
-    Ok(raw.get("teams").and_then(|t| t.get(name)).is_some())
+    Ok(clank_user_config::read(home)?
+        .get("teams")
+        .and_then(|t| t.get(name))
+        .is_some())
 }
 
 /// Write a valid empty new-shape [`RepoConfigFile`] (an empty
@@ -212,55 +205,40 @@ fn user_team_declared(home: &Path, name: &str) -> anyhow::Result<bool> {
 /// `clank agent add <label> --tool <claude|codex|grok|opencode>`, the
 /// first of which becomes master.
 ///
-/// Called only when there's no VALID new-shape config (the
-/// `repo_has_team` guard already ran), so an OLD-shape config is
-/// overwritten here — this is the "re-run `clank init` to
-/// recreate it" recovery path the loader error points users at.
+/// A legacy-shaped config is replaced here: this is the "re-run `clank
+/// init` to recreate it" recovery path the loader error points users at.
+/// A valid one, which another writer may have put there since
+/// [`repo_has_team`] looked, is kept.
 fn bootstrap_empty_repo_config(repo: &Path) -> anyhow::Result<()> {
+    use crate::agent_store::repo_config::{self, Prior};
     use crate::cli::teams_config::RepoConfigFile;
-    let repo_cfg_path = repo.join(".clank/config.json");
-    write_repo_config(&repo_cfg_path, &RepoConfigFile::default())?;
-    eprintln!(
-        "wrote empty roster to {} — add agents with \
-         `clank agent add <label> --tool <claude|codex|grok|opencode>`; the first becomes \
-         master (seed a whole team instead by declaring a `{DEFAULT_TEAM}` team, or with \
-         `clank init --team <name>`)",
-        repo_cfg_path.display()
-    );
-    Ok(())
-}
-
-/// Atomic write of a typed config via tempfile + rename.
-fn write_repo_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".clank-config-")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
-/// True iff `<repo>/.clank/config.json` already exists and parses
-/// as a new-shape [`RepoConfigFile`] (a roster). Keeps bare
-/// `clank init` from clobbering a VALID existing repo config on
-/// re-init (the roster lives in this file). Missing config OR an
-/// OLD-shape config → false, so bare init writes/recreates a
-/// fresh empty config (the documented recovery path).
-fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
-    let path = repo.join(".clank/config.json");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Ok(serde_json::from_str::<crate::cli::teams_config::RepoConfigFile>(&s).is_ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    let wrote = repo_config::replace(repo, |prior| {
+        Ok(match prior {
+            Prior::Valid(_) => (None, false),
+            Prior::Absent | Prior::Legacy => (Some(RepoConfigFile::default()), true),
+        })
+    })?;
+    if wrote {
+        eprintln!(
+            "wrote empty roster to {} — add agents with \
+             `clank agent add <label> --tool <claude|codex|grok|opencode>`; the first becomes \
+             master (seed a whole team instead by declaring a `{DEFAULT_TEAM}` team, or with \
+             `clank init --team <name>`)",
+            repo_config::path(repo).display()
+        );
     }
+    Ok(())
+}
+
+/// True iff `<repo>/.clank/config.json` already holds a new-shape
+/// [`RepoConfigFile`] (a roster), which bare `clank init` keeps. A missing
+/// or legacy-shaped config is false, so bare init writes or recreates a
+/// fresh empty one; one it cannot read is an error and is left alone.
+fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
+    Ok(matches!(
+        crate::agent_store::repo_config::read_prior(repo)?,
+        crate::agent_store::repo_config::Prior::Valid(_)
+    ))
 }
 
 /// Install the `post-rewrite` git hook so feedback files
@@ -496,28 +474,18 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
 
 /// `clank init --team`'s entry point: apply the overwrite guard,
 /// then copy the team roster down. Refuses to clobber a repo that
-/// already has a NON-EMPTY roster unless `force`. The check reads
-/// through [`crate::agent_store::repo_config_if_valid`], which
-/// ignores the legacy shape — an old-shape config is the
-/// documented "re-run `clank init`" recovery path, so it's allowed
-/// to be overwritten. A freshly-bootstrapped empty roster is not
-/// "configured", so the first `--team` after a bare `clank init`
-/// is unaffected. `pub`, env-free (explicit `home`/`repo`).
+/// already has a NON-EMPTY roster unless `force`. A legacy-shaped config
+/// is the documented "re-run `clank init`" recovery path, so it may be
+/// replaced; one this build cannot read may not. A freshly-bootstrapped
+/// empty roster is not "configured", so the first `--team` after a bare
+/// `clank init` is unaffected. `pub`, env-free (explicit `home`/`repo`).
 pub fn register_repo_team_guarded(
     home: &Path,
     repo: &Path,
     team_name: &str,
     force: bool,
 ) -> anyhow::Result<()> {
-    let configured =
-        crate::agent_store::repo_config_if_valid(repo)?.is_some_and(|c| !c.agents.is_empty());
-    if configured && !force {
-        anyhow::bail!(
-            "repo already has a roster; run `clank team save {team_name}` first to keep \
-             local edits, or pass --force to replace"
-        );
-    }
-    register_repo_team(home, repo, team_name)
+    seed_team(home, repo, team_name, force)
 }
 
 /// Seed a repo by RESOLVING the named user-scope team TEMPLATE (a
@@ -533,35 +501,32 @@ pub fn register_repo_team_guarded(
 /// - A malformed team member errors naming the member and the valid
 ///   shapes; a dangling reference errors naming the missing library
 ///   agent.
-/// - An existing VALID repo config round-trips through the new
-///   schema's `extra` flatten catchall, so unknown fields
-///   (review/hooks/diff) are preserved across the swap.
+/// - An existing VALID repo config keeps everything but its roster, so
+///   unknown fields (review/hooks/diff) are preserved across the swap.
 pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::Result<()> {
+    seed_team(home, repo, team_name, true)
+}
+
+fn seed_team(home: &Path, repo: &Path, team_name: &str, force: bool) -> anyhow::Result<()> {
+    use crate::agent_store::repo_config::{self, Prior};
     use crate::cli::teams_config::RepoConfigFile;
 
     let roster = load_user_team_roster(home, team_name)?;
-
-    let repo_cfg_path = repo.join(".clank/config.json");
-    let mut repo_cfg: RepoConfigFile = match std::fs::read_to_string(&repo_cfg_path) {
-        // A VALID new-shape config: keep it so its `extra`
-        // (review/hooks/diff) survives the roster swap. A LEGACY or
-        // unparseable config: this is the recreate path (`init --team`
-        // overwriting old shape, which the guard already permits) —
-        // start from default rather than parse-erroring.
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RepoConfigFile::default(),
-        Err(e) => {
-            return Err(
-                anyhow::Error::from(e).context(format!("reading {}", repo_cfg_path.display()))
-            );
-        }
-    };
-    repo_cfg.agents = roster;
-
-    write_repo_config(&repo_cfg_path, &repo_cfg)?;
+    repo_config::replace(repo, |prior| {
+        let mut repo_cfg = match prior {
+            Prior::Valid(cfg) if !force && !cfg.agents.is_empty() => anyhow::bail!(
+                "repo already has a roster; run `clank team save {team_name}` first to keep \
+                 local edits, or pass --force to replace"
+            ),
+            Prior::Valid(cfg) => *cfg,
+            Prior::Absent | Prior::Legacy => RepoConfigFile::default(),
+        };
+        repo_cfg.agents = roster;
+        Ok((Some(repo_cfg), ()))
+    })?;
     eprintln!(
         "wrote team `{team_name}` roster to {}",
-        repo_cfg_path.display()
+        repo_config::path(repo).display()
     );
     Ok(())
 }
@@ -587,20 +552,8 @@ pub(crate) fn load_user_team_roster(
     use clank_core::ids::AgentLabel;
     use std::collections::BTreeMap;
 
-    let user_path = home.join(".clank/config.json");
-    let raw: serde_json::Value = match std::fs::read_to_string(&user_path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            anyhow::anyhow!(
-                "user-scope config {} is unreadable ({e}); fix or remove it \
-                 (a fresh one is written by `clank team save`)",
-                user_path.display()
-            )
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context(format!("reading {}", user_path.display())));
-        }
-    };
+    let user_path = clank_user_config::path(home);
+    let raw = clank_user_config::read(home)?;
 
     let team_value = raw.get("teams").and_then(|t| t.get(team_name));
     let Some(team_value) = team_value else {

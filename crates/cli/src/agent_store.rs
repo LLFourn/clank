@@ -5,7 +5,6 @@
 //! the only place that knows where they sit on disk and how to
 //! load/save them atomically.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -15,6 +14,13 @@ use time::format_description::well_known::Rfc3339;
 use clank_core::agent_config::{AgentConfig, ResumePending, Session};
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
+use clank_user_config::versioned::{self, Refusal};
+
+pub mod repo_config;
+
+/// The newest version of an agent's `config.json` this build reads and
+/// writes.
+pub const AGENT_CONFIG_VERSION: u64 = 1;
 
 /// A successfully resolved roster does not contain the requested identity.
 ///
@@ -49,10 +55,16 @@ pub fn load_agent_config(repo: &Path, label: &AgentLabel) -> anyhow::Result<Opti
     load_json(&path).with_context(|| format!("reading `{}`", path.display()))
 }
 
-/// An agent config's bytes as stored, for diagnostics about what the
-/// typed config ignores on read. `None` when unreadable.
-pub(crate) fn raw_agent_config(repo: &Path, label: &AgentLabel) -> Option<Vec<u8>> {
-    std::fs::read(agent_config_path(repo, label)).ok()
+/// An agent config as the document it is stored as, for diagnostics
+/// about what the typed config ignores on read. `None` when absent or
+/// unreadable.
+pub(crate) fn agent_config_document(
+    repo: &Path,
+    label: &AgentLabel,
+) -> Option<clank_user_config::Document> {
+    versioned::read(&agent_config_path(repo, label), AGENT_CONFIG_VERSION)
+        .ok()
+        .flatten()
 }
 
 /// The session bound to the agent whose directory is `agent_dir`.
@@ -298,29 +310,6 @@ impl ReviewerTiers {
     }
 }
 
-/// Reviewer tiers for READ-ONLY render paths (`clank status`,
-/// `clank html`). Unlike [`load_reviewer_tiers`], this never
-/// errors: a repo with no team (or a misconfigured one) degrades
-/// to empty tiers so a read-only renderer never crashes on
-/// config absence. The gate then computes as zero-reviewer
-/// (Continued). `clank doctor` is the surface that reports the
-/// underlying misconfiguration. Plan:
-/// `teams-based-agent-registration`.
-pub fn reviewer_tiers_for_render(repo: &Path) -> ReviewerTiers {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    reviewer_tiers_for_render_with(repo, home.as_deref())
-}
-
-/// Home-explicit [`reviewer_tiers_for_render`] — for in-process
-/// render cores that supply the home dir. Same never-errors
-/// degrade semantics. Plan: dogfood-init-setup-in-tests (Phase B).
-pub fn reviewer_tiers_for_render_with(repo: &Path, home: Option<&Path>) -> ReviewerTiers {
-    match try_resolve_via_team_with(repo, home) {
-        Ok(Some(set)) => ReviewerTiers::from_registered(&set),
-        _ => ReviewerTiers::empty(),
-    }
-}
-
 /// Derive a role from a resolved registered set. Pure: no
 /// $HOME, no filesystem. Testable directly.
 pub fn role_from_registered_set(
@@ -338,14 +327,14 @@ pub fn role_from_registered_set(
 }
 
 /// Every agent this repo's roster names, the master first. Empty when
-/// no roster resolves.
-pub fn roster_labels(repo: &Path) -> Vec<AgentLabel> {
-    let Ok(Some(set)) = try_resolve_via_team(repo) else {
-        return Vec::new();
+/// the repo has no master yet; an error when its config cannot be read.
+pub fn roster_labels(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
+    let Some(set) = try_resolve_via_team(repo)? else {
+        return Ok(Vec::new());
     };
     let mut out = vec![set.master.clone()];
     out.extend(set.members.iter().map(|m| m.label.clone()));
-    out
+    Ok(out)
 }
 
 pub fn try_resolve_via_team(
@@ -377,8 +366,7 @@ pub fn try_resolve_via_team_with(
 ) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {
     use crate::cli::teams_config::{ResolutionError, resolve_registered_set};
 
-    let repo_cfg_path = repo.join(".clank/config.json");
-    let Some(repo_cfg) = load_repo_config(&repo_cfg_path)? else {
+    let Some(repo_cfg) = repo_config::read(repo)? else {
         return Ok(None);
     };
 
@@ -396,12 +384,6 @@ pub fn try_resolve_via_team_with(
     }
 }
 
-/// Load `<repo>/.clank/config.json` through the same fail-closed
-/// loader the resolver uses, requiring the file to exist. Missing
-/// file OR old-shape config → re-init hint. Used by `clank team
-/// save` and `clank export`, which need the repo's self-contained
-/// config and must reject the legacy shape rather than silently
-/// publishing/dumping a half-parsed one.
 /// The port the remote listens on for this repo, if one was ever
 /// sampled and kept.
 pub fn web_port(repo: &Path) -> anyhow::Result<Option<u16>> {
@@ -411,128 +393,32 @@ pub fn web_port(repo: &Path) -> anyhow::Result<Option<u16>> {
 /// Keep `port` as this repo's: the next remote binds it rather
 /// than asking the OS again, so the URL stays what it was.
 pub fn record_web_port(repo: &Path, port: u16) -> anyhow::Result<()> {
-    let mut file = load_repo_config_required(repo)?;
-    file.web.get_or_insert_with(Default::default).port = Some(port);
-    write_typed_config(&repo.join(".clank/config.json"), &file)
-}
-
-/// Atomic write of a typed config: the whole value to a temp file
-/// beside `path`, synced, then renamed over it. The one writer for
-/// `.clank/config.json` and `~/.clank/config.json`.
-pub(crate) fn write_typed_config<T: serde::Serialize>(
-    path: &Path,
-    value: &T,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".clank-config-")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
-pub fn load_repo_config_required(
-    repo: &Path,
-) -> anyhow::Result<crate::cli::teams_config::RepoConfigFile> {
-    let repo_cfg_path = repo.join(".clank/config.json");
-    load_repo_config(&repo_cfg_path)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}: no repo config found. Run `clank init` first.",
-            repo_cfg_path.display()
-        )
+    repo_config::replace(repo, |prior| {
+        let mut file = match prior {
+            repo_config::Prior::Valid(file) => *file,
+            repo_config::Prior::Absent => return Err(no_repo_config(repo)),
+            repo_config::Prior::Legacy => {
+                return Err(repo_config::legacy_schema_error(&repo_config::path(repo)));
+            }
+        };
+        file.web.get_or_insert_with(Default::default).port = Some(port);
+        Ok((Some(file), ()))
     })
 }
 
-/// Load `<repo>/.clank/config.json` ONLY if it is a VALID
-/// new-shape config. Returns `Ok(None)` for a missing file AND
-/// for an old-shape / unparseable config — both mean "no
-/// configured team here" for callers that decide whether to
-/// overwrite (`clank init --team`'s overwrite guard). Unlike
-/// [`load_repo_config_required`], this never errors on the legacy
-/// shape: an old-shape config is the documented "re-run `clank
-/// init`" recovery path, so `init` is allowed to recreate it.
-pub fn repo_config_if_valid(
+/// The repo's config, which must exist. Used by `clank team save`,
+/// `clank export` and the remote, which need the repo's self-contained
+/// config and must not publish or dump a half-read one.
+pub fn load_repo_config_required(
     repo: &Path,
-) -> anyhow::Result<Option<crate::cli::teams_config::RepoConfigFile>> {
-    let repo_cfg_path = repo.join(".clank/config.json");
-    match std::fs::read_to_string(&repo_cfg_path) {
-        Ok(body) => {
-            if is_legacy_repo_shape(&body) {
-                return Ok(None);
-            }
-            Ok(serde_json::from_str::<crate::cli::teams_config::RepoConfigFile>(&body).ok())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+) -> anyhow::Result<crate::cli::teams_config::RepoConfigFile> {
+    repo_config::read(repo)?.ok_or_else(|| no_repo_config(repo))
 }
 
-/// Load + parse `<repo>/.clank/config.json` as the new-shape
-/// [`RepoConfigFile`] (a flat ROSTER). Returns `Ok(None)` if the
-/// file doesn't exist. Fail-closed: an old-shape config (legacy
-/// `team: "name"` / a `team` field / `promoted` / an old-shape
-/// `agents` map of role-less descriptions) no longer parses as a
-/// roster, so rather than surface a cryptic serde message we map
-/// it to an actionable re-init hint.
-pub(crate) fn load_repo_config(
-    repo_cfg_path: &Path,
-) -> anyhow::Result<Option<crate::cli::teams_config::RepoConfigFile>> {
-    use crate::cli::teams_config::RepoConfigFile;
-    let body = match std::fs::read_to_string(repo_cfg_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    // Fail-closed BEFORE accepting the parse: a config can parse yet
-    // still carry a legacy marker the typed struct silently swallows —
-    // a stray `promoted` or `team` lands in the `extra` flatten map
-    // and would be ignored. Checking the raw shape first means any
-    // legacy marker yields the re-init hint, parse-success or not.
-    if is_legacy_repo_shape(&body) {
-        return Err(legacy_repo_schema_error(repo_cfg_path));
-    }
-    // An old `{agents: <role-less descriptions>}` config that has no
-    // `team`/`promoted` marker still fails here: a `RosterAgent`
-    // value requires a `role` field the old `AgentDescription`
-    // lacks. Map that serde failure to the same re-init hint.
-    serde_json::from_str::<RepoConfigFile>(&body)
-        .map(Some)
-        .map_err(|_| legacy_repo_schema_error(repo_cfg_path))
-}
-
-/// Detect the old repo schema by raw shape. The new (roster)
-/// schema has NO `team` field and NO `promoted`, and stores
-/// `agents` as a map — so a `team` key, a `promoted` key, or an
-/// array `agents` is unambiguously legacy. Checked on the raw JSON
-/// (not the typed struct) so a marker the typed parse would swallow
-/// into `extra` (e.g. `team`/`promoted`) still fail-closes. A
-/// role-less `agents` map (the just-shipped `{agents, team}` shape
-/// minus the `team`) is caught by the typed parse instead.
-pub(crate) fn is_legacy_repo_shape(body: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    obj.contains_key("promoted")
-        || obj.contains_key("team")
-        || matches!(obj.get("agents"), Some(a) if a.is_array())
-}
-
-pub(crate) fn legacy_repo_schema_error(repo_cfg_path: &Path) -> anyhow::Error {
+fn no_repo_config(repo: &Path) -> anyhow::Error {
     anyhow::anyhow!(
-        "{}: this repo's `.clank/config.json` uses the old team schema; \
-         re-run `clank init` to recreate it",
-        repo_cfg_path.display()
+        "{}: no repo config found. Run `clank init` first.",
+        repo_config::path(repo).display()
     )
 }
 
@@ -936,34 +822,19 @@ pub fn bind_session_to_agent(
 }
 
 fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let parsed = serde_json::from_str(&s)
-                .with_context(|| format!("parsing `{}` as JSON", path.display()))?;
-            Ok(Some(parsed))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    let Some(doc) = versioned::read(path, AGENT_CONFIG_VERSION)? else {
+        return Ok(None);
+    };
+    serde_json::from_value(serde_json::Value::Object(doc))
+        .map(Some)
+        .map_err(|e| Refusal::malformed(path, e).into())
 }
 
 fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".clank-config-")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)?;
-    let pretty = serde_json::to_string_pretty(value)?;
-    tmp.write_all(pretty.as_bytes())?;
-    // Trailing newline — every editor adds one; matching it
-    // avoids a diff every time a human opens the file.
-    tmp.write_all(b"\n")?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    match serde_json::to_value(value)? {
+        serde_json::Value::Object(doc) => versioned::write(path, &doc, AGENT_CONFIG_VERSION),
+        _ => anyhow::bail!("`{}` did not serialize as an object", path.display()),
+    }
 }
 
 #[cfg(test)]

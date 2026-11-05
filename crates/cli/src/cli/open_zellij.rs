@@ -3426,7 +3426,7 @@ mod tests {
                 role: RosterRole::Master,
             },
         );
-        crate::agent_store::write_typed_config(&repo.join(".clank/config.json"), &cfg).unwrap();
+        crate::agent_store::repo_config::store(&repo, &cfg);
         repo
     }
 

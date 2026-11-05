@@ -191,7 +191,9 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     );
     let path = ask(&repo, &author, &args.name, &args.message)?;
 
-    let config = crate::cli::config::load(&repo);
+    let config = crate::cli::config::load(&repo).map_err(|e| {
+        anyhow::anyhow!("the block is raised, but its `hooks.blocked` command was not run: {e:#}")
+    })?;
     if let Some(Some(cmd)) = config.hooks.get(&clank_core::HookEvent::Blocked) {
         use crate::proc_run::{Out, Spec, Stdin};
         let _ = crate::proc_run::run_blocking(

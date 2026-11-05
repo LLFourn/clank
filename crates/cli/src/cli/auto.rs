@@ -65,7 +65,7 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     // ~/.clank default, else off) — the same value the stop hook
     // acts on (auto-mode-default-on).
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let effective = crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref());
+    let effective = crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref())?;
     // Role is roster-derived and best-effort. The shared formatter keeps
     // missing-master distinct from this identity having been removed.
     let role = crate::agent_store::role_status_text(&repo, &label);

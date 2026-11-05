@@ -551,6 +551,18 @@ pub(super) fn scrollable_header(
     let gutter = display_width(&label("fix").1);
     let fix_width = cols.saturating_sub(gutter).max(1);
 
+    for error in &snap.config_errors {
+        for (i, line) in wrap(&format!("FAILED — {error}"), fix_width)
+            .into_iter()
+            .enumerate()
+        {
+            body.push(vec![
+                colored("0;31", format!("{:>5}  ", if i == 0 { "conf" } else { "" })),
+                colored("0;31", line),
+            ]);
+        }
+    }
+
     for warning in &snap.warnings {
         for (i, line) in wrap(&warning.warning.to_string(), fix_width)
             .into_iter()
@@ -718,6 +730,9 @@ pub(super) fn scrollable_header(
                 plain(format!(" {}", a.label)),
                 dim(format!("  {}", tier_label(a.role))),
             ];
+            if a.unreadable.is_some() {
+                spans.push(colored("0;31", "  config unreadable".to_string()));
+            }
             // An attending agent is BLOCKED, not working, so the
             // hourglass replaces the spinner and its verb rather than
             // crowding in beside them — `⌛ working…` claims two things
@@ -6768,6 +6783,36 @@ mod tests {
         assert_eq!(
             s.to_json()["warnings"][0]["warning"]["kind"],
             "rejected_plan_intro"
+        );
+    }
+
+    #[test]
+    fn an_agent_whose_config_cannot_be_read_says_so_on_its_row() {
+        let mut s = crate::cli::status_tui::fixtures::with_agents(
+            snap(None, vec![]),
+            &[("codex", crate::cli::teams_config::RosterRole::Master)],
+        );
+        let shown = |s: &StatusSnapshot| render(s, 24, 100).join("\n");
+        assert!(!shown(&s).contains("config unreadable"));
+        s.agents[0].unreadable = Some("`/r/.clank/agents/codex/config.json` is malformed".into());
+        let out = shown(&s);
+        let row = out
+            .lines()
+            .find(|l| l.contains("codex"))
+            .unwrap_or_default();
+        assert!(row.contains("config unreadable"), "{out}");
+    }
+
+    #[test]
+    fn a_config_it_cannot_read_is_a_failed_line_not_a_crash() {
+        let mut s = snap(None, vec![]);
+        s.config_errors
+            .push("`/r/.clank/config.json` is malformed: expected value".into());
+        let out = render(&s, 24, 100).join("\n");
+        assert!(out.contains("conf"), "{out}");
+        assert!(
+            out.contains("FAILED — `/r/.clank/config.json` is malformed"),
+            "{out}"
         );
     }
 

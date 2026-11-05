@@ -85,14 +85,17 @@ impl ConfiguredSource {
 /// Every source the roster's agents configure, by name and then agent:
 /// the external ones, and each timer that has not yet fired, with its
 /// state. Messages are always on, so they are not sources here; nor is a
-/// config an agent off the roster left on disk.
-pub(crate) fn configured(repo: &std::path::Path) -> Vec<ConfiguredSource> {
-    let mut sources: Vec<ConfiguredSource> = crate::agent_store::roster_labels(repo)
+/// config an agent off the roster left on disk. A roster agent's config
+/// that cannot be read is an error, not an agent with no sources.
+pub(crate) fn configured(repo: &std::path::Path) -> anyhow::Result<Vec<ConfiguredSource>> {
+    let mut configs = Vec::new();
+    for label in crate::agent_store::roster_labels(repo)? {
+        if let Some(cfg) = crate::agent_store::load_agent_config(repo, &label)? {
+            configs.push((label, cfg));
+        }
+    }
+    let mut sources: Vec<ConfiguredSource> = configs
         .iter()
-        .filter_map(|label| {
-            let cfg = crate::agent_store::load_agent_config(repo, label).ok()??;
-            Some((label, cfg))
-        })
         .flat_map(|(label, cfg)| {
             cfg.wait_events
                 .iter()
@@ -116,7 +119,7 @@ pub(crate) fn configured(repo: &std::path::Path) -> Vec<ConfiguredSource> {
     sources.sort_by(|a, b| {
         (&a.name, a.agent.as_str(), &a.key).cmp(&(&b.name, b.agent.as_str(), &b.key))
     });
-    sources
+    Ok(sources)
 }
 
 /// What a source's configuration is, as one comparable value: what the
@@ -472,6 +475,7 @@ mod tests {
             .unwrap();
         }
         let listed: Vec<(String, String)> = configured(repo.path())
+            .unwrap()
             .into_iter()
             .map(|s| (s.name, s.agent.to_string()))
             .collect();
@@ -483,7 +487,7 @@ mod tests {
                 ("questions".into(), "codex".into()),
             ]
         );
-        assert!(configured(&repo.path().join("missing")).is_empty());
+        assert!(configured(&repo.path().join("missing")).unwrap().is_empty());
     }
 
     /// life's shape: recurring reviews and future reminders are listed,
@@ -513,7 +517,11 @@ mod tests {
         })
         .unwrap();
         let names = |repo: &std::path::Path| -> Vec<String> {
-            configured(repo).into_iter().map(|s| s.name).collect()
+            configured(repo)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
         };
         assert!(names(repo.path()).contains(&"tax-bas".to_string()), "owed");
 
@@ -539,7 +547,7 @@ mod tests {
             ],
             "an unreadable timer is listed, not hidden"
         );
-        let sources = configured(repo.path());
+        let sources = configured(repo.path()).unwrap();
         assert!(sources.iter().all(|s| s.timer.is_some()));
         let WaitEventSource::Timer(t) = &sources[0].config else {
             unreachable!()

@@ -1,0 +1,6 @@
+{"t":"inbox","v":1,"seq":1,"at":1790647760,"event_at":1790647760,"transport":"message","action_key":"message#claude/00000000000000000000aa01","item":{"kind":"message","handle":"00000000000000000000aa01","from":"claude","repo":"/home/user/src/example-other","subject":"first, already handled","body":"first, already handled"}}
+{"t":"ack","v":1,"seq":1,"at":1790647892}
+{"t":"inbox","v":1,"seq":2,"at":1790648000,"transport":"message","action_key":"message#codex/00000000000000000000aa02","item":{"kind":"message","handle":"00000000000000000000aa02","from":"codex","repo":"/home/user/src/example-other","subject":"second, still owed","body":"second, still owed"}}
+{"t":"inbox","v":2,"seq":3,"at":1790649000,"transport":"message","action_key":"message#coordinator/00000000000000000000aa03","item":{"kind":"message","handle":"00000000000000000000aa03","from":"coordinator","repo":"/home/user/src/example-hub","subject":"question","body":"which tunnel should the remote use?","requires_reply":true,"reply_route":{"repo":"/home/user/src/example-hub","agent":"coordinator"}}}
+{"t":"a_record_from_a_newer_clank","v":7,"seq":4,"at":1790650000,"payload":{"kept":["byte","for","byte"]}}
+{"t":"inbox","v":1,"seq":5,"at":1790651000,"transp

@@ -120,6 +120,10 @@ struct Wrote {
 /// (codex on 5d24c05).
 pub struct Door {
     home: Option<PathBuf>,
+    /// The user config's schema, which this door does not own: held
+    /// to it, the door's `remote` edit is never written beside a
+    /// setting the CLI cannot read.
+    check: clank_user_config::Check,
     inner: Mutex<Inner>,
     /// Bumped whenever the live set changes: a stream holding a
     /// session watches this and asks whether it is still live.
@@ -167,9 +171,10 @@ impl Door {
     /// open sessions in `~/.clank/remote-sessions.json`, read on
     /// every use. Without a home nothing persists — a session lasts
     /// as long as the process.
-    pub fn new(home: Option<PathBuf>) -> Self {
+    pub fn new(home: Option<PathBuf>, check: clank_user_config::Check) -> Self {
         let door = Self {
             home,
+            check,
             inner: Mutex::new(Inner::default()),
             revoked: tokio::sync::watch::channel(0).0,
             #[cfg(test)]
@@ -262,7 +267,7 @@ impl Door {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => anyhow::bail!("reading `{}`: {e}", path.display()),
         };
-        clank_user_config::transact(home, |cfg| {
+        clank_user_config::transact(home, self.check, |cfg| {
             let mut store = Store {
                 sessions,
                 remote: cfg
@@ -843,6 +848,15 @@ pub fn sessions_path(home: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The part of the schema this crate owns, standing in for the CLI's.
+    fn remote_reads(path: &Path, doc: &clank_user_config::Document) -> anyhow::Result<()> {
+        if let Some(remote) = doc.get("remote") {
+            serde_json::from_value::<RemoteSection>(remote.clone())
+                .map_err(|e| clank_user_config::versioned::Refusal::malformed(path, e))?;
+        }
+        Ok(())
+    }
+
     fn cookie(token: &str) -> String {
         format!("other=1; {COOKIE}={token}")
     }
@@ -857,7 +871,7 @@ mod tests {
             "remote": {"tunnel": {"provider": "quick"}}
         });
         write_typed_config(&user_config_path(home.path()), &original).unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()));
+        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let token = door.token().unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(user_config_path(home.path())).unwrap()).unwrap();
@@ -871,7 +885,7 @@ mod tests {
     /// A link is for one use, five minutes.
     #[tokio::test(start_paused = true)]
     async fn a_link_admits_once_and_not_after_five_minutes() {
-        let door = Door::new(None);
+        let door = Door::new(None, remote_reads);
         let t = door.mint(Link::Login);
         assert!(door.consume(Link::Login, &t));
         assert!(!door.consume(Link::Login, &t), "spent");
@@ -884,8 +898,8 @@ mod tests {
     #[test]
     fn a_shared_link_crosses_door_processes_and_is_spent_once() {
         let home = tempfile::tempdir().unwrap();
-        let tui = Door::new(Some(home.path().to_path_buf()));
-        let host = Door::new(Some(home.path().to_path_buf()));
+        let tui = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let host = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let token = tui.mint_shared(Link::Login).unwrap();
         assert!(
             !std::fs::read_to_string(home.path().join(LINKS_FILE))
@@ -902,14 +916,14 @@ mod tests {
     #[tokio::test]
     async fn the_token_is_the_users_and_outlives_the_process() {
         let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()));
+        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let token = door.token().unwrap();
         assert!(token.len() >= 32, "a guessable token is no token");
         assert_eq!(door.token().unwrap(), token, "minted once, not per call");
 
         // Another repo's remote on this machine, and a fresh
         // process, take the same one: it lives in the user config.
-        let elsewhere = Door::new(Some(home.path().to_path_buf()));
+        let elsewhere = Door::new(Some(home.path().to_path_buf()), remote_reads);
         assert_eq!(elsewhere.token().unwrap(), token);
         let cfg = read_user_config(home.path()).unwrap();
         let remote: RemoteSection = serde_json::from_value(cfg["remote"].clone()).unwrap();
@@ -930,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn rotating_the_token_ends_the_sessions_it_opened() {
         let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()));
+        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let token = door.token().unwrap();
         let cookie_a = door.open_session("token").unwrap();
         let cookie_b = door.open_session("token").unwrap();
@@ -950,7 +964,9 @@ mod tests {
         assert!(door.admit(Some(&cookie(&cookie_b))).is_none());
         assert!(watch.has_changed().unwrap(), "open streams are told");
         assert_eq!(
-            Door::new(Some(home.path().to_path_buf())).token().unwrap(),
+            Door::new(Some(home.path().to_path_buf()), remote_reads)
+                .token()
+                .unwrap(),
             fresh,
             "the rotation is persisted"
         );
@@ -965,8 +981,8 @@ mod tests {
     #[tokio::test]
     async fn a_login_cannot_straddle_a_rotation() {
         let home = tempfile::tempdir().unwrap();
-        let a = Door::new(Some(home.path().to_path_buf()));
-        let b = Door::new(Some(home.path().to_path_buf()));
+        let a = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let b = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let old = a.token().unwrap();
 
         // Verification and the session are ONE hold of the store.
@@ -1012,8 +1028,8 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_session_is_handed_no_token() {
         let home = tempfile::tempdir().unwrap();
-        let a = Door::new(Some(home.path().to_path_buf()));
-        let b = Door::new(Some(home.path().to_path_buf()));
+        let a = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let b = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let opened = a.open_session("token").unwrap();
         let id_hash = a.admit(Some(&cookie(&opened))).expect("admitted").id_hash;
 
@@ -1059,7 +1075,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_is_hashed_on_disk_and_ends_when_revoked_or_old() {
         let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()));
+        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
         assert!(door.admit(Some("clank_session=nothing")).is_none());
         let token = door.open_session("token").unwrap();
         let file = std::fs::read_to_string(sessions_path(home.path())).unwrap();
@@ -1079,7 +1095,7 @@ mod tests {
 
         // A reopened door reads the file: a session from another
         // process is admitted, an old one is not.
-        let fresh = Door::new(Some(home.path().to_path_buf()));
+        let fresh = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let token = fresh.open_session("token").unwrap();
         let old = time::OffsetDateTime::now_utc() - time::Duration::days(SESSION_DAYS + 1);
         let mut records = fresh.sessions().unwrap();
@@ -1094,13 +1110,88 @@ mod tests {
             &SessionsFile { sessions: records },
         )
         .unwrap();
-        let reopened = Door::new(Some(home.path().to_path_buf()));
+        let reopened = Door::new(Some(home.path().to_path_buf()), remote_reads);
         assert!(reopened.admit(Some(&cookie(&token))).is_some());
         assert_eq!(
             reopened.sessions().unwrap().len(),
             1,
             "the stale one is gone"
         );
+    }
+
+    /// Frozen bytes (durable-formats-survive-upgrade): a session opened
+    /// before the token, under its old `passkey` field, and one after.
+    /// Created in 2099 so that expiry, which reads the clock, keeps them.
+    const FROZEN_SESSIONS: &str =
+        include_str!("../../cli/tests/fixtures/formats/remote-sessions.json");
+    const FROZEN_LINKS: &str = include_str!("../../cli/tests/fixtures/formats/remote-links.json");
+    const OLD_SESSION: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const NEW_SESSION: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+
+    #[test]
+    fn the_frozen_session_store_reads_and_keeps_its_old_session_through_a_write() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(sessions_path(home.path()), FROZEN_SESSIONS).unwrap();
+        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        assert!(door.is_live(OLD_SESSION) && door.is_live(NEW_SESSION));
+
+        door.revoke_session(NEW_SESSION).unwrap();
+        assert!(door.is_live(OLD_SESSION) && !door.is_live(NEW_SESSION));
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sessions_path(home.path())).unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({"sessions": [{
+                "id_hash": OLD_SESSION,
+                "how": "passkey",
+                "created": "2099-10-01T00:00:00Z",
+                "last_seen": "2099-10-02T00:00:00Z"
+            }]})
+        );
+    }
+
+    #[test]
+    fn the_frozen_link_store_reads_and_keeps_its_link_through_a_write() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        let path = home.path().join(LINKS_FILE);
+        std::fs::write(&path, FROZEN_LINKS).unwrap();
+        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        assert!(!door.consume_shared(Link::Login, "not-the-token").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FROZEN_LINKS);
+
+        let token = door.mint_shared(Link::Login).unwrap();
+        let frozen: serde_json::Value = serde_json::from_str(FROZEN_LINKS).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let links = stored["links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], frozen["links"][0], "the frozen link is kept");
+        assert!(door.consume_shared(Link::Login, &token).unwrap());
+    }
+
+    #[test]
+    fn the_door_never_writes_over_a_user_config_it_cannot_read() {
+        for body in ["{\"remote\": {", "{\"version\": 2, \"remote\": {}}"] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+            std::fs::write(user_config_path(home.path()), body).unwrap();
+            let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+            for (what, result) in [("token", door.token()), ("rotate", door.rotate_token())] {
+                let err = result.expect_err(what);
+                assert!(
+                    err.chain().any(|e| e
+                        .downcast_ref::<clank_user_config::versioned::Refusal>()
+                        .is_some()),
+                    "{what}: {err:#}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(user_config_path(home.path())).unwrap(),
+                body
+            );
+        }
     }
 
     /// A session written before the token — its field named
@@ -1123,8 +1214,8 @@ mod tests {
     #[tokio::test]
     async fn two_doors_share_one_authority() {
         let home = tempfile::tempdir().unwrap();
-        let a = Door::new(Some(home.path().to_path_buf()));
-        let b = Door::new(Some(home.path().to_path_buf()));
+        let a = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let b = Door::new(Some(home.path().to_path_buf()), remote_reads);
         let token = a.open_session("token").unwrap();
         let admitted = b
             .admit(Some(&cookie(&token)))
@@ -1173,7 +1264,7 @@ mod tests {
     /// is up.
     #[tokio::test(start_paused = true)]
     async fn attempts_are_ten_a_minute_per_address() {
-        let door = Door::new(None);
+        let door = Door::new(None, remote_reads);
         let a: IpAddr = "127.0.0.1".parse().unwrap();
         let b: IpAddr = "10.0.0.2".parse().unwrap();
         for _ in 0..ATTEMPTS_PER_MINUTE {

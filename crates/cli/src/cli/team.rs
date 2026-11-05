@@ -50,16 +50,39 @@ fn user_config_path(home: &Path) -> PathBuf {
 }
 
 /// Read user-scope `~/.clank/config.json` as the typed
-/// [`UserConfigFile`]. `pub` so integration tests can assert
-/// team state after calling the cores.
+/// [`UserConfigFile`], empty when there is none. `pub` so integration
+/// tests can assert team state after calling the cores.
 pub fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
-    let path = user_config_path(home);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| anyhow::Error::from(e).context(format!("parsing {}", path.display()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    }
+    let doc = clank_user_config::read(home)?;
+    check_user_config(&clank_user_config::path(home), &doc)?;
+    typed_user_config(home, doc)
+}
+
+/// The user config's whole known schema: the typed sections and every
+/// setting the config loader layers. The check every writer of the
+/// document, the web door's included, holds it to.
+pub fn check_user_config(path: &Path, doc: &clank_user_config::Document) -> anyhow::Result<()> {
+    crate::cli::config::check_layer(path, doc)?;
+    serde_json::from_value::<UserConfigFile>(serde_json::Value::Object(doc.clone()))
+        .map_err(|e| clank_user_config::versioned::Refusal::malformed(path, e))?;
+    Ok(())
+}
+
+/// [`clank_user_config::transact`] held to [`check_user_config`].
+pub(crate) fn transact_user_config<T>(
+    home: &Path,
+    f: impl FnOnce(&mut clank_user_config::Document) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    clank_user_config::transact(home, check_user_config, f)
+}
+
+fn typed_user_config(
+    home: &Path,
+    doc: clank_user_config::Document,
+) -> anyhow::Result<UserConfigFile> {
+    serde_json::from_value(serde_json::Value::Object(doc)).map_err(|e| {
+        clank_user_config::versioned::Refusal::malformed(&clank_user_config::path(home), e).into()
+    })
 }
 
 /// Resolve a label's EFFECTIVE auto-mode (`auto-mode-default-on`):
@@ -73,27 +96,30 @@ pub fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
 pub(crate) fn resolve_effective_auto_mode(
     per_agent: Option<&clank_core::agent_config::AgentConfig>,
     home: Option<&Path>,
-) -> clank_core::vocab::AutoMode {
-    resolve_effective_auto_mode_with_source(per_agent, home).0
+) -> anyhow::Result<clank_core::vocab::AutoMode> {
+    Ok(resolve_effective_auto_mode_with_source(per_agent, home)?.0)
 }
 
 /// Mode + provenance, for surfaces that display the value (doctor).
 /// Same inputs, same precedence — a projection of THE resolver, so
-/// doctor and `auto status` cannot disagree.
+/// doctor and `auto status` cannot disagree. A user config it cannot read
+/// is an error unless the agent's own setting decides without it.
 pub(crate) fn resolve_effective_auto_mode_with_source(
     per_agent: Option<&clank_core::agent_config::AgentConfig>,
     home: Option<&Path>,
-) -> (
+) -> anyhow::Result<(
     clank_core::vocab::AutoMode,
     clank_core::agent_config::AutoModeSource,
-) {
-    let user_default = home
-        .and_then(|h| read_user_config(h).ok())
-        .and_then(|c| c.auto);
-    clank_core::agent_config::effective_auto_mode_with_source(
-        per_agent.and_then(|c| c.auto_mode),
+)> {
+    let explicit = per_agent.and_then(|c| c.auto_mode);
+    let user_default = match (explicit, home) {
+        (None, Some(home)) => read_user_config(home)?.auto,
+        _ => None,
+    };
+    Ok(clank_core::agent_config::effective_auto_mode_with_source(
+        explicit,
         user_default,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -103,17 +129,13 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
 
 /// Read, change with `f` and write `~/.clank/config.json` as the typed
 /// [`UserConfigFile`], inside the one user-config transaction
-/// ([`clank_user_config::transact`]). Nothing is written when `f` fails.
+/// ([`transact_user_config`]). Nothing is written when `f` fails.
 pub(crate) fn mutate_user_config<T>(
     home: &Path,
     f: impl FnOnce(&mut UserConfigFile) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    clank_user_config::transact(home, |doc| {
-        let path = clank_user_config::path(home);
-        let mut config: UserConfigFile = serde_json::from_value(serde_json::Value::Object(
-            std::mem::take(doc),
-        ))
-        .map_err(|e| anyhow::Error::from(e).context(format!("parsing {}", path.display())))?;
+    transact_user_config(home, |doc| {
+        let mut config = typed_user_config(home, std::mem::take(doc))?;
         let out = f(&mut config)?;
         match serde_json::to_value(&config)? {
             serde_json::Value::Object(map) => *doc = map,
@@ -529,9 +551,12 @@ mod tests {
         let home = home_dir.path();
 
         // No user-global default, no per-agent config → Off (builtin).
-        assert_eq!(resolve_effective_auto_mode(None, Some(home)), AutoMode::Off);
         assert_eq!(
-            resolve_effective_auto_mode_with_source(None, Some(home)),
+            resolve_effective_auto_mode(None, Some(home)).unwrap(),
+            AutoMode::Off
+        );
+        assert_eq!(
+            resolve_effective_auto_mode_with_source(None, Some(home)).unwrap(),
             (AutoMode::Off, AutoModeSource::Builtin)
         );
 
@@ -545,16 +570,19 @@ mod tests {
         // A MISSING per-agent config under a global default-on
         // resolves On, sourced from the user default — the provenance
         // doctor shows (grok-first-turn-orchestration).
-        assert_eq!(resolve_effective_auto_mode(None, Some(home)), AutoMode::On);
         assert_eq!(
-            resolve_effective_auto_mode_with_source(None, Some(home)),
+            resolve_effective_auto_mode(None, Some(home)).unwrap(),
+            AutoMode::On
+        );
+        assert_eq!(
+            resolve_effective_auto_mode_with_source(None, Some(home)).unwrap(),
             (AutoMode::On, AutoModeSource::UserDefault)
         );
 
         // An unset per-agent config also inherits the global default.
         let unset = AgentConfig::default();
         assert_eq!(
-            resolve_effective_auto_mode(Some(&unset), Some(home)),
+            resolve_effective_auto_mode(Some(&unset), Some(home)).unwrap(),
             AutoMode::On
         );
 
@@ -564,13 +592,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_effective_auto_mode(Some(&off), Some(home)),
+            resolve_effective_auto_mode(Some(&off), Some(home)).unwrap(),
             AutoMode::Off
         );
         // An explicit per-agent OFF under a global ON: per-agent wins
         // and the source says so.
         assert_eq!(
-            resolve_effective_auto_mode_with_source(Some(&off), Some(home)),
+            resolve_effective_auto_mode_with_source(Some(&off), Some(home)).unwrap(),
             (AutoMode::Off, AutoModeSource::PerAgent)
         );
     }

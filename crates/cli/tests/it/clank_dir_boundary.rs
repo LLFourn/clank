@@ -63,6 +63,11 @@ const DECLARED: &[&str] = &[
     "attachments",
     ".gitignore",
     "config.json",
+    // The lock every writer of `config.json` holds from its read to its
+    // rename, beside the file it guards so that every path to the repo
+    // reaches the same inode. Never removed: replacing a locked inode
+    // would admit a second holder.
+    "config.lock",
     "agents",
     "plans",
     "finished",

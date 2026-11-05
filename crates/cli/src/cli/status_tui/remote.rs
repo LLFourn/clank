@@ -728,8 +728,7 @@ mod tests {
                 browser_url: format!("http://{addr}"),
             }),
         });
-        crate::agent_store::write_typed_config(&repo.path().join(".clank/config.json"), &config)
-            .unwrap();
+        crate::agent_store::repo_config::store(repo.path(), &config);
         let mut r = Remote::new(
             repo.path().to_path_buf(),
             None,
@@ -801,6 +800,7 @@ mod tests {
             0,
             "existing-session".into(),
             Some(home.clone()),
+            crate::cli::team::check_user_config,
         )
         .await
         .unwrap();
@@ -815,8 +815,7 @@ mod tests {
                 browser_url: browser_url.clone(),
             }),
         });
-        crate::agent_store::write_typed_config(&repo.path().join(".clank/config.json"), &config)
-            .unwrap();
+        crate::agent_store::repo_config::store(repo.path(), &config);
         let rec = Recorder::default();
         let mut remote = Remote::new(
             repo.path().to_path_buf(),
@@ -984,11 +983,10 @@ mod tests {
 
     fn repo_with_config() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        crate::agent_store::write_typed_config(
-            &dir.path().join(".clank/config.json"),
+        crate::agent_store::repo_config::store(
+            dir.path(),
             &crate::cli::teams_config::RepoConfigFile::default(),
-        )
-        .unwrap();
+        );
         dir
     }
 

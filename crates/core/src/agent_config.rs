@@ -27,9 +27,9 @@ use crate::vocab::{AutoMode, Tool};
 /// auto-mode is on, and the wait-for-work timeout. Identity
 /// (role / tool / launch / initial_prompt) lives in the
 /// team-based registration model — user-scope `agents` +
-/// `teams` and repo-scope `team` — not here. Unknown keys in
-/// existing on-disk skeletons (e.g. a leftover `role`/`tool`
-/// from before the cutover) are ignored by serde.
+/// `teams` and repo-scope `team` — not here. Unknown keys, a leftover
+/// `role`/`tool` from before the cutover or a field a newer clank
+/// wrote, are kept in `extra` and written back as they were.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// `Some` only when this session EXPLICITLY chose via `clank auto
@@ -57,6 +57,8 @@ pub struct AgentConfig {
     /// past the check-in window has the next start forget the binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_pending: Option<ResumePending>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// An unconfirmed resume of `session`.
@@ -1148,6 +1150,7 @@ mod tests {
             }),
             wait_events: Vec::new(),
             resume_pending: None,
+            extra: Default::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -1155,10 +1158,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_config_ignores_unknown_legacy_fields() {
+    fn agent_config_keeps_unknown_legacy_fields() {
         // On-disk skeletons from before the team-based cutover
         // still carry `role`/`tool`/`launch`/`initial_prompt`.
-        // serde must ignore them (no `deny_unknown_fields`).
         let json = r#"{
             "auto_mode": "off",
             "role": "master",
@@ -1169,11 +1171,11 @@ mod tests {
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, Some(AutoMode::Off), "explicit off survives");
         assert!(cfg.session.is_none());
-        // Reserialization drops the unknown keys entirely.
-        let back = serde_json::to_string(&cfg).unwrap();
-        assert!(!back.contains("role"));
-        assert!(!back.contains("tool"));
-        assert!(!back.contains("launch"));
+        let back: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            back,
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
     }
 
     #[test]

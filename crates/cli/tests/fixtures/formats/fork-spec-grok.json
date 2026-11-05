@@ -1,0 +1,10 @@
+{
+  "tool": "grok",
+  "from_session": "00000000-0000-4000-8000-000000000003",
+  "prompt": "You are a fork of the example repo.",
+  "grok": {
+    "source_cwd": "/home/user/src/example",
+    "child_id": "00000000-0000-4000-8000-000000000004",
+    "prepared": true
+  }
+}

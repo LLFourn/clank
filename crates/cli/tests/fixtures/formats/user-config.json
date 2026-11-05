@@ -1,0 +1,35 @@
+{
+  "auto": "wait",
+  "agents": {
+    "claude": { "tool": "claude" },
+    "codex": {
+      "tool": "codex",
+      "launch": { "args": ["--profile", "deep"] }
+    }
+  },
+  "teams": {
+    "dev": {
+      "claude": { "role": "master" },
+      "reviewer": { "agent": "codex", "role": "commit" },
+      "scratch": { "tool": "grok", "role": "standby" }
+    }
+  },
+  "review": {
+    "force_review_on_misc_commits": true
+  },
+  "finish": {
+    "autosquash": true
+  },
+  "zellij": {
+    "layout": "layout {\n    tab name=\"clank\" {\n        clank_agents\n    }\n}\n"
+  },
+  "remote": {
+    "tunnel": { "provider": "quick" },
+    "token": "PLACEHOLDER-NOT-A-REAL-TOKEN"
+  },
+  "user_command": {
+    "site_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+  },
+  "default_agents": ["claude"],
+  "a_newer_section": { "kept": true }
+}

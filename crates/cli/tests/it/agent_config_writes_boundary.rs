@@ -39,6 +39,11 @@ const READ_ONLY_SITES: &[(&str, &str, &str)] = &[
         "names the file in a diagnostic",
     ),
     (
+        "cli/src/cli/doctor.rs",
+        "let path = agent_config_path(repo, &label);",
+        "names the file a config check reports, read through `load_agent_config`",
+    ),
+    (
         "user-config/src/lib.rs",
         "home.join(\".clank\").join(\"config.json\")",
         "the user's global `~/.clank/config.json`, not an agent's config",
@@ -87,6 +92,14 @@ fn is(f: &std::path::Path, name: &str) -> bool {
     f.file_name().and_then(|n| n.to_str()) == Some(name)
 }
 
+/// `agent_store.rs` and the modules it owns under `agent_store/`.
+fn in_store(f: &std::path::Path) -> bool {
+    is(f, STORE)
+        || f.parent()
+            .and_then(|d| d.file_name())
+            .is_some_and(|d| d == "agent_store")
+}
+
 fn under_crates(f: &std::path::Path) -> String {
     f.strip_prefix(crates_dir())
         .unwrap_or(f)
@@ -98,7 +111,7 @@ fn under_crates(f: &std::path::Path) -> String {
 fn nothing_outside_the_store_names_save_agent_config() {
     let violations: Vec<String> = all_sources()
         .iter()
-        .filter(|f| !is(f, STORE) && !is(f, "agent_config_writes_boundary.rs"))
+        .filter(|f| !in_store(f) && !is(f, "agent_config_writes_boundary.rs"))
         .flat_map(|f| {
             let body = std::fs::read_to_string(f).unwrap_or_default();
             body.lines()
@@ -125,7 +138,7 @@ fn production_spells_an_agent_config_path_only_where_declared() {
     let production = Production::of(&files);
     let mut seen = vec![false; READ_ONLY_SITES.len()];
     let mut violations = Vec::new();
-    for f in files.iter().filter(|f| !is(f, STORE)) {
+    for f in files.iter().filter(|f| !in_store(f)) {
         let rel = under_crates(f);
         for (i, line) in production.text(f).lines().enumerate() {
             if !spells_agent_config_path(line) {

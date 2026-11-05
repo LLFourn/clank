@@ -9,53 +9,58 @@
 //! replacements, not read-modify-write cycles.
 
 pub mod lease;
+pub mod versioned;
 
 use anyhow::Context;
-use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
-pub type Document = Map<String, Value>;
+pub use versioned::Document;
 
 /// `<home>/.clank/config.json`.
 pub fn path(home: &Path) -> PathBuf {
     home.join(".clank").join("config.json")
 }
 
+/// The newest version of this document this build reads and writes.
+pub const VERSION: u64 = 1;
+
 /// The document as it stands, empty when there is none. Readers take no
-/// lock: every write replaces the file whole.
+/// lock: every write replaces the file whole. A document this build
+/// cannot read is an error carrying a [`versioned::Refusal`].
 pub fn read(home: &Path) -> anyhow::Result<Document> {
-    let path = path(home);
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<Value>(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?
-        {
-            Value::Object(map) => Ok(map),
-            _ => anyhow::bail!("`{}` is not a JSON object", path.display()),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    }
+    Ok(versioned::read(&path(home), VERSION)?.unwrap_or_default())
 }
+
+/// The schema a writer holds the whole document to: every setting it
+/// knows must read, whichever section the writer edits. Unknown keys
+/// pass.
+pub type Check = fn(&Path, &Document) -> anyhow::Result<()>;
 
 /// Read the document, let `f` check and change it, and replace it
 /// atomically if it changed, all while holding `<home>/.clank/config.lock`,
-/// so no other transaction runs between the read and the write. Nothing is
-/// written when `f` fails. The lock file is never removed: replacing a
-/// locked inode would admit a second holder. Holders take no other lock
-/// while they hold it.
+/// so no other transaction runs between the read and the write. The
+/// document is held to `check` before `f` sees it and again before it is
+/// written, so a writer never publishes beside a setting no reader can
+/// read. Nothing is written when `f` or either check fails. The lock file
+/// is never removed: replacing a locked inode would admit a second
+/// holder. Holders take no other lock while they hold it.
 pub fn transact<T>(
     home: &Path,
+    check: Check,
     f: impl FnOnce(&mut Document) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let dir = home.join(".clank");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let _lock = lock(&dir.join("config.lock"))?;
+    let path = path(home);
     let before = read(home)?;
+    check(&path, &before)?;
     after_read();
     let mut doc = before.clone();
     let out = f(&mut doc)?;
     if doc != before {
-        replace(&path(home), &doc)?;
+        check(&path, &doc)?;
+        versioned::write(&path, &doc, VERSION)?;
     }
     Ok(out)
 }
@@ -79,22 +84,6 @@ fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
     }
 }
 
-fn replace(path: &Path, doc: &Document) -> anyhow::Result<()> {
-    use std::io::Write;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".clank-config-")
-        .suffix(".json.tmp")
-        .tempfile_in(parent)?;
-    tmp.write_all(serde_json::to_string_pretty(doc)?.as_bytes())?;
-    tmp.write_all(b"\n")?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
-
 #[cfg(feature = "test-hooks")]
 thread_local! {
     static AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -114,5 +103,83 @@ pub fn after_read() {
     #[cfg(feature = "test-hooks")]
     if let Some(hook) = AFTER_READ.with(|h| h.borrow_mut().take()) {
         hook();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn any(_: &Path, _: &Document) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn auto_is_on_or_off(path: &Path, doc: &Document) -> anyhow::Result<()> {
+        match doc.get("auto") {
+            None => Ok(()),
+            Some(v) if v == "on" || v == "off" => Ok(()),
+            Some(v) => Err(versioned::Refusal::malformed(path, format!("auto is {v}")).into()),
+        }
+    }
+
+    #[test]
+    fn a_document_its_check_refuses_is_never_edited_and_an_edit_it_refuses_is_never_written() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        let body = "{\"auto\": \"yes\", \"diff\": {}}";
+        std::fs::write(path(home.path()), body).unwrap();
+        let ran = std::cell::Cell::new(false);
+        assert!(
+            transact(home.path(), auto_is_on_or_off, |_| {
+                ran.set(true);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!ran.get(), "the edit ran on a document its check refuses");
+        assert_eq!(std::fs::read_to_string(path(home.path())).unwrap(), body);
+
+        let body = "{\"auto\": \"on\"}";
+        std::fs::write(path(home.path()), body).unwrap();
+        assert!(
+            transact(home.path(), auto_is_on_or_off, |doc| {
+                doc.insert("auto".into(), "maybe".into());
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path(home.path())).unwrap(), body);
+    }
+
+    #[test]
+    fn a_document_it_cannot_read_is_never_overwritten() {
+        for body in ["{\"teams\": {", "{\"version\": 2, \"auto\": \"on\"}"] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+            std::fs::write(path(home.path()), body).unwrap();
+            let ran = std::cell::Cell::new(false);
+            let err = transact(home.path(), any, |doc| {
+                ran.set(true);
+                doc.insert("auto".into(), "off".into());
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(err.downcast_ref::<versioned::Refusal>().is_some(), "{err}");
+            assert!(!ran.get(), "the edit ran on `{body}`");
+            assert_eq!(std::fs::read_to_string(path(home.path())).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn a_missing_document_is_created_versioned() {
+        let home = tempfile::tempdir().unwrap();
+        transact(home.path(), any, |doc| {
+            doc.insert("auto".into(), "on".into());
+            Ok(())
+        })
+        .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(home.path())).unwrap()).unwrap();
+        assert_eq!(raw, serde_json::json!({"version": 1, "auto": "on"}));
     }
 }

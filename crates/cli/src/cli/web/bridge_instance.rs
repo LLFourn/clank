@@ -117,9 +117,13 @@ impl BridgeInstance {
             .table()
             .ok_or_else(|| anyhow::anyhow!("zellij did not answer for `{}`", panes.session()))?;
         let port = crate::agent_store::web_port(&repo)?.unwrap_or(0);
-        let host =
-            clank_web_cloudflare::host::Host::start(port, panes.session().to_owned(), home.clone())
-                .await?;
+        let host = clank_web_cloudflare::host::Host::start(
+            port,
+            panes.session().to_owned(),
+            home.clone(),
+            crate::cli::team::check_user_config,
+        )
+        .await?;
         let actual_port = url::Url::parse(&host.local_url)?
             .port()
             .ok_or_else(|| anyhow::anyhow!("host URL has no port"))?;
@@ -857,6 +861,7 @@ mod tests {
             0,
             "existing-session".into(),
             Some(home.path().to_path_buf()),
+            crate::cli::team::check_user_config,
         )
         .await
         .unwrap();
@@ -1057,6 +1062,7 @@ mod tests {
             0,
             "large-transcript".into(),
             Some(home.path().to_path_buf()),
+            crate::cli::team::check_user_config,
         )
         .await
         .unwrap();
@@ -1112,7 +1118,10 @@ mod tests {
             )
             .unwrap();
         }
-        let door = Door::new(Some(home.path().to_path_buf()));
+        let door = Door::new(
+            Some(home.path().to_path_buf()),
+            crate::cli::team::check_user_config,
+        );
         let cookie = format!(
             "{}={}",
             crate::cli::web::door::COOKIE,
@@ -1192,7 +1201,10 @@ mod tests {
             .unwrap();
             let sent = Arc::new(Mutex::new(Vec::new()));
             let panes = Arc::new(TestPanes { sent: sent.clone() });
-            let door = Arc::new(Door::new(Some(home.path().to_path_buf())));
+            let door = Arc::new(Door::new(
+                Some(home.path().to_path_buf()),
+                crate::cli::team::check_user_config,
+            ));
             let startup = Startup {
                 tunnel: None,
                 poll: Duration::from_secs(3600),
@@ -1209,6 +1221,7 @@ mod tests {
                         0,
                         "bridge-smoke".into(),
                         Some(home.path().to_path_buf()),
+                        crate::cli::team::check_user_config,
                     )
                     .await
                     .unwrap(),
@@ -1405,6 +1418,7 @@ mod tests {
             0,
             "bridge-smoke".into(),
             Some(home.path().to_path_buf()),
+            crate::cli::team::check_user_config,
         )
         .await
         .unwrap();

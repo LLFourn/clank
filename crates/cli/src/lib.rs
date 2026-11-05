@@ -30,3 +30,6 @@ pub mod worktree_facts;
 
 // Operator CLI subcommands. Local-only mutations.
 pub mod cli;
+
+#[cfg(test)]
+mod format_fixtures;

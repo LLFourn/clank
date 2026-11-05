@@ -1,0 +1,6 @@
+{
+  "kind": "clone",
+  "source": "/home/user/src/example",
+  "branch": "spike",
+  "base": "0000000000000000000000000000000000000005"
+}
