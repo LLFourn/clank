@@ -3,6 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/cli", "crates/web", "crates/web-cloudflare", "crates/user-config"]
 
 [workspace.package]
+version = "0.1.0"
 license = "0BSD"
 repository = "https://github.com/LLFourn/clank"
 

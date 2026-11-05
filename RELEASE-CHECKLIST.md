@@ -109,16 +109,25 @@ item is queueable as written: plan name, problem, shape of the fix.
     workspace, all targets, checks on 1.96.0, and 1.95.0 is refused
     (2026-10-28).
 
-- [ ] **`version-tags-and-changelog`** — `clank --version` prints
-  `0.0.1+8d05d296` (`build_stamp_inputs.rs:133-190`). It prints the bare
-  version only for a clean checkout whose HEAD is tagged `0.0.1` or
-  `v0.0.1`, or for a build with no git checkout. There are no tags and no
-  CHANGELOG, and all five crates sit at `0.0.1`. Shape: choose the tag
-  form (`v<semver>`), bump the version, tag, and add a CHANGELOG. The
-  release job parses the built binary's `clank <version>` and checks
-  that `<version>` equals the tag with its leading `v` removed
-  (`human_version` prints the bare package version for a `v`-prefixed
-  tag), rejecting any `+sha` or `.dirty`.
+- [x] **`version-tags-and-changelog`** — done 2026-11-05:
+  - Releases are tagged `v<semver>`, and the first is `v0.1.0`.
+  - Every crate takes `version` from `[workspace.package]` (0.1.0), and
+    the inter-crate path dependencies carry `version = "0.1.0"`.
+  - `CHANGELOG.md` is in Keep a Changelog form, with `Unreleased` above
+    `0.1.0`.
+  - `scripts/release-check.sh <tag> [binary]`:
+    - accepts only a plain `vMAJOR.MINOR.PATCH` tag;
+    - requires the tag to equal the version the `clank` crate declares;
+    - builds clank unless given a binary, taking the executable path from
+      Cargo's own artifact report, so `CARGO_TARGET_DIR` and a configured
+      target directory are honoured;
+    - requires `clank --version` to print exactly `clank <version>`;
+    - requires `CHANGELOG.md` to have that version's section.
+  - Tests: `it/release_check.rs` covers a tag the crate doesn't declare,
+    an off-tag build, a dirty build, malformed tags and tags with a
+    development suffix, a missing changelog section, and a stale binary
+    at the default path while Cargo builds elsewhere. The build-stamp
+    tests cover a `v0.1.0` tag.
 
 - [ ] **`durable-formats-survive-upgrade`** — the formats that live across
   releases: `.clank/config.json` and `~/.clank/config.json`, the

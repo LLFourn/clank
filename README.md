@@ -83,7 +83,7 @@ remote. Keep `--locked`: without it
 `cargo install` ignores the committed `Cargo.lock` and re-resolves
 every dependency to the newest semver-compatible version. The checkout
 pins its Rust toolchain in `rust-toolchain.toml`, which rustup picks up.
-`clank --version` prints `0.0.1+<sha>` for a checkout build (`.dirty`
+`clank --version` prints `<version>+<sha>` for a checkout build (`.dirty`
 when the tree had changes), and the TUI names its pane `clank <version>`.
 
 clank is developed on macOS. A Linux CI job (`.github/workflows/ci.yml`)

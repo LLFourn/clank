@@ -1,6 +1,6 @@
 [package]
 name = "clank-web-cloudflare"
-version = "0.0.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.96"
 license.workspace = true
@@ -12,8 +12,8 @@ include = ["/src/**", "/assets/**", "/LICENSE"]
 test-support = []
 
 [dependencies]
-clank-web = { path = "../web" }
-clank-user-config = { path = "../user-config" }
+clank-web = { path = "../web", version = "0.1.0" }
+clank-user-config = { path = "../user-config", version = "0.1.0" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

@@ -520,13 +520,13 @@ mod tests {
         }
 
         fn version(ws: &std::path::Path) -> String {
-            human_version(ws, "0.0.1").0
+            human_version(ws, "0.1.0").0
         }
 
         #[test]
         fn a_build_outside_git_is_the_release() {
             let ws = tree();
-            assert_eq!(human_version(ws.path(), "0.0.1"), ("0.0.1".into(), vec![]));
+            assert_eq!(human_version(ws.path(), "0.1.0"), ("0.1.0".into(), vec![]));
         }
 
         /// The sha follows HEAD; only a build input makes it dirty; only a
@@ -536,26 +536,26 @@ mod tests {
             let ws = checkout();
             let ws = ws.path();
             let one = sha(ws);
-            assert_eq!(version(ws), format!("0.0.1+{one}"));
+            assert_eq!(version(ws), format!("0.1.0+{one}"));
 
             std::fs::write(ws.join("notes.md"), "not built").unwrap();
-            assert_eq!(version(ws), format!("0.0.1+{one}"), "a non-input");
+            assert_eq!(version(ws), format!("0.1.0+{one}"), "a non-input");
             std::fs::write(ws.join("crates/web/src/lib.rs"), "pub fn g() {}").unwrap();
-            assert_eq!(version(ws), format!("0.0.1+{one}.dirty"));
+            assert_eq!(version(ws), format!("0.1.0+{one}.dirty"));
             git(ws, &["checkout", "-q", "--", "crates"]);
             std::fs::write(ws.join("crates/web/src/new.rs"), "").unwrap();
-            assert_eq!(version(ws), format!("0.0.1+{one}.dirty"), "untracked");
+            assert_eq!(version(ws), format!("0.1.0+{one}.dirty"), "untracked");
             std::fs::remove_file(ws.join("crates/web/src/new.rs")).unwrap();
-            assert_eq!(version(ws), format!("0.0.1+{one}"));
+            assert_eq!(version(ws), format!("0.1.0+{one}"));
 
-            git(ws, &["tag", "v0.0.2"]);
-            assert_eq!(version(ws), format!("0.0.1+{one}"), "another version's tag");
-            git(ws, &["tag", "-a", "-m", "release", "v0.0.1"]);
-            assert_eq!(version(ws), "0.0.1");
+            git(ws, &["tag", "v0.1.1"]);
+            assert_eq!(version(ws), format!("0.1.0+{one}"), "another version's tag");
+            git(ws, &["tag", "-a", "-m", "release", "v0.1.0"]);
+            assert_eq!(version(ws), "0.1.0");
             std::fs::write(ws.join("Cargo.lock"), "lock2").unwrap();
             assert_eq!(
                 version(ws),
-                format!("0.0.1+{one}.dirty"),
+                format!("0.1.0+{one}.dirty"),
                 "tagged but dirty"
             );
 
@@ -564,11 +564,11 @@ mod tests {
             assert_ne!(one, two);
             assert_eq!(
                 version(ws),
-                format!("0.0.1+{two}"),
+                format!("0.1.0+{two}"),
                 "HEAD moved off the tag"
             );
-            git(ws, &["checkout", "-q", "--detach", "v0.0.1"]);
-            assert_eq!(version(ws), "0.0.1", "detached at the tag");
+            git(ws, &["checkout", "-q", "--detach", "v0.1.0"]);
+            assert_eq!(version(ws), "0.1.0", "detached at the tag");
         }
 
         /// What can move the version is watched, wherever git keeps it:
@@ -577,16 +577,16 @@ mod tests {
         fn the_version_reruns_on_what_moves_it() {
             let ws = checkout();
             let ws = ws.path();
-            git(ws, &["tag", "v0.0.1"]);
+            git(ws, &["tag", "v0.1.0"]);
             let dot = dunce::canonicalize(ws.join(".git")).unwrap();
-            let (_, watched) = human_version(ws, "0.0.1");
+            let (_, watched) = human_version(ws, "0.1.0");
             for want in ["HEAD", "index", "refs/heads/main", "refs/tags"] {
                 assert!(watched.contains(&dot.join(want)), "{want}: {watched:?}");
             }
 
             git(ws, &["pack-refs", "--all"]);
-            let (version, watched) = human_version(ws, "0.0.1");
-            assert_eq!(version, "0.0.1", "a packed tag");
+            let (version, watched) = human_version(ws, "0.1.0");
+            assert_eq!(version, "0.1.0", "a packed tag");
             for want in ["HEAD", "packed-refs", "refs/heads"] {
                 assert!(watched.contains(&dot.join(want)), "{want}: {watched:?}");
             }
@@ -602,8 +602,8 @@ mod tests {
             );
             std::fs::write(linked.join("crates/web/src/lib.rs"), "pub fn h() {}").unwrap();
             git(&linked, &["commit", "-qam", "side"]);
-            let (version, watched) = human_version(&linked, "0.0.1");
-            assert_eq!(version, format!("0.0.1+{}", sha(&linked)));
+            let (version, watched) = human_version(&linked, "0.1.0");
+            assert_eq!(version, format!("0.1.0+{}", sha(&linked)));
             let own = dunce::canonicalize(dot.join("worktrees/wt")).unwrap();
             for want in [
                 own.join("HEAD"),
