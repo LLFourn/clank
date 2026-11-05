@@ -331,7 +331,7 @@ pub fn repo_checks(
     // presence (`zellij-layout-config-around-agent-panes`). Checked
     // BEFORE the team-resolution early-returns so a broken template
     // surfaces at doctor time even on a teamless repo — never at
-    // `open zellij` time.
+    // `open` time.
     if let Some(template) = home
         .map(crate::cli::team::read_user_config)
         .transpose()

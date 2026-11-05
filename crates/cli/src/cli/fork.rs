@@ -396,10 +396,10 @@ pub(super) async fn open_created_fork<F: std::future::Future<Output = anyhow::Re
     dest: &Path,
     inside_zellij: bool,
     no_open: bool,
-    open: impl FnOnce(super::OpenZellijArgs) -> F,
+    open: impl FnOnce(super::OpenArgs) -> F,
 ) -> anyhow::Result<()> {
     if should_open(inside_zellij, no_open) {
-        open(super::OpenZellijArgs {
+        open(super::OpenArgs {
             repo: Some(dest.to_path_buf()),
             fork: None,
             pr: None,

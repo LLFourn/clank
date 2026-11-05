@@ -339,13 +339,6 @@ pub enum Command {
     /// body for a later attempt instead.
     #[command(after_long_help = STASH_EXAMPLES)]
     Stash(crate::cli::StashArgs),
-    /// Hidden alias for `clank stash push` (+ `shelve clean` →
-    /// `stash drop`). One release of back-compat.
-    #[command(hide = true)]
-    Shelve(crate::cli::ShelveArgs),
-    /// Hidden alias for `clank stash pop`. One release of back-compat.
-    #[command(hide = true)]
-    Unshelve(crate::cli::UnshelveArgs),
     /// Copy plans from another branch
     ///
     /// Brings their commits + plan files onto the current branch; the
@@ -369,9 +362,6 @@ pub enum Command {
     /// An agent asks when it needs a decision it must not make itself,
     /// and waits; the human's answer wakes it.
     Block(crate::cli::BlockArgs),
-    /// The old spelling of `block answer`.
-    #[command(hide = true)]
-    Unblock(crate::cli::UnblockArgs),
     /// Tell clank which subagent you are waiting on
     ///
     /// A subagent by its name (`clank attend "<name>"`); shell work is
@@ -384,13 +374,11 @@ pub enum Command {
     /// you are checked in on once, so a hang cannot hold you asleep.
     /// Nothing is cancelled. Ending your turn with live background work
     /// you are not attending wakes you with a notice naming it.
-    #[command(alias = "attending")]
     Attend(crate::cli::AttendArgs),
     /// The full-screen pane for driving a running team
     ///
     /// The repo's state live: the agents, the plan and its gate, and the
-    /// remote switch. One per repo. The `--tui` flag it grew out of still opens it,
-    /// and says so.
+    /// remote switch. One per repo.
     Tui(crate::cli::TuiArgs),
     /// Run a command under clank, so it knows when the work ends
     ///
@@ -472,12 +460,10 @@ pub async fn dispatch_with(
         Command::Purge(args) => crate::cli::purge::run(args).await,
         Command::Diff(args) => crate::cli::diff::run(args).await,
         Command::Stash(args) => crate::cli::stash::run(args).await,
-        Command::Shelve(args) => crate::cli::stash::run_shelve_alias(args).await,
-        Command::Unshelve(args) => crate::cli::stash::run_unshelve_alias(args).await,
         Command::Fork(args) => crate::cli::fork::run(args).await,
         Command::Log(args) => crate::cli::log::run(args).await,
         Command::Html(args) => crate::cli::html::run(args).await,
-        Command::Open(args) => crate::cli::open::run(args).await,
+        Command::Open(args) => crate::cli::open_zellij::run(args).await,
         Command::Rereview(args) => crate::cli::rereview::run(args).await,
         Command::Rewire(args) => crate::cli::rewire::run(args).await,
         Command::Status(args) => crate::cli::status::run(args).await,
@@ -500,7 +486,6 @@ pub async fn dispatch_with(
         Command::Doctor(args) => crate::cli::doctor::run(args).await,
         Command::Config(args) => crate::cli::config::run(args).await,
         Command::Block(args) => crate::cli::block::run(args).await,
-        Command::Unblock(args) => crate::cli::block::run_unblock(args).await,
         Command::Attend(args) => crate::cli::attend::run(args).await,
         Command::Tui(args) => crate::cli::status_tui::run(args).await,
         Command::Run(args) => crate::cli::run::run(args).await,
@@ -602,7 +587,7 @@ mod tests {
         let mut unknown: Vec<String> = Vec::new();
 
         // Shape 1: reference-table rows, `| `name` | …` — and cells
-        // that name two commands, `block` / `unblock`.
+        // that name two commands, `a` / `b`.
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("| `")
                 && let Some(cell) = rest.split(" |").next()
@@ -661,7 +646,7 @@ mod tests {
     }
 
     /// The README's reference table rows, keyed by each command its first
-    /// cell names (`block` / `unblock` share one), with the row's text.
+    /// cell names (two may share one, `a` / `b`), with the row's text.
     fn readme_rows(text: &str) -> Vec<(String, String)> {
         let reference = text
             .split("## Command reference")
@@ -1200,8 +1185,8 @@ mod tests {
         }
     }
 
-    /// What clank runs itself (hooks, the monitor), one-off migrations
-    /// and old spellings: the group that would list it (empty for the
+    /// What clank runs itself (hooks, the monitor) and one-off
+    /// migrations: the group that would list it (empty for the
     /// top level), its name, and an argv a real caller uses.
     const PLUMBING: &[(&str, &str, &[&str])] = &[
         ("", "stop-hook", &["stop-hook", "--tool", "claude"]),
@@ -1210,10 +1195,7 @@ mod tests {
         ("", "rewire", &["rewire", "--from-stdin"]),
         ("", "monitor", &["monitor", "start"]),
         ("monitor", "upgrade", &["monitor", "upgrade"]),
-        ("block", "migrate", &["block", "migrate", "--dry"]),
-        ("", "unblock", &["unblock", "claude", "q", "-m", "yes"]),
-        ("block", "create", &["block", "create", "q", "-m", "why?"]),
-        ("open", "zellij", &["open", "zellij", "--print"]),
+        ("block", "migrate", &["block", "migrate", "--dry-run"]),
     ];
 
     /// Hiding is presentation only: every installed hook string and
@@ -1307,41 +1289,22 @@ mod tests {
             assert_eq!(a.repo.as_deref(), r, "{argv:?}");
             assert!(a.global && a.json, "{argv:?}");
         }
-        // `open`'s options before and after `zellij` are one request.
-        let Command::Open(o) = parse(&["clank", "open", "--repo", "/r"]) else {
-            panic!()
-        };
-        assert_eq!(o.zellij.repo.as_deref(), r);
-        let Command::Open(o) = parse(&["clank", "open", "zellij", "--repo", "/r"]) else {
-            panic!()
-        };
-        let Some(crate::cli::OpenCmd::Zellij(z)) = o.command else {
-            panic!()
-        };
-        assert_eq!(z.repo.as_deref(), r);
-        let Command::Open(o) = parse(&["clank", "open", "--repo", "/r", "zellij"]) else {
-            panic!()
-        };
-        let Some(crate::cli::OpenCmd::Zellij(after)) = o.command else {
-            panic!()
-        };
-        let merged = crate::cli::open::zellij_args(o.zellij, after).unwrap();
-        assert_eq!(
-            merged.repo.as_deref(),
-            r,
-            "before the subcommand reaches the opener"
-        );
-        let Command::Open(o) = parse(&["clank", "open", "--repo", "/a", "zellij", "--repo", "/b"])
+    }
+
+    /// `clank open` takes options, not a path: the pre-rename `clank open
+    /// <path>` errors rather than mis-parsing (ruthless a25f71d minor).
+    #[test]
+    fn open_takes_options_and_refuses_a_path() {
+        let Command::Open(o) = Cli::try_parse_from(["clank", "open", "--print", "--repo", "/r"])
+            .unwrap()
+            .command
         else {
             panic!()
         };
-        let Some(crate::cli::OpenCmd::Zellij(after)) = o.command else {
-            panic!()
-        };
-        assert!(
-            crate::cli::open::zellij_args(o.zellij, after).is_err(),
-            "and two repos are refused"
-        );
+        assert!(o.print);
+        assert_eq!(o.repo.as_deref(), Some(std::path::Path::new("/r")));
+        assert!(Cli::try_parse_from(["clank", "open", "/some/path"]).is_err());
+        assert!(Cli::try_parse_from(["clank", "open", "--fork", "a", "--pr", "3"]).is_err());
     }
 
     /// The config write reaches the repo named after the key, through the
@@ -1384,7 +1347,7 @@ mod tests {
             };
             let key = c.command.unwrap_or_else(|| panic!("{line}: no key"));
             let args = crate::cli::config::key_args(&key);
-            assert!(args.value.is_some() && args.then.is_none(), "{line}");
+            assert!(args.value.is_some(), "{line}");
         }
     }
 
@@ -1396,99 +1359,9 @@ mod tests {
         assert!(Cli::try_parse_from(["clank", "rewire", "--from-stdin"]).is_ok());
     }
 
-    /// Each old spelling parses to the same request as the new one.
+    /// Every value naming an agent is shown as `<AGENT>`.
     #[test]
-    fn old_spellings_parse_to_the_new_requests() {
-        let parse = |argv: &[&str]| Cli::try_parse_from(argv.iter().copied()).unwrap().command;
-        let ask = |argv: &[&str]| match parse(argv) {
-            Command::Block(crate::cli::BlockArgs {
-                command: crate::cli::BlockCmd::Ask(a) | crate::cli::BlockCmd::Create(a),
-            }) => format!("{a:?}"),
-            _ => panic!("{argv:?}"),
-        };
-        assert_eq!(
-            ask(&["clank", "block", "ask", "q", "-m", "why?", "--author", "a"]),
-            ask(&[
-                "clank", "block", "create", "q", "-m", "why?", "--author", "a"
-            ]),
-        );
-        let answer = |argv: &[&str]| match parse(argv) {
-            Command::Block(crate::cli::BlockArgs {
-                command: crate::cli::BlockCmd::Answer(a),
-            })
-            | Command::Unblock(a) => format!("{a:?}"),
-            _ => panic!("{argv:?}"),
-        };
-        assert_eq!(
-            answer(&["clank", "block", "answer", "claude", "q", "-m", "yes"]),
-            answer(&["clank", "unblock", "claude", "q", "-m", "yes"]),
-        );
-    }
-
-    /// Each renamed word parses the old spelling to the same request.
-    #[test]
-    fn renamed_words_parse_to_the_same_request() {
-        fn dump(m: &clap::ArgMatches) -> String {
-            let mut out = String::new();
-            for id in m.ids() {
-                let raw: Vec<String> = m
-                    .get_raw(id.as_str())
-                    .map(|v| v.map(|s| s.to_string_lossy().into_owned()).collect())
-                    .unwrap_or_default();
-                out.push_str(&format!("{id}={raw:?};"));
-            }
-            if let Some((name, sub)) = m.subcommand() {
-                out.push_str(&format!(" {name}[{}]", dump(sub)));
-            }
-            out
-        }
-        let req = |argv: &str| {
-            use clap::CommandFactory;
-            dump(
-                &Cli::command()
-                    .try_get_matches_from(argv.split(' '))
-                    .unwrap(),
-            )
-        };
-        for (new, old) in [
-            ("clank agent make-master codex", "clank agent promote codex"),
-            (
-                "clank agent config web --clear",
-                "clank agent launch web --clear",
-            ),
-            (
-                "clank team remove pair --force",
-                "clank team delete pair --force",
-            ),
-            ("clank finish p -m x --dry-run", "clank finish p -m x --dry"),
-            ("clank stash --dry-run", "clank stash --dry"),
-            ("clank stash push --dry-run", "clank stash push --dry"),
-            (
-                "clank pick p --from b --dry-run",
-                "clank pick p --from b --dry",
-            ),
-            ("clank purge p --dry-run", "clank purge p --dry"),
-            ("clank block migrate --dry-run", "clank block migrate --dry"),
-            (
-                "clank html open p --print",
-                "clank html open p --print-path",
-            ),
-        ] {
-            assert_eq!(req(new), req(old), "`{old}` should be `{new}`");
-        }
-        let Command::Finish(f) =
-            Cli::try_parse_from(["clank", "finish", "p", "-m", "x", "--dry-run"])
-                .unwrap()
-                .command
-        else {
-            panic!()
-        };
-        assert!(f.dry, "--dry-run is the no-effect mode");
-    }
-
-    /// Help advertises only the new words.
-    #[test]
-    fn help_advertises_only_the_new_words() {
+    fn every_value_naming_an_agent_is_agent() {
         let mut root = cli_at(100);
         root.build();
         let mut help = |path: &[&str]| {
@@ -1498,44 +1371,6 @@ mod tests {
             }
             c.render_long_help().to_string()
         };
-        let listed = |text: &str, name: &str| {
-            text.lines()
-                .any(|l| l.starts_with("  ") && l.split_whitespace().next() == Some(name))
-        };
-        let agent = help(&["agent"]);
-        assert!(
-            listed(&agent, "make-master")
-                && !listed(&agent, "promote")
-                && listed(&agent, "config")
-                && !listed(&agent, "launch"),
-            "{agent}"
-        );
-        let cli = <Cli as clap::CommandFactory>::command();
-        for sub in cli.find_subcommand("agent").unwrap().get_subcommands() {
-            assert_eq!(
-                sub.get_visible_aliases().count(),
-                0,
-                "`agent {}` advertises an old spelling",
-                sub.get_name()
-            );
-        }
-        let team = help(&["team"]);
-        assert!(
-            listed(&team, "remove") && !listed(&team, "delete"),
-            "{team}"
-        );
-        for path in [&["finish"][..], &["stash"], &["pick"], &["purge"]] {
-            let h = help(path);
-            assert!(
-                h.contains("--dry-run") && !h.contains("--dry "),
-                "{path:?}:\n{h}"
-            );
-        }
-        let html = help(&["html", "open"]);
-        assert!(
-            html.contains("--print") && !html.contains("--print-path"),
-            "{html}"
-        );
         for path in [
             &["agent", "add"][..],
             &["agent", "start"],

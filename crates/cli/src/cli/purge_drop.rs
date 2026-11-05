@@ -3,7 +3,7 @@
 //!
 //! One [`DropProgram`], built from the rewrite preview, is what every
 //! executor carries out: the in-process replay (the live default and
-//! `--dry`'s assessment), and the `git rebase --interactive` it hands
+//! `--dry-run`'s assessment), and the `git rebase --interactive` it hands
 //! over to when a kept commit genuinely conflicts.
 
 use std::path::Path;
@@ -202,7 +202,7 @@ impl DropProgram {
 }
 
 /// Why the run must not start, and what replaying it came to: the one
-/// assessment `--dry` reports and a live run acts on.
+/// assessment `--dry-run` reports and a live run acts on.
 fn survey(
     repo: &Path,
     program: &DropProgram,
@@ -223,7 +223,7 @@ fn survey(
     Ok((blockers, assessed))
 }
 
-/// `--dry`: what a live run would drop, keep, and stop at. Writes only
+/// `--dry-run`: what a live run would drop, keep, and stop at. Writes only
 /// unreferenced objects.
 pub(crate) fn dry_run(
     repo: &Path,
@@ -240,7 +240,7 @@ pub(crate) fn dry_run(
 }
 
 /// Run `program`. `Ok(())` once the branch (or `into_branch`) holds the
-/// rewritten history, or after `--dry` has printed it; a conflict that
+/// rewritten history, or after `--dry-run` has printed it; a conflict that
 /// stops in a git rebase is an `Err` naming how to finish it.
 pub(crate) fn execute(
     repo: &Path,

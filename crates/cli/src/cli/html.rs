@@ -50,11 +50,11 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let progress = Progress::new(args.quiet);
 
-    // `clank html open <target>` (without --print-path) launches the browser.
+    // `clank html open <target>` (without --print) launches the browser.
     // Route it through the loading-page flow so a slow first build shows the
     // browser a live progress page IMMEDIATELY instead of nothing.
     if let Some(HtmlCmd::Open(open_args)) = &args.command
-        && !open_args.print_path
+        && !open_args.print
     {
         return run_open(
             &repo,
@@ -69,7 +69,7 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     }
 
     // Otherwise: build first, then note the output (bare `clank html`) or
-    // print the resolved target path (`open --print-path`).
+    // print the resolved target path (`open --print`).
     build_site(
         &repo,
         &basename,
@@ -82,8 +82,8 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     .await?;
     progress.finish();
 
-    // Under `--print-path`, stdout must contain ONLY the resolved path so
-    // callers can use `$(clank html open <plan> --print-path)` verbatim; the
+    // Under `--print`, stdout must contain ONLY the resolved path so
+    // callers can use `$(clank html open <plan> --print)` verbatim; the
     // build-info line goes to stderr (codex dfe596d).
     if let Some(HtmlCmd::Open(open_args)) = &args.command {
         eprintln!("wrote {}", out_dir.display());
@@ -204,7 +204,7 @@ pub async fn generate(
     build_site(repo, &basename, out_dir, home, rebuild, &progress, None).await
 }
 
-/// Resolve the target file the browser (or `--print-path`) lands on.
+/// Resolve the target file the browser (or `--print`) lands on.
 /// When `plan` is set, returns `<out_dir>/plan/<stem>.html` after
 /// resolving the plan name via the shared `plan_resolve` helper —
 /// errors with the established "not a known plan" diagnostic on
@@ -3583,7 +3583,7 @@ mod tests {
             commit: None,
             queue: Some(queue.to_string()),
             stash: None,
-            print_path: false,
+            print: false,
         };
         async fn target(
             p: &Path,

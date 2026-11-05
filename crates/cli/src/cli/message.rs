@@ -9,7 +9,7 @@
 //!
 //! ONE pass, before dispatch, rather than a call in each command's
 //! `run`. Several commands take a free-text `-m` and they disagree about
-//! emptiness — `block create` writes the text with no check at all,
+//! emptiness — `block ask` writes the text with no check at all,
 //! while `feedback write` accepts an empty body as a verdict-only
 //! note. Substitution is therefore all that happens here; what a
 //! command already does with the text it is handed, it keeps doing.
@@ -39,7 +39,6 @@ fn field_of(cmd: &mut Command) -> Option<Field<'_>> {
         }) => Field::Many(&mut a.message),
         Command::Nudge(a) => Field::Many(&mut a.message),
         Command::Finish(a) => Field::Many(&mut a.message),
-        Command::Unblock(a) => Field::One(&mut a.message),
         Command::Queue(QueueArgs {
             command: Some(QueueCmd::Add(a)),
             ..
@@ -48,7 +47,7 @@ fn field_of(cmd: &mut Command) -> Option<Field<'_>> {
             command: FeedbackCmd::Write(a),
         }) => Field::One(&mut a.message),
         Command::Block(BlockArgs {
-            command: BlockCmd::Ask(a) | BlockCmd::Create(a),
+            command: BlockCmd::Ask(a),
         }) => Field::One(&mut a.message),
         Command::Block(BlockArgs {
             command: BlockCmd::Answer(a),
@@ -156,8 +155,8 @@ mod tests {
                 "-m",
                 "-",
             ],
-            vec!["block", "create", "q", "-m", "-"],
-            vec!["unblock", "rev", "q", "-m", "-"],
+            vec!["block", "ask", "q", "-m", "-"],
+            vec!["block", "answer", "rev", "q", "-m", "-"],
         ] {
             assert_eq!(
                 resolved(&args, body),
@@ -286,12 +285,12 @@ mod tests {
         resolve_with(&mut cmd, || panic!("neither is a lone dash")).unwrap();
     }
 
-    /// Emptiness is each command's own question: `block create` writes
+    /// Emptiness is each command's own question: `block ask` writes
     /// the text unchecked, so substituting empty here must not become a
     /// new rejection that changes what an empty `-m ""` already does.
     #[test]
     fn empty_stdin_substitutes_empty_rather_than_failing_here() {
-        assert_eq!(resolved(&["block", "create", "q", "-m", "-"], ""), vec![""]);
+        assert_eq!(resolved(&["block", "ask", "q", "-m", "-"], ""), vec![""]);
     }
 
     /// `queue add` with no `-m` reads the drafts dir, and that must

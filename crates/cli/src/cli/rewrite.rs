@@ -83,7 +83,7 @@ pub struct RewriteOutcome {
 /// - dirty working tree
 /// - `--into-branch` pointing at an existing branch
 ///
-/// In `--dry` mode the engine prints the planned listing FIRST,
+/// In `--dry-run` mode the engine prints the planned listing FIRST,
 /// then reports any blockers as a footer — the operator wants the
 /// commit-by-commit shape even when a blocker would prevent the
 /// live run.
@@ -171,7 +171,7 @@ async fn run_inner(
     // (codex on 714e2cd).
     //
     // A live run builds regardless; it needs the tip. A DRY run builds
-    // only when the answer could change what it prints, so `--dry` on
+    // only when the answer could change what it prints, so `--dry-run` on
     // a clean tree still writes nothing at all.
     let asked = opts.into_branch.is_none() && working_tree_dirty(opts.repo)?;
     let built = if blockers.is_empty() && (!opts.dry || asked) {
@@ -206,7 +206,7 @@ async fn run_inner(
 
     if let Some(first) = blockers.first() {
         // Live run: bail on the first blocker with the same
-        // message --dry would have reported.
+        // message --dry-run would have reported.
         anyhow::bail!("{first}");
     }
     let (new_tip, pairs) = built.expect("a plan with no blockers was built above");
@@ -311,7 +311,7 @@ pub struct RewordOpts<'a> {
 /// trees, messages, and authors (author dates intact).
 ///
 /// Returns the `(old, new)` sha pairs for the reworded target and every
-/// replayed descendant (empty in `--dry`), so the caller can migrate
+/// replayed descendant (empty in `--dry-run`), so the caller can migrate
 /// sha-keyed state (e.g. review feedback — the git `post-rewrite` hook does
 /// NOT fire for a plumbing `update-ref`).
 ///
@@ -528,7 +528,7 @@ fn move_ahead(
     Ok(Ok(ahead))
 }
 
-/// Pre-flight diagnostics. Live run bails on the first; `--dry`
+/// Pre-flight diagnostics. Live run bails on the first; `--dry-run`
 /// reports the full list as a footer after the listing.
 /// Whether landing `new_tip` on the current branch would change the
 /// tree the working copy is checked out to.

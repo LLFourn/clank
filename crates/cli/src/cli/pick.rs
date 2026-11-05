@@ -10,7 +10,7 @@
 //!
 //! A picked active plan enters this branch's review cycle immediately
 //! (its intro carries `plans/<stem>.md`); reviews RESET by design — the
-//! copies are new shas on a new base, same rule as unshelve.
+//! copies are new shas on a new base, same rule as `stash pop`.
 
 use std::collections::BTreeSet;
 
@@ -172,7 +172,7 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Dirty-tree refusal BEFORE the --dry branch: the preview must report
+    // Dirty-tree refusal BEFORE the --dry-run branch: the preview must report
     // the same refusal the live run would hit (dry equals execute — the
     // same rule finish enforces; ruthless aeb97ff).
     if crate::cli::rewrite::working_tree_dirty(&repo)? {
@@ -214,7 +214,7 @@ pub async fn run(args: PickArgs) -> anyhow::Result<()> {
         }
     }
 
-    // The landing shape, computed ONCE for --dry and execute alike
+    // The landing shape, computed ONCE for --dry-run and execute alike
     // (one-computation rule): each plan in SOURCE order with its
     // ordered commits and, for --squash, the composed message.
     let mut landings: Vec<(PlanKey, Vec<&crate::git_io::CommitMeta>, Option<String>)> = Vec::new();

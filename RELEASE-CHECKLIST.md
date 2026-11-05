@@ -222,10 +222,13 @@ item is queueable as written: plan name, problem, shape of the fix.
   Shape: a short SECURITY.md that names the threat model and these
   exposures, plus a fix or a documented acceptance for each one.
 
-- [ ] **`retire-hidden-aliases`** — §0 removes them before release:
-  delete every hidden older spelling (`block create`, `unblock`, `open
-  zellij`, `agent promote`, `shelve`, `status --tui` …) and the README's
-  list of them.
+- [x] **`retire-hidden-aliases`** — done 2026-11-05. Every hidden older
+  spelling of a command, flag or config key is removed, along with the
+  README's list of them. The kept hidden commands are internal entry
+  points (hooks, monitor, rewire, licences, block migrate). The pane
+  matcher still recognises the old TUI pane command, so sessions opened
+  before the rename are found. The inventory is in the plan's As-landed
+  note.
 
 ## 2. Release blockers: per channel (only for the channels chosen in §0)
 

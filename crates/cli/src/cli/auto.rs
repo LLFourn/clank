@@ -7,7 +7,7 @@
 //! path (that's `clank as`).
 //!
 //! `auto_mode` is per-agent STATE. Role is NOT: it comes from the
-//! roster, and changes through `clank agent promote` / `agent add`.
+//! roster, and changes through `clank agent make-master` / `agent add`.
 
 use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, resolve_repo};
 use crate::agent_env::resolve_identity_from_env;

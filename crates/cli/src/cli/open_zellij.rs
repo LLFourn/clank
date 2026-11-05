@@ -1,4 +1,4 @@
-//! `clank open zellij` — auto-generate a zellij layout (KDL)
+//! `clank open` — auto-generate a zellij layout (KDL)
 //! at `<repo>/.clank/zellij/layout.kdl` and spawn
 //! `zellij --layout <path>`. The pane commands pin
 //! `--repo <abs-path>` so the spawned session's cwd doesn't
@@ -10,7 +10,7 @@ use anyhow::Context;
 
 use crate::proc_run::{self, Group, Out, RunError, Spec, Stdin};
 
-use super::OpenZellijArgs;
+use super::OpenArgs;
 use super::{repo_basename, resolve_repo};
 
 /// Whether the environment indicates a Zellij session. This is not a
@@ -23,7 +23,7 @@ pub(crate) fn in_session() -> bool {
     std::env::var_os("ZELLIJ").is_some()
 }
 
-pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
+pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     // `--print` composes and prints; it never needs the binary, and a
     // test that inspects the argv must not require zellij installed.
     if !args.print {
@@ -45,7 +45,7 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
 /// anywhere is reported where it is and not opened again.
 async fn run_with(
     io: &mut impl OpenIo,
-    args: &OpenZellijArgs,
+    args: &OpenArgs,
     current: Option<SessionTarget>,
 ) -> anyhow::Result<()> {
     let source = resolve_repo(args.repo.as_deref())?;
@@ -3120,7 +3120,7 @@ const SESSION_NAME_MAX: usize = 24;
 /// Deterministic per-repo session name (`zellij-session-dedup`):
 /// zellij enforces NAME UNIQUENESS, so a stable name makes
 /// duplicate clank sessions unrepresentable — re-running
-/// `clank open zellij` attaches instead of minting another
+/// `clank open` attaches instead of minting another
 /// randomly-named session full of fresh agent instances.
 ///
 /// Long basenames are CAPPED to [`SESSION_NAME_MAX`]: truncated, with a
@@ -4001,7 +4001,7 @@ mod tests {
 
     const PS_LIVE: &str = "\
 ??        /usr/local/bin/zellij --server /tmp/zellij-501/0.44.3/clank-clank
-ttys004   clank open zellij
+ttys004   clank open
 ttys004   zellij attach clank-dark_skippy
 ttys013   zellij --session clank-fsctl --new-session-with-layout /Users/llfourn/src/fsctl/.clank/zellij/layout.kdl options --session-serialization false
 ttys030   -zsh
@@ -4034,7 +4034,7 @@ ttys030   -zsh
 
     #[test]
     fn picker_ignores_the_server_and_non_zellij_commands() {
-        // The `??`-tty server line and `clank open zellij` (prog !=
+        // The `??`-tty server line and `clank open` (prog !=
         // zellij) are not clients; with the two real clients left and
         // no name match → ambiguous → None.
         assert_eq!(pick_zellij_client_tty(PS_LIVE, Some("nope")), None);
@@ -6528,8 +6528,8 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         );
     }
 
-    fn args(repo: &Path) -> OpenZellijArgs {
-        OpenZellijArgs {
+    fn args(repo: &Path) -> OpenArgs {
+        OpenArgs {
             repo: Some(repo.to_path_buf()),
             fork: None,
             pr: None,
@@ -6788,7 +6788,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
             &agent(&source, "codex"),
             false,
         )]);
-        let args = OpenZellijArgs {
+        let args = OpenArgs {
             all: true,
             ..args(&source)
         };

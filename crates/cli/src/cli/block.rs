@@ -7,7 +7,7 @@ use clank_core::wait::AnswerRef;
 
 pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
     match args.command {
-        BlockCmd::Ask(a) | BlockCmd::Create(a) => run_create(a).await,
+        BlockCmd::Ask(a) => run_create(a).await,
         BlockCmd::Answer(a) => run_unblock(a).await,
         BlockCmd::Clean(a) => run_clean(a).await,
         BlockCmd::Migrate(a) => run_migrate(a).await,
@@ -759,64 +759,12 @@ mod tests {
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("first answer"));
     }
 
-    /// `block ask`/`block answer` and the old `block create`/`unblock`
-    /// leave the same flat pair.
-    #[tokio::test]
-    async fn the_old_and_new_spellings_leave_the_same_pair() {
-        let ask = |root: &std::path::Path| crate::cli::BlockCreateArgs {
-            name: "q".into(),
-            message: "why?".into(),
-            author: Some("claude".into()),
-            repo: Some(root.to_path_buf()),
-        };
-        let answer = |root: &std::path::Path| crate::cli::UnblockArgs {
-            agent: "claude".into(),
-            name: "q".into(),
-            message: "yes".into(),
-            repo: Some(root.to_path_buf()),
-        };
-        let new = tempfile::tempdir().unwrap();
-        let old = tempfile::tempdir().unwrap();
-        run(BlockArgs {
-            command: BlockCmd::Ask(ask(new.path())),
-        })
-        .await
-        .unwrap();
-        run(BlockArgs {
-            command: BlockCmd::Answer(answer(new.path())),
-        })
-        .await
-        .unwrap();
-        run(BlockArgs {
-            command: BlockCmd::Create(ask(old.path())),
-        })
-        .await
-        .unwrap();
-        run_unblock(answer(old.path())).await.unwrap();
-        let read = |root: &std::path::Path| {
-            scan_blocks(root)
-                .into_iter()
-                .map(|b| (b.agent, b.name, b.question, b.answer))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(read(new.path()), read(old.path()));
-        assert_eq!(
-            read(new.path()),
-            [(
-                "claude".into(),
-                "q".into(),
-                "why?".into(),
-                Some("yes".into())
-            )]
-        );
-    }
-
     #[tokio::test]
     async fn pause_round_trips_through_exactly_one_flat_pair() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         crate::cli::block::run(crate::cli::BlockArgs {
-            command: crate::cli::BlockCmd::Create(crate::cli::BlockCreateArgs {
+            command: crate::cli::BlockCmd::Ask(crate::cli::BlockCreateArgs {
                 name: "pause".into(),
                 message: "held for review".into(),
                 author: Some("claude".into()),
@@ -1098,7 +1046,7 @@ mod tests {
         assert!(
             root.join(".clank/agents/alice/blocks/gone/stale.md")
                 .exists(),
-            "--dry must not delete the question it reports"
+            "--dry-run must not delete the question it reports"
         );
     }
 

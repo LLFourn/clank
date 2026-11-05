@@ -344,7 +344,7 @@ fn roster_auto_rows(
 /// Global-library agents (`~/.clank` `agents`) not already on `roster`
 /// — the "+ add" candidates, each with its tool. Read FRESH from the
 /// library by the TUI loop when the picker opens (never cached), so
-/// a `clank agent add --global` made elsewhere shows up immediately.
+/// a `clank team agent add` made elsewhere shows up immediately.
 /// Empty without a resolvable home or library (read-only degrade; the
 /// picker then shows its empty-state hint).
 pub(crate) fn available_agents(
@@ -940,13 +940,6 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     };
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-
-    if args.tui {
-        // The flag outgrew the command; the name says so once, and the
-        // panes of sessions opened before the rename keep working.
-        eprintln!("`clank status --tui` is `clank tui` now");
-        return crate::cli::status_tui::run_tui(repo, basename, home, policy).await;
-    }
 
     if args.watch {
         return run_watch(

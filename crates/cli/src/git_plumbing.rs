@@ -545,7 +545,7 @@ pub fn recommit_distinct(
 /// fallback), parent = `head_sha`, ambient identity, `message`.
 ///
 /// This is the ONE builder for finalize commits (ruthless 3bd7882): the live
-/// `finish` refs the returned commit; `--dry` leaves it dangling and previews
+/// `finish` refs the returned commit; `--dry-run` leaves it dangling and previews
 /// over it. One implementation, so preview and execution cannot drift.
 /// Building from HEAD's tree (not the index) also means unrelated STAGED
 /// changes are never swept into the finalize commit.

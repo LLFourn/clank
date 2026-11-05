@@ -415,7 +415,7 @@ fn pick_dry_squash_purge_previews_the_shape_and_is_a_noop() {
         assert_eq!(
             git_out(repo, &["rev-parse", "HEAD"]),
             before,
-            "--dry is a strict no-op"
+            "--dry-run is a strict no-op"
         );
         // Tracked state untouched (the fold's untracked .clank/cache
         // is clank's own working data, not a pick side effect).
