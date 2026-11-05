@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct RemoteSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelSection>,
+    /// Where clank before [`crate::secret`] kept the token. Read only
+    /// so the door can move it to the store; never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }

@@ -410,11 +410,16 @@ protocol, authentication, and route contracts.
 
 The default host's page is behind a door, and the key is one token. Enter on the
 row opens the remote page, which prints it; paste it into the page
-and you are in. It is minted on first use and kept at user level in
-`~/.clank/config.json` under `remote.token`, so it is the same token
+and you are in. It is minted on first use and kept at user level — in
+the macOS login keychain (generic password `clank-remote`), or in
+`~/.clank/remote-token`, mode 0600, elsewhere — so it is the same token
 for every repo's remote on this machine and it survives restarts —
 paste it once per device, not once per session. Backspace on the
-token row rotates it, which ends every session it opened.
+token row rotates it, which ends every session it opened. A token an
+older clank left in `~/.clank/config.json` under `remote.token` is
+moved to the store on first use; if both hold different tokens the
+remote refuses to start until one is removed. See
+[SECURITY.md](SECURITY.md) for what this protects against.
 
 The links make the paste optional rather than necessary: `o` on the
 row opens the browser through a one-time link, so this machine never

@@ -1385,3 +1385,107 @@ fn html_finished_run_projects_the_recorded_duration_in_its_page_and_timeline() {
         1
     );
 }
+
+/// What `clank html` exports is bounded by what it reads: git history,
+/// plans and feedback. Secrets planted everywhere else it could reach —
+/// the repo, user and agent configs, the environment and every
+/// `~/.clank` store — stay out, while a secret someone COMMITTED in a
+/// plan is exported as git would show it.
+#[test]
+fn html_exports_no_config_environment_or_home_store_secrets() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(
+        repo,
+        ".clank/plans/leaky.md",
+        "# leaky\n\nSENTINEL-COMMITTED-PLAN\n",
+    );
+    commit(repo, "[leaky] intro");
+
+    write(
+        repo,
+        ".clank/config.json",
+        // allow-json-literal: sentinel secrets planted as a user's own file holds them
+        r#"{"agents": {"claude": {"tool": "claude", "role": "master",
+            "initial_prompt": "SENTINEL-REPO-CONFIG"}},
+            "hooks": {"blocked": "echo SENTINEL-REPO-HOOK"}}"#,
+    );
+    write(
+        repo,
+        ".clank/agents/claude/config.json",
+        // allow-json-literal: sentinel secrets planted as a user's own file holds them
+        r#"{"tool": "claude", "role": "master", "wait_events": [
+            {"kind": "command", "name": "mail", "command": ["SENTINEL-AGENT-CONFIG"]}]}"#,
+    );
+    let home = tempfile::tempdir().unwrap();
+    let store = home.path().join(".clank");
+    for (rel, body) in [
+        (
+            "config.json",
+            // allow-json-literal: sentinel secrets planted as a user's own file holds them
+            r#"{"remote": {"token": "SENTINEL-USER-CONFIG-TOKEN"},
+                "hooks": {"blocked": "SENTINEL-USER-CONFIG"}}"#,
+        ),
+        ("remote-token", "SENTINEL-REMOTE-TOKEN\n"),
+        (
+            "remote-sessions.json",
+            r#"{"sessions": [{"id_hash": "SENTINEL-SESSION", "how": "token",
+                "created": "2099-01-01T00:00:00Z", "last_seen": "2099-01-01T00:00:00Z"}]}"#,
+        ),
+        (
+            "remote-links.json",
+            r#"{"links": [{"kind": "Login", "hash": "SENTINEL-LINK", "expires_unix": 4102444800}]}"#,
+        ),
+        (
+            "user-commands/ledger.jsonl",
+            "SENTINEL-USER-COMMAND-LEDGER\n",
+        ),
+    ] {
+        let path = store.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    // SAFETY: a name no other test reads or writes; the std env lock
+    // serialises it against every Rust reader in the harness.
+    unsafe { std::env::set_var("CLANK_HTML_TEST_SECRET", "SENTINEL-ENVIRONMENT") };
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(clank::cli::html::generate(
+            repo,
+            &repo.join(".clank/html"),
+            Some(home.path()),
+            true,
+        ))
+        .expect("html::generate");
+
+    let mut exported = String::new();
+    let mut dirs = vec![repo.join(".clank/html")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                exported.push_str(&String::from_utf8_lossy(&std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    assert!(
+        exported.contains("SENTINEL-COMMITTED-PLAN"),
+        "a committed plan is exported as it is"
+    );
+    for planted in [
+        "SENTINEL-REPO-CONFIG",
+        "SENTINEL-REPO-HOOK",
+        "SENTINEL-AGENT-CONFIG",
+        "SENTINEL-USER-CONFIG",
+        "SENTINEL-REMOTE-TOKEN",
+        "SENTINEL-SESSION",
+        "SENTINEL-LINK",
+        "SENTINEL-USER-COMMAND-LEDGER",
+        "SENTINEL-ENVIRONMENT",
+    ] {
+        assert!(!exported.contains(planted), "`{planted}` reached the html");
+    }
+}

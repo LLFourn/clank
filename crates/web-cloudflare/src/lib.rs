@@ -13,4 +13,5 @@ pub mod door;
 pub mod host;
 pub mod origin;
 pub mod process;
+pub mod secret;
 pub mod tunnel;

@@ -39,6 +39,7 @@ mod plan_admission;
 mod process_boundary;
 mod release_check;
 mod rereview_integration;
+mod security_md;
 mod signal_boundary;
 mod standby_wakes;
 mod stash_dwim;
