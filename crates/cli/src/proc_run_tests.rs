@@ -55,8 +55,11 @@ fn fds_of_child(spec: Spec) -> std::collections::BTreeSet<i32> {
 
 /// A descriptor at `at`, inheritable: `F_DUPFD` never sets CLOEXEC.
 fn inheritable_at(at: i32) -> i32 {
+    use std::os::fd::IntoRawFd;
     let file = std::fs::File::open("/dev/null").unwrap();
-    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, at) };
+    let fd = rustix::io::fcntl_dupfd_cloexec(&file, at).unwrap();
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+    let fd = fd.into_raw_fd();
     assert_eq!(fd, at, "fd {at} was free");
     fd
 }
@@ -78,20 +81,16 @@ fn fd_case_host() {
         }
         "above-limit" => {
             inheritable_at(256);
-            let limit = libc::rlimit {
-                rlim_cur: 64,
-                rlim_max: libc::RLIM_INFINITY,
-            };
-            let mut old = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) };
-            let limit = libc::rlimit {
-                rlim_max: old.rlim_max,
-                ..limit
-            };
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+            let old = getrlimit(Resource::Nofile);
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(64),
+                    maximum: old.maximum,
+                },
+            )
+            .unwrap();
             fds_of_child(Spec::new("/bin/ls"))
         }
         other => panic!("no case {other}"),
@@ -352,9 +351,10 @@ fn group_gone(pgid: i32) -> bool {
 /// `waitpid` has nothing left to say about `pid`. Asked only once the
 /// pid is gone, so this never reaps on anyone's behalf.
 fn echild(pid: i32) -> bool {
-    let mut status = 0;
-    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    rustix::process::Pid::from_raw(pid).is_some_and(|pid| {
+        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).err()
+            == Some(rustix::io::Errno::CHILD)
+    })
 }
 
 /// A group the test owns and nothing else may touch.
@@ -493,7 +493,11 @@ fn a_writer_that_lets_go_within_the_patience_is_whole() {
 /// output at the instant of exit read those copies as holders. The
 /// spinners fork, as Linux's spawn does, so macOS reproduces it too: a
 /// `pre_exec` hook takes std off its `posix_spawn` path.
+///
+/// Unsafe because `pre_exec` is, and only a hook takes std off its
+/// `posix_spawn` path.
 #[test]
+#[allow(unsafe_code)]
 fn concurrent_forks_never_make_a_run_incomplete() {
     use std::os::unix::process::CommandExt;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -503,7 +507,8 @@ fn concurrent_forks_never_make_a_run_incomplete() {
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let mut fork = std::process::Command::new("/usr/bin/true");
-                    // SAFETY: the hook does nothing.
+                    // SAFETY: the hook does nothing, so it makes no call that
+                    // is not async-signal-safe.
                     unsafe { fork.pre_exec(|| Ok(())) };
                     fork.status().unwrap();
                 }
@@ -942,15 +947,19 @@ fn a_joined_child_is_in_the_group_and_its_drop_signals_nothing() {
     let pgid = leader.pgid().unwrap();
     let joined = start(Spec::new("/bin/sleep").arg("30").group(Group::Join(pgid))).unwrap();
     let member = joined.pid() as i32;
-    assert_eq!(unsafe { libc::getpgid(member) }, pgid.get());
+    let child = rustix::process::Pid::from_raw(member).unwrap();
+    assert_eq!(
+        rustix::process::getpgid(Some(child)).unwrap().as_raw_pid(),
+        pgid.get()
+    );
     drop(joined);
     std::thread::sleep(Duration::from_millis(200));
     // Asked of the waits this test owns: a killed child is still a
     // zombie that a liveness probe would read as running.
-    let mut status = 0;
-    assert_eq!(
-        unsafe { libc::waitpid(member, &mut status, libc::WNOHANG) },
-        0,
+    assert!(
+        rustix::process::waitpid(Some(child), rustix::process::WaitOptions::NOHANG)
+            .unwrap()
+            .is_none(),
         "the member was signalled"
     );
     let mut leader = leader;

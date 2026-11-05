@@ -273,7 +273,10 @@ impl Fixture {
         }
     }
     fn monitor_descriptor(&self) -> Option<Value> {
-        let runtime = PathBuf::from(format!("/tmp/clank-run-{}", unsafe { libc::getuid() }));
+        let runtime = PathBuf::from(format!(
+            "/tmp/clank-run-{}",
+            rustix::process::getuid().as_raw()
+        ));
         let tag = blake3::hash(self.root.as_os_str().as_encoded_bytes()).to_hex()[..32].to_owned();
         let value: Value =
             serde_json::from_slice(&std::fs::read(runtime.join(format!("{tag}.json"))).ok()?)
@@ -355,7 +358,10 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Only this fixture repo's descriptor and slot. No process listing or
         // global socket sweep; the monitor uses its own process group.
-        let runtime = PathBuf::from(format!("/tmp/clank-run-{}", unsafe { libc::getuid() }));
+        let runtime = PathBuf::from(format!(
+            "/tmp/clank-run-{}",
+            rustix::process::getuid().as_raw()
+        ));
         let tag = blake3::hash(self.root.as_os_str().as_encoded_bytes()).to_hex()[..32].to_owned();
         let descriptor = runtime.join(format!("{tag}.json"));
         if let Ok(bytes) = std::fs::read(&descriptor)

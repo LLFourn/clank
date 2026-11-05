@@ -178,7 +178,6 @@ impl NativeLock {
     }
 
     fn refresh(&self) -> anyhow::Result<()> {
-        use std::os::fd::AsRawFd;
         anyhow::ensure!(
             self.owns(),
             "Claude config lock was replaced; configuration was not changed"
@@ -192,9 +191,18 @@ impl NativeLock {
                 < Self::STALE,
             "Claude config lock lease expired; configuration was not changed; retry launch"
         );
-        if unsafe { libc::futimens(self.directory.as_raw_fd(), std::ptr::null()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        let now = rustix::fs::Timespec {
+            tv_sec: 0,
+            tv_nsec: rustix::fs::UTIME_NOW,
+        };
+        rustix::fs::futimens(
+            &self.directory,
+            &rustix::fs::Timestamps {
+                last_access: now,
+                last_modification: now,
+            },
+        )
+        .map_err(std::io::Error::from)?;
         Ok(())
     }
 }

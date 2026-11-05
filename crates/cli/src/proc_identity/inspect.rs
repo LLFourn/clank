@@ -298,11 +298,65 @@ mod platform {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) use platform::{bsd_info, group_members};
+
+/// libproc and `sysctl` fill C structs through out-pointers, and neither
+/// std nor rustix wraps them, so the unsafe items live here.
+#[cfg(target_os = "macos")]
 mod platform {
     use super::*;
 
+    #[allow(unsafe_code)]
+    pub(crate) fn bsd_info(pid: i32) -> std::io::Result<libc::proc_bsdinfo> {
+        // SAFETY: `proc_bsdinfo` is a C struct of integers and byte arrays,
+        // for which all-zero bytes are a valid value.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is a correctly sized, zeroed proc_bsdinfo and
+        // `size` describes it; the call only writes into that buffer.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if n != size {
+            return Err(if n <= 0 {
+                super::super::platform::process_read_error(std::io::Error::last_os_error())
+            } else {
+                std::io::ErrorKind::InvalidData.into()
+            });
+        }
+        Ok(info)
+    }
+
+    /// The processes in group `pgid`, or `None` when the system will not
+    /// say.
+    #[allow(unsafe_code)]
+    pub(crate) fn group_members(pgid: i32) -> Option<Vec<i32>> {
+        const CAP: usize = 4096;
+        let mut pids = vec![0i32; CAP];
+        // SAFETY: the buffer is valid for the byte size passed. Unlike
+        // `proc_listpids`, this answers with a COUNT of pids, not bytes.
+        let count = unsafe {
+            libc::proc_listpgrppids(
+                pgid,
+                pids.as_mut_ptr().cast(),
+                (CAP * std::mem::size_of::<i32>()) as libc::c_int,
+            )
+        };
+        if count < 0 {
+            return None;
+        }
+        let n = (count as usize).min(CAP);
+        Some(pids[..n].iter().copied().filter(|pid| *pid > 0).collect())
+    }
+
     pub(super) fn fields(pid: i32) -> Fields {
-        let bsd = match super::super::platform::bsd_info(pid) {
+        let bsd = match bsd_info(pid) {
             Ok(bsd) => bsd,
             Err(e) => return Fields::unavailable(e.into()),
         };
@@ -321,7 +375,10 @@ mod platform {
         }
     }
 
+    #[allow(unsafe_code)]
     fn running_threads(pid: i32) -> Field<i32> {
+        // SAFETY: `proc_taskinfo` is a C struct of integers, for which
+        // all-zero bytes are a valid value.
         let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as libc::c_int;
         // SAFETY: exact size of a valid writable proc_taskinfo; read-only API.
@@ -343,6 +400,7 @@ mod platform {
         }
     }
 
+    #[allow(unsafe_code)]
     pub(super) fn argv(pid: i32) -> Field<Vec<OsString>> {
         // Read the kernel maximum rather than the current argv size: a small
         // PROCARGS2 buffer can yield the TAIL of the argument block, not a

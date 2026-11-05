@@ -2450,8 +2450,7 @@ mod producer_tests {
 
     #[test]
     fn our_own_group_is_occupied() {
-        // SAFETY: a plain query, no memory effects.
-        let mine = unsafe { libc::getpgid(0) };
+        let mine = rustix::process::getpgid(None).unwrap().as_raw_pid();
         assert_eq!(
             group_of(Pgid::new(mine).expect("we are in a real group")),
             Group::Occupied

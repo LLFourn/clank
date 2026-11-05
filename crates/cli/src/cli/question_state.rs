@@ -136,7 +136,6 @@ pub(crate) fn load(agent_dir: &Path) -> Option<State> {
 /// it only settles the projection on the binding. An unreadable record or
 /// binding leaves the record as it is.
 pub(crate) fn observe(agent_dir: &Path, observations: impl IntoIterator<Item = Observation>) {
-    use std::os::fd::AsRawFd;
     if std::fs::create_dir_all(agent_dir).is_err() {
         return;
     }
@@ -148,8 +147,7 @@ pub(crate) fn observe(agent_dir: &Path, observations: impl IntoIterator<Item = O
     else {
         return;
     };
-    // SAFETY: flock on a descriptor this function owns.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).is_err() {
         return;
     }
     let Ok(binding) = crate::agent_store::binding_in(agent_dir) else {

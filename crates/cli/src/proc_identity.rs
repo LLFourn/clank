@@ -91,29 +91,7 @@ mod platform {
         }
     }
 
-    pub(super) fn bsd_info(pid: i32) -> std::io::Result<libc::proc_bsdinfo> {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: `info` is a correctly sized, zeroed proc_bsdinfo and
-        // `size` describes it; the call only writes into that buffer.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-                size,
-            )
-        };
-        if n != size {
-            return Err(if n <= 0 {
-                process_read_error(std::io::Error::last_os_error())
-            } else {
-                std::io::ErrorKind::InvalidData.into()
-            });
-        }
-        Ok(info)
-    }
+    use super::inspect::bsd_info;
 
     pub(super) fn uid_of(pid: i32) -> std::io::Result<u32> {
         Ok(bsd_info(pid)?.pbi_uid)

@@ -8,6 +8,9 @@ license = "0BSD"
 repository = "https://github.com/LLFourn/clank"
 
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

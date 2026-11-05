@@ -54,7 +54,7 @@ fn target(repo: &Path, label: &AgentLabel) -> Option<(String, PathBuf)> {
     // candidate; loaded-thread, cwd and binding checks authorize its use below.
     let default_home = std::env::var_os("HOME").map(PathBuf::from)?;
     let socket = profile_socket(desc.launch.as_ref(), &default_home)?;
-    let socket = own_socket(&socket, unsafe { libc::geteuid() })?;
+    let socket = own_socket(&socket, rustix::process::geteuid().as_raw())?;
     Some((session.id.as_str().to_owned(), socket))
 }
 
@@ -834,7 +834,7 @@ mod tests {
     fn only_a_socket_this_user_owns_is_used_wherever_its_link_leads() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir_in("/tmp").unwrap();
-        let me = unsafe { libc::geteuid() };
+        let me = rustix::process::geteuid().as_raw();
         let real = dir.path().join("real.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
         let real = std::fs::canonicalize(&real).unwrap();

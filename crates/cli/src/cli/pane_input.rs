@@ -234,7 +234,7 @@ pub(crate) struct PaneLock {
 /// callers take it through `event_interrupt::blocking`, off the executor.
 pub(crate) fn lock_pane(session: &str, pane: &str) -> anyhow::Result<PaneLock> {
     super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
-    let dir = super::monitor::runtime_dir(unsafe { libc::getuid() });
+    let dir = super::monitor::runtime_dir(rustix::process::getuid().as_raw());
     lock_pane_in(&dir, session, pane)
 }
 
@@ -261,7 +261,6 @@ fn reserve_in(
     how: Reserve,
 ) -> anyhow::Result<Option<PaneLock>> {
     use anyhow::Context;
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let path = pane_lock_path(dir, session, pane);
     // Never unlinked: replacing a locked inode would admit a second holder.
@@ -280,11 +279,10 @@ fn reserve_in(
         return Ok(taken.then_some(PaneLock { _file: file }));
     }
     loop {
-        // SAFETY: valid owned fd; flock has no memory effects.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        let Err(error) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) else {
             return Ok(Some(PaneLock { _file: file }));
-        }
-        let error = std::io::Error::last_os_error();
+        };
+        let error = std::io::Error::from(error);
         if error.raw_os_error() != Some(libc::EINTR) {
             return Err(error).with_context(|| format!("locking `{}`", path.display()));
         }
@@ -304,7 +302,7 @@ fn pane_lock_path(dir: &std::path::Path, session: &str, pane: &str) -> std::path
 async fn lock_pane_async(session: &str, pane: &str, how: Reserve) -> Result<PaneLock, String> {
     let taken = super::event_interrupt::blocking(|| {
         super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
-        let dir = super::monitor::runtime_dir(unsafe { libc::getuid() });
+        let dir = super::monitor::runtime_dir(rustix::process::getuid().as_raw());
         reserve_in(&dir, session, pane, how)
     });
     match taken {
@@ -2142,7 +2140,7 @@ mod tests {
             "{woke:?}"
         );
         drop(held);
-        let dir = super::super::monitor::runtime_dir(unsafe { libc::getuid() });
+        let dir = super::super::monitor::runtime_dir(rustix::process::getuid().as_raw());
         let _ = std::fs::remove_file(pane_lock_path(&dir, &session, pane));
     }
 

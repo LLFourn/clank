@@ -1391,8 +1391,38 @@ fn html_finished_run_projects_the_recorded_duration_in_its_page_and_timeline() {
 /// the repo, user and agent configs, the environment and every
 /// `~/.clank` store — stay out, while a secret someone COMMITTED in a
 /// plan is exported as git would show it.
+///
+/// The environment sentinel is given to a fresh process of this test
+/// binary through `Command::env`, which then runs the export: setting it
+/// here would race every other thread of the harness that reads the
+/// environment.
 #[test]
 fn html_exports_no_config_environment_or_home_store_secrets() {
+    const SECRET: &str = "CLANK_HTML_TEST_SECRET";
+    if std::env::var_os(SECRET).is_none() {
+        let name = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{name}::html_exports_no_config_environment_or_home_store_secrets"),
+                "--test-threads",
+                "1",
+            ])
+            .env(SECRET, "SENTINEL-ENVIRONMENT")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "the export with the sentinel set failed ({}):\n{text}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
     let dir = init_repo();
     let repo = dir.path();
     write(
@@ -1445,10 +1475,6 @@ fn html_exports_no_config_environment_or_home_store_secrets() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
     }
-    // SAFETY: a name no other test reads or writes; the std env lock
-    // serialises it against every Rust reader in the harness.
-    unsafe { std::env::set_var("CLANK_HTML_TEST_SECRET", "SENTINEL-ENVIRONMENT") };
-
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(clank::cli::html::generate(

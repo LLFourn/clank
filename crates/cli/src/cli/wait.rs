@@ -4877,9 +4877,10 @@ mod tests {
             .parse()
             .unwrap();
         assert_ne!(command, pgid, "the command does not lead its group");
-        // SAFETY: a plain query, no memory effects.
         assert_eq!(
-            unsafe { libc::getpgid(command) },
+            rustix::process::getpgid(Some(rustix::process::Pid::from_raw(command).unwrap()))
+                .unwrap()
+                .as_raw_pid(),
             pgid,
             "it runs INSIDE the recorded group, which is what gets signalled"
         );

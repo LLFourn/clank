@@ -554,7 +554,7 @@ impl Registry {
             ))?;
         let meta = lease.metadata()?;
         ensure!(
-            meta.is_file() && meta.uid() == unsafe { libc::geteuid() },
+            meta.is_file() && meta.uid() == rustix::process::geteuid().as_raw(),
             "untrusted Claude question lease"
         );
         ensure!(
@@ -577,7 +577,7 @@ impl Registry {
                     _=cancelled.changed()=>{connections.shutdown().await;break;}
                 connection=listener.accept()=>{
                         let Ok((socket,_))=connection else{break};
-                        if socket.peer_cred().is_ok_and(|peer|peer.uid()==unsafe{libc::geteuid()}) {
+                        if socket.peer_cred().is_ok_and(|peer|peer.uid()==rustix::process::geteuid().as_raw()) {
                             let registry=registry.clone();connections.spawn(async move {let _=registry.serve(socket).await;});
                         }
                     }
@@ -741,7 +741,7 @@ pub(crate) async fn run() -> Result<()> {
         let path = crate::cli::monitor::runtime_path(&repo, "claude-questions.sock");
         let meta = std::fs::symlink_metadata(&path)?;
         ensure!(
-            meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() },
+            meta.file_type().is_socket() && meta.uid() == rustix::process::geteuid().as_raw(),
             "untrusted question socket"
         );
         let parked = hook.hook_event_name == "PermissionRequest";
@@ -786,10 +786,10 @@ mod tests {
     struct ProviderChild(std::process::Child);
     impl Drop for ProviderChild {
         fn drop(&mut self) {
-            if self.0.try_wait().ok().flatten().is_none() {
-                unsafe {
-                    libc::kill(self.0.id() as i32, libc::SIGTERM);
-                }
+            if self.0.try_wait().ok().flatten().is_none()
+                && let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
             }
             let _ = self.0.wait();
         }

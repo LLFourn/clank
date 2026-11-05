@@ -149,15 +149,15 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     };
     let (from_c, to_c) = (cstr(from)?, cstr(to)?);
     match rename_excl(&from_c, &to_c) {
-        Some(0) => Ok(()),
-        Some(_) => {
-            let e = std::io::Error::last_os_error();
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => {
             // A filesystem without the flag says so; a link refuses a
             // taken name just as surely, and the unlink after it only
             // removes the old name.
-            match e.raw_os_error() {
-                Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => link_then_unlink(from, to),
-                _ => Err(e),
+            use rustix::io::Errno;
+            match e {
+                Errno::INVAL | Errno::NOSYS | Errno::NOTSUP => link_then_unlink(from, to),
+                _ => Err(e.into()),
             }
         }
         None => link_then_unlink(from, to),
@@ -169,28 +169,18 @@ fn link_then_unlink(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::remove_file(from)
 }
 
-#[cfg(target_vendor = "apple")]
-fn rename_excl(from: &std::ffi::CStr, to: &std::ffi::CStr) -> Option<libc::c_int> {
-    // SAFETY: both are valid NUL-terminated paths for the call's duration.
-    Some(unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) })
-}
-
-#[cfg(target_os = "linux")]
-fn rename_excl(from: &std::ffi::CStr, to: &std::ffi::CStr) -> Option<libc::c_int> {
-    // SAFETY: both are valid NUL-terminated paths for the call's duration.
-    Some(unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    })
+/// `RENAME_EXCL` on Apple, `RENAME_NOREPLACE` on Linux.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn rename_excl(
+    from: &std::ffi::CStr,
+    to: &std::ffi::CStr,
+) -> Option<Result<(), rustix::io::Errno>> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    Some(renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE))
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn rename_excl(_: &std::ffi::CStr, _: &std::ffi::CStr) -> Option<libc::c_int> {
+fn rename_excl(_: &std::ffi::CStr, _: &std::ffi::CStr) -> Option<Result<(), rustix::io::Errno>> {
     None
 }
 

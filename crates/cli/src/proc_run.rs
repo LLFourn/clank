@@ -25,9 +25,10 @@
 //! it runs, [`interactive`] for the terminal, [`exec`] to become the
 //! program.
 
+use rustix::event::{PollFd, PollFlags};
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(not(target_os = "macos"))]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -283,7 +284,11 @@ impl Spec {
 
     /// The `std` command, with a hook that marks every inherited
     /// descriptor above 2 close-on-exec in the forked child.
+    ///
+    /// Unsafe because `pre_exec` is: no safe API runs code in the child
+    /// between fork and exec.
     #[cfg(not(target_os = "macos"))]
+    #[allow(unsafe_code)]
     fn command(&self) -> io::Result<std::process::Command> {
         let mut cmd = std::process::Command::new(&self.program);
         cmd.args(&self.args);
@@ -317,7 +322,8 @@ impl Spec {
             #[cfg(test)]
             mark_errno: self.inject.mark_errno,
         };
-        // SAFETY: `Shed::run` makes only async-signal-safe calls.
+        // SAFETY: `Shed::run` makes only async-signal-safe calls and
+        // allocates nothing: `keep` was built before the fork.
         unsafe {
             cmd.pre_exec(move || shed.run());
         }
@@ -354,18 +360,22 @@ struct Shed {
 
 #[cfg(not(target_os = "macos"))]
 impl Shed {
+    /// Unsafe because the descriptors to pass on are numbers the spec
+    /// names, which no type can vouch for in the forked child.
+    #[allow(unsafe_code)]
     fn run(&mut self) -> io::Result<()> {
         #[cfg(test)]
         if let Some(errno) = self.mark_errno.take() {
             return Err(io::Error::from_raw_os_error(errno));
         }
-        // SAFETY: setsid is async-signal-safe.
-        if self.session && unsafe { libc::setsid() } == -1 {
-            return Err(io::Error::last_os_error());
+        if self.session {
+            rustix::process::setsid()?;
         }
         self.mark()?;
         for &fd in &self.keep {
-            // SAFETY: fcntl on a caller-named descriptor.
+            // SAFETY: F_SETFD only clears a descriptor flag, and a number
+            // that is not open fails with EBADF rather than touching
+            // memory.
             if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -400,9 +410,12 @@ impl Shed {
     }
 }
 
+/// Unsafe because neither std nor rustix wraps `close_range`.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn cloexec_range(lo: libc::c_uint, hi: libc::c_uint) -> io::Result<()> {
-    // SAFETY: close_range only changes descriptor flags.
+    // SAFETY: with CLOSE_RANGE_CLOEXEC, close_range only sets a descriptor
+    // flag and takes no pointers.
     let rc = unsafe { libc::syscall(libc::SYS_close_range, lo, hi, libc::CLOSE_RANGE_CLOEXEC) };
     if rc == -1 {
         return Err(io::Error::last_os_error());
@@ -418,12 +431,14 @@ mod apple {
     use super::{Group, Out, Spawned, Spec, Stdin};
     use std::ffi::{CString, OsStr};
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
     const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
 
+    // SAFETY: Apple's spawn.h declares both with these C types.
+    #[allow(unsafe_code)]
     unsafe extern "C" {
         fn posix_spawn_file_actions_addinherit_np(
             actions: *mut libc::posix_spawn_file_actions_t,
@@ -450,8 +465,10 @@ mod apple {
     struct Actions(libc::posix_spawn_file_actions_t);
 
     impl Drop for Actions {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
-            // SAFETY: initialised in `spawn` before this value exists.
+            // SAFETY: initialised in `spawn` before this value exists, and
+            // destroyed only here.
             unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
         }
     }
@@ -459,26 +476,19 @@ mod apple {
     struct Attr(libc::posix_spawnattr_t);
 
     impl Drop for Attr {
+        #[allow(unsafe_code)]
         fn drop(&mut self) {
-            // SAFETY: initialised in `spawn` before this value exists.
+            // SAFETY: initialised in `spawn` before this value exists, and
+            // destroyed only here.
             unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
         }
     }
 
     /// A pipe, both ends close-on-exec.
     fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut fds = [0; 2];
-        // SAFETY: a valid two-element array.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: both were just returned by pipe, owned from here.
-        let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (r, w) = rustix::pipe::pipe()?;
         for fd in [&r, &w] {
-            // SAFETY: fcntl on an owned descriptor.
-            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                return Err(io::Error::last_os_error());
-            }
+            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
         }
         Ok((r, w))
     }
@@ -507,8 +517,9 @@ mod apple {
                 continue;
             };
             let c = cstring(candidate.as_os_str())?;
-            // SAFETY: a valid C path.
-            if meta.is_file() && unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+            if meta.is_file()
+                && rustix::fs::access(c.as_c_str(), rustix::fs::Access::EXEC_OK).is_ok()
+            {
                 return pinned(candidate);
             }
             denied = true;
@@ -521,6 +532,10 @@ mod apple {
     }
 
     /// Spawn `spec`, or with `exec` become it; only an error returns then.
+    ///
+    /// Unsafe because posix_spawn's attributes and file actions are C
+    /// objects built through out-pointers, and nothing safe wraps them.
+    #[allow(unsafe_code)]
     pub(super) fn spawn(spec: &Spec, exec: bool) -> io::Result<Spawned> {
         let env = spec.environment();
         let path = resolve(
@@ -551,12 +566,12 @@ mod apple {
         let mut actions = std::mem::MaybeUninit::uninit();
         // SAFETY: initialises the value it is given.
         check(unsafe { libc::posix_spawn_file_actions_init(actions.as_mut_ptr()) })?;
-        // SAFETY: initialised just above.
+        // SAFETY: initialised just above, which returned success.
         let mut actions = Actions(unsafe { actions.assume_init() });
         let mut attr = std::mem::MaybeUninit::uninit();
         // SAFETY: initialises the value it is given.
         check(unsafe { libc::posix_spawnattr_init(attr.as_mut_ptr()) })?;
-        // SAFETY: initialised just above.
+        // SAFETY: initialised just above, which returned success.
         let mut attr = Attr(unsafe { attr.assume_init() });
 
         let a = &mut actions.0;
@@ -569,25 +584,32 @@ mod apple {
             stdout: None,
             stderr: None,
         };
-        // SAFETY (each call below): `a` is initialised, paths are valid
-        // C strings, and every descriptor named is open.
         match &spec.stdin {
+            // SAFETY: `a` is initialised and `null` is a C string that
+            // outlives the spawn.
             Stdin::Null => check(unsafe {
                 libc::posix_spawn_file_actions_addopen(a, 0, null.as_ptr(), libc::O_RDONLY, 0)
             })?,
+            // SAFETY: `a` is initialised; the action records a number.
             Stdin::Inherit => check(unsafe { posix_spawn_file_actions_addinherit_np(a, 0) })?,
             Stdin::Piped => {
                 let (r, w) = pipe()?;
+                // SAFETY: `a` is initialised and `r` stays open in
+                // `theirs` until the spawn has copied it.
                 check(unsafe { libc::posix_spawn_file_actions_adddup2(a, r.as_raw_fd(), 0) })?;
                 theirs.push(r);
                 spawned.stdin = Some(w);
             }
             Stdin::Fd(fd) => {
+                // SAFETY: `a` is initialised and `spec` holds `fd` open
+                // until the spawn.
                 check(unsafe { libc::posix_spawn_file_actions_adddup2(a, fd.as_raw_fd(), 0) })?
             }
         }
         for (target, out) in [(1, spec.stdout), (2, spec.stderr)] {
             match out {
+                // SAFETY: `a` is initialised and `null` is a C string that
+                // outlives the spawn.
                 Out::Null => check(unsafe {
                     libc::posix_spawn_file_actions_addopen(
                         a,
@@ -598,10 +620,14 @@ mod apple {
                     )
                 })?,
                 Out::Inherit => {
+                    // SAFETY: `a` is initialised; the action records a
+                    // number.
                     check(unsafe { posix_spawn_file_actions_addinherit_np(a, target) })?
                 }
                 Out::Capture { .. } | Out::Piped | Out::Ring { .. } => {
                     let (r, w) = pipe()?;
+                    // SAFETY: `a` is initialised and `w` stays open in
+                    // `theirs` until the spawn has copied it.
                     check(unsafe {
                         libc::posix_spawn_file_actions_adddup2(a, w.as_raw_fd(), target)
                     })?;
@@ -615,6 +641,8 @@ mod apple {
             }
         }
         for &fd in &spec.keep_fds {
+            // SAFETY: `a` is initialised; the action records a number, and
+            // one that is not open fails the spawn with EBADF.
             check(unsafe { posix_spawn_file_actions_addinherit_np(a, fd) })?;
         }
         let cwd = spec
@@ -623,6 +651,8 @@ mod apple {
             .map(|d| cstring(d.as_os_str()))
             .transpose()?;
         if let Some(cwd) = &cwd {
+            // SAFETY: `a` is initialised and `cwd` is a C string that
+            // outlives the spawn.
             check(unsafe { posix_spawn_file_actions_addchdir_np(a, cwd.as_ptr()) })?;
         }
 
@@ -631,8 +661,8 @@ mod apple {
         let mut flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT
             | libc::POSIX_SPAWN_SETSIGMASK
             | libc::POSIX_SPAWN_SETSIGDEF;
-        // SAFETY (each call below): `attr` is initialised and the sets are
-        // valid out-pointers.
+        // SAFETY: `attr` is initialised, and `set` is initialised by
+        // `sigemptyset` before anything reads it.
         unsafe {
             let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
             libc::sigemptyset(set.as_mut_ptr());
@@ -646,10 +676,12 @@ mod apple {
         match spec.group {
             Group::New => {
                 flags |= libc::POSIX_SPAWN_SETPGROUP;
+                // SAFETY: `attr` is initialised.
                 check(unsafe { libc::posix_spawnattr_setpgroup(&mut attr.0, 0) })?;
             }
             Group::Join(pgid) => {
                 flags |= libc::POSIX_SPAWN_SETPGROUP;
+                // SAFETY: `attr` is initialised.
                 check(unsafe { libc::posix_spawnattr_setpgroup(&mut attr.0, pgid.get()) })?;
             }
             Group::Session => flags |= POSIX_SPAWN_SETSID,
@@ -658,6 +690,7 @@ mod apple {
         if exec {
             flags |= libc::POSIX_SPAWN_SETEXEC;
         }
+        // SAFETY: `attr` is initialised.
         check(unsafe { libc::posix_spawnattr_setflags(&mut attr.0, flags as libc::c_short) })?;
 
         let mut pid = 0;
@@ -692,27 +725,23 @@ enum ExitFd {
 impl ExitFd {
     #[cfg(target_os = "linux")]
     fn of(pid: i32) -> io::Result<Self> {
-        // SAFETY: pidfd_open takes a pid and flags; the fd is owned at once.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            let e = io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(libc::ESRCH) => Ok(Self::Exited),
-                _ => Err(e),
-            };
+        use rustix::process::{Pid, PidfdFlags, pidfd_open};
+        let pid = Pid::from_raw(pid).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(fd) => Ok(Self::Watch(fd)),
+            Err(rustix::io::Errno::SRCH) => Ok(Self::Exited),
+            Err(e) => Err(e.into()),
         }
-        Ok(Self::Watch(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
     }
 
+    /// Unsafe because `kevent` has no safe form; the change it registers
+    /// names a pid, not a descriptor, so nothing has to outlive the
+    /// queue.
     #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
     fn of(pid: i32) -> io::Result<Self> {
-        // SAFETY: plain syscall; owned at once. A kqueue is never
-        // inherited across fork.
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+        // A kqueue is never inherited across fork.
+        let kq = rustix::event::kqueue::kqueue()?;
         let change = libc::kevent {
             ident: pid as usize,
             filter: libc::EVFILT_PROC,
@@ -721,7 +750,7 @@ impl ExitFd {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        // SAFETY: one valid change and no event buffer.
+        // SAFETY: one initialised change naming a pid, and no event buffer.
         let rc = unsafe {
             libc::kevent(
                 kq.as_raw_fd(),
@@ -745,32 +774,28 @@ impl ExitFd {
 
 /// Wait up to `timeout` for any of `fds` to turn readable; `Ok(false)`
 /// when the time ran out first.
-fn poll_readable(fds: &mut [libc::pollfd], until: Instant) -> io::Result<bool> {
+fn poll_readable(fds: &mut [PollFd<'_>], until: Instant) -> io::Result<bool> {
     loop {
-        let left = until.saturating_duration_since(Instant::now());
-        let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let left = until
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(i32::MAX as u64));
+        let timeout = rustix::event::Timespec {
+            tv_sec: left.as_secs() as i64,
+            tv_nsec: left.subsec_nanos().into(),
+        };
         for p in fds.iter_mut() {
-            p.revents = 0;
+            p.clear_revents();
         }
-        // SAFETY: a valid array of the stated length.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
+        match rustix::event::poll(fds, Some(&timeout)) {
+            Ok(n) => return Ok(n > 0),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
         }
-        return Ok(n > 0);
     }
 }
 
-fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
-    libc::pollfd {
-        fd,
-        events,
-        revents: 0,
-    }
+fn pollfd(fd: &OwnedFd) -> PollFd<'_> {
+    PollFd::new(fd, PollFlags::IN)
 }
 
 // ── the reaper ────────────────────────────────────────────────────
@@ -812,11 +837,18 @@ fn reaper() -> &'static Reaper {
 }
 
 fn reap_blocking(pid: i32) {
-    let mut status = 0;
+    // `None` or a negative pid would wait for ANY child (or a group),
+    // stealing another owner's wait; `Pid::from_raw` only debug-asserts
+    // against negatives.
+    if pid <= 0 {
+        return;
+    }
+    let Some(child) = rustix::process::Pid::from_raw(pid) else {
+        return;
+    };
     loop {
-        // SAFETY: a valid out-pointer; this pid's wait is ours alone.
-        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if rc == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+        let reaped = rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty());
+        if matches!(reaped, Err(rustix::io::Errno::INTR)) {
             continue;
         }
         #[cfg(test)]
@@ -954,34 +986,34 @@ impl Managed {
         if let Some(status) = self.status {
             return Ok(status);
         }
-        let status = self.waitpid(0)?.expect("a blocking wait returns a status");
+        let status = self
+            .waitpid(rustix::process::WaitOptions::empty())?
+            .expect("a blocking wait returns a status");
         self.reaped(status);
         Ok(status)
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         if self.status.is_none()
-            && let Some(status) = self.waitpid(libc::WNOHANG)?
+            && let Some(status) = self.waitpid(rustix::process::WaitOptions::NOHANG)?
         {
             self.reaped(status);
         }
         Ok(self.status)
     }
 
-    fn waitpid(&self, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
+    fn waitpid(&self, options: rustix::process::WaitOptions) -> io::Result<Option<ExitStatus>> {
         use std::os::unix::process::ExitStatusExt;
-        let mut status = 0;
+        let pid = rustix::process::Pid::from_raw(self.pid)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ECHILD))?;
         loop {
-            // SAFETY: a valid out-pointer; this pid's wait is this value's.
-            let rc = unsafe { libc::waitpid(self.pid, &mut status, options) };
-            if rc == -1 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
+            match rustix::process::waitpid(Some(pid), options) {
+                Ok(reaped) => {
+                    return Ok(reaped.map(|(_, status)| ExitStatus::from_raw(status.as_raw())));
                 }
-                return Err(e);
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
             }
-            return Ok((rc != 0).then(|| ExitStatus::from_raw(status)));
         }
     }
 
@@ -997,10 +1029,7 @@ impl Managed {
             return Ok(self.status);
         }
         if let ExitFd::Watch(fd) = ExitFd::of(self.pid)?
-            && !poll_readable(
-                &mut [pollfd(fd.as_raw_fd(), libc::POLLIN)],
-                Instant::now() + timeout,
-            )?
+            && !poll_readable(&mut [pollfd(&fd)], Instant::now() + timeout)?
         {
             return Ok(None);
         }
@@ -1052,24 +1081,17 @@ impl Managed {
     /// reaping it: its descriptors are closed by then, and its pid and
     /// group id stay reserved.
     fn await_zombie(&self) -> io::Result<()> {
-        // SAFETY: zeroed is a valid siginfo_t, and it is a valid
-        // out-pointer for the call.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid =
+            Pid::from_raw(self.pid).ok_or_else(|| io::Error::from_raw_os_error(libc::ECHILD))?;
         loop {
-            let rc = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    self.pid as libc::id_t,
-                    &mut info,
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if rc == 0 {
-                return Ok(());
-            }
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(e);
+            match waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -1298,21 +1320,17 @@ impl Sink {
                 return Ok(Pumped::More);
             }
             reads += 1;
-            // SAFETY: a valid buffer of the stated length.
-            let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                match e.kind() {
-                    io::ErrorKind::Interrupted => continue,
-                    io::ErrorKind::WouldBlock => return Ok(Pumped::Open),
-                    _ => return Err(e),
-                }
-            }
+            let n = match rustix::io::read(&self.fd, &mut buf) {
+                Ok(n) => n,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::AGAIN) => return Ok(Pumped::Open),
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 self.eof = true;
                 return Ok(Pumped::Eof);
             }
-            let got = &buf[..n as usize];
+            let got = &buf[..n];
             match &mut self.keep {
                 Keep::Whole { cap, bytes } => {
                     let room = *cap - bytes.len();
@@ -1347,13 +1365,8 @@ impl Sink {
 }
 
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    // SAFETY: fcntl on an owned descriptor.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if flags == -1
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
     Ok(())
 }
 
@@ -1598,16 +1611,16 @@ pub fn run_blocking(spec: Spec, budget: Duration) -> Result<Output, RunError> {
             }
             r.expired()?;
             let Some(exit) = &exit else { break };
-            let mut fds = vec![pollfd(exit.as_raw_fd(), libc::POLLIN)];
+            let mut fds = vec![pollfd(exit)];
             fds.extend(
                 r.sinks
                     .iter()
                     .flatten()
                     .filter(|s| s.open())
-                    .map(|s| pollfd(s.fd.as_raw_fd(), libc::POLLIN)),
+                    .map(|s| pollfd(&s.fd)),
             );
             poll_readable(&mut fds, r.deadline).map_err(RunError::Io)?;
-            if fds[0].revents != 0 {
+            if !fds[0].revents().is_empty() {
                 break;
             }
         }
@@ -1621,7 +1634,7 @@ pub fn run_blocking(spec: Spec, budget: Duration) -> Result<Output, RunError> {
                 .iter()
                 .flatten()
                 .filter(|s| s.open())
-                .map(|s| pollfd(s.fd.as_raw_fd(), libc::POLLIN))
+                .map(|s| pollfd(&s.fd))
                 .collect();
             poll_readable(&mut fds, patience.min(r.deadline)).map_err(RunError::Io)?;
         };

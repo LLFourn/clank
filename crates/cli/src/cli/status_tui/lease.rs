@@ -123,7 +123,6 @@ pub(super) fn acquire(repo: &Path) -> Result<StatusLease, String> {
 /// non-blocking flock taken and released at once. `true` is authoritative
 /// absence. Otherwise, the holder record if it could be read.
 pub(crate) fn probe(repo: &Path) -> (bool, Option<crate::cli::remote_control::Holder>) {
-    use std::os::fd::AsRawFd;
     let path = lock_path(repo);
     let file = match std::fs::OpenOptions::new().read(true).open(&path) {
         Ok(f) => f,
@@ -133,9 +132,9 @@ pub(crate) fn probe(repo: &Path) -> (bool, Option<crate::cli::remote_control::Ho
     // One attempt: callers re-ask on every wake to their own deadline,
     // and a held lease is their common case.
     if clank_user_config::lease::take_now(&file).unwrap_or(false) {
-        // SAFETY: as above; the lock is released before anyone else
-        // could be told this repo has no owner.
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        // Released before anyone else could be told this repo has no
+        // owner.
+        let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
         return (true, None);
     }
     let holder = read_holder(&path).map(|h| crate::cli::remote_control::Holder {

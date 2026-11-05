@@ -66,18 +66,16 @@ pub fn transact<T>(
 }
 
 fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening `{}`", path.display()))?;
     loop {
-        // SAFETY: valid owned fd; flock has no memory effects.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        let Err(error) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) else {
             return Ok(file);
-        }
-        let error = std::io::Error::last_os_error();
+        };
+        let error = std::io::Error::from(error);
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error).with_context(|| format!("locking `{}`", path.display()));
         }

@@ -450,7 +450,7 @@ fn a_non_executable_hook_is_off_and_left_alone_even_when_it_is_clanks() {
 /// executable-only-by-others cases cannot be told apart there.
 fn skip_as_root(test: &str) -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
-    let root = unsafe { libc::geteuid() } == 0;
+    let root = rustix::process::geteuid().as_raw() == 0;
     if root {
         println!("skipping {test}: running as root, where X_OK ignores the owner's bits");
     }

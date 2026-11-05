@@ -3,6 +3,8 @@
 //! Hosts provide their own browser and connector admission. This crate
 //! handles the ordered session connection and request outcomes.
 
+#![forbid(unsafe_code)]
+
 pub mod assets;
 pub mod bridge;
 mod bridge_codec;

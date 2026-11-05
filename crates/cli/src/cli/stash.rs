@@ -68,7 +68,6 @@ pub struct StashLock {
 }
 
 pub fn lock_stash(repo: &Path) -> anyhow::Result<StashLock> {
-    use std::os::fd::AsRawFd;
     let dir = stash_dir(repo);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating `{}`", dir.display()))?;
     let path = dir.join(".lock");
@@ -80,12 +79,10 @@ pub fn lock_stash(repo: &Path) -> anyhow::Result<StashLock> {
         .open(&path)
         .with_context(|| format!("opening `{}`", path.display()))?;
     loop {
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc == 0 {
+        let Err(err) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) else {
             return Ok(StashLock { _file: file });
-        }
-        let err = std::io::Error::last_os_error();
+        };
+        let err = std::io::Error::from(err);
         // A signal arriving during the wait is a reason to keep
         // waiting, not a failure to lock.
         if err.kind() != std::io::ErrorKind::Interrupted {

@@ -24,7 +24,6 @@ pub(crate) fn lock(repo: &Path) -> anyhow::Result<PlanMutationLock> {
 /// until it is free, and return it with the canonical repo it is keyed
 /// by: CLI, TUI, aliases and linked callers all reach the same inode.
 pub(crate) fn runtime_lock(repo: &Path, name: &str) -> anyhow::Result<(std::fs::File, PathBuf)> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
     let repo = dunce::canonicalize(repo)
@@ -43,11 +42,10 @@ pub(crate) fn runtime_lock(repo: &Path, name: &str) -> anyhow::Result<(std::fs::
         .open(&path)
         .with_context(|| format!("opening lock `{}`", path.display()))?;
     loop {
-        // SAFETY: valid owned fd; flock has no memory effects.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        let Err(error) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) else {
             return Ok((file, repo));
-        }
-        let error = std::io::Error::last_os_error();
+        };
+        let error = std::io::Error::from(error);
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error).with_context(|| format!("locking `{}`", path.display()));
         }

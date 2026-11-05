@@ -885,7 +885,6 @@ fn read_shared_links(path: &Path) -> anyhow::Result<SharedLinks> {
 /// of the sessions file or the `remote` section. BLOCKING: the
 /// sections are one small file each.
 fn store_lock(home: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     let dir = home.join(".clank");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("remote.lock");
@@ -894,13 +893,8 @@ fn store_lock(home: &Path) -> anyhow::Result<std::fs::File> {
         .append(true)
         .open(&path)
         .map_err(|e| anyhow::anyhow!("opening `{}`: {e}", path.display()))?;
-    // SAFETY: valid owned fd; flock has no memory effects.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        anyhow::bail!(
-            "locking `{}`: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
+    if let Err(e) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
+        anyhow::bail!("locking `{}`: {}", path.display(), std::io::Error::from(e));
     }
     Ok(file)
 }

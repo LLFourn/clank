@@ -84,14 +84,7 @@ impl NonBlocking {
     /// is not a terminal.
     pub(crate) fn terminal() -> Option<Self> {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut name = [0 as libc::c_char; 256];
-        // SAFETY: the buffer is valid for its length; ttyname_r writes a
-        // NUL-terminated path into it or fails.
-        if unsafe { libc::ttyname_r(2, name.as_mut_ptr(), name.len()) } != 0 {
-            return None;
-        }
-        // SAFETY: ttyname_r succeeded, so `name` holds a C string.
-        let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        let path = rustix::termios::ttyname(std::io::stderr(), Vec::with_capacity(256)).ok()?;
         let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
         std::fs::OpenOptions::new()
             .write(true)
@@ -105,13 +98,8 @@ impl NonBlocking {
     /// description: the mode is shared with every copy of it.
     #[cfg(test)]
     pub(crate) fn own(file: std::fs::File) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
-        // SAFETY: fcntl on a valid descriptor this function owns.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let flags = rustix::fs::fcntl_getfl(&file)?;
+        rustix::fs::fcntl_setfl(&file, flags | rustix::fs::OFlags::NONBLOCK)?;
         Ok(NonBlocking(file))
     }
 

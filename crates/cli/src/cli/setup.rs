@@ -920,7 +920,6 @@ pub(super) fn inspect_provider(
 /// The manifest domain is also the lock domain: default providers share the
 /// user manifest; custom homes have their own. Never unlink a locked inode.
 pub(super) fn installation_lock(domain: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let dir = domain.join(".clank");
     std::fs::create_dir_all(&dir)?;
@@ -939,10 +938,10 @@ pub(super) fn installation_lock(domain: &Path) -> anyhow::Result<std::fs::File> 
         "setup lock is not a regular file"
     );
     loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        let Err(error) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) else {
             return Ok(file);
-        }
-        let error = std::io::Error::last_os_error();
+        };
+        let error = std::io::Error::from(error);
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error).context("locking setup installation");
         }

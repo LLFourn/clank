@@ -9,9 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use super::DoctorArgs;
-use crate::agent_env::{
-    detect_session_from_env, explicit_label_from_env, resolve_identity_from_env,
-};
+use crate::agent_env::{Ambient, detect_session_in, explicit_label_in, resolve_identity_in};
 use crate::agent_store::{
     agent_config_path, agents_root, load_agent_config, load_all_agent_configs,
 };
@@ -122,7 +120,7 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     }
 
     // Session scope — only meaningful inside an agent.
-    results.extend(session_checks(repo.as_deref()));
+    results.extend(session_checks(repo.as_deref(), &crate::agent_env::Process));
 
     render(&results, args.json)?;
 
@@ -994,7 +992,7 @@ fn check_root_has_no_clank_rules(repo: &Path) -> CheckResult {
 }
 
 async fn user_checks(repo: Option<&Path>) -> Vec<CheckResult> {
-    use crate::agent_env::{Ambient, Process};
+    use crate::agent_env::Process;
     use clank_core::Tool;
     let mut profiles = Vec::new();
     let mut out = Vec::new();
@@ -1373,11 +1371,11 @@ fn check_clank_hook(
     }
 }
 
-fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
+fn session_checks(repo: Option<&Path>, env: &dyn Ambient) -> Vec<CheckResult> {
     const SECTION: &str = "session";
     let mut out = Vec::<CheckResult>::new();
 
-    let explicit = match explicit_label_from_env() {
+    let explicit = match explicit_label_in(env) {
         Ok(e) => e,
         Err(e) => {
             out.push(CheckResult::warn(
@@ -1403,7 +1401,7 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     // Session-env errors Warn here; the identity check below, through
     // the same resolver every command uses, is the verdict on them.
     let detected: Option<(clank_core::Tool, clank_core::ids::SessionId)> =
-        match detect_session_from_env() {
+        match detect_session_in(env) {
             Ok(d) => {
                 match &d {
                     Some((tool, session_id)) => out.push(CheckResult::ok(
@@ -1449,7 +1447,7 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
 
     // The SAME resolver `clank wait` / `clank auto` use, so doctor
     // never disagrees with what those commands would do.
-    let resolved = match resolve_identity_from_env(repo) {
+    let resolved = match resolve_identity_in(repo, env) {
         Ok(label) => label,
         Err(e) => {
             out.push(CheckResult::fail(SECTION, "identity", format!("{e:#}")));
@@ -2738,58 +2736,6 @@ mod tests {
         assert_eq!(r.status, CheckStatus::Warn);
     }
 
-    /// Helper: run a closure with a focused env state and
-    /// restore everything afterward.
-    ///
-    /// Tests run in parallel by default and the process env is
-    /// global, so we hold a static mutex across the entire
-    /// save→set→run→restore window. The lock spans the closure
-    /// execution itself — releasing the lock around just
-    /// set/restore would let a concurrent test observe our
-    /// mid-run env. Codex flagged this on c1414f2.
-    ///
-    /// SAFETY (`set_var`/`remove_var`): holding `ENV_LOCK`
-    /// serializes every caller of `with_env` against every
-    /// other caller. Tests that read env outside `with_env`
-    /// would still be racy in principle; nothing in this
-    /// module does that.
-    fn with_env<F: FnOnce()>(set: &[(&str, &str)], clear: &[&str], f: F) {
-        use std::sync::{Mutex, OnceLock};
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
-        // Poisoned-lock recovery: if a prior test panicked
-        // inside this critical section we still restored the
-        // env via catch_unwind below, so the poison flag
-        // carries no real risk.
-        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-        let saved: Vec<(String, Option<std::ffi::OsString>)> = set
-            .iter()
-            .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
-            .chain(clear.iter().map(|k| (k.to_string(), std::env::var_os(k))))
-            .collect();
-        unsafe {
-            for k in clear {
-                std::env::remove_var(k);
-            }
-            for (k, v) in set {
-                std::env::set_var(k, v);
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        unsafe {
-            for (k, v) in saved {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        if let Err(p) = result {
-            std::panic::resume_unwind(p);
-        }
-    }
-
     #[test]
     fn session_checks_clank_agent_override_resolves_without_session_binding() {
         // Regression: codex 3808a0d called out that doctor was
@@ -2802,28 +2748,25 @@ mod tests {
         let dir = init_git_repo();
         let repo = dir.path().to_path_buf();
 
-        with_env(
-            &[("CLANK_AGENT", "alice")],
-            &["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"],
-            || {
-                let results = session_checks(Some(&repo));
-                let identity = results
-                    .iter()
-                    .find(|r| r.name == "identity")
-                    .expect("identity check ran");
-                assert_eq!(
-                    identity.status,
-                    CheckStatus::Ok,
-                    "expected OK for CLANK_AGENT override; got {:?}: {}",
-                    identity.status,
-                    identity.message
-                );
-                assert!(
-                    identity.message.contains("alice") && identity.message.contains("CLANK_AGENT"),
-                    "identity message should attribute to override: {}",
-                    identity.message
-                );
-            },
+        let results = session_checks(
+            Some(&repo),
+            &crate::agent_env::Stated::saying(&[("CLANK_AGENT", "alice")]),
+        );
+        let identity = results
+            .iter()
+            .find(|r| r.name == "identity")
+            .expect("identity check ran");
+        assert_eq!(
+            identity.status,
+            CheckStatus::Ok,
+            "expected OK for CLANK_AGENT override; got {:?}: {}",
+            identity.status,
+            identity.message
+        );
+        assert!(
+            identity.message.contains("alice") && identity.message.contains("CLANK_AGENT"),
+            "identity message should attribute to override: {}",
+            identity.message
         );
     }
 
@@ -2834,41 +2777,32 @@ mod tests {
     fn broken_session_env_is_not_rescued_by_clank_agent() {
         let dir = init_git_repo();
         let repo = dir.path().to_path_buf();
-        type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [Case; 2] = [
-            (
-                &[
-                    ("CLANK_AGENT", "alice"),
-                    (
-                        "CLAUDE_CODE_SESSION_ID",
-                        "742f6a04-f174-409a-ab01-419a16c5f372",
-                    ),
-                    ("CODEX_THREAD_ID", "019e5385-ed97-7603-8561-dd9024328ff9"),
-                ],
-                &[],
-            ),
-            (
-                &[
-                    ("CLANK_AGENT", "alice"),
-                    ("CLAUDE_CODE_SESSION_ID", "not/a/valid/session"),
-                ],
-                &["CODEX_THREAD_ID"],
-            ),
+        let cases: [&[(&str, &str)]; 2] = [
+            &[
+                ("CLANK_AGENT", "alice"),
+                (
+                    "CLAUDE_CODE_SESSION_ID",
+                    "742f6a04-f174-409a-ab01-419a16c5f372",
+                ),
+                ("CODEX_THREAD_ID", "019e5385-ed97-7603-8561-dd9024328ff9"),
+            ],
+            &[
+                ("CLANK_AGENT", "alice"),
+                ("CLAUDE_CODE_SESSION_ID", "not/a/valid/session"),
+            ],
         ];
-        for (set, unset) in cases {
-            with_env(set, unset, || {
-                let results = session_checks(Some(&repo));
-                let check = |name: &str| results.iter().find(|r| r.name == name).unwrap();
-                assert_eq!(check("env").status, CheckStatus::Warn, "{set:?}");
-                let identity = check("identity");
-                assert_eq!(
-                    identity.status,
-                    CheckStatus::Fail,
-                    "{set:?}: {}",
-                    identity.message
-                );
-                assert!(!identity.message.contains("alice"), "{}", identity.message);
-            });
+        for set in cases {
+            let results = session_checks(Some(&repo), &crate::agent_env::Stated::saying(set));
+            let check = |name: &str| results.iter().find(|r| r.name == name).unwrap();
+            assert_eq!(check("env").status, CheckStatus::Warn, "{set:?}");
+            let identity = check("identity");
+            assert_eq!(
+                identity.status,
+                CheckStatus::Fail,
+                "{set:?}: {}",
+                identity.message
+            );
+            assert!(!identity.message.contains("alice"), "{}", identity.message);
         }
     }
 }

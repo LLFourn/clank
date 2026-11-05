@@ -48,6 +48,8 @@
 //! producers and consumers round-trip through identical
 //! definitions.
 
+#![forbid(unsafe_code)]
+
 pub mod agent_config;
 pub mod api;
 pub mod checkpoint;

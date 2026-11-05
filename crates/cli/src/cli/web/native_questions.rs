@@ -138,7 +138,7 @@ fn target(repo: &Path, label: &AgentLabel, default_home: Option<&Path>) -> Optio
         let path =
             std::fs::canonicalize(root.join("app-server-control/app-server-control.sock")).ok()?;
         let meta = std::fs::metadata(&path).ok()?;
-        (meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() })
+        (meta.file_type().is_socket() && meta.uid() == rustix::process::geteuid().as_raw())
             .then(|| (path, meta.dev(), meta.ino()))
     });
     Some(Target {
