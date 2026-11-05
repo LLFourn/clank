@@ -185,6 +185,14 @@ a:hover {
   color: var(--graphite);
   font-variant-numeric: oldstyle-nums tabular-nums;
 }
+.commands a {
+  grid-template-columns: 1fr;
+  padding-top: 0.2rem;
+  padding-bottom: 0.2rem;
+}
+.commands a::before {
+  content: none;
+}
 .chapters a:hover {
   color: var(--seal);
 }
@@ -315,6 +323,20 @@ pre code {
   background: none;
   padding: 0;
   font-size: inherit;
+}
+samp {
+  font-family: var(--mono);
+  font-variant-ligatures: none;
+}
+/* A usage pattern sits in samp, not pre, since every pre line is checked as a command to type. */
+.usage {
+  font-size: 0.86rem;
+  line-height: 1.58;
+  background: var(--paper-deep);
+  padding: 0.95rem 1.1rem;
+  border-left: 3px solid var(--rule);
+  overflow-x: auto;
+  white-space: pre;
 }
 var {
   font-style: italic;

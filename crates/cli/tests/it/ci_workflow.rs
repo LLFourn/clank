@@ -14,17 +14,28 @@ use std::collections::BTreeSet;
 
 const UNSET: &str = "unset $SESSION_IDENTITY_VARS;";
 
-fn workflow() -> String {
+/// The workflow file `name` under `.github/workflows/`.
+pub(crate) fn read_workflow(name: &str) -> String {
     let path = crates_dir()
         .parent()
         .expect("crates/ has a parent")
-        .join(".github/workflows/ci.yml");
+        .join(".github/workflows")
+        .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn workflow() -> String {
+    read_workflow("ci.yml")
 }
 
 #[test]
 fn every_test_step_unsets_every_identity_variable() {
-    let text = workflow();
+    assert_every_test_step_unsets_every_identity_variable(&workflow());
+}
+
+/// The workflow `text` copies the production identity variables and
+/// unsets them before each `cargo test`.
+pub(crate) fn assert_every_test_step_unsets_every_identity_variable(text: &str) {
     let defined: Vec<&str> = text
         .lines()
         .filter_map(|l| l.trim().strip_prefix("SESSION_IDENTITY_VARS:"))

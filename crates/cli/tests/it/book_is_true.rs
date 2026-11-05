@@ -585,6 +585,26 @@ fn a_missing_or_escaping_link_fails() {
     assert_eq!(bad.len(), 2, "{bad:?}");
 }
 
+/// A page in a subdirectory, as the generated command reference is, is
+/// checked like any other: its links resolve from its own directory.
+#[test]
+fn a_nested_page_is_checked_too() {
+    let dir = fixture();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("reference")).unwrap();
+    std::fs::write(
+        root.join("reference/index.html"),
+        r#"<a href="../guide.html#review">review</a><code>clank statuz</code>"#,
+    )
+    .unwrap();
+    assert_eq!(broken_links(root), Vec::<String>::new());
+    edit(root, "reference/index.html", "../guide.html", "guide.html");
+    assert_eq!(broken_links(root).len(), 1, "{:?}", broken_links(root));
+    let (bad, _) = unparsable_commands(root);
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert!(bad[0].starts_with("reference/index.html"), "{bad:?}");
+}
+
 /// A link to a source file the checkout does not have fails.
 #[test]
 fn a_link_to_a_missing_source_file_fails() {

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command reference | The clank book</title>
+<meta name="description" content="Multi-agent peer review around plans">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<h1>Command reference</h1>
+<p class="lede">Every <code>clank</code> command, generated from the command-line definitions the binary is built from. Each page says what that command's <code>--help</code> says.</p>
+<p>Multi-agent peer review around plans</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank &lt;COMMAND&gt;</samp></p>
+<h2 id="commands">Commands</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+  <tbody>
+    <tr><td><a href="clank-agent.html"><code>agent</code></a></td><td>Manage this repo&#39;s agent roster</td></tr>
+    <tr><td><a href="clank-as.html"><code>as</code></a></td><td>Bind this session to a roster label</td></tr>
+    <tr><td><a href="clank-attend.html"><code>attend</code></a></td><td>Tell clank which subagent you are waiting on</td></tr>
+    <tr><td><a href="clank-auto.html"><code>auto</code></a></td><td>Manage this agent&#39;s auto-mode</td></tr>
+    <tr><td><a href="clank-block.html"><code>block</code></a></td><td>Questions only the human can answer</td></tr>
+    <tr><td><a href="clank-config.html"><code>config</code></a></td><td>Read or write clank config values</td></tr>
+    <tr><td><a href="clank-diff.html"><code>diff</code></a></td><td>Open a plan or commit-range diff in your editor</td></tr>
+    <tr><td><a href="clank-doctor.html"><code>doctor</code></a></td><td>Check the clank setup across repo, user, and session</td></tr>
+    <tr><td><a href="clank-events.html"><code>events</code></a></td><td>The event inbox: what your wake sources delivered</td></tr>
+    <tr><td><a href="clank-export.html"><code>export</code></a></td><td>Dump the repo&#39;s roster config as JSON</td></tr>
+    <tr><td><a href="clank-feedback.html"><code>feedback</code></a></td><td>Read or write review feedback</td></tr>
+    <tr><td><a href="clank-finish.html"><code>finish</code></a></td><td>Finalize a plan into <code>finished/</code></td></tr>
+    <tr><td><a href="clank-fork.html"><code>fork</code></a></td><td>Fork the team into a linked worktree</td></tr>
+    <tr><td><a href="clank-html.html"><code>html</code></a></td><td>Render the timeline + status to a static site</td></tr>
+    <tr><td><a href="clank-init.html"><code>init</code></a></td><td>Scaffold <code>.clank/</code> in a repo</td></tr>
+    <tr><td><a href="clank-log.html"><code>log</code></a></td><td>Print the repo timeline: commits, reviews, github events</td></tr>
+    <tr><td><a href="clank-nudge.html"><code>nudge</code></a></td><td>Interrupt an agent and type a message into its terminal</td></tr>
+    <tr><td><a href="clank-open.html"><code>open</code></a></td><td>Open the team workspace in zellij</td></tr>
+    <tr><td><a href="clank-pick.html"><code>pick</code></a></td><td>Copy plans from another branch</td></tr>
+    <tr><td><a href="clank-purge.html"><code>purge</code></a></td><td>Strip a plan&#39;s <code>.clank/</code> artifacts from history</td></tr>
+    <tr><td><a href="clank-queue.html"><code>queue</code></a></td><td>Manage the plan queue</td></tr>
+    <tr><td><a href="clank-remote.html"><code>remote</code></a></td><td>Switch this repo&#39;s remote on or off through its <code>clank tui</code></td></tr>
+    <tr><td><a href="clank-rereview.html"><code>rereview</code></a></td><td>Re-open review on a plan&#39;s latest reviewable commit</td></tr>
+    <tr><td><a href="clank-run.html"><code>run</code></a></td><td>Run a command under clank, so it knows when the work ends</td></tr>
+    <tr><td><a href="clank-send.html"><code>send</code></a></td><td>Put a message in an agent&#39;s inbox</td></tr>
+    <tr><td><a href="clank-setup.html"><code>setup</code></a></td><td>Install skills and hooks for Claude, Codex, Grok and OpenCode</td></tr>
+    <tr><td><a href="clank-stash.html"><code>stash</code></a></td><td>Set a plan&#39;s commits aside and restore them later</td></tr>
+    <tr><td><a href="clank-status.html"><code>status</code></a></td><td>Show the repo&#39;s clank state</td></tr>
+    <tr><td><a href="clank-team.html"><code>team</code></a></td><td>Your saved teams and agent descriptions, shared across repos</td></tr>
+    <tr><td><a href="clank-tui.html"><code>tui</code></a></td><td>The full-screen pane for driving a running team</td></tr>
+    <tr><td><a href="clank-unfinish.html"><code>unfinish</code></a></td><td>Move a finalized plan back to active</td></tr>
+    <tr><td><a href="clank-user-command.html"><code>user-command</code></a></td><td>Type a person&#39;s signed command into an agent&#39;s pane</td></tr>
+    <tr><td><a href="clank-wait.html"><code>wait</code></a></td><td>Block until this agent has actionable work</td></tr>
+  </tbody>
+</table>
+</div>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help</p>
+  </dd>
+  <dt id="option-version"><code>-V, --version</code></dt>
+  <dd>
+<p>Print version</p>
+  </dd>
+</dl>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html" aria-current="page">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

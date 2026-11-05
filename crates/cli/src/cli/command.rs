@@ -394,9 +394,10 @@ pub enum Command {
     Run(crate::cli::RunArgs),
     /// Read or write clank config values
     ///
-    /// Bare, every key with its value and source. `clank config <key>` shows
-    /// one; `clank config <key> <value>` writes it (the repo's config, or
-    /// yours with `--global`).
+    /// Bare, every key with its value and source. Name a key to show it, as
+    /// in `clank config diff.wait`; give a value as well to write it, as in
+    /// `clank config diff.wait true` (the repo's config, or yours with
+    /// `--global`).
     #[command(after_long_help = CONFIG_EXAMPLES)]
     Config(crate::cli::ConfigArgs),
     /// Dump the repo's roster config as JSON
@@ -431,6 +432,9 @@ pub enum Command {
     /// Print the licences of clank and of everything built into it
     #[command(hide = true)]
     Licenses,
+    /// Generate documentation from clank's own definitions
+    #[command(hide = true)]
+    Docs(crate::cli::docs::DocsArgs),
 }
 
 /// Run the parsed command. The bin's `main` owns process concerns —
@@ -479,6 +483,7 @@ pub async fn dispatch_with(
         Command::Auto(args) => crate::cli::auto::run(args).await,
         Command::QuestionHook => crate::cli::web::claude_questions::run().await,
         Command::Licenses => crate::cli::licenses::run(),
+        Command::Docs(args) => crate::cli::docs::run(args),
         Command::StopHook(args) => {
             crate::cli::stop_hook::run(args, &mut crate::cli::stop_hook::ProcessHost::new()).await
         }
@@ -1192,6 +1197,7 @@ mod tests {
         ("", "stop-hook", &["stop-hook", "--tool", "claude"]),
         ("", "question-hook", &["question-hook"]),
         ("", "licenses", &["licenses"]),
+        ("", "docs", &["docs", "cli", "book/reference"]),
         ("", "rewire", &["rewire", "--from-stdin"]),
         ("", "monitor", &["monitor", "start"]),
         ("monitor", "upgrade", &["monitor", "upgrade"]),

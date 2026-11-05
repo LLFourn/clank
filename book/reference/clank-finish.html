@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank finish | The clank book</title>
+<meta name="description" content="Finalize a plan into `finished/`">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a></p>
+<h1>clank finish</h1>
+<p class="lede">Finalize a plan into <code>finished/</code></p>
+<p>Runs when the gate says FINISHED; <code>-m</code> is required (what changed, then why). With <code>finish.autosquash</code> the plan&#39;s commits collapse into one.</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank finish [OPTIONS] [PLAN]</samp></p>
+<h2 id="arguments">Arguments</h2>
+<dl class="terms">
+  <dt id="arg-plan"><code>[PLAN]</code></dt>
+  <dd>
+<p>Plan to finalize. Accepts <code>&lt;repo&gt;/&lt;stem&gt;.md</code> or just <code>&lt;stem&gt;</code>. Optional when the cwd-repo has exactly one in-flight active plan</p>
+  </dd>
+</dl>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
+  <dd>
+<p>Repo root. Defaults to the cwd&#39;s git toplevel</p>
+  </dd>
+  <dt id="option-message"><code>-m, --message &lt;MESSAGE&gt;</code></dt>
+  <dd>
+<p>REQUIRED (when authoring the finish commit): the whole plan&#39;s commit message — a brief WHAT subject and a WHY body, written as if the whole plan were one commit. It becomes the plan&#39;s squash summary. A bare <code>finish</code> / subject-only message is rejected. Repeatable, git-style: each <code>-m</code> becomes a paragraph (e.g. <code>-m &quot;&lt;subject&gt;&quot; -m &quot;&lt;why&gt;&quot;</code>), and <code>-m -</code> reads one paragraph from stdin</p>
+<p>May be repeated.</p>
+  </dd>
+  <dt id="option-purge"><code>--purge</code></dt>
+  <dd>
+<p>After finalize, strip the plan&#39;s <code>.clank/</code> artifacts from history (runs the rewrite engine on the just-extended range). The finalize snapshot is included in the strip</p>
+  </dd>
+  <dt id="option-squash"><code>--squash &lt;MSG&gt;</code></dt>
+  <dd>
+<p>After finalize, collapse the plan&#39;s commits into one with the supplied message. Commits in the range that are not the plan&#39;s (adhoc, or another plan&#39;s) move ahead of it, each keeping its own message and author; only one that will not apply there refuses the squash, and then nothing is rewritten. Combine with <code>--purge</code> to also strip the plan&#39;s <code>.clank/</code> artifacts</p>
+  </dd>
+  <dt id="option-no_squash"><code>--no-squash</code></dt>
+  <dd>
+<p>Opt OUT of <code>finish.autosquash</code> for this one finish — keep the plan&#39;s individual commits (e.g. a bisectable refactor). No effect when autosquash is off or <code>--squash</code> is given explicitly</p>
+  </dd>
+  <dt id="option-into_branch"><code>--into-branch &lt;NAME&gt;</code></dt>
+  <dd>
+<p>Write the rewritten history to a fresh branch instead of in-place. Only meaningful with <code>--purge</code>/<code>--squash</code></p>
+  </dd>
+  <dt id="option-dry"><code>--dry-run</code></dt>
+  <dd>
+<p>Preview any history edit this finish would perform, without creating commits or moving refs: the <code>--purge</code>/<code>--squash</code> rewrite plan, or the reword plan for a bare <code>-m</code> on an already-finished plan (the same computation the live run applies). Ignored on a plain fresh finish (no history rewrite happens there)</p>
+  </dd>
+  <dt id="option-force"><code>--force</code></dt>
+  <dd>
+<p>Finalize even when the review gate hasn&#39;t said FINISHED (unreviewed / continued / changes-requested / pending gate tier). Bypasses ONLY the review-gate readiness: messages stay mandatory, autosquash still applies, and safety refusals (dirty plan file, missing plan file, open human block, no reviewable commit) stand</p>
+  </dd>
+  <dt id="option-no_cache"><code>--no-cache</code></dt>
+  <dd>
+<p>Skip the on-disk state cache: don&#39;t read it, don&#39;t write it</p>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+<h2 id="examples">Examples</h2>
+<pre><code># finish the one active plan: what changed, then why
+clank finish -m &quot;Parse errors name the line&quot; -m &quot;Users could not find the typo&quot;</code></pre>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html" aria-current="page">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

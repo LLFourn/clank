@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank config | The clank book</title>
+<meta name="description" content="Read or write clank config values">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a></p>
+<h1>clank config</h1>
+<p class="lede">Read or write clank config values</p>
+<p>Bare, every key with its value and source. Name a key to show it, as in <code>clank config diff.wait</code>; give a value as well to write it, as in <code>clank config diff.wait true</code> (the repo&#39;s config, or yours with <code>--global</code>).</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank config [OPTIONS] [COMMAND]</samp></p>
+<h2 id="commands">Commands</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+  <tbody>
+    <tr><td><a href="clank-config-diff.editor.command.html"><code>diff.editor.command</code></a></td><td>Editor that <code>clank diff</code> opens</td></tr>
+    <tr><td><a href="clank-config-diff.wait.html"><code>diff.wait</code></a></td><td>Whether <code>clank diff</code> waits for the editor</td></tr>
+    <tr><td><a href="clank-config-finish.autosquash.html"><code>finish.autosquash</code></a></td><td>Squash a plan into one commit when it finishes</td></tr>
+    <tr><td><a href="clank-config-hooks.blocked.html"><code>hooks.blocked</code></a></td><td>Command to run when an agent blocks</td></tr>
+    <tr><td><a href="clank-config-recovery.blind_nudge.html"><code>recovery.blind_nudge</code></a></td><td>Nudge an agent whose state clank cannot read</td></tr>
+    <tr><td><a href="clank-config-recovery.stall_nudge.html"><code>recovery.stall_nudge</code></a></td><td>Nudge a stalled agent after its warning</td></tr>
+    <tr><td><a href="clank-config-recovery.stall_warn.html"><code>recovery.stall_warn</code></a></td><td>Warn when a running turn goes silent</td></tr>
+    <tr><td><a href="clank-config-review.adhoc_feedback.html"><code>review.adhoc_feedback</code></a></td><td>Review commits outside any plan</td></tr>
+    <tr><td><a href="clank-config-review.plan_feedback.html"><code>review.plan_feedback</code></a></td><td>Review a plan&#39;s commits</td></tr>
+    <tr><td><a href="clank-config-review.require_commit_prefix.html"><code>review.require_commit_prefix</code></a></td><td>Require a [plan] or [misc] commit subject prefix</td></tr>
+  </tbody>
+</table>
+</div>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
+  <dd>
+<p>Global: every subcommand accepts it too.</p>
+  </dd>
+  <dt id="option-json"><code>-j, --json</code></dt>
+  <dd>
+<p>Global: every subcommand accepts it too.</p>
+  </dd>
+  <dt id="option-global"><code>--global</code></dt>
+  <dd>
+<p>Write to the USER-scope config (<code>~/.clank/config.json</code>) instead of the repo&#39;s <code>.clank/config.json</code>. Only affects writes; reads always show the effective merged value (repo shadows user)</p>
+<p>Global: every subcommand accepts it too.</p>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+<h2 id="examples">Examples</h2>
+<pre><code>clank config
+clank config finish.autosquash
+clank config finish.autosquash true
+clank config diff.wait false --global</code></pre>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html" aria-current="page">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

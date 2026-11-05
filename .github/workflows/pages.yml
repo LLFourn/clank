@@ -1,0 +1,70 @@
+name: Pages
+
+# The site is book/, so only a change there (or here) rebuilds it. A help
+# change regenerates book/reference/, which is a change there.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "book/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# A newer run cancels an older one, so an older book never deploys over
+# a newer site.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must equal clank::agent_env::SESSION_IDENTITY_VARS; the pages_workflow
+  # gate in crates/cli/tests/it holds it to that.
+  SESSION_IDENTITY_VARS: CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID OPENCODE_SESSION_ID GROK_AGENT GROK_SESSION_ID CLANK_AGENT CLANK_BOOTSTRAP_SESSION_ID
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision git and a C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git build-essential
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The artifact is this checkout's book, so it is checked before it
+      # is uploaded: a failure here leaves nothing to deploy.
+      - name: The book is true and its command reference is fresh
+        run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --test it -- book_is_true:: cli_reference::
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
