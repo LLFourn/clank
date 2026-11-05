@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank stash | The clank book</title>
+<meta name="description" content="Set a plan&#39;s commits aside and restore them later">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a></p>
+<h1>clank stash</h1>
+<p class="lede">Set a plan&#39;s commits aside and restore them later</p>
+<p>Bare <code>clank stash [PLAN]</code> pushes, as <code>git stash</code> does: the one in-flight plan, or the named one. Its commits are kept on a protective ref and taken off the branch, so another plan can run. Where only one plan is stashed, commands that act on a stash take it without a name. <code>--to-queue</code> re-queues the plan body for a later attempt instead.</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank stash [OPTIONS] [PLAN] [COMMAND]</samp></p>
+<h2 id="commands">Commands</h2>
+<div class="table-scroll">
+<table>
+  <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+  <tbody>
+    <tr><td><a href="clank-stash-drop.html"><code>drop</code></a></td><td>Permanently discard a plan&#39;s stashed commits + record</td></tr>
+    <tr><td><a href="clank-stash-list.html"><code>list</code></a></td><td>List the stashed plans</td></tr>
+    <tr><td><a href="clank-stash-pop.html"><code>pop</code></a></td><td>Bring a stashed plan back onto the branch</td></tr>
+    <tr><td><a href="clank-stash-push.html"><code>push</code></a></td><td>Set a plan aside, the same as bare <code>clank stash</code></td></tr>
+    <tr><td><a href="clank-stash-show.html"><code>show</code></a></td><td>Print a stashed plan&#39;s body (from its protective ref) + commits</td></tr>
+  </tbody>
+</table>
+</div>
+<h2 id="arguments">Arguments</h2>
+<dl class="terms">
+  <dt id="arg-plan"><code>[PLAN]</code></dt>
+  <dd>
+<p>Plan stem to stash (same parsing as <code>clank purge</code>). Optional when the repo has exactly one in-flight active plan</p>
+  </dd>
+</dl>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
+  <dd>
+<p>Repo root. Defaults to the cwd&#39;s git toplevel</p>
+  </dd>
+  <dt id="option-waiting_for"><code>--for &lt;PLAN&gt;</code></dt>
+  <dd>
+<p>Record that this plan is waiting on another; <code>clank status</code> nudges to pop once that plan finishes</p>
+  </dd>
+  <dt id="option-to_queue"><code>--to-queue</code></dt>
+  <dd>
+<p>Also save the plan body back to the queue for re-attempt from scratch</p>
+  </dd>
+  <dt id="option-priority"><code>--priority &lt;N&gt;</code></dt>
+  <dd>
+<p>Queue priority for <code>--to-queue</code> (default 500)</p>
+  </dd>
+  <dt id="option-dry"><code>--dry-run</code></dt>
+  <dd>
+<p>Print the plan without changing anything</p>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+<h2 id="examples">Examples</h2>
+<pre><code># set the active plan aside, run another, then bring it back
+clank stash
+clank stash pop
+# give the plan up for now, keeping its body in the queue
+clank stash --to-queue</code></pre>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html" aria-current="page">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank wait | The clank book</title>
+<meta name="description" content="Block until this agent has actionable work">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a></p>
+<h1>clank wait</h1>
+<p class="lede">Block until this agent has actionable work</p>
+<p>Author and role come from the session binding (<code>clank as</code>). <code>--peek</code> probes without blocking; <code>--for</code> observes a repo instead; <code>--event</code> adds ad-hoc wake sources (github repos, commands) alongside the agent config&#39;s <code>wait_events</code>.</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank wait [OPTIONS]</samp></p>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
+  <dd>
+<p>Repo root. Defaults to the cwd&#39;s git toplevel</p>
+  </dd>
+  <dt id="option-author"><code>--author &lt;AGENT&gt;</code></dt>
+  <dd>
+<p>Agent label this caller is waiting as. Keys feedback files and the participant set. Optional: defaults via the shared identity resolver: the binding of the session named by the harness&#39;s session variable (see <code>clank as --help</code>), or CLANK_AGENT outside any session. Pass explicitly to override</p>
+  </dd>
+  <dt id="option-die_with_owner"><code>--die-with-owner</code></dt>
+  <dd>
+<p>Exit when the process that spawned this wait goes away.</p>
+<p>The spawner must hand this process a pipe as stdin and hold the write end; EOF then means the owner is gone, which the kernel reports on an orderly exit and a SIGKILL alike. Opt-in on purpose: without it stdin is ignored, so an interactive wait whose stdin is <code>/dev/null</code> does not exit the moment it starts.</p>
+  </dd>
+  <dt id="option-json"><code>-j, --json</code></dt>
+  <dd>
+<p>Emit JSON instead of the human rendering</p>
+  </dd>
+  <dt id="option-events"><code>--event &lt;JSON&gt;</code></dt>
+  <dd>
+<p>Extra wake source for THIS wait, as the agent-config item JSON (<code>{&quot;kind&quot;:&quot;github&quot;,…}</code> / <code>{&quot;kind&quot;:&quot;command&quot;,…}</code>) — exactly the <code>wait_events</code> config shape, merged after the config&#39;s entries. Repeatable</p>
+<p>May be repeated.</p>
+  </dd>
+  <dt id="option-for"><code>--for &lt;EVENT&gt;</code></dt>
+  <dd>
+<p>OBSERVE the repo instead of waiting for own work: block until the given event lands, counting only events AFTER the wait starts. For watching a foreign repo (pair with --repo) — no session binding is needed there, so --author is ignored. Fires no lifecycle hooks</p>
+<p>Possible values:</p>
+<ul>
+<li><code>commit</code>: HEAD moved (any new commit)</li>
+<li><code>finished</code>: A plan was finalized</li>
+<li><code>stopped</code>: The repo came to a stop-point: a plan finalized OR a new unanswered block appeared (someone needs the human)</li>
+</ul>
+  </dd>
+  <dt id="option-peek"><code>--peek</code></dt>
+  <dd>
+<p>One-shot, non-blocking probe: report whether the caller has actionable work RIGHT NOW and return immediately — never enter the watcher loop. Unlike a real wait it is SIDE-EFFECT-FREE: it fires no lifecycle or idle hooks and promotes nothing. Prints the same items as a real wait; exits 3 with a no-work diagnostic when idle. Used by SessionStart to check for pending work without blocking</p>
+  </dd>
+  <dt id="option-no_cache"><code>--no-cache</code></dt>
+  <dd>
+<p>Skip the on-disk state cache</p>
+  </dd>
+  <dt id="option-poll"><code>--poll</code></dt>
+  <dd>
+<p>Force polling mode for git changes (skip the native gitdir watch, refold on a 500ms tick). Use this when native <code>notify</code> events on the gitdir are unreliable — most notably inside the Codex tool sandbox.</p>
+<p>Default is <code>false</code>. Unset, the default flips to <code>true</code> when <code>CODEX_SANDBOX=seatbelt</code> is in the environment. Pass <code>--no-poll</code> to force the native path regardless of env.</p>
+  </dd>
+  <dt id="option-no_poll"><code>--no-poll</code></dt>
+  <dd>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html" aria-current="page">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

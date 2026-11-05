@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank log | The clank book</title>
+<meta name="description" content="Print the repo timeline: commits, reviews, github events">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a></p>
+<h1>clank log</h1>
+<p class="lede">Print the repo timeline: commits, reviews, github events</p>
+<p>Chronological and newest-first, with github events interleaved by their github-side time (<code>--no-github</code> to leave them out, <code>--plan</code> to scope to one plan, <code>--oneline</code> / <code>-j</code> for compact and machine forms).</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank log [OPTIONS] [RANGE]</samp></p>
+<h2 id="arguments">Arguments</h2>
+<dl class="terms">
+  <dt id="arg-range"><code>[RANGE]</code></dt>
+  <dd>
+<p>Commit range (git-log style). <code>&lt;sha&gt;</code> = from sha to HEAD. <code>&lt;from&gt;..&lt;to&gt;</code> = exclusive from, inclusive to. Omit for the last <code>-n</code> commits from HEAD</p>
+  </dd>
+</dl>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
+  <dd>
+  </dd>
+  <dt id="option-json"><code>-j, --json</code></dt>
+  <dd>
+  </dd>
+  <dt id="option-plan"><code>--plan &lt;PLAN&gt;</code></dt>
+  <dd>
+  </dd>
+  <dt id="option-limit"><code>-n &lt;LIMIT&gt;</code></dt>
+  <dd>
+<p>Number of commits to fold from HEAD (default 30)</p>
+<p>Default: <code>30</code>.</p>
+  </dd>
+  <dt id="option-oneline"><code>--oneline</code></dt>
+  <dd>
+<p>Compact one-line-per-commit output</p>
+  </dd>
+  <dt id="option-no_github"><code>--no-github</code></dt>
+  <dd>
+<p>Leave github events out of the timeline (log-timeline-github-events)</p>
+  </dd>
+  <dt id="option-diagnostics"><code>--diagnostics</code></dt>
+  <dd>
+<p>Show history reconstruction diagnostics instead of the timeline. Respects the commit range, -n and --plan; --json emits typed records</p>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html" aria-current="page">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

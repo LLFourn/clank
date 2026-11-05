@@ -5,8 +5,9 @@ a plan; reviewers weigh in; the master implements the complete plan in one
 commit by default; reviewers sign off; the plan finalizes into a sealed record.
 
 **New here? Read [the clank book](book/index.html)**: the ideas, the three ways to
-use clank, and real recordings. Open `book/index.html` in a browser; it works
-offline. This README is the reference.
+use clank, and real recordings. Read it at https://llfourn.github.io/clank/, or
+open `book/index.html` in a browser; it works offline. This README is the
+reference.
 
 Everything durable lives in `.clank/` and `git`. No server, no
 database — the review history IS the commit history. One background process

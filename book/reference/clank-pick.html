@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank pick | The clank book</title>
+<meta name="description" content="Copy plans from another branch">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a></p>
+<h1>clank pick</h1>
+<p class="lede">Copy plans from another branch</p>
+<p>Brings their commits + plan files onto the current branch; the source is never modified. Run it where the plans should land.</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank pick [OPTIONS] --from &lt;COMMITTISH&gt; &lt;PLANS&gt;...</samp></p>
+<h2 id="arguments">Arguments</h2>
+<dl class="terms">
+  <dt id="arg-plans"><code>&lt;PLANS&gt;...</code></dt>
+  <dd>
+<p>Plan stem(s) to copy from <code>--from</code>. Replayed in SOURCE order (their stacking order over there), regardless of argument order</p>
+  </dd>
+</dl>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-from"><code>--from &lt;COMMITTISH&gt;</code></dt>
+  <dd>
+<p>Branch (or any committish) to copy the plans FROM. Never modified — <code>pick</code> is a copy, not a move</p>
+<p>Required.</p>
+  </dd>
+  <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
+  <dd>
+<p>Repo root. Defaults to the cwd&#39;s git toplevel</p>
+  </dd>
+  <dt id="option-squash"><code>--squash</code></dt>
+  <dd>
+<p>Collapse each picked plan&#39;s commit stack into ONE commit on this branch (N plans → N commits, in source order). The commit message reuses the plan&#39;s finalize WHY when it has one</p>
+  </dd>
+  <dt id="option-purge"><code>--purge</code></dt>
+  <dd>
+<p>Strip the plan&#39;s <code>.clank/</code> artifacts from what lands — the code is copied, the plan file / review scaffolding is not. Commits that become empty after the strip are dropped. Composes with --squash (one clean commit)</p>
+  </dd>
+  <dt id="option-dry"><code>--dry-run</code></dt>
+  <dd>
+<p>Print the resolved plan order and each plan&#39;s commits without picking anything (the same computation the live run applies)</p>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html" aria-current="page">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

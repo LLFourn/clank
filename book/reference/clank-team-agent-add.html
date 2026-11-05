@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clank team agent add | The clank book</title>
+<meta name="description" content="Save an agent description to your library">
+<script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
+<link rel="stylesheet" href="../book.css">
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<header class="bar">
+  <a class="brand" href="../index.html">clank</a>
+  <a class="bar-link" href="#chapters">Commands</a>
+</header>
+<main id="text">
+  <article class="page">
+<p class="chapter-no"><a href="index.html">Command reference</a> / <a href="clank-team.html">clank team</a> / <a href="clank-team-agent.html">clank team agent</a></p>
+<h1>clank team agent add</h1>
+<p class="lede">Save an agent description to your library</p>
+<h2 id="usage">Usage</h2>
+<p class="usage"><samp>clank team agent add [OPTIONS] --tool &lt;TOOL&gt; &lt;AGENT&gt; [-- &lt;TOOL ARGS&gt;...]</samp></p>
+<h2 id="arguments">Arguments</h2>
+<dl class="terms">
+  <dt id="arg-label"><code>&lt;AGENT&gt;</code></dt>
+  <dd>
+<p>Agent label</p>
+  </dd>
+  <dt id="arg-tool_args"><code>[TOOL ARGS]...</code></dt>
+  <dd>
+<p>The tool&#39;s own arguments, after <code>--</code>, exactly as you would type them to the tool</p>
+  </dd>
+</dl>
+<h2 id="options">Options</h2>
+<dl class="terms">
+  <dt id="option-tool"><code>--tool &lt;TOOL&gt;</code></dt>
+  <dd>
+<p>Tool this agent runs</p>
+<p>Required.</p>
+<p>Possible values:</p>
+<ul>
+<li><code>claude</code></li>
+<li><code>codex</code></li>
+<li><code>grok</code></li>
+<li><code>opencode</code>: One word, like the binary (clap would kebab-case the variant)</li>
+</ul>
+  </dd>
+  <dt id="option-cmd"><code>--cmd &lt;EXECUTABLE&gt;</code></dt>
+  <dd>
+<p>The executable <code>clank agent start</code> runs, instead of the tool&#39;s own name</p>
+  </dd>
+  <dt id="option-env"><code>--env &lt;KEY=VAL&gt;</code></dt>
+  <dd>
+<p>An environment variable for the agent&#39;s process, <code>KEY=VAL</code>; repeatable</p>
+<p>May be repeated.</p>
+  </dd>
+  <dt id="option-initial_prompt"><code>--initial-prompt &lt;STRING&gt;</code></dt>
+  <dd>
+<p>Initial prompt passed to the resumed tool, as for <code>agent add</code></p>
+  </dd>
+  <dt id="option-help"><code>-h, --help</code></dt>
+  <dd>
+<p>Print help (see a summary with &#39;-h&#39;)</p>
+  </dd>
+</dl>
+  </article>
+</main>
+<nav class="rail" id="chapters" aria-label="Commands">
+  <div class="rail-inner">
+    <a class="brand" href="../index.html">clank</a>
+    <span class="brand-sub">Command reference</span>
+    <ol class="chapters commands">
+        <li><a href="index.html">All commands</a></li>
+        <li><a href="clank-agent.html">clank agent</a></li>
+        <li><a href="clank-as.html">clank as</a></li>
+        <li><a href="clank-attend.html">clank attend</a></li>
+        <li><a href="clank-auto.html">clank auto</a></li>
+        <li><a href="clank-block.html">clank block</a></li>
+        <li><a href="clank-config.html">clank config</a></li>
+        <li><a href="clank-diff.html">clank diff</a></li>
+        <li><a href="clank-doctor.html">clank doctor</a></li>
+        <li><a href="clank-events.html">clank events</a></li>
+        <li><a href="clank-export.html">clank export</a></li>
+        <li><a href="clank-feedback.html">clank feedback</a></li>
+        <li><a href="clank-finish.html">clank finish</a></li>
+        <li><a href="clank-fork.html">clank fork</a></li>
+        <li><a href="clank-html.html">clank html</a></li>
+        <li><a href="clank-init.html">clank init</a></li>
+        <li><a href="clank-log.html">clank log</a></li>
+        <li><a href="clank-nudge.html">clank nudge</a></li>
+        <li><a href="clank-open.html">clank open</a></li>
+        <li><a href="clank-pick.html">clank pick</a></li>
+        <li><a href="clank-purge.html">clank purge</a></li>
+        <li><a href="clank-queue.html">clank queue</a></li>
+        <li><a href="clank-remote.html">clank remote</a></li>
+        <li><a href="clank-rereview.html">clank rereview</a></li>
+        <li><a href="clank-run.html">clank run</a></li>
+        <li><a href="clank-send.html">clank send</a></li>
+        <li><a href="clank-setup.html">clank setup</a></li>
+        <li><a href="clank-stash.html">clank stash</a></li>
+        <li><a href="clank-status.html">clank status</a></li>
+        <li><a href="clank-team.html">clank team</a></li>
+        <li><a href="clank-tui.html">clank tui</a></li>
+        <li><a href="clank-unfinish.html">clank unfinish</a></li>
+        <li><a href="clank-user-command.html">clank user-command</a></li>
+        <li><a href="clank-wait.html">clank wait</a></li>
+    </ol>
+    <p class="rail-foot"><a href="../index.html">Back to the book</a></p>
+  </div>
+</nav>
+</body>
+</html>

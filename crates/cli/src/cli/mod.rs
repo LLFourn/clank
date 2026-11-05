@@ -23,6 +23,7 @@ pub mod command_source;
 pub(crate) mod composer;
 pub mod config;
 pub mod diff;
+pub mod docs;
 pub mod doctor;
 pub(crate) mod event_interrupt;
 pub(crate) mod event_source;
@@ -566,8 +567,8 @@ pub struct WaitArgs {
     /// The spawner must hand this process a pipe as stdin and hold
     /// the write end; EOF then means the owner is gone, which the
     /// kernel reports on an orderly exit and a SIGKILL alike. Opt-in
-    /// on purpose: without it stdin is ignored, so an interactive
-    /// `clank wait < /dev/null` does not exit the moment it starts.
+    /// on purpose: without it stdin is ignored, so an interactive wait
+    /// whose stdin is `/dev/null` does not exit the moment it starts.
     #[arg(long)]
     pub die_with_owner: bool,
     /// The hook's actual session, passed to its owned child.
@@ -851,7 +852,7 @@ pub struct EventsWatchArgs {
 pub enum EventsWatchCmd {
     /// Show the agent's wake sources, numbered from 1.
     List(EventsWatchListArgs),
-    /// Add one wake source, in the JSON shape `clank wait --event` takes
+    /// Add one wake source, in the JSON shape of `clank wait`'s `--event`
     ///
     /// Refused, with nothing written, when an arm would refuse it.
     Add(EventsWatchAddArgs),

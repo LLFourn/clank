@@ -2237,7 +2237,7 @@ fn classify_line(line: &str) -> (&'static str, &'static str, &str) {
 
 // ─────────────────────────── helpers ────────────────────────
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
