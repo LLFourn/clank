@@ -10,11 +10,11 @@ item is queueable as written: plan name, problem, shape of the fix.
 - **Channels.** These four:
   - crates.io;
   - prebuilt binaries on GitHub Releases;
-  - the same binaries on our own website;
-  - a `curl | sh` installer served from the website.
+  - a `curl | sh` installer served from the website, which fetches
+    those binaries.
 
-  No Homebrew yet. The website is deployed with `flyctl` on a fly.dev
-  address; no custom domain yet.
+  No Homebrew yet. The website is GitHub Pages
+  (`llfourn.github.io/clank`), built from `book/`; no custom domain yet.
 - **Platforms.** macOS and Linux binaries, for arm64 and x86_64 on each.
   Windows is a non-goal: the code is unix-only, with `cfg(not(unix))`
   stubs.
@@ -24,8 +24,9 @@ item is queueable as written: plan name, problem, shape of the fix.
   table in §1 `first-run-walk-per-harness`).
 - **Hidden aliases.** Removed before the first release
   (§1 `retire-hidden-aliases`).
-- **The book.** Hosted as the website, which also serves the binaries
-  and the installer (§2 `website-on-fly`).
+- **The book.** Hosted as the website on GitHub Pages. It rebuilds only
+  when `book/` changes, and carries a CLI reference generated from the
+  clap definitions (§2 `website-on-github-pages`).
 
 ## 1. Release blockers: every channel
 
@@ -227,10 +228,10 @@ item is queueable as written: plan name, problem, shape of the fix.
 
 ### Website
 
-- [ ] **`website-on-fly`** — a fly.io app that serves `book/` as the site
-  and hosts each release's archives, checksums and the `curl | sh`
-  installer. It is deployed with `flyctl` on a fly.dev address. The
-  release workflow uploads to it.
+- [ ] **`website-on-github-pages`** — a Pages workflow that deploys
+  `book/` only when `book/**` changes. It carries a CLI reference
+  generated from clap, checked in and kept fresh by CI, and serves
+  `install.sh`, which downloads from GitHub Releases.
 
 ### Prebuilt binaries
 
