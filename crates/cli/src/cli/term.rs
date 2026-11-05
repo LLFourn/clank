@@ -204,15 +204,16 @@ mod restore {
             }
         }
 
-        fn mask_bytes(mask: &libc::sigset_t) -> Vec<u8> {
-            // SAFETY: a `sigset_t` is plain bytes of its own size.
-            unsafe {
-                std::slice::from_raw_parts(
-                    (mask as *const libc::sigset_t).cast::<u8>(),
-                    std::mem::size_of::<libc::sigset_t>(),
-                )
-            }
-            .to_vec()
+        /// The signals a mask holds. A raw byte compare would also compare
+        /// the part of glibc's 1024-bit `sigset_t` the kernel never fills.
+        fn members(mask: &libc::sigset_t) -> Vec<libc::c_int> {
+            (1..=64)
+                .filter(|&sig| {
+                    // SAFETY: `mask` is a valid `sigset_t` for the call, and
+                    // `sigismember` only reads it.
+                    unsafe { libc::sigismember(mask, sig) == 1 }
+                })
+                .collect()
         }
 
         /// Installation keeps `signal`'s semantics, restart included,
@@ -248,10 +249,7 @@ mod restore {
                 "interrupted reads restart"
             );
             assert_eq!(installed.sa_flags, by_signal.sa_flags);
-            assert_eq!(
-                mask_bytes(&installed.sa_mask),
-                mask_bytes(&by_signal.sa_mask)
-            );
+            assert_eq!(members(&installed.sa_mask), members(&by_signal.sa_mask));
             println!("RESULT:{INSTALLED}");
         }
     }
