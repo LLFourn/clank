@@ -1,5 +1,6 @@
 //! Enforcement gate: CI runs the tests with no agent identity in its
-//! environment, and never opts out of the Node harness.
+//! environment, never opts out of the Node harness, and checks every
+//! dependency's licence and that the notice the binary ships is current.
 //!
 //! YAML cannot read the Rust list, so the workflow keeps its own copy
 //! of the identity variables. This holds the copy to the production
@@ -49,4 +50,28 @@ fn every_test_step_unsets_every_identity_variable() {
 #[test]
 fn the_workflow_never_skips_the_node_harness() {
     assert!(!workflow().contains("CLANK_SKIP_NODE_HARNESS"));
+}
+
+fn has_step(text: &str, run: &str) -> bool {
+    text.lines()
+        .any(|l| l.trim().strip_prefix("run:").map(str::trim) == Some(run))
+}
+
+#[test]
+fn ci_checks_dependency_licences_and_their_notice() {
+    let text = workflow();
+    assert!(
+        has_step(&text, "cargo deny --locked check licenses"),
+        "no cargo deny licence step"
+    );
+    assert!(
+        has_step(&text, "scripts/notices/check.sh"),
+        "no notice freshness step"
+    );
+    assert!(
+        text.contains(
+            r#"cargo install cargo-about --locked --features cli --version "$(cat scripts/notices/cargo-about.version)""#
+        ),
+        "cargo-about is not installed at the version the notice was generated with"
+    );
 }

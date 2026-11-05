@@ -50,5 +50,6 @@ mod wait_for_observer;
 mod wake_receipt_acceptance;
 mod web_host_process;
 mod web_timeline_boundary;
+mod workspace_licence;
 mod zellij_cost_boundary;
 mod zellij_ownership_boundary;

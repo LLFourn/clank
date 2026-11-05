@@ -3,6 +3,10 @@ name = "clank-web"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.96"
+license.workspace = true
+repository.workspace = true
+description = "Session transport and browser UI shared by the clank TUI connector and its web hosts."
+include = ["/src/**", "/assets/**", "/examples/**", "/tests/**", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1"

@@ -3,6 +3,10 @@ name = "clank-web-cloudflare"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.96"
+license.workspace = true
+repository.workspace = true
+description = "The default clank web host: its login door, server process and Cloudflare quick tunnel."
+include = ["/src/**", "/assets/**", "/LICENSE"]
 
 [features]
 test-support = []

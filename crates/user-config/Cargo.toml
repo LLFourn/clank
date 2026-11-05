@@ -3,6 +3,9 @@ name = "clank-user-config"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.96"
+license.workspace = true
+repository.workspace = true
+description = "Clank's user-scope config file: locked, atomic reads and writes of ~/.clank/config.json."
 publish = false
 
 [features]
