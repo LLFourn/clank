@@ -298,9 +298,12 @@ async fn an_existing_host_is_ready_before_repo_attachment() {
             .status()
             .is_success()
     );
-    let cookie = Door::new(Some(home.path().to_path_buf()))
-        .open_session("existing")
-        .unwrap();
+    let cookie = Door::new(
+        Some(home.path().to_path_buf()),
+        clank::cli::team::check_user_config,
+    )
+    .open_session("existing")
+    .unwrap();
     let status: serde_json::Value = reqwest::Client::new()
         .get(format!("{local_url}/bridge/status"))
         .header(
@@ -331,7 +334,12 @@ async fn feature_parity() {
         "<h1>repo plan</h1>",
     )
     .unwrap();
-    let token = Door::new(Some(home.path().to_path_buf())).token().unwrap();
+    let token = Door::new(
+        Some(home.path().to_path_buf()),
+        clank::cli::team::check_user_config,
+    )
+    .token()
+    .unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_clank-web-cloudflare"))
         .current_dir(unrelated.path())
         .env("HOME", home.path())

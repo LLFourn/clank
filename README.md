@@ -164,6 +164,22 @@ hooks (Claude's PostCompact, for one), and only sessions clank launches
 repair them on their own. `clank doctor` warns about a missing one.
 `--force` refreshes skill files you have locally edited.
 
+### Upgrading
+
+- **Monitors retire on their own.** A running monitor retires itself when a
+  different build is installed, and its successor runs the new one. Agent
+  panes keep running through it. `clank monitor upgrade` moves monitors
+  from before that onto this build.
+- **A config written by a newer clank is refused.** `~/.clank/config.json`,
+  `.clank/config.json` and each `.clank/agents/<label>/config.json` carry a
+  `version`. A file without one is read as version 1, and the next write
+  adds it. A version newer than this build reads stops the command with
+  "written by a newer clank (version N; this build reads up to M)"; a file
+  that does not parse stops it naming the file. Neither is skipped, and
+  neither is written over.
+- **`clank doctor` checks each config document**, reporting it as ok,
+  missing, malformed or too new.
+
 ## Quickstart
 
 Two agents reviewing each other, from nothing. Every block says whose

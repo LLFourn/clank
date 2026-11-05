@@ -101,7 +101,7 @@ impl WaitBinding {
                 .as_ref()
                 .map_err(|error| anyhow::anyhow!("{error:#}"))?;
             anyhow::ensure!(
-                crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
+                crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())?
                     == clank_core::AutoMode::On,
                 "automatic Grok wait cancelled: Clank auto mode is off"
             );
@@ -202,7 +202,7 @@ pub(super) fn automatic_grok(
         &session,
     )?;
     let cfg = crate::agent_store::load_agent_config(&bound_repo, &author)?;
-    if crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), env.home().as_deref())
+    if crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), env.home().as_deref())?
         == clank_core::AutoMode::Off
     {
         return Ok(None);
@@ -964,7 +964,7 @@ pub(crate) fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Re
     // Re-derived every refold, so a roster change corrects a parked
     // wait on its next wake rather than stranding it.
     let role = crate::agent_store::resolve_role(repo, author)?;
-    let config = crate::cli::config::load(repo);
+    let config = crate::cli::config::load(repo)?;
     // Reviewer tiers from the team resolver. wait is a workflow
     // command, so it hard-errors when no team is configured
     // (`teams-based-agent-registration` render-vs-workflow boundary).

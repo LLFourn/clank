@@ -2683,7 +2683,7 @@ fn issued_path(agent_dir: &Path) -> PathBuf {
 
 /// The highest attempt number issued, zero when none ever was. A file
 /// that is there but cannot be read is an error, never zero.
-fn load_issued(agent_dir: &Path) -> std::io::Result<u32> {
+pub(crate) fn load_issued(agent_dir: &Path) -> std::io::Result<u32> {
     match std::fs::read(issued_path(agent_dir)) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
@@ -2691,7 +2691,7 @@ fn load_issued(agent_dir: &Path) -> std::io::Result<u32> {
     }
 }
 
-fn store_issued(agent_dir: &Path, n: u32) -> std::io::Result<()> {
+pub(crate) fn store_issued(agent_dir: &Path, n: u32) -> std::io::Result<()> {
     let path = issued_path(agent_dir);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(&n)?)?;

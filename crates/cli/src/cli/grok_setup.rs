@@ -237,7 +237,7 @@ pub(super) async fn launch_ready(
         .get("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    if super::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()) == AutoMode::Off {
+    if super::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())? == AutoMode::Off {
         return Ok(());
     }
     let recovery = format!(

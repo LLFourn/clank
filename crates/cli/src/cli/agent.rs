@@ -20,8 +20,9 @@ use serde::Serialize;
 
 use crate::agent_store::load_agent_config;
 use crate::cli::session_holder::{self, Holder};
+use crate::cli::team::read_user_config;
 use crate::cli::teams_config::{
-    AgentDescription, RepoConfigFile, ReviewKind, RosterAgent, RosterRole, UserConfigFile,
+    AgentDescription, RepoConfigFile, ReviewKind, RosterAgent, RosterRole,
 };
 use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
 use clank_core::ids::{AgentLabel, SessionId};
@@ -540,9 +541,10 @@ async fn start_with(
                     }
                     let orientation = unlaunched_opencode_child(&repo, &label, session)?;
                     consume_fork = orientation.is_some();
-                    let prompt = orientation
-                        .map(|spec| spec.prompt)
-                        .or_else(|| start_prompt(&desc, cfg.as_ref(), session.tool));
+                    let prompt = match orientation {
+                        Some(spec) => Some(spec.prompt),
+                        None => start_prompt(&desc, cfg.as_ref(), session.tool)?,
+                    };
                     (
                         compose_launch(
                             &repo,
@@ -869,10 +871,18 @@ pub(crate) fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -
 
 /// The configured or auto-mode prompt a launch of an existing session
 /// carries.
-fn start_prompt(desc: &AgentDescription, cfg: Option<&AgentConfig>, tool: Tool) -> Option<String> {
+fn start_prompt(
+    desc: &AgentDescription,
+    cfg: Option<&AgentConfig>,
+    tool: Tool,
+) -> anyhow::Result<Option<String>> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg, home.as_deref());
-    resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode, tool)
+    let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg, home.as_deref())?;
+    Ok(resolve_initial_prompt(
+        desc.initial_prompt.as_deref(),
+        auto_mode,
+        tool,
+    ))
 }
 
 /// The launch of an agent with no bound session. OpenCode has no hook
@@ -925,7 +935,7 @@ fn compose_unbound_launch(
         label,
         &session,
         desc.launch.as_ref(),
-        start_prompt(desc, cfg, Tool::OpenCode).as_deref(),
+        start_prompt(desc, cfg, Tool::OpenCode)?.as_deref(),
     ))
 }
 
@@ -1829,11 +1839,39 @@ fn write_stand_in_noclobber(
     }
 }
 
-fn write_repo_transition(
+/// Edit this repo's roster in one config transaction. When the roster
+/// changes, the stand-ins the transition owes are written before the
+/// config, so they land while their authors are still unexpected and
+/// therefore gate-neutral; a failed config write removes the ones this
+/// call created.
+fn edit_roster<T>(
+    repo: &Path,
+    policy: RosterTransitionPolicy,
+    edit: impl FnOnce(&mut RepoConfigFile) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut created = Vec::new();
+    let result = crate::agent_store::repo_config::transact(repo, |cfg| {
+        let before = cfg.clone();
+        let out = edit(cfg)?;
+        if before.agents != cfg.agents {
+            write_stand_ins(repo, &before, cfg, policy, &mut created)?;
+        }
+        Ok(out)
+    });
+    if result.is_err() {
+        for path in created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+fn write_stand_ins(
     repo: &Path,
     before: &RepoConfigFile,
     after: &RepoConfigFile,
     policy: RosterTransitionPolicy,
+    created: &mut Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // No active plan means there is no plan gate to preserve and no reason to
     // pay for a fold. This also keeps pre-adoption roster setup independent of
@@ -1856,39 +1894,20 @@ fn write_repo_transition(
             (Vec::new(), Vec::new())
         };
 
-    // Stand-ins are written first while their authors are still unexpected and
-    // therefore gate-neutral. Noclobber protects a concurrent or historical
-    // human review. Roll back only files created by this call if config
-    // persistence fails.
-    let mut created = Vec::new();
+    // Noclobber protects a concurrent or historical human review.
     for stand_in in &stand_ins {
-        match write_stand_in_noclobber(repo, stand_in, &all_shas) {
-            Ok(Some(path)) => {
-                // Say it out loud. A synthetic verdict nobody is told
-                // about is one nobody knows to question, and the whole
-                // point of `rereview` is that it can be questioned.
-                eprintln!(
-                    "auto-continued {} for `{}` (roster change, not a review) — \
-                     `clank rereview` opens a real round",
-                    &stand_in.sha.as_str()[..7.min(stand_in.sha.as_str().len())],
-                    stand_in.author.as_str()
-                );
-                created.push(path)
-            }
-            Ok(None) => {}
-            Err(error) => {
-                for path in created {
-                    let _ = std::fs::remove_file(path);
-                }
-                return Err(error);
-            }
+        if let Some(path) = write_stand_in_noclobber(repo, stand_in, &all_shas)? {
+            // Say it out loud. A synthetic verdict nobody is told
+            // about is one nobody knows to question, and the whole
+            // point of `rereview` is that it can be questioned.
+            eprintln!(
+                "auto-continued {} for `{}` (roster change, not a review) — \
+                 `clank rereview` opens a real round",
+                &stand_in.sha.as_str()[..7.min(stand_in.sha.as_str().len())],
+                stand_in.author.as_str()
+            );
+            created.push(path);
         }
-    }
-    if let Err(error) = write_repo_config_raw(repo, after) {
-        for path in created {
-            let _ = std::fs::remove_file(path);
-        }
-        return Err(error);
     }
     Ok(())
 }
@@ -1994,27 +2013,22 @@ fn insert_roster_agent(
     origin: &str,
 ) -> anyhow::Result<Option<crate::cli::init::SupportSetup>> {
     let _roster = roster_lock(repo)?;
-    let mut repo_cfg = read_repo_config(repo)?;
-    let role = choice.on(&repo_cfg);
-    let before = repo_cfg.clone();
-    if repo_cfg.agents.contains_key(label) {
-        anyhow::bail!(
-            "agent `{label}` is already on this repo's roster. \
-             Remove it with `clank agent remove {label}` first, or pick a different name.",
-            label = label.as_str()
-        );
-    }
-    let desc = describe()?;
-    let setup = setup(repo)?;
-    repo_cfg
-        .agents
-        .insert(label.clone(), RosterAgent::from_description(desc, role));
-    write_repo_transition(
-        repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::PreserveGate,
-    )?;
+    let (role, setup) = edit_roster(repo, RosterTransitionPolicy::PreserveGate, |repo_cfg| {
+        let role = choice.on(repo_cfg);
+        if repo_cfg.agents.contains_key(label) {
+            anyhow::bail!(
+                "agent `{label}` is already on this repo's roster. \
+                     Remove it with `clank agent remove {label}` first, or pick a different name.",
+                label = label.as_str()
+            );
+        }
+        let desc = describe()?;
+        let setup = setup(repo)?;
+        repo_cfg
+            .agents
+            .insert(label.clone(), RosterAgent::from_description(desc, role));
+        Ok((role, setup))
+    })?;
     eprintln!(
         "added `{}` to this repo's roster: {}{}{origin}",
         label.as_str(),
@@ -2085,40 +2099,39 @@ pub fn swap_repo_agent(
     out: &AgentLabel,
     into: &AgentLabel,
 ) -> anyhow::Result<()> {
-    let mut repo_cfg = read_repo_config(repo)?;
-    let before = repo_cfg.clone();
-    let role = match repo_cfg.agents.get(out) {
-        Some(a) => a.role,
-        None => anyhow::bail!(
-            "agent `{}` is not on this repo's roster, so there is nothing to swap out",
-            out.as_str()
-        ),
-    };
-    // A map keyed by label: inserting onto an existing one COLLAPSES
-    // two entries into one. `out` would go, `into`'s tier would be
-    // overwritten with `out`'s, and the roster would shrink by one
-    // silently — the shrinking expected-reviewer set this command
-    // exists to avoid.
-    if repo_cfg.agents.contains_key(into) {
-        anyhow::bail!(
-            "agent `{into}` is already on this repo's roster, so swapping onto it \
+    let role = edit_roster(
+        repo,
+        RosterTransitionPolicy::RequireFreshReview,
+        |repo_cfg| {
+            let role = match repo_cfg.agents.get(out) {
+                Some(a) => a.role,
+                None => anyhow::bail!(
+                    "agent `{}` is not on this repo's roster, so there is nothing to swap out",
+                    out.as_str()
+                ),
+            };
+            // A map keyed by label: inserting onto an existing one COLLAPSES
+            // two entries into one. `out` would go, `into`'s tier would be
+            // overwritten with `out`'s, and the roster would shrink by one
+            // silently — the shrinking expected-reviewer set this command
+            // exists to avoid.
+            if repo_cfg.agents.contains_key(into) {
+                anyhow::bail!(
+                    "agent `{into}` is already on this repo's roster, so swapping onto it \
              would drop an entry rather than replace one. To change a tier use \
              `clank agent set-review {into} <tier>`; to drop an agent use \
              `clank agent remove {out}`.",
-            into = into.as_str(),
-            out = out.as_str()
-        );
-    }
-    let desc = library_description(home, into)?;
-    repo_cfg.agents.remove(out);
-    repo_cfg
-        .agents
-        .insert(into.clone(), RosterAgent::from_description(desc, role));
-    write_repo_transition(
-        repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::RequireFreshReview,
+                    into = into.as_str(),
+                    out = out.as_str()
+                );
+            }
+            let desc = library_description(home, into)?;
+            repo_cfg.agents.remove(out);
+            repo_cfg
+                .agents
+                .insert(into.clone(), RosterAgent::from_description(desc, role));
+            Ok(role)
+        },
     )?;
     eprintln!(
         "swapped `{}` out for `{}` as `{}`",
@@ -2156,39 +2169,34 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
 /// master (if any, and different) to `Commit`. The agent must
 /// already be on the roster.
 pub fn set_repo_master(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
-    let mut repo_cfg = read_repo_config(repo)?;
-    let before = repo_cfg.clone();
-    if !repo_cfg.agents.contains_key(label) {
-        anyhow::bail!(
-            "agent `{label}` is not on this repo's roster. \
+    let changed = edit_roster(repo, RosterTransitionPolicy::PreserveGate, |repo_cfg| {
+        if !repo_cfg.agents.contains_key(label) {
+            anyhow::bail!(
+                "agent `{label}` is not on this repo's roster. \
              Add it first with `clank agent add {label} --tool <claude|codex|grok|opencode>` \
              (or by name: `clank agent add {label}`).",
-            label = label.as_str()
-        );
-    }
-
-    // Already the master → no-op.
-    if repo_cfg.agents.get(label).map(|a| a.role) == Some(RosterRole::Master) {
-        eprintln!("note: `{}` is already this repo's master", label.as_str());
-        return Ok(());
-    }
-
-    // Demote the previous master to commit.
-    for (other, agent) in repo_cfg.agents.iter_mut() {
-        if other != label && agent.role == RosterRole::Master {
-            agent.role = RosterRole::Commit;
+                label = label.as_str()
+            );
         }
+
+        if repo_cfg.agents.get(label).map(|a| a.role) == Some(RosterRole::Master) {
+            eprintln!("note: `{}` is already this repo's master", label.as_str());
+            return Ok(false);
+        }
+
+        for (other, agent) in repo_cfg.agents.iter_mut() {
+            if other != label && agent.role == RosterRole::Master {
+                agent.role = RosterRole::Commit;
+            }
+        }
+        if let Some(agent) = repo_cfg.agents.get_mut(label) {
+            agent.role = RosterRole::Master;
+        }
+        Ok(true)
+    })?;
+    if changed {
+        eprintln!("set `{}` as this repo's master", label.as_str());
     }
-    if let Some(agent) = repo_cfg.agents.get_mut(label) {
-        agent.role = RosterRole::Master;
-    }
-    write_repo_transition(
-        repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::PreserveGate,
-    )?;
-    eprintln!("set `{}` as this repo's master", label.as_str());
     Ok(())
 }
 
@@ -2209,41 +2217,38 @@ fn set_review(args: AgentSetReviewArgs) -> anyhow::Result<()> {
 /// auto-demotes the old one) or isn't on the roster; no-op if already at
 /// `tier`.
 pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> anyhow::Result<()> {
-    let mut repo_cfg = read_repo_config(repo)?;
-    let before = repo_cfg.clone();
-    let agent = match repo_cfg.agents.get_mut(label) {
-        Some(a) => a,
-        None => anyhow::bail!(
-            "agent `{label}` is not on this repo's roster. \
+    let new_role = RosterRole::from(tier);
+    let changed = edit_roster(repo, RosterTransitionPolicy::PreserveGate, |repo_cfg| {
+        let agent = match repo_cfg.agents.get_mut(label) {
+            Some(a) => a,
+            None => anyhow::bail!(
+                "agent `{label}` is not on this repo's roster. \
              Add it with `clank agent add {label}` first.",
-            label = label.as_str()
-        ),
-    };
-    if agent.role == RosterRole::Master {
-        anyhow::bail!(
-            "agent `{}` is the master, not a reviewer. To change the master, \
+                label = label.as_str()
+            ),
+        };
+        if agent.role == RosterRole::Master {
+            anyhow::bail!(
+                "agent `{}` is the master, not a reviewer. To change the master, \
              promote a different agent with `clank agent make-master <other>` \
              (which demotes the current master).",
-            label.as_str()
-        );
+                label.as_str()
+            );
+        }
+        if agent.role == new_role {
+            eprintln!(
+                "note: `{}` is already {}",
+                label.as_str(),
+                role_phrase(new_role)
+            );
+            return Ok(false);
+        }
+        agent.role = new_role;
+        Ok(true)
+    })?;
+    if changed {
+        eprintln!("`{}` is now {}", label.as_str(), role_phrase(new_role));
     }
-    let new_role = RosterRole::from(tier);
-    if agent.role == new_role {
-        eprintln!(
-            "note: `{}` is already {}",
-            label.as_str(),
-            role_phrase(new_role)
-        );
-        return Ok(());
-    }
-    agent.role = new_role;
-    write_repo_transition(
-        repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::PreserveGate,
-    )?;
-    eprintln!("`{}` is now {}", label.as_str(), role_phrase(new_role));
     Ok(())
 }
 
@@ -2311,25 +2316,22 @@ fn remove_repo_agent_with_policy(
     label: &AgentLabel,
     allow_master: bool,
 ) -> anyhow::Result<()> {
-    let mut repo_cfg = read_repo_config(repo)?;
-    let before = repo_cfg.clone();
-    if !allow_master
-        && repo_cfg
-            .agents
-            .get(label)
-            .is_some_and(|agent| agent.role == RosterRole::Master)
-    {
-        anyhow::bail!("the master cannot be removed from the team; promote another agent first");
-    }
-    if repo_cfg.agents.remove(label).is_none() {
-        anyhow::bail!("agent `{}` is not on this repo's roster", label.as_str());
-    }
-    write_repo_transition(
-        repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::PreserveGate,
-    )?;
+    edit_roster(repo, RosterTransitionPolicy::PreserveGate, |repo_cfg| {
+        if !allow_master
+            && repo_cfg
+                .agents
+                .get(label)
+                .is_some_and(|agent| agent.role == RosterRole::Master)
+        {
+            anyhow::bail!(
+                "the master cannot be removed from the team; promote another agent first"
+            );
+        }
+        if repo_cfg.agents.remove(label).is_none() {
+            anyhow::bail!("agent `{}` is not on this repo's roster", label.as_str());
+        }
+        Ok(())
+    })?;
     eprintln!("removed `{}` from this repo's roster", label.as_str());
     Ok(())
 }
@@ -2503,7 +2505,7 @@ async fn launch_with(args: AgentConfigArgs, find_holder: FindHolder) -> anyhow::
             label.as_str()
         );
     }
-    let cfg = read_repo_config(&repo)?;
+    let cfg = crate::agent_store::repo_config::read(&repo)?.unwrap_or_default();
     let agent = cfg.agents.get(&label).ok_or_else(|| {
         anyhow::anyhow!("agent `{}` is not on this repo's roster", label.as_str())
     })?;
@@ -2572,22 +2574,17 @@ pub fn set_repo_launch(
     label: &AgentLabel,
     launch: Option<LaunchConfig>,
 ) -> anyhow::Result<()> {
-    let mut repo_cfg = read_repo_config(repo)?;
-    let before = repo_cfg.clone();
-    let Some(agent) = repo_cfg.agents.get_mut(label) else {
-        anyhow::bail!(
-            "agent `{label}` is not on this repo's roster. \
-             Add it with `clank agent add {label}` first.",
-            label = label.as_str()
-        );
-    };
-    agent.launch = launch;
-    write_repo_transition(
-        repo,
-        &before,
-        &repo_cfg,
-        RosterTransitionPolicy::PreserveGate,
-    )
+    edit_roster(repo, RosterTransitionPolicy::PreserveGate, |repo_cfg| {
+        let Some(agent) = repo_cfg.agents.get_mut(label) else {
+            anyhow::bail!(
+                "agent `{label}` is not on this repo's roster. \
+                 Add it with `clank agent add {label}` first.",
+                label = label.as_str()
+            );
+        };
+        agent.launch = launch;
+        Ok(())
+    })
 }
 
 fn build_launch(
@@ -2603,44 +2600,6 @@ fn build_launch(
         args,
         env,
     })
-}
-
-/// Read `~/.clank/config.json` as a typed [`UserConfigFile`].
-/// Missing file → default; malformed JSON → error.
-fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
-    let path = home.join(".clank/config.json");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| anyhow::Error::from(e).context(format!("parsing {}", path.display()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    }
-}
-
-/// Read `<repo>/.clank/config.json` as the typed
-/// [`RepoConfigFile`]. Missing file → default; malformed JSON →
-/// error.
-fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
-    let path = repo.join(".clank/config.json");
-    match std::fs::read_to_string(&path) {
-        // Fail-closed on an old-shape config BEFORE accepting the parse:
-        // a legacy `{"team":"dev"}` / stray `promoted` would otherwise
-        // deserialize (the key lands in `extra`) and a roster mutation
-        // would rewrite a mixed old/new config. Use the same raw guard
-        // as `agent_store::load_repo_config` (codex a52d486).
-        Ok(s) if crate::agent_store::is_legacy_repo_shape(&s) => {
-            Err(crate::agent_store::legacy_repo_schema_error(&path))
-        }
-        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoConfigFile::default()),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    }
-}
-
-/// Atomic write of `<repo>/.clank/config.json`. The `extra`
-/// flatten catchall preserves unknown sections on round-trip.
-fn write_repo_config_raw(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
-    crate::agent_store::write_typed_config(&repo.join(".clank/config.json"), file)
 }
 
 #[cfg(test)]
@@ -2835,12 +2794,14 @@ mod tests {
     fn read_repo_config_fails_closed_on_legacy_shape() {
         // codex a52d486: a legacy `{"team":"dev"}` would deserialize (the
         // `team` key lands in `extra`) and a roster mutation would rewrite
-        // a mixed old/new config. read_repo_config must fail closed with
+        // a mixed old/new config. the config read must fail closed with
         // the re-init hint instead, so agent add/remove/promote refuse.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
         std::fs::write(dir.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
-        let err = read_repo_config(dir.path()).unwrap_err().to_string();
+        let err = crate::agent_store::repo_config::read(dir.path())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("old team schema") && err.contains("clank init"),
             "expected re-init hint; got: {err}"
@@ -2949,8 +2910,9 @@ mod tests {
     }
 
     fn read_repo(repo: &Path) -> crate::cli::teams_config::RepoConfigFile {
-        let body = std::fs::read_to_string(repo.join(".clank/config.json")).unwrap();
-        serde_json::from_str(&body).unwrap()
+        crate::agent_store::repo_config::read(repo)
+            .unwrap()
+            .unwrap()
     }
 
     fn desc(tool: Tool) -> AgentDescription {
@@ -3237,11 +3199,11 @@ mod tests {
     #[test]
     fn roster_config_has_one_raw_write_choke_point() {
         let source = include_str!("agent.rs");
-        let raw_writer = concat!("write_repo_config", "_raw(");
+        let transaction = concat!("repo_config::", "transact(");
         assert_eq!(
-            source.matches(raw_writer).count(),
-            2,
-            "the raw writer must appear only at its definition and inside write_repo_transition"
+            source.matches(transaction).count(),
+            1,
+            "every roster write must go through edit_roster, which writes the stand-ins"
         );
     }
 
@@ -3665,7 +3627,7 @@ mod tests {
     // ── agent add (by name, copy-down) ───────────────────────
 
     fn seed_user_config(home: &Path, agents: &[(&str, Tool)]) {
-        let mut cfg = UserConfigFile::default();
+        let mut cfg = crate::cli::teams_config::UserConfigFile::default();
         for (l, t) in agents {
             cfg.agents.insert(AgentLabel::parse(l).unwrap(), desc(*t));
         }
@@ -4569,7 +4531,7 @@ mod tests {
     fn remove_global_agent_scrubs_team_templates() {
         use crate::cli::teams_config::{TeamMember, TeamRef, TeamRoster};
         let home = tempfile::tempdir().unwrap();
-        let mut cfg = UserConfigFile::default();
+        let mut cfg = crate::cli::teams_config::UserConfigFile::default();
         cfg.agents
             .insert(AgentLabel::parse("codex").unwrap(), desc(Tool::Codex));
         let mut dev: TeamRoster = BTreeMap::new();
@@ -5136,7 +5098,7 @@ mod tests {
         let err = unbound_launch(repo.path(), "kimi", &kimi_desc(None), None, false).unwrap_err();
         let err = format!("{err:#}");
         assert!(
-            err.contains("`kimi` was not launched") && err.contains("parsing"),
+            err.contains("`kimi` was not launched") && err.contains("is malformed"),
             "{err}"
         );
         assert_eq!(std::fs::read_to_string(&config).unwrap(), "{ not json");

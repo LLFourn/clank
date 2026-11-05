@@ -51,7 +51,7 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // and collapsing the plan there is the whole point. If the branch is
     // already pushed, that rewrites published history; `--no-squash` opts
     // out for that one finish.
-    let cfg = crate::cli::config::load(&repo);
+    let cfg = crate::cli::config::load(&repo)?;
     if cfg.finish.autosquash
         && !already_finished
         && args.squash.is_none()

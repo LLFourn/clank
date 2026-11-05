@@ -1,0 +1,45 @@
+{
+  "agents": {
+    "claude": {
+      "tool": "claude",
+      "role": "master"
+    },
+    "codex": {
+      "tool": "codex",
+      "role": "commit",
+      "launch": {
+        "args": ["--profile", "deep"],
+        "env": { "CODEX_EXAMPLE": "1" }
+      }
+    },
+    "ruthless": {
+      "tool": "claude",
+      "role": "gate",
+      "initial_prompt": "Review each commit as it lands."
+    }
+  },
+  "review": {
+    "force_review_on_misc_commits": true,
+    "force_review_on_plan_commits": false,
+    "require_commit_prefix": true
+  },
+  "hooks": {
+    "blocked": "notify-send clank-blocked",
+    "future_hook": { "cmd": "echo", "env": { "A": "1" } }
+  },
+  "diff": {
+    "editor": { "command": "emacsclient", "args": ["-n"] },
+    "wait": true
+  },
+  "finish": {
+    "autosquash": true
+  },
+  "recovery": {
+    "stall_warn": "30m",
+    "stall_nudge": "off"
+  },
+  "web": {
+    "port": 64473
+  },
+  "a_newer_section": { "kept": ["exactly", 1, true] }
+}

@@ -64,7 +64,7 @@ pub async fn run(args: DiffArgs) -> anyhow::Result<()> {
     // explicit "neither" error listing candidates.
     let kind = resolve_kind(&repo, &state, &basename, &args).await?;
 
-    let config = super::config::load(&repo);
+    let config = super::config::load(&repo)?;
     let editor = config.diff.editor.clone().ok_or_else(|| {
         anyhow::anyhow!(
             "no editor configured; set diff.editor.command in ~/.clank/config.json \

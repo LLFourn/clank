@@ -83,6 +83,7 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     // Repo scope — skip if we're not in a clank-initialized repo.
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let repo = super::resolve_repo(args.repo.as_deref()).ok();
+    results.extend(config_checks(repo.as_deref(), home.as_deref()));
     if let Some(repo) = repo.as_deref() {
         // Probed ONCE at the command boundary, so `repo_checks` stays
         // deterministic and spawns nothing. Reported even outside a
@@ -134,12 +135,91 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Each config document this build reads, as ok, missing, malformed or
+/// too new: the user's, the repo's and every agent's. A document that
+/// cannot be read is a failure, since every command that needs it
+/// refuses to run.
+pub fn config_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResult> {
+    const SECTION: &str = "config";
+    let mut out = Vec::new();
+    if let Some(home) = home {
+        let path = clank_user_config::path(home);
+        out.push(document_check(
+            SECTION,
+            &path,
+            crate::cli::team::read_user_config(home).map(|_| path.exists()),
+        ));
+    }
+    let Some(repo) = repo else { return out };
+    use crate::agent_store::repo_config::{self, Prior};
+    let path = repo_config::path(repo);
+    out.push(match repo_config::read_prior(repo) {
+        Ok(Prior::Legacy) => CheckResult::fail(
+            SECTION,
+            path.display().to_string(),
+            "legacy: uses the old team schema; re-run `clank init` to recreate it",
+        ),
+        other => document_check(SECTION, &path, other.map(|p| !matches!(p, Prior::Absent))),
+    });
+    if let Ok(dirs) = std::fs::read_dir(agents_root(repo)) {
+        let mut labels: Vec<AgentLabel> = dirs
+            .flatten()
+            .filter_map(|d| AgentLabel::parse(d.file_name().to_str()?).ok())
+            .collect();
+        labels.sort();
+        for label in labels {
+            let path = agent_config_path(repo, &label);
+            if path.exists() {
+                out.push(document_check(
+                    SECTION,
+                    &path,
+                    load_agent_config(repo, &label).map(|c| c.is_some()),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// One document's check from its reader's answer: `Ok(present)`, or the
+/// error it refused with.
+fn document_check(section: &'static str, path: &Path, read: anyhow::Result<bool>) -> CheckResult {
+    use clank_user_config::versioned::Refusal;
+    let name = path.display().to_string();
+    match read {
+        Ok(true) => CheckResult::ok(section, name, "ok"),
+        Ok(false) => CheckResult::ok(section, name, "missing (nothing set here)"),
+        Err(e) => match e.downcast_ref::<Refusal>() {
+            Some(Refusal::TooNew { .. }) => {
+                CheckResult::fail(section, name, format!("too new: {e:#}"))
+            }
+            Some(Refusal::Malformed { .. }) => {
+                CheckResult::fail(section, name, format!("malformed: {e:#}"))
+            }
+            None => CheckResult::fail(section, name, format!("unreadable: {e:#}")),
+        },
+    }
+}
+
 async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResult> {
     use clank_core::{AutoMode, Tool};
     let mut out = Vec::new();
     let mut profiles = Vec::new();
+    let registered =
+        match repo.map(|repo| crate::agent_store::try_resolve_via_team_with(repo, home)) {
+            Some(Err(e)) => {
+                out.push(CheckResult::fail(
+                    "repo",
+                    "Grok profiles",
+                    format!("not checked: the roster cannot be read: {e:#}"),
+                ));
+                None
+            }
+            Some(Ok(set)) => set,
+            None => None,
+        };
     if let Some(repo) = repo
-        && let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo, home)
+        && let Some(set) = registered
     {
         let mut members = vec![(set.master.clone(), set.master_desc.clone())];
         members.extend(
@@ -171,9 +251,15 @@ async fn grok_checks(repo: Option<&Path>, home: Option<&Path>) -> Vec<CheckResul
                         let profile_home = provider.env.get("HOME").map(PathBuf::from)
                             .or_else(|| home.map(Path::to_owned))
                             .map(|path| if path.is_absolute() { path } else { repo.join(path) });
-                        let automatic = super::team::resolve_effective_auto_mode(
+                        let automatic = match super::team::resolve_effective_auto_mode(
                             cfg.as_ref(), profile_home.as_deref(),
-                        ) == AutoMode::On;
+                        ) {
+                            Ok(mode) => mode == AutoMode::On,
+                            Err(e) => {
+                                out.push(CheckResult::fail("repo", format!("Grok {label} auto mode"), format!("{e:#}")));
+                                false
+                            }
+                        };
                         profiles.push((label.to_string(), repo.to_owned(), provider, automatic));
                     }
                     Err(_) => out.push(CheckResult::fail("repo", format!("Grok {label} profile"), "invalid managed session/cwd options or missing provider home; check this launch profile")),
@@ -332,6 +418,7 @@ pub fn repo_checks(
     // BEFORE the team-resolution early-returns so a broken template
     // surfaces at doctor time even on a teamless repo — never at
     // `open` time.
+    // A user config that cannot be read is reported by `config_checks`.
     if let Some(template) = home
         .map(crate::cli::team::read_user_config)
         .transpose()
@@ -513,19 +600,19 @@ pub fn repo_checks(
         // resolver `auto status` uses — the raw per-agent field alone
         // reads as "off" when a user-global default is actually driving
         // (grok-first-turn-orchestration).
-        let (auto_mode, auto_source) =
-            crate::cli::team::resolve_effective_auto_mode_with_source(Some(&cfg), home);
-        let auto_desc = match auto_source {
-            clank_core::agent_config::AutoModeSource::PerAgent => {
-                format!("{} (per-agent)", auto_mode.as_str())
-            }
-            clank_core::agent_config::AutoModeSource::UserDefault => {
-                format!("{} (user default; per-agent unset)", auto_mode.as_str())
-            }
-            clank_core::agent_config::AutoModeSource::Builtin => {
-                format!("{} (builtin default; nothing set)", auto_mode.as_str())
-            }
-        };
+        let auto_desc =
+            match crate::cli::team::resolve_effective_auto_mode_with_source(Some(&cfg), home) {
+                Ok((auto_mode, clank_core::agent_config::AutoModeSource::PerAgent)) => {
+                    format!("{} (per-agent)", auto_mode.as_str())
+                }
+                Ok((auto_mode, clank_core::agent_config::AutoModeSource::UserDefault)) => {
+                    format!("{} (user default; per-agent unset)", auto_mode.as_str())
+                }
+                Ok((auto_mode, clank_core::agent_config::AutoModeSource::Builtin)) => {
+                    format!("{} (builtin default; nothing set)", auto_mode.as_str())
+                }
+                Err(e) => format!("unknown ({e:#})"),
+            };
         let base_msg = format!(
             "{}: auto_mode={auto_desc}, session={}",
             agent_config_path(repo, label).display(),
@@ -595,8 +682,8 @@ pub fn repo_checks(
                 problem,
             ));
         }
-        if let Some(message) =
-            crate::agent_store::raw_agent_config(repo, label).and_then(|raw| ignored_delivery(&raw))
+        if let Some(message) = crate::agent_store::agent_config_document(repo, label)
+            .and_then(|doc| ignored_delivery(&doc))
         {
             out.push(CheckResult::warn(
                 SECTION,
@@ -610,10 +697,9 @@ pub fn repo_checks(
 }
 
 /// What to say about github watches whose raw config still carries
-/// `delivery`, which every watch now ignores. Read from the bytes
+/// `delivery`, which every watch now ignores. Read from the document
 /// because the typed config has no such field to keep it in.
-fn ignored_delivery(raw: &[u8]) -> Option<String> {
-    let config: serde_json::Value = serde_json::from_slice(raw).ok()?;
+fn ignored_delivery(config: &clank_user_config::Document) -> Option<String> {
     let repos: Vec<String> = config
         .get("wait_events")?
         .as_array()?

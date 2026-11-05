@@ -17,6 +17,7 @@ mod ci_workflow;
 mod clank_dir_boundary;
 mod claude_question_protocol;
 mod codex_question_protocol;
+mod config_read_boundary;
 mod diff_tree_changes_scenarios;
 mod doctor_unbound_reviewer_integration;
 mod feedback_read_integration;

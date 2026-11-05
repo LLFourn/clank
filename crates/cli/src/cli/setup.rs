@@ -967,10 +967,7 @@ fn seed_autosquash_default(home: &Path, dry_run: bool) -> anyhow::Result<Option<
         )
     };
     if dry_run {
-        Ok(
-            (!crate::cli::config::json_path_present(&clank_user_config::path(home), key))
-                .then(|| notice("would seed")),
-        )
+        Ok((!crate::cli::config::user_key_present(home, key)?).then(|| notice("would seed")))
     } else if crate::cli::config::set_user_key_if_absent(home, key, "true", "bool")? {
         Ok(Some(notice("seeded")))
     } else {
@@ -2541,7 +2538,6 @@ mod tests {
     #[test]
     fn seed_autosquash_seeds_when_absent_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path().join(".clank/config.json");
         // Absent → seeds, and the notice DISCLOSES the destructive default
         // (in-place rewrite + published-history risk + both opt-outs) at the
         // surface, not just in a code comment (ruthless 432a82e).
@@ -2553,10 +2549,9 @@ mod tests {
         assert!(notice.contains("published history"), "{notice}");
         assert!(notice.contains("finish.autosquash false"), "{notice}");
         assert!(notice.contains("--no-squash"), "{notice}");
-        assert!(crate::cli::config::json_path_present(
-            &cfg,
-            &["finish", "autosquash"]
-        ));
+        assert!(
+            crate::cli::config::user_key_present(tmp.path(), &["finish", "autosquash"]).unwrap()
+        );
         // Already set → no-op (explicit value preserved).
         assert!(
             seed_autosquash_default(tmp.path(), false)

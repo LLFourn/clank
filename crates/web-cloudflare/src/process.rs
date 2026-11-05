@@ -26,20 +26,24 @@ struct Ready<'a> {
     public_url: Option<&'a str>,
 }
 
-/// The host process, starting any tunnel command through `spawn`.
-pub fn main(spawn: std::sync::Arc<dyn tunnel::Spawn>) {
+/// The host process, starting any tunnel command through `spawn`, and
+/// holding the user config to `check` whenever it writes it.
+pub fn main(spawn: std::sync::Arc<dyn tunnel::Spawn>, check: clank_user_config::Check) {
     let outcome = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(anyhow::Error::from)
-        .and_then(|runtime| runtime.block_on(run(spawn)));
+        .and_then(|runtime| runtime.block_on(run(spawn, check)));
     if let Err(error) = outcome {
         let _ = write_line(&serde_json::json!({"error":format!("{error:#}")}));
         std::process::exit(1);
     }
 }
 
-async fn run(spawn: std::sync::Arc<dyn tunnel::Spawn>) -> anyhow::Result<()> {
+async fn run(
+    spawn: std::sync::Arc<dyn tunnel::Spawn>,
+    check: clank_user_config::Check,
+) -> anyhow::Result<()> {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     let mut line = String::new();
     anyhow::ensure!(stdin.read_line(&mut line)? > 0, "startup pipe closed");
@@ -57,7 +61,7 @@ async fn run(spawn: std::sync::Arc<dyn tunnel::Spawn>) -> anyhow::Result<()> {
         let _ = stop.send(true);
     });
 
-    let host = Host::start(start.port, start.session, home.clone()).await?;
+    let host = Host::start(start.port, start.session, home.clone(), check).await?;
     let mut active_tunnel = None;
     let outcome = async {
         let port = url::Url::parse(&host.local_url)?

@@ -63,8 +63,11 @@ impl Gathered {
         };
         let auto = config
             .as_ref()
-            .map(|cfg| super::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()))
-            .map_err(|e| format!("{e:#}"));
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|cfg| {
+                super::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
+                    .map_err(|e| format!("{e:#}"))
+            });
         let role =
             crate::agent_store::resolve_role(repo, author).map_err(|e| role_failure(author, &e));
         let dir = crate::agent_store::agents_root(repo).join(author.as_str());
@@ -293,6 +296,23 @@ fn store_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("turn.json")
 }
 
+/// The turn state saved in `agent_dir`, `None` when there is none or it
+/// cannot be read: an unreadable record starts the binding afresh.
+pub(crate) fn load_stored(agent_dir: &Path) -> Option<Persisted> {
+    std::fs::read(store_path(agent_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+pub(crate) fn write_stored(agent_dir: &Path, state: &Persisted) -> std::io::Result<()> {
+    let path = store_path(agent_dir);
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(state).map_err(std::io::Error::other)?;
+    std::fs::create_dir_all(agent_dir)?;
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &path)
+}
+
 impl Turns {
     pub(crate) fn new(repo: PathBuf) -> Self {
         Turns {
@@ -314,9 +334,7 @@ impl Turns {
             return None;
         };
         if !self.agents.contains_key(author) {
-            let stored: Option<Persisted> = std::fs::read(store_path(&self.agent_dir(author)))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let stored = load_stored(&self.agent_dir(author));
             let state = match &stored {
                 Some(p) if &p.binding == bound => SessionState::restored(p.clone()),
                 _ => SessionState::new(bound.clone()),
@@ -375,16 +393,7 @@ impl Turns {
         if custody.stored.as_ref() == Some(&now) {
             return;
         }
-        let path = store_path(&dir);
-        let tmp = path.with_extension("json.tmp");
-        let written = serde_json::to_vec(&now)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| {
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(&tmp, bytes)?;
-                std::fs::rename(&tmp, &path)
-            });
-        match written {
+        match write_stored(&dir, &now) {
             Ok(()) => custody.stored = Some(now),
             Err(e) => eprintln!("monitor: could not record `{author}`'s turn state: {e}"),
         }
@@ -815,10 +824,7 @@ impl Turns {
         self.agents
             .get(author)
             .is_some_and(|c| c.state.repeat.is_some())
-            || std::fs::read(store_path(&self.agent_dir(author)))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Persisted>(&b).ok())
-                .is_some_and(|p| p.repeat.is_some())
+            || load_stored(&self.agent_dir(author)).is_some_and(|p| p.repeat.is_some())
     }
 
     /// Whether recovery must leave `author` alone: the model's own answer,

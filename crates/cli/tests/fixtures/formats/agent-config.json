@@ -1,0 +1,43 @@
+{
+  "auto_mode": "hint",
+  "session": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "tool": "claude",
+    "updated_at": "2026-11-04T22:22:18.002002Z",
+    "transcript": "/home/user/.claude/projects/example/00000000-0000-4000-8000-000000000001.jsonl"
+  },
+  "resume_pending": {
+    "session": "00000000-0000-4000-8000-000000000001",
+    "at": "2026-11-04T22:20:00Z"
+  },
+  "wait_events": [
+    {
+      "kind": "github",
+      "repo": "example/clank",
+      "events": [],
+      "include_own_actions": false,
+      "prompt": "CI finished on a PR: land it when it passed, fix it when it failed.",
+      "watch": [
+        {
+          "pr": {
+            "events": ["ci_passed", "ci_failed"]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "timer",
+      "name": "standup",
+      "due_at": "2026-11-05T09:00:00Z",
+      "repeat_every": "24h",
+      "content": "post the standup"
+    },
+    {
+      "kind": "command",
+      "name": "mail",
+      "command": ["example-mail-watch", "--json"]
+    }
+  ],
+  "role": "reviewers",
+  "tool": "claude"
+}

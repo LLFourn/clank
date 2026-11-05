@@ -4073,6 +4073,7 @@ mod tests {
             repeated: None,
 
             attending: Vec::new(),
+            unreadable: None,
         }];
         let mut shown = None;
         // Frame 1: entering the page from the panel, cursor on the
@@ -4932,6 +4933,7 @@ mod tests {
                     })
                     .into_iter()
                     .collect(),
+                unreadable: None,
             })
             .collect()
     }

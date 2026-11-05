@@ -85,7 +85,12 @@ pub struct Host {
 }
 
 impl Host {
-    pub async fn start(port: u16, session: String, home: Option<PathBuf>) -> anyhow::Result<Self> {
+    pub async fn start(
+        port: u16,
+        session: String,
+        home: Option<PathBuf>,
+        check: clank_user_config::Check,
+    ) -> anyhow::Result<Self> {
         let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
             Ok(listener) => listener,
             Err(_) if port != 0 => TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?,
@@ -95,7 +100,7 @@ impl Host {
         let credential = door::random_token();
         let admin_credential = door::random_token();
         let nonce = door::random_token();
-        let door = Arc::new(Door::new(home));
+        let door = Arc::new(Door::new(home, check));
         let public_url = Arc::new(RwLock::new(None));
         let session_state = Arc::new(Session::new(session.clone()));
         let web = Arc::new(WebService::new(

@@ -154,6 +154,19 @@ pub struct StatusSnapshot {
     pub(crate) head_correction: Option<clank_core::wait::HeadCorrection>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) warnings: Vec<clank_core::repo_state::RepoWarning>,
+    /// Why a config document could not be read, once per distinct
+    /// failure. The snapshot is still built, from the defaults, so the
+    /// failure is shown rather than the status lost.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) config_errors: Vec<String>,
+}
+
+/// Keep `error` as a config failure the snapshot shows, once.
+fn config_failed(errors: &mut Vec<String>, error: anyhow::Error) {
+    let line = format!("{error:#}");
+    if !errors.contains(&line) {
+        errors.push(line);
+    }
 }
 
 /// One team agent as the TUI's agent panel sees it: its label,
@@ -203,6 +216,10 @@ pub(crate) struct AgentAutoRow {
     /// that reaches the escalation threshold. A count, not a verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) repeated: Option<u32>,
+    /// Why the agent's own config cannot be read, when it cannot: its
+    /// auto mode, binding and sources are then unknown, not off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unreadable: Option<String>,
 }
 
 impl AgentAutoRow {
@@ -290,6 +307,7 @@ fn roster_auto_rows(
     repo: &Path,
     home: Option<&Path>,
     set: &crate::cli::teams_config::RegisteredSet,
+    config_errors: &mut Vec<String>,
 ) -> Vec<AgentAutoRow> {
     use crate::cli::teams_config::RosterRole;
     // Carry the TIER (Master/Commit/Gate), not the collapsed
@@ -305,10 +323,19 @@ fn roster_auto_rows(
         if !seen.insert(label.as_str()) {
             continue;
         }
-        let cfg = crate::agent_store::load_agent_config(repo, label)
-            .ok()
-            .flatten();
-        let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home);
+        let (cfg, unreadable) = match crate::agent_store::load_agent_config(repo, label) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => {
+                let why = format!("{e:#}");
+                config_failed(config_errors, e);
+                (None, Some(why))
+            }
+        };
+        let auto_mode = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home)
+            .unwrap_or_else(|e| {
+                config_failed(config_errors, e);
+                clank_core::vocab::AutoMode::Off
+            });
         let session = cfg.as_ref().and_then(|c| c.session.clone());
         let state =
             crate::cli::agent_state::view(repo, label, session.as_ref().map(|s| s.id.as_str()));
@@ -336,6 +363,7 @@ fn roster_auto_rows(
             state,
             asking,
             repeated,
+            unreadable,
         });
     }
     rows
@@ -612,16 +640,26 @@ impl StatusSnapshot {
         let (branch, head_sha, head_subject) = head_info(&git);
         let dirty = git.working_tree_dirty()?;
 
-        let config = crate::cli::config::load_with_home(repo, home);
-        // Plan: teams-based-agent-registration. `status` is a
-        // read-only renderer (also reused by `clank html`), so it
-        // DEGRADES on a team-less / misconfigured repo: no team →
-        // empty reviewer tiers → gate computes as zero-reviewer
-        // (Continued). It never hard-errors the way the
-        // workflow-driving commands (wait / finish / promote) do.
-        let registered = crate::agent_store::try_resolve_via_team_with(repo, home)
-            .ok()
-            .flatten();
+        // `status` is a read-only renderer (also reused by `clank html`), so
+        // a config it cannot read becomes a failed config line over the
+        // defaults rather than a lost status: no team → empty reviewer
+        // tiers → gate computes as zero-reviewer (Continued). The
+        // workflow-driving commands (wait / finish / promote) refuse.
+        let mut config_errors = Vec::new();
+        let config = crate::cli::config::load_with_home(repo, home).unwrap_or_else(|e| {
+            config_failed(&mut config_errors, e);
+            crate::cli::config::Config::default()
+        });
+        if let Some(home) = home
+            && let Err(e) = crate::cli::team::read_user_config(home)
+        {
+            config_failed(&mut config_errors, e);
+        }
+        let registered =
+            crate::agent_store::try_resolve_via_team_with(repo, home).unwrap_or_else(|e| {
+                config_failed(&mut config_errors, e);
+                None
+            });
         let master = registered
             .as_ref()
             .map(|set| set.master.as_str().to_string());
@@ -632,7 +670,7 @@ impl StatusSnapshot {
         // input the nothing-changed gate covers.
         let agents = registered
             .as_ref()
-            .map(|set| roster_auto_rows(repo, home, set))
+            .map(|set| roster_auto_rows(repo, home, set, &mut config_errors))
             .unwrap_or_default();
         let tiers = registered
             .as_ref()
@@ -728,7 +766,10 @@ impl StatusSnapshot {
             blocks,
             queue,
             drafts: crate::cli::queue::scan_drafts(repo),
-            sources: crate::cli::source_status::configured(repo),
+            sources: crate::cli::source_status::configured(repo).unwrap_or_else(|e| {
+                config_failed(&mut config_errors, e);
+                Vec::new()
+            }),
             sources_live: crate::cli::source_status::live(repo),
             master,
             agents,
@@ -748,6 +789,7 @@ impl StatusSnapshot {
                 .filter(|warning| warning.is_amendable_at(state.head.as_ref()))
                 .cloned()
                 .collect(),
+            config_errors,
         })
     }
 
@@ -773,6 +815,9 @@ impl StatusSnapshot {
             let _ = writeln!(out, "head:   {s}");
         }
         let _ = writeln!(out, "monitor: {}", self.monitor.line());
+        for error in &self.config_errors {
+            let _ = writeln!(out, "config: FAILED — {error}");
+        }
         for warning in &self.warnings {
             let _ = writeln!(
                 out,
@@ -1370,7 +1415,7 @@ fn sources_fingerprint(repo: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{:?}", crate::cli::source_status::live(repo)).hash(&mut h);
-    for source in crate::cli::source_status::configured(repo) {
+    for source in crate::cli::source_status::configured(repo).unwrap_or_default() {
         if let Some(state) = &source.timer {
             (source.agent.as_str(), &source.key, format!("{state:?}")).hash(&mut h);
         }
@@ -2949,6 +2994,7 @@ mod dirty_and_wake_tests {
             asking: None,
             repeated: None,
             attending: attending.into_iter().collect(),
+            unreadable: None,
         }
     }
 
@@ -3148,7 +3194,7 @@ mod dirty_and_wake_tests {
                 },
                 members: Vec::new(),
             };
-            let row = roster_auto_rows(repo.path(), None, &set).remove(0);
+            let row = roster_auto_rows(repo.path(), None, &set, &mut Vec::new()).remove(0);
             (row.repeated, row.asking)
         };
         assert_eq!(
@@ -3278,6 +3324,7 @@ mod dirty_and_wake_tests {
             ad_hoc: Vec::new(),
             head_correction: None,
             warnings: Vec::new(),
+            config_errors: Vec::new(),
         }
     }
 
@@ -3438,6 +3485,7 @@ mod dirty_and_wake_tests {
             ad_hoc,
             head_correction: _,
             warnings,
+            config_errors,
             // Emitted, and pinned by the wire fixture below rather
             // than here: `--repo` means the reader need not be
             // standing in it (codex on 772b84f).
@@ -3458,6 +3506,7 @@ mod dirty_and_wake_tests {
         } = &snap;
 
         assert!(warnings.is_empty() && v.get("warnings").is_none());
+        assert!(config_errors.is_empty() && v.get("config_errors").is_none());
         assert_eq!(v["repo_basename"], **basename);
         assert_eq!(v["branch"], *branch.as_deref().unwrap());
         assert_eq!(v["head_sha"], *head_sha.as_deref().unwrap());

@@ -4173,7 +4173,15 @@ fn recovery_facts(
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
     let head = crate::git_io::head_commit_at(repo, state);
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let config = crate::cli::config::load_with_home(repo, home.as_deref()).recovery;
+    // Recovery acts on what the config says, so a config it cannot read
+    // makes no decisions rather than ones under the defaults.
+    let config = match crate::cli::config::load_with_home(repo, home.as_deref()) {
+        Ok(config) => config.recovery,
+        Err(error) => {
+            tracing::warn!(repo = %repo.display(), error = %format!("{error:#}"), "recovery: config unreadable; skipping");
+            return Vec::new();
+        }
+    };
     let mut facts = Vec::new();
     let mut bound = std::collections::BTreeSet::new();
     for author in roster_authors(repo) {
@@ -4192,8 +4200,10 @@ fn recovery_facts(
         let delivering = clients
             .iter()
             .any(|c| matches!(&c.who, Served::Agent { author: a } if a == &author));
-        let auto = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
-            == clank_core::AutoMode::On;
+        let auto = matches!(
+            crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()),
+            Ok(clank_core::AutoMode::On)
+        );
         let counting = turns.counting(&author);
         let owed = if delivering && !counting {
             Vec::new()
@@ -4376,9 +4386,10 @@ fn recovery_gate(
         return Gate::Deliverer;
     }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    if crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref())
-        != clank_core::AutoMode::On
-    {
+    if !matches!(
+        crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref()),
+        Ok(clank_core::AutoMode::On)
+    ) {
         return Gate::AutoOff;
     }
     let cwd = std::env::current_dir().ok();
@@ -5500,8 +5511,14 @@ fn hostable(
 /// tying a producer to whoever happens to be attached is tying it to a
 /// delivery client again, and the churn that causes is what this plan
 /// exists to end. A monitor's producers live as long as the monitor.
+///
+/// A roster that cannot be read names no one: what is notified or
+/// recovered on its word waits until it can be read again.
 fn roster_authors(repo: &std::path::Path) -> Vec<AgentLabel> {
-    crate::agent_store::roster_labels(repo)
+    crate::agent_store::roster_labels(repo).unwrap_or_else(|error| {
+        eprintln!("monitor: the roster cannot be read: {error:#}");
+        Vec::new()
+    })
 }
 
 #[cfg(test)]
@@ -5616,7 +5633,15 @@ fn reconcile_hosting_with(
         }
     };
     let mut departing = Vec::new();
-    let authors = roster_authors(repo);
+    // A roster that cannot be read is not an empty one: stopping every
+    // producer on it would drop what they hold until the next valid edit.
+    let authors = match crate::agent_store::roster_labels(repo) {
+        Ok(authors) => authors,
+        Err(error) => {
+            eprintln!("monitor: the roster cannot be read; keeping hosted sources: {error:#}");
+            return departing;
+        }
+    };
     for author in &authors {
         // An invalid edit is a rejected replacement, not an empty config.
         // Keep the last accepted drivers and definitions until a valid edit.
@@ -5904,8 +5929,10 @@ fn automatic_grok_client(repo: &std::path::Path, client: &Client) -> bool {
         return false;
     };
     let home = super::grok_setup::launch_home(repo, author);
-    crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref())
-        == clank_core::AutoMode::On
+    matches!(
+        crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()),
+        Ok(clank_core::AutoMode::On)
+    )
 }
 
 fn client_refusal(repo: &std::path::Path, client: &Client) -> Option<String> {

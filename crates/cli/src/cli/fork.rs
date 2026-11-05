@@ -691,8 +691,10 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
     // a degraded environment); else the source repo's roster; else
     // (source never `clank init`ed) → warn and fall back to the
     // user-scope `default` team.
-    let source_roster = crate::agent_store::load_repo_config(&source.join(".clank/config.json"))?
-        .map(|c| c.agents)
+    let source_config = crate::agent_store::repo_config::read(&source)?;
+    let source_roster = source_config
+        .as_ref()
+        .map(|c| c.agents.clone())
         .filter(|r| !r.is_empty());
     let team_seed: Option<(String, crate::cli::teams_config::Roster)> =
         match (&args.team, &source_roster) {
@@ -855,12 +857,17 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
     // Repo config (team selection) is per-worktree + gitignored,
     // so it doesn't arrive with the checkout. Tracked state
     // (plans/, finished/, .gitignore) does.
-    let src_cfg = source.join(".clank/config.json");
-    if src_cfg.is_file() {
-        let dst_cfg = dest.join(".clank/config.json");
-        std::fs::create_dir_all(dst_cfg.parent().expect("has parent"))?;
-        std::fs::copy(&src_cfg, &dst_cfg)
-            .with_context(|| format!("seeding `{}`", dst_cfg.display()))?;
+    if let Some(config) = source_config {
+        crate::agent_store::repo_config::transact(&dest, |seeded| {
+            *seeded = config;
+            Ok(())
+        })
+        .with_context(|| {
+            format!(
+                "seeding `{}`",
+                crate::agent_store::repo_config::path(&dest).display()
+            )
+        })?;
     }
     // A template-seeded fork (`--team` / the default fallback) swaps the
     // ROSTER in over the copied config, so non-roster sections
@@ -1371,8 +1378,7 @@ detached
                 role: RosterRole::Master,
             },
         );
-        crate::agent_store::write_typed_config(&source.path().join(".clank/config.json"), &config)
-            .unwrap();
+        crate::agent_store::repo_config::store(source.path(), &config);
         let mut args = fork_args("open-fails", source.path());
         args.fresh = true;
         let dest = run_fork(&args, None).await.unwrap();

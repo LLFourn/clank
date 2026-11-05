@@ -1,0 +1,5 @@
+{
+  "team": "dev",
+  "promoted": "codex",
+  "agents": ["claude", "codex"]
+}
