@@ -213,6 +213,8 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 # test-only: paused-time (`start_paused`) so the github poll loop's
 # inter-tick sleeps resolve instantly in tests (extra-wait-events).
 tokio = { version = "1", features = ["test-util"] }
+# test-only: the harness_support gate reads docs/harness-support.toml.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 
 [lints]
 workspace = true

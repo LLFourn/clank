@@ -119,18 +119,25 @@ binary runs and matches the tag; the test suite runs on Linux only. It
 needs `git`, and
 [zellij](https://zellij.dev) for `clank open`.
 
-The version floors below are what the source checks for. The test suite
-runs against fixtures, not the installed agent tools, so a working
-first run on a given tool version has not been verified for every
-combination:
+The floors below are what the source checks for. The test suite runs
+against fixtures, not the installed agent tools, so a version counts as
+tested only once a clean first run on it passed, along with that
+harness's native acceptance tests ([the first-run
+walk](docs/first-run-walk.md)). The evidence is
+[`docs/harness-support.toml`](docs/harness-support.toml), and a test
+holds this table to it.
 
-- Claude Code: 2.1.223 or later for the async loop (older versions get
-  the legacy loop; see [How agents stay awake](#how-agents-stay-awake)).
-- Grok: 1.x, at least 1.0.46, advertising the native Stop decision gate.
-- OpenCode: 2.x.
-- Codex: no version check.
-- zellij: `zellij action override-layout`, which 0.45 lacks; `clank doctor`
-  checks for it.
+| harness | floor in source | tested |
+|---|---|---|
+| Claude Code | 2.1.223 or later for the async loop; older versions get the legacy loop | not yet tested |
+| Codex | no version check | not yet tested |
+| Grok | 1.x, at least 1.0.46, advertising the native Stop decision gate | not yet tested |
+| OpenCode | 2.x | not yet tested |
+
+The legacy loop is described in [How agents stay awake](#how-agents-stay-awake).
+OpenCode has no native acceptance test yet, so no OpenCode version can
+count as tested. clank also needs zellij's `zellij action override-layout`,
+which 0.45 lacks; `clank doctor` checks for it.
 
 Then wire it into your agents (Claude Code, Codex CLI, Grok CLI,
 opencode — any or all):

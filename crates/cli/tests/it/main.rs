@@ -27,6 +27,7 @@ mod finish_integration;
 mod fork_integration;
 mod git_boundary;
 mod grok_launch_acceptance;
+mod harness_support;
 mod hook_is_a_messenger;
 mod html_integration;
 mod identity_env_boundary;

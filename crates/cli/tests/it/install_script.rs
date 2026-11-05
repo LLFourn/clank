@@ -438,6 +438,7 @@ fn the_installer_and_release_scripts_pass_shellcheck() {
             "scripts/release-archive.sh",
             "scripts/release-assets.sh",
             "scripts/release-notes.sh",
+            "scripts/first-run/env.sh",
         ])
         .current_dir(&root)
         .output()
