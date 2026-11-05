@@ -5,28 +5,27 @@ the source and `clank --help` at `5681c4bc`, 2026-10-27. Every unchecked
 item is queueable as written: plan name, problem, shape of the fix.
 "Unverified" means nobody ran the check; it is not evidence either way.
 
-## 0. Decisions (make these before queueing the per-channel items)
+## 0. Decisions (made by Lloyd, 2026-11-05)
 
-- **Channels.** crates.io, prebuilt GitHub binaries (plus a `curl | sh`
-  installer), Homebrew (a formula over the prebuilt binaries; no §2
-  item until chosen), or a subset. Today the only path is clone +
-  `cargo install --path crates/cli --locked` (README.md, Install).
-  §2 lists what each channel costs; pick before queueing any of it.
-- **Platforms.** macOS arm64 is the only target built here. Linux has
-  code (`crates/cli/src/proc_identity/linux.rs`) and CI builds and tests
-  it on x86_64 (`ci-gates-every-push`); Linux arm64 is unverified.
-  Windows: the code is unix-only, with
-  `cfg(not(unix))` stubs (`cli/run.rs:20`, `cli/agent.rs:1440`,
-  `cli/init.rs:331`). Declare it a non-goal or say otherwise.
-- **Licence.** Which one (§1 `license-and-attribution`).
-- **Supported harness versions.** Which versions the release claims
-  (see the table in §1 `first-run-walk-per-harness`).
-- **Hidden aliases.** The README's command reference says older spellings "still work,
-  hidden" (`block create`, `unblock`, `open zellij`, `agent promote`,
-  …). A first public release has no users of them: drop them
-  before release or keep them a release longer.
-- **The book.** Ship `book/` only in the repo (README.md:7-9 has users
-  open it locally), or host it as well.
+- **Channels.** These four:
+  - crates.io;
+  - prebuilt binaries on GitHub Releases;
+  - the same binaries on our own website;
+  - a `curl | sh` installer served from the website.
+
+  No Homebrew yet. The website is deployed with `flyctl` on a fly.dev
+  address; no custom domain yet.
+- **Platforms.** macOS and Linux binaries, for arm64 and x86_64 on each.
+  Windows is a non-goal: the code is unix-only, with `cfg(not(unix))`
+  stubs.
+- **Licence.** 0BSD (§1 `license-and-attribution`).
+- **Supported harness versions.** Claude Code, Codex, Grok and OpenCode.
+  The versions claimed are the ones the first-run walk passes (see the
+  table in §1 `first-run-walk-per-harness`).
+- **Hidden aliases.** Removed before the first release
+  (§1 `retire-hidden-aliases`).
+- **The book.** Hosted as the website, which also serves the binaries
+  and the installer (§2 `website-on-fly`).
 
 ## 1. Release blockers: every channel
 
@@ -200,6 +199,11 @@ item is queueable as written: plan name, problem, shape of the fix.
   Shape: a short SECURITY.md that names the threat model and these
   exposures, plus a fix or a documented acceptance for each one.
 
+- [ ] **`retire-hidden-aliases`** — §0 removes them before release:
+  delete every hidden older spelling (`block create`, `unblock`, `open
+  zellij`, `agent promote`, `shelve`, `status --tui` …) and the README's
+  list of them.
+
 ## 2. Release blockers: per channel (only for the channels chosen in §0)
 
 ### crates.io
@@ -220,6 +224,13 @@ item is queueable as written: plan name, problem, shape of the fix.
   Shape: publish the internal crates with versions or fold them into the
   main crate, make the build stamp work without a workspace (hash the
   package's own files plus `CARGO_PKG_VERSION`), and claim the name.
+
+### Website
+
+- [ ] **`website-on-fly`** — a fly.io app that serves `book/` as the site
+  and hosts each release's archives, checksums and the `curl | sh`
+  installer. It is deployed with `flyctl` on a fly.dev address. The
+  release workflow uploads to it.
 
 ### Prebuilt binaries
 
@@ -242,8 +253,7 @@ item is queueable as written: plan name, problem, shape of the fix.
 - [ ] **`harness-acceptance-job`** — the `#[ignore]` acceptance tests run
   only by hand. Shape: a scheduled job, with pinned harness versions and
   credentials, that runs them and publishes which versions passed.
-- [ ] **`retire-hidden-aliases`** — only if §0 keeps them: remove the
-  hidden spellings after one release.
+
 
 ## Done (evidence)
 
