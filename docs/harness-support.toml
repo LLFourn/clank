@@ -1,0 +1,72 @@
+# The evidence behind the README's harness table (first-run-walk-per-harness).
+# docs/first-run-walk.md is the procedure that produces it; the
+# `harness_support` gate (crates/cli/tests/it/harness_support.rs) holds the
+# README to it.
+#
+# Per harness:
+#   source_floor         the minimum the source enforces. `version` is read
+#                        back from `file`:`line`; "none" means no check.
+#                        `readme` is the README's floor cell, verbatim.
+#   walks                one entry per walk: version, date (YYYY-MM-DD),
+#                        outcome (passed | failed | not-run), and rough_edges,
+#                        the plan stem filed for each rough edge found.
+#   required_acceptance  the native acceptance tests a version must pass, or
+#                        "unavailable" when none exists, which blocks a claim.
+#   acceptance           one entry per required test and version: test,
+#                        version, date, outcome.
+# A version is "tested" when its latest walk passed and the latest entry for
+# every required test passed. No walk has been run yet: every list is empty.
+
+[[harness]]
+name = "Claude Code"
+required_acceptance = [
+    "it::claude_question_protocol::interactive_permission_question_hooks_arbitrate_with_the_local_terminal",
+    "cli::web::claude_questions::tests::installed_claude_uses_the_real_clank_hook_and_broker_end_to_end",
+]
+walks = []
+acceptance = []
+
+[harness.source_floor]
+version = "2.1.223"
+readme = "2.1.223 or later for the async loop; older versions get the legacy loop"
+file = "crates/cli/src/cli/setup.rs"
+line = 1616
+
+[[harness]]
+name = "Codex"
+required_acceptance = [
+    "it::codex_question_protocol::installed_codex_replays_questions_and_arbitrates_native_answers",
+]
+walks = []
+acceptance = []
+
+[harness.source_floor]
+version = "none"
+readme = "no version check"
+
+[[harness]]
+name = "Grok"
+required_acceptance = [
+    "cli::grok_setup::tests::installed_initialize_advertises_the_native_baseline_without_starting_a_session",
+    "cli::grok_launch::tests::native_offline_fork_uses_production_preparation_owner",
+]
+walks = []
+acceptance = []
+
+[harness.source_floor]
+version = "1.0.46"
+readme = "1.x, at least 1.0.46, advertising the native Stop decision gate"
+file = "crates/cli/src/cli/grok_setup.rs"
+line = 103
+
+[[harness]]
+name = "OpenCode"
+required_acceptance = "unavailable"
+walks = []
+acceptance = []
+
+[harness.source_floor]
+version = "2"
+readme = "2.x"
+file = "crates/cli/src/cli/setup.rs"
+line = 362

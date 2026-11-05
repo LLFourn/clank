@@ -188,6 +188,15 @@ item is queueable as written: plan name, problem, shape of the fix.
   installed harness and records the versions that passed. That record is
   what the README states as supported.
 
+  The procedure is `docs/first-run-walk.md`, the clean environment
+  `scripts/first-run/env.sh`, and the evidence record
+  `docs/harness-support.toml`, which every harness enters as not run.
+  The `harness_support` gate (`it/harness_support.rs`) holds the README's
+  harness table to that record, so the README says "not yet tested" for
+  each harness. Still open: the live walks, one per harness, and their
+  native acceptance runs. OpenCode has no native acceptance test, so it
+  cannot be claimed as tested until one exists.
+
 - [x] **`docs-match-the-release`** — README, every book chapter, the
   installed skills, `--help`, setup's and doctor's text and the Grok
   contract were read against the source and corrected. Resolved:
