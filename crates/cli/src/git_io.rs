@@ -217,11 +217,13 @@ impl Repo {
                     .collect()
             })
             .unwrap_or_default();
+        let merge = self.commit_parent_count(head).is_ok_and(|n| n > 1);
         Some(clank_core::wait::HeadCommit {
             sha: head.clone(),
             subject,
             touched,
             adopted: state.fold.adopted,
+            merge,
         })
     }
 
@@ -2992,6 +2994,45 @@ mod tests {
                 "roots_equal={roots_equal} parent={parent:?} child={child:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_head_with_two_parents_is_a_merge() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "--quiet", "--initial-branch=main"]);
+        git(d, &["config", "user.email", "t@t"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("f.txt"), "x").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "--quiet", "-m", "base"]);
+        git(d, &["checkout", "--quiet", "-b", "side"]);
+        std::fs::write(d.join("g.txt"), "y").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "--quiet", "-m", "side work"]);
+        git(d, &["checkout", "--quiet", "main"]);
+        let head_facts = || {
+            let mut state = crate::repo_state::RepoState::empty(d.to_path_buf());
+            state.head = rev_parse_head(d).unwrap();
+            open(d).unwrap().head_commit(&state).expect("a HEAD")
+        };
+        assert!(!head_facts().merge, "an ordinary commit");
+        git(
+            d,
+            &["merge", "--quiet", "--no-ff", "-m", "Merge side", "side"],
+        );
+        assert!(head_facts().merge, "a two-parent commit");
     }
 
     #[test]

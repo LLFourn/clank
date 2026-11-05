@@ -663,6 +663,11 @@ pub struct HeadCommit {
     /// Repo adoption (`RepoState::adopted`). Off → clank is a guest
     /// on an un-committed `.clank`; never police commit conventions.
     pub adopted: bool,
+    /// HEAD has more than one parent. Clank reads history as one line,
+    /// so a merge's `touched` is its whole merged side, and its subject
+    /// is written by whatever made the merge
+    /// (a-merge-commit-is-warned-about).
+    pub merge: bool,
 }
 
 /// A structured HEAD commit-tag invariant violation. The three kinds
@@ -706,7 +711,7 @@ pub fn head_tag_violation(
     head: &HeadCommit,
     known_plans: &BTreeSet<PlanKey>,
 ) -> Option<HeadTagViolation> {
-    if !head.adopted {
+    if !head.adopted || head.merge {
         return None;
     }
     // One parsed candidate, either a known plan or one invalid/unknown name.
@@ -1770,6 +1775,7 @@ mod tests {
             subject: subject.to_string(),
             touched: pset(touched),
             adopted,
+            merge: false,
         };
         let mut known: BTreeSet<PlanKey> = pset(active);
         known.extend(head.touched.iter().cloned());
@@ -1795,6 +1801,22 @@ mod tests {
         // A comma candidate is a single invalid name, even when a member is active.
         let v = violate(true, "[foo,bar] x", &["foo"], &[]).expect("invalid candidate flagged");
         assert_eq!(v.unknown, Some("foo,bar".to_string()));
+    }
+
+    /// The same untagged plan-file touch is a violation on an ordinary
+    /// commit and none on a merge, whose subject is the merge tool's.
+    #[test]
+    fn a_merge_head_is_not_held_to_the_tag_rule() {
+        let head = |merge| HeadCommit {
+            sha: sha("aaaa"),
+            subject: "Merge pull request #6 from o/branch".to_string(),
+            touched: pset(&["real"]),
+            adopted: true,
+            merge,
+        };
+        let known = pset(&["real"]);
+        assert!(head_tag_violation(&head(false), &known).is_some());
+        assert!(head_tag_violation(&head(true), &known).is_none());
     }
 
     #[test]
@@ -2909,6 +2931,7 @@ mod tests {
             subject: subject.to_string(),
             touched: touched.iter().map(|t| plan(t)).collect(),
             adopted: true,
+            merge: false,
         }
     }
 
@@ -2953,6 +2976,29 @@ mod tests {
             status
                 .work_for(&label("ruthless"), Role::Reviewer)
                 .is_empty()
+        );
+    }
+
+    /// A merge HEAD whose first-parent diff carries a plan file routes
+    /// no FixCommitTag to the master and leaves the gate alone.
+    #[test]
+    fn derive_status_merge_head_is_no_correction() {
+        let state = state_one_plan("real");
+        let merge = HeadCommit {
+            merge: true,
+            ..head("Merge pull request #6 from o/branch", &["real"])
+        };
+        let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), Some(&merge));
+        assert!(status.head_correction.is_none());
+        assert_ne!(
+            status.active_plan.as_ref().unwrap().waiting_on,
+            WaitingOn::MasterToFixCommitTag
+        );
+        assert!(
+            !status
+                .work_for(&label("lloyd"), Role::Master)
+                .iter()
+                .any(|w| matches!(w, WaitItem::FixCommitTag { .. }))
         );
     }
 
@@ -3012,6 +3058,7 @@ mod tests {
                 subject: subject.into(),
                 touched: touched.into_iter().collect(),
                 adopted: true,
+                merge: false,
             };
             let status = state.derive_status(&MockReviews(vec![]), &plan_policy(), Some(&h));
             assert!(status.head_correction.is_none(), "{subject}");
