@@ -8,111 +8,9 @@
 //! name in place.
 
 use crate::ci_workflow::{assert_every_test_step_unsets_every_identity_variable, read_workflow};
-
-/// One line of block-style YAML and the more-indented lines under it.
-#[derive(Debug)]
-struct Node {
-    text: String,
-    children: Vec<Node>,
-}
-
-/// The workflow as a tree of lines by indentation, comments and blank
-/// lines dropped. A `- key: v` sequence item's sibling keys are its
-/// children, as they are indented under it.
-fn parse(text: &str) -> Vec<Node> {
-    let mut lines = text
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        .map(|l| (l.len() - l.trim_start().len(), l.trim().to_string()))
-        .peekable();
-    fn level(
-        lines: &mut std::iter::Peekable<impl Iterator<Item = (usize, String)>>,
-        indent: usize,
-    ) -> Vec<Node> {
-        let mut out = Vec::new();
-        while let Some((at, _)) = lines.peek() {
-            if *at < indent {
-                break;
-            }
-            let (at, text) = lines.next().unwrap();
-            let children = match lines.peek().map(|(next, _)| *next) {
-                Some(next) if next > at => level(lines, next),
-                _ => Vec::new(),
-            };
-            out.push(Node { text, children });
-        }
-        out
-    }
-    level(&mut lines, 0)
-}
-
-fn key_of(text: &str) -> &str {
-    let text = text.strip_prefix("- ").unwrap_or(text);
-    text.split_once(':').map_or(text, |(k, _)| k.trim())
-}
-
-fn value_of(text: &str) -> Option<&str> {
-    let text = text.strip_prefix("- ").unwrap_or(text);
-    text.split_once(':')
-        .map(|(_, v)| v.trim())
-        .filter(|v| !v.is_empty())
-}
-
-fn child<'a>(nodes: &'a [Node], key: &str) -> Option<&'a Node> {
-    nodes.iter().find(|n| key_of(&n.text) == key)
-}
-
-fn at<'a>(nodes: &'a [Node], path: &[&str]) -> Option<&'a Node> {
-    let (first, rest) = path.split_first()?;
-    let node = child(nodes, first)?;
-    if rest.is_empty() {
-        Some(node)
-    } else {
-        at(&node.children, rest)
-    }
-}
-
-fn value<'a>(nodes: &'a [Node], path: &[&str]) -> Option<&'a str> {
-    value_of(&at(nodes, path)?.text)
-}
-
-/// A mapping's entries as `key: value` lines, sorted.
-fn entries(node: Option<&Node>) -> Vec<String> {
-    let mut out: Vec<String> = node
-        .map(|n| n.children.iter().map(|c| c.text.clone()).collect())
-        .unwrap_or_default();
-    out.sort();
-    out
-}
-
-fn keys(node: Option<&Node>) -> Vec<String> {
-    let mut out: Vec<String> = node
-        .map(|n| {
-            n.children
-                .iter()
-                .map(|c| key_of(&c.text).to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    out.sort();
-    out
-}
-
-/// Every field of a step, its first line's included.
-fn step_field<'a>(step: &'a Node, key: &str) -> Option<&'a str> {
-    if key_of(&step.text) == key {
-        return value_of(&step.text);
-    }
-    child(&step.children, key).and_then(|n| value_of(&n.text))
-}
-
-fn steps<'a>(root: &'a [Node], job: &str) -> &'a [Node] {
-    at(root, &["jobs", job, "steps"]).map_or(&[], |n| &n.children)
-}
-
-fn uses_action(step: &Node, action: &str) -> bool {
-    step_field(step, "uses").is_some_and(|u| u.starts_with(&format!("{action}@")))
-}
+use crate::workflow_tree::{
+    at, entries, keys, parse, run_text, step_field, steps, uses_action, value,
+};
 
 const VALIDATION: &str = "cargo test --locked -p clank --test it -- book_is_true:: cli_reference::";
 
@@ -160,9 +58,9 @@ fn violations(text: &str) -> Vec<String> {
     let checkout = build
         .iter()
         .position(|s| uses_action(s, "actions/checkout"));
-    let validation = build
-        .iter()
-        .position(|s| step_field(s, "run").is_some_and(|r| r.ends_with(VALIDATION)));
+    let validation = build.iter().position(|s| {
+        run_text(s).is_some_and(|r| r.lines().any(|l| l.trim_end().ends_with(VALIDATION)))
+    });
     let upload = build
         .iter()
         .position(|s| uses_action(s, "actions/upload-pages-artifact"));

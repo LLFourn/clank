@@ -21,10 +21,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Provision git and a C compiler
+      - name: Provision git, a C compiler and shellcheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git build-essential
+          sudo apt-get install -y --no-install-recommends git build-essential shellcheck
 
       # The OpenCode plugin lifecycle harness fails without node, by design.
       - uses: actions/setup-node@v4
@@ -38,6 +38,12 @@ jobs:
           cargo --version
 
       - uses: Swatinem/rust-cache@v2
+
+      # The identity unset splits its variable list on purpose.
+      - name: actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -ignore 'SC2086:'
 
       - name: cargo fmt
         run: cargo fmt --all --check

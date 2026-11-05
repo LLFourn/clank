@@ -50,7 +50,8 @@ jobs:
       # The artifact is this checkout's book, so it is checked before it
       # is uploaded: a failure here leaves nothing to deploy.
       - name: The book is true and its command reference is fresh
-        run: unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --test it -- book_is_true:: cli_reference::
+        run: |
+          unset $SESSION_IDENTITY_VARS; cargo test --locked -p clank --test it -- book_is_true:: cli_reference::
 
       - uses: actions/upload-pages-artifact@v5
         with:

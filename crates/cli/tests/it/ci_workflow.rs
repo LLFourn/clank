@@ -86,3 +86,27 @@ fn ci_checks_dependency_licences_and_their_notice() {
         "cargo-about is not installed at the version the notice was generated with"
     );
 }
+
+/// The installer test skips shellcheck where it is missing, so CI
+/// installs it; actionlint checks every workflow, `release.yml` included.
+#[test]
+fn ci_lints_the_workflows_and_has_shellcheck() {
+    let text = workflow();
+    assert!(
+        text.lines()
+            .any(|l| l.trim().starts_with("sudo apt-get install")
+                && l.split_whitespace().any(|w| w == "shellcheck")),
+        "CI does not install shellcheck"
+    );
+    assert!(
+        text.lines().any(|l| l
+            .trim()
+            .starts_with("go install github.com/rhysd/actionlint/cmd/actionlint@v")),
+        "CI does not install a pinned actionlint"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.trim().starts_with(r#""$(go env GOPATH)/bin/actionlint""#)),
+        "CI does not run actionlint"
+    );
+}

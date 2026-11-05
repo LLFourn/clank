@@ -1,0 +1,106 @@
+name: Release
+
+# A v<version> tag builds every target natively, checks each build
+# against the tag, and only when all of them pass publishes one release.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        # Each target builds on a runner of its own OS and arch, so the
+        # checks below execute the binary that ships. Linux is static
+        # musl: no glibc floor.
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision musl
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup toolchain install
+          rustup target add "${{ matrix.target }}"
+          rustc --version
+
+      - name: Build both executables
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p clank --bin clank --bin clank-web-cloudflare
+
+      - name: The build is the tagged version
+        run: scripts/release-check.sh "$GITHUB_REF_NAME" "target/${{ matrix.target }}/release/clank"
+
+      # clank-web-cloudflare takes no flags; with its startup pipe
+      # closed it reports that and exits, which proves it runs here.
+      - name: Both executables run on this target
+        run: |
+          bin="target/${{ matrix.target }}/release"
+          "$bin/clank" --help >/dev/null
+          if out="$("$bin/clank-web-cloudflare" </dev/null)"; then
+            echo "clank-web-cloudflare accepted a closed startup pipe" >&2
+            exit 1
+          fi
+          grep -qF "startup pipe closed" <<<"$out"
+
+      - name: Pack the archive
+        run: scripts/release-archive.sh "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" "target/${{ matrix.target }}/release" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Exactly the four archives, and their checksums
+        run: scripts/release-assets.sh "${GITHUB_REF_NAME#v}" dist
+
+      - name: The changelog section is the notes
+        run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
+
+      # Given assets, gh creates the release as a draft, uploads them,
+      # then publishes it, so no one sees a release missing an archive.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "clank ${GITHUB_REF_NAME#v}" --notes-file notes.md dist/*.tar.gz dist/SHA256SUMS
