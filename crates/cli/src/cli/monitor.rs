@@ -1672,12 +1672,17 @@ pub(crate) fn greet_at(
 
 /// Whether a handshake error is the peer closing on us, as opposed to a
 /// deadline or a fault on our side.
+///
+/// `NotConnected` is a close too: the socket was connected, and Darwin
+/// answers a write that races the peer's close with `ENOTCONN` rather
+/// than `EPIPE`.
 fn hung_up(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
     )
 }
 
@@ -3274,7 +3279,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 }
                 Wake::Records(events)
             }
-            _ = crate::cli::timer_source::deadline(timer_deadline) => Wake::TimersDue,
+            _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => Wake::TimersDue,
             Some(()) = uc_changed.recv() => {
                 while uc_changed.try_recv().is_ok() {}
                 Wake::UserCommands
@@ -3454,9 +3459,11 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             match settled {
                                 Ok(Some(commit)) => {
                                     let repo = repo.as_ref().clone();
-                                    owned
-                                        .departing
-                                        .push(tokio::spawn(async move { commit.run(&repo).await }));
+                                    let committed = commit.author.clone();
+                                    owned.departing.push(tokio::spawn(async move {
+                                        commit.run(&repo).await;
+                                        tracing::debug!(author = %committed, "monitor delivery committed");
+                                    }));
                                 }
                                 Ok(None) => {}
                                 Err(why) => eprintln!("monitor: refused a delivery result: {why}"),
@@ -11395,34 +11402,93 @@ mod tests {
         );
     }
 
-    /// A monitor that hangs up during the handshake is repaired, not
-    /// gone around.
+    /// Where in the handshake a dying monitor closes the client's
+    /// connection.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HangUp {
+        /// Before accepting it: the listener closes with the connection
+        /// still in its backlog.
+        Unaccepted,
+        /// Before the client has written its hello.
+        BeforeHello,
+        /// After it has read the hello, before answering.
+        AfterHello,
+    }
+
+    /// A published monitor that closes the client's first connection at
+    /// `when`, then stops listening — what a client reconnecting to a
+    /// monitor that was just killed meets — and a replacement the
+    /// client's start publishes, already listening.
     ///
-    /// The published monitor accepts one connection and closes it unread,
-    /// then stops listening: what a client reconnecting to a monitor that
-    /// was just killed meets on Linux, where the listener outlives the
-    /// client connections by a few milliseconds and the hello is reset.
-    #[tokio::test]
-    async fn a_monitor_that_hangs_up_mid_handshake_is_replaced() {
+    /// Both ends of the race are signalled, not timed. The client's
+    /// first connect returns only after the hang-up when `when` puts it
+    /// before the hello, and every later knock at the dying address
+    /// waits for the listener to be gone, so where the hang-up lands is
+    /// `when` and nothing else. The replacement is bound before its
+    /// descriptor is published, so it answers whenever it is found.
+    async fn replaced_after(when: HangUp) -> (Attached, usize) {
         let repo = repo_dir();
         let dir = tempfile::tempdir().unwrap();
-        let path = socket_path(dir.path(), 4747).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let dying = socket_path(dir.path(), 4747).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&dying).unwrap();
         publish(
             repo.path(),
             &Descriptor {
                 proto: PROTO,
                 pid: 4747,
                 repo: repo.path().to_string_lossy().to_string(),
-                socket: path.to_string_lossy().to_string(),
+                socket: dying.to_string_lossy().to_string(),
                 build: None,
             },
         )
         .unwrap();
-        let dying = std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let (hung_up, gone) = std::sync::mpsc::channel::<()>();
+        let (knocked, knock) = std::sync::mpsc::channel::<()>();
+        let closer = std::thread::spawn(move || {
+            use std::io::Read;
+            if when == HangUp::Unaccepted {
+                knock.recv().unwrap();
+            } else {
+                let (mut stream, _) = listener.accept().unwrap();
+                if when == HangUp::AfterHello {
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {}
+                }
+                drop(stream);
+            }
+            drop(listener);
+            hung_up.send(()).unwrap();
+        });
+        let gone = std::sync::Mutex::new(Some(gone));
+        let wait_gone = || {
+            if let Some(gone) = gone.lock().unwrap().take() {
+                gone.recv().unwrap();
+            }
+        };
+        let knocks = std::sync::atomic::AtomicUsize::new(0);
         let (_live, d) = unannounced_monitor(repo.path());
         let starts = std::sync::atomic::AtomicUsize::new(0);
 
+        let (dying, wait_gone, knocks, knocked) = (&dying, &wait_gone, &knocks, &knocked);
+        let connect = move |path: &std::path::Path, deadline| {
+            if path != dying {
+                return connect_within(path, deadline);
+            }
+            if knocks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                wait_gone();
+                return connect_within(path, deadline);
+            }
+            let stream = connect_within(path, deadline)?;
+            match when {
+                HangUp::Unaccepted => {
+                    knocked.send(()).unwrap();
+                    wait_gone();
+                }
+                HangUp::BeforeHello => wait_gone(),
+                HangUp::AfterHello => {}
+            }
+            Ok(stream)
+        };
         let got = attach_or_spawn_by(
             repo.path(),
             agent("codex"),
@@ -11433,14 +11499,23 @@ mod tests {
                 starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 publish(r, &d).map(|()| Box::new(NotStarted) as Box<dyn Started>)
             },
-            connect_within,
+            connect,
             |r| acquire_lease(r).is_ok(),
         )
         .await;
-        dying.join().unwrap();
+        closer.join().unwrap();
+        (got, starts.load(std::sync::atomic::Ordering::SeqCst))
+    }
 
-        assert!(matches!(got, Attached::Shared(_)), "{got:?}");
-        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    /// A monitor that hangs up during the handshake is repaired, not
+    /// gone around, wherever in the handshake the hang-up lands.
+    #[tokio::test]
+    async fn a_monitor_that_hangs_up_mid_handshake_is_replaced() {
+        for when in [HangUp::Unaccepted, HangUp::BeforeHello, HangUp::AfterHello] {
+            let (got, starts) = replaced_after(when).await;
+            assert!(matches!(got, Attached::Shared(_)), "{when:?}: {got:?}");
+            assert_eq!(starts, 1, "{when:?}");
+        }
     }
 
     /// A hang-up is told apart from a peer that never answers: only the
@@ -11478,6 +11553,35 @@ mod tests {
             ),
             Seen::Unproven(_)
         ));
+    }
+
+    /// A hello that meets `ENOTCONN` met a monitor going away.
+    ///
+    /// Darwin answers a write racing the peer's close that way, a window
+    /// no sequencing of the two ends can land in, so an unconnected
+    /// socket stands in for it: it gives the same answer every time.
+    #[test]
+    fn a_hello_that_finds_the_connection_gone_is_a_hang_up() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let repo = repo_dir();
+        let unconnected = |_: &std::path::Path, _: std::time::Instant| {
+            // SAFETY: a fresh socket, owned at once.
+            let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            assert!(raw >= 0, "{}", std::io::Error::last_os_error());
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            #[cfg(target_vendor = "apple")]
+            set_nosigpipe(raw)?;
+            set_nonblocking(raw, true)?;
+            Ok(std::os::unix::net::UnixStream::from(fd))
+        };
+        let seen = greet_at(
+            "unconnected",
+            repo.path(),
+            agent("codex"),
+            std::time::Instant::now() + Duration::from_millis(150),
+            unconnected,
+        );
+        assert!(matches!(seen, Seen::HungUp(_)), "{seen:?}");
     }
 
     /// The runtime namespace is derived, not created, by a LOOKUP.
@@ -13127,8 +13231,16 @@ mod tests {
         })
         .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hosted = Default::default();
+        let mut hosted: std::collections::BTreeMap<AgentLabel, Hosted> = Default::default();
         assert!(reconcile_hosting(repo.path(), &mut hosted, &tx).is_empty());
+        assert!(rx.try_recv().is_err(), "hosting only arms");
+        hosted
+            .get_mut(&author)
+            .unwrap()
+            .timers
+            .as_mut()
+            .unwrap()
+            .due();
         let (_, (item, _)) = rx.try_recv().unwrap();
         let selector = item.event_view().unwrap().selector.unwrap();
         let key = selector.split_once('@').unwrap().0;
@@ -13416,8 +13528,15 @@ mod tests {
         let author = AgentLabel::parse("codex").unwrap();
         with_timer(repo.path(), "past", 1);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut hosts = Default::default();
+        let mut hosts: std::collections::BTreeMap<AgentLabel, Hosted> = Default::default();
         assert!(reconcile_hosting(repo.path(), &mut hosts, &tx).is_empty());
+        hosts
+            .get_mut(&author)
+            .unwrap()
+            .timers
+            .as_mut()
+            .unwrap()
+            .due();
         assert!(matches!(
             rx.recv().await.unwrap().1,
             (

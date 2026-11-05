@@ -1605,7 +1605,12 @@ impl EventLog {
                 ..
             }
         ) {
-            return self.append_recurring_ack_unlocked(seq, ident, now_epoch());
+            // Coverage is the timer's clock to judge, as acceptance is.
+            return self.append_recurring_ack_unlocked(
+                seq,
+                ident,
+                crate::cli::timer_source::wall_now(),
+            );
         }
         if row.acked {
             return Ok(());

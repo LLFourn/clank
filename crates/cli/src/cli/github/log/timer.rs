@@ -373,6 +373,21 @@ impl EventLog {
         Ok(())
     }
 
+    /// The slot this recurring timer next falls due at, passed or not,
+    /// or `None` while an occurrence awaits its ack. Arming reads this;
+    /// only [`Self::accept_recurring_with_interrupt`] appends.
+    pub(crate) fn recurring_next_due(&self, r: &Recurrence) -> std::io::Result<Option<u64>> {
+        self.validate_recurring_key(r)?;
+        let _lock = SidecarLock::acquire(&self.lock_path, false)?;
+        let state = fold(&self.recurring_lines()?, r)?;
+        if state.pending.is_some() {
+            return Ok(None);
+        }
+        r.next_due(state.covered)
+            .map(Some)
+            .map_err(std::io::Error::other)
+    }
+
     /// Revalidate and append under the ack/compaction write lock. A complete
     /// unsynced prior append is synced before it can be published on retry.
     #[cfg(test)]

@@ -1392,7 +1392,8 @@ mod tests {
         struct Scripted {
             alive: bool,
             samples: Mutex<VecDeque<&'static str>>,
-            subscribed: AtomicUsize,
+            /// When each subscription was started, on the paused clock.
+            subscribed: Mutex<Vec<tokio::time::Instant>>,
             sampled: AtomicUsize,
         }
 
@@ -1401,9 +1402,13 @@ mod tests {
                 Arc::new(Self {
                     alive,
                     samples: Mutex::new(samples.iter().copied().collect()),
-                    subscribed: AtomicUsize::new(0),
+                    subscribed: Mutex::new(Vec::new()),
                     sampled: AtomicUsize::new(0),
                 })
+            }
+
+            fn subscriptions(&self) -> usize {
+                self.subscribed.lock().unwrap().len()
             }
         }
 
@@ -1415,7 +1420,10 @@ mod tests {
                 Some(table())
             }
             fn subscribe(&self, _: &[String]) -> Option<SubscribeChild> {
-                self.subscribed.fetch_add(1, Ordering::SeqCst);
+                self.subscribed
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
                 let script = if self.alive {
                     "exec sleep 300"
                 } else {
@@ -1547,11 +1555,7 @@ mod tests {
                 (vec!["c".to_string()], 2),
                 "the confirming sample is published"
             );
-            assert_eq!(
-                panes.subscribed.load(Ordering::SeqCst),
-                2,
-                "and the subscription restarted"
-            );
+            assert_eq!(panes.subscriptions(), 2, "and the subscription restarted");
             run.stop().await;
         }
 
@@ -1568,11 +1572,7 @@ mod tests {
                 2,
                 "one sample per window"
             );
-            assert_eq!(
-                panes.subscribed.load(Ordering::SeqCst),
-                1,
-                "never restarted"
-            );
+            assert_eq!(panes.subscriptions(), 1, "never restarted");
             assert_eq!(shown(&run.feed), (vec!["a".to_string()], 1));
             run.stop().await;
         }
@@ -1585,19 +1585,68 @@ mod tests {
             pass(1).await;
             frame(&run.feed, "b");
             pass(3).await;
-            assert_eq!(panes.subscribed.load(Ordering::SeqCst), 1);
+            assert_eq!(panes.subscriptions(), 1);
             assert_eq!(shown(&run.feed), (vec!["b".to_string()], 2));
             run.stop().await;
+        }
+
+        /// The paused clock's step while the supervisor restarts.
+        const STEP: Duration = Duration::from_millis(250);
+
+        impl Running {
+            /// Block until the live subscription's reader has seen its
+            /// child's EOF. The reader is a real thread the paused clock
+            /// does not wait for: a tick that outran it read a dying
+            /// subscription as healthy and reset the backoff. Blocking the
+            /// runtime thread holds both the clock and the supervisor.
+            fn died(&self) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                // A JoinHandle the supervisor owns can be asked, not awaited.
+                while !self
+                    .subscription
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|s| s.reader.is_finished())
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the scripted subscription never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+
+            /// Step the paused clock until the supervisor subscribes again,
+            /// each step only once the subscription it holds is dead.
+            async fn resubscribed(&self, panes: &Scripted) {
+                let before = panes.subscriptions();
+                while panes.subscriptions() == before {
+                    self.died();
+                    tokio::time::sleep(STEP).await;
+                }
+            }
         }
 
         #[tokio::test(start_paused = true)]
         async fn a_dead_subscription_is_restarted_with_backoff() {
             let panes = Scripted::new(false, &[]);
             let run = supervise(panes.clone());
-            pass(20).await;
-            let n = panes.subscribed.load(Ordering::SeqCst);
-            // Restarts at about 1, 3, 7 and 15 s: doubling, not once a second.
-            assert!((4..=6).contains(&n), "{n} subscriptions in 20 s");
+            for _ in 0..5 {
+                run.resubscribed(&panes).await;
+            }
+            let at = panes.subscribed.lock().unwrap().clone();
+            let gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
+            assert!(
+                gaps[0].abs_diff(Duration::from_secs(1)) <= STEP,
+                "the first restart waits about a second: {gaps:?}"
+            );
+            for pair in gaps.windows(2) {
+                assert!(
+                    pair[1] > pair[0] && pair[1].abs_diff(pair[0] * 2) <= STEP,
+                    "each wait doubles the one before: {gaps:?}"
+                );
+            }
             run.stop().await;
         }
 

@@ -163,6 +163,11 @@ name = "clank-web-cloudflare"
 path = "src/bin/clank-web-cloudflare.rs"
 test = false
 
+[features]
+# Test-only: native timers may run on a logical clock a test controls
+# (`timer_source::clock`). Never part of an installed build.
+test-clock = []
+
 [build-dependencies]
 sha2 = "0.11"
 
@@ -172,6 +177,9 @@ sha2 = "0.11"
 webpki-roots = "1.0.10"
 clank-web-cloudflare = { path = "../web-cloudflare", version = "0.1.0", features = ["test-support"] }
 clank-user-config = { path = "../user-config", version = "0.1.0", features = ["test-hooks"] }
+# Itself, so every test build -- the binary the integration tests spawn
+# included -- has the logical timer clock, and no installed build does.
+clank = { path = ".", features = ["test-clock"] }
 # Only to answer a handshake by hand in the live connector test.
 sha1 = "0.11.0"
 # test-only: the vendored assets are checked against the digest their

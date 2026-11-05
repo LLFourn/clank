@@ -1,6 +1,7 @@
 //! Passive native deadlines. The lifecycle owner selects one absolute sleep;
 //! this module owns no task, producer, watcher or idle ingest lease.
 
+pub(crate) mod clock;
 pub(crate) mod recurrence;
 
 use super::event_source::{Durability, EmissionSink, SourceOrigin};
@@ -13,15 +14,12 @@ use clank_core::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::time::Instant;
 
 pub(crate) fn wall_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    clock::wall().as_secs()
 }
 
 pub(crate) fn parse(source: &TimerSource) -> anyhow::Result<u64> {
@@ -167,10 +165,8 @@ impl TimerSet {
         let mut names = HashSet::new();
         let mut keys = HashSet::new();
         let mut invocation_keys = BTreeSet::new();
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let now = Instant::now();
+        let wall = clock::wall();
+        let now = clock::now();
         for (source, origin) in sources {
             let WaitEventSource::Timer(source) = source else {
                 continue;
@@ -280,13 +276,17 @@ impl TimerSet {
     /// before disturbing a running host. Arm once after taking ownership.
     pub(crate) fn arm(&mut self) {
         self.refresh();
-        self.due();
     }
 
     /// Refresh only on admission or existing event-directory invalidation.
     /// Pending entries have no deadline and never enter heartbeat retries.
+    ///
+    /// Refreshing only arms: a slot already due gets a deadline that has
+    /// passed, and [`TimerSet::due`] accepts it on the owner's next
+    /// deadline wake. Acceptance has that one path, so a refresh racing
+    /// the deadline can neither take a slot from it nor take one twice.
     pub(crate) fn refresh(&mut self) {
-        self.refresh_at(wall_now(), Instant::now());
+        self.refresh_at(wall_now(), clock::now());
     }
 
     fn refresh_at(&mut self, wall: u64, now: Instant) {
@@ -316,18 +316,20 @@ impl TimerSet {
             }
         }
         for (entry, deadline) in refresh {
-            self.try_entry(entry, wall, now, deadline);
+            self.arm_recurring(entry, wall, now, deadline);
         }
     }
 
+    /// Accept every occurrence whose deadline has passed: the only way a
+    /// timer's occurrence enters its WAL.
     pub(crate) fn due(&mut self) {
         if self
             .next_deadline()
-            .is_none_or(|deadline| deadline > Instant::now())
+            .is_none_or(|deadline| deadline > clock::now())
         {
             return;
         }
-        self.due_at(wall_now(), Instant::now());
+        self.due_at(wall_now(), clock::now());
     }
 
     fn due_at(&mut self, wall: u64, now: Instant) {
@@ -344,18 +346,15 @@ impl TimerSet {
         for entry in ready {
             if entry.recurrence.is_none() && entry.due > wall {
                 // Backward wall-clock movement: never ingest early.
-                if let Some(deadline) = now.checked_add(Duration::from_secs(entry.due - wall)) {
-                    self.entries.insert((deadline, entry.key.clone()), entry);
-                } else {
-                    self.recovery.push(entry);
-                }
+                self.arm_one_shot(entry, wall, now);
             } else {
-                self.try_entry(entry, wall, now, None);
+                self.try_entry(entry, wall, now);
             }
         }
     }
 
     /// Healthy future timers do not read clocks or files on heartbeats.
+    /// Like a refresh, a retry only re-arms what failed.
     pub(crate) fn retry(&mut self) {
         self.retry_entries(true);
     }
@@ -369,26 +368,34 @@ impl TimerSet {
             return;
         }
         let wall = wall_now();
+        let now = clock::now();
         for entry in std::mem::take(&mut self.recovery) {
-            if !recurring && entry.recurrence.is_some() {
-                self.recovery.push(entry);
-                continue;
+            match &entry.recurrence {
+                Some(_) if !recurring => self.recovery.push(entry),
+                Some(_) => self.arm_recurring(entry, wall, now, None),
+                None => self.arm_one_shot(entry, wall, now),
             }
-            if entry.recurrence.is_none() && entry.due > wall {
-                if let Some(deadline) =
-                    Instant::now().checked_add(Duration::from_secs(entry.due - wall))
-                {
-                    self.entries.insert((deadline, entry.key.clone()), entry);
-                } else {
-                    self.recovery.push(entry);
-                }
-                continue;
-            }
-            self.try_entry(entry, wall, Instant::now(), None);
         }
     }
 
-    fn try_entry(&mut self, mut entry: Entry, wall: u64, now: Instant, previous: Option<Instant>) {
+    fn arm_one_shot(&mut self, entry: Entry, wall: u64, now: Instant) {
+        match now.checked_add(Duration::from_secs(entry.due.saturating_sub(wall))) {
+            Some(deadline) => {
+                self.entries.insert((deadline, entry.key.clone()), entry);
+            }
+            None => self.recovery.push(entry),
+        }
+    }
+
+    /// Arm `entry` for the slot its WAL says is next, which may already
+    /// have passed, or hold it pending its ack. Writes nothing.
+    fn arm_recurring(&mut self, entry: Entry, wall: u64, now: Instant, previous: Option<Instant>) {
+        let r = entry.recurrence.as_ref().expect("a recurring entry");
+        let next = EventLog::open(&self.dir, &entry.key).and_then(|log| log.recurring_next_due(r));
+        self.settle(entry, wall, now, previous, next, false);
+    }
+
+    fn try_entry(&mut self, entry: Entry, wall: u64, now: Instant) {
         let result = match &entry.recurrence {
             None => {
                 accept(&self.dir, &entry.key, &entry.source, entry.due, &self.sink).map(|_| None)
@@ -430,6 +437,22 @@ impl TimerSet {
                 Ok(next)
             })(),
         };
+        self.settle(entry, wall, now, None, result, true);
+    }
+
+    /// File `entry` by its WAL's answer: `Some` slot to arm for; `None`,
+    /// pending its ack (recurring) or done (one-off). Only an `accepted`
+    /// answer clears a recorded failure, so re-arming a timer that still
+    /// fails does not report it again.
+    fn settle(
+        &mut self,
+        mut entry: Entry,
+        wall: u64,
+        now: Instant,
+        previous: Option<Instant>,
+        result: std::io::Result<Option<u64>>,
+        accepted: bool,
+    ) {
         match result {
             Ok(Some(due)) => {
                 let deadline = previous
@@ -437,7 +460,10 @@ impl TimerSet {
                     .or_else(|| now.checked_add(Duration::from_secs(due.saturating_sub(wall))));
                 entry.due = due;
                 if let Some(deadline) = deadline {
-                    entry.failure = None;
+                    tracing::debug!(timer = %entry.source.name, due, "timer armed");
+                    if accepted {
+                        entry.failure = None;
+                    }
                     self.entries.insert((deadline, entry.key.clone()), entry);
                 } else {
                     if entry.failure.as_deref()
@@ -453,7 +479,9 @@ impl TimerSet {
                 }
             }
             Ok(None) if entry.recurrence.is_some() => {
-                entry.failure = None;
+                if accepted {
+                    entry.failure = None;
+                }
                 self.pending.insert(entry.key.clone(), entry);
             }
             Ok(None) => {}
@@ -752,6 +780,7 @@ mod tests {
         let (mut timers, mut rx) = set(dir.path(), vec![source]);
         let now = Instant::now();
         timers.refresh_at(100, now);
+        timers.due_at(100, now);
         let (item, _) = rx.try_recv().unwrap();
         assert!(
             item.event_view()
@@ -816,7 +845,9 @@ mod tests {
             .unwrap()
             .source_key();
         let (mut timers, mut rx) = set(dir.path(), vec![source]);
-        timers.refresh_at(100, Instant::now());
+        let now = Instant::now();
+        timers.refresh_at(100, now);
+        timers.due_at(100, now);
         rx.try_recv().unwrap();
         let row = rows(dir.path(), &key).remove(0);
         EventLog::open(dir.path(), &key)
@@ -871,7 +902,9 @@ mod tests {
         let r = recurrence::Recurrence::parse(&source, None).unwrap();
         let key = r.source_key();
         let (mut timers, mut rx) = set(dir.path(), vec![source]);
-        timers.refresh_at(120, Instant::now());
+        let now = Instant::now();
+        timers.refresh_at(120, now);
+        timers.due_at(120, now);
         rx.try_recv().unwrap();
         let path = dir.path().join(format!("{key}.jsonl"));
         let mut original = std::fs::read(&path).unwrap();
@@ -947,7 +980,9 @@ mod tests {
         let path = dir.path().join(format!("{key}.jsonl"));
         std::fs::write(&path, bytes).unwrap();
         let (mut timers, mut rx) = set(dir.path(), vec![source]);
-        timers.refresh_at(r.due_at(completed).unwrap(), Instant::now());
+        let (wall, now) = (r.due_at(completed).unwrap(), Instant::now());
+        timers.refresh_at(wall, now);
+        timers.due_at(wall, now);
         let (item, _) = rx.try_recv().unwrap();
         assert!(
             item.event_view()
@@ -1043,6 +1078,7 @@ mod tests {
         );
         drop(held);
         timers.retry();
+        timers.due();
         assert_eq!(looked(&dir, &timer), TimerState::Fired);
 
         let seen = dir.join(format!("{key}.seen"));
@@ -1233,9 +1269,11 @@ mod tests {
         assert_eq!(timers.recovery.len(), 1);
         assert!(rx.try_recv().is_err());
         timers.retry();
+        timers.due();
         assert_eq!(timers.recovery.len(), 1);
         drop(lease);
         timers.retry();
+        timers.due();
         assert!(timers.recovery.is_empty());
         assert!(matches!(
             rx.recv().await.unwrap().0,
@@ -1271,6 +1309,7 @@ mod tests {
         assert_eq!(timers.recovery.len(), 1);
         std::fs::remove_dir(&blocked).unwrap();
         timers.retry();
+        timers.due();
         assert!(timers.recovery.is_empty());
         assert!(rx.try_recv().is_err());
         assert_eq!(rows(dir.path(), &key).len(), 1);
@@ -1309,6 +1348,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         std::fs::remove_file(dir.path().join(format!("{key}.seen"))).unwrap();
         timers.retry();
+        timers.due();
         assert!(timers.recovery.is_empty());
         assert!(
             log.retained_timer_ids().unwrap().len() < 2100,

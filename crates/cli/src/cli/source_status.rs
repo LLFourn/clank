@@ -536,6 +536,7 @@ mod tests {
         let mut set =
             crate::cli::timer_source::TimerSet::new(&past, &events, None, tx.into()).unwrap();
         set.arm();
+        set.due();
         assert_eq!(
             names(repo.path()),
             [
