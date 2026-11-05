@@ -699,13 +699,13 @@ async fn submit_pause_question(
             "no master agent on the roster to author the block".into(),
         );
     };
-    // Same core as `clank block create` (the Blocked hook
+    // Same core as `clank block ask` (the Blocked hook
     // fires identically); authored as the MASTER because
     // blocks live under an agent dir. Fixed name `pause`
     // keeps re-block idempotent, and blocks are repo-wide,
     // so there is exactly one.
     let res = crate::cli::block::run(crate::cli::BlockArgs {
-        command: crate::cli::BlockCmd::Create(crate::cli::BlockCreateArgs {
+        command: crate::cli::BlockCmd::Ask(crate::cli::BlockCreateArgs {
             name: block_page::PAUSE.to_string(),
             message: text.to_string(),
             author: Some(master.label.clone()),
@@ -3414,8 +3414,8 @@ pub(crate) async fn run_tui(
     // the agent panel. The single source of key-routing truth.
     let mut mode = initial_mode(&snapshot);
     // The "+ add" candidate list — read FRESH from the global library
-    // the moment the picker opens (never cached, so a `clank agent add
-    // --global` elsewhere shows up at once), referenced by index while
+    // the moment the picker opens (never cached, so a `clank team agent
+    // add` elsewhere shows up at once), referenced by index while
     // AddPicker/Confirm(Add) is active, cleared when the picker closes.
     let mut picker: Vec<crate::cli::status::AvailableAgent> = Vec::new();
     // The open plan-actions page (tui-plan-actions-page): identity +

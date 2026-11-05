@@ -1,6 +1,5 @@
-//! In-process integration tests for `clank shelve` / `unshelve` /
-//! `shelve clean` (plan-lifecycle-verbs). Drives the command cores
-//! directly — no binary spawning.
+//! In-process integration tests for `clank stash` (plan-lifecycle-verbs).
+//! Drives the command cores directly — no binary spawning.
 
 use crate::common;
 
@@ -65,16 +64,11 @@ fn repo_with_inflight_foo() -> TestEnv {
 /// `impl b`, which touch `src/`, so every test that stashes through
 /// this helper is now also proving the case that used to need
 /// `--force` (stash-stops-refusing-impl-commits).
-fn push_args(env: &TestEnv, to_queue: bool, waiting_for: Option<&str>) -> clank::cli::ShelveArgs {
-    clank::cli::ShelveArgs {
-        command: None,
-        plan: Some("foo".into()),
-        repo: Some(env.repo().to_path_buf()),
-        waiting_for: waiting_for.map(str::to_string),
-        to_queue,
-        priority: None,
-        dry: false,
-    }
+fn push_args(env: &TestEnv, to_queue: bool, waiting_for: Option<&str>) -> clank::cli::StashArgs {
+    let mut args = bare_stash(env.repo(), Some("foo"));
+    args.push.waiting_for = waiting_for.map(str::to_string);
+    args.push.to_queue = to_queue;
+    args
 }
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -82,14 +76,11 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 #[test]
-fn shelve_protects_then_drops() {
+fn stash_protects_then_drops() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
 
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
 
     // Protective ref exists.
     let refs = git_out(repo, &["show-ref"]);
@@ -107,15 +98,12 @@ fn shelve_protects_then_drops() {
 }
 
 #[test]
-fn git_gc_does_not_lose_shelved_work() {
+fn git_gc_does_not_lose_stashed_work() {
     // Ruthless c8f216b concern 1: the protective ref must keep the
-    // shelved commits alive through a full gc.
+    // stashed commits alive through a full gc.
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
 
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(repo.join(".clank/stash/foo.json")).unwrap())
@@ -137,29 +125,26 @@ fn git_gc_does_not_lose_shelved_work() {
             .args(["cat-file", "-e", sha])
             .status()
             .unwrap();
-        assert!(status.success(), "shelved commit {sha} lost to gc");
+        assert!(status.success(), "stashed commit {sha} lost to gc");
     }
 }
 
 #[test]
-fn unshelve_restores_and_resets_reviews() {
+fn pop_restores_and_resets_reviews() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
 
-    // Other work lands while foo is shelved.
+    // Other work lands while foo is stashed.
     write(repo, "src/other.rs", "// other\n");
     commit(repo, "[misc] other work");
 
-    block_on(clank::cli::stash::run_unshelve_alias(
-        clank::cli::UnshelveArgs {
+    block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Pop(
+        clank::cli::StashPopArgs {
             plan: Some("foo".into()),
             repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .unwrap();
 
     // Plan file is back; commits replayed on top.
@@ -206,10 +191,7 @@ fn another_plans_commit_interleaved_is_kept() {
     write(repo, "src/a.rs", "// a\n");
     commit(repo, "[foo] impl a");
 
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
     let log = git_out(repo, &["log", "--format=%s"]);
     assert!(!log.contains("[foo]"), "{log}");
     assert!(log.contains("[bar] independent work"), "{log}");
@@ -229,10 +211,8 @@ fn impl_commits_stash_without_any_flag() {
     // implementation work is the NORMAL path and must need no flag.
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .expect("a plan's own implementation commits stash with no flag");
+    block_on(clank::cli::stash::run(push_args(&env, false, None)))
+        .expect("a plan's own implementation commits stash with no flag");
     assert!(git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
     // And they come back. Replayed onto later work, like a real
     // resume — an immediate pop onto the unchanged tip conflicts on
@@ -240,12 +220,12 @@ fn impl_commits_stash_without_any_flag() {
     // replay, not of this change.
     write(repo, "src/later.rs", "// later\n");
     commit(repo, "[misc] later work");
-    block_on(clank::cli::stash::run_unshelve_alias(
-        clank::cli::UnshelveArgs {
+    block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Pop(
+        clank::cli::StashPopArgs {
             plan: Some("foo".into()),
             repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .expect("pop restores them");
     let log = git_out(repo, &["log", "--oneline"]);
     assert!(log.contains("[foo] impl a"), "impl a restored: {log}");
@@ -256,10 +236,7 @@ fn impl_commits_stash_without_any_flag() {
 fn to_queue_saves_body_and_sets_aside() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, true, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, true, None))).unwrap();
 
     let queued = repo.join(".clank/queue/500-foo.md");
     assert!(queued.is_file(), "body re-queued");
@@ -271,51 +248,45 @@ fn to_queue_saves_body_and_sets_aside() {
 }
 
 #[test]
-fn unshelve_refuses_when_plan_active_again() {
+fn pop_refuses_when_plan_active_again() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
 
     // The stem gets re-promoted as a fresh plan.
     write(repo, ".clank/plans/foo.md", "# foo v2\n");
     commit(repo, "[foo] intro v2");
 
-    let err = block_on(clank::cli::stash::run_unshelve_alias(
-        clank::cli::UnshelveArgs {
+    let err = block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Pop(
+        clank::cli::StashPopArgs {
             plan: Some("foo".into()),
             repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .unwrap_err()
     .to_string();
     assert!(err.contains("already active"), "got: {err}");
-    // Fail-closed: shelved state untouched.
+    // Fail-closed: stashed state untouched.
     assert!(repo.join(".clank/stash/foo.json").is_file());
 }
 
 #[test]
-fn conflicted_unshelve_moves_nothing_and_leaves_ref_and_state_intact() {
+fn conflicted_pop_moves_nothing_and_leaves_ref_and_state_intact() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
 
-    // Conflicting content at a path the shelved commits also touch.
+    // Conflicting content at a path the stashed commits also touch.
     write(repo, "src/a.rs", "// conflicting\n");
     commit(repo, "[misc] conflicting change");
     let head = git_out(repo, &["rev-parse", "HEAD"]);
 
-    let err = block_on(clank::cli::stash::run_unshelve_alias(
-        clank::cli::UnshelveArgs {
+    let err = block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Pop(
+        clank::cli::StashPopArgs {
             plan: Some("foo".into()),
             repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .unwrap_err()
     .to_string();
     assert!(
@@ -334,29 +305,17 @@ fn conflicted_unshelve_moves_nothing_and_leaves_ref_and_state_intact() {
 }
 
 #[test]
-fn shelve_clean_discards_ref_and_state() {
+fn drop_discards_ref_and_state() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
 
-    // `shelve clean` alias routes to `stash drop`.
-    block_on(clank::cli::stash::run_shelve_alias(
-        clank::cli::ShelveArgs {
-            command: Some(clank::cli::ShelveCmd::Clean(clank::cli::ShelveCleanArgs {
-                plan: Some("foo".into()),
-                repo: Some(repo.to_path_buf()),
-            })),
-            plan: None,
-            repo: None,
-            waiting_for: None,
-            to_queue: false,
-            priority: None,
-            dry: false,
+    block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Drop(
+        clank::cli::StashDropArgs {
+            plan: Some("foo".into()),
+            repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .unwrap();
 
     assert!(!repo.join(".clank/stash/foo.json").exists());
@@ -367,12 +326,7 @@ fn shelve_clean_discards_ref_and_state() {
 fn status_surfaces_stash_with_for_nudge() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env,
-        false,
-        Some("bar"),
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, Some("bar")))).unwrap();
 
     // Before bar exists: waiting, not ready.
     let snap = block_on(clank::cli::status::snapshot(repo, Some(env.home()))).unwrap();
@@ -408,10 +362,7 @@ fn uncommitted_work_is_stashed_as_an_automatic_commit() {
     let repo = env.repo();
     std::fs::write(repo.join("src/a.rs"), "uncommitted edit\n").unwrap();
 
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
     assert_eq!(git_out(repo, &["status", "--porcelain"]), "");
     assert!(!repo.join("src/a.rs").exists());
     let set_aside = git_out(repo, &["log", "--format=%s", "refs/clank/stash/foo", "-1"]);
@@ -420,12 +371,12 @@ fn uncommitted_work_is_stashed_as_an_automatic_commit() {
         "[foo] clank stash: uncommitted work at stash time"
     );
 
-    block_on(clank::cli::stash::run_unshelve_alias(
-        clank::cli::UnshelveArgs {
+    block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Pop(
+        clank::cli::StashPopArgs {
             plan: Some("foo".into()),
             repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .unwrap();
     assert_eq!(
         std::fs::read_to_string(repo.join("src/a.rs")).unwrap(),
@@ -442,10 +393,7 @@ fn legacy_shelved_record_pops_via_its_own_ref() {
     let env = repo_with_inflight_foo();
     let repo = env.repo();
     // Stash it with today's code (lands at the new paths)…
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
     // …then relocate record + ref to the LEGACY locations, simulating a
     // pre-rename repo.
     let record = std::fs::read_to_string(repo.join(".clank/stash/foo.json")).unwrap();
@@ -466,12 +414,12 @@ fn legacy_shelved_record_pops_via_its_own_ref() {
     assert_eq!(items[0].1.git_ref, "refs/clank/shelved/foo");
 
     // …and pop restores through the legacy ref, consuming both.
-    block_on(clank::cli::stash::run_unshelve_alias(
-        clank::cli::UnshelveArgs {
+    block_on(clank::cli::stash::run(verb(clank::cli::StashCmd::Pop(
+        clank::cli::StashPopArgs {
             plan: Some("foo".into()),
             repo: Some(repo.to_path_buf()),
         },
-    ))
+    ))))
     .unwrap();
     assert!(repo.join(".clank/plans/foo.md").exists(), "plan restored");
     assert!(!repo.join(".clank/shelved/foo.json").exists());
@@ -486,10 +434,7 @@ fn stash_show_reads_the_body_from_the_protective_ref() {
     // in its tree (run_show prints; the read path is what we pin).
     let env = repo_with_inflight_foo();
     let repo = env.repo();
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
+    block_on(clank::cli::stash::run(push_args(&env, false, None))).unwrap();
     assert!(
         !repo.join(".clank/plans/foo.md").exists(),
         "plan file left the branch"
@@ -686,8 +631,8 @@ fn list_lists() {
 
 #[test]
 fn run_refuses_a_parent_option_beside_a_verb_before_touching_anything() {
-    // `clank stash --dry drop foo`: the operator asked to preview; a
-    // run that parsed `--dry` onto the parent and executed the drop
+    // `clank stash --dry-run drop foo`: the operator asked to preview; a
+    // run that parsed `--dry-run` onto the parent and executed the drop
     // would discard the only copy (codex on 70a17f8). Through `run`,
     // because the refusal is only worth anything there.
     let env = repo_with_inflight_foo();
@@ -703,7 +648,7 @@ fn run_refuses_a_parent_option_beside_a_verb_before_touching_anything() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("--dry") && err.contains("after the verb"),
+        err.contains("--dry-run") && err.contains("after the verb"),
         "{err}"
     );
     assert!(
@@ -711,74 +656,4 @@ fn run_refuses_a_parent_option_beside_a_verb_before_touching_anything() {
         "nothing dropped"
     );
     assert!(git_out(repo, &["show-ref"]).contains("refs/clank/stash/foo"));
-}
-
-#[test]
-fn the_aliases_infer_refuse_and_guard_exactly_like_stash() {
-    // `shelve clean` / `unshelve` are `stash drop` / `stash pop` in old
-    // clothes: same inference over zero, one and many, same refusal of
-    // a parent option beside the verb (codex on c7cf432).
-    let env = repo_with_inflight_foo();
-    let repo = env.repo();
-    let unshelve = |plan: Option<&str>| {
-        block_on(clank::cli::stash::run_unshelve_alias(
-            clank::cli::UnshelveArgs {
-                plan: plan.map(str::to_string),
-                repo: Some(repo.to_path_buf()),
-            },
-        ))
-    };
-    let shelve_clean = |plan: Option<&str>, dry_on_parent: bool| {
-        block_on(clank::cli::stash::run_shelve_alias(
-            clank::cli::ShelveArgs {
-                command: Some(clank::cli::ShelveCmd::Clean(clank::cli::ShelveCleanArgs {
-                    plan: plan.map(str::to_string),
-                    repo: Some(repo.to_path_buf()),
-                })),
-                plan: None,
-                repo: None,
-                waiting_for: None,
-                to_queue: false,
-                priority: None,
-                dry: dry_on_parent,
-            },
-        ))
-    };
-
-    // Zero.
-    let err = unshelve(None).unwrap_err().to_string();
-    assert!(err.contains("nothing is stashed"), "{err}");
-
-    // One: inferred.
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
-    unshelve(None).expect("unshelve infers the one stash");
-    assert!(git_out(repo, &["log", "--format=%s"]).contains("[foo] impl b"));
-
-    // Many: named back, nothing touched.
-    block_on(clank::cli::stash::run_shelve_alias(push_args(
-        &env, false, None,
-    )))
-    .unwrap();
-    write(repo, ".clank/plans/bar.md", "# bar\n");
-    commit(repo, "[bar] intro");
-    write(repo, "src/c.rs", "// c\n");
-    commit(repo, "[bar] impl c");
-    block_on(clank::cli::stash::run(bare_stash(repo, Some("bar")))).unwrap();
-    let err = shelve_clean(None, false).unwrap_err().to_string();
-    assert!(err.contains("foo") && err.contains("bar"), "{err}");
-
-    // A parent option beside the verb: refused before anything goes.
-    let err = shelve_clean(Some("bar"), true).unwrap_err().to_string();
-    assert!(
-        err.contains("--dry") && err.contains("after the verb"),
-        "{err}"
-    );
-    assert!(repo.join(".clank/stash/bar.json").is_file());
-
-    // Named: drops.
-    shelve_clean(Some("bar"), false).unwrap();
-    assert!(!repo.join(".clank/stash/bar.json").exists());
 }

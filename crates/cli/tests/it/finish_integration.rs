@@ -829,7 +829,7 @@ fn finish_dash_m_rewords_when_the_finalize_is_head() {
 
 #[test]
 fn finish_dash_m_dry_previews_the_reword_without_changing_anything() {
-    // --dry threads into the engine's dry mode — the SAME computation the live
+    // --dry-run threads into the engine's dry mode — the SAME computation the live
     // run applies, printed instead of executed. Nothing may move.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
@@ -852,12 +852,12 @@ fn finish_dash_m_dry_previews_the_reword_without_changing_anything() {
     assert_eq!(
         git_out(repo, &["rev-parse", "HEAD"]),
         head_before,
-        "--dry must not move any ref"
+        "--dry-run must not move any ref"
     );
     assert_eq!(
         git_out(repo, &["log", "-1", "--format=%s", "HEAD~1"]),
         "[foo] wrap up foo",
-        "--dry must not rewrite the finalize message"
+        "--dry-run must not rewrite the finalize message"
     );
 }
 
@@ -888,7 +888,7 @@ fn autosquash_squashes_on_main() {
 
 #[test]
 fn fresh_squash_dry_is_a_strict_noop_then_live_agrees() {
-    // The one-computation rule for the FRESH composite: --dry runs the same
+    // The one-computation rule for the FRESH composite: --dry-run runs the same
     // preview + engine path as live (over a synthetic finalize commit) and
     // mutates NOTHING; the live run then executes the plan the dry printed.
     let env = TestEnv::init();
@@ -900,7 +900,7 @@ fn fresh_squash_dry_is_a_strict_noop_then_live_agrees() {
     let head_before = git_out(repo, &["rev-parse", "HEAD"]);
     let refs_before = git_out(repo, &["for-each-ref"]);
 
-    // Fresh --dry (autosquash fills squash + allow flag; plan not finalized).
+    // Fresh --dry-run (autosquash fills squash + allow flag; plan not finalized).
     let mut args = finish_args(repo, "foo", None);
     args.message = vec!["wrap up foo".into(), "one commit reads cleaner".into()];
     args.dry = true;
@@ -909,16 +909,16 @@ fn fresh_squash_dry_is_a_strict_noop_then_live_agrees() {
     assert_eq!(
         git_out(repo, &["rev-parse", "HEAD"]),
         head_before,
-        "--dry must not move HEAD"
+        "--dry-run must not move HEAD"
     );
     assert_eq!(
         git_out(repo, &["for-each-ref"]),
         refs_before,
-        "--dry must not create or move any ref"
+        "--dry-run must not create or move any ref"
     );
     assert!(
         repo.join(".clank/plans/foo.md").exists(),
-        "--dry must not finalize the plan file"
+        "--dry-run must not finalize the plan file"
     );
 
     // The live run executes what the dry previewed: base + ONE squashed commit.
@@ -935,7 +935,7 @@ fn fresh_squash_dry_is_a_strict_noop_then_live_agrees() {
 #[test]
 fn fresh_squash_dry_reports_the_same_blocker_live_refuses() {
     // Blocker parity: an explicit --squash --into-branch naming a branch
-    // that exists. The live run refuses; the --dry — the same
+    // that exists. The live run refuses; the --dry-run — the same
     // computation — reports the blocker and changes nothing.
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
@@ -1065,7 +1065,7 @@ fn buried_squash_dry_is_a_noop_then_live_agrees() {
     assert_eq!(
         git_out(repo, &["rev-parse", "HEAD"]),
         head_before,
-        "--dry must not move HEAD"
+        "--dry-run must not move HEAD"
     );
 
     let args = finish_args(repo, "foo", Some(msg));
@@ -1222,7 +1222,7 @@ fn a_foreign_commit_that_cannot_move_refuses_the_finish_before_it_lands() {
     assert_eq!(
         git_out(repo, &["rev-parse", "HEAD"]),
         head,
-        "--dry moved nothing"
+        "--dry-run moved nothing"
     );
 
     let mut args = finish_args(repo, "foo", Some("all of foo\n\nas one commit"));

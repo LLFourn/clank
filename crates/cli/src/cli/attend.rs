@@ -12,8 +12,7 @@
 //! turn-end's listing of live background work. Until a listing shows
 //! exactly one live match, nothing is quiet. Quiet lasts only while the
 //! work is listed running and the `--expect` deadline has not passed; at
-//! that deadline the agent is checked in on once. `clank attending` is the
-//! old spelling.
+//! that deadline the agent is checked in on once.
 
 use super::{AttendArgs, resolve_repo};
 use crate::cli::monitor::Control;
@@ -249,17 +248,6 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(desc.as_deref(), Some("probe run"), "normalised, not raw");
-    }
-
-    #[test]
-    fn the_old_spelling_still_parses() {
-        use clap::Parser;
-        let cli = crate::cli::command::Cli::try_parse_from(["clank", "attending", "sleeper"])
-            .expect("the hidden alias parses");
-        let crate::cli::command::Command::Attend(a) = cli.command else {
-            panic!("not attend");
-        };
-        assert_eq!(a.selector.as_deref(), Some("sleeper"));
     }
 
     #[test]

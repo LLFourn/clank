@@ -230,7 +230,7 @@ pub(crate) fn classify(
     use clank_core::wait::WaitKind as K;
     match kind {
         K::Master => match reason {
-            // Says only what ENDS it. The `clank attending` recipe is
+            // Says only what ENDS it. The `clank attend` recipe is
             // the hint's job (attending-suppresses-standing-wakes),
             // which fires only when a background task is actually
             // live — advertising it unconditionally here would tell an
@@ -1703,7 +1703,7 @@ mod tests {
             "feedback write", // the spelled-out command
             "FINISHED",       // the verdict essay
             "continue|finished|request-changes",
-            "clank unblock",      // the spelled-out unblock
+            "clank block answer", // the spelled-out answer
             "evaluate whether",   // the promote walkthrough
             "full question text", // block question is for the human
             FULL_SHA,             // full sha never appears in the hint

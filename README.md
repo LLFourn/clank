@@ -524,16 +524,6 @@ itself or they exist for one-off upgrades. They still work:
   builds that predate self-retirement; run it once after upgrading from one.
 - `block migrate` flattens the legacy plan-scoped block layout.
 
-Older spellings still work, hidden: `block create` is `block ask`, `unblock`
-is `block answer`, `agent add --global --tool` and `agent remove --global`
-are `team agent add` and `team agent remove`, `open zellij` is `open`, `agent promote` is `agent make-master`, `agent launch` is `agent config`, `team
-delete` is `team remove`, `attending` is `attend`, `--dry` is `--dry-run`,
-`html open --print-path` is `--print`, `shelve` / `unshelve` / `shelve clean`
-are `stash push` / `stash pop` / `stash drop`, `agent add --launch-cmd` /
-`--launch-arg` / `--launch-env` are `--cmd` / `-- …` / `--env`, `queue
-reprioritize` is `reprioritise`, `config <key> get` / `set <value>` are
-`config <key>` / `config <key> <value>`, and `status --tui` is `tui`.
-
 ### Messages: send, interrupt, nudge
 
 Three levels, for three situations:

@@ -49,12 +49,20 @@ fn push(repo: &Path, name: &str) -> anyhow::Result<()> {
 fn pop(repo: &Path, name: &str) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(clank::cli::stash::run_unshelve_alias(
-            clank::cli::UnshelveArgs {
+        .block_on(clank::cli::stash::run(clank::cli::StashArgs {
+            command: Some(clank::cli::StashCmd::Pop(clank::cli::StashPopArgs {
                 plan: Some(name.into()),
                 repo: Some(repo.into()),
+            })),
+            push: clank::cli::StashPushArgs {
+                plan: None,
+                repo: None,
+                waiting_for: None,
+                to_queue: false,
+                priority: None,
+                dry: false,
             },
-        ))
+        }))
 }
 fn stashed_foo() -> TestEnv {
     let env = fixture();

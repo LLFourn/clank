@@ -87,7 +87,6 @@ async fn team_with_standby() -> TestEnv {
         "--repo",
         repo.to_str().unwrap(),
         "review.adhoc_feedback",
-        "set",
         "true",
     ])
     .unwrap();

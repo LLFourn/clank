@@ -1,8 +1,7 @@
 //! `clank stash` — set an in-flight plan's commits aside (bare, or
 //! `push`) and restore them later (`pop`), with `show` / `drop` /
 //! `list`. The verbs mirror `git stash`, bare-is-push included
-//! (rename-shelve-to-stash, stash-does-what-you-mean; formerly
-//! `clank shelve`/`unshelve`, kept as hidden aliases for a release).
+//! (rename-shelve-to-stash, stash-does-what-you-mean).
 //!
 //! Push and pop are one transaction each (`stash_txn`): the result is
 //! built in the object database, checked against the working tree, and
@@ -31,9 +30,7 @@ use crate::lifecycle::PlanKey;
 use crate::rebuild::CachePolicy;
 use clank_core::ids::CommitSha;
 
-use super::{
-    ShelveArgs, ShelveCmd, StashArgs, StashCmd, StashPushArgs, StashShowArgs, UnshelveArgs,
-};
+use super::{StashArgs, StashCmd, StashPushArgs, StashShowArgs};
 
 /// On-disk stash record — `.clank/stash/<plan>.json` for new pushes,
 /// `.clank/shelved/<plan>.json` for legacy ones (read-both). The wire
@@ -206,7 +203,7 @@ pub fn scan_stash(repo: &Path) -> Vec<(String, StashRecord)> {
 }
 
 /// The bare form's options belong to the bare form. Parsed before a
-/// verb they would be silently dropped — `clank stash --dry drop foo`
+/// verb they would be silently dropped — `clank stash --dry-run drop foo`
 /// running the drop — so a verb with any of them set is refused here,
 /// before anything is touched (codex on 70a17f8).
 pub fn refuse_parent_options(args: &StashArgs) -> anyhow::Result<()> {
@@ -260,55 +257,6 @@ pub async fn run(args: StashArgs) -> anyhow::Result<()> {
         }
         Some(StashCmd::List(a)) => run_list(a.repo.as_deref()).await,
     }
-}
-
-/// Hidden-alias adapter: `clank shelve [clean]` is `clank stash
-/// [drop]`, spelled the old way — the SAME `StashArgs`, so the
-/// parent-option refusal and the single-stash inference hold for the
-/// alias exactly as for the command (codex on c7cf432).
-pub fn shelve_as_stash(args: ShelveArgs) -> StashArgs {
-    StashArgs {
-        command: args.command.map(|c| match c {
-            ShelveCmd::Clean(a) => StashCmd::Drop(super::StashDropArgs {
-                plan: a.plan,
-                repo: a.repo,
-            }),
-        }),
-        push: StashPushArgs {
-            plan: args.plan,
-            repo: args.repo,
-            waiting_for: args.waiting_for,
-            to_queue: args.to_queue,
-            priority: args.priority,
-            dry: args.dry,
-        },
-    }
-}
-
-pub async fn run_shelve_alias(args: ShelveArgs) -> anyhow::Result<()> {
-    run(shelve_as_stash(args)).await
-}
-
-/// Hidden-alias adapter: `clank unshelve` is `clank stash pop`.
-pub fn unshelve_as_stash(args: UnshelveArgs) -> StashArgs {
-    StashArgs {
-        command: Some(StashCmd::Pop(super::StashPopArgs {
-            plan: args.plan,
-            repo: args.repo,
-        })),
-        push: StashPushArgs {
-            plan: None,
-            repo: None,
-            waiting_for: None,
-            to_queue: false,
-            priority: None,
-            dry: false,
-        },
-    }
-}
-
-pub async fn run_unshelve_alias(args: UnshelveArgs) -> anyhow::Result<()> {
-    run(unshelve_as_stash(args)).await
 }
 
 /// The stem a pop/show/drop means: the named one, or the only one

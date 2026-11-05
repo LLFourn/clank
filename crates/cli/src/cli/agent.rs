@@ -5,7 +5,7 @@
 //! `BTreeMap<AgentLabel, RosterAgent>` where each entry carries
 //! its definition (tool / launch / initial_prompt) AND its role
 //! (master / commit / gate). There is no separate `team`.
-//! `agent add` is ONE step (definition + role); `agent promote`
+//! `agent add` is ONE step (definition + role); `agent make-master`
 //! picks the master; the ROLE RESOLVER
 //! (`agent_store::try_resolve_via_team`) reads the roster directly.
 //! The per-agent skeleton at `.clank/agents/<label>/config.json`
@@ -1522,11 +1522,10 @@ fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
     Err(anyhow::anyhow!("failed to exec `{}`: {err}", c.program))
 }
 
-// ── clank agent add / promote / remove ────────────────────
+// ── clank agent add / make-master / remove ────────────────
 //
 // The repo's `agents` IS the roster. `agent add` is ONE step
-// (definition + role). Two modes (the library is `team agent`, and
-// the hidden `--global` spelling routes there):
+// (definition + role). Two modes (the library is `team agent`):
 //   - repo `--tool`: define a fresh agent inline → insert a
 //     RosterAgent with the `--review` role;
 //   - repo by-name (no `--tool`): copy a description from the
@@ -1534,7 +1533,7 @@ fn exec_composed(c: ComposedLaunch, repo: Option<&Path>) -> anyhow::Result<()> {
 // Per-agent skeletons hold only state (session / auto_mode /
 // wake sources) — never declaration.
 
-/// `clank agent add <label> [--global] [--tool ...] [--review ...]`
+/// `clank agent add <label> [--tool ...] [--review ...]`
 /// — thin shell: parse the label + role, build the launch profile,
 /// dispatch to the matching `pub` core by scope/tool.
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
@@ -1542,20 +1541,13 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     add_with_home(args, home.as_deref())
 }
 
-/// [`add`] with `$HOME` passed in. `--global` writes only the user
-/// library and never resolves, let alone initializes, a repo.
+/// [`add`] with `$HOME` passed in.
 fn add_with_home(args: AgentAddArgs, home: Option<&Path>) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
     let role = args.review.map_or(NewRole::Default, |kind| {
         NewRole::Given(ReviewKind::from(kind).into())
     });
-
-    if args.global {
-        let (label, desc) = library_entry_from_add(&args)?;
-        let home = home.ok_or_else(|| anyhow::anyhow!("the agent library needs $HOME"))?;
-        return declare_global_agent(home, &label, desc);
-    }
 
     let repo = resolve_repo(args.repo.as_deref())?;
     match args.tool {
@@ -2035,8 +2027,8 @@ fn insert_roster_agent(
 /// Add `<label>` to THIS repo's roster BY NAME: copy its
 /// description from the user-scope `agents` library and insert it
 /// with the given role. Errors if the label isn't in the library
-/// (suggesting `--tool` to define it inline, or `agent add
-/// --global --tool` to populate the library first).
+/// (suggesting `--tool` to define it inline, or `team agent add
+/// --tool` to populate the library first).
 /// The description `<label>` carries in the user-scope `agents`
 /// library. Errors with the two ways to define one when absent.
 fn library_description(
@@ -2148,7 +2140,7 @@ fn swap(args: AgentSwapArgs) -> anyhow::Result<()> {
     swap_repo_agent(&repo, home.as_deref(), &out, &into)
 }
 
-/// `clank agent promote <name>` — thin shell.
+/// `clank agent make-master <name>` — thin shell.
 fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
@@ -2255,22 +2247,14 @@ pub fn set_repo_review(repo: &Path, label: &AgentLabel, tier: ReviewKind) -> any
     Ok(())
 }
 
-/// `clank agent remove <label> [--global]` — thin shell.
+/// `clank agent remove <label>` — thin shell.
 fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-
-    if args.global {
-        remove_global_agent(&library_home()?, &label)?;
-    } else {
-        let repo = resolve_repo(args.repo.as_deref())?;
-        // Capture the role BEFORE removal: only a reviewer's pane is in
-        // scope (master panes are deliberately left alone).
-        remove_repo_agent(&repo, &label)?;
-        // Pane closure moved to the TUI's roster→pane reconciler
-        // (tui-zellij-pane-reconcile).
-    }
-    Ok(())
+    let repo = resolve_repo(args.repo.as_deref())?;
+    // Pane closure is the TUI's roster→pane reconciler's
+    // (tui-zellij-pane-reconcile).
+    remove_repo_agent(&repo, &label)
 }
 
 /// Remove an agent DESCRIPTION from the user-scope `agents`
@@ -2442,23 +2426,6 @@ fn library_entry(
     ))
 }
 
-/// The same entry, from the old `clank agent add --global --tool` spelling.
-fn library_entry_from_add(args: &AgentAddArgs) -> anyhow::Result<(AgentLabel, AgentDescription)> {
-    let label = AgentLabel::parse(&args.label)
-        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let tool = args.tool.ok_or_else(|| {
-        anyhow::anyhow!("--global requires --tool (a library description needs a tool)")
-    })?;
-    Ok((
-        label,
-        AgentDescription {
-            tool: tool.into(),
-            launch: launch_from_add(args)?,
-            initial_prompt: args.initial_prompt.clone(),
-        },
-    ))
-}
-
 /// `clank team agent list`: each description's label, tool and launch.
 pub fn print_library(home: &Path, json: bool) -> anyhow::Result<()> {
     let file = read_user_config(home)?;
@@ -2504,17 +2471,10 @@ pub fn print_library(home: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 fn launch_from_add(args: &AgentAddArgs) -> anyhow::Result<Option<LaunchConfig>> {
-    let mut env = parse_env_overrides(&args.env)?;
-    env.extend(parse_env_overrides(&args.launch_envs)?);
-    let tool_args = if args.tool_args.is_empty() {
-        args.launch_args.clone()
-    } else {
-        args.tool_args.clone()
-    };
     Ok(build_launch(
-        args.cmd.clone().or_else(|| args.launch_cmd.clone()),
-        tool_args,
-        env,
+        args.cmd.clone(),
+        args.tool_args.clone(),
+        parse_env_overrides(&args.env)?,
     ))
 }
 
@@ -3395,35 +3355,6 @@ mod tests {
     }
 
     #[test]
-    fn a_global_add_never_touches_the_repo() {
-        use crate::cli::command::{Cli, Command};
-        use clap::Parser;
-        let repo = git_repo();
-        let home = tempfile::tempdir().unwrap();
-        let repo_arg = repo.path().to_str().unwrap();
-        let Command::Agent(crate::cli::AgentArgs {
-            command: crate::cli::AgentCmd::Add(args),
-        }) = Cli::try_parse_from([
-            "clank", "agent", "add", "web", "--global", "--tool", "codex", "--repo", repo_arg,
-        ])
-        .unwrap()
-        .command
-        else {
-            panic!("agent add --global")
-        };
-        let before = tree(repo.path());
-        add_with_home(args, Some(home.path())).unwrap();
-        assert_eq!(tree(repo.path()), before);
-        assert!(!repo.path().join(".clank").exists());
-        assert!(
-            read_user_config(home.path())
-                .unwrap()
-                .agents
-                .contains_key(&AgentLabel::parse("web").unwrap())
-        );
-    }
-
-    #[test]
     fn concurrent_first_adds_keep_both_agents_and_one_master() {
         for _ in 0..10 {
             let repo = git_repo();
@@ -3805,7 +3736,7 @@ mod tests {
         assert!(format!("{err:#}").contains("already on this repo's roster"));
     }
 
-    // ── agent promote ─────────────────────────────────────
+    // ── agent make-master ─────────────────────────────────
 
     #[test]
     fn set_repo_master_sets_and_demotes_previous() {
@@ -3919,84 +3850,6 @@ mod tests {
         let web = &roster.agents[&AgentLabel::parse("web").unwrap()];
         assert_eq!(web.launch.as_ref().unwrap().args, AWKWARD);
         assert_eq!(web.role, RosterRole::Standby);
-    }
-
-    #[test]
-    fn the_old_flags_build_the_same_launch() {
-        let old = add_args(&[
-            "web",
-            "--tool",
-            "codex",
-            "--launch-cmd",
-            "codex2",
-            "--launch-env",
-            "A=1",
-            "--launch-arg",
-            "--no-daemon",
-            "--launch-arg",
-            "-c",
-        ]);
-        let new = add_args(&[
-            "web",
-            "--tool",
-            "codex",
-            "--cmd",
-            "codex2",
-            "--env",
-            "A=1",
-            "--",
-            "--no-daemon",
-            "-c",
-        ]);
-        assert_eq!(
-            launch_from_add(&old).unwrap(),
-            launch_from_add(&new).unwrap()
-        );
-    }
-
-    #[test]
-    fn mixing_the_old_flags_with_the_new_form_is_refused() {
-        for argv in [
-            &[
-                "clank",
-                "agent",
-                "add",
-                "w",
-                "--tool",
-                "codex",
-                "--launch-arg",
-                "x",
-                "--",
-                "y",
-            ][..],
-            &[
-                "clank",
-                "agent",
-                "add",
-                "w",
-                "--tool",
-                "codex",
-                "--launch-cmd",
-                "a",
-                "--cmd",
-                "b",
-            ],
-            &[
-                "clank",
-                "agent",
-                "add",
-                "w",
-                "--tool",
-                "codex",
-                "--launch-env",
-                "A=1",
-                "--env",
-                "B=2",
-            ],
-        ] {
-            let err = parse(argv).unwrap_err().to_string();
-            assert!(err.contains("cannot be used with"), "{argv:?}: {err}");
-        }
     }
 
     #[test]
@@ -4667,52 +4520,6 @@ mod tests {
         let phantom = AgentLabel::parse("phantom").unwrap();
         let err = remove_repo_agent(repo.path(), &phantom).unwrap_err();
         assert!(format!("{err:#}").contains("not on this repo's roster"));
-    }
-
-    /// `clank team agent add` and the old `clank agent add --global`
-    /// describe the same library entry, launch included.
-    #[test]
-    fn both_library_spellings_describe_the_same_entry() {
-        use crate::cli::command::{Cli, Command};
-        use clap::Parser;
-        let tail = [
-            "--tool",
-            "codex",
-            "--cmd",
-            "codex-beta",
-            "--env",
-            "CODEX_HOME=/h",
-            "--",
-            "--no-daemon",
-        ];
-        let new: Vec<&str> = ["clank", "team", "agent", "add", "web"]
-            .into_iter()
-            .chain(tail)
-            .collect();
-        let old: Vec<&str> = ["clank", "agent", "add", "web", "--global"]
-            .into_iter()
-            .chain(tail)
-            .collect();
-        let Command::Team(crate::cli::TeamArgs {
-            command:
-                crate::cli::TeamCmd::Agent(crate::cli::TeamAgentArgs {
-                    command: crate::cli::TeamAgentCmd::Add(new),
-                }),
-        }) = Cli::try_parse_from(new).unwrap().command
-        else {
-            panic!("team agent add")
-        };
-        let Command::Agent(crate::cli::AgentArgs {
-            command: crate::cli::AgentCmd::Add(old),
-        }) = Cli::try_parse_from(old).unwrap().command
-        else {
-            panic!("agent add --global")
-        };
-        let new = library_entry(&new).unwrap();
-        assert_eq!(new, library_entry_from_add(&old).unwrap());
-        let launch = new.1.launch.expect("the launch is kept");
-        assert_eq!(launch.command.as_deref(), Some("codex-beta"));
-        assert_eq!(launch.args, vec!["--no-daemon".to_string()]);
     }
 
     /// The library round trip touches only the user's config: no repo is

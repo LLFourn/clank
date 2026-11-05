@@ -3,7 +3,7 @@
 //!
 //! Setup goes through [`TestEnv`] + [`register_team`]: build the
 //! repo ROSTER via the REAL library cores (`clank agent add` /
-//! `clank agent promote`), in a HOME distinct from the repo.
+//! `clank agent make-master`), in a HOME distinct from the repo.
 //! The repo's `agents` IS the operating team — there's no separate
 //! `team` field.
 

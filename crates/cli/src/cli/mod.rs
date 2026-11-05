@@ -48,7 +48,6 @@ pub mod monitor;
 pub mod monitor_upgrade;
 pub mod nudge;
 pub(crate) mod nudge_log;
-pub mod open;
 pub mod open_zellij;
 pub(crate) mod opencode_fork;
 mod owned_callback;
@@ -117,12 +116,8 @@ pub struct ConfigArgs {
 #[derive(Args, Debug)]
 pub struct ConfigKeyArgs {
     /// The value to write. Omit it to show the key, its value and where
-    /// that value comes from. The older `get` and `set <value>` spellings
-    /// still work, so to write the word `get` or `set` itself, use
-    /// `set get` or `set set`.
+    /// that value comes from.
     pub value: Option<String>,
-    #[arg(hide = true)]
-    pub then: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -130,35 +125,32 @@ pub enum ConfigKey {
     /// Review commits outside any plan
     ///
     /// bool, default: false.
-    #[command(name = "review.adhoc_feedback", alias = "review_adhoc_feedback")]
+    #[command(name = "review.adhoc_feedback")]
     ReviewAdhocFeedback(ConfigKeyArgs),
     /// Review a plan's commits
     ///
     /// bool, default: true.
-    #[command(name = "review.plan_feedback", alias = "review_plan_feedback")]
+    #[command(name = "review.plan_feedback")]
     ReviewPlanFeedback(ConfigKeyArgs),
     /// Require a [plan] or [misc] commit subject prefix
     ///
     /// bool, default: false.
-    #[command(
-        name = "review.require_commit_prefix",
-        alias = "review_require_commit_prefix"
-    )]
+    #[command(name = "review.require_commit_prefix")]
     ReviewRequireCommitPrefix(ConfigKeyArgs),
     /// Command to run when an agent blocks
     ///
     /// string or null.
-    #[command(name = "hooks.blocked", alias = "hooks_blocked")]
+    #[command(name = "hooks.blocked")]
     HooksBlocked(ConfigKeyArgs),
     /// Editor that `clank diff` opens
     ///
     /// string or null.
-    #[command(name = "diff.editor.command", alias = "diff_editor_command")]
+    #[command(name = "diff.editor.command")]
     DiffEditorCommand(ConfigKeyArgs),
     /// Whether `clank diff` waits for the editor
     ///
     /// bool, default: false; `--wait` / `--no-wait` override it.
-    #[command(name = "diff.wait", alias = "diff_wait")]
+    #[command(name = "diff.wait")]
     DiffWait(ConfigKeyArgs),
     /// Squash a plan into one commit when it finishes
     ///
@@ -166,28 +158,28 @@ pub enum ConfigKey {
     /// if it was already pushed. bool, default: false, though `clank setup`
     /// sets it to true in your user config unless you have set it. `clank
     /// finish --no-squash` skips it for one finish.
-    #[command(name = "finish.autosquash", alias = "finish_autosquash")]
+    #[command(name = "finish.autosquash")]
     FinishAutosquash(ConfigKeyArgs),
     /// Nudge an agent whose state clank cannot read
     ///
     /// For an agent that owes work but whose record clank cannot read: at
     /// most one nudge per stuck interval. duration (30s, 40m, 1h) or
     /// `off`, default: off.
-    #[command(name = "recovery.blind_nudge", alias = "recovery_blind_nudge")]
+    #[command(name = "recovery.blind_nudge")]
     RecoveryBlindNudge(ConfigKeyArgs),
     /// Warn when a running turn goes silent
     ///
     /// For an agent that owes work and whose running turn's record has
     /// been silent this long. duration (30s, 40m, 1h) or `off`, default:
     /// 40m.
-    #[command(name = "recovery.stall_warn", alias = "recovery_stall_warn")]
+    #[command(name = "recovery.stall_warn")]
     RecoveryStallWarn(ConfigKeyArgs),
     /// Nudge a stalled agent after its warning
     ///
     /// Once per quiet period, this long after the warning; the nudge may
     /// stop a tool that is still running. duration (30s, 40m, 1h) or
     /// `off`, default: 5m.
-    #[command(name = "recovery.stall_nudge", alias = "recovery_stall_nudge")]
+    #[command(name = "recovery.stall_nudge")]
     RecoveryStallNudge(ConfigKeyArgs),
 }
 
@@ -456,46 +448,12 @@ pub struct HtmlOpenArgs {
     /// Print the resolved target path on stdout and exit
     /// without launching a browser. Mirrors `--print` on
     /// `clank agent start`, `clank diff`, `clank open`.
-    #[arg(long = "print", alias = "print-path")]
-    pub print_path: bool,
-}
-
-/// `clank open` — bare form opens the zellij agent workspace
-/// (context-aware: new tab in-session, attach-or-create outside;
-/// `clank-open-zellij-context`). Subcommands: `dry` = the
-/// read-only path classifier; `zellij` = the opener, explicit.
-#[derive(Args, Debug)]
-pub struct OpenArgs {
-    #[command(subcommand)]
-    pub command: Option<OpenCmd>,
-    /// Bare `clank open` IS the zellij opener: a tab inside a live
-    /// session, attach-or-create outside one. The SAME OpenZellijArgs
-    /// is flattened here so the bare form's flags can't drift from the
-    /// `zellij` subcommand's (ruthless 8c2206d).
-    #[command(flatten)]
-    pub zellij: OpenZellijArgs,
-}
-
-#[derive(clap::Subcommand, Debug)]
-pub enum OpenCmd {
-    /// Open the workspace, the same as bare `clank open`
-    ///
-    /// Generates a zellij layout (KDL) for the master and reviewer panes
-    /// and spawns it via `zellij --layout`.
-    ///
-    /// Inside an existing zellij session, the layout opens as a
-    /// new tab (no new session is spawned). Outside any session,
-    /// it starts a new session. This is zellij's `--layout`
-    /// behavior — no extra detection in clank.
-    ///
-    /// Use `--print` to emit the composed KDL on stdout + the
-    /// would-be-spawned argv on stderr instead of shelling out.
-    #[command(hide = true)]
-    Zellij(OpenZellijArgs),
+    #[arg(long)]
+    pub print: bool,
 }
 
 #[derive(Args, Debug, Default, Clone, PartialEq, Eq)]
-pub struct OpenZellijArgs {
+pub struct OpenArgs {
     /// Repo root override. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -586,11 +544,6 @@ pub struct StatusArgs {
     /// line per update.
     #[arg(long)]
     pub watch: bool,
-    /// Open the full-screen pane: the same as `clank tui`, which it
-    /// says on stderr. Kept so panes opened before `tui` existed
-    /// still work. Conflicts with --json/--watch/--plan.
-    #[arg(long, conflicts_with_all = ["json", "watch", "plan"])]
-    pub tui: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1323,8 +1276,8 @@ Examples:
     /// Make an agent the repo's master
     ///
     /// The previous master becomes a `commit` reviewer. The agent must
-    /// already be on the roster. (`agent promote` is the old spelling.)
-    #[command(name = "make-master", alias = "promote")]
+    /// already be on the roster.
+    #[command(name = "make-master")]
     Promote(AgentPromoteArgs),
     /// Take an agent off this repo's roster
     ///
@@ -1350,9 +1303,7 @@ Examples:
     /// would run. Given `--cmd`, `--env` or `-- <args>`, that is the
     /// agent's whole new launch (nothing is kept from before); `--clear`
     /// is the bare tool. The agent keeps its role, session and pane, and
-    /// the change applies from its next start. (`agent launch` is the
-    /// old spelling.)
-    #[command(alias = "launch")]
+    /// the change applies from its next start.
     Config(AgentConfigArgs),
 }
 
@@ -1410,9 +1361,6 @@ pub struct AgentAddArgs {
     /// that has none, and `commit` otherwise.
     #[arg(long, value_enum)]
     pub review: Option<ReviewKindArg>,
-    /// The old spelling of `clank team agent add`.
-    #[arg(long, hide = true)]
-    pub global: bool,
     /// The executable `clank agent start` runs, instead of the tool's
     /// own name.
     #[arg(long, value_name = "EXECUTABLE")]
@@ -1422,26 +1370,6 @@ pub struct AgentAddArgs {
     /// tool home goes here: `--env CODEX_HOME=~/.codex-browser`.
     #[arg(long = "env", value_name = "KEY=VAL")]
     pub env: Vec<String>,
-    /// The old spelling of `--cmd`.
-    #[arg(long, value_name = "CMD", hide = true, conflicts_with_all = ["cmd", "tool_args"])]
-    pub launch_cmd: Option<String>,
-    /// The old spelling of the arguments after `--`, one per flag.
-    #[arg(
-        long = "launch-arg",
-        value_name = "ARG",
-        allow_hyphen_values = true,
-        hide = true,
-        conflicts_with = "tool_args"
-    )]
-    pub launch_args: Vec<String>,
-    /// The old spelling of `--env`.
-    #[arg(
-        long = "launch-env",
-        value_name = "KEY=VAL",
-        hide = true,
-        conflicts_with_all = ["env", "tool_args"]
-    )]
-    pub launch_envs: Vec<String>,
     /// Initial prompt passed to the resumed tool as a trailing
     /// positional. Pass `""` to explicitly disable the prompt
     /// (escape hatch when `auto_mode == On` but you don't want
@@ -1502,9 +1430,6 @@ pub struct AgentRemoveArgs {
     /// Agent label to remove.
     #[arg(value_name = "AGENT")]
     pub label: String,
-    /// The old spelling of `clank team agent remove`.
-    #[arg(long, hide = true)]
-    pub global: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -1555,7 +1480,7 @@ pub enum TeamCmd {
     ///
     /// Needs `--force`: clank cannot tell which repos were seeded from
     /// it.
-    #[command(name = "remove", alias = "delete")]
+    #[command(name = "remove")]
     Delete(TeamDeleteArgs),
 }
 
@@ -1692,7 +1617,6 @@ Examples:
     /// Promote a queued item to an active plan.
     Promote(QueuePromoteArgs),
     /// Change a queued item's priority (renames its `NNN-` prefix).
-    #[command(alias = "reprioritize")]
     Reprioritise(QueueReprioritiseArgs),
     /// Move a queued plan back to drafts
     ///
@@ -1732,7 +1656,7 @@ pub struct PickArgs {
     pub purge: bool,
     /// Print the resolved plan order and each plan's commits without
     /// picking anything (the same computation the live run applies).
-    #[arg(long = "dry-run", alias = "dry")]
+    #[arg(long = "dry-run")]
     pub dry: bool,
 }
 
@@ -1808,7 +1732,7 @@ pub struct FinishArgs {
     /// reword plan for a bare `-m` on an already-finished plan (the same
     /// computation the live run applies). Ignored on a plain fresh finish
     /// (no history rewrite happens there).
-    #[arg(long = "dry-run", alias = "dry")]
+    #[arg(long = "dry-run")]
     pub dry: bool,
     /// Finalize even when the review gate hasn't said FINISHED
     /// (unreviewed / continued / changes-requested / pending gate tier).
@@ -1828,7 +1752,7 @@ pub struct FinishArgs {
 ///
 /// The push options live on the parent for the bare form only: with
 /// a verb present they are refused by [`crate::cli::stash::run`]
-/// rather than parsed and dropped — `clank stash --dry drop foo` must
+/// rather than parsed and dropped — `clank stash --dry-run drop foo` must
 /// not run a drop the operator asked to preview (codex on 70a17f8).
 /// Each verb carries its own `--repo`. A verb's name always means the
 /// verb, even after an option (`subcommand_precedence_over_arg`); a
@@ -1918,60 +1842,8 @@ pub struct StashPushArgs {
     #[arg(long, value_name = "N")]
     pub priority: Option<u16>,
     /// Print the plan without changing anything.
-    #[arg(long = "dry-run", alias = "dry")]
+    #[arg(long = "dry-run")]
     pub dry: bool,
-}
-
-/// HIDDEN ALIAS (one release): `clank shelve` → `clank stash push`,
-/// `clank shelve clean` → `clank stash drop`.
-#[derive(Args, Debug)]
-#[command(subcommand_precedence_over_arg = true)]
-pub struct ShelveArgs {
-    #[command(subcommand)]
-    pub command: Option<ShelveCmd>,
-    /// Plan stem to shelve (same parsing as `clank purge`).
-    pub plan: Option<String>,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
-    /// Record that this plan is waiting on another; `clank status`
-    /// nudges to pop once that plan finishes.
-    #[arg(long = "for", value_name = "PLAN")]
-    pub waiting_for: Option<String>,
-    /// Also save the plan body back to the queue for re-attempt
-    /// from scratch (absorbs the removed `clank demote`).
-    #[arg(long)]
-    pub to_queue: bool,
-    /// Queue priority for `--to-queue` (default 500).
-    #[arg(long, value_name = "N")]
-    pub priority: Option<u16>,
-    /// Print the plan without changing anything.
-    #[arg(long = "dry-run", alias = "dry")]
-    pub dry: bool,
-}
-
-#[derive(clap::Subcommand, Debug)]
-pub enum ShelveCmd {
-    /// Permanently discard a plan's shelved commits + state.
-    Clean(ShelveCleanArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct ShelveCleanArgs {
-    /// Shelved plan stem. Optional when exactly one plan is stashed.
-    pub plan: Option<String>,
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub struct UnshelveArgs {
-    /// Shelved plan stem to restore. Optional when exactly one plan is
-    /// stashed.
-    pub plan: Option<String>,
-    /// Repo root. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1992,9 +1864,6 @@ pub struct BlockArgs {
 pub enum BlockCmd {
     /// Ask the human a question, and wait for the answer
     Ask(BlockCreateArgs),
-    /// The old spelling of `block ask`.
-    #[command(hide = true)]
-    Create(BlockCreateArgs),
     /// Answer an agent's question
     Answer(UnblockArgs),
     /// Tidy away this agent's received answers and leftover answer files.
@@ -2007,7 +1876,7 @@ pub enum BlockCmd {
 #[derive(Args, Debug)]
 pub struct BlockMigrateArgs {
     /// Print what would change without touching anything.
-    #[arg(long = "dry-run", alias = "dry")]
+    #[arg(long = "dry-run")]
     pub dry: bool,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -2138,7 +2007,7 @@ pub struct PurgeArgs {
     /// Print the planned rewrite and exit 0 without moving any refs
     /// or touching the index or worktree. With `--drop` it also
     /// names the conflict a live run would stop at.
-    #[arg(long = "dry-run", alias = "dry")]
+    #[arg(long = "dry-run")]
     pub dry: bool,
     /// Collapse the plan-attributed range into a single commit
     /// with the supplied message, moving commits that are not the
@@ -2254,7 +2123,7 @@ mod stash_cli_parse_tests {
     }
 
     /// A parent option before a verb is refused, never parsed and
-    /// dropped: `--dry` before `drop` would otherwise run the drop
+    /// dropped: `--dry-run` before `drop` would otherwise run the drop
     /// (codex on 70a17f8). clap recognises the verb (it is not swallowed
     /// as the plan) and `stash::run` refuses the combination before it
     /// touches anything.
@@ -2262,7 +2131,7 @@ mod stash_cli_parse_tests {
     fn parent_options_are_refused_when_a_verb_is_present() {
         use crate::cli::stash::refuse_parent_options;
         for argv in [
-            &["--dry", "drop", "foo"][..],
+            &["--dry-run", "drop", "foo"][..],
             &["--repo", "/x", "list"],
             &["--repo", "/x", "drop", "foo"],
             &["foo", "list"],
@@ -2279,71 +2148,12 @@ mod stash_cli_parse_tests {
         refuse_parent_options(&parse(&["list"]).unwrap()).unwrap();
         refuse_parent_options(&parse(&["drop", "foo", "--repo", "/x"]).unwrap()).unwrap();
         // And the bare form is never refused for carrying its own options.
-        refuse_parent_options(&parse(&["foo", "--dry", "--repo", "/x"]).unwrap()).unwrap();
-    }
-
-    /// The hidden aliases are the same command in old clothes: parsed
-    /// through the production tree, converted, and refused or inferred
-    /// exactly as `stash` is (codex on c7cf432).
-    #[test]
-    fn the_shelve_and_unshelve_aliases_are_stash_args() {
-        use crate::cli::stash::{refuse_parent_options, shelve_as_stash, unshelve_as_stash};
-        let shelve = |argv: &[&str]| {
-            Cli::try_parse_from(["clank", "shelve"].into_iter().chain(argv.iter().copied())).map(
-                |cli| match cli.command {
-                    Command::Shelve(a) => shelve_as_stash(a),
-                    _ => unreachable!(),
-                },
-            )
-        };
-        // `shelve --dry clean foo`: the verb is the verb, and the stray
-        // option is refused.
-        let a = shelve(&["--dry", "clean", "foo", "--repo", "/x"]).unwrap();
-        assert!(matches!(a.command, Some(StashCmd::Drop(_))));
-        assert!(
-            refuse_parent_options(&a)
-                .unwrap_err()
-                .to_string()
-                .contains("--dry")
-        );
-        // `shelve clean` with no plan infers, like `stash drop`.
-        match shelve(&["clean"]).unwrap().command {
-            Some(StashCmd::Drop(d)) => assert!(d.plan.is_none()),
-            other => panic!("{other:?}"),
-        }
-        // Bare `shelve foo --to-queue` is the bare push.
-        let a = shelve(&["foo", "--to-queue"]).unwrap();
-        assert!(a.command.is_none() && a.push.to_queue && a.push.plan.as_deref() == Some("foo"));
-        refuse_parent_options(&a).unwrap();
-
-        // `unshelve [plan]` is `stash pop [plan]`.
-        let unshelve = |argv: &[&str]| {
-            Cli::try_parse_from(
-                ["clank", "unshelve"]
-                    .into_iter()
-                    .chain(argv.iter().copied()),
-            )
-            .map(|cli| match cli.command {
-                Command::Unshelve(a) => unshelve_as_stash(a),
-                _ => unreachable!(),
-            })
-        };
-        match unshelve(&[]).unwrap().command {
-            Some(StashCmd::Pop(p)) => assert!(p.plan.is_none()),
-            other => panic!("{other:?}"),
-        }
-        match unshelve(&["foo", "--repo", "/x"]).unwrap().command {
-            Some(StashCmd::Pop(p)) => {
-                assert_eq!(p.plan.as_deref(), Some("foo"));
-                assert_eq!(p.repo.as_deref(), Some(std::path::Path::new("/x")));
-            }
-            other => panic!("{other:?}"),
-        }
+        refuse_parent_options(&parse(&["foo", "--dry-run", "--repo", "/x"]).unwrap()).unwrap();
     }
 
     #[test]
     fn the_bare_form_carries_the_push_options_and_each_verb_its_own_repo() {
-        let bare = parse(&["foo", "--dry", "--repo", "/x"]).unwrap();
+        let bare = parse(&["foo", "--dry-run", "--repo", "/x"]).unwrap();
         assert!(bare.command.is_none());
         assert_eq!(bare.push.plan.as_deref(), Some("foo"));
         assert!(bare.push.dry);
@@ -2370,7 +2180,7 @@ mod stash_cli_parse_tests {
             }
             other => panic!("expected drop, got {other:?}"),
         }
-        match parse(&["push", "foo", "--dry"]).unwrap().command {
+        match parse(&["push", "foo", "--dry-run"]).unwrap().command {
             Some(StashCmd::Push(a)) => assert!(a.dry && a.plan.as_deref() == Some("foo")),
             other => panic!("expected push, got {other:?}"),
         }
@@ -2510,16 +2320,10 @@ mod agent_team_cli_parse_tests {
     }
 
     #[test]
-    fn agent_promote_parses() {
+    fn agent_make_master_parses() {
         assert!(
-            AgentT::try_parse_from(["t", "promote", "codex"]).is_ok(),
-            "agent promote <name> must parse"
-        );
-        // The `set-master` alias was DROPPED — it must no longer parse
-        // (regression guard, inverted from the old back-compat assertion).
-        assert!(
-            AgentT::try_parse_from(["t", "set-master", "codex"]).is_err(),
-            "agent set-master alias must no longer parse (dropped)"
+            AgentT::try_parse_from(["t", "make-master", "codex"]).is_ok(),
+            "agent make-master <name> must parse"
         );
     }
 
@@ -2547,17 +2351,6 @@ mod agent_team_cli_parse_tests {
         assert_eq!(
             crate::cli::teams_config::ReviewKind::from(crate::cli::ReviewKindArg::Standby),
             crate::cli::teams_config::ReviewKind::Standby
-        );
-    }
-
-    #[test]
-    fn agent_global_requires_tool_handled_at_runtime() {
-        // `--global` without `--tool` PARSES (the requirement is
-        // enforced at runtime, not by clap, so the by-name path can
-        // omit --tool).
-        assert!(AgentT::try_parse_from(["t", "add", "claude", "--global"]).is_ok());
-        assert!(
-            AgentT::try_parse_from(["t", "add", "claude", "--global", "--tool", "claude"]).is_ok()
         );
     }
 
@@ -2595,7 +2388,7 @@ mod agent_team_cli_parse_tests {
         assert!(TeamT::try_parse_from(["t", "save", "dev"]).is_ok());
         assert!(TeamT::try_parse_from(["t", "save", "dev", "--force"]).is_ok());
         assert!(TeamT::try_parse_from(["t", "list"]).is_ok());
-        assert!(TeamT::try_parse_from(["t", "delete", "dev"]).is_ok());
-        assert!(TeamT::try_parse_from(["t", "delete", "dev", "--force"]).is_ok());
+        assert!(TeamT::try_parse_from(["t", "remove", "dev"]).is_ok());
+        assert!(TeamT::try_parse_from(["t", "remove", "dev", "--force"]).is_ok());
     }
 }

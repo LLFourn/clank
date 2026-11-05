@@ -89,7 +89,7 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // the finalize sits: `reword_in_place` rewords it (a no-descendant reword
     // when it's HEAD; reword-and-replay when it's buried under later work — the
     // common case once autosquash collapses each plan to one commit). No
-    // "must be HEAD" refusal, and no `--dry` short-circuit: the engine's `dry`
+    // "must be HEAD" refusal, and no `--dry-run` short-circuit: the engine's `dry`
     // flag prints the SAME plan the live run applies, so preview and execution
     // cannot drift (ruthless a2314e9).
     if already_finished && message.is_some() && !args.purge && args.squash.is_none() {
@@ -116,7 +116,7 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     // (`finish-squash-idempotent-on-finished`). This path only
     // rewrites the range; it does not touch the finalize commit.
     // Plain `finish` (no purge/squash) still falls through to the
-    // no-op below. `--dry` is NOT short-circuited here: the engine's
+    // no-op below. `--dry-run` is NOT short-circuited here: the engine's
     // own dry mode prints the faithful plan (same computation the
     // live run applies); the one finish-level fact it can't know is
     // framed first.
@@ -167,7 +167,7 @@ pub async fn run(mut args: FinishArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fresh `--squash`/`--purge` `--dry`: print the finalize framing (the one
+/// Fresh `--squash`/`--purge` `--dry-run`: print the finalize framing (the one
 /// finish-level fact the engine can't know), then run the SAME preview +
 /// engine path the live run takes — over a SYNTHETIC, dangling finalize
 /// commit (`git_plumbing::write_finalize_commit`, bit-for-bit the tree the
@@ -382,8 +382,8 @@ async fn run_post_finalize_rewrite(
 }
 
 /// Preview + run the `--squash`/`--purge` range rewrite over `state`. The ONE
-/// path for both `--dry` and live (`args.dry` threads into the engine): live
-/// callers pass the re-folded post-finalize state; the fresh `--dry` passes a
+/// path for both `--dry-run` and live (`args.dry` threads into the engine): live
+/// callers pass the re-folded post-finalize state; the fresh `--dry-run` passes a
 /// synthetic post-finalize state. finish.rs owns no preview text for the
 /// history edit — the engine prints or applies the same computed plan.
 async fn rewrite_with_state(
@@ -575,8 +575,8 @@ async fn finalize(
     message: Option<&str>,
 ) -> anyhow::Result<()> {
     // ONE builder for the finalize commit — the same `write_finalize_commit`
-    // the `--dry` preview walks (ruthless 3bd7882): live IS the preview
-    // commit, ref'd. Built from HEAD's tree, so `--dry` and execution cannot
+    // the `--dry-run` preview walks (ruthless 3bd7882): live IS the preview
+    // commit, ref'd. Built from HEAD's tree, so `--dry-run` and execution cannot
     // drift by construction, and unrelated STAGED changes are never swept
     // into the finalize commit (the old commit-the-index flow did that).
     let head =
@@ -631,7 +631,7 @@ async fn finalize(
 ///
 /// `dry` threads straight into the engine: the preview IS the live plan
 /// computed once and printed instead of applied (same descendants, same
-/// blockers), so `--dry` and execution cannot drift (ruthless a2314e9).
+/// blockers), so `--dry-run` and execution cannot drift (ruthless a2314e9).
 ///
 /// A history rewrite must disclose its extent at least as loudly as its
 /// preview (ruthless 883fb5e): report the replayed-descendant count and the
@@ -910,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_ignores_unrelated_staged_changes() {
-        // ONE builder (`write_finalize_commit`, shared with --dry) reads
+        // ONE builder (`write_finalize_commit`, shared with --dry-run) reads
         // HEAD's tree — so an unrelated STAGED change must NOT be swept into
         // the finalize commit (the old commit-the-index flow did exactly
         // that), and it must still be staged afterwards (ruthless 3bd7882).
