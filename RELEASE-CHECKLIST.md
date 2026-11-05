@@ -7,8 +7,7 @@ item is queueable as written: plan name, problem, shape of the fix.
 
 ## 0. Decisions (made by Lloyd, 2026-11-05)
 
-- **Channels.** These four:
-  - crates.io;
+- **Channels.** These two:
   - prebuilt binaries on GitHub Releases;
   - a `curl | sh` installer served from the website, which fetches
     those binaries.
@@ -251,22 +250,11 @@ item is queueable as written: plan name, problem, shape of the fix.
 
 ### crates.io
 
-- [ ] **`crates-io-packaging`** — three problems:
-  - `clank` depends on four path crates with no `version`, two of them
-    `publish = false` (`crates/core`, `crates/user-config`). By Cargo's
-    rules it cannot be published as it stands (`cargo publish --dry-run`
-    has not been run).
-  - `build.rs:4-9` assumes the crate sits two levels below a workspace. In
-    a registry tarball that path is `~/.cargo/registry/src`, so
-    `stamp_files` reads nothing. Every crates.io build made with the same
-    toolchain and features would then have the same stamp, and monitors
-    would not retire across upgrades (`build_stamp.rs:1-7`). This is read
-    from the source; no tarball build was run.
-  - The crate name `clank` may already be taken on crates.io (unverified).
-
-  Shape: publish the internal crates with versions or fold them into the
-  main crate, make the build stamp work without a workspace (hash the
-  package's own files plus `CARGO_PKG_VERSION`), and claim the name.
+Dropped (Lloyd, 2026-11-05). The name `clank` is taken by an unrelated,
+abandoned 2025 crate, and publishing would mean renaming all five
+packages to `clank-agents-*`. The installer and GitHub Releases cover
+installation. A checkout's `cargo install --path crates/cli --locked`
+still works for building from source.
 
 ### Website
 
