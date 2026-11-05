@@ -736,17 +736,22 @@ pub(crate) fn launch_executable(
 
 /// `claude attach <short id>` and nothing else: `attach` is a
 /// subcommand, and the profile's args belong to the process that is
-/// already running with them. The env goes along as for any launch.
+/// already running with them. Attaching to an existing background session
+/// requires agent view, even when ordinary Claude launches disable it.
 fn compose_attach_launch(
     tool: Tool,
     label: &AgentLabel,
     launch: Option<&LaunchConfig>,
     short_id: &str,
 ) -> ComposedLaunch {
+    let mut env_overrides = launch_env(tool, label, launch);
+    if tool == Tool::Claude {
+        env_overrides.insert(DISABLE_AGENT_VIEW.into(), "0".into());
+    }
     ComposedLaunch {
         program: launch_program(tool, launch),
         args: vec!["attach".into(), short_id.into()],
-        env_overrides: launch_env(tool, label, launch),
+        env_overrides,
     }
 }
 
@@ -2854,7 +2859,10 @@ mod tests {
         let launch = LaunchConfig {
             command: Some("/opt/bin/claude-wrapper".into()),
             args: vec!["--agent".into(), "reviewer".into()],
-            env: BTreeMap::from([("CLANK_X".to_string(), "1".to_string())]),
+            env: BTreeMap::from([
+                ("CLANK_X".to_string(), "1".to_string()),
+                (DISABLE_AGENT_VIEW.to_string(), "1".to_string()),
+            ]),
         };
         let c = compose_attach_launch(Tool::Claude, &label("claude"), Some(&launch), "1f47fd71");
         assert_eq!(c.program, "/opt/bin/claude-wrapper");
@@ -2863,9 +2871,19 @@ mod tests {
             c.env_overrides.get("CLANK_X").map(String::as_str),
             Some("1")
         );
+        assert_eq!(
+            c.env_overrides.get(DISABLE_AGENT_VIEW).map(String::as_str),
+            Some("0")
+        );
         let bare = compose_attach_launch(Tool::Claude, &label("claude"), None, "1f47fd71");
         assert_eq!(bare.program, "claude");
         assert_eq!(bare.args, ["attach", "1f47fd71"]);
+        assert_eq!(
+            bare.env_overrides
+                .get(DISABLE_AGENT_VIEW)
+                .map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]

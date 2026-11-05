@@ -937,7 +937,8 @@ daemon moves a running conversation into a background worker and keeps a
 spare Claude warm in the agent's directory with the agent's environment, and
 that spare's start reads as the agent's. Remote Control has its own switch and
 keeps working. A launch's `--env CLAUDE_CODE_DISABLE_AGENT_VIEW=0` turns agent
-view back on for that agent.
+view back on for that agent. Reattaching an existing background conversation
+enables agent view for the attach client so it can recover that session.
 
 Keep the launch line to the few flags that select a configuration. Structured
 tool configuration (MCP servers, feature switches, allow-lists) belongs in the
