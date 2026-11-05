@@ -1,8 +1,8 @@
 //! Shared knowledge of what `clank init` manages: canonical bodies,
-//! markers, paths, and read-side state classifiers. `init.rs`
-//! (writer) and `cli/open.rs` (reader) both depend on this so the
-//! "what state does init recognize?" predicates live in exactly
-//! one place.
+//! paths, and read-side state classifiers. `init.rs` (writer) and its
+//! readers both depend on this so the "what state does init
+//! recognize?" predicates live in exactly one place. The `post-rewrite`
+//! hook's are in [`crate::post_rewrite`].
 
 use std::path::{Path, PathBuf};
 
@@ -45,15 +45,6 @@ pub fn clank_gitignore_body() -> String {
     out
 }
 
-/// Marker line embedded in the canonical post-rewrite hook so we
-/// can recognize our own across re-runs.
-pub const POST_REWRITE_MARKER: &str = "# clank rewire hook";
-
-/// Canonical body of `.git/hooks/post-rewrite`.
-pub const POST_REWRITE_BODY: &str = "#!/usr/bin/env sh\n\
-# clank rewire hook\n\
-exec clank rewire --from-stdin\n";
-
 pub fn clank_dir(repo: &Path) -> PathBuf {
     repo.join(".clank")
 }
@@ -73,19 +64,6 @@ pub fn plan_md_rel(stem: &str) -> String {
 /// (`.clank/finished/<stem>.md`) — the finalize move's destination.
 pub fn finished_md_rel(stem: &str) -> String {
     format!(".clank/finished/{stem}.md")
-}
-
-/// Resolve the real `post-rewrite` hook path in the SHARED
-/// (common) git dir. `None` if it can't be resolved (not a git
-/// repo). Honors `.git`-as-file linked worktrees: hooks live in
-/// the main repo's shared `hooks/`, so this uses the common dir.
-pub fn post_rewrite_hook_path(repo: &Path) -> Option<PathBuf> {
-    // `hooks/` is SHARED across linked worktrees → the common dir.
-    Some(
-        crate::git_io::common_dir(repo)
-            .ok()?
-            .join("hooks/post-rewrite"),
-    )
 }
 
 /// Classification of `.clank/.gitignore`'s current state.
@@ -129,35 +107,6 @@ pub fn classify_gitignore_body(body: &str) -> GitignoreState {
         return GitignoreState::Legacy;
     }
     GitignoreState::Drifted
-}
-
-/// Classification of the resolved `post-rewrite` hook.
-///
-/// `Missing` (absent) and `Refreshable` (marker-present but
-/// body has drifted) are repaired by `clank init`. `Foreign`
-/// (file exists, no marker) makes init only warn — needs
-/// `--force-hooks` — so surface as a warning, not an InitGap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HookState {
-    /// Git can't resolve a hook path (not a real git repo).
-    Indeterminate,
-    Missing,
-    Canonical,
-    Refreshable,
-    Foreign,
-}
-
-pub fn classify_post_rewrite_hook(repo: &Path) -> HookState {
-    let Some(path) = post_rewrite_hook_path(repo) else {
-        return HookState::Indeterminate;
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(body) if body == POST_REWRITE_BODY => HookState::Canonical,
-        Ok(body) if body.contains(POST_REWRITE_MARKER) => HookState::Refreshable,
-        Ok(_) => HookState::Foreign,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HookState::Missing,
-        Err(_) => HookState::Foreign,
-    }
 }
 
 #[cfg(test)]

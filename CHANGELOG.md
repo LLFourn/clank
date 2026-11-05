@@ -7,6 +7,12 @@ All notable changes to clank are recorded here. The format follows
 
 ## [Unreleased]
 
+- `clank init` installs the `post-rewrite` hook where `core.hooksPath`
+  points, chains an existing plain hook behind clank's instead of skipping
+  it, and leaves symlinked and hook-manager hooks alone. `clank doctor`
+  reports whether rewire is wired and how to wire it.
+- `clank init --force-hooks` is removed.
+
 ## [0.1.0]
 
 The first public release.

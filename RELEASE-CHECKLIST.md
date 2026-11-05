@@ -158,15 +158,14 @@ item is queueable as written: plan name, problem, shape of the fix.
   config that fails to parse a loud error (`doctor` reports it as a
   failure). Say in the README which sessions survive an upgrade.
 
-- [ ] **`post-rewrite-hook-chaining`** — when `.git/hooks/post-rewrite`
-  already exists with someone else's content, `clank init` warns and skips
-  it (`cli/init.rs:293-301`), and `--force-hooks` overwrites it. The hook is
-  always written to `<common-dir>/hooks` (`cli/init.rs:314-320`) and
-  `core.hooksPath` is never consulted (no match in `crates/cli/src`), so a
-  repo using a hook manager never runs rewire. Feedback then silently fails
-  to follow a rebase. Shape: honour `core.hooksPath`, and chain into a
-  foreign hook idempotently instead of skipping it; `doctor` reports a hook
-  that is not wired.
+- [x] **`post-rewrite-hook-chaining`** — done 2026-11-05. One resolver
+  (`git_io::post_rewrite_slot`) finds the hook git runs, `core.hooksPath`
+  included, for both `clank init` and `doctor`. Init installs into an empty
+  slot and chains a plain foreign hook behind a wrapper that hands both
+  consumers git's stream; it writes nothing to a disabled, symlinked or
+  managed (husky, lefthook, pre-commit) hook. `doctor` reports Wired,
+  Delegated, Unwired (with the owner's recipe) or Off. The overwrite flag
+  is gone.
 
 - [ ] **`first-run-walk-per-harness`** — walk a clean user account
   (empty `~/.clank`, no skills installed): install → `clank setup` →

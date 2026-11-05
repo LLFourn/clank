@@ -530,7 +530,10 @@ itself or they exist for one-off upgrades. They still work:
 
 - `stop-hook` and `question-hook` are the tool hooks `clank setup` installs.
 - `rewire --from-stdin` is the `post-rewrite` git hook `clank init` installs;
-  it remaps feedback after a rebase or amend.
+  it remaps feedback after a rebase or amend. Init puts it where git looks,
+  `core.hooksPath` included, and chains an existing plain hook behind it.
+  A symlinked hook or one a hook manager owns (husky, lefthook, pre-commit)
+  is left alone, and `clank doctor` prints what to add to it.
 - `monitor start` runs the per-repo watcher that every wait and TUI shares.
   A parked wait starts one when none is running, and an open `clank tui`
   keeps one up: when its monitor retires or exits, the TUI starts the

@@ -3224,7 +3224,7 @@ mod tests {
     }
 
     fn hook_path(repo: &Path) -> PathBuf {
-        crate::init_facts::post_rewrite_hook_path(repo).unwrap()
+        crate::git_io::post_rewrite_slot(repo).unwrap().path()
     }
 
     /// Every file under `root`, `.git` included, with its bytes.
@@ -3259,7 +3259,7 @@ mod tests {
         let hook = hook_path(repo.path());
         assert_eq!(
             std::fs::read_to_string(&hook).unwrap(),
-            crate::init_facts::POST_REWRITE_BODY
+            crate::post_rewrite::POST_REWRITE_BODY
         );
         assert_eq!(
             std::fs::metadata(&hook).unwrap().permissions().mode() & 0o111,
@@ -3388,12 +3388,14 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_hook_is_kept_and_the_first_add_says_so() {
+    fn a_foreign_hook_is_chained_and_the_first_add_says_so() {
+        use std::os::unix::fs::PermissionsExt;
         let repo = git_repo();
         let hook = hook_path(repo.path());
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
         let foreign = "#!/bin/sh\necho mine\n";
         std::fs::write(&hook, foreign).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let qwen = AgentLabel::parse("qwen").unwrap();
         let setup = insert_roster_agent(
             repo.path(),
@@ -3405,11 +3407,18 @@ mod tests {
         )
         .unwrap()
         .expect("a first add sets the repo up");
-        assert_eq!(std::fs::read_to_string(&hook).unwrap(), foreign);
+        assert_eq!(
+            std::fs::read_to_string(&hook).unwrap(),
+            crate::post_rewrite::WRAPPER_BODY
+        );
+        assert_eq!(
+            std::fs::read_to_string(hook.with_file_name(crate::post_rewrite::CHAINED)).unwrap(),
+            foreign
+        );
         assert!(
             setup
                 .summary()
-                .contains("kept your existing post-rewrite hook"),
+                .contains("chained your post-rewrite hook behind clank's"),
             "{}",
             setup.summary()
         );
@@ -3420,7 +3429,7 @@ mod tests {
     #[test]
     fn an_add_to_an_initialized_repo_changes_only_the_roster() {
         let repo = git_repo();
-        crate::cli::init::setup_repo_support(repo.path(), false).unwrap();
+        crate::cli::init::setup_repo_support(repo.path()).unwrap();
         crate::cli::init::seed_bare(None, repo.path()).unwrap();
         let mut before = tree(repo.path());
         let qwen = AgentLabel::parse("qwen").unwrap();

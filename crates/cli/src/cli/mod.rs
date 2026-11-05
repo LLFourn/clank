@@ -188,9 +188,6 @@ pub struct InitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Overwrite an existing foreign `post-rewrite` hook.
-    #[arg(long)]
-    pub force_hooks: bool,
     /// With `--team <name>`: replace an existing VALID repo roster.
     /// Without it, `--team` refuses to clobber a configured repo
     /// roster (run `clank team save <name>` first to keep local
