@@ -32,6 +32,7 @@ struct Fixture {
     author: AgentLabel,
     tool: Tool,
     producer: Option<(i32, clank::proc_identity::ProcToken)>,
+    timer_clock: Option<PathBuf>,
 }
 impl Fixture {
     fn new(tool: Tool, receipts: bool) -> Self {
@@ -116,6 +117,7 @@ impl Fixture {
             author,
             tool,
             producer: None,
+            timer_clock: None,
         };
         if receipts {
             fixture.enable_receipts();
@@ -150,7 +152,20 @@ impl Fixture {
             )
             .current_dir(&self.hook_cwd)
             .kill_on_drop(true);
+        if let Some(clock) = &self.timer_clock {
+            command.env("CLANK_TEST_TIMER_CLOCK", clock);
+        }
         command
+    }
+    /// Hold every process this fixture starts from now on to a logical
+    /// timer clock reading `secs`, and move it there for those already
+    /// running.
+    fn set_timer_clock(&mut self, secs: u64) {
+        let clock = self.repo.join("timer-clock");
+        let staged = self.repo.join("timer-clock.next");
+        std::fs::write(&staged, secs.to_string()).unwrap();
+        std::fs::rename(&staged, &clock).unwrap();
+        self.timer_clock = Some(clock);
     }
     fn hook(&self, session_start: bool) -> Command {
         let mut command = self.command();
@@ -558,9 +573,36 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
     fixture.retire(monitor).await;
 }
 
+/// Until the monitor has logged a line containing every needle of each
+/// entry, in any order; `LIMIT` only bounds a stall.
+async fn logged(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    wanted: &[&[&str]],
+) {
+    let mut missing: Vec<&[&str]> = wanted.to_vec();
+    tokio::time::timeout(LIMIT, async {
+        while !missing.is_empty() {
+            let Some(line) = lines.next_line().await.unwrap() else {
+                panic!("monitor closed while {missing:?} were still owed");
+            };
+            missing.retain(|needles| !needles.iter().all(|needle| line.contains(needle)));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the monitor never logged {wanted:?}"));
+}
+
+const ADMITTED: &[&str] = &["monitor agent wait admitted"];
+const COMMITTED: &[&str] = &["monitor delivery committed"];
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_native_deadline() {
-    let fixture = Fixture::new(Tool::Codex, false);
+    let mut fixture = Fixture::new(Tool::Codex, false);
+    let start = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+    let anchor = start - 105;
+    // Between slot 10 (anchor + 100) and slot 11: nothing falls due
+    // until the test moves the clock.
+    fixture.set_timer_clock(anchor + 105);
     clank::agent_store::update_agent_config(&fixture.repo, &fixture.author, |cfg| {
         cfg.wait_events.clear();
     })
@@ -568,7 +610,10 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
     let mut monitor = fixture
         .command()
         .args(["monitor", "start", "--repo", fixture.repo.to_str().unwrap()])
-        .env("RUST_LOG", "clank::cli::monitor=debug")
+        .env(
+            "RUST_LOG",
+            "clank::cli::monitor=debug,clank::cli::timer_source=debug",
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -584,28 +629,15 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
     );
     let mut stderr = BufReader::new(monitor.stderr.take().unwrap()).lines();
     let first_hook = fixture.hook_child(false).await;
-    async fn admitted(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>) {
-        tokio::time::timeout(LIMIT, async {
-            while let Some(line) = lines.next_line().await.unwrap() {
-                if line.contains("monitor agent wait admitted") {
-                    return;
-                }
-            }
-            panic!("monitor closed before admission");
-        })
-        .await
-        .expect("waiter must attach to shared monitor");
-    }
-    admitted(&mut stderr).await;
-    let anchor = time::OffsetDateTime::now_utc() - time::Duration::seconds(100);
-    let anchor = anchor.replace_nanosecond(0).unwrap();
+    logged(&mut stderr, &[ADMITTED]).await;
+    let anchor_at = time::OffsetDateTime::from_unix_timestamp(anchor as i64).unwrap();
     clank::agent_store::update_agent_config(&fixture.repo, &fixture.author, |cfg| {
         cfg.wait_events = vec![WaitEventSource::Timer(
             clank_core::agent_config::TimerSource {
                 interrupt: false,
                 interrupt_message: None,
                 name: "recurring-monitor".into(),
-                due_at: anchor
+                due_at: anchor_at
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap(),
                 repeat_every: Some("10s".into()),
@@ -638,13 +670,24 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
     let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 1, "offline slots coalesce");
     let row = &rows[0];
-    let previous_last = row["item"]["recurrence"]["last_slot"].as_u64().unwrap();
-    assert!(row["item"]["recurrence"]["count"].as_u64().unwrap() >= 11);
+    let recurrence = &row["item"]["recurrence"];
+    assert_eq!(
+        (
+            recurrence["first_slot"].as_u64(),
+            recurrence["last_slot"].as_u64(),
+            recurrence["count"].as_u64()
+        ),
+        (Some(0), Some(10), Some(11)),
+        "every slot due on the logical clock, in one event"
+    );
     let selector = row["id"].as_str().unwrap();
     let key = row["source"].as_str().unwrap();
     let wal = clank::agent_store::agents_root(&fixture.repo)
         .join("codex/events")
         .join(format!("{key}.jsonl"));
+    // The first wake's evidence is appended by the monitor after the hook
+    // has exited, so the WAL settles only once that commit is logged.
+    logged(&mut stderr, &[COMMITTED]).await;
     let accepted_bytes = std::fs::read(&wal).unwrap();
     let replay = fixture.hook_child(false).await;
     let replay = tokio::time::timeout(LIMIT, replay.wait_with_output())
@@ -652,6 +695,14 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
         .unwrap()
         .unwrap();
     assert!(replay.status.success());
+    let replay: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert!(
+        replay["reason"]
+            .as_str()
+            .unwrap()
+            .contains("recurring work")
+    );
+    logged(&mut stderr, &[COMMITTED]).await;
     assert_eq!(
         std::fs::read(&wal).unwrap(),
         accepted_bytes,
@@ -672,7 +723,16 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
         String::from_utf8_lossy(&ack.stderr)
     );
     let second_hook = fixture.hook_child(false).await;
-    admitted(&mut stderr).await;
+    let next_due = (anchor + 110).to_string();
+    logged(&mut stderr, &[ADMITTED, &["timer armed", &next_due]]).await;
+    fixture.set_timer_clock(anchor + 110);
+    // A watcher invalidation racing the deadline: the refresh it causes
+    // may arm the slot but never accept it, so only the deadline can.
+    filetime::set_file_mtime(
+        clank::agent_store::agents_root(&fixture.repo).join("codex"),
+        filetime::FileTime::now(),
+    )
+    .unwrap();
     let second = tokio::time::timeout(LIMIT, second_hook.wait_with_output())
         .await
         .unwrap()
@@ -706,11 +766,15 @@ async fn shared_monitor_recurring_timer_watches_config_and_ack_then_rearms_nativ
         .filter(|row| row["acked"] == false)
         .collect();
     assert_eq!(pending.len(), 1);
-    assert!(
-        pending[0]["item"]["recurrence"]["first_slot"]
-            .as_u64()
-            .unwrap()
-            > previous_last
+    let recurrence = &pending[0]["item"]["recurrence"];
+    assert_eq!(
+        (
+            recurrence["first_slot"].as_u64(),
+            recurrence["last_slot"].as_u64(),
+            recurrence["count"].as_u64()
+        ),
+        (Some(11), Some(11), Some(1)),
+        "the slot the clock was moved to, and only it"
     );
     assert_ne!(pending[0]["id"].as_str().unwrap(), selector);
     assert!(

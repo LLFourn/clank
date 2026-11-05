@@ -485,6 +485,9 @@ async fn items_with_policy(
             source_tx.clone().into(),
         )?;
         timers.arm();
+        // The initial pass answers without parking, so it fires what was
+        // due while nobody waited rather than leave it to the loop.
+        timers.due();
         Some(timers)
     };
     let invocation_keys = timers
@@ -652,7 +655,7 @@ async fn items_with_policy(
             let mut external: Vec<WaitItem> = Vec::new();
             let timer_deadline = timers.as_ref().and_then(|timers| timers.next_deadline());
             let existing_wake = tokio::select! {
-                _ = crate::cli::timer_source::deadline(timer_deadline) => {
+                _ = crate::cli::timer_source::clock::sleep_until(timer_deadline) => {
                     if let Some(timers) = &mut timers { timers.due(); }
                     timer_backlog.invalidate();
                     false
