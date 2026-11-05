@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "clank"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "clank-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "clank-user-config"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "clank-web"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "clank-web-cloudflare"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
