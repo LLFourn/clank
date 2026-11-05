@@ -59,6 +59,7 @@ impl Fixture {
     }
 
     fn git_in(&self, dir: &Path, args: &[&str]) -> String {
+        no_child_writes_under(&self.root());
         let out = Command::new("git")
             .current_dir(dir)
             .env("PATH", self.path_env())
@@ -174,6 +175,59 @@ impl Fixture {
     }
 }
 
+/// Waits until no child of this test process holds a file under `root`
+/// open for writing. On Linux a sibling test's fork inherits every fd
+/// open at that instant until its exec closes them; exec'ing a script
+/// one of those children still holds for writing fails with ETXTBSY.
+/// The writer here has already closed its own fd, so only children
+/// forked during that window can hold one, and they release it on exec.
+#[cfg(target_os = "linux")]
+fn no_child_writes_under(root: &Path) {
+    let me = std::process::id().to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let busy = std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                let pid = entry.path();
+                let Ok(stat) = std::fs::read_to_string(pid.join("stat")) else {
+                    return false;
+                };
+                let after_comm = stat.rsplit_once(") ").map(|(_, rest)| rest).unwrap_or("");
+                if after_comm.split(' ').nth(1) != Some(me.as_str()) {
+                    return false;
+                }
+                std::fs::read_dir(pid.join("fd"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|fd| {
+                        let writes =
+                            std::fs::read_to_string(pid.join("fdinfo").join(fd.file_name()))
+                                .ok()
+                                .and_then(|info| {
+                                    info.lines()
+                                        .find_map(|l| l.strip_prefix("flags:"))
+                                        .and_then(|f| u32::from_str_radix(f.trim(), 8).ok())
+                                })
+                                .is_some_and(|flags| flags & 0o3 != 0);
+                        writes
+                            && std::fs::read_link(fd.path())
+                                .is_ok_and(|target| target.starts_with(root))
+                    })
+            });
+        if !busy {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn no_child_writes_under(_root: &Path) {}
+
 fn write_exec(path: &Path, body: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, body).unwrap();
@@ -277,6 +331,7 @@ fn the_wrapper_exits_with_the_chained_hooks_status_and_leaves_no_temp_file() {
     chain_foreign(&f, 3);
     let tmpdir = f.root().join("tmp");
     std::fs::create_dir_all(&tmpdir).unwrap();
+    no_child_writes_under(&f.root());
     let mut child = Command::new(f.slot().path())
         .arg("amend")
         .current_dir(&f.top)
