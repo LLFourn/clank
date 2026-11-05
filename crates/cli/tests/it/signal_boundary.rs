@@ -42,18 +42,29 @@ fn owns_a_signal_target(path: &std::path::Path) -> bool {
     SIGNAL_MODULES.iter().any(|m| p.ends_with(m))
 }
 
-/// Whether a line delivers or probes a signal through `libc`.
+/// Whether a line delivers or probes a signal through `libc` or `rustix`.
 ///
 /// Deliberately not a spelling list: ANY mention from outside a
 /// validating module is the violation, including signal 0, because a
 /// probe that reads a bad id as an answer is how a caller decides a
 /// group is empty when it asked about every process on the machine.
+/// rustix's `Pid` refuses 0 but not 1, and `kill_current_process_group`
+/// is the caller's own group by name.
 fn names_a_libc_signal(line: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with("//") {
         return false;
     }
-    t.contains("libc::kill(") || t.contains("libc::killpg(")
+    t.contains("libc::kill(")
+        || t.contains("libc::killpg(")
+        || [
+            "kill_process(",
+            "kill_process_group(",
+            "kill_current_process_group(",
+            "pidfd_send_signal(",
+        ]
+        .iter()
+        .any(|call| t.contains(call))
 }
 
 /// A negated pid built for a `kill` SUBPROCESS.
@@ -148,6 +159,21 @@ fn the_scanner_sees_what_it_claims_to() {
         1,
         "a probe too — a bad id there is a wrong answer about a group"
     );
+
+    for rustix in [
+        "    let _ = rustix::process::kill_process(pid, Signal::TERM);\n",
+        "    let _ = kill_process_group(group, Signal::KILL);\n",
+        "    rustix::process::test_kill_process(pid).is_ok()\n",
+        "    rustix::process::test_kill_process_group(pid).is_ok()\n",
+        "    let _ = rustix::process::kill_current_process_group(Signal::KILL);\n",
+        "    let _ = rustix::process::pidfd_send_signal(&fd, Signal::KILL);\n",
+    ] {
+        assert_eq!(
+            signals(rustix),
+            1,
+            "rustix's spelling is a signal too: {rustix}"
+        );
+    }
 
     // Prose about the hazard is not the hazard.
     assert_eq!(

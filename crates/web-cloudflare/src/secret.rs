@@ -46,23 +46,21 @@ fn identity(home: &Path) -> PathBuf {
 }
 
 /// The passwd entry's home for this uid, which `HOME` cannot move.
+///
+/// Unsafe because neither std nor rustix has a passwd lookup.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn login_home() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
+    let uid = rustix::process::getuid().as_raw();
     let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: `passwd` is a C struct of integers and raw pointers, for
+    // which all-zero bytes are a valid value.
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found: *mut libc::passwd = std::ptr::null_mut();
     // SAFETY: every pointer is to a live local sized as passed;
     // getpwuid_r writes only within them.
-    let rc = unsafe {
-        libc::getpwuid_r(
-            libc::getuid(),
-            &mut pwd,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut found,
-        )
-    };
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut found) };
     if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
         return None;
     }

@@ -188,7 +188,7 @@ pub(crate) enum Live {
 /// starts a monitor.
 pub(crate) fn live(repo: &std::path::Path) -> Live {
     live_in(
-        &crate::cli::monitor::runtime_dir(unsafe { libc::getuid() }),
+        &crate::cli::monitor::runtime_dir(rustix::process::getuid().as_raw()),
         repo,
     )
 }
@@ -198,7 +198,7 @@ pub(crate) type Producers = std::collections::BTreeMap<(String, String), i32>;
 
 fn live_in(namespace: &std::path::Path, repo: &std::path::Path) -> Live {
     let crate::cli::monitor::Published::Ours(descriptor) =
-        crate::cli::monitor::published_in(namespace, repo, unsafe { libc::getuid() })
+        crate::cli::monitor::published_in(namespace, repo, rustix::process::getuid().as_raw())
     else {
         return Live::Unavailable;
     };
@@ -383,7 +383,7 @@ mod tests {
     /// account at all say nothing is known.
     #[test]
     fn the_account_is_the_running_monitors_or_nothing() {
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
         let ns = tempfile::tempdir().unwrap();
         let namespace = ns.path().join("run");
         let repo = tempfile::tempdir().unwrap();

@@ -37,28 +37,31 @@
 /// only way to obtain one of these is through a constructor that
 /// refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pgid(i32);
+pub struct Pgid(rustix::process::Pid);
 
 impl Pgid {
     /// `None` for the ids that do not name a group we may address.
     pub fn new(pgid: i32) -> Option<Self> {
-        (pgid > 1).then_some(Self(pgid))
+        (pgid > 1)
+            .then(|| rustix::process::Pid::from_raw(pgid))
+            .flatten()
+            .map(Self)
     }
 
     pub fn get(self) -> i32 {
-        self.0
+        self.0.as_raw_pid()
     }
 }
 
 impl std::fmt::Display for Pgid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.get().fmt(f)
     }
 }
 
 /// One process that is safe to address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pid(i32);
+pub struct Pid(rustix::process::Pid);
 
 impl Pid {
     /// `None` for the ids that do not name a process we may signal.
@@ -67,17 +70,20 @@ impl Pid {
     /// the single-process form of `kill` reads -1 and 0 exactly as the
     /// group form does, and 1 is not ours to end.
     pub fn new(pid: i32) -> Option<Self> {
-        (pid > 1).then_some(Self(pid))
+        (pid > 1)
+            .then(|| rustix::process::Pid::from_raw(pid))
+            .flatten()
+            .map(Self)
     }
 
     pub fn get(self) -> i32 {
-        self.0
+        self.0.as_raw_pid()
     }
 }
 
 impl std::fmt::Display for Pid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.get().fmt(f)
     }
 }
 
@@ -105,10 +111,10 @@ pub fn probe_process(pid: i32) -> Probe {
     if pid <= 0 {
         return Probe::Gone;
     }
-    // SAFETY: signal 0 runs the existence and permission checks without
-    // delivering anything, and has no memory effects.
-    let rc = unsafe { libc::kill(pid, 0) };
-    probe_from(outcome(rc))
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return Probe::Gone;
+    };
+    probe_from(outcome(rustix::process::test_kill_process(pid)))
 }
 
 /// Whether `pid` names a process that EXISTS, whoever owns it.
@@ -128,11 +134,7 @@ pub fn alive(pid: i32) -> bool {
 /// a `sh -c` that backgrounds something exits while that descendant
 /// keeps running in the same group.
 pub fn probe_group(pgid: Pgid) -> Probe {
-    // SAFETY: a negative pid addresses the process group; `Pgid` has
-    // refused the ids for which that would mean something else, and
-    // signal 0 delivers nothing.
-    let rc = unsafe { libc::kill(-pgid.get(), 0) };
-    probe_from(outcome(rc))
+    probe_from(outcome(rustix::process::test_kill_process_group(pgid.0)))
 }
 
 /// The processes in `pgid`, or `None` when the system will not say.
@@ -146,22 +148,7 @@ pub fn group_members(pgid: Pgid) -> Option<Vec<i32>> {
 
 #[cfg(target_os = "macos")]
 fn group_members_native(pgid: i32) -> Option<Vec<i32>> {
-    const CAP: usize = 4096;
-    let mut pids = vec![0i32; CAP];
-    // SAFETY: the buffer is valid for the byte size passed. Unlike
-    // `proc_listpids`, this answers with a COUNT of pids, not bytes.
-    let count = unsafe {
-        libc::proc_listpgrppids(
-            pgid,
-            pids.as_mut_ptr().cast(),
-            (CAP * std::mem::size_of::<i32>()) as libc::c_int,
-        )
-    };
-    if count < 0 {
-        return None;
-    }
-    let n = (count as usize).min(CAP);
-    Some(pids[..n].iter().copied().filter(|pid| *pid > 0).collect())
+    crate::proc_identity::inspect::group_members(pgid)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -193,19 +180,62 @@ fn group_members_native(pgid: i32) -> Option<Vec<i32>> {
 
 /// Signal every process in `pgid`.
 pub fn signal_group(pgid: Pgid, sig: libc::c_int) {
-    // SAFETY: a negative pid addresses the process group; the signal is
-    // valid and has no memory effects.
-    unsafe {
-        libc::kill(-pgid.get(), sig);
-    }
+    deliver(Aim::Group(pgid), sig, &Kernel);
 }
 
 /// Signal one process.
 pub fn signal_process(pid: Pid, sig: libc::c_int) {
-    // SAFETY: a positive pid addresses that one process; the signal is
-    // valid and has no memory effects.
-    unsafe {
-        libc::kill(pid.get(), sig);
+    deliver(Aim::Process(pid), sig, &Kernel);
+}
+
+/// Who a signal is for, validated by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aim {
+    Process(Pid),
+    Group(Pgid),
+}
+
+/// The two ways a signal reaches the kernel.
+///
+/// rustix names only the standard signals, and its unchecked constructor
+/// forbids sending the libc-reserved real-time ones, so any other number
+/// goes to `kill` as it is: delivered if valid, refused if not, exactly
+/// as before rustix.
+trait Deliver {
+    fn named(&self, aim: Aim, sig: rustix::process::Signal);
+    fn raw(&self, aim: Aim, sig: libc::c_int);
+}
+
+fn deliver(aim: Aim, sig: libc::c_int, via: &dyn Deliver) {
+    match rustix::process::Signal::from_named_raw(sig) {
+        Some(named) => via.named(aim, named),
+        None => via.raw(aim, sig),
+    }
+}
+
+struct Kernel;
+
+impl Deliver for Kernel {
+    fn named(&self, aim: Aim, sig: rustix::process::Signal) {
+        let _ = match aim {
+            Aim::Process(pid) => rustix::process::kill_process(pid.0, sig),
+            Aim::Group(pgid) => rustix::process::kill_process_group(pgid.0, sig),
+        };
+    }
+
+    /// Unsafe because rustix has no way to send a signal it cannot name.
+    #[allow(unsafe_code)]
+    fn raw(&self, aim: Aim, sig: libc::c_int) {
+        let target = match aim {
+            Aim::Process(pid) => pid.get(),
+            Aim::Group(pgid) => -pgid.get(),
+        };
+        // SAFETY: `kill` takes no pointers. `target` comes from a `Pid` or
+        // `Pgid`, which refuse every id at or below 1, so it names exactly
+        // that process or group; an invalid `sig` is refused with EINVAL.
+        unsafe {
+            libc::kill(target, sig);
+        }
     }
 }
 
@@ -217,16 +247,12 @@ pub fn signal_process(pid: Pid, sig: libc::c_int) {
 /// cannot see it empty until it does this. `ECHILD` — not our child,
 /// or already reaped by the runtime — leaves nothing to do.
 pub fn collect_exited_child(pid: Pid) {
-    let mut status = 0;
-    // SAFETY: WNOHANG never blocks, and `status` is a valid out-pointer.
-    unsafe {
-        libc::waitpid(pid.get(), &mut status, libc::WNOHANG);
-    }
+    let _ = rustix::process::waitpid(Some(pid.0), rustix::process::WaitOptions::NOHANG);
 }
 
-/// A `kill` return read as an errno, with `None` meaning it succeeded.
-fn outcome(rc: i32) -> Option<i32> {
-    (rc != 0).then(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+/// A `kill` result read as an errno, with `None` meaning it succeeded.
+fn outcome(result: rustix::io::Result<()>) -> Option<i32> {
+    result.err().map(rustix::io::Errno::raw_os_error)
 }
 
 /// Read a probe's outcome.
@@ -268,6 +294,50 @@ mod tests {
     }
 
     use super::*;
+
+    #[derive(Default)]
+    struct Recorded(std::cell::RefCell<Vec<(Aim, &'static str, i32)>>);
+
+    impl Deliver for Recorded {
+        fn named(&self, aim: Aim, sig: rustix::process::Signal) {
+            self.0.borrow_mut().push((aim, "named", sig.as_raw()));
+        }
+        fn raw(&self, aim: Aim, sig: libc::c_int) {
+            self.0.borrow_mut().push((aim, "raw", sig));
+        }
+    }
+
+    /// A number rustix cannot name still reaches `kill`, as it did before
+    /// rustix: nothing is dropped on the way. Recorded, never sent.
+    #[test]
+    fn every_signal_number_is_delivered_named_or_raw() {
+        let pid = Aim::Process(Pid::new(4242).unwrap());
+        let group = Aim::Group(Pgid::new(4243).unwrap());
+        #[cfg(target_os = "linux")]
+        let realtime = libc::SIGRTMIN();
+        #[cfg(not(target_os = "linux"))]
+        let realtime = 64;
+        let seen = Recorded::default();
+        for (aim, sig) in [
+            (pid, libc::SIGTERM),
+            (group, libc::SIGKILL),
+            (pid, realtime),
+            (group, realtime),
+            (group, 0),
+        ] {
+            deliver(aim, sig, &seen);
+        }
+        assert_eq!(
+            seen.0.into_inner(),
+            vec![
+                (pid, "named", libc::SIGTERM),
+                (group, "named", libc::SIGKILL),
+                (pid, "raw", realtime),
+                (group, "raw", realtime),
+                (group, "raw", 0),
+            ]
+        );
+    }
 
     /// The ids that mean something other than one target are refused by
     /// the only constructor, so `signal_process(1, …)` and

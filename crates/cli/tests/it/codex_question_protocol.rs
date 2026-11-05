@@ -185,8 +185,8 @@ impl Drop for OwnedCodex {
     fn drop(&mut self) {
         // This process group is created exclusively for this test. Kill
         // and reap it on assertion/error too, including pending questions.
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        if let Some(group) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
         let _ = self.child.wait();
     }

@@ -1733,7 +1733,7 @@ impl RuntimeWatch {
         wake: impl Fn() + Send + 'static,
     ) -> Self {
         let dir = crate::cli::monitor::ensure_runtime_dir()
-            .map(|()| crate::cli::monitor::runtime_dir(unsafe { libc::getuid() }));
+            .map(|()| crate::cli::monitor::runtime_dir(rustix::process::getuid().as_raw()));
         Self::start_in(repo, dir, requests, wake)
     }
 

@@ -464,25 +464,24 @@ fn pick_url(said: &str, wanted: Option<&str>) -> Option<String> {
 /// cannot be handed a number at all, and the only way to obtain one of
 /// these is a constructor that refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Pgid(i32);
+struct Pgid(rustix::process::Pid);
 
 impl Pgid {
     fn new(group: i32) -> Option<Self> {
-        (group > 1).then_some(Self(group))
+        (group > 1)
+            .then(|| rustix::process::Pid::from_raw(group))
+            .flatten()
+            .map(Self)
     }
 }
 
 /// Whether any process of the group is left, zombies included.
 fn group_alive(group: Pgid) -> bool {
-    // SAFETY: signal 0 checks existence and sends nothing.
-    unsafe { libc::killpg(group.0, 0) == 0 }
+    rustix::process::test_kill_process_group(group.0).is_ok()
 }
 
-fn signal_group(group: Pgid, signal: i32) {
-    // SAFETY: signalling a process group this process created; no
-    // memory effects. `Pgid` has already refused the ids for which
-    // `killpg` would mean something other than that group.
-    unsafe { libc::killpg(group.0, signal) };
+fn signal_group(group: Pgid, signal: rustix::process::Signal) {
+    let _ = rustix::process::kill_process_group(group.0, signal);
 }
 
 impl Handle for CommandHandle {
@@ -490,7 +489,7 @@ impl Handle for CommandHandle {
         Box::pin(async move {
             let mut this = *self;
             if let Some(group) = this.pid.and_then(|pid| Pgid::new(pid as i32)) {
-                signal_group(group, libc::SIGTERM);
+                signal_group(group, rustix::process::Signal::TERM);
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), this.child.wait())
                     .await;
                 // The leader's exit says nothing of the group: a
@@ -498,7 +497,7 @@ impl Handle for CommandHandle {
                 // tunnel, and is ended by name of the group
                 // (codex on f248156).
                 if group_alive(group) {
-                    signal_group(group, libc::SIGKILL);
+                    signal_group(group, rustix::process::Signal::KILL);
                     let _ = this.child.wait().await;
                     let gone = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
                     while group_alive(group) && tokio::time::Instant::now() < gone {
@@ -537,13 +536,13 @@ impl Drop for CommandHandle {
     /// its pipes behind (codex on 49e387f).
     fn drop(&mut self) {
         if let Some(group) = self.pid.and_then(|pid| Pgid::new(pid as i32)) {
-            signal_group(group, libc::SIGTERM);
+            signal_group(group, rustix::process::Signal::TERM);
             let gone = std::time::Instant::now() + std::time::Duration::from_millis(500);
             while group_alive(group) && std::time::Instant::now() < gone {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             if group_alive(group) {
-                signal_group(group, libc::SIGKILL);
+                signal_group(group, rustix::process::Signal::KILL);
             }
         }
         // The pipes close with the group; the readers end on their
@@ -1618,8 +1617,8 @@ mod tests {
     }
 
     fn alive(pid: i32) -> bool {
-        // SAFETY: signal 0 checks existence and sends nothing.
-        unsafe { libc::kill(pid, 0) == 0 }
+        rustix::process::Pid::from_raw(pid)
+            .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
     }
 
     async fn pid_from(file: &Path) -> i32 {

@@ -368,6 +368,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rquickjs",
+ "rustix",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -407,7 +408,7 @@ name = "clank-user-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
+ "rustix",
  "serde_json",
  "tempfile",
 ]
@@ -456,6 +457,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "reqwest",
+ "rustix",
  "security-framework",
  "serde",
  "serde_json",

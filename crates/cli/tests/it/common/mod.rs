@@ -63,8 +63,11 @@ impl Drop for TestEnv {
         use std::os::unix::ffi::OsStrExt;
         if let Ok(repo) = dunce::canonicalize(self.repo()) {
             let tag = blake3::hash(repo.as_os_str().as_bytes()).to_hex()[..32].to_string();
-            let path = PathBuf::from(format!("/tmp/clank-run-{}", unsafe { libc::getuid() }))
-                .join(format!("{tag}.plan-mutation"));
+            let path = PathBuf::from(format!(
+                "/tmp/clank-run-{}",
+                rustix::process::getuid().as_raw()
+            ))
+            .join(format!("{tag}.plan-mutation"));
             let _ = std::fs::remove_file(path);
         }
     }

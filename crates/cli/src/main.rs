@@ -3,12 +3,7 @@ use clap::FromArgMatches;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Reset SIGPIPE to default so piping into `head` etc. doesn't
-    // panic on broken pipe.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    reset_sigpipe();
     init_tracing();
     let cli = Cli::from_arg_matches(&clank::cli::command::cli().get_matches())
         .unwrap_or_else(|e| e.exit());
@@ -18,6 +13,21 @@ async fn main() -> anyhow::Result<()> {
         clank::cli::source_group::exit(code);
     }
     Ok(())
+}
+
+/// Restore SIGPIPE's default, so piping into `head` ends clank quietly
+/// rather than panicking on a broken pipe.
+///
+/// Unsafe because Rust sets SIGPIPE to ignore and has no safe API to undo
+/// that.
+#[allow(unsafe_code)]
+fn reset_sigpipe() {
+    // SAFETY: `signal` takes no pointers, and the default disposition
+    // runs no handler code; a disposition change is atomic for every
+    // thread, so the runtime's workers see either the old or the new one.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 fn init_tracing() {

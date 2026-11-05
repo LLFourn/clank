@@ -37,7 +37,6 @@
 //!   `<name>.corrupt`.
 
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use clank_core::wait::WaitItem;
@@ -507,15 +506,11 @@ impl SidecarLock {
             .write(true)
             .open(path)?;
         let op = if exclusive {
-            libc::LOCK_EX
+            rustix::fs::FlockOperation::LockExclusive
         } else {
-            libc::LOCK_SH
+            rustix::fs::FlockOperation::LockShared
         };
-        // SAFETY: valid owned fd; flock has no memory effects.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        rustix::fs::flock(&file, op)?;
         Ok(Self { _file: file })
     }
 }

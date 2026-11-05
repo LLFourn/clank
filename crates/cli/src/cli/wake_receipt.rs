@@ -1063,7 +1063,7 @@ mod tests {
         assert_ne!(path, diagnostic_path(Path::new("/repo"), &b));
         assert_eq!(
             path.parent(),
-            Some(super::super::monitor::runtime_dir(unsafe { libc::getuid() }).as_path())
+            Some(super::super::monitor::runtime_dir(rustix::process::getuid().as_raw()).as_path())
         );
         assert_ne!(
             lease_path(Path::new("/repo"), &a, &route.key),

@@ -72,8 +72,14 @@ impl Fixture {
         std::fs::create_dir(&hook_cwd).unwrap();
         std::fs::create_dir(&host_cwd).unwrap();
         let gate_path = repo.join("producer-gate");
-        let name = std::ffi::CString::new(gate_path.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&gate_path)
+                .status()
+                .unwrap()
+                .success()
+        );
         // RDWR keeps fixture readiness cancellation safe and writing finite;
         // the producer reads one line, so no EOF dependency is introduced.
         let gate = std::fs::OpenOptions::new()
@@ -344,7 +350,10 @@ impl Fixture {
     }
 }
 fn runtime_dir() -> PathBuf {
-    PathBuf::from(format!("/tmp/clank-run-{}", unsafe { libc::getuid() }))
+    PathBuf::from(format!(
+        "/tmp/clank-run-{}",
+        rustix::process::getuid().as_raw()
+    ))
 }
 fn repo_tag(repo: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;

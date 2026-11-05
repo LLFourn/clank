@@ -81,7 +81,6 @@ fn update_with(
     change: impl FnOnce(&mut BTreeSet<String>),
 ) -> anyhow::Result<BTreeSet<String>> {
     use std::io::Write;
-    use std::os::fd::AsRawFd;
     let lock_path = record.with_extension("lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -89,10 +88,9 @@ fn update_with(
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
-    // SAFETY: flock on a descriptor this function owns; released when
-    // `lock` drops, after the write below.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
+    // Released when `lock` drops, after the write below.
+    if let Err(e) = rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive) {
+        return Err(std::io::Error::from(e))
             .with_context(|| format!("locking {}", lock_path.display()));
     }
     let before = load_at(record)?;

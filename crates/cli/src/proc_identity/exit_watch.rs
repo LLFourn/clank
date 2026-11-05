@@ -238,10 +238,12 @@ impl Seam for Native<'_> {
 mod platform {
     use super::Registered;
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Field order is drop order: the queue closes before the directory
+    /// it watches, so the registered descriptor outlives the queue.
     pub(super) struct Sys {
         kq: OwnedFd,
         _dir: Option<OwnedFd>,
@@ -267,8 +269,14 @@ mod platform {
     }
 
     impl Sys {
+        /// Unsafe because `kevent` registers descriptors by number: each
+        /// must outlive the queue, which no type can say.
+        #[allow(unsafe_code)]
         fn apply(&self, ev: libc::kevent) -> io::Result<()> {
-            // SAFETY: one valid change, no event buffer.
+            // SAFETY: one initialised change and no event buffer. The only
+            // descriptor ever registered is `_dir`, which `Sys` owns and
+            // drops after `kq`; the other filters name a pid or a user
+            // event, not a descriptor.
             let n = unsafe {
                 libc::kevent(
                     self.kq.as_raw_fd(),
@@ -287,23 +295,15 @@ mod platform {
         }
 
         pub(super) fn new(dir: Option<&Path>) -> io::Result<Self> {
-            // SAFETY: plain syscall; the fd is owned immediately.
-            let raw = unsafe { libc::kqueue() };
-            if raw < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let kq = unsafe { OwnedFd::from_raw_fd(raw) };
+            use std::os::unix::fs::OpenOptionsExt;
+            let kq = rustix::event::kqueue::kqueue()?;
             let dir = dir
                 .map(|dir| {
-                    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
-                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-                    // SAFETY: a valid C path; the fd is owned immediately.
-                    let raw =
-                        unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
-                    if raw < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_EVTONLY)
+                        .open(dir)
+                        .map(OwnedFd::from)
                 })
                 .transpose()?;
             let sys = Self {
@@ -356,10 +356,15 @@ mod platform {
         }
 
         /// Blocks until the kernel reports something; `None` once stopped.
+        ///
+        /// Unsafe for the same reason as [`Sys::apply`]: `kevent` has no
+        /// safe form, even with no changes to register.
+        #[allow(unsafe_code)]
         pub(super) fn wait(&self) -> Option<Vec<Event>> {
             loop {
-                let mut out: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
-                // SAFETY: `out` is a valid buffer of the stated length.
+                let mut out = [change(0, 0, 0, 0); 16];
+                // SAFETY: no changes are registered, and `out` is a valid
+                // buffer of the stated length.
                 let n = unsafe {
                     libc::kevent(
                         self.kq.as_raw_fd(),
@@ -400,9 +405,10 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::Registered;
+    use rustix::event::epoll;
     use std::collections::HashMap;
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -423,51 +429,33 @@ mod platform {
     const WAKE: u64 = u64::MAX;
     const DIR: u64 = u64::MAX - 1;
 
-    fn owned(raw: libc::c_int) -> io::Result<OwnedFd> {
-        if raw < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: a fresh fd returned by the kernel to this process.
-            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-        }
-    }
-
     impl Sys {
-        fn add(&self, fd: libc::c_int, data: u64) -> io::Result<()> {
-            let mut ev = libc::epoll_event {
-                events: libc::EPOLLIN as u32,
-                u64: data,
-            };
-            // SAFETY: valid fds and event.
-            let n = unsafe {
-                libc::epoll_ctl(self.epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev)
-            };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
+        fn add(&self, fd: &OwnedFd, data: u64) -> io::Result<()> {
+            epoll::add(
+                &self.epoll,
+                fd,
+                epoll::EventData::new_u64(data),
+                epoll::EventFlags::IN,
+            )?;
+            Ok(())
         }
 
         pub(super) fn new(dir: Option<&Path>) -> io::Result<Self> {
-            let epoll = owned(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) })?;
-            let wake = owned(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) })?;
+            use rustix::event::{EventfdFlags, eventfd};
+            use rustix::fs::inotify;
+            let epoll = epoll::create(epoll::CreateFlags::CLOEXEC)?;
+            let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
             let dir = dir
                 .map(|dir| -> io::Result<OwnedFd> {
-                    let fd = owned(unsafe {
-                        libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK)
-                    })?;
-                    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
-                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-                    let mask = libc::IN_CREATE
-                        | libc::IN_DELETE
-                        | libc::IN_MOVED_TO
-                        | libc::IN_MOVED_FROM
-                        | libc::IN_CLOSE_WRITE;
-                    // SAFETY: a valid inotify fd and C path.
-                    if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
+                    let fd = inotify::init(
+                        inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK,
+                    )?;
+                    let mask = inotify::WatchFlags::CREATE
+                        | inotify::WatchFlags::DELETE
+                        | inotify::WatchFlags::MOVED_TO
+                        | inotify::WatchFlags::MOVED_FROM
+                        | inotify::WatchFlags::CLOSE_WRITE;
+                    inotify::add_watch(&fd, dir, mask)?;
                     Ok(fd)
                 })
                 .transpose()?;
@@ -478,23 +466,25 @@ mod platform {
                 pidfds: Mutex::default(),
                 stopping: AtomicBool::new(false),
             };
-            sys.add(sys.wake.as_raw_fd(), WAKE)?;
+            sys.add(&sys.wake, WAKE)?;
             if let Some(fd) = &sys.dir {
-                sys.add(fd.as_raw_fd(), DIR)?;
+                sys.add(fd, DIR)?;
             }
             Ok(sys)
         }
 
         /// `reg` is the epoll data and comes back with the event.
         pub(super) fn register(&self, reg: u64, pid: i32) -> Registered {
-            // SAFETY: plain syscall.
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
-            let fd = match owned(raw) {
+            use rustix::process::{Pid, PidfdFlags, pidfd_open};
+            let Some(pid) = (pid > 0).then(|| Pid::from_raw(pid)).flatten() else {
+                return Registered::Failed;
+            };
+            let fd = match pidfd_open(pid, PidfdFlags::empty()) {
                 Ok(fd) => fd,
-                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Registered::Gone,
+                Err(rustix::io::Errno::SRCH) => return Registered::Gone,
                 Err(_) => return Registered::Failed,
             };
-            if self.add(fd.as_raw_fd(), reg).is_err() {
+            if self.add(&fd, reg).is_err() {
                 return Registered::Failed;
             }
             self.pidfds.lock().unwrap().insert(reg, fd);
@@ -508,47 +498,31 @@ mod platform {
 
         pub(super) fn stop(&self) {
             self.stopping.store(true, Ordering::Release);
-            let one: u64 = 1;
-            // SAFETY: an 8-byte write to an eventfd.
-            unsafe {
-                libc::write(
-                    self.wake.as_raw_fd(),
-                    &one as *const u64 as *const libc::c_void,
-                    8,
-                )
-            };
+            let _ = rustix::io::write(&self.wake, &1u64.to_ne_bytes());
         }
 
         fn drain(fd: &OwnedFd) {
             let mut buf = [0u8; 4096];
-            // SAFETY: reads into a valid buffer; the fd is non-blocking.
-            while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+            while matches!(rustix::io::read(fd, &mut buf), Ok(n) if n > 0) {}
         }
 
         pub(super) fn wait(&self) -> Option<Vec<Event>> {
+            let mut out = Vec::with_capacity(16);
             loop {
-                let mut out: [libc::epoll_event; 16] = unsafe { std::mem::zeroed() };
-                // SAFETY: `out` is a valid buffer of the stated length.
-                let n = unsafe {
-                    libc::epoll_wait(
-                        self.epoll.as_raw_fd(),
-                        out.as_mut_ptr(),
-                        out.len() as i32,
-                        -1,
-                    )
-                };
+                out.clear();
+                let waited =
+                    epoll::wait(&self.epoll, rustix::buffer::spare_capacity(&mut out), None);
                 if self.stopping.load(Ordering::Acquire) {
                     return None;
                 }
-                if n < 0 {
-                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return None;
+                match waited {
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(_) => return None,
                 }
                 let mut events = Vec::new();
-                for ev in &out[..n as usize] {
-                    match ev.u64 {
+                for ev in &out {
+                    match ev.data.u64() {
                         WAKE => Self::drain(&self.wake),
                         DIR => {
                             if let Some(fd) = &self.dir {

@@ -810,10 +810,11 @@ mod tests {
                 .trim()
                 .parse()
                 .unwrap();
-            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "{name}: child survived");
+            let pid = rustix::process::Pid::from_raw(pid).expect("a child's pid");
             assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "{name}: child survived"
             );
         }
     }

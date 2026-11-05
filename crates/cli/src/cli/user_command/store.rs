@@ -212,7 +212,7 @@ impl Store {
     pub(crate) fn lock(&self, tag: &str, label: &AgentLabel, id: &Id) -> anyhow::Result<Held> {
         let dir = self.ensure_label(tag, label)?;
         let file = open_lock(&dir, id)?;
-        flock(&file, libc::LOCK_EX)?;
+        flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
         Ok(Held {
             dir,
             id: id.clone(),
@@ -352,14 +352,12 @@ fn open_lock(dir: &Path, id: &Id) -> anyhow::Result<std::fs::File> {
         .with_context(|| format!("opening `{}`", path.display()))
 }
 
-fn flock(file: &std::fs::File, how: libc::c_int) -> anyhow::Result<()> {
-    use std::os::fd::AsRawFd;
+fn flock(file: &std::fs::File, how: rustix::fs::FlockOperation) -> anyhow::Result<()> {
     loop {
-        // SAFETY: valid owned fd; flock has no memory effects.
-        if unsafe { libc::flock(file.as_raw_fd(), how) } == 0 {
+        let Err(error) = rustix::fs::flock(file, how) else {
             return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
+        };
+        let error = std::io::Error::from(error);
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error.into());
         }
@@ -370,7 +368,7 @@ fn flock(file: &std::fs::File, how: libc::c_int) -> anyhow::Result<()> {
 /// an error when it is anything else.
 fn vet(dir: &Path) -> anyhow::Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     match super::super::monitor::trusted_dir(dir, me) {
         super::super::monitor::Trust::Absent => return Ok(false),
         super::super::monitor::Trust::Theirs(why) => bail!("{why}"),
@@ -412,7 +410,7 @@ fn read_record(path: &Path) -> anyhow::Result<Option<Record>> {
     };
     let md = file.metadata()?;
     ensure!(
-        md.is_file() && md.uid() == unsafe { libc::getuid() } && md.mode() & 0o077 == 0,
+        md.is_file() && md.uid() == rustix::process::getuid().as_raw() && md.mode() & 0o077 == 0,
         "`{}` is not a private regular file of ours",
         path.display()
     );

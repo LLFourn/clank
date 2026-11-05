@@ -354,13 +354,7 @@ pub fn wiring(slot: &HookSlot) -> Wiring {
 /// symlinks, that this user may execute. Git's own test is
 /// `access(X_OK)`, which an execute bit for some other user does not pass.
 pub fn runnable(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `c_path` is a NUL-terminated string that outlives the call,
-    // and access only reads it.
-    let executable = unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0;
+    let executable = rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok();
     executable && std::fs::metadata(path).is_ok_and(|m| m.is_file())
 }
 

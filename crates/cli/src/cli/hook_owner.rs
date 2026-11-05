@@ -43,8 +43,7 @@ pub(crate) struct Native;
 
 impl Parentage for Native {
     fn parent(&self) -> i32 {
-        // SAFETY: getppid has no preconditions and cannot fail.
-        unsafe { libc::getppid() }
+        rustix::process::Pid::as_raw(rustix::process::getppid())
     }
     fn token(&self, pid: i32) -> Option<ProcToken> {
         crate::proc_identity::token_for(pid)

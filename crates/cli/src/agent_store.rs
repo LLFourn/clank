@@ -576,18 +576,16 @@ pub(crate) fn hold_binding<'a>(
 /// Block until this process holds `path`'s exclusive flock, creating
 /// the file if need be. Held until the returned file is dropped.
 pub(crate) fn exclusive_lock(path: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("opening `{}`", path.display()))?;
-    // SAFETY: valid owned fd; flock has no memory effects.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if let Err(e) = rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
         return Err(anyhow::anyhow!(
             "locking `{}`: {}",
             path.display(),
-            std::io::Error::last_os_error()
+            std::io::Error::from(e)
         ));
     }
     Ok(file)

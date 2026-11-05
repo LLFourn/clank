@@ -32,3 +32,6 @@ url = "2"
 [[example]]
 name = "custom_host"
 test = true
+
+[lints]
+workspace = true

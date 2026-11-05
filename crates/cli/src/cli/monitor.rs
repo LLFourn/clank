@@ -11,7 +11,10 @@
 //! client receives the same `WaitItem`s it would have derived itself
 //! and then speaks its own adapter's protocol, unchanged.
 
+use std::os::fd::{AsFd, BorrowedFd};
 use std::time::Duration;
+
+use rustix::event::PollFlags;
 
 use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
@@ -1038,43 +1041,33 @@ pub(crate) fn connect_within(
     path: &std::path::Path,
     deadline: std::time::Instant,
 ) -> std::io::Result<std::os::unix::net::UnixStream> {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
     use std::os::unix::ffi::OsStrExt;
 
-    let bytes = path.as_os_str().as_bytes();
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    addr.sun_family = libc::AF_UNIX as _;
-    if bytes.len() >= addr.sun_path.len() {
+    let sun_path = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    if path.as_os_str().as_bytes().len() >= sun_path {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "socket path too long",
         ));
     }
-    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
-        *slot = *byte as _;
-    }
+    let addr = SocketAddrUnix::new(path)?;
 
     // Close-on-exec atomically where the platform offers it. A raw
-    // `libc::socket` has none of the setup std's own constructor does,
-    // and without this a command source clank spawns INHERITS the
-    // monitor connection — keeping it open after the client exits, so
-    // the monitor goes on believing someone is listening (codex on
+    // socket has none of the setup std's own constructor does, and
+    // without this a command source clank spawns INHERITS the monitor
+    // connection — keeping it open after the client exits, so the
+    // monitor goes on believing someone is listening (codex on
     // f3d6ea9).
     #[cfg(target_os = "linux")]
-    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    let flags = SocketFlags::CLOEXEC;
     #[cfg(not(target_os = "linux"))]
-    let kind = libc::SOCK_STREAM;
-
-    // SAFETY: a fresh AF_UNIX stream socket; the fd is owned below so
-    // every return path closes it.
-    let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    let flags = SocketFlags::empty();
+    let owned = rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None)?;
 
     #[cfg(not(target_os = "linux"))]
-    set_cloexec(raw)?;
+    set_cloexec(&owned)?;
     // On Apple targets std sets this when it builds a socket, and
     // `main` resets SIGPIPE to SIG_DFL so ordinary pipes behave. Both
     // together mean a monitor that closes during a write would KILL the
@@ -1082,29 +1075,16 @@ pub(crate) fn connect_within(
     // `Attached` is that a failure degrades to a local wait rather than
     // taking the agent down.
     #[cfg(target_vendor = "apple")]
-    set_nosigpipe(raw)?;
+    set_nosigpipe(&owned)?;
 
-    set_nonblocking(raw, true)?;
-    // SAFETY: `addr` is a fully initialised sockaddr_un and `raw` is a
-    // valid socket fd.
-    let rc = unsafe {
-        libc::connect(
-            raw,
-            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        let pending = matches!(
-            err.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        ) || err.raw_os_error() == Some(libc::EINPROGRESS);
-        if !pending {
-            return Err(err);
+    set_nonblocking(&owned, true)?;
+    if let Err(err) = rustix::net::connect(&owned, &addr) {
+        use rustix::io::Errno;
+        if !matches!(err, Errno::AGAIN | Errno::INTR | Errno::INPROGRESS) {
+            return Err(err.into());
         }
-        wait_ready(raw, libc::POLLOUT, deadline)?;
-        if let Some(code) = socket_error(raw)? {
+        wait_ready(owned.as_fd(), PollFlags::OUT, deadline)?;
+        if let Some(code) = socket_error(&owned)? {
             return Err(std::io::Error::from_raw_os_error(code));
         }
     }
@@ -1113,54 +1093,28 @@ pub(crate) fn connect_within(
 
 /// Mark an fd close-on-exec, for platforms with no `SOCK_CLOEXEC`.
 #[cfg(not(target_os = "linux"))]
-fn set_cloexec(fd: libc::c_int) -> std::io::Result<()> {
-    // SAFETY: `fd` is a valid fd for the life of the call.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+fn set_cloexec(fd: impl AsFd) -> std::io::Result<()> {
+    let flags = rustix::io::fcntl_getfd(&fd)?;
+    rustix::io::fcntl_setfd(&fd, flags | rustix::io::FdFlags::CLOEXEC)?;
     Ok(())
 }
 
 /// Ask the kernel for `EPIPE` instead of a signal on a dead peer.
 #[cfg(target_vendor = "apple")]
-fn set_nosigpipe(fd: libc::c_int) -> std::io::Result<()> {
-    let on: libc::c_int = 1;
-    // SAFETY: `on` outlives the call and matches SO_NOSIGPIPE's shape.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
-            &on as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+fn set_nosigpipe(fd: impl AsFd) -> std::io::Result<()> {
+    rustix::net::sockopt::set_socket_nosigpipe(fd, true)?;
     Ok(())
 }
 
-fn set_nonblocking(fd: libc::c_int, on: bool) -> std::io::Result<()> {
-    // SAFETY: `fd` is a valid socket fd for the life of the call.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+fn set_nonblocking(fd: impl AsFd, on: bool) -> std::io::Result<()> {
+    use rustix::fs::OFlags;
+    let flags = rustix::fs::fcntl_getfl(&fd)?;
     let next = if on {
-        flags | libc::O_NONBLOCK
+        flags | OFlags::NONBLOCK
     } else {
-        flags & !libc::O_NONBLOCK
+        flags - OFlags::NONBLOCK
     };
-    // SAFETY: as above.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, next) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    rustix::fs::fcntl_setfl(&fd, next)?;
     Ok(())
 }
 
@@ -1171,33 +1125,27 @@ fn set_nonblocking(fd: libc::c_int, on: bool) -> std::io::Result<()> {
 /// asked for, so a peer that closes wakes this immediately and the
 /// read that follows reports the buffered bytes or the EOF.
 fn wait_ready(
-    fd: libc::c_int,
-    events: libc::c_short,
+    fd: BorrowedFd<'_>,
+    events: PollFlags,
     deadline: std::time::Instant,
 ) -> std::io::Result<()> {
     loop {
         let Some(left) = remaining(deadline) else {
             return Err(expired());
         };
-        let mut pfd = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
+        let mut pfd = [rustix::event::PollFd::from_borrowed_fd(fd, events)];
+        let left = left.min(Duration::from_millis(i32::MAX as u64));
+        let timeout = rustix::event::Timespec {
+            tv_sec: left.as_secs() as i64,
+            tv_nsec: left.subsec_nanos().into(),
         };
-        let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
-        // SAFETY: one initialised pollfd describing a valid fd.
-        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
-        match rc {
-            0 => return Err(expired()),
-            r if r > 0 => return Ok(()),
-            _ => {
-                let err = std::io::Error::last_os_error();
-                // A signal restarts the wait against the SAME deadline,
-                // so an interrupted poll cannot extend the budget.
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(err);
-                }
-            }
+        match rustix::event::poll(&mut pfd, Some(&timeout)) {
+            Ok(0) => return Err(expired()),
+            Ok(_) => return Ok(()),
+            // A signal restarts the wait against the SAME deadline,
+            // so an interrupted poll cannot extend the budget.
+            Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
         }
     }
 }
@@ -1211,23 +1159,10 @@ fn wait_ready(
 /// full backlog is the platform-specific condition the connect seam
 /// exists to stand in for. The clean path is covered; the error arm is
 /// defensive, and said so rather than claimed.
-fn socket_error(fd: libc::c_int) -> std::io::Result<Option<libc::c_int>> {
-    let mut err: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `err`/`len` outlive the call and match SO_ERROR's shape.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            &mut err as *mut libc::c_int as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((err != 0).then_some(err))
+fn socket_error(fd: impl AsFd) -> std::io::Result<Option<i32>> {
+    Ok(rustix::net::sockopt::socket_error(fd)?
+        .err()
+        .map(rustix::io::Errno::raw_os_error))
 }
 
 /// Write one frame, bounded by the SAME deadline as everything else.
@@ -1245,7 +1180,6 @@ pub(crate) fn write_frame(
     deadline: std::time::Instant,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::fd::AsRawFd;
     let mut rest = frame;
     while !rest.is_empty() {
         if remaining(deadline).is_none() {
@@ -1266,7 +1200,7 @@ pub(crate) fn write_frame(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                wait_ready(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+                wait_ready(stream.as_fd(), PollFlags::OUT, deadline)?;
             }
             Err(e) => return Err(e),
         }
@@ -1297,7 +1231,6 @@ fn read_frame(
     deadline: std::time::Instant,
 ) -> std::io::Result<String> {
     use std::io::Read;
-    use std::os::fd::AsRawFd;
 
     loop {
         if remaining(deadline).is_none() {
@@ -1323,7 +1256,7 @@ fn read_frame(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                wait_ready(reader.get_ref().as_raw_fd(), libc::POLLIN, deadline)?;
+                wait_ready(reader.get_ref().as_fd(), PollFlags::IN, deadline)?;
             }
             Err(e) => return Err(e),
         }
@@ -1495,7 +1428,7 @@ pub(crate) fn look_at(
     ) -> std::io::Result<std::os::unix::net::UnixStream>,
 ) -> Seen {
     look_at_in(
-        &runtime_dir(unsafe { libc::getuid() }),
+        &runtime_dir(rustix::process::getuid().as_raw()),
         repo,
         who,
         budget,
@@ -1526,7 +1459,7 @@ pub(crate) fn look_at_in(
     // c4b5899). The repo still gates — a descriptor outlives the repo
     // it describes — and the VERSION is settled by the handshake,
     // where both ends can act on it.
-    let socket = match published_in(namespace, repo, unsafe { libc::getuid() }) {
+    let socket = match published_in(namespace, repo, rustix::process::getuid().as_raw()) {
         Published::Nothing => {
             return Seen::Vacant(format!("no monitor published for {}", repo.display()));
         }
@@ -1711,13 +1644,10 @@ pub(crate) struct RepairPermit {
 
 impl Drop for RepairPermit {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
         // A concurrent fork can briefly inherit this open-file description
         // before CLOEXEC closes it. Release explicitly when repair ends,
         // rather than leave admission waiting for that unrelated child.
-        unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -1747,7 +1677,7 @@ pub(crate) fn runtime_dir(me: u32) -> std::path::PathBuf {
 /// it, so a read-only lookup never has to make a directory to find out
 /// where something would be.
 pub(crate) fn ensure_runtime_dir() -> Result<(), String> {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     ensure_dir(&runtime_dir(me), me)
 }
 
@@ -1758,7 +1688,7 @@ pub(crate) fn ensure_runtime_dir() -> Result<(), String> {
 /// descriptor would be without making a directory to find out. The
 /// mutation boundaries vet and create (codex on 2a0c59a).
 pub(crate) fn runtime_path(repo: &std::path::Path, ext: &str) -> std::path::PathBuf {
-    runtime_path_in(&runtime_dir(unsafe { libc::getuid() }), repo, ext)
+    runtime_path_in(&runtime_dir(rustix::process::getuid().as_raw()), repo, ext)
 }
 
 /// [`runtime_path`] with the namespace supplied.
@@ -1847,7 +1777,7 @@ pub(crate) enum Repair {
 
 /// Take this repo's repair gate.
 pub(crate) fn take_repair_permit(repo: &std::path::Path) -> Repair {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     take_repair_permit_in(repo, &runtime_dir(me), me)
 }
 
@@ -2615,7 +2545,7 @@ impl MonitorLease {
 /// The pid in the descriptor is for diagnostics and is never the
 /// authority — a pid can be reused, a lease cannot.
 pub(crate) fn acquire_lease(repo: &std::path::Path) -> Result<MonitorLease, LeaseError> {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     acquire_lease_in(repo, &runtime_dir(me), me)
 }
 
@@ -2653,7 +2583,7 @@ fn acquire_lease_with(
 /// [`acquire_lease`] in one attempt, for a caller polling it to its own
 /// deadline: a patient take would park the runtime thread polling it.
 fn acquire_lease_now(repo: &std::path::Path) -> Result<MonitorLease, LeaseError> {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     let dir = runtime_dir(me);
     let path = runtime_path_in(&dir, repo, "lock");
     acquire_lease_taking(&dir, path, me, |_| {}, clank_user_config::lease::take_now)
@@ -2735,7 +2665,7 @@ fn acquire_lease_taking(
 /// Rename is atomic within a directory, so a reader sees one whole
 /// descriptor or the previous one (codex on 06ccd66).
 pub(crate) fn publish(repo: &std::path::Path, d: &Descriptor) -> std::io::Result<()> {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     publish_in(repo, &runtime_dir(me), me, d)
 }
 
@@ -2804,7 +2734,7 @@ pub(crate) enum Published {
 
 /// What the runtime namespace says about this repo's monitor.
 pub(crate) fn published(repo: &std::path::Path) -> Published {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     published_in(&runtime_dir(me), repo, me)
 }
 
@@ -3020,7 +2950,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     // The lease first: everything after it assumes no other owner,
     // including clearing a socket a dead one left behind.
     let lease = acquire_lease(&repo).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
     let pid = std::process::id() as i32;
     let (listener, socket) = bind_listener(&socket_dirs(me, xdg.as_deref()), pid, me, &lease)
@@ -10619,7 +10549,7 @@ mod tests {
         let (_listener, path) = bind_listener(
             &[too_long.clone(), good.clone()],
             4242,
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
             &lease,
         )
         .expect("the second candidate takes it");
@@ -10652,7 +10582,7 @@ mod tests {
         let (_l, path) = bind_listener(
             &[loose.clone(), tight.clone()],
             4242,
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
             &lease,
         )
         .expect("the tight one is used");
@@ -10673,8 +10603,8 @@ mod tests {
         let path = socket_path(&dir, 4242).unwrap();
         std::fs::write(&path, b"a corpse").unwrap();
 
-        let (_l, bound) =
-            bind_listener(&[dir], 4242, unsafe { libc::getuid() }, &lease).expect("binds anyway");
+        let (_l, bound) = bind_listener(&[dir], 4242, rustix::process::getuid().as_raw(), &lease)
+            .expect("binds anyway");
         assert_eq!(bound, path);
     }
 
@@ -10686,7 +10616,7 @@ mod tests {
         let why = bind_listener(
             &[home.path().join("d".repeat(120))],
             4242,
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
             &lease,
         )
         .expect_err("nothing usable")
@@ -10702,7 +10632,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("socks");
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
 
         let planted = dir.clone();
         let why = ensure_dir_with(&dir, me, move |_| {
@@ -10720,7 +10650,7 @@ mod tests {
     fn a_directory_we_create_is_accepted() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("socks");
-        ensure_dir(&dir, unsafe { libc::getuid() }).expect("ours is fine");
+        ensure_dir(&dir, rustix::process::getuid().as_raw()).expect("ours is fine");
         assert!(dir.is_dir());
     }
 
@@ -10731,7 +10661,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("socks");
         std::fs::write(&path, b"in the way").unwrap();
-        let why = ensure_dir(&path, unsafe { libc::getuid() }).expect_err("refused");
+        let why = ensure_dir(&path, rustix::process::getuid().as_raw()).expect_err("refused");
         assert!(why.contains("not a directory"), "{why}");
     }
 
@@ -10743,7 +10673,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let first = home.path().join("first");
         let second = home.path().join("second");
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
 
         // Fails for the first candidate only, so the fallback is
         // exercised as well as the refusal.
@@ -10779,7 +10709,7 @@ mod tests {
         let why = bind_listener_with(
             std::slice::from_ref(&only),
             4242,
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
             &lease,
             |_| Err("chmod refused".to_string()),
         )
@@ -10801,7 +10731,7 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         let link = home.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
 
         // The target is ours and perfectly acceptable.
         ensure_dir(&real, me).expect("the target itself is fine");
@@ -10821,7 +10751,7 @@ mod tests {
 
         let planted = dir.clone();
         let target = real.clone();
-        let why = ensure_dir_with(&dir, unsafe { libc::getuid() }, move |_| {
+        let why = ensure_dir_with(&dir, rustix::process::getuid().as_raw(), move |_| {
             std::os::unix::fs::symlink(&target, &planted).unwrap();
         })
         .expect_err("a planted link must not be accepted");
@@ -10844,7 +10774,7 @@ mod tests {
         let (_l, path) = bind_listener(
             &[link.clone(), private.clone()],
             4242,
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
             &lease,
         )
         .expect("the private candidate is used");
@@ -10861,8 +10791,8 @@ mod tests {
         std::fs::write(&blocker, b"a file, not a directory").unwrap();
 
         // Statting through a file gives ENOTDIR, not NotFound.
-        let why =
-            ensure_dir(&blocker.join("socks"), unsafe { libc::getuid() }).expect_err("refused");
+        let why = ensure_dir(&blocker.join("socks"), rustix::process::getuid().as_raw())
+            .expect_err("refused");
         assert!(
             why.contains("cannot stat"),
             "the stat decided, not the create: {why}"
@@ -11284,7 +11214,7 @@ mod tests {
         let (_listener, path) = bind_listener(
             &[dir.path().to_path_buf()],
             std::process::id() as i32,
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
             &lease,
         )
         .unwrap();
@@ -11562,16 +11492,13 @@ mod tests {
     /// socket stands in for it: it gives the same answer every time.
     #[test]
     fn a_hello_that_finds_the_connection_gone_is_a_hang_up() {
-        use std::os::fd::{FromRawFd, OwnedFd};
+        use rustix::net::{AddressFamily, SocketType};
         let repo = repo_dir();
         let unconnected = |_: &std::path::Path, _: std::time::Instant| {
-            // SAFETY: a fresh socket, owned at once.
-            let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-            assert!(raw >= 0, "{}", std::io::Error::last_os_error());
-            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
             #[cfg(target_vendor = "apple")]
-            set_nosigpipe(raw)?;
-            set_nonblocking(raw, true)?;
+            set_nosigpipe(&fd)?;
+            set_nonblocking(&fd, true)?;
             Ok(std::os::unix::net::UnixStream::from(fd))
         };
         let seen = greet_at(
@@ -11634,7 +11561,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
         let repo = repo_dir();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
         let d = describe(repo.path(), 4242, std::path::Path::new("/tmp/planted.sock"));
         let home = tempfile::tempdir().unwrap();
 
@@ -11733,7 +11660,7 @@ mod tests {
     #[test]
     fn every_mutation_boundary_refuses_a_namespace_it_cannot_vet() {
         let repo = repo_dir();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
         let d = describe(repo.path(), 4242, std::path::Path::new("/tmp/x.sock"));
 
         let home = tempfile::tempdir().unwrap();
@@ -11860,7 +11787,7 @@ mod tests {
         // left the wiring free to derive the directory some other way,
         // which a mutation duly did.
         let repo = repo_dir();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
         let gate = runtime_dir(me).join(format!("{}.repair", repo_tag(repo.path())));
         let _ = std::fs::remove_file(&gate);
         let held = take_repair_permit(repo.path());
@@ -11883,7 +11810,7 @@ mod tests {
     #[test]
     fn an_untrusted_namespace_is_unavailable_rather_than_busy() {
         let repo = repo_dir();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
 
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("shared");
@@ -12535,7 +12462,7 @@ mod tests {
     #[tokio::test]
     async fn a_client_finding_the_permit_held_attaches_to_the_repairers_monitor() {
         let repo = repo_dir();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
         let gate = match take_repair_permit_in(repo.path(), &runtime_dir(me), me) {
             Repair::Acquired(p) => p,
             other => panic!("the repairer takes it: {other:?}"),
@@ -12594,7 +12521,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_contender_starts_nothing_while_the_first_repairs() {
         let repo = repo_dir();
-        let me = unsafe { libc::getuid() };
+        let me = rustix::process::getuid().as_raw();
         let gate = match take_repair_permit_in(repo.path(), &runtime_dir(me), me) {
             Repair::Acquired(p) => p,
             other => panic!("the first contender takes it: {other:?}"),
@@ -13094,11 +13021,10 @@ mod tests {
     #[test]
     fn waiting_for_readiness_gives_up_at_the_deadline() {
         let kind = within(Duration::from_millis(900), || {
-            use std::os::fd::AsRawFd;
             let (full, _peer) = wedged_pair();
             wait_ready(
-                full.as_raw_fd(),
-                libc::POLLOUT,
+                full.as_fd(),
+                PollFlags::OUT,
                 std::time::Instant::now() + Duration::from_millis(120),
             )
             .map_err(|e| e.kind())
@@ -13129,16 +13055,12 @@ mod tests {
     /// unexercised rather than covered.
     #[test]
     fn a_healthy_socket_reports_no_pending_error() {
-        use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let path = socket_path(dir.path(), 4242).unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
 
-        assert_eq!(
-            socket_error(stream.as_raw_fd()).expect("getsockopt works"),
-            None
-        );
+        assert_eq!(socket_error(&stream).expect("getsockopt works"), None);
     }
 
     /// A raw socket gets none of std's setup, so the protections it
@@ -13147,40 +13069,24 @@ mod tests {
     /// the difference.
     #[test]
     fn a_connected_socket_carries_the_protections_std_would_have_given_it() {
-        use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let path = socket_path(dir.path(), 4242).unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
 
         let stream = connect_within(&path, std::time::Instant::now() + Duration::from_secs(2))
             .expect("connects");
-        let fd = stream.as_raw_fd();
 
-        // SAFETY: `fd` is owned by `stream` for the rest of the test.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert!(flags >= 0, "F_GETFD failed");
+        let flags = rustix::io::fcntl_getfd(&stream).expect("F_GETFD");
         assert!(
-            flags & libc::FD_CLOEXEC != 0,
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
             "not close-on-exec: a spawned command source would inherit this connection"
         );
 
         #[cfg(target_vendor = "apple")]
         {
-            let mut on: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            // SAFETY: `on`/`len` outlive the call and match the option.
-            let rc = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    &mut on as *mut libc::c_int as *mut libc::c_void,
-                    &mut len,
-                )
-            };
-            assert!(rc >= 0, "getsockopt failed");
+            let on = rustix::net::sockopt::socket_nosigpipe(&stream).expect("getsockopt");
             assert!(
-                on != 0,
+                on,
                 "SO_NOSIGPIPE unset: with main's SIG_DFL, a dead monitor would kill the client"
             );
         }
@@ -16090,7 +15996,7 @@ mod lease_tests {
     use std::cell::Cell;
 
     fn me() -> u32 {
-        unsafe { libc::getuid() }
+        rustix::process::getuid().as_raw()
     }
 
     /// A namespace of its own and the lease path in it.

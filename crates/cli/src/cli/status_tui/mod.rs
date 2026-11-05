@@ -3369,12 +3369,13 @@ pub(crate) async fn run_tui(
     std::thread::spawn(move || {
         let mut buf = [0u8; 16];
         loop {
-            // SAFETY: reading our own stdin (fd 0) into a local buffer.
-            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            if ev_tx.send(Ev::Stdin(buf[..n as usize].to_vec())).is_err() {
+            // The descriptor, not `Stdin`'s buffered reader: what is read
+            // is handed on at once.
+            let n = match rustix::io::read(std::io::stdin(), &mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => break,
+            };
+            if ev_tx.send(Ev::Stdin(buf[..n].to_vec())).is_err() {
                 return;
             }
         }

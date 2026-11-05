@@ -644,7 +644,7 @@ pub(crate) async fn upgrade_with(
 
 /// `clank monitor upgrade`.
 pub async fn run() -> anyhow::Result<()> {
-    let me = unsafe { libc::getuid() };
+    let me = rustix::process::getuid().as_raw();
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let report = upgrade_with(
         super::monitor::socket_dirs(me, xdg.as_deref()),
@@ -695,7 +695,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn me() -> u32 {
-        unsafe { libc::getuid() }
+        rustix::process::getuid().as_raw()
     }
 
     /// A vetted socket namespace holding listening sockets for `pids`.

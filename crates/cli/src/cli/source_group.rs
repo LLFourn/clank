@@ -1029,9 +1029,9 @@ pub(crate) mod tests {
     /// successor in this same process sees what it would see in life.
     pub(crate) fn init_stands_in_for(pid: i32) {
         std::thread::spawn(move || {
-            let mut status = 0;
-            // SAFETY: a blocking wait on one pid; `status` is valid.
-            unsafe { libc::waitpid(pid, &mut status, 0) };
+            if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                let _ = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty());
+            }
         });
     }
 
@@ -1366,7 +1366,12 @@ pub(crate) mod tests {
         .await;
         let pid = pid_in(&pidfile).await;
         // SAFETY: a plain query, no memory effects.
-        assert_eq!(unsafe { libc::getpgid(pid) }, owned.pgid().get());
+        assert_eq!(
+            rustix::process::getpgid(Some(rustix::process::Pid::from_raw(pid).unwrap()))
+                .unwrap()
+                .as_raw_pid(),
+            owned.pgid().get()
+        );
 
         crate::signal::signal_process(Pid::new(pid).unwrap(), libc::SIGTERM);
         tokio::time::timeout(Duration::from_secs(10), child.wait_async())

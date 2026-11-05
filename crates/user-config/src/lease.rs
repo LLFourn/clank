@@ -3,7 +3,6 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 /// How long a Busy answer is retried before it is believed.
@@ -39,11 +38,11 @@ pub fn take(file: &File) -> io::Result<bool> {
 /// passing copy, so it is never final on its own.
 pub fn take_now(file: &File) -> io::Result<bool> {
     loop {
-        // SAFETY: a valid owned fd; flock has no memory effects.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let Err(e) = rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        else {
             return Ok(true);
-        }
-        let e = io::Error::last_os_error();
+        };
+        let e = io::Error::from(e);
         match e.kind() {
             io::ErrorKind::Interrupted => continue,
             io::ErrorKind::WouldBlock => return Ok(false),

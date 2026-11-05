@@ -59,9 +59,13 @@ const fn framed() -> [u8; LEN] {
 #[used]
 static CLANK_BUILD_STAMP: [u8; LEN] = framed();
 
+/// Unsafe because only a volatile read is guaranteed not to be folded
+/// into the constant, and a folded copy of the marker is a second stamp
+/// in the image (`the_running_image_carries_its_stamp_once`).
+#[allow(unsafe_code)]
 fn embedded() -> [u8; LEN] {
-    // SAFETY: a read of an initialised static. Volatile, so the static is
-    // what is read rather than the constant it was built from.
+    // SAFETY: a read of an initialised, immutable static through a
+    // reference to it, so the pointer is valid and aligned.
     unsafe { std::ptr::read_volatile(&CLANK_BUILD_STAMP) }
 }
 
@@ -294,12 +298,7 @@ pub fn rendezvous_of(
 
 /// Whether exec would run `path`: a file this process may execute.
 fn executable(path: &std::path::Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: a valid NUL-terminated path; access has no memory effects.
-    path.is_file() && unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0
+    path.is_file() && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
 /// This process's installation path.
