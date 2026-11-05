@@ -492,7 +492,7 @@ async fn build_site(
     // state regardless of slice contents.
     let head_str = head_sha.as_ref().map(|s| s.as_str());
     let index_html = render_index(
-        &status,
+        &IndexHeader::of(&status),
         &stash_items,
         &queue_entries,
         &events,
@@ -1068,8 +1068,36 @@ fn collect_reviews(repo: &Path, shas: &[CommitSha]) -> BTreeMap<String, Vec<Revi
 
 // ─────────────────────────── index ──────────────────────────
 
+/// What of the status the index shows, and all that the renderer can
+/// see of it: names, the head, the plan's gate and the open questions.
+/// A snapshot's configured sources, agent settings and team resolution
+/// never reach the page because they are not here.
+struct IndexHeader<'a> {
+    basename: &'a str,
+    branch: Option<&'a str>,
+    head_sha: Option<&'a str>,
+    dirty: bool,
+    active_plan: Option<&'a PlanWorkState>,
+    last_finished: Option<&'a clank_core::repo_state::FinishedPlan>,
+    blocks: &'a [crate::cli::block::BlockEntry],
+}
+
+impl<'a> IndexHeader<'a> {
+    fn of(status: &'a StatusSnapshot) -> Self {
+        Self {
+            basename: &status.basename,
+            branch: status.branch.as_deref(),
+            head_sha: status.head_sha.as_deref(),
+            dirty: status.dirty.is_some(),
+            active_plan: status.active_plan.as_ref(),
+            last_finished: status.last_finished.as_ref(),
+            blocks: &status.blocks,
+        }
+    }
+}
+
 fn render_index(
-    status: &StatusSnapshot,
+    status: &IndexHeader<'_>,
     stash: &[(String, crate::cli::stash::StashRecord)],
     queue: &[crate::cli::queue::QueueEntry],
     events: &[LogEvent],
@@ -1090,21 +1118,17 @@ fn render_index(
         &meta,
     );
     out.push_str("<header class=\"status\">\n");
-    out.push_str(&format!("  <h1>{}</h1>\n", esc(&status.basename)));
-    let branch = status.branch.as_deref().unwrap_or("(detached)");
-    let head_short = status.head_sha.as_deref().map(short).unwrap_or("(no head)");
-    let dirty = if status.dirty.is_some() {
-        " · dirty"
-    } else {
-        ""
-    };
+    out.push_str(&format!("  <h1>{}</h1>\n", esc(status.basename)));
+    let branch = status.branch.unwrap_or("(detached)");
+    let head_short = status.head_sha.map(short).unwrap_or("(no head)");
+    let dirty = if status.dirty { " · dirty" } else { "" };
     out.push_str(&format!(
         "  <div class=\"status-meta\"><span class=\"branch\">{}</span> · <code>{}</code>{}</div>\n",
         esc(branch),
         esc(head_short),
         dirty
     ));
-    if let Some(p) = &status.active_plan {
+    if let Some(p) = status.active_plan {
         out.push_str("  <ul class=\"plan-list\">\n");
         out.push_str(&format!(
                 "    <li><span class=\"plan-pill\">{}</span> <span class=\"gate gate-{}\">{}</span> <span class=\"waiting\">{:?}</span></li>\n",
@@ -1114,7 +1138,7 @@ fn render_index(
                 p.waiting_on
             ));
         out.push_str("  </ul>\n");
-    } else if let Some(fp) = &status.last_finished {
+    } else if let Some(fp) = status.last_finished {
         out.push_str(&format!(
             "  <div class=\"last-finished\">last finished: <span class=\"plan-pill\">{}</span> at <code>{}</code> · duration {}</div>\n",
             esc(fp.plan.as_str()),
@@ -1158,7 +1182,7 @@ fn render_index(
     }
     if !status.blocks.is_empty() {
         out.push_str("  <div class=\"blocks\">blocks:\n    <ul>\n");
-        for b in &status.blocks {
+        for b in status.blocks {
             out.push_str(&format!(
                 "      <li><code>{}</code>/{} — {}</li>\n",
                 esc(&b.agent),
@@ -3665,7 +3689,7 @@ mod tests {
             path: "/x/.clank/queue/500-queued-idea.md".into(),
         }];
         let html = render_index(
-            &status,
+            &IndexHeader::of(&status),
             &stash,
             &queue,
             &empty_events,
@@ -3680,7 +3704,7 @@ mod tests {
 
         // Empty stash: no block.
         let html = render_index(
-            &status,
+            &IndexHeader::of(&status),
             &[],
             &queue,
             &empty_events,
@@ -3713,7 +3737,7 @@ mod tests {
             },
         ];
         let html = render_index(
-            &status,
+            &IndexHeader::of(&status),
             &[],
             &queue,
             &empty_events,
@@ -3735,7 +3759,15 @@ mod tests {
         assert!(a < b, "priority order (lower NNN first)");
 
         // Empty queue: the block is omitted entirely (no empty header).
-        let html = render_index(&status, &[], &[], &empty_events, &reviews, &subjects, None);
+        let html = render_index(
+            &IndexHeader::of(&status),
+            &[],
+            &[],
+            &empty_events,
+            &reviews,
+            &subjects,
+            None,
+        );
         assert!(!html.contains("class=\"queue\""), "no empty queue block");
     }
 

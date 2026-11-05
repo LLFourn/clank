@@ -97,20 +97,20 @@ struct Inner {
 #[derive(Default)]
 struct Memory {
     sessions: Vec<SessionRecord>,
-    remote: RemoteSection,
+    token: Option<String>,
 }
 
 /// Both halves of the store, as one locked read gives them.
 struct Store {
     sessions: Vec<SessionRecord>,
-    remote: RemoteSection,
+    token: Option<String>,
 }
 
 /// Which halves an edit changed, so only those are written.
 #[derive(Default)]
 struct Wrote {
     sessions: bool,
-    remote: bool,
+    token: bool,
 }
 
 /// The remote's authority is the user's, not one TUI's: every TUI
@@ -120,6 +120,8 @@ struct Wrote {
 /// (codex on 5d24c05).
 pub struct Door {
     home: Option<PathBuf>,
+    /// Where the token is kept; present exactly when `home` is.
+    secrets: Option<std::sync::Arc<dyn crate::secret::Secrets>>,
     /// The user config's schema, which this door does not own: held
     /// to it, the door's `remote` edit is never written beside a
     /// setting the CLI cannot read.
@@ -154,6 +156,31 @@ pub enum Refused {
     Store(String),
 }
 
+/// The token is in both the user config and its store, and they differ.
+/// Refused rather than resolved: either could be the one a browser
+/// holds, and picking wrongly locks the user out or lets a rotated-away
+/// token back in.
+#[derive(Debug)]
+pub struct Conflict {
+    pub config: PathBuf,
+    pub store: String,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the remote token in `{}` (`remote.token`) differs from the one in {}; \
+             the remote stays off until one is removed — delete `remote.token` from \
+             the config to keep the stored one, or the stored one to keep the config's",
+            self.config.display(),
+            self.store
+        )
+    }
+}
+
+impl std::error::Error for Conflict {}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -167,13 +194,37 @@ impl std::fmt::Display for Refused {
 }
 
 impl Door {
-    /// The door for this user: the token in `~/.clank/config.json`,
-    /// open sessions in `~/.clank/remote-sessions.json`, read on
-    /// every use. Without a home nothing persists — a session lasts
-    /// as long as the process.
+    /// The door for this user: the token in this platform's
+    /// [`crate::secret::platform`] store, open sessions in
+    /// `~/.clank/remote-sessions.json`, read on every use. Without a
+    /// home nothing persists — a session lasts as long as the process.
     pub fn new(home: Option<PathBuf>, check: clank_user_config::Check) -> Self {
+        match home {
+            Some(home) => {
+                let secrets = crate::secret::platform(&home);
+                Self::with_secrets(home, check, secrets)
+            }
+            None => Self::build(None, None, check),
+        }
+    }
+
+    /// [`Door::new`] for `home`, with the token kept in `secrets`.
+    pub fn with_secrets(
+        home: PathBuf,
+        check: clank_user_config::Check,
+        secrets: std::sync::Arc<dyn crate::secret::Secrets>,
+    ) -> Self {
+        Self::build(Some(home), Some(secrets), check)
+    }
+
+    fn build(
+        home: Option<PathBuf>,
+        secrets: Option<std::sync::Arc<dyn crate::secret::Secrets>>,
+        check: clank_user_config::Check,
+    ) -> Self {
         let door = Self {
             home,
+            secrets,
             check,
             inner: Mutex::new(Inner::default()),
             revoked: tokio::sync::watch::channel(0).0,
@@ -198,30 +249,30 @@ impl Door {
         &self,
         edit: impl FnOnce(&mut Vec<SessionRecord>) -> (R, bool),
     ) -> anyhow::Result<R> {
-        self.with_store(|store| {
+        self.with_store(false, |store| {
             let (r, changed) = edit(&mut store.sessions);
             (
                 r,
                 Wrote {
                     sessions: changed,
-                    remote: false,
+                    token: false,
                 },
             )
         })
     }
 
-    /// The `remote` section, the same way, in the user config.
-    fn with_remote<R>(
+    /// The token, the same way, in its store.
+    fn with_token<R>(
         &self,
-        edit: impl FnOnce(&mut RemoteSection) -> (R, bool),
+        edit: impl FnOnce(&mut Option<String>) -> (R, bool),
     ) -> anyhow::Result<R> {
-        self.with_store(|store| {
-            let (r, changed) = edit(&mut store.remote);
+        self.with_store(true, |store| {
+            let (r, changed) = edit(&mut store.token);
             (
                 r,
                 Wrote {
                     sessions: false,
-                    remote: changed,
+                    token: changed,
                 },
             )
         })
@@ -240,23 +291,35 @@ impl Door {
     /// valid over emptied sessions, which refuses too much. The
     /// reverse would leave a rotated credential over sessions the old
     /// one opened, which admits too much.
-    fn with_store<R>(&self, edit: impl FnOnce(&mut Store) -> (R, Wrote)) -> anyhow::Result<R> {
+    ///
+    /// The token's store joins the same hold, and a token still in
+    /// the user config, where every earlier clank kept it, is moved
+    /// out first ([`Door::migrate`]). Unless `reads_token`, the store
+    /// is not asked and the edit sees no token: the remote polls the
+    /// sessions, and a keychain read on every poll is a keychain
+    /// prompt on every poll when its access is not yet granted.
+    fn with_store<R>(
+        &self,
+        reads_token: bool,
+        edit: impl FnOnce(&mut Store) -> (R, Wrote),
+    ) -> anyhow::Result<R> {
         #[cfg(test)]
         self.transactions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let Some(home) = &self.home else {
+        let (Some(home), Some(secrets)) = (&self.home, &self.secrets) else {
             let mut inner = self.lock();
-            let Memory { sessions, remote } = &mut inner.memory;
+            let Memory { sessions, token } = &mut inner.memory;
             let mut store = Store {
                 sessions: std::mem::take(sessions),
-                remote: remote.clone(),
+                token: token.clone(),
             };
             let (r, _) = edit(&mut store);
             *sessions = store.sessions;
-            *remote = store.remote;
+            *token = store.token;
             return Ok(r);
         };
         let _lock = store_lock(home)?;
+        let token = self.migrate(home, secrets.as_ref(), reads_token)?;
         let path = sessions_path(home);
         let sessions = match std::fs::read_to_string(&path) {
             Ok(s) => {
@@ -267,29 +330,92 @@ impl Door {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => anyhow::bail!("reading `{}`: {e}", path.display()),
         };
+        let mut store = Store { sessions, token };
+        let (r, wrote) = edit(&mut store);
+        debug_assert!(reads_token || !wrote.token, "a token written unread");
+        if wrote.sessions {
+            write_typed_config(
+                &path,
+                &SessionsFile {
+                    sessions: store.sessions,
+                },
+            )?;
+        }
+        if reads_token
+            && wrote.token
+            && let Some(token) = &store.token
+        {
+            secrets
+                .write(token)
+                .map_err(|e| store_error(secrets.as_ref(), "writing", e, &[token]))?;
+        }
+        Ok(r)
+    }
+
+    /// The token as its store holds it, after moving any copy out of
+    /// the user config. Its own user-config transaction, committed
+    /// before the caller's edit, so a later failure in that edit can
+    /// never leave the config's copy beside a rotated store.
+    ///
+    /// The config's copy is removed only once the store has been read
+    /// back holding it. Whatever fails, the config keeps it, and the
+    /// remote is refused rather than run from plaintext or from a
+    /// token minted to replace one that could not be read.
+    fn migrate(
+        &self,
+        home: &Path,
+        secrets: &dyn crate::secret::Secrets,
+        reads_token: bool,
+    ) -> anyhow::Result<Option<String>> {
         clank_user_config::transact(home, self.check, |cfg| {
-            let mut store = Store {
-                sessions,
-                remote: cfg
-                    .get("remote")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()?
-                    .unwrap_or_default(),
+            let remote: RemoteSection = cfg
+                .get("remote")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let in_config = remote.token.filter(|t| !t.is_empty());
+            if in_config.is_none() && !reads_token {
+                return Ok(None);
+            }
+            let masks: Vec<&str> = in_config.iter().map(String::as_str).collect();
+            let stored = secrets
+                .read()
+                .map_err(|e| store_error(secrets, "reading", e, &masks))?;
+            let Some(legacy) = in_config.as_deref() else {
+                return Ok(stored);
             };
-            let (r, wrote) = edit(&mut store);
-            if wrote.sessions {
-                write_typed_config(
-                    &path,
-                    &SessionsFile {
-                        sessions: store.sessions,
-                    },
-                )?;
+            match stored {
+                Some(stored) if admits(&stored, legacy) => {}
+                Some(_) => {
+                    return Err(Conflict {
+                        config: clank_user_config::path(home),
+                        store: secrets.describe(),
+                    }
+                    .into());
+                }
+                None => {
+                    secrets
+                        .write(legacy)
+                        .map_err(|e| store_error(secrets, "moving the token into", e, &masks))?;
+                    let back = secrets
+                        .read()
+                        .map_err(|e| store_error(secrets, "reading back", e, &masks))?;
+                    anyhow::ensure!(
+                        back.as_deref().is_some_and(|back| admits(back, legacy)),
+                        "{} did not read back the token written to it; it stays in the \
+                         user config and the remote stays off",
+                        secrets.describe()
+                    );
+                }
             }
-            if wrote.remote {
-                cfg.insert("remote".into(), serde_json::to_value(store.remote)?);
+            // Removed from the document itself: a round trip through
+            // `RemoteSection` would drop every field this build does
+            // not know, beside the token and inside the tunnel.
+            if let Some(remote) = cfg.get_mut("remote").and_then(|r| r.as_object_mut()) {
+                remote.remove("token");
             }
-            Ok(r)
+            Ok(Some(legacy.to_string()))
         })
     }
 
@@ -300,11 +426,11 @@ impl Door {
     /// else, so two TUIs minting at once settle on one token rather
     /// than overwriting each other.
     pub fn token(&self) -> anyhow::Result<String> {
-        self.with_remote(|remote| match &remote.token {
+        self.with_token(|token| match token {
             Some(t) if !t.is_empty() => (t.clone(), false),
             _ => {
                 let minted = random_token();
-                remote.token = Some(minted.clone());
+                *token = Some(minted.clone());
                 (minted, true)
             }
         })
@@ -321,7 +447,7 @@ impl Door {
     /// `None` means the session is no longer one; the caller refuses
     /// as it would refuse any request without a session.
     pub fn token_for_session(&self, id_hash: &str) -> anyhow::Result<Option<String>> {
-        self.with_store(|store| {
+        self.with_store(true, |store| {
             let now = now_utc();
             let live = store
                 .sessions
@@ -330,18 +456,18 @@ impl Door {
             if !live {
                 return (None, Wrote::default());
             }
-            match &store.remote.token {
+            match &store.token {
                 Some(t) if !t.is_empty() => (Some(t.clone()), Wrote::default()),
                 // First use mints it, as `token` does: a page asking
                 // before anyone has looked at the TUI is not an error.
                 _ => {
                     let minted = random_token();
-                    store.remote.token = Some(minted.clone());
+                    store.token = Some(minted.clone());
                     (
                         Some(minted),
                         Wrote {
                             sessions: false,
-                            remote: true,
+                            token: true,
                         },
                     )
                 }
@@ -356,14 +482,14 @@ impl Door {
     pub fn rotate_token(&self) -> anyhow::Result<String> {
         let minted = random_token();
         let fresh = minted.clone();
-        self.with_store(move |store| {
+        self.with_store(true, move |store| {
             store.sessions.clear();
-            store.remote.token = Some(fresh);
+            store.token = Some(fresh);
             (
                 (),
                 Wrote {
                     sessions: true,
-                    remote: true,
+                    token: true,
                 },
             )
         })?;
@@ -384,24 +510,23 @@ impl Door {
             created: now.clone(),
             last_seen: now,
         };
-        let opened = self.with_store(move |store| {
-            let ours = match store.remote.token.clone() {
-                Some(t) if !t.is_empty() => t,
+        let opened = self.with_store(true, move |store| {
+            let (ours, minted_now) = match store.token.clone() {
+                Some(t) if !t.is_empty() => (t, false),
                 // Nothing minted yet: mint here rather than admit,
                 // so a first paste cannot race the first mint.
                 _ => {
                     let minted = random_token();
-                    store.remote.token = Some(minted.clone());
-                    minted
+                    store.token = Some(minted.clone());
+                    (minted, true)
                 }
             };
-            let minted_now = store.remote.token.as_deref() != Some(ours.as_str());
             if !admits(&ours, presented) {
                 return (
                     None,
                     Wrote {
                         sessions: false,
-                        remote: !minted_now,
+                        token: minted_now,
                     },
                 );
             }
@@ -410,7 +535,7 @@ impl Door {
                 Some(cookie),
                 Wrote {
                     sessions: true,
-                    remote: true,
+                    token: minted_now,
                 },
             )
         })?;
@@ -672,6 +797,26 @@ impl Door {
     }
 }
 
+/// A store's failure, in words that name the store and carry none of
+/// `tokens`, whatever the store itself said.
+fn store_error(
+    secrets: &dyn crate::secret::Secrets,
+    doing: &str,
+    error: anyhow::Error,
+    tokens: &[&str],
+) -> anyhow::Error {
+    let said = tokens
+        .iter()
+        .filter(|t| !t.is_empty())
+        .fold(format!("{error:#}"), |said, t| {
+            said.replace(t, "[redacted]")
+        });
+    anyhow::anyhow!(
+        "{doing} {}: {said}; the remote stays off until it answers",
+        secrets.describe()
+    )
+}
+
 /// Whole, and in constant time.
 fn admits(ours: &str, presented: &str) -> bool {
     bool::from(hash_token(ours).ct_eq(&hash_token(presented)))
@@ -861,6 +1006,16 @@ mod tests {
         format!("other=1; {COOKIE}={token}")
     }
 
+    /// The door the tests use: the token in `home`'s own file, never a
+    /// keychain.
+    fn door_at(home: &Path) -> Door {
+        Door::with_secrets(
+            home.to_path_buf(),
+            remote_reads,
+            std::sync::Arc::new(crate::secret::TokenFile::at(home)),
+        )
+    }
+
     #[test]
     fn editing_remote_preserves_the_rest_of_user_config() {
         let home = tempfile::tempdir().unwrap();
@@ -871,7 +1026,7 @@ mod tests {
             "remote": {"tunnel": {"provider": "quick"}}
         });
         write_typed_config(&user_config_path(home.path()), &original).unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let door = door_at(home.path());
         let token = door.token().unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(user_config_path(home.path())).unwrap()).unwrap();
@@ -879,7 +1034,14 @@ mod tests {
         assert_eq!(saved["agents"], original["agents"]);
         assert_eq!(saved["future_setting"], original["future_setting"]);
         assert_eq!(saved["remote"]["tunnel"], original["remote"]["tunnel"]);
-        assert_eq!(saved["remote"]["token"], token);
+        assert!(saved["remote"].get("token").is_none(), "not in the config");
+        assert!(!serde_json::to_string(&saved).unwrap().contains(&token));
+        assert_eq!(
+            crate::secret::Secrets::read(&crate::secret::TokenFile::at(home.path()))
+                .unwrap()
+                .as_deref(),
+            Some(token.as_str())
+        );
     }
 
     /// A link is for one use, five minutes.
@@ -898,8 +1060,8 @@ mod tests {
     #[test]
     fn a_shared_link_crosses_door_processes_and_is_spent_once() {
         let home = tempfile::tempdir().unwrap();
-        let tui = Door::new(Some(home.path().to_path_buf()), remote_reads);
-        let host = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let tui = door_at(home.path());
+        let host = door_at(home.path());
         let token = tui.mint_shared(Link::Login).unwrap();
         assert!(
             !std::fs::read_to_string(home.path().join(LINKS_FILE))
@@ -916,18 +1078,15 @@ mod tests {
     #[tokio::test]
     async fn the_token_is_the_users_and_outlives_the_process() {
         let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let door = door_at(home.path());
         let token = door.token().unwrap();
         assert!(token.len() >= 32, "a guessable token is no token");
         assert_eq!(door.token().unwrap(), token, "minted once, not per call");
 
         // Another repo's remote on this machine, and a fresh
-        // process, take the same one: it lives in the user config.
-        let elsewhere = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        // process, take the same one: it lives in the user's store.
+        let elsewhere = door_at(home.path());
         assert_eq!(elsewhere.token().unwrap(), token);
-        let cfg = read_user_config(home.path()).unwrap();
-        let remote: RemoteSection = serde_json::from_value(cfg["remote"].clone()).unwrap();
-        assert_eq!(remote.token.as_deref(), Some(token.as_str()));
 
         assert!(door.admits_token(&token).unwrap());
         assert!(!door.admits_token("").unwrap());
@@ -944,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn rotating_the_token_ends_the_sessions_it_opened() {
         let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let door = door_at(home.path());
         let token = door.token().unwrap();
         let cookie_a = door.open_session("token").unwrap();
         let cookie_b = door.open_session("token").unwrap();
@@ -964,9 +1123,7 @@ mod tests {
         assert!(door.admit(Some(&cookie(&cookie_b))).is_none());
         assert!(watch.has_changed().unwrap(), "open streams are told");
         assert_eq!(
-            Door::new(Some(home.path().to_path_buf()), remote_reads)
-                .token()
-                .unwrap(),
+            door_at(home.path()).token().unwrap(),
             fresh,
             "the rotation is persisted"
         );
@@ -981,8 +1138,8 @@ mod tests {
     #[tokio::test]
     async fn a_login_cannot_straddle_a_rotation() {
         let home = tempfile::tempdir().unwrap();
-        let a = Door::new(Some(home.path().to_path_buf()), remote_reads);
-        let b = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let a = door_at(home.path());
+        let b = door_at(home.path());
         let old = a.token().unwrap();
 
         // Verification and the session are ONE hold of the store.
@@ -1028,8 +1185,8 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_session_is_handed_no_token() {
         let home = tempfile::tempdir().unwrap();
-        let a = Door::new(Some(home.path().to_path_buf()), remote_reads);
-        let b = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let a = door_at(home.path());
+        let b = door_at(home.path());
         let opened = a.open_session("token").unwrap();
         let id_hash = a.admit(Some(&cookie(&opened))).expect("admitted").id_hash;
 
@@ -1075,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_is_hashed_on_disk_and_ends_when_revoked_or_old() {
         let home = tempfile::tempdir().unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let door = door_at(home.path());
         assert!(door.admit(Some("clank_session=nothing")).is_none());
         let token = door.open_session("token").unwrap();
         let file = std::fs::read_to_string(sessions_path(home.path())).unwrap();
@@ -1095,7 +1252,7 @@ mod tests {
 
         // A reopened door reads the file: a session from another
         // process is admitted, an old one is not.
-        let fresh = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let fresh = door_at(home.path());
         let token = fresh.open_session("token").unwrap();
         let old = time::OffsetDateTime::now_utc() - time::Duration::days(SESSION_DAYS + 1);
         let mut records = fresh.sessions().unwrap();
@@ -1110,7 +1267,7 @@ mod tests {
             &SessionsFile { sessions: records },
         )
         .unwrap();
-        let reopened = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let reopened = door_at(home.path());
         assert!(reopened.admit(Some(&cookie(&token))).is_some());
         assert_eq!(
             reopened.sessions().unwrap().len(),
@@ -1133,7 +1290,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".clank")).unwrap();
         std::fs::write(sessions_path(home.path()), FROZEN_SESSIONS).unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let door = door_at(home.path());
         assert!(door.is_live(OLD_SESSION) && door.is_live(NEW_SESSION));
 
         door.revoke_session(NEW_SESSION).unwrap();
@@ -1157,7 +1314,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".clank")).unwrap();
         let path = home.path().join(LINKS_FILE);
         std::fs::write(&path, FROZEN_LINKS).unwrap();
-        let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let door = door_at(home.path());
         assert!(!door.consume_shared(Link::Login, "not-the-token").unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), FROZEN_LINKS);
 
@@ -1177,7 +1334,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(home.path().join(".clank")).unwrap();
             std::fs::write(user_config_path(home.path()), body).unwrap();
-            let door = Door::new(Some(home.path().to_path_buf()), remote_reads);
+            let door = door_at(home.path());
             for (what, result) in [("token", door.token()), ("rotate", door.rotate_token())] {
                 let err = result.expect_err(what);
                 assert!(
@@ -1214,8 +1371,8 @@ mod tests {
     #[tokio::test]
     async fn two_doors_share_one_authority() {
         let home = tempfile::tempdir().unwrap();
-        let a = Door::new(Some(home.path().to_path_buf()), remote_reads);
-        let b = Door::new(Some(home.path().to_path_buf()), remote_reads);
+        let a = door_at(home.path());
+        let b = door_at(home.path());
         let token = a.open_session("token").unwrap();
         let admitted = b
             .admit(Some(&cookie(&token)))
@@ -1257,6 +1414,383 @@ mod tests {
         );
         assert!(a.revoke_session("anything").is_err());
         assert!(a.open_session("token").is_err());
+        assert!(a.sessions().is_err());
+    }
+
+    const LEGACY: &str = "PLACEHOLDER-LEGACY-TOKEN";
+    const OTHER: &str = "PLACEHOLDER-OTHER-TOKEN";
+
+    /// A token store that can be made to fail, and whose failures
+    /// quote the token, as a careless real one might.
+    #[derive(Default)]
+    struct Fake {
+        held: Mutex<Option<String>>,
+        writes: std::sync::atomic::AtomicUsize,
+        fail_read: std::sync::atomic::AtomicBool,
+        fail_write: std::sync::atomic::AtomicBool,
+        reads_back_wrong: std::sync::atomic::AtomicBool,
+    }
+
+    impl Fake {
+        fn holding(token: &str) -> std::sync::Arc<Self> {
+            let fake = Self::default();
+            *fake.held.lock().unwrap() = Some(token.into());
+            std::sync::Arc::new(fake)
+        }
+        fn held(&self) -> Option<String> {
+            self.held.lock().unwrap().clone()
+        }
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set(flag: &std::sync::atomic::AtomicBool, on: bool) {
+            flag.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::secret::Secrets for Fake {
+        fn read(&self) -> anyhow::Result<Option<String>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            anyhow::ensure!(!self.fail_read.load(SeqCst), "the fake store is locked");
+            if self.reads_back_wrong.load(SeqCst) && self.writes() > 0 {
+                return Ok(Some(OTHER.into()));
+            }
+            Ok(self.held())
+        }
+        fn write(&self, token: &str) -> anyhow::Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            anyhow::ensure!(
+                !self.fail_write.load(SeqCst),
+                "the fake store refused to keep {token}"
+            );
+            self.writes.fetch_add(1, SeqCst);
+            *self.held.lock().unwrap() = Some(token.into());
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "the fake store".into()
+        }
+    }
+
+    fn door_with(home: &Path, fake: &std::sync::Arc<Fake>) -> Door {
+        Door::with_secrets(home.to_path_buf(), remote_reads, fake.clone())
+    }
+
+    /// A user config as every earlier clank left it: the token in it.
+    fn legacy_config(home: &Path, token: &str) -> String {
+        let body = serde_json::to_string_pretty(&serde_json::json!({
+            "auto": "on",
+            "remote": {"tunnel": {"provider": "quick"}, "token": token}
+        }))
+        .unwrap();
+        std::fs::create_dir_all(home.join(".clank")).unwrap();
+        std::fs::write(user_config_path(home), &body).unwrap();
+        body
+    }
+
+    fn config_token(home: &Path) -> Option<String> {
+        let cfg = read_user_config(home).unwrap();
+        cfg.get("remote")?
+            .get("token")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn quiet(err: &anyhow::Error) -> String {
+        let said = format!("{err:#}");
+        for token in [LEGACY, OTHER] {
+            assert!(!said.contains(token), "a token in an error: {said}");
+        }
+        said
+    }
+
+    /// The user config around the token, as a newer clank might have
+    /// written it: settings this build does not know, beside the token
+    /// and inside the tunnel.
+    fn config_with_unknowns(token: Option<&str>) -> serde_json::Value {
+        let mut remote = serde_json::json!({
+            "tunnel": {"provider": "command", "run": ["true"], "future_nested": "keep-me-too"},
+            "future_setting": "keep-me"
+        });
+        if let Some(token) = token {
+            remote["token"] = token.into();
+        }
+        serde_json::json!({"other": "kept", "remote": remote})
+    }
+
+    /// Moving the token out removes `remote.token` and nothing else,
+    /// whether the store was empty or already held it, and again is a
+    /// no-op.
+    #[test]
+    fn migration_removes_only_the_token() {
+        for already_stored in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            write_typed_config(
+                &user_config_path(home.path()),
+                &config_with_unknowns(Some(LEGACY)),
+            )
+            .unwrap();
+            let fake = if already_stored {
+                Fake::holding(LEGACY)
+            } else {
+                std::sync::Arc::new(Fake::default())
+            };
+            for _ in 0..2 {
+                assert_eq!(door_with(home.path(), &fake).token().unwrap(), LEGACY);
+                let saved = serde_json::Value::Object(read_user_config(home.path()).unwrap());
+                let mut want = config_with_unknowns(None);
+                if let Some(version) = saved.get("version") {
+                    want["version"] = version.clone();
+                }
+                assert_eq!(saved, want, "already stored: {already_stored}");
+            }
+            assert_eq!(fake.writes(), usize::from(!already_stored));
+        }
+    }
+
+    type Items = std::collections::HashMap<(String, String), Vec<u8>>;
+
+    #[derive(Clone, Default)]
+    struct SharedKeychain(std::sync::Arc<Mutex<Items>>);
+
+    impl crate::secret::KeychainApi for SharedKeychain {
+        fn get(&self, service: &str, account: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(service.into(), account.into()))
+                .cloned())
+        }
+        fn set(&self, service: &str, account: &str, secret: &[u8]) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert((service.into(), account.into()), secret.to_vec());
+            Ok(())
+        }
+    }
+
+    /// One home spelled three ways shares one lock and one sessions
+    /// file, so it must share one keychain item: a rotation through
+    /// one spelling is the token every spelling admits.
+    #[test]
+    fn one_home_however_spelled_has_one_keychain_token() {
+        let home = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let linked = links.path().join("home");
+        std::os::unix::fs::symlink(home.path(), &linked).unwrap();
+        let keychain = SharedKeychain::default();
+        let doors: Vec<Door> = [home.path().to_path_buf(), home.path().join("."), linked]
+            .into_iter()
+            .map(|spelling| {
+                let secrets = crate::secret::Keychain::new(keychain.clone(), &spelling);
+                Door::with_secrets(spelling, remote_reads, std::sync::Arc::new(secrets))
+            })
+            .collect();
+        let old = doors[0].token().unwrap();
+        for door in &doors {
+            assert_eq!(door.token().unwrap(), old);
+        }
+        assert_eq!(keychain.0.lock().unwrap().len(), 1, "one item");
+
+        let fresh = doors[1].rotate_token().unwrap();
+        for door in &doors {
+            assert_eq!(door.token().unwrap(), fresh);
+            assert!(door.open_session_for_token(&old).unwrap().is_none());
+        }
+        assert!(doors[2].open_session_for_token(&fresh).unwrap().is_some());
+    }
+
+    /// Two processes' doors meet a config still holding the token:
+    /// one moves it, the other finds it moved, and the config keeps
+    /// everything else.
+    #[test]
+    fn the_config_token_moves_to_the_store_once_under_concurrency() {
+        let home = tempfile::tempdir().unwrap();
+        legacy_config(home.path(), LEGACY);
+        let fake = std::sync::Arc::new(Fake::default());
+        let start = std::sync::Barrier::new(2);
+        let seen: Vec<String> = std::thread::scope(|s| {
+            let runs: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        let door = door_with(home.path(), &fake);
+                        start.wait();
+                        door.token().unwrap()
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(
+            seen,
+            [LEGACY, LEGACY],
+            "the token the browser holds is kept"
+        );
+        assert_eq!(fake.writes(), 1, "one migration");
+        assert_eq!(fake.held().as_deref(), Some(LEGACY));
+        assert_eq!(config_token(home.path()), None);
+        let cfg = read_user_config(home.path()).unwrap();
+        assert_eq!(cfg["auto"], "on");
+        assert_eq!(cfg["remote"]["tunnel"]["provider"], "quick");
+
+        assert_eq!(door_with(home.path(), &fake).token().unwrap(), LEGACY);
+        assert_eq!(fake.writes(), 1, "idempotent");
+    }
+
+    /// Both stores holding the same token is a migration that wrote
+    /// the store and died before the config: finishing it removes the
+    /// config's copy and writes nothing.
+    #[test]
+    fn an_equal_copy_in_the_config_is_removed() {
+        let home = tempfile::tempdir().unwrap();
+        legacy_config(home.path(), LEGACY);
+        let fake = Fake::holding(LEGACY);
+        assert_eq!(door_with(home.path(), &fake).token().unwrap(), LEGACY);
+        assert_eq!(config_token(home.path()), None);
+        assert_eq!(fake.writes(), 0);
+    }
+
+    #[test]
+    fn a_failed_move_keeps_the_config_copy_and_refuses_the_remote() {
+        let home = tempfile::tempdir().unwrap();
+        let before = legacy_config(home.path(), LEGACY);
+        let fake = std::sync::Arc::new(Fake::default());
+        Fake::set(&fake.fail_write, true);
+        let door = door_with(home.path(), &fake);
+        let said = quiet(&door.token().expect_err("refused"));
+        assert!(said.contains("the fake store"), "{said}");
+        assert!(
+            said.contains("[redacted]"),
+            "the store's own words, masked: {said}"
+        );
+        quiet(&door.open_session_for_token(LEGACY).expect_err("refused"));
+        quiet(&door.rotate_token().expect_err("refused"));
+        assert_eq!(
+            std::fs::read_to_string(user_config_path(home.path())).unwrap(),
+            before,
+            "the config keeps its copy"
+        );
+        assert_eq!(fake.held(), None);
+
+        Fake::set(&fake.fail_write, false);
+        assert_eq!(door.token().unwrap(), LEGACY, "resolved, it moves");
+        assert_eq!(config_token(home.path()), None);
+    }
+
+    #[test]
+    fn a_store_that_reads_back_wrong_keeps_the_config_copy() {
+        let home = tempfile::tempdir().unwrap();
+        legacy_config(home.path(), LEGACY);
+        let fake = std::sync::Arc::new(Fake::default());
+        Fake::set(&fake.reads_back_wrong, true);
+        quiet(&door_with(home.path(), &fake).token().expect_err("refused"));
+        assert_eq!(config_token(home.path()).as_deref(), Some(LEGACY));
+    }
+
+    /// Different tokens in the two stores: either could be the one a
+    /// browser holds, so neither is picked and neither is touched.
+    #[test]
+    fn a_conflict_is_refused_and_changes_neither_store() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = std::sync::Arc::new(Fake::default());
+        let door = door_with(home.path(), &fake);
+        let cookie_value = door.open_session("token").unwrap();
+        let before = legacy_config(home.path(), LEGACY);
+        *fake.held.lock().unwrap() = Some(OTHER.into());
+        let sessions = std::fs::read_to_string(sessions_path(home.path())).unwrap();
+
+        let err = door.token().expect_err("a conflict");
+        let conflict = err.downcast_ref::<Conflict>().expect("named as a conflict");
+        assert_eq!(conflict.config, user_config_path(home.path()));
+        let said = quiet(&err);
+        assert!(said.contains("the fake store") && said.contains("remote.token"));
+        quiet(&door.rotate_token().expect_err("a conflict"));
+        quiet(&door.open_session_for_token(OTHER).expect_err("a conflict"));
+        assert!(door.admit(Some(&cookie(&cookie_value))).is_none());
+
+        assert_eq!(
+            std::fs::read_to_string(user_config_path(home.path())).unwrap(),
+            before
+        );
+        assert_eq!(fake.held().as_deref(), Some(OTHER));
+        assert_eq!(fake.writes(), 0);
+        assert_eq!(
+            std::fs::read_to_string(sessions_path(home.path())).unwrap(),
+            sessions,
+            "the rotation emptied nothing"
+        );
+    }
+
+    /// A store that cannot be read is not an empty one: minting would
+    /// replace the token every browser holds, and the config is never
+    /// the fallback.
+    #[test]
+    fn an_unreadable_store_mints_nothing_and_falls_back_to_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = std::sync::Arc::new(Fake::default());
+        Fake::set(&fake.fail_read, true);
+        let door = door_with(home.path(), &fake);
+        quiet(&door.token().expect_err("refused"));
+        quiet(&door.open_session_for_token(LEGACY).expect_err("refused"));
+        quiet(&door.rotate_token().expect_err("refused"));
+        let opened = door.open_session("token").unwrap();
+        let id_hash = door
+            .admit(Some(&cookie(&opened)))
+            .expect("admitted")
+            .id_hash;
+        quiet(&door.token_for_session(&id_hash).expect_err("refused"));
+        assert_eq!(fake.writes(), 0, "no token minted");
+        assert_eq!(config_token(home.path()), None, "none written in plaintext");
+
+        let before = legacy_config(home.path(), LEGACY);
+        quiet(&door.token().expect_err("refused"));
+        assert_eq!(
+            std::fs::read_to_string(user_config_path(home.path())).unwrap(),
+            before
+        );
+    }
+
+    /// A session the legacy token opened, revoked by a rotation that
+    /// also performed the migration, stays revoked: neither its cookie
+    /// nor the old token gets back in, and the old token reappearing
+    /// in the config is a conflict, not a way in.
+    #[test]
+    fn a_revoked_session_is_not_readmitted_after_a_migration() {
+        let home = tempfile::tempdir().unwrap();
+        legacy_config(home.path(), LEGACY);
+        let cookie_value = random_token();
+        let now = rfc3339(now_utc());
+        write_typed_config(
+            &sessions_path(home.path()),
+            &SessionsFile {
+                sessions: vec![SessionRecord {
+                    id_hash: hex(&hash_token(&cookie_value)),
+                    how: "token".into(),
+                    created: now.clone(),
+                    last_seen: now,
+                }],
+            },
+        )
+        .unwrap();
+        let fake = std::sync::Arc::new(Fake::default());
+        let a = door_with(home.path(), &fake);
+        let b = door_with(home.path(), &fake);
+        let id_hash = a
+            .admit(Some(&cookie(&cookie_value)))
+            .expect("admitted")
+            .id_hash;
+
+        let fresh = b.rotate_token().unwrap();
+        assert_eq!(fake.held().as_deref(), Some(fresh.as_str()));
+        assert_eq!(config_token(home.path()), None);
+        assert!(a.admit(Some(&cookie(&cookie_value))).is_none());
+        assert_eq!(a.token_for_session(&id_hash).unwrap(), None);
+        assert!(a.open_session_for_token(LEGACY).unwrap().is_none());
+
+        legacy_config(home.path(), LEGACY);
+        quiet(&a.open_session_for_token(LEGACY).expect_err("a conflict"));
         assert!(a.sessions().is_err());
     }
 

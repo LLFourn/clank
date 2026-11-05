@@ -70,8 +70,8 @@ pub struct UserConfigFile {
     pub diff: Option<crate::cli::config::DiffConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zellij: Option<ZellijSection>,
-    /// The remote's door: the tunnel's URL and the registered
-    /// token (the-way-in-is-a-token).
+    /// The remote's tunnel, and the token older clank kept here
+    /// before the door moved it to its own store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<crate::cli::web::door::RemoteSection>,
     /// The sites' trusted public keys for `clank user-command`.
