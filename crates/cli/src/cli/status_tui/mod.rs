@@ -710,6 +710,9 @@ async fn submit_pause_question(
             message: text.to_string(),
             author: Some(master.label.clone()),
             repo: Some(repo.to_path_buf()),
+            permission: false,
+            suggest: None,
+            suggest_file: None,
         }),
     })
     .await;
@@ -818,7 +821,11 @@ async fn resume_from_pause(
         crate::cli::block::run_unblock(crate::cli::UnblockArgs {
             agent: b.agent.clone(),
             name: b.name.clone(),
-            message: "resumed from clank tui".to_string(),
+            message: Some("resumed from clank tui".to_string()),
+            nudge: false,
+            resend: false,
+            delivered: false,
+            override_permission_classifier: false,
             repo: Some(repo.to_path_buf()),
         })
         .await?;
@@ -3927,7 +3934,17 @@ pub(crate) async fn run_tui(
                             &snapshot,
                             rows as usize,
                             cols as usize,
-                            |ask, text| block_page::answer_in_store(&repo, ask, text),
+                            |ask, text| {
+                                let to = crate::lifecycle::AgentLabel::parse(&ask.agent)
+                                    .map_err(|e| anyhow::anyhow!("invalid agent label: {e}"))?;
+                                let mut pane = crate::cli::nudge::Pane {
+                                    repo: &repo,
+                                    to: &to,
+                                };
+                                crate::cli::event_interrupt::blocking(|| {
+                                    block_page::answer_in_store(&repo, ask, text, &mut pane)
+                                })
+                            },
                         ) {
                             PageStep::To(m) => mode = m,
                             PageStep::Answered(m) => {
@@ -7675,6 +7692,9 @@ pub(crate) mod tests {
                 question: "Which option?".into(),
                 answer: None,
                 occurrence: None,
+                kind: crate::cli::block::Stored::Valid(Default::default()),
+                nudge: None,
+                unreadable: None,
             },
             crate::cli::block::BlockEntry {
                 agent: "codex".into(),
@@ -7682,6 +7702,9 @@ pub(crate) mod tests {
                 question: "Why?".into(),
                 answer: Some("Because".into()),
                 occurrence: None,
+                kind: crate::cli::block::Stored::Valid(Default::default()),
+                nudge: None,
+                unreadable: None,
             },
         ];
         let facts = web_facts(&snap, &Default::default());

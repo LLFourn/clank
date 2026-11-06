@@ -101,6 +101,10 @@ must amend BEFORE anything else proceeds. Three ways to break it:
   wake you. Raise one only when you genuinely cannot proceed.
   The human's answer arrives in your next wake, and that wake is its
   receipt: there is nothing to acknowledge or clean.
+  When something you need was refused by a permission check, raise it
+  with `--permission` (and `--suggest "<the message that would lift it>"`):
+  the human answers by typing into your terminal, so the answer arrives as
+  their own message rather than in a wake.
 
 ### Extra wake sources (controller repos)
 

@@ -558,16 +558,58 @@ impl serde::Serialize for Answerable<'_> {
             agent,
             name,
             occurrence,
+            kind: _,
             question,
             answer,
+            nudge,
+            unreadable,
         } = self.0;
-        let mut m = s.serialize_map(Some(6))?;
+        let mut m = s.serialize_map(Some(10))?;
         m.serialize_entry("agent", agent)?;
         m.serialize_entry("name", name)?;
         m.serialize_entry("occurrence", occurrence)?;
+        m.serialize_entry("kind", self.0.kind_name())?;
+        m.serialize_entry("suggestion", &self.0.suggestion())?;
         m.serialize_entry("question", question)?;
         m.serialize_entry("answer", answer)?;
         m.serialize_entry("pending", &answer.is_none())?;
+        m.serialize_entry("nudge", &nudge.as_ref().map(Unsettled))?;
+        m.serialize_entry("unreadable", unreadable)?;
+        m.end()
+    }
+}
+
+/// An unsettled nudge as the wire says it: its outcome is unknown until a
+/// person settles it.
+/// An unreadable record says only why.
+struct Unsettled<'a>(&'a crate::cli::block::Stored<crate::cli::block::Attempt>);
+
+impl serde::Serialize for Unsettled<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(6))?;
+        m.serialize_entry("outcome", "unknown")?;
+        m.serialize_entry("reason", &self.0.unknown_reason())?;
+        match self.0 {
+            crate::cli::block::Stored::Valid(crate::cli::block::Attempt {
+                occurrence: _,
+                attempt,
+                text,
+                started,
+                diagnostic,
+            }) => {
+                m.serialize_entry("diagnostic", diagnostic)?;
+                m.serialize_entry("attempt", attempt)?;
+                m.serialize_entry("text", text)?;
+                m.serialize_entry("started", started)?;
+            }
+            crate::cli::block::Stored::Unreadable(why) => {
+                m.serialize_entry("diagnostic", why)?;
+                m.serialize_entry("attempt", &None::<String>)?;
+                m.serialize_entry("text", &None::<String>)?;
+                m.serialize_entry("started", &None::<u64>)?;
+            }
+        }
         m.end()
     }
 }
@@ -958,11 +1000,27 @@ impl StatusSnapshot {
             let _ = writeln!(out);
             let _ = writeln!(out, "blocks:");
             for b in &self.blocks {
+                let who = match b.kind_name() {
+                    "plain" => b.agent.clone(),
+                    kind => format!("{}, {kind}", b.agent),
+                };
                 if let Some(ref answer) = b.answer {
-                    let _ = writeln!(out, "  UNBLOCKED ({}): {}", b.agent, b.question);
+                    let _ = writeln!(out, "  UNBLOCKED ({who}): {}", b.question);
                     let _ = writeln!(out, "    answer: {answer}");
                 } else {
-                    let _ = writeln!(out, "  BLOCKED ({}): {}", b.agent, b.question);
+                    let _ = writeln!(out, "  BLOCKED ({who}): {}", b.question);
+                }
+                if let Some(suggestion) = b.suggestion() {
+                    let _ = writeln!(out, "    suggested: {suggestion}");
+                }
+                if let Some(nudge) = &b.nudge {
+                    let _ = writeln!(out, "    {}", nudge.unknown_reason());
+                    if let Some(a) = nudge.valid() {
+                        let _ = writeln!(out, "    typed: {}", a.text);
+                    }
+                }
+                if let Some(why) = &b.unreadable {
+                    let _ = writeln!(out, "    unreadable: {why}");
                 }
             }
         }
@@ -3307,6 +3365,9 @@ mod dirty_and_wake_tests {
                 question: "why?".to_string(),
                 answer: None,
                 occurrence: None,
+                kind: crate::cli::block::Stored::Valid(Default::default()),
+                nudge: None,
+                unreadable: None,
             }],
             queue: Vec::new(),
             drafts: Vec::new(),
@@ -3359,6 +3420,110 @@ mod dirty_and_wake_tests {
         );
     }
 
+    /// Tests 1 and 7, the wire half: `status -j` carries a permission
+    /// block's kind and suggestion, and an unsettled nudge as unresolved
+    /// with its diagnostic; the text status says the same.
+    #[test]
+    fn status_reports_a_permission_block_and_its_unknown_nudge() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let codex = clank_core::AgentLabel::parse("codex").unwrap();
+        crate::cli::block::ask_with(
+            repo,
+            &codex,
+            "push",
+            "git push fork was refused",
+            &crate::cli::block::Kind::Permission {
+                suggestion: Some("yes: push it".into()),
+            },
+        )
+        .unwrap();
+        let mut snap = minimal_snapshot();
+        snap.blocks = crate::cli::block::scan_blocks(repo);
+        let occurrence = snap.blocks[0].occurrence.clone();
+        assert_eq!(
+            snap.to_json()["blocks"],
+            serde_json::json!([{
+                "agent": "codex",
+                "name": "push",
+                "occurrence": occurrence,
+                "kind": "permission",
+                "suggestion": "yes: push it",
+                "question": "git push fork was refused",
+                "answer": null,
+                "pending": true,
+                "nudge": null,
+                "unreadable": null,
+            }])
+        );
+
+        crate::cli::block::resolve(
+            repo,
+            "codex",
+            "push",
+            None,
+            crate::cli::block::By::Person,
+            crate::cli::block::How::Nudge {
+                text: "yes: push it",
+                resend: false,
+                via: &mut |_: &str| crate::cli::nudge_log::Outcome::Indeterminate {
+                    reason: "the prompt was not confirmed".into(),
+                },
+            },
+        )
+        .unwrap();
+        snap.blocks = crate::cli::block::scan_blocks(repo);
+        let block = &snap.to_json()["blocks"][0];
+        assert_eq!(block["pending"], true, "unresolved, not answered");
+        let nudge = &block["nudge"];
+        assert_eq!(nudge["outcome"], "unknown");
+        assert_eq!(nudge["diagnostic"], "the prompt was not confirmed");
+        assert_eq!(
+            nudge["reason"],
+            "nudge outcome unknown: the prompt was not confirmed"
+        );
+        assert_eq!(nudge["text"], "yes: push it");
+        assert!(nudge["started"].as_u64().is_some() && nudge["attempt"].is_string());
+        let text = snap.to_human();
+        assert!(
+            text.contains("BLOCKED (codex, permission): git push fork was refused")
+                && text.contains("suggested: yes: push it")
+                && text.contains("nudge outcome unknown: the prompt was not confirmed"),
+            "{text}"
+        );
+    }
+
+    /// Unreadable state is reported, never hidden: the block stays
+    /// pending, its unreadable attempt shows as an unknown outcome, and
+    /// `unreadable` says why.
+    #[test]
+    fn status_reports_unreadable_block_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let codex = clank_core::AgentLabel::parse("codex").unwrap();
+        crate::cli::block::ask_with(
+            repo,
+            &codex,
+            "push",
+            "git push fork was refused",
+            &crate::cli::block::Kind::Permission { suggestion: None },
+        )
+        .unwrap();
+        std::fs::write(repo.join(".clank/agents/codex/blocks/push.attempt"), "torn").unwrap();
+        let mut snap = minimal_snapshot();
+        snap.blocks = crate::cli::block::scan_blocks(repo);
+        let block = &snap.to_json()["blocks"][0];
+        assert_eq!(block["pending"], true);
+        assert_eq!(block["kind"], "permission");
+        assert_eq!(block["nudge"]["outcome"], "unknown");
+        assert!(block["nudge"]["text"].is_null());
+        let why = block["unreadable"].as_str().expect("says why");
+        assert!(why.contains("malformed"), "{why}");
+        assert_eq!(block["nudge"]["diagnostic"], why);
+        let text = snap.to_human();
+        assert!(text.contains(&format!("unreadable: {why}")), "{text}");
+    }
+
     #[test]
     fn to_json_minimal_omits_conditional_keys() {
         // The typed snapshot is the wire, including its optional active
@@ -3394,9 +3559,13 @@ mod dirty_and_wake_tests {
                 "agent": "codex",
                 "name": "q",
                 "occurrence": null,
+                "kind": "plain",
+                "suggestion": null,
                 "question": "why?",
                 "answer": null,
                 "pending": true,
+                "nudge": null,
+                "unreadable": null,
             }],
             // The roster, always said: a teamless repo says so rather
             // than saying nothing (status-is-one-model-rendered-two-ways).

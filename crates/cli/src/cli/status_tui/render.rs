@@ -1934,6 +1934,15 @@ pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine
                 spans: vec![accent(line)],
             });
         }
+        for line in block_notes(b)
+            .iter()
+            .flat_map(|note| wrap(note, width.saturating_sub(2).max(1)))
+        {
+            lines.push(AskLine {
+                block: Some(std::sync::Arc::clone(&ask)),
+                spans: vec![dim(format!("  {line}"))],
+            });
+        }
     }
     if !lines.is_empty() {
         lines.push(AskLine {
@@ -1942,6 +1951,34 @@ pub(super) fn block_ask_spans(snap: &StatusSnapshot, cols: usize) -> Vec<AskLine
         });
     }
     lines
+}
+
+/// What a block is beyond its question: a permission block says so and
+/// shows its suggestion, an unsettled nudge shows its unknown outcome, and
+/// unreadable state says why.
+pub(super) fn block_notes(b: &crate::cli::block::BlockEntry) -> Vec<String> {
+    let mut notes = Vec::new();
+    if b.is_permission() {
+        notes.push(format!(
+            "permission: answered by typing your text into {}'s terminal",
+            b.agent
+        ));
+    }
+    if let Some(s) = b.suggestion() {
+        notes.push(format!("suggested: {s}"));
+    }
+    if let Some(nudge) = &b.nudge {
+        notes.push(nudge.unknown_reason());
+        if let Some(a) = nudge.valid() {
+            notes.push(format!("typed: {}", a.text));
+        }
+    }
+    if let Some(why) = &b.unreadable {
+        notes.push(format!(
+            "unreadable, so it cannot be answered until repaired: {why}"
+        ));
+    }
+    notes
 }
 
 /// The signal lamp: `{emoji} {ACTOR} {verb}` left, plan stem
@@ -4812,10 +4849,26 @@ pub(super) fn block_page_layout(
     cols: usize,
 ) -> BlockPageLayout {
     use super::block_page::Button;
-    let question: Vec<String> = wrap(page.ask.question.trim(), cols.saturating_sub(4).max(1))
+    let width = cols.saturating_sub(4).max(1);
+    let mut question: Vec<String> = wrap(page.ask.question.trim(), width)
         .into_iter()
         .map(|line| emit(&[accent(format!("  {line}"))], "", cols))
         .collect();
+    if let crate::cli::block::Stored::Valid(crate::cli::block::Kind::Permission { suggestion }) =
+        &page.ask.kind
+    {
+        question.push(String::new());
+        let mut notes = vec![format!(
+            "permission block: your answer is typed into {}'s terminal as your own message",
+            page.ask.agent
+        )];
+        notes.extend(suggestion.iter().map(|s| format!("suggested: {s}")));
+        for note in notes {
+            for line in wrap(&note, width) {
+                question.push(emit(&[dim(format!("  {line}"))], "", cols));
+            }
+        }
+    }
     let mut controls = vec![String::new()];
     if let Some(why) = page.failure.as_deref().or_else(|| standing.reason()) {
         for line in wrap(why, cols.saturating_sub(4).max(1)) {
@@ -4824,11 +4877,16 @@ pub(super) fn block_page_layout(
     }
     if page.typing {
         push_input_line(&mut controls, &page.draft, cols);
-        controls.push(emit(
-            &[dim("  ⏎ send · esc back to the buttons".to_string())],
-            "",
-            cols,
-        ));
+        let hint = match page.ask.kind {
+            crate::cli::block::Stored::Valid(crate::cli::block::Kind::Permission { .. }) => {
+                format!(
+                    "  ⏎ type into {}'s terminal · esc back to the buttons",
+                    page.ask.agent
+                )
+            }
+            _ => "  ⏎ send · esc back to the buttons".to_string(),
+        };
+        controls.push(emit(&[dim(hint)], "", cols));
     } else {
         let menu: Vec<MenuRow<'_>> = super::block_page::BUTTONS
             .iter()
@@ -5778,6 +5836,9 @@ mod tests {
                 question: "first question".into(),
                 answer: None,
                 occurrence: None,
+                kind: crate::cli::block::Stored::Valid(Default::default()),
+                nudge: None,
+                unreadable: None,
             },
             crate::cli::block::BlockEntry {
                 agent: "codex".into(),
@@ -5785,6 +5846,9 @@ mod tests {
                 question: "second question".into(),
                 answer: None,
                 occurrence: None,
+                kind: crate::cli::block::Stored::Valid(Default::default()),
+                nudge: None,
+                unreadable: None,
             },
         ];
         let lines = block_ask_spans(&s, 60);
@@ -5810,6 +5874,9 @@ mod tests {
             question: "word ".repeat(13_000),
             answer: None,
             occurrence: Some("ask-1".into()),
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         let lines = block_ask_spans(&s, 80);
         let asks: Vec<_> = lines.iter().filter_map(|l| l.block.as_ref()).collect();
@@ -5830,6 +5897,9 @@ mod tests {
             question: "already answered".into(),
             answer: Some("yes".into()),
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         assert!(block_ask_spans(&s, 60).is_empty());
     }
@@ -5848,6 +5918,9 @@ mod tests {
             question: question.into(),
             answer: None,
             occurrence: Some("02".into()),
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         let mut open = BlockPage::open(Ask::of(&s.blocks[0]), Origin::Log);
         page(&mut open);
@@ -6883,6 +6956,9 @@ mod tests {
                     question: "choose".into(),
                     answer: None,
                     occurrence: None,
+                    kind: crate::cli::block::Stored::Valid(Default::default()),
+                    nudge: None,
+                    unreadable: None,
                 }),
                 _ => {}
             }
@@ -7938,6 +8014,9 @@ mod tests {
             question: "which sims?".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         let v = visible(&render(&s, 1, 60)[0]);
         assert!(v.starts_with("🙋 CLAUDE blocked"), "got `{v}`");
@@ -7956,6 +8035,9 @@ mod tests {
             question: "?".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         let v = visible(&render(&s, 1, 60)[0]);
         assert!(v.contains("blocked"), "expected the block lamp, got `{v}`");
@@ -8083,6 +8165,9 @@ mod tests {
             question: "is this right?\nmore detail".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         // Tall pane so the (now scrollable) ask is fully on screen.
         let texts: Vec<String> = render(&s, 12, 60).iter().map(|l| visible(l)).collect();
@@ -8124,6 +8209,9 @@ mod tests {
             question: q.into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         // Narrow + short so the ask wraps to many lines and overflows.
         let top = render_at(&s, 8, 24, 0, 0, &PanelView::just(Mode::LogScroll))
@@ -12655,6 +12743,9 @@ mod tests {
             question: "the first line is long enough to wrap\nsecond paragraph".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         let cols = 24;
         let lines = render(&s, 20, cols as u16);

@@ -20,7 +20,7 @@
 <h1>clank block answer</h1>
 <p class="lede">Answer an agent&#39;s question</p>
 <h2 id="usage">Usage</h2>
-<p class="usage"><samp>clank block answer [OPTIONS] -m &lt;MSG&gt; &lt;AGENT&gt; &lt;NAME&gt;</samp></p>
+<p class="usage"><samp>clank block answer [OPTIONS] &lt;AGENT&gt; &lt;NAME&gt;</samp></p>
 <h2 id="arguments">Arguments</h2>
 <dl class="terms">
   <dt id="arg-agent"><code>&lt;AGENT&gt;</code></dt>
@@ -37,7 +37,22 @@
   <dt id="option-message"><code>-m &lt;MSG&gt;</code></dt>
   <dd>
 <p>Answer message. <code>-m -</code> reads it from stdin</p>
-<p>Required.</p>
+  </dd>
+  <dt id="option-nudge"><code>--nudge</code></dt>
+  <dd>
+<p>Type the answer into the agent&#39;s terminal as your own message, the way <code>clank nudge</code> does, and record it only once it was submitted. The only way to answer a permission block. If the outcome is unknown the block stays unresolved, and nothing is resent</p>
+  </dd>
+  <dt id="option-resend"><code>--resend</code></dt>
+  <dd>
+<p>With <code>--nudge</code>: replace an outstanding nudge whose text you know did not arrive, or whose duplicate you accept, and type it again</p>
+  </dd>
+  <dt id="option-delivered"><code>--delivered</code></dt>
+  <dd>
+<p>Settle an outstanding nudge whose text you saw arrive: record it as the answer, typing nothing</p>
+  </dd>
+  <dt id="option-override_permission_classifier"><code>--override-permission-classifier</code></dt>
+  <dd>
+<p>Required to answer a permission block (with <code>--nudge</code>, <code>--resend</code> or <code>--delivered</code>): it lifts a refusal the agent&#39;s permission classifier made, so it must be run by a person. The name is a hint to that classifier, which refuses a command announcing it bypasses permission checks; it is not enforcement, and an agent running without the classifier can still pass it. Ordinary blocks ignore it</p>
   </dd>
   <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
   <dd>

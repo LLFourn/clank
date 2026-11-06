@@ -1892,6 +1892,26 @@ pub struct BlockCreateArgs {
     pub author: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// A permission block: something you need was refused, and only the
+    /// person's own message in your terminal lifts the refusal. It can be
+    /// answered only with `block answer --nudge`, which types the
+    /// person's text into your terminal. Say in `-m` what was refused and
+    /// why you need it.
+    #[arg(long)]
+    pub permission: bool,
+    /// Your guess at the message that would lift the refusal, e.g. "yes:
+    /// push repro-ci-experiment to the fork". Shown to the person as the
+    /// answer's starting text; never sent unless they send it.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        requires = "permission",
+        conflicts_with = "suggest_file"
+    )]
+    pub suggest: Option<String>,
+    /// Read the suggestion from a file.
+    #[arg(long, value_name = "PATH", requires = "permission")]
+    pub suggest_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1974,8 +1994,30 @@ pub struct UnblockArgs {
     /// Block name to answer.
     pub name: String,
     /// Answer message. `-m -` reads it from stdin.
-    #[arg(short = 'm', value_name = "MSG")]
-    pub message: String,
+    #[arg(short = 'm', value_name = "MSG", required_unless_present = "delivered")]
+    pub message: Option<String>,
+    /// Type the answer into the agent's terminal as your own message, the
+    /// way `clank nudge` does, and record it only once it was submitted.
+    /// The only way to answer a permission block. If the outcome is
+    /// unknown the block stays unresolved, and nothing is resent.
+    #[arg(long, conflicts_with = "delivered")]
+    pub nudge: bool,
+    /// With `--nudge`: replace an outstanding nudge whose text you know did
+    /// not arrive, or whose duplicate you accept, and type it again.
+    #[arg(long, requires = "nudge")]
+    pub resend: bool,
+    /// Settle an outstanding nudge whose text you saw arrive: record it as
+    /// the answer, typing nothing.
+    #[arg(long, conflicts_with = "message")]
+    pub delivered: bool,
+    /// Required to answer a permission block (with `--nudge`, `--resend` or
+    /// `--delivered`): it lifts a refusal the agent's permission classifier
+    /// made, so it must be run by a person. The name is a hint to that
+    /// classifier, which refuses a command announcing it bypasses
+    /// permission checks; it is not enforcement, and an agent running
+    /// without the classifier can still pass it. Ordinary blocks ignore it.
+    #[arg(long)]
+    pub override_permission_classifier: bool,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
 }

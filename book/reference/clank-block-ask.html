@@ -42,6 +42,18 @@
   <dt id="option-repo"><code>--repo &lt;PATH&gt;</code></dt>
   <dd>
   </dd>
+  <dt id="option-permission"><code>--permission</code></dt>
+  <dd>
+<p>A permission block: something you need was refused, and only the person&#39;s own message in your terminal lifts the refusal. It can be answered only with <code>block answer --nudge</code>, which types the person&#39;s text into your terminal. Say in <code>-m</code> what was refused and why you need it</p>
+  </dd>
+  <dt id="option-suggest"><code>--suggest &lt;TEXT&gt;</code></dt>
+  <dd>
+<p>Your guess at the message that would lift the refusal, e.g. &quot;yes: push repro-ci-experiment to the fork&quot;. Shown to the person as the answer&#39;s starting text; never sent unless they send it</p>
+  </dd>
+  <dt id="option-suggest_file"><code>--suggest-file &lt;PATH&gt;</code></dt>
+  <dd>
+<p>Read the suggestion from a file</p>
+  </dd>
   <dt id="option-help"><code>-h, --help</code></dt>
   <dd>
 <p>Print help</p>

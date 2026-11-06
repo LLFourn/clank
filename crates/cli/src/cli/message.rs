@@ -51,7 +51,7 @@ fn field_of(cmd: &mut Command) -> Option<Field<'_>> {
         }) => Field::One(&mut a.message),
         Command::Block(BlockArgs {
             command: BlockCmd::Answer(a),
-        }) => Field::One(&mut a.message),
+        }) => Field::Maybe(&mut a.message),
         _ => return None,
     })
 }

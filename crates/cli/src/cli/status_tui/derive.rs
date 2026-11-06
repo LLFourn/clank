@@ -554,6 +554,9 @@ mod tests {
             question: "halt?".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         assert_eq!(
             attention_state(&s),
@@ -574,6 +577,9 @@ mod tests {
             question: "halt?".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         vec![
             ("blocked", blocked),
@@ -701,6 +707,9 @@ mod tests {
             question: "halt?".into(),
             answer: None,
             occurrence: None,
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
         }];
         assert_eq!(
             attention_state(&blocked),
