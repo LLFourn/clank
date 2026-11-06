@@ -434,7 +434,7 @@ pub(crate) fn view(
 
 /// The activity and its age, and what clank means to do.
 fn brief(state: &AgentState, now: u64) -> String {
-    let age = crate::cli::config::show_duration(now.saturating_sub(state.since));
+    let age = crate::age::duration(now.saturating_sub(state.since));
     let mut out = match &state.activity {
         Activity::Working => format!("working {age}"),
         Activity::Unwatched => format!("unwatched {age}"),
@@ -451,7 +451,7 @@ fn brief(state: &AgentState, now: u64) -> String {
         Nudge::Nothing => {}
         Nudge::At(at) => out.push_str(&format!(
             " · nudge in {}",
-            crate::cli::config::show_duration(at.saturating_sub(now))
+            crate::age::duration(at.saturating_sub(now))
         )),
         Nudge::InFlight => out.push_str(" · nudged"),
         Nudge::Silent { since, at } => {
@@ -551,6 +551,33 @@ mod tests {
     fn an_unobserved_agent_with_a_waiter_is_waiting_for_work() {
         let shown = line(&unobserved(vec![Suppressor::Delivering]), 1000);
         assert_eq!(shown, "waiting for work");
+    }
+
+    /// An age is read by a person, so 20 hours reads `20h`, not the second
+    /// count the exact config formatter would print.
+    #[test]
+    fn ages_and_countdowns_read_as_times() {
+        let interrupted = AgentState {
+            activity: Activity::Interrupted,
+            since: 100,
+            ..state()
+        };
+        assert_eq!(brief(&interrupted, 100 + 72_090), "interrupted 20h");
+        let due = AgentState {
+            nudge: Nudge::At(1000 + 150),
+            ..state()
+        };
+        assert!(
+            brief(&due, 1000).ends_with(" · nudge in 2m"),
+            "{}",
+            brief(&due, 1000)
+        );
+        let future = AgentState {
+            since: 2000,
+            ..state()
+        };
+        assert_eq!(brief(&future, 1000), "idle 0s");
+        assert_eq!(crate::cli::config::show_duration(90), "90s");
     }
 
     /// The TUI row reads the same words through `brief`, waiter or not.
