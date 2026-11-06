@@ -721,6 +721,39 @@ mod tests {
         );
     }
 
+    /// Test 2, the browser half: the browser has no nudge, so the shared
+    /// operation's refusal is what it gets, and the block stays open.
+    #[tokio::test]
+    async fn the_browser_cannot_answer_a_permission_block() {
+        let repo = git_repo();
+        let claude = AgentLabel::parse("claude").unwrap();
+        crate::cli::block::ask_with(
+            repo.path(),
+            &claude,
+            "push",
+            "git push fork was refused",
+            &crate::cli::block::Kind::Permission { suggestion: None },
+        )
+        .unwrap();
+        let shown = crate::cli::block::scan_blocks(repo.path()).remove(0);
+        let backend = backend(repo.path(), None);
+        let reply = ask(
+            &backend,
+            BrowserRequest::BlockAnswer {
+                agent: "claude".into(),
+                name: "push".into(),
+                occurrence: shown.occurrence,
+                question: shown.question,
+                answer: "yes".into(),
+            },
+        )
+        .await;
+        assert_eq!(reply.status, 409, "{}", reply.body);
+        assert!(reply.body.contains("--nudge"), "{}", reply.body);
+        let after = crate::cli::block::scan_blocks(repo.path()).remove(0);
+        assert_eq!((after.answer, after.nudge), (None, None));
+    }
+
     #[tokio::test]
     async fn block_answers_require_the_current_question_and_are_single_use() {
         let repo = git_repo();

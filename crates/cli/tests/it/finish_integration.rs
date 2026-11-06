@@ -1384,6 +1384,9 @@ fn an_answered_block_never_holds_finish() {
                 message: "Which API shape?".into(),
                 author: Some("claude".into()),
                 repo: Some(repo.to_path_buf()),
+                permission: false,
+                suggest: None,
+                suggest_file: None,
             }),
         }))
         .unwrap();
@@ -1392,7 +1395,11 @@ fn an_answered_block_never_holds_finish() {
         block_on(clank::cli::block::run_unblock(clank::cli::UnblockArgs {
             agent: "claude".into(),
             name: name.into(),
-            message: "the second".into(),
+            message: Some("the second".into()),
+            nudge: false,
+            resend: false,
+            delivered: false,
+            override_permission_classifier: false,
             repo: Some(repo.to_path_buf()),
         }))
         .unwrap();

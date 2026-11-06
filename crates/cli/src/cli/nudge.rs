@@ -52,6 +52,36 @@ async fn attempt(
     ))
 }
 
+/// A block's answer typed the way `clank nudge` types, from synchronous
+/// code: the production [`Nudger`](crate::cli::block::Nudger).
+pub(crate) struct Pane<'a> {
+    pub(crate) repo: &'a std::path::Path,
+    pub(crate) to: &'a crate::lifecycle::AgentLabel,
+}
+
+impl crate::cli::block::Nudger for Pane<'_> {
+    fn nudge(&mut self, text: &str) -> Outcome {
+        // A thread of its own, so the caller's runtime flavor, or having
+        // none, never decides whether the delivery can run.
+        let tried = std::thread::scope(|s| {
+            s.spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| Unconfirmed::Refused(format!("starting a runtime: {e}")))?;
+                runtime.block_on(attempt(self.repo, self.to, text))
+            })
+            .join()
+        });
+        match tried {
+            Ok(tried) => outcome(&tried),
+            Err(_) => Outcome::Indeterminate {
+                reason: "the nudge panicked mid-delivery".to_string(),
+            },
+        }
+    }
+}
+
 /// What the attempt's result lets the history say.
 fn outcome<T>(tried: &Result<(T, Delivered), Unconfirmed>) -> Outcome {
     match tried {

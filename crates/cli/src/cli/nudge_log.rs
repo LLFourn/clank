@@ -30,6 +30,8 @@ pub(crate) enum Trigger {
     Stall,
     /// A person's signed command (`clank user-command`), by its request id.
     UserCommand { id: String },
+    /// `clank block answer --nudge`, answering the block it names.
+    Block { name: String },
 }
 
 /// What the attempt could tell. Only `Submitted` means the text arrived:
@@ -92,6 +94,7 @@ impl Record {
             Trigger::Fallback { .. } => format!("{what} · blind, its record unreadable"),
             Trigger::Stall => format!("{what} · its running turn went silent"),
             Trigger::UserCommand { id } => format!("{what} · user command {id}"),
+            Trigger::Block { name } => format!("{what} · answering block {name}"),
         }
     }
 }

@@ -279,6 +279,9 @@ async fn inspecting_an_answer_receives_nothing() {
             message: "and this?".into(),
             author: Some("master".into()),
             repo: Some(repo.to_path_buf()),
+            permission: false,
+            suggest: None,
+            suggest_file: None,
         }),
     })
     .await
@@ -286,7 +289,11 @@ async fn inspecting_an_answer_receives_nothing() {
     clank::cli::block::run_unblock(clank::cli::UnblockArgs {
         agent: "master".into(),
         name: "current".into(),
-        message: "no".into(),
+        message: Some("no".into()),
+        nudge: false,
+        resend: false,
+        delivered: false,
+        override_permission_classifier: false,
         repo: Some(repo.to_path_buf()),
     })
     .await

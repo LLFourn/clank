@@ -2,7 +2,7 @@
 //! takes, typed beneath it.
 
 use super::input::{AnyKey, InputNav, Key, TextInput, move_selection, text_input_nav};
-use crate::cli::block::BlockEntry;
+use crate::cli::block::{BlockEntry, Kind, Stored};
 
 /// The name of the TUI's own repo pause block.
 pub(super) const PAUSE: &str = "pause";
@@ -16,6 +16,7 @@ pub(super) struct Ask {
     pub(super) agent: String,
     pub(super) name: String,
     pub(super) occurrence: Option<String>,
+    pub(super) kind: Stored<Kind>,
     pub(super) question: String,
 }
 
@@ -25,6 +26,7 @@ impl Ask {
             agent: b.agent.clone(),
             name: b.name.clone(),
             occurrence: b.occurrence.clone(),
+            kind: b.kind.clone(),
             question: b.question.clone(),
         }
     }
@@ -42,6 +44,12 @@ impl Ask {
 pub(super) enum Standing {
     Open,
     Answered,
+    /// Part of its stored state cannot be read; nothing answers it until a
+    /// person repairs it.
+    Unreadable,
+    /// A nudge answering it is outstanding with its outcome unknown; only
+    /// the CLI settles it.
+    Unsettled,
     /// The name was asked again, even with the same text: a different
     /// question, which this page never saw.
     Replaced,
@@ -54,6 +62,15 @@ impl Standing {
         match self {
             Standing::Open => None,
             Standing::Answered => Some("this question was answered elsewhere"),
+            Standing::Unreadable => Some(
+                "part of this block's stored state cannot be read, so nothing can answer it \
+                 until a person repairs it; `clank status` says what",
+            ),
+            Standing::Unsettled => Some(
+                "a nudge answering this is outstanding and its outcome is unknown; if the text \
+                 arrived, settle it with `clank block answer <agent> <name> --delivered`, and if \
+                 not, `--nudge --resend -m …`",
+            ),
             Standing::Replaced => Some(
                 "this question was asked again since the page opened; go back and open the new one",
             ),
@@ -74,6 +91,8 @@ pub(super) fn standing(ask: &Ask, live: &[BlockEntry]) -> Standing {
             Standing::Replaced
         }
         Some(b) if b.answer.is_some() => Standing::Answered,
+        Some(b) if b.unreadable.is_some() => Standing::Unreadable,
+        Some(b) if b.nudge.is_some() => Standing::Unsettled,
         Some(_) => Standing::Open,
     }
 }
@@ -119,13 +138,21 @@ pub(super) enum Nav {
 }
 
 impl BlockPage {
+    /// A permission block's draft starts as its suggestion: the person
+    /// edits or confirms it, and nothing is sent until they do.
     pub(super) fn open(ask: Ask, origin: Origin) -> Self {
+        let draft = ask
+            .kind
+            .valid()
+            .and_then(Kind::suggestion)
+            .map(TextInput::prefilled)
+            .unwrap_or_default();
         Self {
             ask,
             origin,
             sel: 0,
             typing: false,
-            draft: TextInput::default(),
+            draft,
             failure: None,
             scroll: 0,
         }
@@ -242,11 +269,38 @@ pub(super) fn from_agent(label: &str, live: &[BlockEntry]) -> Option<BlockPage> 
         .map(|b| BlockPage::open(Ask::of(b), Origin::Agent(label.to_owned())))
 }
 
-/// Record `text` as the answer to exactly `ask`: the store refuses it
-/// if the name has been asked again since, even with the same text.
-pub(super) fn answer_in_store(repo: &std::path::Path, ask: &Ask, text: &str) -> anyhow::Result<()> {
-    crate::cli::block::answer_block(repo, &ask.agent, &ask.name, text, Some(ask.shown()))
-        .map(|_| ())
+/// Answer exactly `ask` with `text`: the store refuses it if the name has
+/// been asked again since, even with the same text. A permission block is
+/// always answered by typing `text` through `via`; any other is recorded.
+pub(super) fn answer_in_store(
+    repo: &std::path::Path,
+    ask: &Ask,
+    text: &str,
+    via: &mut dyn crate::cli::block::Nudger,
+) -> anyhow::Result<()> {
+    use crate::cli::block::{By, How};
+    let how = match &ask.kind {
+        Stored::Valid(Kind::Plain) => How::Plain(text),
+        Stored::Valid(Kind::Permission { .. }) => How::Nudge {
+            text,
+            resend: false,
+            via,
+        },
+        Stored::Unreadable(why) => {
+            anyhow::bail!("this block's kind cannot be read, so it cannot be answered: {why}")
+        }
+    };
+    // The answer is a keypress in the person's own TUI.
+    crate::cli::block::resolve(
+        repo,
+        &ask.agent,
+        &ask.name,
+        Some(ask.shown()),
+        By::Person,
+        how,
+    )?
+    .into_answer(&ask.agent, &ask.name)
+    .map(|_| ())
 }
 
 /// Whether the repo is paused: its pause block is asked and unanswered.
@@ -269,9 +323,16 @@ mod tests {
             agent: agent.into(),
             name: name.into(),
             occurrence: Some(occurrence.into()),
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
             question: question.into(),
             answer: None,
         }
+    }
+
+    fn never(text: &str) -> crate::cli::nudge_log::Outcome {
+        panic!("an ordinary answer typed {text:?} into a terminal")
     }
 
     fn opened_from_log(s: &StatusSnapshot, cursor: usize) -> Option<BlockPage> {
@@ -418,7 +479,7 @@ mod tests {
             let mut s = two_agent_snap();
             s.blocks = crate::cli::block::scan_blocks(repo);
             let mut slot = opened_from_log(&s, 0);
-            let mut store = |a: &Ask, t: &str| answer_in_store(repo, a, t);
+            let mut store = |a: &Ask, t: &str| answer_in_store(repo, a, t, &mut never);
             press(&mut slot, &s, &typed("yes"), &mut store);
             crate::cli::block::ask(repo, &codex, "scope", "Ship it?").unwrap();
             if refreshed {
@@ -525,6 +586,184 @@ mod tests {
         assert!(calls.is_empty());
     }
 
+    fn permission_store(suggestion: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = clank_core::AgentLabel::parse("codex").unwrap();
+        crate::cli::block::ask_with(
+            dir.path(),
+            &codex,
+            "push",
+            "git push fork was refused",
+            &Kind::Permission {
+                suggestion: suggestion.map(str::to_owned),
+            },
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A permission block's page says what it is and shows the
+    /// suggestion, and its input starts as that suggestion.
+    #[test]
+    fn a_permission_page_shows_itself_and_prefills_the_suggestion() {
+        let dir = permission_store(Some("yes: push it"));
+        let mut s = two_agent_snap();
+        s.blocks = crate::cli::block::scan_blocks(dir.path());
+        let log = block_ask_spans(&s, 80)
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.1.clone()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log.contains("permission") && log.contains("suggested: yes: push it"),
+            "{log}"
+        );
+        let mut slot = opened_from_log(&s, 0);
+        press(
+            &mut slot,
+            &s,
+            &[AnyKey::Cmd(Key::Enter)],
+            &mut |_, _| Ok(()),
+        );
+        let page = slot.as_ref().unwrap();
+        assert!(page.typing);
+        assert_eq!(page.draft.buf, "yes: push it");
+        let (lines, _) = crate::cli::status_tui::render::render_block_page(
+            page,
+            standing(&page.ask, &s.blocks),
+            24,
+            80,
+        );
+        let text = crate::cli::status_tui::fixtures::visible(&lines.join("\n"));
+        assert!(
+            text.contains("permission block") && text.contains("suggested: yes: push it"),
+            "{text}"
+        );
+        assert!(text.contains("type into codex's terminal"), "{text}");
+    }
+
+    /// The page's answer to a permission block is always a nudge: the
+    /// edited text is what reaches the terminal, and it is recorded only
+    /// once submitted.
+    #[test]
+    fn answering_a_permission_page_always_nudges() {
+        let dir = permission_store(Some("yes"));
+        let repo = dir.path();
+        let mut s = two_agent_snap();
+        s.blocks = crate::cli::block::scan_blocks(repo);
+        let mut slot = opened_from_log(&s, 0);
+        let mut typed = Vec::new();
+        let mut keys = vec![AnyKey::Cmd(Key::Enter)];
+        keys.extend(", push it".bytes().map(|b| AnyKey::Text(TextKey::Char(b))));
+        keys.push(AnyKey::Text(TextKey::Enter));
+        let mut store = |a: &Ask, t: &str| {
+            answer_in_store(repo, a, t, &mut |text: &str| {
+                typed.push(text.to_string());
+                crate::cli::nudge_log::Outcome::Submitted
+            })
+        };
+        assert_eq!(
+            press(&mut slot, &s, &keys, &mut store),
+            PageStep::Answered(Mode::LogScroll)
+        );
+        assert_eq!(typed, ["yes, push it"]);
+        assert!(
+            crate::cli::block::scan_blocks(repo).is_empty(),
+            "answered and received"
+        );
+    }
+
+    /// Test 2, the TUI half: a page that took the block for an ordinary
+    /// one still cannot answer it plainly, because the guard is the store's.
+    #[test]
+    fn the_store_refuses_a_plain_answer_from_a_page_that_misread_the_kind() {
+        let dir = permission_store(None);
+        let repo = dir.path();
+        let mut ask = Ask::of(&crate::cli::block::scan_blocks(repo)[0]);
+        ask.kind = Stored::Valid(Kind::Plain);
+        let err = answer_in_store(repo, &ask, "yes", &mut never)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--nudge"), "{err}");
+        let live = crate::cli::block::scan_blocks(repo);
+        assert_eq!(
+            (live[0].answer.as_ref(), live[0].nudge.as_ref()),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn an_unsettled_nudge_refuses_the_answer_button_with_its_reason() {
+        let dir = permission_store(None);
+        let repo = dir.path();
+        crate::cli::block::resolve(
+            repo,
+            "codex",
+            "push",
+            None,
+            crate::cli::block::By::Person,
+            crate::cli::block::How::Nudge {
+                text: "yes",
+                resend: false,
+                via: &mut |_: &str| crate::cli::nudge_log::Outcome::Indeterminate {
+                    reason: "timed out".into(),
+                },
+            },
+        )
+        .unwrap();
+        let mut s = two_agent_snap();
+        s.blocks = crate::cli::block::scan_blocks(repo);
+        let mut slot = opened_from_log(&s, 0);
+        press(
+            &mut slot,
+            &s,
+            &[AnyKey::Cmd(Key::Enter)],
+            &mut |_, _| Ok(()),
+        );
+        let page = slot.as_ref().unwrap();
+        assert!(!page.typing);
+        assert_eq!(page.failure.as_deref(), Standing::Unsettled.reason());
+        let log = block_ask_spans(&s, 80)
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.1.clone()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(log.contains("nudge outcome unknown: timed out"), "{log}");
+    }
+
+    #[test]
+    fn an_unreadable_block_refuses_the_answer_button_and_says_why() {
+        let dir = permission_store(None);
+        let repo = dir.path();
+        std::fs::write(repo.join(".clank/agents/codex/blocks/push.attempt"), "torn").unwrap();
+        let mut s = two_agent_snap();
+        s.blocks = crate::cli::block::scan_blocks(repo);
+        let mut slot = opened_from_log(&s, 0);
+        press(
+            &mut slot,
+            &s,
+            &[AnyKey::Cmd(Key::Enter)],
+            &mut |_, _| Ok(()),
+        );
+        let page = slot.as_ref().unwrap();
+        assert!(!page.typing);
+        assert_eq!(page.failure.as_deref(), Standing::Unreadable.reason());
+        let ask = page.ask.clone();
+        let err = answer_in_store(repo, &ask, "yes", &mut never)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot read"), "{err}");
+        let log = block_ask_spans(&s, 120)
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.1.clone()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            log.contains("unreadable, so it cannot be answered"),
+            "{log}"
+        );
+    }
+
     #[test]
     fn answering_the_pause_from_its_page_resumes_the_repo() {
         let dir = tempfile::tempdir().unwrap();
@@ -537,7 +776,7 @@ mod tests {
         let mut slot = opened_from_log(&s, 0);
         let mut keys = typed("go");
         keys.push(AnyKey::Text(TextKey::Enter));
-        let mut store = |a: &Ask, t: &str| answer_in_store(repo, a, t);
+        let mut store = |a: &Ask, t: &str| answer_in_store(repo, a, t, &mut never);
         assert_eq!(
             press(&mut slot, &s, &keys, &mut store),
             PageStep::Answered(Mode::LogScroll)

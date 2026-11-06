@@ -561,7 +561,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `stash` | Set a plan's commits aside (bare or `push`, like `git stash`) / `pop` restores / `show` / `drop` / `list` |
 | `pick` | Copy plans (commits + files) from another branch (`--from`) |
 | `purge` | Strip a plan's `.clank/` artifacts from history (`--drop` = all of it) |
-| `block` | Questions only the human can answer: an agent's `block ask`, the human's `block answer`, and `block clean` to tidy away delivered ones. The wake carrying an answer is its receipt; the agent acknowledges nothing |
+| `block` | Questions only the human can answer: an agent's `block ask` (`--permission` for a refused permission, see *Permission blocks*), the human's `block answer` (`--nudge` types the answer into the agent's terminal), and `block clean` to tidy away delivered ones. The wake carrying an answer is its receipt; the agent acknowledges nothing |
 | `config` | Read/write typed config values (repo or `--global`): `review.adhoc_feedback`, `review.plan_feedback`, `review.require_commit_prefix`, `hooks.blocked`, `diff.editor.command`, `diff.wait`, `finish.autosquash`, `recovery.blind_nudge`, `recovery.stall_warn`, `recovery.stall_nudge` |
 | `export` | Dump the repo's roster config as JSON |
 
@@ -603,6 +603,60 @@ Three levels, for three situations:
   the interrupt key, the message and Enter unread. Nothing waits to be
   acknowledged, but each attempt and its outcome (`submitted`, refused, or
   indeterminate) is kept in the agent's nudge history.
+
+### Permission blocks
+
+Some refusals are lifted only by your own message in the agent's terminal:
+Claude Code's auto-mode classifier trusts what the user typed, and an
+ordinary block answer reaches the agent as a hook's reminder, not as your
+turn. A permission block is answered by typing your answer there for you.
+
+- `clank block ask <name> --permission -m "<what was refused, and why it is
+  needed>" [--suggest <text> | --suggest-file <path>]` raises one. The
+  suggestion is the agent's guess at the message that would lift the
+  refusal ("yes: push repro-ci-experiment to the fork"). It is stored and
+  shown, and never sent unless a person sends it.
+- `clank block answer <agent> <name> --nudge --override-permission-classifier
+  -m "<text>"` types the text
+  into the agent's pane as your message, through the same pane discovery,
+  input path and nudge history as `clank nudge`, and records the answer
+  only once it was submitted. It is the only way to answer a permission
+  block: a plain `block answer`, from the CLI or the browser, is refused
+  with an error naming `--nudge`. `--nudge` works on an ordinary block too,
+  and answers it by typing. The TUI's answer on a permission block always
+  nudges, its input starting as the suggestion.
+- Answering a permission block from the CLI (`--nudge`, `--resend` or
+  `--delivered`) also needs `--override-permission-classifier`; without it
+  the command is refused, naming the flag and saying a person must run it.
+  The name is aimed at the agent's own permission classifier, which refuses
+  a command announcing it bypasses permission checks, so an agent cannot
+  approve its own refusal or another agent's. It is a hint to that
+  classifier, not enforcement: an agent running without the classifier can
+  still pass it. A person in their own terminal, or the site, passes it
+  deliberately; the TUI's keypress is a person's and needs no flag, and an
+  ordinary block ignores it.
+- A nudge whose outcome is unknown (its confirmation timed out after the
+  text may have been typed, or its process was interrupted) leaves the
+  block unresolved: `status`, the TUI and `status -j` show "nudge outcome
+  unknown: <reason>" with the text and when it was typed. Nothing resends
+  it, and every other answer is refused until you settle it:
+  `clank block answer <agent> <name> --delivered` if you saw the text
+  arrive (it is recorded, nothing is typed), or `--nudge --resend -m
+  "<text>"` if it did not, or a duplicate is acceptable (each with
+  `--override-permission-classifier` on a permission block).
+- Stored block state clank cannot read (a damaged header, an unknown kind or
+  disposition, an attempt record that is malformed or cannot be read) is
+  never taken for absent or plain. The block stays visible with the reason
+  (`unreadable` in `status -j`), is neither answered, retried, owed,
+  received nor cleaned, and waits for a person to repair the files.
+- At most one delivery is made per ask unless you pass `--resend`. A
+  nudged answer is never delivered again as a wake: the agent saw it typed.
+- In `status -j`, every block carries `kind` (`plain` or `permission`),
+  `suggestion`, and `nudge`: `null`, or for an unsettled nudge
+  `{"outcome": "unknown", "reason", "diagnostic", "attempt", "text",
+  "started"}` (only `reason` and `diagnostic` for an unreadable record),
+  and `unreadable`: `null`, or why part of the block cannot be read. `kind`
+  is `unreadable` when the kind itself cannot be read.
 
 ### User commands
 
