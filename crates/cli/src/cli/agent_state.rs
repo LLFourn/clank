@@ -395,6 +395,12 @@ impl View {
         self.stale.is_none().then_some(&self.state.activity)
     }
 
+    /// Whether the agent's latest turn is currently known to have been
+    /// interrupted. A stale state says nothing about now, so it is never.
+    pub(crate) fn interrupted(&self) -> bool {
+        self.activity() == Some(&Activity::Interrupted)
+    }
+
     /// The whole state in one line, with every reason it gives.
     pub(crate) fn line(&self, now: u64) -> String {
         match self.stale {
@@ -432,6 +438,14 @@ pub(crate) fn view(
     Some(View { state, stale })
 }
 
+/// How an interrupted agent is named wherever a person reads its state.
+pub(crate) const INTERRUPTED: &str = "INTERRUPTED";
+
+/// The SGR an interrupted agent is drawn in: bold orange #d75f00, 3.8:1
+/// on a white background and 5.5:1 on black. The head-correction orange
+/// (208, #ff8700) is 2.4:1 on white.
+pub(crate) const INTERRUPTED_SGR: &str = "1;38;5;166";
+
 /// The activity and its age, and what clank means to do.
 fn brief(state: &AgentState, now: u64) -> String {
     let age = crate::age::duration(now.saturating_sub(state.since));
@@ -441,7 +455,9 @@ fn brief(state: &AgentState, now: u64) -> String {
         Activity::Idle => format!("idle {age}"),
         Activity::Failed(class) => format!("failed ({class}) {age}"),
         Activity::Asking => format!("asking {age}"),
-        Activity::Interrupted => format!("interrupted {age}"),
+        // Recovery leaves an interrupted turn alone, so a person reading
+        // this is the only one who will act on it.
+        Activity::Interrupted => format!("{INTERRUPTED} {age}"),
         Activity::Unknown(_) => "unknown".to_string(),
         // Clank has nothing for it, whether a parked wait or a nudge
         // would deliver the next thing.
@@ -562,7 +578,7 @@ mod tests {
             since: 100,
             ..state()
         };
-        assert_eq!(brief(&interrupted, 100 + 72_090), "interrupted 20h");
+        assert_eq!(brief(&interrupted, 100 + 72_090), "INTERRUPTED 20h");
         let due = AgentState {
             nudge: Nudge::At(1000 + 150),
             ..state()
@@ -726,14 +742,25 @@ mod tests {
         assert!(rec.marker_fields(now).is_none());
     }
 
-    /// A stale view says so and claims no activity.
+    /// A stale view says so and claims no activity, even one whose
+    /// record says it was interrupted.
     #[test]
     fn a_stale_view_claims_nothing() {
+        let interrupted = AgentState {
+            activity: Activity::Interrupted,
+            ..state()
+        };
+        let current = View {
+            state: interrupted.clone(),
+            stale: None,
+        };
+        assert!(current.interrupted());
         let v = View {
-            state: state(),
+            state: interrupted,
             stale: Some("its monitor is gone"),
         };
         assert_eq!(v.activity(), None);
+        assert!(!v.interrupted());
         assert_eq!(v.line(1000), "stale: its monitor is gone");
         assert_eq!(v.brief(1000), "stale");
     }

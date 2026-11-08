@@ -247,6 +247,86 @@ pub(super) fn work_projection(snap: &StatusSnapshot) -> clank_core::wait::WorkSt
     }
 }
 
+/// The queued plan master would promote now: the head of the queue,
+/// unless a pending block stops it. Blocks are repo-wide, so one pending
+/// block stops the whole queue.
+pub(super) fn promotable(snap: &StatusSnapshot) -> Option<&crate::cli::status::QueueItemView> {
+    if snap.active_plan.is_some() || snap.blocks.iter().any(|b| b.answer.is_none()) {
+        return None;
+    }
+    snap.queue.first()
+}
+
+/// What an agent owes now: the work the routing hands it, and how many
+/// event copies addressed to it are unacknowledged.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct Owes {
+    pub(super) work: Option<String>,
+    pub(super) events: usize,
+}
+
+impl Owes {
+    /// The obligation in words, or `None` when the agent owes nothing.
+    pub(super) fn text(&self) -> Option<String> {
+        let events = match self.events {
+            0 => None,
+            1 => Some("1 unacked event".to_string()),
+            n => Some(format!("{n} unacked events")),
+        };
+        let parts: Vec<String> = self.work.iter().cloned().chain(events).collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// What `label` owes now, from the snapshot alone: the first item
+/// `work_for` routes to its role, else, for master, the queued plan it
+/// would promote; and its unacknowledged event copies, whatever their
+/// kind. Baseline copies are born acknowledged, so pre-watch history is
+/// never owed.
+pub(super) fn owes(snap: &StatusSnapshot, label: &str) -> Owes {
+    use clank_core::wait::WaitItem;
+    let short = |sha: &str| crate::cli::status::short_sha(sha).to_string();
+    let role = snap
+        .agents
+        .iter()
+        .find(|a| a.label == label)
+        .map(|a| a.role.resolved());
+    let routed = role.and_then(|role| {
+        let parsed = clank_core::ids::AgentLabel::parse(label).ok()?;
+        work_projection(snap)
+            .work_for(&parsed, role)
+            .into_iter()
+            .next()
+    });
+    let work = match routed {
+        Some(item @ (WaitItem::Reviewer { .. } | WaitItem::AdHocReview { .. })) => {
+            Some(format!("review of {}", super::object_of(&item)))
+        }
+        Some(item @ WaitItem::AdHocRevise { .. }) => {
+            Some(format!("revision of {}", super::object_of(&item)))
+        }
+        Some(item @ WaitItem::Master { .. }) => {
+            Some(format!("work on {}", super::object_of(&item)))
+        }
+        Some(WaitItem::FixCommitTag { sha, .. }) => {
+            Some(format!("tag fix on {}", short(sha.as_str())))
+        }
+        Some(WaitItem::PromoteFromQueue { name, .. }) => Some(format!("promotion of {name}")),
+        Some(_) => None,
+        None if role == Some(clank_core::vocab::Role::Master) => {
+            promotable(snap).map(|q| format!("promotion of {}", q.name))
+        }
+        None => None,
+    };
+    let events = snap
+        .github_events
+        .iter()
+        .flat_map(|e| &e.members)
+        .filter(|m| m.key.agent == label && !m.acked)
+        .count();
+    Owes { work, events }
+}
+
 /// ROSTER-driven (tui-adhoc-review-activity, intro 956bed7):
 /// candidates are the roster's non-master rows and the shared
 /// `is_actionable` alone decides who is awaited — one routing path
@@ -335,7 +415,88 @@ pub(super) fn verb_of(w: &WaitingOn) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::status_tui::fixtures::{plan_state, reviewer_missing, snap, with_agents};
+    use crate::cli::status_tui::fixtures::{
+        event_copy as copy, merged_event as event, plan_state, reviewer_missing, snap, with_agents,
+    };
+
+    fn team(s: StatusSnapshot) -> StatusSnapshot {
+        use crate::cli::teams_config::RosterRole;
+        with_agents(
+            s,
+            &[
+                ("claude", RosterRole::Master),
+                ("codex", RosterRole::Commit),
+            ],
+        )
+    }
+
+    /// An agent owes its routed review, and the event copies addressed
+    /// to it that are not yet acknowledged; another agent's unacked copy
+    /// of the same event is not its debt.
+    #[test]
+    fn an_agent_owes_its_review_and_its_own_unacked_events() {
+        let mut s = team(snap(
+            Some(plan_state("foo", reviewer_missing("codex"))),
+            vec![],
+        ));
+        assert_eq!(
+            owes(&s, "codex").text().as_deref(),
+            Some("review of abc1230")
+        );
+        assert_eq!(owes(&s, "claude").text(), None, "master owes nothing");
+
+        s.active_plan = None;
+        s.github_events = vec![
+            event(vec![copy("codex", false), copy("claude", true)]),
+            event(vec![copy("codex", true)]),
+        ];
+        assert_eq!(owes(&s, "codex").text().as_deref(), Some("1 unacked event"));
+        assert_eq!(owes(&s, "claude").text(), None, "its copy is acknowledged");
+        s.github_events.push(event(vec![copy("codex", false)]));
+        assert_eq!(
+            owes(&s, "codex").text().as_deref(),
+            Some("2 unacked events")
+        );
+        s.github_events = vec![event(vec![copy("codex", true)])];
+        assert_eq!(owes(&s, "codex"), Owes::default());
+    }
+
+    /// Master owes the queued plan it would promote, unless a pending
+    /// block stops the queue, and a broken HEAD tag before either.
+    #[test]
+    fn master_owes_its_promotion_or_its_tag_fix() {
+        let mut s = team(snap(None, vec!["next", "later"]));
+        assert_eq!(
+            owes(&s, "claude").text().as_deref(),
+            Some("promotion of next")
+        );
+        assert_eq!(owes(&s, "codex").text(), None);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "codex".into(),
+            name: "scope".into(),
+            occurrence: Some("01".into()),
+            kind: crate::cli::block::Stored::Valid(Default::default()),
+            nudge: None,
+            unreadable: None,
+            question: "Ship it?".into(),
+            answer: None,
+        }];
+        assert_eq!(owes(&s, "claude").text(), None, "blocked queue");
+
+        s.blocks.clear();
+        s.head_correction = Some(clank_core::wait::HeadCorrection {
+            sha: crate::lifecycle::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            violation: clank_core::wait::HeadTagViolation {
+                unknown: Some("ghost".to_string()),
+                untagged_touched: vec![],
+                extra_named: None,
+            },
+        });
+        assert_eq!(
+            owes(&s, "claude").text().as_deref(),
+            Some("tag fix on aaaaaaa")
+        );
+    }
 
     #[test]
     fn master_is_active_follows_state_color_precedence() {

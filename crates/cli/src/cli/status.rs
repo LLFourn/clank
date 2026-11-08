@@ -846,6 +846,12 @@ impl StatusSnapshot {
     }
 
     pub fn to_human(&self) -> String {
+        self.human(false)
+    }
+
+    /// [`Self::to_human`], with an interrupted agent's state in colour
+    /// when `paint`.
+    pub(crate) fn human(&self, paint: bool) -> String {
         let mut out = String::new();
         use std::fmt::Write as _;
 
@@ -918,12 +924,15 @@ impl StatusSnapshot {
                 );
             }
             if let Some(state) = &row.state {
-                let _ = writeln!(
-                    out,
-                    "state: {} → {}",
-                    row.label,
-                    state.line(crate::cli::recovery::unix_now())
-                );
+                let line = state.line(crate::cli::recovery::unix_now());
+                let line = match paint && state.interrupted() {
+                    true => format!(
+                        "\x1b[{}m{line}\x1b[0m",
+                        crate::cli::agent_state::INTERRUPTED_SGR
+                    ),
+                    false => line,
+                };
+                let _ = writeln!(out, "state: {} → {line}", row.label);
             }
             // A current state already says why it waits for a person.
             if let Some(why) = &row.waiting_for_you
@@ -1069,10 +1078,17 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
     } else {
-        print!("{}", snapshot.to_human());
+        print!("{}", snapshot.human(paint_stdout()));
         println!();
     }
     Ok(())
+}
+
+/// Whether human output may carry colour: stdout is a terminal and
+/// `NO_COLOR` is unset.
+fn paint_stdout() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 /// The watch loop's failure policy (tui-transient-refresh-resilience,
@@ -1130,7 +1146,7 @@ async fn run_watch(
                         let output = if json {
                             snapshot.to_json_compact()
                         } else {
-                            snapshot.to_human()
+                            snapshot.human(paint_stdout())
                         };
 
                         if last_emitted.as_deref() != Some(&output) {
@@ -3327,6 +3343,53 @@ mod dirty_and_wake_tests {
             "{stale}"
         );
         assert!(stale.contains("waiting for you: codex"), "{stale}");
+    }
+
+    /// An interrupted agent's state reads in capitals, and in the TUI's
+    /// orange only when painted; any other state is never painted.
+    #[test]
+    fn plain_status_marks_an_interrupted_agent() {
+        use crate::cli::agent_state::{
+            Activity, AgentState, INTERRUPTED_SGR, Nudge, Observer, View,
+        };
+        let shown = |activity, paint| {
+            let mut snap = minimal_snapshot();
+            let mut row = agent_row("claude", None);
+            row.state = Some(View {
+                state: AgentState {
+                    role: "commit".into(),
+                    session: "s1".into(),
+                    tool: clank_core::Tool::Claude,
+                    monitor: Observer {
+                        pid: 1,
+                        birth: None,
+                    },
+                    activity,
+                    since: 0,
+                    suppressors: Vec::new(),
+                    nudge: Nudge::Nothing,
+                    cannot_resume: None,
+                    attending: Vec::new(),
+                    asking: None,
+                    repeated: None,
+                },
+                stale: None,
+            });
+            snap.agents = vec![row];
+            snap.human(paint)
+        };
+        let plain = shown(Activity::Interrupted, false);
+        assert!(plain.contains("state: claude → INTERRUPTED "), "{plain}");
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        let painted = shown(Activity::Interrupted, true);
+        assert!(
+            painted.contains(&format!(
+                "state: claude → \x1b[{INTERRUPTED_SGR}mINTERRUPTED "
+            )),
+            "{painted:?}"
+        );
+        let idle = shown(Activity::Idle, true);
+        assert!(!idle.contains('\x1b'), "{idle:?}");
     }
 
     #[test]

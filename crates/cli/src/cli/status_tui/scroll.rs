@@ -33,6 +33,28 @@ pub(super) enum InProgress {
 }
 
 impl InProgress {
+    /// The agent whose row spins.
+    pub(super) fn label(&self) -> &str {
+        match self {
+            InProgress::PendingReview { label, .. }
+            | InProgress::MasterWorking { name: label, .. } => label,
+        }
+    }
+
+    /// The first item `work` routes to this agent: what it owes, from the
+    /// same routing that made its row spin.
+    pub(super) fn owed(
+        &self,
+        work: &clank_core::wait::WorkStatus,
+    ) -> Option<clank_core::wait::WaitItem> {
+        let role = match self {
+            InProgress::PendingReview { .. } => clank_core::vocab::Role::Reviewer,
+            InProgress::MasterWorking { .. } => clank_core::vocab::Role::Master,
+        };
+        let label = clank_core::ids::AgentLabel::parse(self.label()).ok()?;
+        work.work_for(&label, role).into_iter().next()
+    }
+
     /// When this agent's oldest outstanding obligation began, if any
     /// of them is dated.
     pub(super) fn since(&self) -> Option<i64> {

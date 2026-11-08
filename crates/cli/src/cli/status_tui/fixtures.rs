@@ -255,3 +255,48 @@ pub(crate) fn library_home(labels: &[&str]) -> tempfile::TempDir {
     .unwrap();
     home
 }
+
+/// One copy of an event, addressed to `agent`.
+pub(crate) fn event_copy(agent: &str, acked: bool) -> crate::cli::github::timeline::MemberRef {
+    crate::cli::github::timeline::MemberRef {
+        woken_at: Some(1),
+        key: crate::cli::github::timeline::MemberKey {
+            agent: agent.into(),
+            source: "command-watch".into(),
+            seq: 1,
+            ident: String::new(),
+        },
+        acked,
+        transport: crate::cli::github::log::Transport::Command,
+        content: None,
+    }
+}
+
+/// An event made of `members`, open while any is unacked.
+pub(crate) fn merged_event(
+    members: Vec<crate::cli::github::timeline::MemberRef>,
+) -> crate::cli::github::timeline::MergedEvent {
+    crate::cli::github::timeline::MergedEvent {
+        replies: Vec::new(),
+        reply_history_pruned: false,
+        outgoing: Vec::new(),
+        recurrence: None,
+        at: 1,
+        backend: crate::cli::github::timeline::Backend::Command,
+        glyph: None,
+        source: "watch".into(),
+        kind: "k".into(),
+        failure: false,
+        detail: None,
+        number: None,
+        content: None,
+        body: None,
+        actor: None,
+        url: None,
+        seen_by: Vec::new(),
+        sender: None,
+        unhandled: members.iter().any(|m| !m.acked),
+        baseline: false,
+        members,
+    }
+}
