@@ -769,10 +769,19 @@ pub(super) fn scrollable_header(
                 if gone {
                     spans.push(dim("  gone".to_string()));
                 } else if let Some(s) = not_working {
-                    spans.push(dim(format!(
-                        "  {}",
-                        s.brief(crate::cli::recovery::unix_now())
-                    )));
+                    let brief = s.brief(crate::cli::recovery::unix_now());
+                    if s.interrupted() {
+                        let owes = owes(snap, &a.label)
+                            .text()
+                            .map(|o| format!(" · owes {o}"))
+                            .unwrap_or_default();
+                        spans.push(colored(
+                            crate::cli::agent_state::INTERRUPTED_SGR,
+                            format!("  {brief}{owes}"),
+                        ));
+                    } else {
+                        spans.push(dim(format!("  {brief}")));
+                    }
                 } else if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
@@ -2021,20 +2030,33 @@ pub(super) fn bar(
     // A pane too narrow to hold the lamp AND the instruments keeps the
     // lamp: the instruments are secondary, and a bar that overflows
     // its pane is worse than one missing them.
+    // An interrupted verb leaves the lamp for the terminal's own
+    // background, in the row's orange: on the lamp it would be one more
+    // word in the frame's hue, and vanish into an orange frame.
+    use crate::cli::agent_state::{INTERRUPTED, INTERRUPTED_SGR};
+    let shout = |left: &str| match left.strip_suffix(INTERRUPTED) {
+        Some(head) => format!("{head}\x1b[0;{INTERRUPTED_SGR}m{INTERRUPTED}\x1b[0;1;7;{color}m"),
+        None => left.to_string(),
+    };
     if cols < reserve + 1 {
         let left = truncate_to(&left, cols);
         let pad = cols.saturating_sub(display_width(&left));
-        return format!("\x1b[1;7;{color}m{left}{}\x1b[0m", " ".repeat(pad));
+        return format!(
+            "\x1b[1;7;{color}m{}{}\x1b[0m",
+            shout(&left),
+            " ".repeat(pad)
+        );
     }
     let inner = cols - reserve;
     let left = truncate_to(&left, inner);
     let lw = display_width(&left);
     let rw = display_width(&right);
+    let lamp = shout(&left);
     // Keep the right segment only when it fits with ≥2 cols of gap.
     let body = if !right.is_empty() && lw + 2 + rw <= inner {
-        format!("{left}{}{right}", " ".repeat(inner - lw - rw))
+        format!("{lamp}{}{right}", " ".repeat(inner - lw - rw))
     } else {
-        format!("{left}{}", " ".repeat(inner - lw))
+        format!("{lamp}{}", " ".repeat(inner - lw))
     };
     // The instruments sit on a band of their own colour, each in its
     // own hue as a FOREGROUND: a hue painted as a background was a
@@ -2161,9 +2183,30 @@ pub(super) fn remote_row(
     ]
 }
 
+/// `verb`, unless every agent `labels` names is currently interrupted:
+/// the bar must not say they are doing what their role asks.
+fn lamp_verb(snap: &StatusSnapshot, labels: &[&str], verb: &'static str) -> &'static str {
+    let interrupted = |label: &&str| {
+        snap.agents.iter().any(|a| {
+            a.label == *label
+                && a.state
+                    .as_ref()
+                    .is_some_and(crate::cli::agent_state::View::interrupted)
+        })
+    };
+    if !labels.is_empty() && labels.iter().all(interrupted) {
+        crate::cli::agent_state::INTERRUPTED
+    } else {
+        verb
+    }
+}
+
 /// Bar text: (left = who + verb, right = where). Every state
-/// names WHO must act; `idle` only when nothing and nobody waits.
+/// names WHO must act; `idle` only when nothing and nobody waits. The
+/// verb is [`crate::cli::agent_state::INTERRUPTED`] when the agents
+/// it names are.
 pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
+    let master: Vec<&str> = snap.master.as_deref().into_iter().collect();
     match snap.active_plan.as_ref() {
         // Ad-hoc ChangesRequested is an actionable MASTER item
         // (AdHocRevise) that wait returns BEFORE scanning the queue —
@@ -2182,13 +2225,15 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
                 .expect("guard checked");
             (
                 format!(
-                    "🔨 {} revising",
-                    snap.master.as_deref().unwrap_or("master").to_uppercase()
+                    "🔨 {} {}",
+                    snap.master.as_deref().unwrap_or("master").to_uppercase(),
+                    lamp_verb(snap, &master, "revising")
                 ),
                 crate::cli::status::short_sha(ah.sha.as_str()).to_string(),
             )
         }
         None if !snap.queue.is_empty() => {
+            let masters = master;
             let master = snap.master.as_deref().unwrap_or("master").to_uppercase();
             // Mirror the wait promote scan (wait-ignores-queue-only-blocks):
             // a queued plan is promotable only if no PENDING block
@@ -2196,14 +2241,7 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
             // ALL, a plan-scoped one suppresses its plan. Block > promote:
             // if nothing is promotable the queue is STOPPED on a human ask,
             // so show the block lamp (🙋), not the promote lamp.
-            // Blocks are repo-wide: one pending block stops the queue
-            // regardless of which item is next.
-            let pending = |_name: &str| snap.blocks.iter().any(|b| b.answer.is_none());
-            let promotable = snap
-                .queue
-                .iter()
-                .find(|item| !pending(&item.name))
-                .map(|item| item.name.clone());
+            let promotable = promotable(snap).map(|item| item.name.clone());
             let head = promotable
                 .clone()
                 .unwrap_or_else(|| snap.queue[0].name.clone());
@@ -2213,7 +2251,10 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
                 head
             };
             if promotable.is_some() {
-                (format!("📋 {master} promote"), right)
+                (
+                    format!("📋 {master} {}", lamp_verb(snap, &masters, "promote")),
+                    right,
+                )
             } else {
                 (format!("🙋 {master} blocked"), right)
             }
@@ -2230,7 +2271,11 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
                 .expect("guard checked");
             match super::derive::awaited_reviewers(snap).first() {
                 Some(reviewer) => (
-                    format!("👀 {} reviewing", reviewer.to_uppercase()),
+                    format!(
+                        "👀 {} {}",
+                        reviewer.to_uppercase(),
+                        lamp_verb(snap, &[reviewer.as_str()], "reviewing")
+                    ),
                     crate::cli::status::short_sha(ah.sha.as_str()).to_string(),
                 ),
                 // Roster gap: nobody CAN act — say so honestly.
@@ -2238,15 +2283,30 @@ pub(super) fn bar_text(snap: &StatusSnapshot) -> (String, String) {
             }
         }
         None => ("💤 idle".to_string(), String::new()),
-        Some(v) => (
-            format!(
-                "{} {} {}",
-                emoji_of(&v.waiting_on),
-                actor_of(v).to_uppercase(),
-                verb_of(&v.waiting_on)
-            ),
-            v.plan.as_str().to_string(),
-        ),
+        Some(v) => {
+            use clank_core::plan_view::WaitingOn;
+            let named: Vec<&str> = match &v.waiting_on {
+                WaitingOn::ReviewerApprovalsMissing { missing }
+                | WaitingOn::GateReviewersMissing { missing } => {
+                    missing.iter().map(|l| l.as_str()).collect()
+                }
+                WaitingOn::Blocked { .. } => Vec::new(),
+                WaitingOn::MasterToRevise { .. }
+                | WaitingOn::MasterToContinue
+                | WaitingOn::MasterToCommit
+                | WaitingOn::MasterToFinalize
+                | WaitingOn::MasterToFixCommitTag => master,
+            };
+            (
+                format!(
+                    "{} {} {}",
+                    emoji_of(&v.waiting_on),
+                    actor_of(v).to_uppercase(),
+                    lamp_verb(snap, &named, verb_of(&v.waiting_on))
+                ),
+                v.plan.as_str().to_string(),
+            )
+        }
     }
 }
 
@@ -11771,6 +11831,114 @@ mod tests {
         assert!(
             !r.contains("gone"),
             "running without a pane is not gone: {r}"
+        );
+    }
+
+    /// An interrupted agent's row is drawn in capitals and the orange, not
+    /// dim, and names what [`owes`] says it owes, an unacked event alone
+    /// included; one owing nothing names nothing. A stale interrupted state keeps the stale treatment.
+    #[test]
+    fn an_interrupted_agent_row_shouts_what_it_owes() {
+        use crate::cli::agent_state::{Activity, INTERRUPTED_SGR};
+        let orange = format!("\x1b[{INTERRUPTED_SGR}m");
+        let mut s = two_agent_snap();
+        s.active_plan = Some(plan_state("foo", reviewer_missing("codex")));
+        s.agents[0].state = Some(view_of(Activity::Interrupted, None));
+        s.agents[1].state = Some(view_of(Activity::Interrupted, None));
+        let out = render_at(&s, 40, 120, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        let codex = line_with(&out, "codex");
+        assert!(
+            codex.contains(&format!("{orange}  INTERRUPTED ")),
+            "{codex:?}"
+        );
+        assert!(
+            visible(codex).contains("· owes review of abc1230"),
+            "{codex:?}"
+        );
+        assert!(!codex.contains(SPINNER[0]), "{codex:?}");
+        let claude = line_with(&out, "claude");
+        assert!(claude.contains(&orange), "{claude:?}");
+        assert!(!visible(claude).contains("owes"), "{claude:?}");
+
+        s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
+        let out = render_at(&s, 40, 120, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        assert!(
+            visible(line_with(&out, "claude")).contains("· owes work on foo"),
+            "{out:?}"
+        );
+
+        s.active_plan = None;
+        s.github_events = vec![crate::cli::status_tui::fixtures::merged_event(vec![
+            crate::cli::status_tui::fixtures::event_copy("codex", false),
+        ])];
+        let out = render_at(&s, 40, 120, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        assert!(
+            visible(line_with(&out, "codex")).contains("· owes 1 unacked event"),
+            "{out:?}"
+        );
+        s.github_events.clear();
+
+        s.agents[1].state = Some(view_of(Activity::Idle, None));
+        let out = render_at(&s, 40, 120, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        let idle = line_with(&out, "codex");
+        assert!(
+            !idle.contains(&orange) && idle.contains("\x1b[2m  idle "),
+            "{idle:?}"
+        );
+        s.agents[1].state = Some(view_of(Activity::Interrupted, Some("its monitor is gone")));
+        let out = render_at(&s, 40, 120, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+        assert!(!line_with(&out, "codex").contains("INTERRUPTED"), "{out:?}");
+    }
+
+    /// The bar says INTERRUPTED, off the lamp in the orange, when every
+    /// agent it names is currently interrupted, and its role's verb
+    /// otherwise.
+    #[test]
+    fn the_bar_names_an_interrupted_actor_as_interrupted() {
+        use crate::cli::agent_state::{Activity, INTERRUPTED_SGR};
+        use crate::cli::status_tui::remote::Shown;
+        use crate::cli::status_tui::zellij::ZellijReach;
+        let mut s = two_agent_snap();
+        s.active_plan = Some(plan_state("foo", reviewer_missing("codex")));
+        assert_eq!(bar_text(&s).0, "👀 CODEX reviewing");
+        s.agents[1].state = Some(view_of(Activity::Interrupted, Some("its monitor is gone")));
+        assert_eq!(bar_text(&s).0, "👀 CODEX reviewing", "stale");
+        s.agents[1].state = Some(view_of(Activity::Interrupted, None));
+        assert_eq!(bar_text(&s).0, "👀 CODEX INTERRUPTED");
+        let color = state_color(&s).sgr();
+        let line = bar(&s, &color, 80, ZellijReach::Connected, Shown::Off, true);
+        assert!(
+            line.contains(&format!(
+                "\x1b[0;{INTERRUPTED_SGR}mINTERRUPTED\x1b[0;1;7;{color}m"
+            )),
+            "{line:?}"
+        );
+
+        s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
+        assert_eq!(bar_text(&s).0, "🔨 MASTER working", "codex is not named");
+        s.agents[0].state = Some(view_of(Activity::Interrupted, None));
+        assert_eq!(bar_text(&s).0, "🔨 MASTER INTERRUPTED");
+
+        s.agents.push(crate::cli::status_tui::fixtures::agent_row(
+            "ruthless",
+            crate::cli::teams_config::RosterRole::Commit,
+            clank_core::vocab::AutoMode::Off,
+        ));
+        let label = |l: &str| clank_core::ids::AgentLabel::parse(l).unwrap();
+        s.active_plan = Some(plan_state(
+            "foo",
+            WaitingOn::ReviewerApprovalsMissing {
+                missing: clank_core::repo_state::NonEmptyVec::new(vec![
+                    label("codex"),
+                    label("ruthless"),
+                ])
+                .unwrap(),
+            },
+        ));
+        assert_eq!(
+            bar_text(&s).0,
+            "👀 CODEX, RUTHLESS reviewing",
+            "ruthless is not interrupted"
         );
     }
 

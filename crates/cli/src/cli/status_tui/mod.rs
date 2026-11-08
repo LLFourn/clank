@@ -2624,7 +2624,6 @@ pub(crate) fn web_facts(
     snap: &StatusSnapshot,
     with_transcript: &std::collections::BTreeSet<String>,
 ) -> WebFacts {
-    use clank_core::vocab::Role;
     let (lamp, plan) = render::bar_text(snap);
     let hue = derive::state_color(snap).hex();
     let work = derive::work_projection(snap);
@@ -2634,19 +2633,18 @@ pub(crate) fn web_facts(
     let mut owed: std::collections::HashMap<String, Owed> = in_progress_rows(snap)
         .into_iter()
         .map(|p| {
-            let (label, verb, since, role) = match p {
-                InProgress::PendingReview { label, verb, since } => {
-                    (label, verb, since, Role::Reviewer)
-                }
-                InProgress::MasterWorking { name, verb, since } => {
-                    (name, verb, since, Role::Master)
-                }
-            };
-            let object = clank_core::ids::AgentLabel::parse(&label)
-                .ok()
-                .and_then(|l| work.work_for(&l, role).into_iter().next())
+            let object = p
+                .owed(&work)
                 .map(|item| object_of(&item))
                 .unwrap_or_default();
+            let (label, verb, since) = match p {
+                InProgress::PendingReview { label, verb, since }
+                | InProgress::MasterWorking {
+                    name: label,
+                    verb,
+                    since,
+                } => (label, verb, since),
+            };
             (
                 label,
                 Owed {
@@ -2762,7 +2760,7 @@ pub(crate) fn web_facts(
 }
 
 /// What a routed item is about, as the floor says it.
-fn object_of(item: &clank_core::wait::WaitItem) -> String {
+pub(super) fn object_of(item: &clank_core::wait::WaitItem) -> String {
     use clank_core::wait::WaitItem;
     let short = |s: &clank_core::ids::CommitSha| s.as_str()[..7.min(s.as_str().len())].to_string();
     match item {
