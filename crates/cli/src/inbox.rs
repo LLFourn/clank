@@ -508,8 +508,65 @@ pub(crate) fn compact_after_ack(repo: &Path, label: &AgentLabel) {
     }
 }
 
-/// This agent's unacked messages, oldest first, each stamped with what
-/// acks it.
+/// The run's one identity: its registered process, which no other run
+/// can share.
+fn run_id(proof: &clank_core::turn_policy::ShellProof) -> String {
+    let hex = blake3::hash(format!("{}\0{}", proof.pid, proof.token).as_bytes()).to_hex();
+    hex.as_str()[..24].to_string()
+}
+
+fn run_ended_key(label: &AgentLabel, run: &str) -> String {
+    format!(
+        "{}{}/{run}",
+        crate::cli::github::log::RUN_ENDED_PREFIX,
+        label.as_str()
+    )
+}
+
+/// Log the one terminal record of `label`'s run `end`, so it wakes the
+/// agent until acked. Idempotent per run: its key is pinned in the log's
+/// dedup horizon, so a record once written is never written again, which
+/// is what lets the monitor write before it forgets the run.
+pub(crate) fn record_run_end(
+    repo: &Path,
+    label: &AgentLabel,
+    end: &clank_core::turn_policy::RunEnd,
+) -> anyhow::Result<()> {
+    let run = run_id(&end.proof);
+    let key = run_ended_key(label, &run);
+    message_transaction(repo, label, |log| {
+        if log.load().action_keys.contains(&key) {
+            return Ok(());
+        }
+        let item = WaitItem::RunEnded {
+            presentation: None,
+            run,
+            desc: end.desc.clone(),
+            started: end.started,
+            ended_seen: end.ended_seen,
+            selector: None,
+        };
+        log.append_interruptible_inbox(
+            Transport::Message,
+            None,
+            Some(&key),
+            Some(end.ended_seen / 1000),
+            &item,
+            Default::default(),
+        )
+        .with_context(|| format!("logging a run's end for `{}`", label.as_str()))?;
+        if let Err(e) = log.maybe_compact() {
+            eprintln!(
+                "clank: could not compact `{}`'s message log: {e}",
+                label.as_str()
+            );
+        }
+        Ok(())
+    })
+}
+
+/// This agent's unacked messages and ended runs, oldest first, each
+/// stamped with what acks it.
 pub fn pending(repo: &Path, label: &AgentLabel) -> Vec<WaitItem> {
     // Anything still in the old file inbox joins the log first, so one
     // read answers for both.
@@ -530,7 +587,9 @@ pub fn pending(repo: &Path, label: &AgentLabel) -> Vec<WaitItem> {
                 seq: row.seq,
                 ident: row.ident,
             });
-            let WaitItem::Message { selector, .. } = &mut item else {
+            let (WaitItem::Message { selector, .. } | WaitItem::RunEnded { selector, .. }) =
+                &mut item
+            else {
                 return None;
             };
             *selector =

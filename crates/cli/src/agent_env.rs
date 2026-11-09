@@ -25,7 +25,7 @@ const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
 /// not export the id; those still use the newest session dir for cwd.
 const ENV_GROK_MARKER: &str = "GROK_AGENT";
 pub(crate) const ENV_GROK_SESSION: &str = "GROK_SESSION_ID";
-/// Exported by opencode 2.x itself into the shell of the bash tool it
+/// Exported by opencode 2.x itself into the shell of the `shell` tool it
 /// runs for a session; the clank plugin blanks it everywhere else, so it
 /// is present iff the shell belongs to that exact session.
 const ENV_OPENCODE_SESSION: &str = "OPENCODE_SESSION_ID";

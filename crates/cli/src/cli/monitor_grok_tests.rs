@@ -140,7 +140,7 @@ async fn an_attending_groks_background_wait_delivers_a_new_event() {
     use crate::cli::github::log::{EventLog, Transport as Wal};
     use crate::cli::turn_custody::{Gathered, Turns};
     use crate::cli::turn_wire::{Report, WireVerdict};
-    use clank_core::turn_policy::{AttendRequest, Handoff, Selector};
+    use clank_core::turn_policy::AttendRequest;
 
     let repo = TempRepo::new();
     let author = AgentLabel::parse("grok").unwrap();
@@ -178,22 +178,18 @@ async fn an_attending_groks_background_wait_delivers_a_new_event() {
     turns
         .attend(
             &author,
-            AttendRequest::Attend {
+            AttendRequest::Declare {
                 session: session.clone(),
-                selector: Selector::Name("sleeper".into()),
+                name: "sleeper".into(),
                 desc: None,
                 expect: 600_000,
-                shell: None,
             },
             &g,
         )
         .unwrap();
     let handoff = Report::Handoff {
-        handoff: Handoff {
-            session: session.clone(),
-            wait_running: false,
-            continued: false,
-        },
+        session: session.clone(),
+        continued: false,
         deadline: u64::MAX,
     };
     let frame = turns.answer(&author, 1, &handoff, true, &g).unwrap();
@@ -328,5 +324,126 @@ async fn lost_automatic_wait(registered_before_close: bool) {
     assert!(
         turns.state(&author).unwrap().unwatched.is_some(),
         "registered before close: {registered_before_close}"
+    );
+}
+
+/// A Grok Stop's report, carried on a connection that holds nothing, as
+/// the hook's own child carries it.
+async fn reporting(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    session: &SessionId,
+) -> (Client, tokio::io::BufReader<tokio::net::UnixStream>) {
+    let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
+    let hello = Hello {
+        proto: PROTO,
+        repo: repo.to_string_lossy().into(),
+        who: Who::Agent {
+            author: author.to_string(),
+            holder: None,
+            has_cli_sources: false,
+            turn_end: Some(crate::cli::turn_wire::Report::Handoff {
+                session: session.clone(),
+                continued: false,
+                deadline: u64::MAX,
+            }),
+        },
+    };
+    peer.write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let client = admit(server, repo).await.unwrap().client();
+    let mut peer = tokio::io::BufReader::new(peer);
+    let mut welcome = String::new();
+    peer.read_line(&mut welcome).await.unwrap();
+    (client, peer)
+}
+
+/// What the monitor answers one Grok Stop while `clients` are connected.
+async fn handoff_answer(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    session: &SessionId,
+    clients: &mut Vec<Client>,
+) -> crate::cli::turn_wire::WireVerdict {
+    let (report, mut peer) = reporting(repo, author, session).await;
+    clients.push(report);
+    let mut turns = crate::cli::turn_custody::Turns::new(repo.to_path_buf());
+    for writer in serve_reports(
+        repo,
+        clients,
+        None,
+        None,
+        &[],
+        &mut Default::default(),
+        &Default::default(),
+        &mut turns,
+    ) {
+        writer.await.unwrap();
+    }
+    loop {
+        let mut line = String::new();
+        assert!(peer.read_line(&mut line).await.unwrap() > 0, "no verdict");
+        if let Note::Verdict(frame) = serde_json::from_str::<Note>(&line).unwrap() {
+            return frame.verdict;
+        }
+    }
+}
+
+/// The monitor's registration of the session's bare background wait is
+/// the only evidence it runs: with none the Stop is told to arm one, with
+/// one it is silent, and once that wait exits its registration drops and
+/// the next Stop is told to arm one again. A second wait is refused by the
+/// one-wait-per-session holder, so the registration stays single.
+#[tokio::test]
+async fn the_registered_waiter_alone_decides_whether_grok_arms_one() {
+    use crate::cli::turn_wire::WireVerdict;
+    let (repo, author, session) = fixture();
+    let mut clients = vec![];
+    assert_eq!(
+        handoff_answer(repo.path(), &author, &session, &mut clients).await,
+        WireVerdict::Notify,
+        "no wait registered"
+    );
+
+    let (wait, wait_peer) = connecting(repo.path(), &author, &session).await;
+    let closed = wait.out.clone();
+    assert!(joining(repo.path(), &mut clients, wait).is_empty());
+    let (duplicate, mut duplicate_peer) = connecting(repo.path(), &author, &session).await;
+    let _ = joining(repo.path(), &mut clients, duplicate);
+    let mut refusal = String::new();
+    duplicate_peer.read_line(&mut refusal).await.unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<Note>(&refusal).unwrap(),
+            Note::Refused { .. }
+        ),
+        "{refusal}"
+    );
+    assert_eq!(
+        handoff_answer(repo.path(), &author, &session, &mut clients).await,
+        WireVerdict::Silent {
+            why: clank_core::SilentReason::WaitArmed
+        },
+        "the registered wait carries the next wake"
+    );
+
+    let other = SessionId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+    crate::agent_store::bind_session_to_agent(repo.path(), &author, Tool::Grok, &other).unwrap();
+    assert_eq!(
+        handoff_answer(repo.path(), &author, &other, &mut clients).await,
+        WireVerdict::Notify,
+        "another session's wait is not this one's"
+    );
+    crate::agent_store::bind_session_to_agent(repo.path(), &author, Tool::Grok, &session).unwrap();
+
+    drop(wait_peer);
+    tokio::time::timeout(Duration::from_secs(1), closed.closed())
+        .await
+        .unwrap();
+    assert_eq!(
+        handoff_answer(repo.path(), &author, &session, &mut clients).await,
+        WireVerdict::Notify,
+        "the wait exited, so its registration is gone"
     );
 }

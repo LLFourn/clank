@@ -47,7 +47,11 @@ use clank_core::wait::WaitItem;
 // 19 ends a parked Stop with the `user_command` silent reason when a signed
 // command waits, which an 18 hook cannot decode; an 18 monitor never
 // releases a park for one.
-pub(crate) const PROTO: u32 = 19;
+// 20 reads no task listing: a `clank run` registers its process and a
+// `clank attend` declares a name, and Grok's handoff carries no waiter
+// evidence because the monitor's own registration is it. A 19 monitor would
+// wait for a listing that never comes.
+pub(crate) const PROTO: u32 = 20;
 
 #[cfg(test)]
 #[path = "monitor_grok_tests.rs"]
@@ -179,16 +183,23 @@ pub(crate) enum Control {
         key: String,
         accepted: String,
     },
-    /// Attend background work from `author`'s next turn-end.
+    /// A `clank run` registering the process it is about to become.
+    Run {
+        author: String,
+        session: clank_core::SessionId,
+        desc: String,
+        expect_ms: u64,
+        proof: clank_core::turn_policy::ShellProof,
+    },
+    /// A `clank attend` declaration, standing until `author`'s next turn
+    /// starts.
     Attend {
         author: String,
         session: clank_core::SessionId,
-        selector: clank_core::turn_policy::Selector,
+        name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         desc: Option<String>,
         expect_ms: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        shell: Option<clank_core::turn_policy::ShellProof>,
     },
     /// Withdraw `which` of `author`'s attendances, and the check-ins they
     /// owe.
@@ -261,10 +272,6 @@ pub(crate) enum Note {
     },
     /// A control request was carried out.
     Done { what: String },
-    /// An attend from `clank run` refused because another attended run
-    /// already holds its `--desc`: that command must not run, or neither
-    /// run could be told apart in the harness's listing.
-    DescInUse { desc: String },
     /// A turn-end verdict, for a connection carrying a report.
     Verdict(super::turn_wire::Frame),
     /// Proof of life, and nothing else.
@@ -3614,7 +3621,9 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 );
                                 answered.map_err(refused)
                             }
-                            Control::Attend { .. } | Control::Clear { .. } => {
+                            Control::Run { .. }
+                            | Control::Attend { .. }
+                            | Control::Clear { .. } => {
                                 let answered =
                                     turn_control(&repo, &mut turns, &request, |author| {
                                         gather(
@@ -3851,6 +3860,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                             &hosted,
                         ));
                         if owner {
+                            end_gone_runs(&repo, &mut turns);
                             leaving.extend(serve_reports(
                                 &repo,
                                 &mut clients,
@@ -4656,6 +4666,17 @@ fn may_check_in_now(
         return Err("its input line is not empty".into());
     }
     turns.may_type_check_in(&ask.author, &ask.check_ins, g)
+}
+
+/// Record the end of every bound agent's `clank run` whose process is
+/// gone. Each beat asks, so a run ends within one beat of its process,
+/// and the first beat after a restart ends those that went while no
+/// monitor watched.
+fn end_gone_runs(repo: &std::path::Path, turns: &mut crate::cli::turn_custody::Turns) {
+    for author in roster_authors(repo) {
+        let g = crate::cli::turn_custody::Gathered::of(repo, &author, None);
+        turns.end_gone_runs(&author, &g);
+    }
 }
 
 /// Step every check-in due by `now`, gathering each agent as it is
@@ -7373,6 +7394,11 @@ fn serve_reports(
     turns: &mut crate::cli::turn_custody::Turns,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut leaving = Vec::new();
+    let waiters: Vec<(AgentLabel, String)> = clients
+        .iter()
+        .filter_map(registered_waiter)
+        .map(|(author, session)| (author.clone(), session.to_string()))
+        .collect();
     let mut keep = Vec::with_capacity(clients.len());
     for mut client in clients.drain(..) {
         let (Served::Agent { author }, Some(reporting)) = (&client.who, client.report.as_mut())
@@ -7389,7 +7415,9 @@ fn serve_reports(
         if !reporting.stepped {
             turns.observe_questions(&author, &reporting.report);
         }
-        let g = gather(repo, state, &author, hosted, timer_backlogs, pending);
+        let session = reporting.report.session().as_str();
+        let g = gather(repo, state, &author, hosted, timer_backlogs, pending)
+            .waiting(waiters.iter().any(|(a, s)| a == &author && s == session));
         let first = !reporting.stepped;
         let Some(frame) = turns.answer(&author, client.conn, &reporting.report, first, &g) else {
             keep.push(client);
@@ -7422,6 +7450,19 @@ fn serve_reports(
     }
     *clients = keep;
     leaving
+}
+
+/// A session's background `clank wait`, as the monitor holds it: an
+/// agent's open connection that holds the session and carries no report.
+/// Its registration is the only evidence that the wait runs; it drops when
+/// the wait exits.
+fn registered_waiter(c: &Client) -> Option<(&AgentLabel, &str)> {
+    match (&c.who, &c.holder, &c.report) {
+        (Served::Agent { author }, Some(holder), None) if !c.out.is_closed() => {
+            Some((author, holder.session.as_str()))
+        }
+        _ => None,
+    }
 }
 
 /// The parked reports whose hook can wait no longer: each gets the verdict
@@ -7519,21 +7560,34 @@ fn turn_control(
 ) -> Result<(AgentLabel, String), Note> {
     use clank_core::turn_policy::AttendRequest;
     let (author, request) = match request {
+        Control::Run {
+            author,
+            session,
+            desc,
+            expect_ms,
+            proof,
+        } => (
+            author,
+            AttendRequest::Run {
+                session: session.clone(),
+                proof: proof.clone(),
+                desc: desc.clone(),
+                expect: *expect_ms,
+            },
+        ),
         Control::Attend {
             author,
             session,
-            selector,
+            name,
             desc,
             expect_ms,
-            shell,
         } => (
             author,
-            AttendRequest::Attend {
+            AttendRequest::Declare {
                 session: session.clone(),
-                selector: selector.clone(),
+                name: name.clone(),
                 desc: desc.clone(),
                 expect: *expect_ms,
-                shell: shell.clone(),
             },
         ),
         Control::Clear {
@@ -7551,27 +7605,15 @@ fn turn_control(
             return Err(refused("not a turn request".into()));
         }
     };
-    if let AttendRequest::Attend {
-        selector: clank_core::turn_policy::Selector::TaskId(_),
-        ..
-    } = &request
-    {
-        return Err(refused(
-            "attend a subagent by its name; shell work is attended by launching it with \
-             `clank run`"
-                .into(),
-        ));
-    }
     let author = AgentLabel::parse(author)
         .map_err(|e| refused(format!("invalid author `{author}`: {e}")))?;
     crate::agent_store::resolve_role(repo, &author)
         .map_err(|e| refused(format!("`{author}` is not on this repo's roster: {e:#}")))?;
     let g = gathered(&author);
-    match turns.attend(&author, request, &g) {
-        Ok(said) => Ok((author, said)),
-        Err(crate::cli::turn_custody::Refused::DescInUse(desc)) => Err(Note::DescInUse { desc }),
-        Err(crate::cli::turn_custody::Refused::Other(why)) => Err(refused(why)),
-    }
+    turns
+        .attend(&author, request, &g)
+        .map(|said| (author, said))
+        .map_err(refused)
 }
 
 fn refused(why: String) -> Note {
@@ -8600,7 +8642,6 @@ mod recovery_tests {
                         position: Some(n),
                         human_turn: false,
                     },
-                    tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
                 },
                 deadline: u64::MAX,
                 questions: Vec::new(),
@@ -8650,37 +8691,15 @@ mod recovery_tests {
         assert_eq!(count(), None, "another session's count");
         bind(clank_core::Tool::Codex, "session-one");
 
-        // A qualifying attendance holds recovery back; a codex one never
-        // qualifies, since nothing wakes it when its work completes.
-        bind(clank_core::Tool::Claude, "session-one");
+        // An attendance declared in the turn a delivery started holds
+        // recovery back over the work that delivery received.
         let g =
             crate::cli::turn_custody::Gathered::of(repo.path(), &codex, Some((&owed_now(), None)));
-        turns
-            .borrow_mut()
-            .attend(
-                &codex,
-                clank_core::turn_policy::AttendRequest::Attend {
-                    session: clank_core::SessionId::parse("session-one").unwrap(),
-                    selector: clank_core::turn_policy::Selector::Name("sleeper".into()),
-                    desc: None,
-                    expect: 600_000,
-                    shell: None,
-                },
-                &g,
-            )
-            .unwrap();
-        let listing: Vec<clank_core::hook_io::BackgroundTask> = vec![
-            serde_json::from_value(serde_json::json!({
-                "id": "a1", "type": "subagent", "status": "running", "description": "sleeper",
-            }))
-            .unwrap(),
-        ];
         let stop = crate::cli::turn_wire::Report::TurnEnd {
             stop: clank_core::turn_policy::TurnEndReport {
-                tool: clank_core::Tool::Claude,
+                tool: clank_core::Tool::Codex,
                 session: clank_core::SessionId::parse("session-one").unwrap(),
                 place: Default::default(),
-                tasks: clank_core::turn_policy::TaskSnapshot::Known(listing),
             },
             deadline: u64::MAX,
             questions: Vec::new(),
@@ -8691,12 +8710,8 @@ mod recovery_tests {
             .unwrap();
         let presentation = frame
             .presentation()
-            .unwrap_or_else(|| panic!("work never delivered is not quieted: {frame:?}"))
+            .unwrap_or_else(|| panic!("owed work is delivered: {frame:?}"))
             .clone();
-        assert!(
-            !facts(&[])[0].attending,
-            "nor does it hold recovery back before it is received"
-        );
         turns
             .borrow_mut()
             .result(
@@ -8707,8 +8722,25 @@ mod recovery_tests {
             )
             .unwrap();
         assert!(
+            !facts(&[])[0].attending,
+            "received work with nothing attended does not hold recovery back"
+        );
+        turns
+            .borrow_mut()
+            .attend(
+                &codex,
+                clank_core::turn_policy::AttendRequest::Declare {
+                    session: clank_core::SessionId::parse("session-one").unwrap(),
+                    name: "sleeper".into(),
+                    desc: None,
+                    expect: 600_000,
+                },
+                &g,
+            )
+            .unwrap();
+        assert!(
             facts(&[])[0].attending,
-            "a qualifying attendance holds recovery back over received work"
+            "a declaration holds recovery back over received work, for codex too"
         );
         assert!(
             !facts(&[])[0].projection.attended.is_empty(),
@@ -8810,8 +8842,7 @@ mod recovery_tests {
         crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::Off).unwrap();
         assert_eq!(gate(&[]), Gate::AutoOff);
 
-        // A qualifying attendance holds recovery: a Claude session's
-        // subagent, listed running at its last Stop.
+        // A declaration holds recovery from the moment it is made.
         crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::On).unwrap();
         crate::agent_store::bind_session_to_agent(
             repo.path(),
@@ -8826,40 +8857,14 @@ mod recovery_tests {
             .borrow_mut()
             .attend(
                 &codex,
-                clank_core::turn_policy::AttendRequest::Attend {
+                clank_core::turn_policy::AttendRequest::Declare {
                     session: clank_core::SessionId::parse("session-one").unwrap(),
-                    selector: clank_core::turn_policy::Selector::Name("sleeper".into()),
+                    name: "sleeper".into(),
                     desc: None,
                     expect: 600_000,
-                    shell: None,
                 },
                 &g,
             )
-            .unwrap();
-        assert_eq!(
-            gate(&[]),
-            Gate::Go,
-            "an intent quiets nothing until a Stop proves it"
-        );
-        let stop = crate::cli::turn_wire::Report::TurnEnd {
-            stop: clank_core::turn_policy::TurnEndReport {
-                tool: clank_core::Tool::Claude,
-                session: clank_core::SessionId::parse("session-one").unwrap(),
-                place: Default::default(),
-                tasks: clank_core::turn_policy::TaskSnapshot::Known(vec![
-                    serde_json::from_value(serde_json::json!({
-                        "id": "a1", "type": "subagent", "status": "running",
-                        "description": "sleeper",
-                    }))
-                    .unwrap(),
-                ]),
-            },
-            deadline: u64::MAX,
-            questions: Vec::new(),
-        };
-        turns
-            .borrow_mut()
-            .answer(&codex, 1, &stop, true, &g)
             .unwrap();
         assert_eq!(gate(&[]), Gate::Hold);
         turns
@@ -9824,7 +9829,7 @@ mod tests {
         }
         let wire = serde_json::to_string(&clank_core::SilentReason::UserCommand).unwrap();
         assert!(serde_json::from_str::<Proto18Reason>(&wire).is_err());
-        assert_eq!(PROTO, 19);
+        const { assert!(PROTO >= 19) };
 
         let repo = repo_with_roster();
         let hello = |proto: u32| {
@@ -9844,9 +9849,31 @@ mod tests {
             "a 19 client does not share an 18 monitor"
         );
         assert!(matches!(
-            greeting_of(&hello(19), repo.path()),
+            greeting_of(&hello(PROTO), repo.path()),
             Greeting::Client(_)
         ));
+    }
+
+    /// Protocol 20 reads no task listing: a 19 hook's Stop carries one and
+    /// its Grok handoff carries the hook's own waiter evidence, so it is
+    /// declined rather than half-read.
+    #[test]
+    fn a_hook_that_reports_a_task_listing_is_declined() {
+        assert_eq!(PROTO, 20);
+        let repo = repo_with_roster();
+        let hello = |proto: u32| {
+            serde_json::to_string(&Hello {
+                proto,
+                repo: repo.path().to_string_lossy().to_string(),
+                who: agent("codex"),
+            })
+            .unwrap()
+        };
+        assert!(matches!(
+            greeting_of(&hello(19), repo.path()),
+            Greeting::Decline(_)
+        ));
+        assert!(!admits(PROTO, 19));
     }
 
     /// A higher version alone retires NOTHING.
@@ -15284,7 +15311,6 @@ mod tests {
         match note {
             Note::Done { what } => panic!("unexpected control answer: {what}"),
             Note::Refused { why } => panic!("unexpected refusal: {why}"),
-            Note::DescInUse { desc } => panic!("unexpected refusal: {desc}"),
             Note::Beat => {}
             Note::Recover { .. } => panic!("a wait is never sent a recovery"),
             Note::Superseded => panic!("nothing superseded this wait"),
@@ -17200,7 +17226,6 @@ mod user_command_tests {
                         tool: clank_core::Tool::Claude,
                         session: clank_core::SessionId::parse(session).unwrap(),
                         place: Default::default(),
-                        tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
                     },
                     deadline: u64::MAX,
                     questions: Vec::new(),

@@ -147,7 +147,8 @@ impl Expectation {
 /// on it.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attended {
-    /// The task id it resolved to, or what it names before it has.
+    /// What `clank attend` names it by: a declaration's name, or a run's
+    /// `--desc`.
     pub(crate) task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) expect: Option<Expectation>,
@@ -161,13 +162,14 @@ pub(crate) struct Attended {
     pub(crate) token: Option<crate::proc_identity::ProcToken>,
     /// RFC3339, when the attendance was accepted.
     pub(crate) at: String,
-    /// The provider's own agent: its listing is its liveness, and it has
-    /// no process of its own to check.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) subagent: bool,
-    /// Accepted, and not yet seen in a turn-end's listing.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) pending: bool,
+    /// A `clank attend` declaration: it has no process of its own to
+    /// check.
+    #[serde(
+        default,
+        alias = "subagent",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub(crate) declared: bool,
     /// What became of its check-in, once it was due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) check_in: Option<String>,
@@ -196,9 +198,9 @@ fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Attended>, 
 
 impl Attended {
     /// Whether it covers its work now: the monitor said so, and a run's
-    /// process is positively still there. A subagent has no process.
+    /// process is positively still there. A declaration has no process.
     pub(crate) fn covers(&self) -> bool {
-        self.unqualified.is_none() && (self.subagent || self.process_alive() == Some(true))
+        self.unqualified.is_none() && (self.declared || self.process_alive() == Some(true))
     }
 
     /// One line for a detail page: what it attends, and its age against
@@ -229,13 +231,9 @@ impl Attended {
             Some(pid) => format!("{pid} ({})", self.task),
             None => self.task.clone(),
         };
-        match (&self.unqualified, self.pending) {
-            (_, true) => out.push_str(" · from the next turn-end"),
-            (Some(why), false) => {
-                out.push_str(" · ");
-                out.push_str(why);
-            }
-            (None, false) => {}
+        if let Some(why) = &self.unqualified {
+            out.push_str(" · ");
+            out.push_str(why);
         }
         match (self.process_alive(), self.age(now)) {
             (Some(false), _) => out.push_str(" · stale, ended"),
@@ -293,7 +291,7 @@ impl Attended {
     /// The row marker's fields in priority order: subject, then age, then
     /// pid. Callers drop from the RIGHT to fit. `None` for a wait the row
     /// cannot show as ongoing: a process not positively alive, which a
-    /// subagent, having none, never is asked for.
+    /// declaration, having none, never is asked for.
     pub(crate) fn marker_fields(&self, now: time::OffsetDateTime) -> Option<MarkerFields<'_>> {
         if !self.covers() {
             return None;
@@ -693,8 +691,7 @@ mod tests {
             pid: None,
             token: None,
             at: at(10),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -713,10 +710,10 @@ mod tests {
         );
     }
 
-    /// A subagent has no process of its own, so the row shows it on the
+    /// A declaration has no process of its own, so the row shows it on the
     /// monitor's word; shell work is shown only while its process lives.
     #[test]
-    fn a_subagent_is_drawn_without_a_process_and_shell_work_only_with_one() {
+    fn a_declaration_is_drawn_without_a_process_and_shell_work_only_with_one() {
         let now = time::OffsetDateTime::now_utc();
         let mut rec = Attended {
             task: "a25eee2eef81caf3e".into(),
@@ -725,8 +722,7 @@ mod tests {
             pid: None,
             token: None,
             at: "2026-08-20T14:51:09Z".into(),
-            subagent: true,
-            pending: false,
+            declared: true,
             check_in: Some("check-in undeliverable: no pane".into()),
             unqualified: None,
         };
@@ -738,7 +734,7 @@ mod tests {
             rec.summary(now)
                 .ends_with("check-in undeliverable: no pane")
         );
-        rec.subagent = false;
+        rec.declared = false;
         assert!(rec.marker_fields(now).is_none());
     }
 

@@ -6,7 +6,8 @@
 //!
 //! - claude stdin: `{ session_id, transcript_path, cwd,
 //!   stop_hook_active, last_assistant_message, ... }` plus
-//!   claude-only extras (`effort`, `background_tasks`, ...).
+//!   claude-only extras (`effort`, `background_tasks`, ...), none of
+//!   which clank reads.
 //! - codex stdin: same common fields plus codex-only extras
 //!   (`turn_id`, `model`, ...).
 //!
@@ -58,243 +59,6 @@ pub struct HookInput {
     /// send one.
     #[serde(default)]
     pub turn_id: Option<String>,
-    /// Claude's in-flight background work at turn end:
-    /// `run_in_background` shells, subagents, MCP monitors, … . Claude
-    /// lists ONLY live tasks here (`[]` once they finish) and re-fires
-    /// Stop when one completes. `None` when the provider omits the field
-    /// (codex), which says nothing about whether anything is running.
-    #[serde(default)]
-    pub background_tasks: Option<Vec<BackgroundTask>>,
-}
-
-/// One entry of claude's Stop-hook `background_tasks` array.
-///
-/// Observed shapes (`crates/core/tests/fixtures/stop_hook/`): a subagent is
-/// `{id, type: "subagent", status, description, agent_type}` with its name
-/// in `description`; a finished task leaves the list rather than turning
-/// `completed`. Every field is optional, and `raw` keeps the whole entry as
-/// observed, so a field clank does not read yet is never lost.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "serde_json::Value", into = "serde_json::Value")]
-pub struct BackgroundTask {
-    pub id: Option<String>,
-    pub status: Option<String>,
-    /// The raw shell command line, for `shell` tasks.
-    pub command: Option<String>,
-    /// The provider's task kind: `subagent`, `shell`, `monitor`, … .
-    pub kind: Option<String>,
-    pub description: Option<String>,
-    pub agent_type: Option<String>,
-    pub raw: serde_json::Value,
-}
-
-impl From<BackgroundTask> for serde_json::Value {
-    fn from(task: BackgroundTask) -> Self {
-        task.raw
-    }
-}
-
-impl From<serde_json::Value> for BackgroundTask {
-    fn from(raw: serde_json::Value) -> Self {
-        let text = |key: &str| raw.get(key).and_then(|v| v.as_str()).map(str::to_owned);
-        Self {
-            id: text("id"),
-            status: text("status"),
-            command: text("command"),
-            kind: text("type"),
-            description: text("description"),
-            agent_type: text("agent_type"),
-            raw,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ShellToken {
-    Word(String),
-    Boundary,
-}
-
-/// Index of the actual program word, skipping leading `VAR=value`
-/// assignments and `env` / `exec` / `command` wrappers.
-///
-/// Shared by every command recogniser here so the wrapper rules cannot
-/// drift apart between them.
-fn command_word_index(words: &[&str]) -> usize {
-    let mut command = 0;
-    loop {
-        while words.get(command).is_some_and(|word| is_assignment(word)) {
-            command += 1;
-        }
-        match words.get(command).map(|word| program_basename(word)) {
-            Some("env" | "exec" | "command") => {
-                command += 1;
-                if words.get(command) == Some(&"--") {
-                    command += 1;
-                }
-            }
-            _ => return command,
-        }
-    }
-}
-
-/// The `--desc` VALUE of a `clank run` invocation, or `None` if this
-/// command line is not one.
-///
-/// Structured recognition, not substring matching: `echo "test run"`
-/// names the same words and is not a run, and a `clank run` whose
-/// description happens to appear later on its own line is not a match
-/// for that later text either. The description is the only handle the
-/// hook has on an owned run — the tool assigns a task id only after
-/// launching the command, so no id can exist in the marker — which is
-/// exactly why the handle has to be recognised precisely.
-///
-/// Stops at `--`: everything after it belongs to the command being
-/// run, so a `--desc` there is the CHILD's flag, not clank's.
-pub fn clank_run_desc(command: &str) -> Option<String> {
-    let tokens = shell_tokens(command);
-    tokens
-        .split(|token| matches!(token, ShellToken::Boundary))
-        .find_map(|segment| {
-            let words: Vec<&str> = segment
-                .iter()
-                .filter_map(|token| match token {
-                    ShellToken::Word(word) => Some(word.as_str()),
-                    ShellToken::Boundary => None,
-                })
-                .collect();
-            let at = command_word_index(&words);
-            if words.get(at).map(|w| program_basename(w)) != Some("clank")
-                || words.get(at + 1) != Some(&"run")
-            {
-                return None;
-            }
-            let mut i = at + 2;
-            while let Some(word) = words.get(i) {
-                if *word == "--" {
-                    return None;
-                }
-                if *word == "--desc" {
-                    return words.get(i + 1).map(|v| v.trim().to_string());
-                }
-                if let Some(v) = word.strip_prefix("--desc=") {
-                    return Some(v.trim().to_string());
-                }
-                i += 1;
-            }
-            None
-        })
-        .filter(|d| !d.is_empty())
-}
-
-/// Whether this command line is a `clank wait`: clank's own waiter, which a
-/// harness may run as background work and which is never work to attend.
-pub fn clank_wait(command: &str) -> bool {
-    shell_tokens(command)
-        .split(|token| matches!(token, ShellToken::Boundary))
-        .any(|segment| {
-            let words: Vec<&str> = segment
-                .iter()
-                .filter_map(|token| match token {
-                    ShellToken::Word(word) => Some(word.as_str()),
-                    ShellToken::Boundary => None,
-                })
-                .collect();
-            let at = command_word_index(&words);
-            words.get(at).map(|w| program_basename(w)) == Some("clank")
-                && words.get(at + 1) == Some(&"wait")
-        })
-}
-
-fn program_basename(word: &str) -> &str {
-    word.rsplit(['/', '\\']).next().unwrap_or(word)
-}
-
-fn is_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut chars = name.chars();
-    matches!(chars.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
-        && chars.all(|ch| matches!(ch, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
-}
-
-fn shell_tokens(command: &str) -> Vec<ShellToken> {
-    let mut tokens = Vec::new();
-    let mut word = String::new();
-    let mut word_started = false;
-    let mut chars = command.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' => {
-                word_started = true;
-                for quoted in chars.by_ref() {
-                    if quoted == '\'' {
-                        break;
-                    }
-                    word.push(quoted);
-                }
-            }
-            '"' => {
-                word_started = true;
-                while let Some(quoted) = chars.next() {
-                    match quoted {
-                        '"' => break,
-                        '\\' => {
-                            if let Some(escaped) = chars.next() {
-                                word.push(escaped);
-                            }
-                        }
-                        _ => word.push(quoted),
-                    }
-                }
-            }
-            '\\' => {
-                word_started = true;
-                if let Some(escaped) = chars.next() {
-                    word.push(escaped);
-                }
-            }
-            '#' if !word_started => {
-                for comment in chars.by_ref() {
-                    if comment == '\n' {
-                        push_boundary(&mut tokens, &mut word, &mut word_started);
-                        break;
-                    }
-                }
-            }
-            '\n' => push_boundary(&mut tokens, &mut word, &mut word_started),
-            ch if ch.is_whitespace() => push_word(&mut tokens, &mut word, &mut word_started),
-            ';' | '(' | ')' => push_boundary(&mut tokens, &mut word, &mut word_started),
-            '&' | '|' => {
-                push_boundary(&mut tokens, &mut word, &mut word_started);
-                if chars.peek() == Some(&ch) {
-                    chars.next();
-                }
-            }
-            _ => {
-                word_started = true;
-                word.push(ch);
-            }
-        }
-    }
-    push_word(&mut tokens, &mut word, &mut word_started);
-    tokens
-}
-
-fn push_word(tokens: &mut Vec<ShellToken>, word: &mut String, word_started: &mut bool) {
-    if *word_started {
-        tokens.push(ShellToken::Word(std::mem::take(word)));
-        *word_started = false;
-    }
-}
-
-fn push_boundary(tokens: &mut Vec<ShellToken>, word: &mut String, word_started: &mut bool) {
-    push_word(tokens, word, word_started);
-    if !matches!(tokens.last(), Some(ShellToken::Boundary)) {
-        tokens.push(ShellToken::Boundary);
-    }
 }
 
 /// What the stop-hook adapter decides to emit after evaluating
@@ -424,49 +188,24 @@ mod tests {
         assert!(parsed.last_assistant_message.is_none());
     }
 
+    /// A harness's task listing is an extra like any other: a payload that
+    /// carries one still parses, and nothing in what clank reads holds it.
     #[test]
-    fn clank_run_desc_recognises_the_invocation_not_the_words() {
-        assert_eq!(
-            clank_run_desc("clank run --desc \"test run\" -- cargo test").as_deref(),
-            Some("test run")
-        );
-        assert_eq!(
-            clank_run_desc("/Users/x/.cargo/bin/clank run --desc 'test run' -- make").as_deref(),
-            Some("test run")
-        );
-        assert_eq!(
-            clank_run_desc("cd /repo && exec clank run --desc=build -- ./x").as_deref(),
-            Some("build")
-        );
-
-        // Substring matching is NOT identity: each of these names the
-        // same words and is not a run.
-        assert_eq!(clank_run_desc("echo \"test run\""), None);
-        assert_eq!(clank_run_desc("cargo test # test run"), None);
-        assert_eq!(clank_run_desc("clank wait --author claude"), None);
-        assert_eq!(clank_run_desc("clank attend x --desc \"test run\""), None);
-
-        // Everything after `--` belongs to the CHILD. Its `--desc` is
-        // not clank's and must not be picked up.
-        assert_eq!(
-            clank_run_desc("clank run --desc \"ours\" -- cargo test --desc \"theirs\"").as_deref(),
-            Some("ours")
-        );
-        assert_eq!(
-            clank_run_desc("clank run -- cargo test --desc \"theirs\""),
-            None,
-            "a run with no --desc of its own matches nothing"
-        );
-    }
-
-    #[test]
-    fn clank_wait_recognises_the_invocation_not_the_words() {
-        assert!(clank_wait("clank wait"));
-        assert!(clank_wait("/Users/x/.cargo/bin/clank wait --author grok"));
-        assert!(clank_wait("cd /repo && exec clank wait"));
-        assert!(!clank_wait("echo clank wait"));
-        assert!(!clank_wait("clank run --desc wait -- clank-wait"));
-        assert!(!clank_wait("clank attend wait"));
+    fn a_payload_with_a_task_listing_parses_and_keeps_none_of_it() {
+        let bare = r#"{"session_id":"session-one","cwd":"/repo","stop_hook_active":false}"#;
+        let listed = r#"{
+            "session_id": "session-one",
+            "cwd": "/repo",
+            "stop_hook_active": false,
+            "background_tasks": [
+                {"id": "a25eee2", "type": "subagent", "status": "running",
+                 "description": "capture-probe sleeper"},
+                {"id": "b1", "type": "shell", "command": "cargo test"}
+            ]
+        }"#;
+        let bare: HookInput = serde_json::from_str(bare).unwrap();
+        let listed: HookInput = serde_json::from_str(listed).unwrap();
+        assert_eq!(listed, bare);
     }
 
     #[test]

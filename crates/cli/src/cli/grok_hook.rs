@@ -1,15 +1,15 @@
 //! Grok's native lifecycle. SessionStart binds the session and SessionEnd
-//! releases it. A Stop that ends a turn is reported to the monitor with
-//! what it shows of a running `clank wait`; the monitor decides whether
-//! the agent is asked for one ([`clank_core::turn_policy::handoff_verdict`])
-//! and this adapter frames the answer. It never rewrites a tool call or
+//! releases it. A Stop that ends a turn is reported to the monitor, which
+//! knows from its own registrations whether the session's `clank wait` is
+//! running and decides whether the agent is asked for one
+//! ([`clank_core::turn_policy::handoff_verdict`]); this adapter frames the
+//! answer. It reads no task list, never rewrites a tool call and never
 //! waits for work itself.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clank_core::turn_policy::Handoff;
 use clank_core::{AgentLabel, SessionId, Tool};
 use serde::Deserialize;
 
@@ -27,32 +27,11 @@ struct Input {
     subagent_type: Option<String>,
     #[serde(default)]
     stop_hook_active: bool,
-    background_tasks: Option<Vec<Task>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Task {
-    #[serde(rename = "type")]
-    kind: String,
-    status: String,
-    command: Option<String>,
-}
-
-// A native task description is evidence of a running command, never an
-// authorisation token. The wait validates its session and repository itself.
-fn is_wait(command: &str) -> bool {
-    let Ok(words) = shell_words::split(command) else {
-        return false;
-    };
-    let words = words.strip_prefix(&["exec".to_owned()]).unwrap_or(&words);
-    matches!(words, [program, subcommand, ..]
-        if Path::new(program).file_name() == Some(std::ffi::OsStr::new("clank"))
-            && subcommand == "wait")
 }
 
 /// Route one native event: bind or release on the session's ends, and for
-/// a bound Stop that ended a turn, the evidence the monitor decides on.
-fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<(AgentLabel, Handoff)>> {
+/// a bound Stop that ended a turn, the label it reports for.
+fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<AgentLabel>> {
     if input.subagent_type.is_some() {
         return Ok(None);
     }
@@ -82,23 +61,7 @@ fn route(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<(AgentL
     if input.hook_event_name != "stop" || input.reason.as_deref() != Some("end_turn") {
         return Ok(None);
     }
-    let tasks = input
-        .background_tasks
-        .as_ref()
-        .context("native Grok Stop omitted backgroundTasks")?;
-    let wait_running = tasks.iter().any(|task| {
-        task.kind == "shell"
-            && task.status == "running"
-            && task.command.as_deref().is_some_and(is_wait)
-    });
-    Ok(Some((
-        label,
-        Handoff {
-            session: input.session_id.clone(),
-            wait_running,
-            continued: input.stop_hook_active,
-        },
-    )))
+    Ok(Some(label))
 }
 
 /// The repo a hook acts for: `--repo` exactly, else the worktree holding
@@ -114,7 +77,7 @@ fn hook_repo(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
 const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
-    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, Handoff)>> {
+    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, SessionId, bool)>> {
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(1024 * 1024 + 1)
@@ -129,23 +92,25 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
         if !repo.join(".clank").is_dir() {
             return Ok(None);
         }
-        Ok(route(&input, &repo, &Process)?.map(|(label, handoff)| (repo, label, handoff)))
+        Ok(route(&input, &repo, &Process)?
+            .map(|label| (repo, label, input.session_id, input.stop_hook_active)))
     })();
     let frame = match routed {
         Ok(None) => return Ok(()),
-        Ok(Some((repo, label, handoff))) => {
-            let session = handoff.session.as_str().to_string();
+        Ok(Some((repo, label, session, continued))) => {
+            let bound = session.as_str().to_string();
             let asked = super::stop_hook::answer_once(
                 &repo,
                 &label,
-                &session,
+                &bound,
                 Report::Handoff {
-                    handoff,
+                    session,
+                    continued,
                     deadline: super::turn_custody::now_ms() + HANDOFF_BUDGET.as_millis() as u64,
                 },
                 HANDOFF_BUDGET,
             );
-            still_bound(&repo, &label, &session, asked).await
+            still_bound(&repo, &label, &bound, asked).await
         }
         Err(e) => Frame::bare(WireVerdict::Diagnostic {
             message: format!("{e:#}"),

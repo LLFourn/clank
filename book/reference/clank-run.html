@@ -19,7 +19,7 @@
 <p class="chapter-no"><a href="index.html">Command reference</a></p>
 <h1>clank run</h1>
 <p class="lede">Run a command under clank, so it knows when the work ends</p>
-<p>Background this instead of the bare command: <code>clank run --desc &quot;test run&quot; -- cargo test</code>. Clank records what it is attending, beside anything else you attend, then BECOMES the command — same pid, same stdio, same exit status — so the harness task&#39;s lifetime is the work&#39;s lifetime and nothing has to be told when it finished. <code>--expect 30m</code> says how long it should take; past that you are checked in on once, and nothing is cancelled. Two attended runs cannot share a <code>--desc</code>: the second is refused and does not run.</p>
+<p>Start this in the background instead of the bare command: <code>clank run --desc &quot;test run&quot; -- cargo test</code>. Clank registers the run with the monitor, beside anything else you attend, then BECOMES the command — same pid, same stdio, same exit status. When that process is gone you are woken once; its output and exit status are wherever you launched it. <code>--expect 30m</code> says how long it should take; past that you are checked in on once, and nothing is cancelled. With no monitor to take the registration the command is refused and does not run.</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank run [OPTIONS] --desc &lt;TEXT&gt; &lt;CMD&gt;...</samp></p>
 <h2 id="arguments">Arguments</h2>
@@ -33,8 +33,7 @@
 <dl class="terms">
   <dt id="option-desc"><code>--desc &lt;TEXT&gt;</code></dt>
   <dd>
-<p>TWO WORDS for what you are waiting on — <code>--desc &quot;test run&quot;</code>.</p>
-<p>Required, and load-bearing twice over: it is what <code>clank tui</code> shows, AND it is how clank recognises this run among the tool&#39;s live background tasks. The monitor reads the command line the harness reported, so the description has to be ON it — which is why clank cannot just generate an id for you.</p>
+<p>TWO WORDS for what you are waiting on — <code>--desc &quot;test run&quot;</code>. What <code>clank tui</code> shows, and the name <code>clank attend</code> renews or clears the run by</p>
 <p>Required.</p>
   </dd>
   <dt id="option-expect"><code>--expect &lt;DURATION&gt;</code></dt>

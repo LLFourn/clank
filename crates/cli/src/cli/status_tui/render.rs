@@ -11399,8 +11399,7 @@ mod tests {
             // A live pid, so the marker reads as a real wait.
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12050,8 +12049,7 @@ mod tests {
                 task: task.into(),
                 pid: (!subagent).then_some(i32::MAX),
                 at: "unknown".into(),
-                subagent,
-                pending: false,
+                declared: subagent,
                 check_in: None,
                 unqualified: why.map(str::to_string),
             }
@@ -12123,8 +12121,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12155,8 +12152,7 @@ mod tests {
             // Above every platform's pid_max, so it cannot be running.
             pid: Some(i32::MAX),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12194,8 +12190,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: None,
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12214,8 +12209,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12253,8 +12247,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -12307,8 +12300,7 @@ mod tests {
                 task: "b72qah60w".to_string(),
                 pid,
                 at: at.to_string(),
-                subagent: false,
-                pending: false,
+                declared: false,
                 check_in: None,
                 unqualified: None,
             };
@@ -12336,8 +12328,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -12426,8 +12417,7 @@ mod tests {
             task: String::new(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12465,8 +12455,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12534,8 +12523,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];
@@ -12575,8 +12563,7 @@ mod tests {
                 pid,
                 token,
                 at: "2026-08-20T14:51:09Z".to_string(),
-                subagent: false,
-                pending: false,
+                declared: false,
                 check_in: None,
                 unqualified: None,
             }
@@ -12641,8 +12628,7 @@ mod tests {
             pid: Some(pid),
             token: Some(birth.clone()),
             at: "2026-10-03T00:00:00Z".into(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -12702,8 +12688,7 @@ mod tests {
             pid: Some(pid),
             token: Some(token.clone()),
             at: "2026-10-03T00:00:00Z".into(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -12810,8 +12795,7 @@ mod tests {
             pid: Some(pid),
             token: Some(token.clone()),
             at: "bad".into(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -12867,8 +12851,7 @@ mod tests {
             pid: Some(me),
             token: crate::proc_identity::token_for(me),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         };
@@ -12916,8 +12899,7 @@ mod tests {
             task: "b72qah60w".to_string(),
             pid: Some(std::process::id() as i32),
             at: "2026-08-20T14:51:09Z".to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }];

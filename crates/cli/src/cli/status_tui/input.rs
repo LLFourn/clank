@@ -4926,8 +4926,7 @@ mod tests {
                         pid: None,
                         token: None,
                         at: "2026-08-20T14:51:09Z".to_string(),
-                        subagent: false,
-                        pending: false,
+                        declared: false,
                         check_in: None,
                         unqualified: None,
                     })

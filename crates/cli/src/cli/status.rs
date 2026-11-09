@@ -3080,8 +3080,7 @@ mod dirty_and_wake_tests {
             task: task.to_string(),
             pid,
             at: at.unwrap_or("2026-08-20T14:51:09Z").to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }

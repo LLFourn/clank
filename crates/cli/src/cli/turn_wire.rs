@@ -2,7 +2,7 @@
 //! child carries in its hello, the verdicts the monitor answers with, and
 //! the one delivery result the child forwards on the same connection.
 
-use clank_core::turn_policy::{Handoff, Ms, PresentationId, TurnEndReport};
+use clank_core::turn_policy::{Ms, PresentationId, TurnEndReport};
 use clank_core::{HookOutcome, SessionId, SilentReason, Tool};
 
 /// What a hook reports to the monitor.
@@ -19,16 +19,23 @@ pub(crate) enum Report {
     },
     /// Claude's PostCompact: a compaction ends the park the last Stop
     /// armed, so the hook arms it again. It ends no turn and proves
-    /// nothing about the agent's questions or background work, so it is
-    /// stepped as the park it replaces.
+    /// nothing about the agent's questions, so it is stepped as the park
+    /// it replaces.
     Compacted { stop: TurnEndReport, deadline: Ms },
     SessionStart {
         tool: Tool,
         session: SessionId,
         deadline: Ms,
     },
-    /// Grok's native Stop, answered at once and never parked.
-    Handoff { handoff: Handoff, deadline: Ms },
+    /// Grok's native Stop, answered at once and never parked. Whether its
+    /// background wait is running is the monitor's own registration, not
+    /// anything the hook saw.
+    Handoff {
+        session: SessionId,
+        /// This Stop continues the turn that was asked to arm the wait.
+        continued: bool,
+        deadline: Ms,
+    },
 }
 
 impl Report {
@@ -44,7 +51,7 @@ impl Report {
         match self {
             Report::TurnEnd { stop, .. } | Report::Compacted { stop, .. } => &stop.session,
             Report::SessionStart { session, .. } => session,
-            Report::Handoff { handoff, .. } => &handoff.session,
+            Report::Handoff { session, .. } => session,
         }
     }
 

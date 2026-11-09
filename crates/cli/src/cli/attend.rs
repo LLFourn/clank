@@ -1,22 +1,20 @@
-//! `clank attend <name>` — tell the monitor which subagent this agent is
-//! waiting on, so work it has already been shown does not wake it again
-//! while that work runs. New work still wakes it.
+//! `clank attend <name>` — declare work clank cannot observe, such as a
+//! subagent, so work this agent has already been shown does not wake it
+//! again meanwhile. New work still wakes it.
+//!
+//! A declaration takes effect at once and lasts until the agent's next
+//! turn starts, whatever wakes it, or until `--clear`. clank never learns
+//! whether the named work finished, so it never says so: an agent woken
+//! while that work still runs declares it again. At `--expect`, a
+//! declaration still standing is checked in on once.
 //!
 //! An agent may attend several things at once; each request adds an entry
-//! or renews the one already attending the same work, and never touches
-//! another. Shell work is attended by launching it through `clank run`,
-//! which registers itself: a shell task's description is the tool's, not a
-//! handle, so a name that matches only shell work is refused.
-//!
-//! The request is an INTENT. The monitor resolves it against the next
-//! turn-end's listing of live background work. Until a listing shows
-//! exactly one live match, nothing is quiet. Quiet lasts only while the
-//! work is listed running and the `--expect` deadline has not passed; at
-//! that deadline the agent is checked in on once.
+//! or renews what already stands under that name (a run's `--desc`
+//! included), and never touches another.
 
 use super::{AttendArgs, resolve_repo};
 use crate::cli::monitor::Control;
-use clank_core::turn_policy::{Clearing, Selector};
+use clank_core::turn_policy::Clearing;
 
 pub async fn run(args: AttendArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -73,7 +71,7 @@ pub(crate) fn request(
         });
     }
     let Some(name) = name else {
-        anyhow::bail!("name the subagent to attend, or `--clear` to stop attending");
+        anyhow::bail!("name the work to attend, or `--clear` to stop attending");
     };
     if name.is_empty() {
         anyhow::bail!("the name to attend is empty");
@@ -87,10 +85,9 @@ pub(crate) fn request(
     Ok(Control::Attend {
         author,
         session: session.clone(),
-        selector: Selector::Name(name.to_string()),
+        name: name.to_string(),
         desc: Some(desc),
         expect_ms: args.expect.as_millis() as u64,
-        shell: None,
     })
 }
 
@@ -99,8 +96,6 @@ pub(crate) fn request(
 pub(crate) enum NotDone {
     /// No monitor took the request, so nothing was recorded.
     NotTaken(String),
-    /// Another attended `clank run` holds this `--desc`.
-    DescInUse(String),
     /// The monitor refused it, and why.
     Refused(String),
 }
@@ -111,11 +106,6 @@ impl std::fmt::Display for NotDone {
             Self::NotTaken(why) => write!(
                 f,
                 "no monitor took the request ({why}), so nothing was recorded"
-            ),
-            Self::DescInUse(desc) => write!(
-                f,
-                "another `clank run` is already attended as `{desc}`; give this one a different \
-                 --desc"
             ),
             Self::Refused(why) => f.write_str(why),
         }
@@ -139,7 +129,6 @@ pub(crate) async fn submit(repo: &std::path::Path, control: Control) -> Result<S
     match conn.note(deadline) {
         Ok(crate::cli::monitor::Note::Done { what }) => Ok(what),
         Ok(crate::cli::monitor::Note::Refused { why }) => Err(NotDone::Refused(why)),
-        Ok(crate::cli::monitor::Note::DescInUse { desc }) => Err(NotDone::DescInUse(desc)),
         Ok(other) => Err(NotDone::NotTaken(format!("the monitor answered {other:?}"))),
         Err(e) => Err(NotDone::NotTaken(format!(
             "the monitor did not answer: {e}"
@@ -209,22 +198,21 @@ mod tests {
         }
     }
 
-    fn attend(control: Control) -> (Selector, Option<String>, u64) {
+    fn attend(control: Control) -> (String, Option<String>, u64) {
         match control {
             Control::Attend {
-                selector,
+                name,
                 desc,
                 expect_ms,
-                shell: None,
                 ..
-            } => (selector, desc, expect_ms),
+            } => (name, desc, expect_ms),
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn a_subagent_is_attended_by_its_name() {
-        let (selector, desc, expect) = attend(
+    fn work_is_declared_by_its_name() {
+        let (name, desc, expect) = attend(
             request(
                 &args(Some("capture-probe sleeper"), None),
                 &label(),
@@ -232,7 +220,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(selector, Selector::Name("capture-probe sleeper".into()));
+        assert_eq!(name, "capture-probe sleeper");
         assert_eq!(
             desc.as_deref(),
             Some("capture-probe sleeper"),

@@ -7,53 +7,17 @@
 //! the state, the event and [`Facts`] the monitor gathers when it evaluates.
 //! Facts are never cached: a proof is re-checked each time it is used.
 //!
+//! clank never detects background work. What an agent attends is only what
+//! it declared: a `clank run` (its registered process) or a `clank attend`
+//! declaration (standing until the agent's next turn starts).
+//!
 use serde::{Deserialize, Serialize};
 
-use crate::hook_io::{BackgroundTask, HookInput, clank_run_desc, clank_wait};
 use crate::ids::SessionId;
 use crate::vocab::{AutoMode, Role, Tool};
 
 /// Milliseconds since the Unix epoch.
 pub type Ms = u64;
-
-/// What the provider said about its background work at one Stop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "snapshot", content = "tasks", rename_all = "snake_case")]
-pub enum TaskSnapshot {
-    /// The provider sent `background_tasks`, possibly empty: a task missing
-    /// from it is not running.
-    Known(Vec<BackgroundTask>),
-    /// The provider sends no task list (codex). Evidence of neither
-    /// completion nor liveness.
-    Unavailable,
-}
-
-impl TaskSnapshot {
-    /// The snapshot a Stop's payload carries: a list when the provider
-    /// sent one, however empty, and `Unavailable` when it omitted it.
-    pub fn of(input: &HookInput) -> Self {
-        match &input.background_tasks {
-            Some(tasks) => Self::Known(tasks.clone()),
-            None => Self::Unavailable,
-        }
-    }
-
-    /// The tasks the snapshot lists as still running.
-    pub fn running(&self) -> Vec<&BackgroundTask> {
-        self.live().map(Iterator::collect).unwrap_or_default()
-    }
-
-    fn live(&self) -> Option<impl Iterator<Item = &BackgroundTask>> {
-        match self {
-            Self::Known(tasks) => Some(
-                tasks
-                    .iter()
-                    .filter(|t| t.status.as_deref() != Some("completed")),
-            ),
-            Self::Unavailable => None,
-        }
-    }
-}
 
 /// Where a Stop sits in the agent's own record, for repeat counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +37,6 @@ pub struct TurnEndReport {
     pub tool: Tool,
     pub session: SessionId,
     pub place: TurnPlace,
-    pub tasks: TaskSnapshot,
 }
 
 /// Work the generic owed-work fold says this agent is owed now.
@@ -86,18 +49,30 @@ pub struct OwedItem {
     pub receipts: Vec<String>,
 }
 
-/// A shell task's process, as recorded when it was attended: a pid alone
-/// is reused, so the birth token says which process it was.
+/// A `clank run`'s process, as it registered itself: a pid alone is
+/// reused, so the birth token says which process it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellProof {
     pub pid: i32,
     pub token: String,
 }
 
+/// What the system can say of a recorded process now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// Positively still that process.
+    Live,
+    /// Positively not: no such process, or its pid carries another birth.
+    Gone,
+    /// Neither can be established (an unreadable or unrecognised identity,
+    /// a denied or failed read). Never evidence that it ended.
+    Unknown,
+}
+
 /// Whether a recorded process is still that process. The monitor answers
 /// it at evaluation time; nothing caches the answer.
 pub trait Liveness {
-    fn holds(&self, proof: &ShellProof) -> bool;
+    fn presence(&self, proof: &ShellProof) -> Presence;
 }
 
 /// Facts the monitor gathers at the moment it evaluates an event.
@@ -120,69 +95,12 @@ pub struct Facts<'a> {
     pub user_command: bool,
 }
 
-/// What an attendance names before it is resolved to a task.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Selector {
-    /// A task's `description`, matched exactly: a subagent's name.
-    Name(String),
-    /// The `--desc` of a `clank run`.
-    RunDesc(String),
-    /// A task id, as an older clank's `attend <task> --pid` recorded it.
-    /// Kept only so state saved then still resolves; nothing asks for one
-    /// now.
-    TaskId(String),
-}
-
-impl Selector {
-    fn matches(&self, task: &BackgroundTask) -> bool {
-        match self {
-            Self::Name(name) => task.description.as_deref() == Some(name),
-            Self::TaskId(id) => task.id.as_deref() == Some(id),
-            Self::RunDesc(desc) => task
-                .command
-                .as_deref()
-                .and_then(clank_run_desc)
-                .is_some_and(|d| &d == desc),
-        }
-    }
-
-    pub fn text(&self) -> &str {
-        match self {
-            Self::Name(text) | Self::RunDesc(text) | Self::TaskId(text) => text,
-        }
-    }
-}
-
-/// The kinds of task an attendance can be proven against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskKind {
-    /// The provider's own agent: its listing is the proof.
-    Subagent,
-    /// A background shell: the listing AND its process must hold.
-    Shell,
-    /// Anything else, such as a `monitor`. Never proves anything.
-    Unknown(Option<String>),
-}
-
-impl TaskKind {
-    /// No observed payload has carried a shell's `type`, so a task with a
-    /// command line and no kind is a shell too: today's records are.
-    pub fn of(task: &BackgroundTask) -> Self {
-        match task.kind.as_deref() {
-            Some("subagent") => Self::Subagent,
-            Some("shell") => Self::Shell,
-            None if task.command.is_some() => Self::Shell,
-            other => Self::Unknown(other.map(str::to_owned)),
-        }
-    }
-}
-
-/// An entry's one check-in. It is armed only once the entry has qualified
-/// at a turn-end: one that never qualified quieted nothing, so no wake was
-/// handed to it.
+/// An entry's one check-in, armed from the moment the entry is accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckIn {
-    Unarmed,
+    /// `Unarmed` is how state saved before attending took effect at once
+    /// spelled an entry not yet in force.
+    #[serde(alias = "Unarmed")]
     Armed,
     Fired,
     /// Due while a gate held it back. Spent, not deferred: what lifts the
@@ -193,8 +111,8 @@ pub enum CheckIn {
     /// delivered; past the deadline recovery treats the agent as any
     /// other.
     Undeliverable(String),
-    /// Due after its process had already gone: there was nothing left to
-    /// check in on.
+    /// Due after its run's process had already gone: the run's end is the
+    /// wake it owes.
     ProcessGone,
 }
 
@@ -229,21 +147,27 @@ pub fn wake_gate(facts: &Facts<'_>) -> Result<(), Withheld> {
     Ok(())
 }
 
-/// The task an entry resolved to: from then on it covers exactly that task.
+/// What one attended piece of work is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Resolved {
-    pub task_id: String,
-    pub kind: TaskKind,
+pub enum Attending {
+    /// A `clank run`: its registered process is the work, so the work
+    /// ends exactly when that process is gone.
+    Run(ShellProof),
+    /// A `clank attend` declaration of work clank cannot observe. It
+    /// claims nothing about when that work finishes.
+    Declared {
+        name: String,
+        /// A turn has ended since it was declared or renewed: the agent's
+        /// next turn start ends it.
+        #[serde(default)]
+        seen_turn_end: bool,
+    },
 }
 
 /// What every mutation of an entry is scoped to.
-///
-/// A run is its process: its `--desc` only correlates it with a listing.
-/// A subagent is its name until a listing resolves it, then its task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKey {
     Name(String),
-    Task(String),
     Run(ShellProof),
 }
 
@@ -252,118 +176,95 @@ pub enum EntryKey {
 /// last renewed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    pub selector: Selector,
-    /// `None` until a turn-end's listing shows exactly one live match.
-    pub resolved: Option<Resolved>,
-    pub desc: Option<String>,
+    pub work: Attending,
+    /// What status shows, and the name `clank attend` renews or clears a
+    /// run by.
+    pub desc: String,
+    /// When it was first accepted; renewals leave it.
+    pub started: Ms,
     pub since: Ms,
     pub expect: Ms,
-    pub shell: Option<ShellProof>,
     pub check_in: CheckIn,
 }
 
 impl Entry {
     pub fn key(&self) -> EntryKey {
-        match (&self.shell, &self.resolved) {
-            (Some(proof), _) => EntryKey::Run(proof.clone()),
-            (None, Some(r)) => EntryKey::Task(r.task_id.clone()),
-            (None, None) => EntryKey::Name(self.selector.text().to_string()),
+        match &self.work {
+            Attending::Run(proof) => EntryKey::Run(proof.clone()),
+            Attending::Declared { name, .. } => EntryKey::Name(name.clone()),
         }
     }
 
-    pub fn task(&self) -> Option<&str> {
-        self.resolved.as_ref().map(|r| r.task_id.as_str())
+    /// The name `clank attend` renews or clears this entry by.
+    pub fn name(&self) -> &str {
+        match &self.work {
+            Attending::Run(_) => &self.desc,
+            Attending::Declared { name, .. } => name,
+        }
+    }
+
+    pub fn proof(&self) -> Option<&ShellProof> {
+        match &self.work {
+            Attending::Run(proof) => Some(proof),
+            Attending::Declared { .. } => None,
+        }
     }
 
     pub fn deadline(&self) -> Ms {
         self.since.saturating_add(self.expect)
     }
 
-    fn is_run(&self) -> bool {
-        matches!(self.selector, Selector::RunDesc(_))
+    /// A declaration whose turn has ended: the next turn start ends it.
+    fn outlived(&self) -> bool {
+        matches!(
+            self.work,
+            Attending::Declared {
+                seen_turn_end: true,
+                ..
+            }
+        )
     }
 
-    /// A new expectation from `since`. A check-in it already earned is
-    /// re-armed against the new deadline; one never armed waits for a
-    /// qualifying turn-end as before.
+    /// A new expectation from `since`, with its check-in re-armed against
+    /// it. A renewed declaration stands for the turn it was renewed in.
     fn renew(&mut self, since: Ms, expect: Ms, desc: Option<String>) {
         self.since = since;
         self.expect = expect;
-        if desc.is_some() {
+        if let Some(desc) = desc {
             self.desc = desc;
         }
-        if self.check_in != CheckIn::Unarmed {
-            self.check_in = CheckIn::Armed;
+        self.check_in = CheckIn::Armed;
+        if let Attending::Declared { seen_turn_end, .. } = &mut self.work {
+            *seen_turn_end = false;
         }
     }
-}
-
-impl Uncovered {
-    /// The identity its demand is presented and repeat-counted under,
-    /// beside owed work's.
-    pub fn identity(&self) -> String {
-        format!("uncovered:{}", self.task_id)
-    }
-}
-
-/// The provider wakes the agent when its background work completes.
-/// Without that wake, quiet on an attendance would leave the agent with
-/// no wake at all.
-pub fn completion_wake(tool: Tool) -> bool {
-    matches!(tool, Tool::Claude)
 }
 
 /// Why an entry does or does not quiet anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Qualifies {
     Yes,
-    /// A known listing no longer has the task: the work is over.
-    Ended,
     No(Unqualified),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unqualified {
-    NotResolved,
-    NoCompletionWake,
-    /// No fresh known listing correlates the task.
-    Uncorrelated,
-    NoProcessProof,
+    /// A run whose registered process is gone: it has ended, and its
+    /// terminal record is being written.
     ProcessGone,
-    UnknownKind,
+    /// A run whose process cannot be seen now: still registered, but
+    /// nothing proves the work runs.
+    ProcessUnknown,
     PastDeadline,
 }
 
-/// THE rule. Turn-end, check-in, coverage and recovery all ask this and
-/// nothing else whether an entry may quiet anything.
-pub fn qualifies(
-    entry: &Entry,
-    tool: Tool,
-    snapshot: Option<&TaskSnapshot>,
-    facts: &Facts<'_>,
-) -> Qualifies {
-    let Some(Resolved { task_id, kind }) = &entry.resolved else {
-        return Qualifies::No(Unqualified::NotResolved);
-    };
-    let Some(mut live) = snapshot.and_then(TaskSnapshot::live) else {
-        return Qualifies::No(Unqualified::Uncorrelated);
-    };
-    if !live.any(|t| t.id.as_deref() == Some(task_id.as_str())) {
-        return Qualifies::Ended;
-    }
-    if !completion_wake(tool) {
-        return Qualifies::No(Unqualified::NoCompletionWake);
-    }
-    match kind {
-        TaskKind::Subagent => {}
-        TaskKind::Shell => match &entry.shell {
-            None => return Qualifies::No(Unqualified::NoProcessProof),
-            Some(proof) if !facts.liveness.holds(proof) => {
-                return Qualifies::No(Unqualified::ProcessGone);
-            }
-            Some(_) => {}
-        },
-        TaskKind::Unknown(_) => return Qualifies::No(Unqualified::UnknownKind),
+/// THE rule. Turn-end, check-in and recovery all ask this and nothing
+/// else whether an entry may quiet anything.
+pub fn qualifies(entry: &Entry, facts: &Facts<'_>) -> Qualifies {
+    match entry.proof().map(|p| facts.liveness.presence(p)) {
+        Some(Presence::Gone) => return Qualifies::No(Unqualified::ProcessGone),
+        Some(Presence::Unknown) => return Qualifies::No(Unqualified::ProcessUnknown),
+        Some(Presence::Live) | None => {}
     }
     if facts.now >= entry.deadline() {
         return Qualifies::No(Unqualified::PastDeadline);
@@ -371,22 +272,15 @@ pub fn qualifies(
     Qualifies::Yes
 }
 
-/// A live task no qualifying entry covers, that a permitted command could.
+/// A run whose registered process is gone: everything its one terminal
+/// record says. clank captured no output and claims no exit status.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Uncovered {
-    pub task_id: String,
-    pub work: Attendable,
-    /// Why the entry resolved to this task does not cover it, if one is.
-    pub entry: Option<Unqualified>,
-}
-
-/// Live work, with the handle a permitted command attends it by.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Attendable {
-    /// A subagent whose name resolves to it alone.
-    Subagent { name: String },
-    /// Shell work, and the `--desc` of the `clank run` it is, if it is one.
-    Shell { run: Option<String> },
+pub struct RunEnd {
+    pub proof: ShellProof,
+    pub desc: String,
+    pub started: Ms,
+    /// When clank saw the process gone, which is not when it exited.
+    pub ended_seen: Ms,
 }
 
 /// How many times in a row the same items have been delivered.
@@ -475,46 +369,11 @@ pub struct Presentation {
 /// Text a verdict carries that is not work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// An intent matched no live task, listed so the agent can pick one.
-    NoMatch {
-        selector: Selector,
-        live: Vec<TaskSummary>,
-    },
-    Ambiguous {
-        selector: Selector,
-        matches: Vec<TaskSummary>,
-    },
-    /// A name matched only shell work, whose description is the tool's and
-    /// not a handle: shell work is attended by launching it with
-    /// `clank run`.
-    ShellNamed { name: String, task_id: String },
-    /// The Stop listed live work no qualifying entry covers.
-    Uncovered(Vec<Uncovered>),
     /// Alone mode: work is owed and no monitor can present it.
     MonitorUnavailable,
     /// Grok's native handoff: run `clank wait` in the background, whose
     /// completion wakes the agent.
     ArmWait,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskSummary {
-    pub id: Option<String>,
-    pub kind: TaskKind,
-    pub description: Option<String>,
-    /// The `--desc` of the `clank run` the task is, if it is one.
-    pub run: Option<String>,
-}
-
-impl From<&BackgroundTask> for TaskSummary {
-    fn from(t: &BackgroundTask) -> Self {
-        Self {
-            id: t.id.clone(),
-            kind: TaskKind::of(t),
-            description: t.description.clone(),
-            run: t.command.as_deref().and_then(clank_run_desc),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,7 +398,6 @@ pub enum Verdict {
         identities: Vec<String>,
         repeat: u32,
         escalated: bool,
-        notices: Vec<Notice>,
     },
     /// Wake with text that is not work, never empty. Creates no
     /// presentation.
@@ -569,12 +427,20 @@ pub fn deadline_verdict(tool: Tool) -> DeadlineVerdict {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttendRequest {
-    Attend {
+    /// A `clank run` registering the process it is about to become.
+    Run {
         session: SessionId,
-        selector: Selector,
+        proof: ShellProof,
+        desc: String,
+        expect: Ms,
+    },
+    /// A `clank attend` declaration, or the renewal of whatever already
+    /// stands under `name`.
+    Declare {
+        session: SessionId,
+        name: String,
         desc: Option<String>,
         expect: Ms,
-        shell: Option<ShellProof>,
     },
     Clear {
         session: SessionId,
@@ -589,7 +455,8 @@ pub enum Clearing {
     /// Every entry: only the operator's own `clank attend --clear`.
     #[default]
     All,
-    /// The entry whose subagent name or run `--desc` this is.
+    /// Every entry standing under this name: a declaration's, or a run's
+    /// `--desc`.
     Named(String),
     /// Exactly the run this process proof registered.
     Run(ShellProof),
@@ -597,20 +464,14 @@ pub enum Clearing {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttendReply {
-    /// A new entry, proven at the next turn-end.
+    /// A new entry, in force now.
     Accepted,
-    /// An entry already attending this work now runs on the new
+    /// What already stood under this name or process now runs on the new
     /// expectation.
     Renewed,
     Cleared {
         removed: usize,
     },
-    /// The name is both a subagent's and a run's: these are the entries
-    /// it names, and nothing changed.
-    Ambiguous(Vec<Selector>),
-    /// Another `clank run` already attended holds this `--desc`, so a
-    /// second would make neither correlatable.
-    DescInUse(String),
     RefusedStale,
 }
 
@@ -627,10 +488,12 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckInLine {
     pub check_in: CheckInRef,
-    pub task_id: String,
-    pub kind: TaskKind,
-    pub desc: Option<String>,
-    pub selector: Selector,
+    pub desc: String,
+    /// What `clank attend` renews it by.
+    pub name: String,
+    /// A `clank run`, whose end wakes the agent; otherwise a declaration,
+    /// whose end nothing reports.
+    pub run: bool,
     pub elapsed: Ms,
     pub expect: Ms,
 }
@@ -664,11 +527,12 @@ pub enum ResultOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A Stop. A report answered Park is stepped again with the same
-    /// report when the state or facts change.
+    /// A Stop: a turn of the agent's ended. A report answered Park is
+    /// stepped again with the same report when the state or facts change.
     TurnEnd(TurnEndReport),
     Attend(AttendRequest),
     /// Only from the connection that carried the in-flight presentation.
+    /// The agent starts a turn on it.
     Delivered(PresentationId),
     /// The emit failed, or the hook's connection closed without a result:
     /// the monitor turns a closed connection into this, so every
@@ -682,12 +546,14 @@ pub enum Event {
         why: String,
     },
     /// A report answered Park, stepped again because the state or facts
-    /// changed. It is not a new Stop: it resolves no intent and proves no
-    /// attendance, since its listing is as old as the park.
+    /// changed. It is not a new Stop: no turn ended.
     Parked(TurnEndReport),
     /// A session started: its owed work, presented once and never counted
     /// as a repeat, or nothing.
     SessionStart(SessionId),
+    /// Grok's native Stop: a turn ended, though the handoff, not this
+    /// state, answers it.
+    NativeTurnEnd(SessionId),
     /// The facts changed with no event of the agent's own: an owed-work
     /// change still ends the repeat episode.
     Observed,
@@ -701,8 +567,9 @@ pub enum Output {
     Result(ResultOutcome),
 }
 
-/// What survives a monitor restart. The last task listing does not: a
-/// restored entry is unproven until the next turn-end reports one.
+/// What survives a monitor restart: every entry, a run's registration
+/// included, so a run that ended while no monitor watched is still
+/// recorded once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "legacy::Stored")]
 pub struct Persisted {
@@ -719,8 +586,9 @@ pub struct Persisted {
     pub unwatched: Option<Unwatched>,
 }
 
-/// The persisted shapes from before an agent could attend several things,
-/// read so a monitor restarted across the upgrade keeps what was attended.
+/// The persisted shapes from before attending was only what an agent
+/// declared, read so a monitor restarted across the upgrade keeps every
+/// run it registered.
 mod legacy {
     use super::*;
 
@@ -728,7 +596,7 @@ mod legacy {
     pub(super) struct Stored {
         binding: SessionId,
         #[serde(default)]
-        attendances: Option<Vec<Entry>>,
+        attendances: Option<Vec<StoredEntry>>,
         #[serde(default)]
         attendance: Option<Attendance>,
         repeat: Option<RepeatRecord>,
@@ -744,10 +612,37 @@ mod legacy {
     }
 
     #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredEntry {
+        Current(Entry),
+        Listed(Listed),
+    }
+
+    /// An entry from when attendance was resolved against a harness's
+    /// task listing.
+    #[derive(Deserialize)]
+    struct Listed {
+        selector: Selector,
+        desc: Option<String>,
+        since: Ms,
+        expect: Ms,
+        shell: Option<ShellProof>,
+        check_in: CheckIn,
+    }
+
+    #[derive(Deserialize)]
     enum Selector {
         TaskId(String),
         Name(String),
         RunDesc(String),
+    }
+
+    impl Selector {
+        fn text(&self) -> &str {
+            match self {
+                Self::TaskId(t) | Self::Name(t) | Self::RunDesc(t) => t,
+            }
+        }
     }
 
     #[derive(Deserialize)]
@@ -765,7 +660,6 @@ mod legacy {
         Intent(Request),
         Standing {
             task_id: String,
-            kind: TaskKind,
             desc: Option<String>,
             since: Ms,
             expect: Ms,
@@ -778,11 +672,13 @@ mod legacy {
 
     impl From<Stored> for Persisted {
         fn from(s: Stored) -> Self {
+            let attendances = match s.attendances {
+                Some(entries) => entries.into_iter().map(StoredEntry::current).collect(),
+                None => s.attendance.map(entries).unwrap_or_default(),
+            };
             Persisted {
                 binding: s.binding,
-                attendances: s
-                    .attendances
-                    .unwrap_or_else(|| s.attendance.map(entries).unwrap_or_default()),
+                attendances,
                 repeat: s.repeat,
                 outstanding: s.outstanding,
                 outstanding_episode_broken: s.outstanding_episode_broken,
@@ -794,13 +690,55 @@ mod legacy {
         }
     }
 
+    impl StoredEntry {
+        fn current(self) -> Entry {
+            match self {
+                Self::Current(entry) => entry,
+                Self::Listed(l) => entry(
+                    l.shell,
+                    l.desc.unwrap_or_else(|| l.selector.text().to_string()),
+                    l.selector.text().to_string(),
+                    l.since,
+                    l.expect,
+                    l.check_in,
+                ),
+            }
+        }
+    }
+
+    /// A run keeps its registration, so its end is still recorded. A named
+    /// attendance was made in a turn that has since ended: it stands
+    /// until the agent's next turn starts, as any declaration does.
+    fn entry(
+        shell: Option<ShellProof>,
+        desc: String,
+        name: String,
+        since: Ms,
+        expect: Ms,
+        check_in: CheckIn,
+    ) -> Entry {
+        Entry {
+            work: match shell {
+                Some(proof) => Attending::Run(proof),
+                None => Attending::Declared {
+                    name,
+                    seen_turn_end: true,
+                },
+            },
+            desc,
+            started: since,
+            since,
+            expect,
+            check_in,
+        }
+    }
+
     fn entries(old: Attendance) -> Vec<Entry> {
         match old {
             Attendance::None => Vec::new(),
-            Attendance::Intent(request) => vec![request.entry()],
+            Attendance::Intent(r) => vec![r.entry()],
             Attendance::Standing {
                 task_id,
-                kind,
                 desc,
                 since,
                 expect,
@@ -808,64 +746,26 @@ mod legacy {
                 check_in,
                 renewal,
             } => {
-                // The old record kept no selector: a subagent was attended
-                // by the name it recorded as its description, and a run by
-                // its `--desc`.
-                let named = desc.clone().unwrap_or_else(|| task_id.clone());
-                let selector = match kind {
-                    TaskKind::Shell => super::Selector::RunDesc(named),
-                    TaskKind::Subagent | TaskKind::Unknown(_) => super::Selector::Name(named),
-                };
-                let mut standing = Entry {
-                    selector,
-                    resolved: Some(Resolved { task_id, kind }),
-                    desc,
-                    since,
-                    expect,
-                    shell,
-                    check_in,
-                };
-                match renewal {
-                    None => vec![standing],
-                    Some(request) if request.names(&standing) => {
-                        standing.renew(request.since, request.expect, request.desc);
-                        vec![standing]
-                    }
-                    Some(request) => vec![standing, request.entry()],
-                }
+                let named = desc.clone().unwrap_or(task_id);
+                let standing = entry(shell, named.clone(), named, since, expect, check_in);
+                std::iter::once(standing)
+                    .chain(renewal.map(Request::entry))
+                    .collect()
             }
         }
     }
 
     impl Request {
         fn entry(self) -> Entry {
-            let selector = match self.selector {
-                Selector::TaskId(id) => super::Selector::TaskId(id),
-                Selector::Name(name) => super::Selector::Name(name),
-                Selector::RunDesc(desc) => super::Selector::RunDesc(desc),
-            };
-            Entry {
-                selector,
-                resolved: None,
-                desc: self.desc,
-                since: self.since,
-                expect: self.expect,
-                shell: self.shell,
-                check_in: CheckIn::Unarmed,
-            }
-        }
-
-        fn names(&self, standing: &Entry) -> bool {
-            match &self.selector {
-                Selector::TaskId(id) => standing.task() == Some(id.as_str()),
-                // A name may since have passed to another task: only a
-                // listing can say it is still this one.
-                Selector::Name(_) => false,
-                Selector::RunDesc(desc) => {
-                    self.shell == standing.shell
-                        && matches!(&standing.selector, super::Selector::RunDesc(d) if d == desc)
-                }
-            }
+            let name = self.selector.text().to_string();
+            entry(
+                self.shell,
+                self.desc.unwrap_or_else(|| name.clone()),
+                name,
+                self.since,
+                self.expect,
+                CheckIn::Armed,
+            )
         }
     }
 }
@@ -885,10 +785,6 @@ pub struct SessionState {
     /// Everything the agent attends. Each entry is independent: adding,
     /// renewing, ending or clearing one never touches another.
     pub attendances: Vec<Entry>,
-    /// The latest report's listing, which recovery judges by.
-    pub snapshot: Option<TaskSnapshot>,
-    /// The tool of the latest report.
-    pub tool: Option<Tool>,
     pub repeat: Option<RepeatRecord>,
     /// The one presentation in flight. While it is, no other is made: its
     /// result commits against the record it was counted from, as today's
@@ -914,8 +810,6 @@ impl SessionState {
         Self {
             binding,
             attendances: Vec::new(),
-            snapshot: None,
-            tool: None,
             repeat: None,
             outstanding: None,
             outstanding_episode_broken: false,
@@ -954,8 +848,6 @@ impl SessionState {
         Self {
             binding: p.binding,
             attendances: p.attendances,
-            snapshot: None,
-            tool: None,
             repeat: p.repeat,
             outstanding: None,
             outstanding_episode_broken: false,
@@ -991,21 +883,38 @@ impl SessionState {
         facts.binding == Some(&self.binding)
     }
 
-    /// Every entry, with what [`qualifies`] says of it by the latest
-    /// listing.
+    /// Every entry, with what [`qualifies`] says of it now.
     pub fn standing<'s>(&'s self, facts: &Facts<'_>) -> Vec<(&'s Entry, Qualifies)> {
         self.attendances
             .iter()
-            .map(|e| (e, self.qualifies(e, facts)))
+            .map(|e| (e, qualifies(e, facts)))
             .collect()
     }
 
-    fn qualifies(&self, entry: &Entry, facts: &Facts<'_>) -> Qualifies {
-        match self.tool {
-            Some(tool) => qualifies(entry, tool, self.snapshot.as_ref(), facts),
-            None if entry.resolved.is_none() => Qualifies::No(Unqualified::NotResolved),
-            None => Qualifies::No(Unqualified::Uncorrelated),
-        }
+    /// Every run whose registered process is positively gone, as its
+    /// terminal record reads; one whose process cannot be seen is kept. Nothing is removed: the monitor writes each record durably
+    /// first and only then calls [`Self::end_run`], so a crash between the
+    /// two writes the same record again rather than none.
+    pub fn ended_runs(&self, liveness: &dyn Liveness, now: Ms) -> Vec<RunEnd> {
+        self.attendances
+            .iter()
+            .filter_map(|e| {
+                let proof = e
+                    .proof()
+                    .filter(|p| liveness.presence(p) == Presence::Gone)?;
+                Some(RunEnd {
+                    proof: proof.clone(),
+                    desc: e.desc.clone(),
+                    started: e.started,
+                    ended_seen: now,
+                })
+            })
+            .collect()
+    }
+
+    /// The run `proof` registered is over and its record is written.
+    pub fn end_run(&mut self, proof: &ShellProof) {
+        self.retain_entries(|e| e.proof() != Some(proof));
     }
 
     pub fn step(&mut self, event: Event, facts: &Facts<'_>) -> Output {
@@ -1023,6 +932,12 @@ impl SessionState {
             }
             Event::Parked(report) => Output::Verdict(self.parked(report, facts)),
             Event::SessionStart(session) => Output::Verdict(self.session_start(session, facts)),
+            Event::NativeTurnEnd(session) => {
+                if facts.binding == Some(&session) && self.bound(facts) {
+                    self.turn_ended();
+                }
+                Output::Effects(Vec::new())
+            }
             Event::Observed => Output::Effects(Vec::new()),
         };
         self.prune_received(facts);
@@ -1055,58 +970,47 @@ impl SessionState {
     }
 
     /// The receipt mask is global: one qualifying entry quiets all received
-    /// work. Which live tasks are covered is a separate, per-task question
-    /// ([`Self::uncovered`]).
+    /// work.
     fn quieting(&self, facts: &Facts<'_>) -> bool {
         self.attendances
             .iter()
-            .any(|e| self.qualifies(e, facts) == Qualifies::Yes)
+            .any(|e| qualifies(e, facts) == Qualifies::Yes)
     }
 
-    /// Every removal of entries goes through here, and says how many it
-    /// removed. When the last entry holding resolved work leaves, what the
-    /// set quieted is released: that work is presented again before any
-    /// later entry can quiet it.
+    /// A clear or a run's end removes entries through here, and says how
+    /// many it removed. When the last entry leaves, what the set quieted is
+    /// released: that work is presented again before any later entry can
+    /// quiet it.
     fn retain_entries(&mut self, keep: impl FnMut(&Entry) -> bool) -> usize {
-        let had_work = self.attendances.iter().any(|e| e.resolved.is_some());
         let before = self.attendances.len();
         self.attendances.retain(keep);
-        if had_work && !self.attendances.iter().any(|e| e.resolved.is_some()) {
+        if before > 0 && self.attendances.is_empty() {
             self.received.clear();
         }
         before - self.attendances.len()
     }
 
-    /// Entries whose task a known listing no longer has: that work is
-    /// over, and the provider's completion wake reports it.
-    fn end_finished(&mut self, facts: &Facts<'_>) {
-        let Some(tool) = self.tool else {
-            return;
-        };
-        let snapshot = self.snapshot.clone();
-        self.retain_entries(|e| qualifies(e, tool, snapshot.as_ref(), facts) != Qualifies::Ended);
-    }
-
-    /// A run that never reached a listing and whose process has gone can
-    /// never resolve: its work is over. Keeps the set bounded by live work
-    /// where no listing ever arrives to resolve or end it.
-    fn forget_gone_requests(&mut self, facts: &Facts<'_>) {
-        self.retain_entries(|e| {
-            e.resolved.is_some() || e.shell.as_ref().is_none_or(|p| facts.liveness.holds(p))
-        });
-    }
-
-    fn arm_qualified(&mut self, facts: &Facts<'_>) {
-        let Some(tool) = self.tool else {
-            return;
-        };
+    /// A turn ended. A Stop is reached only by running a turn, so a
+    /// declaration that had already seen a turn end has had its next turn
+    /// start: it is over. Every other declaration has now seen one.
+    fn turn_ended(&mut self) {
+        self.turn_started();
         for entry in &mut self.attendances {
-            if entry.check_in == CheckIn::Unarmed
-                && qualifies(entry, tool, self.snapshot.as_ref(), facts) == Qualifies::Yes
-            {
-                entry.check_in = CheckIn::Armed;
+            if let Attending::Declared { seen_turn_end, .. } = &mut entry.work {
+                *seen_turn_end = true;
             }
         }
+    }
+
+    /// The agent began a turn: every declaration made before the last turn
+    /// end is over, whatever woke it. clank never claims that work
+    /// finished.
+    ///
+    /// What it quieted is not released: the agent was not choosing to stop
+    /// attending, and re-declaring in the turn it was woken for restores
+    /// the quiet rather than re-presenting work it already has.
+    fn turn_started(&mut self) {
+        self.attendances.retain(|e| !e.outlived());
     }
 
     /// Today's `forget_if_stale`: a count describes one unbroken run of the
@@ -1118,7 +1022,7 @@ impl SessionState {
         if !self.bound(facts) {
             return;
         }
-        let owed = self.episode(facts);
+        let owed = owed_identities(&self.deliverable(facts));
         if self
             .outstanding
             .as_ref()
@@ -1131,101 +1035,18 @@ impl SessionState {
         }
     }
 
-    /// What one repeat episode is made of: the deliverable owed work and
-    /// the live work no entry covers. A presentation is counted against
-    /// both, and a change in either ends the episode.
-    fn episode(&self, facts: &Facts<'_>) -> Vec<String> {
-        let mut items = owed_identities(&self.deliverable(facts));
-        items.extend(self.uncovered(facts).iter().map(Uncovered::identity));
-        items.sort();
-        items.dedup();
-        items
-    }
-
     fn turn_end(&mut self, report: TurnEndReport, facts: &Facts<'_>) -> Verdict {
         if facts.binding != Some(&report.session) || !self.bound(facts) {
             return Verdict::Silent(SilentWhy::StaleBinding);
         }
-        let notices = self.resolve_requests(&report.tasks);
-        self.tool = Some(report.tool);
-        self.snapshot = Some(report.tasks);
-        self.end_finished(facts);
-        self.forget_gone_requests(facts);
-
+        self.turn_ended();
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
-        self.arm_qualified(facts);
-
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        // Gated as every wake clank makes, and by a person's command
-        // waiting for the prompt, which a demand must not pre-empt.
-        let demands = if wake_gate(facts).is_ok() && !facts.user_command {
-            self.uncovered(facts)
-        } else {
-            Vec::new()
-        };
-        release_for_user_command(
-            self.deliver_or_park(facts, Some(&report.place), notices, demands),
-            facts,
-        )
-    }
-
-    /// The live tasks the latest listing shows that no qualifying entry
-    /// covers, limited to work an allowed command could cover: a subagent
-    /// whose name alone resolves to it, or a shell with a task id, in a
-    /// known listing, for a tool whose completion wake makes attending
-    /// meaningful. A demand the agent could not satisfy would wake it
-    /// forever: so no nameless or name-sharing subagent, and never clank's
-    /// own `clank wait`.
-    fn uncovered(&self, facts: &Facts<'_>) -> Vec<Uncovered> {
-        if !self.tool.is_some_and(completion_wake) {
-            return Vec::new();
-        }
-        let Some(live) = self.snapshot.as_ref().and_then(TaskSnapshot::live) else {
-            return Vec::new();
-        };
-        let live: Vec<&BackgroundTask> = live.collect();
-        live.iter()
-            .filter_map(|&task| {
-                let task_id = task.id.clone()?;
-                let work = match TaskKind::of(task) {
-                    TaskKind::Subagent => {
-                        let name = task.description.clone()?;
-                        let resolves = !name.is_empty()
-                            && name.trim() == name
-                            && resolve(&Selector::Name(name.clone()), &live)
-                                .is_ok_and(|only| only.id == task.id);
-                        resolves.then_some(Attendable::Subagent { name })?
-                    }
-                    TaskKind::Shell if !task.command.as_deref().is_some_and(clank_wait) => {
-                        Attendable::Shell {
-                            run: task.command.as_deref().and_then(clank_run_desc),
-                        }
-                    }
-                    TaskKind::Shell | TaskKind::Unknown(_) => return None,
-                };
-                let verdicts: Vec<Qualifies> = self
-                    .attendances
-                    .iter()
-                    .filter(|e| e.task() == Some(task_id.as_str()))
-                    .map(|e| self.qualifies(e, facts))
-                    .collect();
-                if verdicts.contains(&Qualifies::Yes) {
-                    return None;
-                }
-                Some(Uncovered {
-                    entry: verdicts.into_iter().find_map(|q| match q {
-                        Qualifies::No(why) => Some(why),
-                        Qualifies::Yes | Qualifies::Ended => None,
-                    }),
-                    task_id,
-                    work,
-                })
-            })
-            .collect()
+        release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts)
     }
 
     fn parked(&mut self, report: TurnEndReport, facts: &Facts<'_>) -> Verdict {
@@ -1238,10 +1059,7 @@ impl SessionState {
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        release_for_user_command(
-            self.deliver_or_park(facts, Some(&report.place), Vec::new(), Vec::new()),
-            facts,
-        )
+        release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts)
     }
 
     fn session_start(&mut self, session: SessionId, facts: &Facts<'_>) -> Verdict {
@@ -1251,124 +1069,37 @@ impl SessionState {
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
-        self.deliver_or_park(facts, None, Vec::new(), Vec::new())
+        self.deliver_or_park(facts, None)
     }
 
-    /// The [`deliverable`](Self::deliverable) work and the uncovered
-    /// work `demands` names as one new presentation, or Park when there is
-    /// neither or another presentation is in flight. A park keeps the
-    /// hook's wait armed, so work that arrives later still wakes the agent.
-    /// `place` is the Stop it counts against; without one it is not
-    /// counted.
-    fn deliver_or_park(
-        &mut self,
-        facts: &Facts<'_>,
-        place: Option<&TurnPlace>,
-        mut notices: Vec<Notice>,
-        demands: Vec<Uncovered>,
-    ) -> Verdict {
+    /// The [`deliverable`](Self::deliverable) work as one new presentation,
+    /// or Park when there is none or another presentation is in flight. A
+    /// park keeps the hook's wait armed, so work that arrives later still
+    /// wakes the agent. `place` is the Stop it counts against; without one
+    /// it is not counted.
+    fn deliver_or_park(&mut self, facts: &Facts<'_>, place: Option<&TurnPlace>) -> Verdict {
         let deliverable = self.deliverable(facts);
-        let demanded: Vec<String> = demands.iter().map(Uncovered::identity).collect();
-        if !demands.is_empty() {
-            notices.push(Notice::Uncovered(demands));
+        if deliverable.is_empty() || self.outstanding.is_some() {
+            return Verdict::Park;
         }
-        if (deliverable.is_empty() && demanded.is_empty()) || self.outstanding.is_some() {
-            return if notices.is_empty() {
-                Verdict::Park
-            } else {
-                Verdict::Notify(notices)
-            };
-        }
-        let p = self.present(&deliverable, &demanded, place);
+        let p = self.present(&deliverable, place);
         let repeat = p.repeat.count();
         let verdict = Verdict::Deliver {
             presentation: p.id.clone(),
             identities: p.identities.clone(),
             repeat,
             escalated: repeat >= ESCALATE_AT,
-            notices,
         };
         self.outstanding = Some(p);
         verdict
-    }
-
-    /// Resolve every pending entry against THIS report's listing, which is
-    /// the first that can contain work started in the turn that asked for
-    /// it. Each resolves, or is dropped with its own notice, alone: no
-    /// other entry is touched. One that resolves to a task an entry already
-    /// covers renews that entry instead of doubling it.
-    fn resolve_requests(&mut self, tasks: &TaskSnapshot) -> Vec<Notice> {
-        let Some(live) = tasks.live() else {
-            return Vec::new();
-        };
-        let live: Vec<&BackgroundTask> = live.collect();
-        let mut notices = Vec::new();
-        let (mut kept, pending): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut self.attendances)
-            .into_iter()
-            .partition(|e| e.resolved.is_some());
-        for mut entry in pending {
-            if let Some(name) = run_alias(&entry.selector, &live) {
-                let runs: Vec<&mut Entry> = kept
-                    .iter_mut()
-                    .filter(|e| {
-                        e.is_run()
-                            && e.selector.text() == name
-                            && e.task()
-                                .is_some_and(|id| live.iter().any(|t| t.id.as_deref() == Some(id)))
-                    })
-                    .collect();
-                if !runs.is_empty() {
-                    for run in runs {
-                        run.renew(entry.since, entry.expect, None);
-                    }
-                    continue;
-                }
-            }
-            let task = match resolve(&entry.selector, &live) {
-                Ok(task) => task,
-                Err(notice) => {
-                    notices.push(notice);
-                    continue;
-                }
-            };
-            let kind = TaskKind::of(task);
-            let task_id = task.id.clone().unwrap_or_default();
-            if let Selector::Name(name) = &entry.selector
-                && kind == TaskKind::Shell
-            {
-                notices.push(Notice::ShellNamed {
-                    name: name.clone(),
-                    task_id,
-                });
-                continue;
-            }
-            if let Some(held) = kept.iter_mut().find(|e| e.task() == Some(task_id.as_str())) {
-                held.renew(entry.since, entry.expect, entry.desc);
-                continue;
-            }
-            entry.desc = entry.desc.or_else(|| task.description.clone());
-            entry.resolved = Some(Resolved { task_id, kind });
-            entry.check_in = CheckIn::Unarmed;
-            kept.push(entry);
-        }
-        self.attendances = kept;
-        notices
     }
 
     /// Always a new presentation, counted from the last COMMITTED repeat
     /// record. A failed one is never reused: its count belongs to the
     /// episode it was made in, which an observed change may since have
     /// ended.
-    fn present(
-        &mut self,
-        owed: &[OwedItem],
-        demanded: &[String],
-        place: Option<&TurnPlace>,
-    ) -> Presentation {
-        let mut identities = owed_identities(owed);
-        identities.extend_from_slice(demanded);
-        identities.sort();
-        identities.dedup();
+    fn present(&mut self, owed: &[OwedItem], place: Option<&TurnPlace>) -> Presentation {
+        let identities = owed_identities(owed);
         let receipts: Vec<String> = owed.iter().flat_map(|o| o.receipts.clone()).collect();
         self.next_seq += 1;
         Presentation {
@@ -1387,101 +1118,74 @@ impl SessionState {
 
     fn attend(&mut self, req: AttendRequest, facts: &Facts<'_>) -> AttendReply {
         let session = match &req {
-            AttendRequest::Attend { session, .. } | AttendRequest::Clear { session, .. } => session,
+            AttendRequest::Run { session, .. }
+            | AttendRequest::Declare { session, .. }
+            | AttendRequest::Clear { session, .. } => session,
         };
         if facts.binding != Some(session) || !self.bound(facts) {
             return AttendReply::RefusedStale;
         }
         match req {
-            AttendRequest::Attend {
-                selector,
+            AttendRequest::Run {
+                proof,
                 desc,
                 expect,
-                shell,
                 ..
-            } => self.add(selector, desc, expect, shell, facts),
+            } => {
+                let at = |e: &Entry| e.proof() == Some(&proof);
+                let work = Attending::Run(proof.clone());
+                self.add(at, work, desc, expect, facts.now)
+            }
+            AttendRequest::Declare {
+                name, desc, expect, ..
+            } => {
+                let at = |e: &Entry| e.name() == name;
+                let work = Attending::Declared {
+                    name: name.clone(),
+                    seen_turn_end: false,
+                };
+                let desc = desc.unwrap_or_else(|| name.clone());
+                self.add(at, work, desc, expect, facts.now)
+            }
             AttendRequest::Clear { which, .. } => self.clear(which),
         }
     }
 
-    /// A request adds an entry, or renews the one already attending the
-    /// same work. It never removes or renews any other.
+    /// A request renews every entry `same` picks, or adds `work` when
+    /// there is none. It never removes or renews any other.
     fn add(
         &mut self,
-        selector: Selector,
-        desc: Option<String>,
+        same: impl Fn(&Entry) -> bool,
+        work: Attending,
+        desc: String,
         expect: Ms,
-        shell: Option<ShellProof>,
-        facts: &Facts<'_>,
+        now: Ms,
     ) -> AttendReply {
-        self.forget_gone_requests(facts);
-        let renewing: Vec<usize> = match (&selector, &shell) {
-            (Selector::RunDesc(_), Some(proof)) => {
-                match self
-                    .attendances
-                    .iter()
-                    .position(|e| e.shell.as_ref() == Some(proof))
-                {
-                    Some(same) => vec![same],
-                    None if self
-                        .attendances
-                        .iter()
-                        .any(|e| e.is_run() && e.selector.text() == selector.text()) =>
-                    {
-                        return AttendReply::DescInUse(selector.text().to_string());
-                    }
-                    None => Vec::new(),
-                }
-            }
-            // Only a request for this very name still waiting for a listing.
-            // A resolved entry under the name may be a task that has since
-            // ended and been replaced: which task the name means now, and so
-            // whether this renews that entry, is the listing's to show
-            // ([`Self::resolve_requests`]).
-            (Selector::Name(_), _) => self
-                .attendances
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.resolved.is_none() && e.selector == selector)
-                .map(|(i, _)| i)
-                .collect(),
-            (Selector::RunDesc(_) | Selector::TaskId(_), _) => Vec::new(),
-        };
-        if renewing.is_empty() {
-            self.attendances.push(Entry {
-                selector,
-                resolved: None,
-                desc,
-                since: facts.now,
-                expect,
-                shell,
-                check_in: CheckIn::Unarmed,
-            });
-            return AttendReply::Accepted;
+        let mut renewed = false;
+        for entry in self.attendances.iter_mut().filter(|e| same(e)) {
+            let desc = entry.proof().is_none().then(|| desc.clone());
+            entry.renew(now, expect, desc);
+            renewed = true;
         }
-        for i in renewing {
-            self.attendances[i].renew(facts.now, expect, desc.clone());
+        if renewed {
+            return AttendReply::Renewed;
         }
-        AttendReply::Renewed
+        self.attendances.push(Entry {
+            work,
+            desc,
+            started: now,
+            since: now,
+            expect,
+            check_in: CheckIn::Armed,
+        });
+        AttendReply::Accepted
     }
 
     fn clear(&mut self, which: Clearing) -> AttendReply {
         let removed = match which {
             Clearing::All => self.retain_entries(|_| false),
-            Clearing::Run(proof) => self.retain_entries(|e| e.shell.as_ref() != Some(&proof)),
-            Clearing::Named(name) => {
-                let named: Vec<&Entry> = self
-                    .attendances
-                    .iter()
-                    .filter(|e| e.selector.text() == name)
-                    .collect();
-                if named.iter().any(|e| e.is_run()) && named.iter().any(|e| !e.is_run()) {
-                    return AttendReply::Ambiguous(
-                        named.iter().map(|e| e.selector.clone()).collect(),
-                    );
-                }
-                self.retain_entries(|e| e.selector.text() != name)
-            }
+            Clearing::Run(proof) => self.retain_entries(|e| e.proof() != Some(&proof)),
+            Clearing::Named(name) => self.retain_entries(|e| e.name() != name),
         };
         AttendReply::Cleared { removed }
     }
@@ -1489,8 +1193,8 @@ impl SessionState {
     /// Settle the in-flight presentation with its one result. A success
     /// commits its receipts and its repeat decision, which was made
     /// against the record nothing could replace while it was in flight,
-    /// and is the only evidence that its work was received. Only owed work
-    /// is received: an uncovered task's demand is counted, never quieted.
+    /// and is the only evidence that its work was received. The agent
+    /// starts a turn on it.
     fn settle(&mut self, id: PresentationId, how: Resolution, facts: &Facts<'_>) -> ResultOutcome {
         if !self.bound(facts) {
             return ResultOutcome::ProtocolViolation(id);
@@ -1507,6 +1211,7 @@ impl SessionState {
         if how == Resolution::Failed {
             return ResultOutcome::Resolved(Vec::new());
         }
+        self.turn_started();
         let owed = owed_identities(facts.owed);
         for identity in p.identities.into_iter().filter(|i| owed.contains(i)) {
             if let Err(at) = self.received.binary_search(&identity) {
@@ -1541,9 +1246,8 @@ impl SessionState {
                 continue;
             }
             if entry
-                .shell
-                .as_ref()
-                .is_some_and(|p| !facts.liveness.holds(p))
+                .proof()
+                .is_some_and(|p| facts.liveness.presence(p) == Presence::Gone)
             {
                 entry.check_in = CheckIn::ProcessGone;
                 continue;
@@ -1552,10 +1256,8 @@ impl SessionState {
                 entry.check_in = CheckIn::Withheld(why);
                 continue;
             }
-            if let Some(line) = check_in_line(entry, facts.now) {
-                entry.check_in = CheckIn::Fired;
-                lines.push(line);
-            }
+            entry.check_in = CheckIn::Fired;
+            lines.push(check_in_line(entry, facts.now));
         }
         if lines.is_empty() {
             Vec::new()
@@ -1599,7 +1301,7 @@ impl SessionState {
             .attendances
             .iter()
             .filter(|e| fired.iter().any(|r| is_fired(e, r)))
-            .filter_map(|e| check_in_line(e, facts.now))
+            .map(|e| check_in_line(e, facts.now))
             .collect();
         if lines.is_empty() {
             return Err("the attendance it was for was cleared or renewed".into());
@@ -1626,65 +1328,25 @@ impl SessionState {
     }
 }
 
-/// `entry`'s line in a check-in at `now`; `None` before it has resolved.
-fn check_in_line(entry: &Entry, now: Ms) -> Option<CheckInLine> {
-    let Resolved { task_id, kind } = entry.resolved.as_ref()?;
-    Some(CheckInLine {
+/// `entry`'s line in a check-in at `now`.
+fn check_in_line(entry: &Entry, now: Ms) -> CheckInLine {
+    CheckInLine {
         check_in: CheckInRef {
             key: entry.key(),
             since: entry.since,
         },
-        task_id: task_id.clone(),
-        kind: kind.clone(),
         desc: entry.desc.clone(),
-        selector: entry.selector.clone(),
+        name: entry.name().to_string(),
+        run: entry.proof().is_some(),
         elapsed: now.saturating_sub(entry.since),
         expect: entry.expect,
-    })
+    }
 }
 
 /// Whether `entry` is still the one `fired` was fired for, with that
 /// check-in still in flight.
 fn is_fired(entry: &Entry, fired: &CheckInRef) -> bool {
     entry.check_in == CheckIn::Fired && entry.since == fired.since && entry.key() == fired.key
-}
-
-/// The `--desc` a name request may mean instead, when no live subagent
-/// carries that name: a run is renewed by its own `--desc`, or past its
-/// expectation it could never be given longer. Only a run entry this
-/// listing proves still holds its task may take it.
-fn run_alias<'s>(selector: &'s Selector, live: &[&BackgroundTask]) -> Option<&'s str> {
-    let Selector::Name(name) = selector else {
-        return None;
-    };
-    (!live
-        .iter()
-        .any(|t| TaskKind::of(t) == TaskKind::Subagent && selector.matches(t)))
-    .then_some(name.as_str())
-}
-
-/// The one live task `selector` names, or the notice saying why there is
-/// none.
-fn resolve<'t>(
-    selector: &Selector,
-    live: &[&'t BackgroundTask],
-) -> Result<&'t BackgroundTask, Notice> {
-    let matches: Vec<&BackgroundTask> = live
-        .iter()
-        .copied()
-        .filter(|t| selector.matches(t))
-        .collect();
-    match matches.as_slice() {
-        [only] if only.id.is_some() => Ok(only),
-        [] | [_] => Err(Notice::NoMatch {
-            selector: selector.clone(),
-            live: live.iter().copied().map(TaskSummary::from).collect(),
-        }),
-        many => Err(Notice::Ambiguous {
-            selector: selector.clone(),
-            matches: many.iter().copied().map(TaskSummary::from).collect(),
-        }),
-    }
 }
 
 /// The gates every presentation passes before attendance or work: an
@@ -1730,22 +1392,22 @@ pub enum Quiet {
     Attending,
 }
 
-/// What a hook does when no monitor can decide: the generic owed-work fold
-/// only says whether work is owed. Never quiet on attendance, never a
-/// presentation, so the monitor keeps custody of every receipt.
-/// What Grok's native Stop showed: whether a `clank wait` was already
-/// running, and whether this Stop is the continuation of one that asked
-/// for it.
+/// Grok's native Stop: whether the monitor holds a live registration of
+/// this session's background `clank wait`, and whether this Stop is the
+/// continuation of one that asked for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
     pub session: SessionId,
-    pub wait_running: bool,
+    pub wait_registered: bool,
     pub continued: bool,
 }
 
 /// Grok's native turn-end, with or without a monitor: the drive gate, then
 /// a request for the background wait unless one already carries the wake.
-/// A continuation never asks again, so a wait that failed is not
+///
+/// A continuation is the turn that was just asked to arm one, so its wait
+/// may have started without registering yet: it is pending, never asked
+/// for again. That is also what stops a wait that failed from being
 /// requested in a loop within one turn.
 pub fn handoff_verdict(handoff: &Handoff, facts: &Facts<'_>) -> Verdict {
     if facts.binding != Some(&handoff.session) {
@@ -1754,12 +1416,15 @@ pub fn handoff_verdict(handoff: &Handoff, facts: &Facts<'_>) -> Verdict {
     if let Some(gated) = drive_gate(facts) {
         return gated;
     }
-    if handoff.wait_running || handoff.continued {
+    if handoff.wait_registered || handoff.continued {
         return Verdict::Silent(SilentWhy::WaitArmed);
     }
     Verdict::Notify(vec![Notice::ArmWait])
 }
 
+/// What a hook does when no monitor can decide: the generic owed-work fold
+/// only says whether work is owed. Never quiet on attendance, never a
+/// presentation, so the monitor keeps custody of every receipt.
 pub fn alone_verdict(session: &SessionId, facts: &Facts<'_>) -> Verdict {
     if facts.binding != Some(session) {
         return Verdict::Silent(SilentWhy::StaleBinding);
