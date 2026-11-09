@@ -8,6 +8,7 @@ use clank_core::{Tool, ids::AgentLabel};
 use std::path::{Path, PathBuf};
 
 use super::open_zellij::{self, Lookup, SessionPane, SessionScan, Unresolved};
+use super::zellij_endpoint::Session;
 
 /// One explicit batch lookup; healthy servers respond well below this deadline.
 const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -15,7 +16,7 @@ const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 /// The one live pane named by an agent in its repo's workspace.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Found {
-    pub(crate) session: String,
+    pub(crate) session: Session,
     pub(crate) pane: String,
 }
 
@@ -102,7 +103,7 @@ pub(crate) fn locate(
 /// tool the roster gives that agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Target {
-    pub(crate) session: String,
+    pub(crate) session: Session,
     pub(crate) pane: String,
     pub(crate) tool: Tool,
     pub(crate) repo: PathBuf,
@@ -112,7 +113,7 @@ pub(crate) struct Target {
 impl Target {
     pub(crate) fn input(&self) -> super::pane_input::Target<'_> {
         super::pane_input::Target {
-            session: &self.session,
+            session: self.session.endpoint(),
             pane: &self.pane,
             tool: self.tool,
             repo: &self.repo,

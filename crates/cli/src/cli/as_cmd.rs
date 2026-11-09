@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use super::open_zellij::{self, CallerIdentity, Lookup, Workspace, ZellijPane};
+use super::zellij_endpoint::Endpoint;
 use super::{AsArgs, resolve_repo};
 use crate::agent_env::detect_session_from_env;
 use crate::agent_store::bind_session_to_agent;
@@ -49,9 +50,9 @@ pub async fn run(args: AsArgs) -> anyhow::Result<()> {
 trait AsIo {
     fn caller(&mut self) -> CallerIdentity;
     /// This session's panes; `None` when zellij did not answer.
-    fn listing(&mut self) -> Option<Vec<ZellijPane>>;
+    fn listing(&mut self, session: &Endpoint) -> Option<Vec<ZellijPane>>;
     fn owned(&mut self, repo: &Path) -> anyhow::Result<Option<BTreeSet<String>>>;
-    fn rename(&mut self, pane: &str, name: &str) -> Result<(), String>;
+    fn rename(&mut self, session: &Endpoint, pane: &str, name: &str) -> Result<(), String>;
     fn own(&mut self, repo: &Path, label: &str) -> anyhow::Result<()>;
     fn say(&mut self, line: &str);
 }
@@ -62,14 +63,14 @@ impl AsIo for Live {
     fn caller(&mut self) -> CallerIdentity {
         open_zellij::caller_identity()
     }
-    fn listing(&mut self) -> Option<Vec<ZellijPane>> {
-        open_zellij::snapshot_panes()
+    fn listing(&mut self, session: &Endpoint) -> Option<Vec<ZellijPane>> {
+        open_zellij::snapshot_panes(session)
     }
     fn owned(&mut self, repo: &Path) -> anyhow::Result<Option<BTreeSet<String>>> {
         super::pane_owners::load(repo)
     }
-    fn rename(&mut self, pane: &str, name: &str) -> Result<(), String> {
-        open_zellij::rename_pane_checked(pane, name)
+    fn rename(&mut self, session: &Endpoint, pane: &str, name: &str) -> Result<(), String> {
+        open_zellij::rename_pane_checked(session, pane, name)
     }
     fn own(&mut self, repo: &Path, label: &str) -> anyhow::Result<()> {
         super::pane_owners::update(repo, &BTreeSet::from([label.to_string()]), &BTreeSet::new())
@@ -86,7 +87,7 @@ enum PaneStep {
     Untouched,
     /// Inside zellij, but the pane is not renamed, for this reason.
     NotRenamed(String),
-    Rename(String),
+    Rename(Endpoint, String),
 }
 
 /// Decide what may be done to the calling pane, refusing when another
@@ -97,16 +98,18 @@ fn pane_step(
     roster: &BTreeSet<String>,
     io: &mut impl AsIo,
 ) -> anyhow::Result<PaneStep> {
-    let pane_id = match io.caller() {
+    let (session, pane_id) = match io.caller() {
         CallerIdentity::NotInZellij => return Ok(PaneStep::Untouched),
         CallerIdentity::Unidentified => {
             return Ok(PaneStep::NotRenamed(
-                "zellij did not say which pane this is (ZELLIJ_PANE_ID is unset)".into(),
+                "which zellij server and pane this is could not be told (its process \
+                 ancestry was unreadable, or ZELLIJ_PANE_ID is unset)"
+                    .into(),
             ));
         }
-        CallerIdentity::Pane { pane_id, .. } => pane_id,
+        CallerIdentity::Pane { session, pane_id } => (session, pane_id),
     };
-    let Some(panes) = io.listing() else {
+    let Some(panes) = io.listing(&session) else {
         return Ok(PaneStep::NotRenamed(
             "zellij did not answer the pane listing".into(),
         ));
@@ -146,7 +149,7 @@ fn pane_step(
             open_zellij::describe_ambiguities(&doubts)
         ),
     }
-    Ok(PaneStep::Rename(pane_id))
+    Ok(PaneStep::Rename(session, pane_id))
 }
 
 fn run_with(
@@ -183,9 +186,14 @@ fn run_with(
             io.say(&format!("this pane was not renamed: {why}"));
             return Ok(());
         }
-        PaneStep::Rename(pane) => pane,
+        PaneStep::Rename(session, pane) => (session, pane),
     };
-    if let Err(e) = io.rename(&pane, &open_zellij::agent_pane_title(label.as_str())) {
+    let (session, pane) = pane;
+    if let Err(e) = io.rename(
+        &session,
+        &pane,
+        &open_zellij::agent_pane_title(label.as_str()),
+    ) {
         anyhow::bail!("the session is bound, but this pane was not renamed to `{label}`: {e}");
     }
     io.say(&format!("renamed this pane to `{label}`"));
@@ -240,7 +248,9 @@ mod tests {
         fn in_pane(listing: Option<String>) -> Self {
             Self {
                 caller: CallerIdentity::Pane {
-                    session: "s".into(),
+                    session: crate::cli::zellij_endpoint::Session::fixture("s")
+                        .endpoint()
+                        .clone(),
                     pane_id: "terminal_5".into(),
                 },
                 listing,
@@ -257,7 +267,7 @@ mod tests {
         fn caller(&mut self) -> CallerIdentity {
             self.caller.clone()
         }
-        fn listing(&mut self) -> Option<Vec<ZellijPane>> {
+        fn listing(&mut self, _: &Endpoint) -> Option<Vec<ZellijPane>> {
             self.listing
                 .as_deref()
                 .map(|json| serde_json::from_str(json).unwrap())
@@ -265,7 +275,7 @@ mod tests {
         fn owned(&mut self, _: &Path) -> anyhow::Result<Option<BTreeSet<String>>> {
             Ok(self.record.clone())
         }
-        fn rename(&mut self, pane: &str, name: &str) -> Result<(), String> {
+        fn rename(&mut self, _: &Endpoint, pane: &str, name: &str) -> Result<(), String> {
             self.renamed.push((pane.into(), name.into()));
             self.rename.clone()
         }

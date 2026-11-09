@@ -29,21 +29,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::cli::codex_chat;
 use crate::cli::open_zellij::{self, PaneMeta, SubscribeChild};
+use crate::cli::zellij_endpoint::Session;
 pub(crate) use bridge_instance::AdminState;
 pub(crate) use bridge_instance::BridgeInstance;
 use feed::{Feed, SubscribeEvent, TableChange};
-
-/// Which session to look in. `--session` wins; else the one this
-/// process runs inside; else the name `clank open` would have used.
-/// Only a preference: the caller verifies the listing, because
-/// `open_one` adds a repo's tab to whatever session the caller was
-/// in, and the convention is where penlock's panes were NOT.
-pub(crate) fn choose_session(explicit: Option<&str>, current: Option<&str>, repo: &Path) -> String {
-    explicit
-        .or(current)
-        .map(str::to_string)
-        .unwrap_or_else(|| open_zellij::repo_session_name(repo))
-}
 
 /// What the repo connector needs of zellij, behind a trait so an instance
 /// runs in a test without one: the session, its panes, a
@@ -71,17 +60,17 @@ pub(crate) trait Panes: Send + Sync + 'static {
 
 /// The real session this TUI runs in.
 pub(crate) struct Zellij {
-    session: String,
+    session: Session,
     repo: PathBuf,
 }
 
 impl Zellij {
-    /// The session this process is in, else the name `clank open`
-    /// would have used; verified to hold the repo's tab.
+    /// The server this process runs under, else the one running the
+    /// repo's TUI; verified to hold the repo's tab.
     pub(crate) fn find(repo: &Path) -> anyhow::Result<Self> {
         open_zellij::require_zellij()?;
-        let session = choose_session(None, open_zellij::current_session().as_deref(), repo);
-        let panes = open_zellij::snapshot_panes_in(&session).ok_or_else(|| {
+        let session = open_zellij::workspace_session(repo)?;
+        let panes = open_zellij::snapshot_panes(session.endpoint()).ok_or_else(|| {
             anyhow::anyhow!("zellij did not answer for session `{session}` — is it running?")
         })?;
         if open_zellij::repo_tab_id(&panes, repo).is_none() {
@@ -187,14 +176,14 @@ fn scoped_table(
 
 impl Panes for Zellij {
     fn session(&self) -> &str {
-        &self.session
+        self.session.name()
     }
     fn table(&self) -> Option<Vec<PaneMeta>> {
-        let panes = open_zellij::snapshot_panes_in(&self.session)?;
+        let panes = open_zellij::snapshot_panes(self.session.endpoint())?;
         Some(self.scoped_table(&panes))
     }
     fn subscribe(&self, ids: &[String]) -> Option<SubscribeChild> {
-        open_zellij::subscribe_panes(&self.session, ids)
+        open_zellij::subscribe_panes(self.session.endpoint(), ids)
     }
     fn sample(
         &self,
@@ -202,13 +191,13 @@ impl Panes for Zellij {
         deadline: std::time::Duration,
     ) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
         sample_initial(
-            open_zellij::subscribe_panes(&self.session, ids)?,
+            open_zellij::subscribe_panes(self.session.endpoint(), ids)?,
             ids,
             deadline,
         )
     }
     fn say(&self, pane: &str, text: &str) -> anyhow::Result<()> {
-        let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {
+        let panes = open_zellij::snapshot_panes(self.session.endpoint()).ok_or_else(|| {
             anyhow::anyhow!("zellij did not answer for session `{}`", self.session)
         })?;
         let table = self.scoped_table(&panes);
@@ -219,17 +208,22 @@ impl Panes for Zellij {
             text,
             codex_chat::send,
             |tool, text| {
-                crate::cli::pane_input::say_to_pane_for_tool(&self.session, pane, tool, text)
+                crate::cli::pane_input::say_to_pane_for_tool(
+                    self.session.endpoint(),
+                    pane,
+                    tool,
+                    text,
+                )
             },
         )
     }
     fn stop(&self, pane: &str) -> anyhow::Result<()> {
-        let panes = open_zellij::snapshot_panes_in(&self.session).ok_or_else(|| {
+        let panes = open_zellij::snapshot_panes(self.session.endpoint()).ok_or_else(|| {
             anyhow::anyhow!("zellij did not answer for session `{}`", self.session)
         })?;
         let table = self.scoped_table(&panes);
         let tool = pane_tool(&self.repo, &table, pane)?;
-        crate::cli::pane_input::stop_pane(&self.session, pane, tool)
+        crate::cli::pane_input::stop_pane(self.session.endpoint(), pane, tool)
     }
 }
 
@@ -1790,17 +1784,6 @@ mod tests {
         ] {
             assert!(site_file(path).is_none(), "{path}");
         }
-    }
-
-    #[test]
-    fn session_selection_prefers_explicit_then_current_then_repo() {
-        let repo = Path::new("/x/penlock-experiment");
-        assert_eq!(
-            choose_session(Some("chosen"), Some("current"), repo),
-            "chosen"
-        );
-        assert_eq!(choose_session(None, Some("current"), repo), "current");
-        assert_eq!(choose_session(None, None, repo), "clank-penlock-experiment");
     }
 
     #[test]

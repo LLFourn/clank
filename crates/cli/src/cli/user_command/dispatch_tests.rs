@@ -25,6 +25,7 @@ fn seen() -> PaneSeen {
     PaneSeen {
         session: "zs".into(),
         pane: "terminal_3".into(),
+        server: Some("zs".into()),
     }
 }
 

@@ -2471,6 +2471,20 @@ const REOPEN_NOTICE: &str = "reopen pane";
 
 const OWNERSHIP_NOTICE: &str = "panes";
 
+const ZELLIJ_NOTICE: &str = "zellij";
+
+/// The undetermined alarm's reason, as a log notice while it stands, and
+/// gone once the session can be told again.
+fn mount_reach_notice(rows: &mut Vec<crate::cli::log::OnelineRow>, reach: &zellij::ZellijReach) {
+    use crate::cli::log::OnelineRow;
+    match render::zellij_notice(reach) {
+        Some(notice) => mount_notice(rows, ZELLIJ_NOTICE, &notice),
+        None => {
+            rows.retain(|r| !matches!(r, OnelineRow::Notice(n) if n.starts_with(ZELLIJ_NOTICE)))
+        }
+    }
+}
+
 /// What the gate is waiting on this agent for, with the TUI's verb
 /// and since when. The clock is what the page's `auto` compares to
 /// find whoever has been kept waiting longest.
@@ -3527,6 +3541,7 @@ pub(crate) async fn run_tui(
         if let Some(notice) = reconcile_worker.ownership_notice() {
             mount_notice(&mut snapshot.log_rows, OWNERSHIP_NOTICE, &notice);
         }
+        mount_reach_notice(&mut snapshot.log_rows, &reconcile_worker.reach());
         let (rows, cols) = term_size();
         // Every pass, before any render: see the fn's invariant doc.
         enforce_panel_tops_log(mode, &mut log);
@@ -7258,6 +7273,29 @@ pub(crate) mod tests {
 
     use super::fixtures::*;
     use super::*;
+
+    /// The undetermined alarm's reason is a notice while it stands, kept
+    /// once however many passes mount it, and gone when the session can be
+    /// told again.
+    #[test]
+    fn the_unknown_reason_is_a_notice_only_while_it_stands() {
+        use crate::cli::log::OnelineRow;
+        let mut rows = Vec::new();
+        let why = zellij::ZellijReach::Undetermined("index locked".into());
+        mount_reach_notice(&mut rows, &why);
+        mount_reach_notice(&mut rows, &why);
+        let notices: Vec<&String> = rows
+            .iter()
+            .filter_map(|r| match r {
+                OnelineRow::Notice(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("index locked"), "{notices:?}");
+        mount_reach_notice(&mut rows, &zellij::ZellijReach::Connected);
+        assert!(rows.is_empty());
+    }
 
     #[test]
     fn log_view_cursor_moves_saturate() {

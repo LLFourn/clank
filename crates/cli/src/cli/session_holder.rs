@@ -138,7 +138,7 @@ pub(crate) fn decide(
     {
         let is_caller = |sp: &SessionPane| match caller {
             CallerIdentity::Pane { session, pane_id } => {
-                sp.session == *session && sp.pane.pane_id() == *pane_id
+                sp.session.endpoint() == session && sp.pane.pane_id() == *pane_id
             }
             _ => false,
         };
@@ -150,14 +150,14 @@ pub(crate) fn decide(
             Lookup::Known(found) => {
                 if let Some(other) = found.first() {
                     return Holder::Pane {
-                        session: other.session.clone(),
+                        session: other.session.to_string(),
                         tab: other.pane.tab_name().to_string(),
                     };
                 }
             }
             Lookup::Uncertain(doubts) => {
                 return Holder::Uncertain {
-                    session,
+                    session: session.to_string(),
                     why: open_zellij::describe_ambiguities(&doubts),
                 };
             }
@@ -245,7 +245,7 @@ mod tests {
             .expect("fixture is a list-panes element")
             .into_iter()
             .map(|pane| SessionPane {
-                session: session.to_string(),
+                session: session.into(),
                 pane,
             })
             .collect()

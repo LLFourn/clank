@@ -88,6 +88,17 @@ pub(super) trait TabIo {
 
 struct ZellijTabIo;
 
+/// This TUI's own server, from its ancestry: kept once found, asked again
+/// while it could not be told.
+fn own_endpoint() -> Result<crate::cli::zellij_endpoint::Endpoint, String> {
+    use crate::cli::zellij_endpoint::Resolved;
+    match crate::cli::zellij_endpoint::own_endpoint() {
+        Resolved::Found(ep) => Ok(ep),
+        Resolved::NotInZellij => Err("no zellij server is above this TUI".to_string()),
+        Resolved::Unknown(why) => Err(why),
+    }
+}
+
 /// No tabs at all: what the pane-only tests run against.
 #[cfg(test)]
 struct NoTabs;
@@ -104,10 +115,10 @@ impl TabIo for NoTabs {
 
 impl TabIo for ZellijTabIo {
     fn tabs(&mut self) -> Option<Vec<(u32, String)>> {
-        crate::cli::open_zellij::list_tabs()
+        crate::cli::open_zellij::list_tabs(&own_endpoint().ok()?)
     }
     fn rename(&mut self, id: u32, name: &str) -> bool {
-        crate::cli::open_zellij::rename_tab(id, name)
+        own_endpoint().is_ok_and(|ep| crate::cli::open_zellij::rename_tab(&ep, id, name))
     }
 }
 
@@ -191,7 +202,9 @@ impl TabMirror {
 }
 
 fn rename_pane(id: &str, name: &str) {
-    crate::cli::open_zellij::rename_pane(id, name)
+    if let Ok(ep) = own_endpoint() {
+        crate::cli::open_zellij::rename_pane(&ep, id, name)
+    }
 }
 
 /// Per-refresh retitle data, derived ON THE LOOP (pure — no zellij)
@@ -627,6 +640,11 @@ pub(super) trait PaneIo {
     /// session. Read only; this never starts or reconnects an agent.
     fn lost_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String>;
     /// The tab holding the terminal pane `caller`, as `snap` names it.
+    /// Why the last snapshot could not even be asked for: which server
+    /// this is, or its name, could not be told. `None` when it was asked.
+    fn unreached(&self) -> Option<String> {
+        None
+    }
     fn tab_of(&mut self, _snap: &Self::Snap, _caller: &str) -> Option<u32> {
         None
     }
@@ -684,17 +702,33 @@ struct ZellijPaneIo<'a> {
     repo: &'a std::path::Path,
     /// The TUI's own pane, whose tab is the workspace.
     caller: Option<String>,
+    /// The last snapshot's reason for not asking, if it did not.
+    unreached: Option<String>,
+}
+
+impl ZellijPaneIo<'_> {
+    /// The server every call goes to; `None` when it can't be told, which
+    /// the next snapshot reports.
+    fn endpoint(&self) -> Option<crate::cli::zellij_endpoint::Endpoint> {
+        own_endpoint().ok()
+    }
 }
 
 impl PaneIo for ZellijPaneIo<'_> {
     type Snap = Scoped;
     fn snapshot(&mut self, candidates: &Labels) -> Option<Self::Snap> {
-        Scoped::of(
-            crate::cli::open_zellij::snapshot_panes()?,
-            self.repo,
-            self.caller.as_deref(),
-            candidates,
-        )
+        use crate::cli::open_zellij::Unlisted;
+        let listed = own_endpoint()
+            .map_err(Unlisted::Unnamed)
+            .and_then(|ep| crate::cli::open_zellij::list_agent_panes(&ep));
+        self.unreached = match &listed {
+            Err(Unlisted::Unnamed(why)) => Some(why.clone()),
+            _ => None,
+        };
+        Scoped::of(listed.ok()?, self.repo, self.caller.as_deref(), candidates)
+    }
+    fn unreached(&self) -> Option<String> {
+        self.unreached.clone()
     }
     fn seen(&mut self, snap: &Self::Snap) -> Seen {
         snap.seen()
@@ -728,13 +762,21 @@ impl PaneIo for ZellijPaneIo<'_> {
             .map_err(|e| format!("{e:#}"))
     }
     fn capture_focus(&mut self, snap: &Self::Snap) -> Option<String> {
-        crate::cli::open_zellij::pass_focus_target(&snap.panes)
+        crate::cli::open_zellij::pass_focus_target(&self.endpoint()?, &snap.panes)
     }
     fn restore_focus(&mut self, id: &str) {
-        crate::cli::open_zellij::focus_pane(id);
+        if let Some(ep) = self.endpoint() {
+            crate::cli::open_zellij::focus_pane(&ep, id);
+        }
     }
     fn add(&mut self, label: &str, snap: &Self::Snap) -> Option<String> {
-        crate::cli::open_zellij::open_agent_pane(self.repo, label, &snap.panes, &snap.ws)
+        crate::cli::open_zellij::open_agent_pane(
+            &self.endpoint()?,
+            self.repo,
+            label,
+            &snap.panes,
+            &snap.ws,
+        )
     }
     fn is_placed(&mut self, reviewers: &[String], snap: &Self::Snap) -> bool {
         snap.stacked(self.repo, reviewers)
@@ -755,10 +797,14 @@ impl PaneIo for ZellijPaneIo<'_> {
         .ok()
     }
     fn override_layout(&mut self, kdl: &str, snap: &Self::Snap) -> bool {
-        crate::cli::open_zellij::override_tab_layout(self.repo, snap.ws.tab(), kdl)
+        self.endpoint().is_some_and(|ep| {
+            crate::cli::open_zellij::override_tab_layout(&ep, self.repo, snap.ws.tab(), kdl)
+        })
     }
     fn remove_all(&mut self, labels: &[String], snap: &Self::Snap) {
-        crate::cli::open_zellij::remove_reviewer_panes(labels, &snap.panes, &snap.ws);
+        if let Some(ep) = self.endpoint() {
+            crate::cli::open_zellij::remove_reviewer_panes(&ep, labels, &snap.panes, &snap.ws);
+        }
     }
     fn live_labels(&mut self, snap: &Self::Snap) -> std::collections::BTreeSet<String> {
         snap.live_labels()
@@ -1210,20 +1256,23 @@ impl PaneReconciler {
 /// START one, while inside a session that does not answer something
 /// is wrong with zellij itself — and that case otherwise looks like
 /// "clank did nothing" (zellij-is-the-workspace).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ZellijReach {
-    /// `$ZELLIJ` is unset. Pane operations are unavailable by design.
+    /// The TUI's whole ancestry was read and no zellij server is in it.
+    /// Pane operations are unavailable by design.
     NotInSession,
-    /// `$ZELLIJ` is set but no listing has returned yet. A distinct
-    /// state rather than a guess: seeding `Connected` before any
-    /// evidence showed a dead session as healthy on its first frame —
-    /// the exact ambiguity this indicator exists to remove (codex on
-    /// a9c9bd4).
+    /// No listing has returned yet. A distinct state rather than a guess:
+    /// seeding `Connected` before any evidence showed a dead session as
+    /// healthy on its first frame — the exact ambiguity this indicator
+    /// exists to remove (codex on a9c9bd4).
     Unknown,
-    /// In a session and the client answered the last listing.
+    /// The server answered the last listing, whatever its name.
     Connected,
-    /// In a session but the client did NOT answer.
+    /// The server was found but did NOT answer.
     Unreachable,
+    /// Which server this is, or its name, could not be told, so nothing
+    /// was asked: the reason why.
+    Undetermined(String),
 }
 
 /// A `PaneIo` that records whether each listing it performs was
@@ -1239,11 +1288,12 @@ struct Observed<'a, I: PaneIo> {
 
 impl<I: PaneIo> Observed<'_, I> {
     fn note(&self, answered: bool) {
-        self.seen.set(Some(if answered {
-            ZellijReach::Connected
-        } else {
-            ZellijReach::Unreachable
-        }));
+        self.seen
+            .set(Some(match (answered, self.inner.unreached()) {
+                (true, _) => ZellijReach::Connected,
+                (false, Some(why)) => ZellijReach::Undetermined(why),
+                (false, None) => ZellijReach::Unreachable,
+            }));
     }
 }
 
@@ -1303,6 +1353,9 @@ impl<I: PaneIo> PaneIo for Observed<'_, I> {
     }
     fn tab_of(&mut self, snap: &Self::Snap, caller: &str) -> Option<u32> {
         self.inner.tab_of(snap, caller)
+    }
+    fn unreached(&self) -> Option<String> {
+        self.inner.unreached()
     }
 }
 
@@ -1533,7 +1586,9 @@ impl ReconcileWorker {
     /// a report, so the loop paints changed presence or lost-process
     /// marks without waiting for its next event.
     pub(super) fn spawn(repo: std::path::PathBuf, wake: impl Fn() + Send + 'static) -> Self {
-        if !crate::cli::open_zellij::in_session() {
+        if crate::cli::zellij_endpoint::own_endpoint()
+            == crate::cli::zellij_endpoint::Resolved::NotInZellij
+        {
             return Self {
                 tx: None,
                 join: None,
@@ -1555,6 +1610,7 @@ impl ReconcileWorker {
             let io = ZellijPaneIo {
                 repo: &repo,
                 caller,
+                unreached: None,
             };
             let seen = std::cell::Cell::new(None);
             let mut io = Observed {
@@ -1685,7 +1741,7 @@ impl ReconcileWorker {
     /// without blocking, so the render loop never waits on zellij.
     pub(super) fn reach(&mut self) -> ZellijReach {
         self.drain();
-        self.reach
+        self.reach.clone()
     }
 
     /// Hand the worker a fresh snapshot's roster view. Non-blocking:
@@ -1964,7 +2020,7 @@ mod tests {
             "the reconcile listing, and only it"
         );
         assert_eq!(
-            seen.get(),
+            seen.take(),
             Some(ZellijReach::Connected),
             "read off that listing"
         );
@@ -1977,7 +2033,7 @@ mod tests {
             io.inner.snapshots_taken, 1,
             "a converged batch lists nothing"
         );
-        assert_eq!(seen.get(), None, "nothing listed, nothing observed");
+        assert_eq!(seen.take(), None, "nothing listed, nothing observed");
     }
 
     /// Before the first listing returns, nothing may claim the client
@@ -2007,7 +2063,30 @@ mod tests {
             |_, _| {},
         );
         assert_eq!(io.inner.snapshots_taken, 1);
-        assert_eq!(seen.get(), Some(ZellijReach::Unreachable));
+        assert_eq!(seen.take(), Some(ZellijReach::Unreachable));
+    }
+
+    /// A listing never asked for, because which server this is or its
+    /// name could not be told, is not a server that did not answer: it
+    /// reads as undetermined, with the reason.
+    #[test]
+    fn an_unaskable_listing_reads_as_undetermined_not_unreachable() {
+        let seen = std::cell::Cell::new(None);
+        let mut inner = FakeIo::new(vec![None]);
+        inner.unreached = Some("zellij's session index is locked".into());
+        let mut io = Observed { inner, seen: &seen };
+        let mut state = WorkerState::new(None);
+        state.handle(
+            wb(Some(view(&["claude"], Some("claude"))), None, Vec::new()),
+            &mut io,
+            |_, _| {},
+        );
+        assert_eq!(
+            seen.take(),
+            Some(ZellijReach::Undetermined(
+                "zellij's session index is locked".into()
+            ))
+        );
     }
 
     // ── tui-zellij-pane-reconcile: planning + convergence ──────
@@ -2178,6 +2257,8 @@ mod tests {
         record: Result<Option<Labels>, String>,
         /// Every `reown` call, as `(own, disown)`.
         reowns: Vec<(Labels, Labels)>,
+        /// Why a failed snapshot was never asked, if it was not.
+        unreached: Option<String>,
     }
 
     /// The repo every fake composes for. Composition needs a path
@@ -2215,6 +2296,7 @@ mod tests {
                 owner: None,
                 record: Ok(Some(Labels::new())),
                 reowns: Vec::new(),
+                unreached: None,
             }
         }
 
@@ -2226,6 +2308,9 @@ mod tests {
 
     impl PaneIo for FakeIo {
         type Snap = Vec<(String, bool)>;
+        fn unreached(&self) -> Option<String> {
+            self.unreached.clone()
+        }
         fn snapshot(&mut self, _: &Labels) -> Option<Self::Snap> {
             self.snapshots_taken += 1;
             self.snaps.pop_front().unwrap_or(None)

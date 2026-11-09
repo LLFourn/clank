@@ -390,7 +390,7 @@ pub(super) fn render_at(
         snap,
         color,
         cols,
-        view.reach,
+        view.reach.clone(),
         view.remote,
         remote_in_body,
     ));
@@ -2088,12 +2088,11 @@ pub(super) fn cluster(
     remote_in_body: bool,
 ) -> Vec<(String, crate::cli::status_tui::derive::Hue)> {
     use crate::cli::status_tui::derive::Hue;
-    use crate::cli::status_tui::zellij::ZellijReach;
     let mut items = Vec::new();
     // An ALARM: drawn only when something is wrong, and said nowhere
     // else, so it earns the cells whatever the body is doing.
-    if matches!(reach, ZellijReach::NotInSession | ZellijReach::Unreachable) {
-        items.push(("! zellij".to_string(), Hue::Red));
+    if let Some(alarm) = zellij_alarm(&reach) {
+        items.push((alarm, Hue::Red));
     }
     // A STATUS, and the body says it in words with its URL or its
     // reason. A lamp beside that is a worse copy of a better row, paid
@@ -2105,6 +2104,32 @@ pub(super) fn cluster(
         items.push((REMOTE_ICON.to_string(), remote_hue(remote)));
     }
     items
+}
+
+/// What the bar says about zellij, when something is wrong. Each state
+/// names its own problem, because each calls for a different fix: start a
+/// session, look at the server, or read why clank couldn't tell. Short, so
+/// the band always fits it: an undetermined reason is a path-long error, and
+/// the log notice ([`zellij_notice`]) carries it.
+/// The log notice behind an undetermined alarm: the full reason clank
+/// couldn't tell which server or session this is.
+pub(super) fn zellij_notice(reach: &crate::cli::status_tui::zellij::ZellijReach) -> Option<String> {
+    match reach {
+        crate::cli::status_tui::zellij::ZellijReach::Undetermined(why) => {
+            Some(format!("which session this is can't be told: {why}"))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn zellij_alarm(reach: &crate::cli::status_tui::zellij::ZellijReach) -> Option<String> {
+    use crate::cli::status_tui::zellij::ZellijReach;
+    match reach {
+        ZellijReach::NotInSession => Some("! no zellij".to_string()),
+        ZellijReach::Unreachable => Some("! zellij not answering".to_string()),
+        ZellijReach::Undetermined(_) => Some("! zellij unknown".to_string()),
+        ZellijReach::Connected | ZellijReach::Unknown => None,
+    }
 }
 
 /// The remote's icon: `U+2601` CLOUD followed by `U+FE0F`,
@@ -7240,37 +7265,44 @@ mod tests {
         let body = v
             .strip_suffix(&format!(" {REMOTE_ICON} "))
             .unwrap_or_else(|| panic!("bar ends with the instruments band; got `{v}`"));
-        body.strip_suffix(" ! zellij")
+        let alarm = zellij_alarm(&crate::cli::status_tui::zellij::ZellijReach::NotInSession)
+            .expect("outside zellij is an alarm");
+        body.strip_suffix(&format!(" {alarm}"))
             .unwrap_or(body)
             .trim_end()
             .to_string()
     }
 
-    /// zellij is silent when connected or not yet known, and says
-    /// `! zellij` in red — the word that names what to do — when not
-    /// in a session or in one that does not answer. The instruments
-    /// sit on their own gray band, in their own FOREGROUND hues: the
-    /// bar's colour never reaches them, and no hue is a background.
+    /// zellij is silent when connected or not yet known, whatever its
+    /// session is named, and says what is wrong in red otherwise: each
+    /// failure in words of its own. The instruments sit on their own gray
+    /// band, in their own FOREGROUND hues: the bar's colour never reaches
+    /// them, and no hue is a background.
     #[test]
     fn zellij_speaks_only_when_disconnected_on_the_bands_own_gray() {
         use crate::cli::status_tui::zellij::ZellijReach::*;
         let s = snap(None, vec![]);
         let color = state_color(&s).sgr();
-        for (reach, warns) in [
-            (Connected, false),
-            (Unknown, false),
-            (NotInSession, true),
-            (Unreachable, true),
+        for (reach, says) in [
+            (Connected, None),
+            (Unknown, None),
+            (NotInSession, Some("! no zellij")),
+            (Unreachable, Some("! zellij not answering")),
+            (
+                Undetermined("pid 7: denied".into()),
+                Some("! zellij unknown"),
+            ),
         ] {
-            // `false`: the body draws no remote row here, so the lamp
-            // is carried and this test's tail assertion still holds.
-            let line = bar(&s, &color, 40, reach, Default::default(), false);
+            // Wide enough for the longest alarm. `false`: the body draws
+            // no remote row here, so the lamp is carried and this test's
+            // tail assertion still holds.
+            let line = bar(&s, &color, 80, reach.clone(), Default::default(), false);
             let v = visible_untrimmed(&line);
-            assert_eq!(v.contains("! zellij"), warns, "{reach:?}: `{v}`");
+            assert_eq!(v.contains("! "), says.is_some(), "{reach:?}: `{v}`");
             assert!(v.ends_with(&format!("{REMOTE_ICON} ")), "{reach:?}: `{v}`");
-            if warns {
+            if let Some(says) = says {
                 assert!(
-                    line.contains("\x1b[1;31m! zellij"),
+                    line.contains(&format!("\x1b[1;31m{says}")),
                     "{reach:?}: red, as a foreground: {line:?}"
                 );
             }
@@ -7286,6 +7318,36 @@ mod tests {
         }
     }
 
+    /// A realistic undetermined reason is longer than any bar. The alarm
+    /// stays in the band at 80 columns whatever its length, and the reason
+    /// is the notice's, whole.
+    #[test]
+    fn a_long_unknown_reason_keeps_the_alarm_and_moves_to_the_notice() {
+        use crate::cli::status_tui::zellij::ZellijReach::Undetermined;
+        let why = "zellij's session index `/Users/someone-with-a-long-name/Library/Caches/\
+                   org.Zellij-Contributors.Zellij/contract_version_1/session_index.sqlite` \
+                   could not be read: database is locked";
+        let reach = Undetermined(why.into());
+        let s = snap(Some(plan_state("foo", reviewer_missing("codex"))), vec![]);
+        let v = visible_untrimmed(&bar(
+            &s,
+            &state_color(&s).sgr(),
+            80,
+            reach.clone(),
+            Default::default(),
+            true,
+        ));
+        assert!(v.contains("! zellij unknown"), "`{v}`");
+        assert!(!v.contains("sqlite"), "the reason is not the bar's: `{v}`");
+        assert_eq!(display_width(&v), 80);
+        let notice = zellij_notice(&reach).expect("an undetermined reach has a notice");
+        assert!(notice.contains(why), "{notice}");
+        assert_eq!(
+            zellij_notice(&crate::cli::status_tui::zellij::ZellijReach::Unreachable),
+            None
+        );
+    }
+
     /// The bar is EXACTLY `cols` wide in every state. The connected
     /// glyph is two cells, so a reservation that counted it as one
     /// rendered `cols + 1` — invisible to suffix and colour checks.
@@ -7293,14 +7355,20 @@ mod tests {
     fn the_bar_is_exactly_cols_wide_in_every_reach_state() {
         use crate::cli::status_tui::zellij::ZellijReach::*;
         let s = snap(Some(plan_state("foo", reviewer_missing("codex"))), vec![]);
-        for reach in [Connected, NotInSession, Unknown, Unreachable] {
+        for reach in [
+            Connected,
+            NotInSession,
+            Unknown,
+            Unreachable,
+            Undetermined("pid 7: denied".into()),
+        ] {
             for in_body in [false, true] {
                 for cols in [4, 8, 12, 20, 40, 80] {
                     let v = visible_untrimmed(&bar(
                         &s,
                         &state_color(&s).sgr(),
                         cols,
-                        reach,
+                        reach.clone(),
                         Default::default(),
                         in_body,
                     ));
@@ -7973,7 +8041,7 @@ mod tests {
                 in_body,
             ));
             assert!(
-                v.contains("! zellij"),
+                v.contains("! no zellij"),
                 "alarm kept (in_body {in_body}): {v}"
             );
         }
@@ -8024,21 +8092,22 @@ mod tests {
             )),
             vec![],
         );
-        // 18 cells of lamp, then the band: a margin, `! zellij` (the
-        // test view is outside a session), a margin, the cloud, a
-        // margin. The cloud is TWO cells -- it asks for the emoji --
+        // 18 cells of lamp, then the band: a margin, the outside-zellij
+        // alarm (the test view is outside a session), a margin, the
+        // cloud, a margin. The cloud is TWO cells -- it asks for the emoji --
         // so the band reserves one more than it did when the icon was
         // a bare codepoint the renderer might draw either way.
         // 29 cells of everything else, plus whatever the cloud costs:
         // written as a sum so the boundary MOVES with the icon. A
         // reserve that stopped counting the icon would fail here
         // rather than quietly giving the bar a cell it does not have.
-        let fits = 29 + display_width(REMOTE_ICON) as u16;
+        let alarm = zellij_alarm(&crate::cli::status_tui::zellij::ZellijReach::NotInSession)
+            .expect("outside zellij is an alarm");
+        let fits = 21 + display_width(&alarm) as u16 + display_width(REMOTE_ICON) as u16;
         let v = bar_body(&render(&s, 1, fits)[0]);
         assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
-        // Pinned from BOTH sides: measured on this tree, 31 fits and
-        // 30 truncates, so the assertion above is at the boundary
-        // rather than comfortably past it.
+        // Pinned from BOTH sides, so the assertion above is at the
+        // boundary rather than comfortably past it.
         let v = bar_body(&render(&s, 1, fits - 1)[0]);
         assert!(v.ends_with('…'), "a cell short must truncate; got `{v}`",);
     }

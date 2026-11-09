@@ -4539,7 +4539,8 @@ impl Typist for Panes {
                 .await
                 .map_err(|e| format!("its pane was not found: {e:#}"))?;
             let screen =
-                crate::cli::open_zellij::dump_pane_screen(&target.session, &target.pane).await;
+                crate::cli::open_zellij::dump_pane_screen(target.session.endpoint(), &target.pane)
+                    .await;
             Ok((target, screen))
         })
     }
@@ -17271,6 +17272,7 @@ mod user_command_tests {
             record.pane = Some(PaneSeen {
                 session: "zs".into(),
                 pane: "terminal_1".into(),
+                server: Some("zs".into()),
             });
             held.save(&record).unwrap();
         }

@@ -11,7 +11,7 @@ dependencies) built for:
   x86_64-unknown-linux-gnu
   aarch64-unknown-linux-gnu
 
-365 packages. Each entry gives the licence the crate declares,
+371 packages. Each entry gives the licence the crate declares,
 the licence clank uses it under (the chosen branch of an OR, every part
 of an AND), and the numbered licence texts below that apply to it, which
 carry the crate's own copyright lines where its licence files do.
@@ -24,109 +24,115 @@ adler2 2.0.1
   source:     https://crates.io/crates/adler2/2.0.1
   declared:   0BSD OR MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
+
+ahash 0.8.12
+  source:     https://crates.io/crates/ahash/0.8.12
+  declared:   MIT OR Apache-2.0
+  used under: MIT
+  texts:      [112] MIT
 
 aho-corasick 1.1.5
   source:     https://crates.io/crates/aho-corasick/1.1.5
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 allocator-api2 0.2.21
   source:     https://crates.io/crates/allocator-api2/0.2.21
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [175] MIT
+  texts:      [179] MIT
 
 anstream 1.0.0
   source:     https://crates.io/crates/anstream/1.0.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 anstyle 1.0.14
   source:     https://crates.io/crates/anstyle/1.0.14
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 anstyle-parse 1.0.0
   source:     https://crates.io/crates/anstyle-parse/1.0.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 anstyle-query 1.1.5
   source:     https://crates.io/crates/anstyle-query/1.1.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 anyhow 1.0.104
   source:     https://crates.io/crates/anyhow/1.0.104
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 arc-swap 1.9.2
   source:     https://crates.io/crates/arc-swap/1.9.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [99] MIT
+  texts:      [102] MIT
 
 arrayvec 0.7.8
   source:     https://crates.io/crates/arrayvec/0.7.8
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [149] MIT
+  texts:      [153] MIT
 
 async-trait 0.1.92
   source:     https://crates.io/crates/async-trait/0.1.92
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 atomic-waker 1.1.2
   source:     https://crates.io/crates/atomic-waker/1.1.2
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [48] MIT, [174] MIT
+  texts:      [48] MIT, [178] MIT
 
 base64 0.21.7
   source:     https://crates.io/crates/base64/0.21.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [183] MIT
+  texts:      [187] MIT
 
 base64 0.22.1
   source:     https://crates.io/crates/base64/0.22.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [183] MIT
+  texts:      [187] MIT
 
 base64 0.23.1
   source:     https://crates.io/crates/base64/0.23.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [197] MIT
+  texts:      [201] MIT
 
 bincode 1.3.3
   source:     https://crates.io/crates/bincode/1.3.3
   declared:   MIT
   used under: MIT
-  texts:      [201] MIT
+  texts:      [205] MIT
 
 bit-set 0.8.0
   source:     https://crates.io/crates/bit-set/0.8.0
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [139] MIT
+  texts:      [143] MIT
 
 bit-vec 0.8.0
   source:     https://crates.io/crates/bit-vec/0.8.0
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [139] MIT
+  texts:      [143] MIT
 
 bitflags 2.13.2
   source:     https://crates.io/crates/bitflags/2.13.2
@@ -144,43 +150,43 @@ block-buffer 0.10.4
   source:     https://crates.io/crates/block-buffer/0.10.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [110] MIT
+  texts:      [114] MIT
 
 block-buffer 0.12.1
   source:     https://crates.io/crates/block-buffer/0.12.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [113] MIT
+  texts:      [117] MIT
 
 bstr 1.13.1
   source:     https://crates.io/crates/bstr/1.13.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [195] MIT
+  texts:      [199] MIT
 
 bytemuck 1.25.2
   source:     https://crates.io/crates/bytemuck/1.25.2
   declared:   Zlib OR Apache-2.0 OR MIT
   used under: MIT
-  texts:      [162] MIT
+  texts:      [166] MIT
 
 byteorder 1.5.0
   source:     https://crates.io/crates/byteorder/1.5.0
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 byteorder-lite 0.1.0
   source:     https://crates.io/crates/byteorder-lite/0.1.0
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 bytes 1.12.1
   source:     https://crates.io/crates/bytes/1.12.1
   declared:   MIT
   used under: MIT
-  texts:      [105] MIT
+  texts:      [108] MIT
 
 capnp 0.20.6
   source:     https://crates.io/crates/capnp/0.20.6
@@ -210,62 +216,62 @@ chacha20 0.10.2
   source:     https://crates.io/crates/chacha20/0.10.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [127] MIT
+  texts:      [131] MIT
 
 clap 4.6.7
   source:     https://crates.io/crates/clap/4.6.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 clap_builder 4.6.7
   source:     https://crates.io/crates/clap_builder/4.6.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 clap_derive 4.6.7
   source:     https://crates.io/crates/clap_derive/4.6.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 clap_lex 1.1.1
   source:     https://crates.io/crates/clap_lex/1.1.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 cloudflare-quick-tunnel 0.3.1
   source:     https://crates.io/crates/cloudflare-quick-tunnel/0.3.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [164] MIT
+  texts:      [168] MIT
   notice:     THIRD_PARTY_NOTICES.md (under Notices below)
 
 clru 0.6.3
   source:     https://crates.io/crates/clru/0.6.3
   declared:   MIT
   used under: MIT
-  texts:      [130] MIT
+  texts:      [134] MIT
 
 color_quant 1.1.0
   source:     https://crates.io/crates/color_quant/1.1.0
   declared:   MIT
   used under: MIT
-  texts:      [193] MIT
+  texts:      [197] MIT
 
 colorchoice 1.0.5
   source:     https://crates.io/crates/colorchoice/1.0.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 const-oid 0.10.2
   source:     https://crates.io/crates/const-oid/0.10.2
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [132] MIT
+  texts:      [136] MIT
 
 constant_time_eq 0.4.2
   source:     https://crates.io/crates/constant_time_eq/0.4.2
@@ -289,115 +295,115 @@ core_detect 1.0.0
   source:     https://crates.io/crates/core_detect/1.0.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [103] MIT
+  texts:      [106] MIT
 
 cpufeatures 0.2.17
   source:     https://crates.io/crates/cpufeatures/0.2.17
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [131] MIT
+  texts:      [135] MIT
 
 cpufeatures 0.3.1
   source:     https://crates.io/crates/cpufeatures/0.3.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [132] MIT
+  texts:      [136] MIT
 
 crc32fast 1.5.2
   source:     https://crates.io/crates/crc32fast/1.5.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [160] MIT
+  texts:      [164] MIT
 
 crossbeam-channel 0.5.17
   source:     https://crates.io/crates/crossbeam-channel/0.5.17
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [196] MIT
+  texts:      [200] MIT
 
 crossbeam-deque 0.8.8
   source:     https://crates.io/crates/crossbeam-deque/0.8.8
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [196] MIT
+  texts:      [200] MIT
 
 crossbeam-epoch 0.9.21
   source:     https://crates.io/crates/crossbeam-epoch/0.9.21
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [196] MIT
+  texts:      [200] MIT
 
 crossbeam-utils 0.8.23
   source:     https://crates.io/crates/crossbeam-utils/0.8.23
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [196] MIT
+  texts:      [200] MIT
 
 crypto-common 0.1.7
   source:     https://crates.io/crates/crypto-common/0.1.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [133] MIT
+  texts:      [137] MIT
 
 crypto-common 0.2.2
   source:     https://crates.io/crates/crypto-common/0.2.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [134] MIT
+  texts:      [138] MIT
 
 darling 0.23.0
   source:     https://crates.io/crates/darling/0.23.0
   declared:   MIT
   used under: MIT
-  texts:      [157] MIT
+  texts:      [161] MIT
 
 darling_core 0.23.0
   source:     https://crates.io/crates/darling_core/0.23.0
   declared:   MIT
   used under: MIT
-  texts:      [157] MIT
+  texts:      [161] MIT
 
 darling_macro 0.23.0
   source:     https://crates.io/crates/darling_macro/0.23.0
   declared:   MIT
   used under: MIT
-  texts:      [157] MIT
+  texts:      [161] MIT
 
 dashmap 6.2.1
   source:     https://crates.io/crates/dashmap/6.2.1
   declared:   MIT
   used under: MIT
-  texts:      [161] MIT
+  texts:      [165] MIT
 
 data-encoding 2.11.1
   source:     https://crates.io/crates/data-encoding/2.11.1
   declared:   MIT
   used under: MIT
-  texts:      [191] MIT
+  texts:      [195] MIT
 
 deranged 0.5.8
   source:     https://crates.io/crates/deranged/0.5.8
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [141] MIT
+  texts:      [145] MIT
 
 digest 0.10.7
   source:     https://crates.io/crates/digest/0.10.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [94] MIT
+  texts:      [97] MIT
 
 digest 0.11.3
   source:     https://crates.io/crates/digest/0.11.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [104] MIT
+  texts:      [107] MIT
 
 displaydoc 0.2.7
   source:     https://crates.io/crates/displaydoc/0.2.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 dunce 1.0.5
   source:     https://crates.io/crates/dunce/1.0.5
@@ -409,37 +415,37 @@ either 1.18.0
   source:     https://crates.io/crates/either/1.18.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [66] MIT
+  texts:      [67] MIT
 
 encoding_rs 0.8.41
   source:     https://crates.io/crates/encoding_rs/0.8.41
   declared:   (Apache-2.0 OR MIT) AND BSD-3-Clause
   used under: BSD-3-Clause AND MIT
-  texts:      [10] BSD-3-Clause, [12] BSD-3-Clause, [155] MIT
+  texts:      [10] BSD-3-Clause, [12] BSD-3-Clause, [159] MIT
 
 endian-type 0.1.2
   source:     https://crates.io/crates/endian-type/0.1.2
   declared:   MIT
   used under: MIT
-  texts:      [182] MIT
+  texts:      [186] MIT
 
 enum-as-inner 0.6.1
   source:     https://crates.io/crates/enum-as-inner/0.6.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [74] MIT
+  texts:      [76] MIT
 
 env_home 0.1.0
   source:     https://crates.io/crates/env_home/0.1.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 equivalent 1.0.2
   source:     https://crates.io/crates/equivalent/1.0.2
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [89] MIT
+  texts:      [92] MIT
 
 errno 0.3.14
   source:     https://crates.io/crates/errno/0.3.14
@@ -447,35 +453,47 @@ errno 0.3.14
   used under: MIT
   texts:      [57] MIT
 
+fallible-iterator 0.3.0
+  source:     https://crates.io/crates/fallible-iterator/0.3.0
+  declared:   MIT OR Apache-2.0
+  used under: MIT
+  texts:      [74] MIT
+
+fallible-streaming-iterator 0.1.9
+  source:     https://crates.io/crates/fallible-streaming-iterator/0.1.9
+  declared:   MIT OR Apache-2.0
+  used under: MIT
+  texts:      [88] MIT
+
 fancy-regex 0.16.2
   source:     https://crates.io/crates/fancy-regex/0.16.2
   declared:   MIT
   used under: MIT
-  texts:      [179] MIT
+  texts:      [183] MIT
 
 faster-hex 0.10.0
   source:     https://crates.io/crates/faster-hex/0.10.0
   declared:   MIT
   used under: MIT
-  texts:      [159] MIT
+  texts:      [163] MIT
 
 fastrand 2.5.0
   source:     https://crates.io/crates/fastrand/2.5.0
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 fdeflate 0.3.7
   source:     https://crates.io/crates/fdeflate/0.3.7
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [170] MIT
+  texts:      [174] MIT
 
 file-id 0.2.3
   source:     https://crates.io/crates/file-id/0.2.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [138] MIT
+  texts:      [142] MIT
 
 filetime 0.2.29
   source:     https://crates.io/crates/filetime/0.2.29
@@ -487,19 +505,19 @@ flate2 1.1.10
   source:     https://crates.io/crates/flate2/1.1.10
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [63] MIT
+  texts:      [64] MIT
 
 fnv 1.0.7
   source:     https://crates.io/crates/fnv/1.0.7
   declared:   Apache-2.0  OR  MIT
   used under: MIT
-  texts:      [95] MIT
+  texts:      [98] MIT
 
 foldhash 0.2.0
   source:     https://crates.io/crates/foldhash/0.2.0
   declared:   Zlib
   used under: Zlib
-  texts:      [207] Zlib
+  texts:      [212] Zlib
 
 form_urlencoded 1.2.2
   source:     https://crates.io/crates/form_urlencoded/1.2.2
@@ -511,217 +529,217 @@ fsevent-sys 4.1.0
   source:     https://crates.io/crates/fsevent-sys/4.1.0
   declared:   MIT
   used under: MIT
-  texts:      [188] MIT
+  texts:      [192] MIT
 
 futures 0.3.34
   source:     https://crates.io/crates/futures/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-channel 0.3.34
   source:     https://crates.io/crates/futures-channel/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-core 0.3.34
   source:     https://crates.io/crates/futures-core/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-executor 0.3.34
   source:     https://crates.io/crates/futures-executor/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-io 0.3.34
   source:     https://crates.io/crates/futures-io/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-macro 0.3.34
   source:     https://crates.io/crates/futures-macro/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-sink 0.3.34
   source:     https://crates.io/crates/futures-sink/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-task 0.3.34
   source:     https://crates.io/crates/futures-task/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 futures-util 0.3.34
   source:     https://crates.io/crates/futures-util/0.3.34
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [79] MIT
+  texts:      [81] MIT
 
 generic-array 0.14.7
   source:     https://crates.io/crates/generic-array/0.14.7
   declared:   MIT
   used under: MIT
-  texts:      [202] MIT
+  texts:      [206] MIT
 
 getrandom 0.2.17
   source:     https://crates.io/crates/getrandom/0.2.17
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [112] MIT
+  texts:      [116] MIT
 
 getrandom 0.3.4
   source:     https://crates.io/crates/getrandom/0.3.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [114] MIT
+  texts:      [118] MIT
 
 getrandom 0.4.3
   source:     https://crates.io/crates/getrandom/0.4.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [117] MIT
+  texts:      [121] MIT
 
 gif 0.14.2
   source:     https://crates.io/crates/gif/0.14.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [190] MIT
+  texts:      [194] MIT
 
 gix 0.84.0
   source:     https://crates.io/crates/gix/0.84.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-actor 0.41.2
   source:     https://crates.io/crates/gix-actor/0.41.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-attributes 0.33.2
   source:     https://crates.io/crates/gix-attributes/0.33.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-bitmap 0.3.3
   source:     https://crates.io/crates/gix-bitmap/0.3.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-chunk 0.7.3
   source:     https://crates.io/crates/gix-chunk/0.7.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-command 0.9.2
   source:     https://crates.io/crates/gix-command/0.9.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-commitgraph 0.37.1
   source:     https://crates.io/crates/gix-commitgraph/0.37.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-config 0.57.0
   source:     https://crates.io/crates/gix-config/0.57.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-config-value 0.18.1
   source:     https://crates.io/crates/gix-config-value/0.18.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-date 0.15.6
   source:     https://crates.io/crates/gix-date/0.15.6
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-diff 0.64.0
   source:     https://crates.io/crates/gix-diff/0.64.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-dir 0.26.0
   source:     https://crates.io/crates/gix-dir/0.26.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-discover 0.52.0
   source:     https://crates.io/crates/gix-discover/0.52.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-error 0.2.5
   source:     https://crates.io/crates/gix-error/0.2.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-features 0.48.1
   source:     https://crates.io/crates/gix-features/0.48.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-filter 0.31.0
   source:     https://crates.io/crates/gix-filter/0.31.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-fs 0.21.2
   source:     https://crates.io/crates/gix-fs/0.21.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-glob 0.26.1
   source:     https://crates.io/crates/gix-glob/0.26.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-hash 0.25.1
   source:     https://crates.io/crates/gix-hash/0.25.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-hashtable 0.15.2
   source:     https://crates.io/crates/gix-hashtable/0.15.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-ignore 0.21.1
   source:     https://crates.io/crates/gix-ignore/0.21.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-imara-diff 0.2.5
   source:     https://crates.io/crates/gix-imara-diff/0.2.5
@@ -733,271 +751,277 @@ gix-index 0.52.0
   source:     https://crates.io/crates/gix-index/0.52.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-lock 23.0.1
   source:     https://crates.io/crates/gix-lock/23.0.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-merge 0.17.0
   source:     https://crates.io/crates/gix-merge/0.17.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-object 0.61.0
   source:     https://crates.io/crates/gix-object/0.61.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-odb 0.81.0
   source:     https://crates.io/crates/gix-odb/0.81.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-pack 0.71.0
   source:     https://crates.io/crates/gix-pack/0.71.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-packetline 0.21.5
   source:     https://crates.io/crates/gix-packetline/0.21.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-path 0.12.6
   source:     https://crates.io/crates/gix-path/0.12.6
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-pathspec 0.18.1
   source:     https://crates.io/crates/gix-pathspec/0.18.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-protocol 0.62.0
   source:     https://crates.io/crates/gix-protocol/0.62.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-quote 0.7.2
   source:     https://crates.io/crates/gix-quote/0.7.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-ref 0.64.0
   source:     https://crates.io/crates/gix-ref/0.64.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-refspec 0.42.0
   source:     https://crates.io/crates/gix-refspec/0.42.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-revision 0.46.0
   source:     https://crates.io/crates/gix-revision/0.46.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-revwalk 0.32.0
   source:     https://crates.io/crates/gix-revwalk/0.32.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-sec 0.14.2
   source:     https://crates.io/crates/gix-sec/0.14.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-shallow 0.12.1
   source:     https://crates.io/crates/gix-shallow/0.12.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-status 0.31.0
   source:     https://crates.io/crates/gix-status/0.31.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-submodule 0.31.0
   source:     https://crates.io/crates/gix-submodule/0.31.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-tempfile 23.0.2
   source:     https://crates.io/crates/gix-tempfile/23.0.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-trace 0.1.21
   source:     https://crates.io/crates/gix-trace/0.1.21
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-transport 0.57.2
   source:     https://crates.io/crates/gix-transport/0.57.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-traverse 0.58.0
   source:     https://crates.io/crates/gix-traverse/0.58.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-url 0.36.2
   source:     https://crates.io/crates/gix-url/0.36.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-utils 0.3.6
   source:     https://crates.io/crates/gix-utils/0.3.6
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-validate 0.11.4
   source:     https://crates.io/crates/gix-validate/0.11.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 gix-worktree 0.53.0
   source:     https://crates.io/crates/gix-worktree/0.53.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [176] MIT
+  texts:      [180] MIT
 
 globset 0.4.20
   source:     https://crates.io/crates/globset/0.4.20
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 hash32 0.3.1
   source:     https://crates.io/crates/hash32/0.3.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [106] MIT
+  texts:      [109] MIT
 
 hashbrown 0.14.5
   source:     https://crates.io/crates/hashbrown/0.14.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [80] MIT
+  texts:      [82] MIT
 
 hashbrown 0.16.1
   source:     https://crates.io/crates/hashbrown/0.16.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [80] MIT
+  texts:      [82] MIT
 
 hashbrown 0.17.1
   source:     https://crates.io/crates/hashbrown/0.17.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [80] MIT
+  texts:      [82] MIT
+
+hashlink 0.9.1
+  source:     https://crates.io/crates/hashlink/0.9.1
+  declared:   MIT OR Apache-2.0
+  used under: MIT
+  texts:      [207] MIT
 
 heapless 0.8.0
   source:     https://crates.io/crates/heapless/0.8.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [97] MIT
+  texts:      [100] MIT
 
 heck 0.5.0
   source:     https://crates.io/crates/heck/0.5.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 hickory-client 0.24.4
   source:     https://crates.io/crates/hickory-client/0.24.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [71] MIT
+  texts:      [72] MIT
 
 hickory-proto 0.24.4
   source:     https://crates.io/crates/hickory-proto/0.24.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [69] MIT
+  texts:      [70] MIT
 
 hickory-resolver 0.24.4
   source:     https://crates.io/crates/hickory-resolver/0.24.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [69] MIT
+  texts:      [70] MIT
 
 http 1.5.0
   source:     https://crates.io/crates/http/1.5.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [100] MIT
+  texts:      [103] MIT
 
 http-body 1.1.0
   source:     https://crates.io/crates/http-body/1.1.0
   declared:   MIT
   used under: MIT
-  texts:      [126] MIT
+  texts:      [130] MIT
 
 http-body-util 0.1.5
   source:     https://crates.io/crates/http-body-util/0.1.5
   declared:   MIT
   used under: MIT
-  texts:      [126] MIT
+  texts:      [130] MIT
 
 httparse 1.10.1
   source:     https://crates.io/crates/httparse/1.10.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [78] MIT
+  texts:      [80] MIT
 
 httpdate 1.0.3
   source:     https://crates.io/crates/httpdate/1.0.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [84] MIT
+  texts:      [86] MIT
 
 hybrid-array 0.4.15
   source:     https://crates.io/crates/hybrid-array/0.4.15
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [135] MIT
+  texts:      [139] MIT
 
 hyper 1.11.1
   source:     https://crates.io/crates/hyper/1.11.1
   declared:   MIT
   used under: MIT
-  texts:      [64] MIT
+  texts:      [65] MIT
 
 hyper-rustls 0.27.10
   source:     https://crates.io/crates/hyper-rustls/0.27.10
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 hyper-tungstenite 0.30.0
   source:     https://crates.io/crates/hyper-tungstenite/0.30.0
@@ -1009,55 +1033,55 @@ hyper-util 0.1.20
   source:     https://crates.io/crates/hyper-util/0.1.20
   declared:   MIT
   used under: MIT
-  texts:      [140] MIT
+  texts:      [144] MIT
 
 icu_collections 2.3.0
   source:     https://crates.io/crates/icu_collections/2.3.0
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 icu_locale_core 2.3.0
   source:     https://crates.io/crates/icu_locale_core/2.3.0
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 icu_normalizer 2.3.0
   source:     https://crates.io/crates/icu_normalizer/2.3.0
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 icu_normalizer_data 2.3.0
   source:     https://crates.io/crates/icu_normalizer_data/2.3.0
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 icu_properties 2.3.0
   source:     https://crates.io/crates/icu_properties/2.3.0
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 icu_properties_data 2.3.0
   source:     https://crates.io/crates/icu_properties_data/2.3.0
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 icu_provider 2.3.1
   source:     https://crates.io/crates/icu_provider/2.3.1
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 ident_case 1.0.1
   source:     https://crates.io/crates/ident_case/1.0.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [172] MIT
+  texts:      [176] MIT
 
 idna 1.1.0
   source:     https://crates.io/crates/idna/1.1.0
@@ -1069,31 +1093,31 @@ idna_adapter 1.2.2
   source:     https://crates.io/crates/idna_adapter/1.2.2
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [148] MIT
+  texts:      [152] MIT
 
 ignore 0.4.33
   source:     https://crates.io/crates/ignore/0.4.33
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 image 0.25.10
   source:     https://crates.io/crates/image/0.25.10
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [170] MIT
+  texts:      [174] MIT
 
 image-webp 0.2.4
   source:     https://crates.io/crates/image-webp/0.2.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [170] MIT
+  texts:      [174] MIT
 
 indexmap 2.14.2
   source:     https://crates.io/crates/indexmap/2.14.2
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [88] MIT
+  texts:      [91] MIT
 
 inotify 0.11.5
   source:     https://crates.io/crates/inotify/0.11.5
@@ -1111,31 +1135,31 @@ ipnet 2.12.2
   source:     https://crates.io/crates/ipnet/2.12.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [151] MIT
+  texts:      [155] MIT
 
 is_terminal_polyfill 1.70.2
   source:     https://crates.io/crates/is_terminal_polyfill/1.70.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 itoa 1.0.18
   source:     https://crates.io/crates/itoa/1.0.18
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 jiff 0.2.37
   source:     https://crates.io/crates/jiff/0.2.37
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 jiff-core 0.1.1
   source:     https://crates.io/crates/jiff-core/0.1.1
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 kdl 4.7.1
   source:     https://crates.io/crates/kdl/4.7.1
@@ -1147,7 +1171,7 @@ kstring 2.0.5
   source:     https://crates.io/crates/kstring/2.0.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [144] MIT
+  texts:      [148] MIT
 
 lazy_static 1.5.0
   source:     https://crates.io/crates/lazy_static/1.5.0
@@ -1159,31 +1183,37 @@ libc 0.2.189
   source:     https://crates.io/crates/libc/0.2.189
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [147] MIT
+  texts:      [151] MIT
+
+libsqlite3-sys 0.28.0
+  source:     https://crates.io/crates/libsqlite3-sys/0.28.0
+  declared:   MIT
+  used under: MIT
+  texts:      [63] MIT
 
 linked-hash-map 0.5.6
   source:     https://crates.io/crates/linked-hash-map/0.5.6
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 linux-raw-sys 0.12.1
   source:     https://crates.io/crates/linux-raw-sys/0.12.1
   declared:   Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 litemap 0.8.3
   source:     https://crates.io/crates/litemap/0.8.3
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 lock_api 0.4.14
   source:     https://crates.io/crates/lock_api/0.4.14
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [85] MIT
+  texts:      [87] MIT
 
 log 0.4.34
   source:     https://crates.io/crates/log/0.4.34
@@ -1195,37 +1225,37 @@ lru-cache 0.1.2
   source:     https://crates.io/crates/lru-cache/0.1.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 lru-slab 0.1.3
   source:     https://crates.io/crates/lru-slab/0.1.3
   declared:   MIT OR Apache-2.0 OR Zlib
   used under: MIT
-  texts:      [143] MIT
+  texts:      [147] MIT
 
 matchers 0.2.0
   source:     https://crates.io/crates/matchers/0.2.0
   declared:   MIT
   used under: MIT
-  texts:      [121] MIT
+  texts:      [125] MIT
 
 maybe-async 0.2.11
   source:     https://crates.io/crates/maybe-async/0.2.11
   declared:   MIT
   used under: MIT
-  texts:      [128] MIT
+  texts:      [132] MIT
 
 memchr 2.8.3
   source:     https://crates.io/crates/memchr/2.8.3
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 memmap2 0.9.11
   source:     https://crates.io/crates/memmap2/0.9.11
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [129] MIT
+  texts:      [133] MIT
 
 miette 5.10.0
   source:     https://crates.io/crates/miette/5.10.0
@@ -1249,19 +1279,19 @@ minimal-lexical 0.2.1
   source:     https://crates.io/crates/minimal-lexical/0.2.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 miniz_oxide 0.8.9
   source:     https://crates.io/crates/miniz_oxide/0.8.9
   declared:   MIT OR Zlib OR Apache-2.0
   used under: MIT
-  texts:      [168] MIT, [169] MIT
+  texts:      [172] MIT, [173] MIT
 
 miniz_oxide 0.9.1
   source:     https://crates.io/crates/miniz_oxide/0.9.1
   declared:   MIT OR Zlib OR Apache-2.0
   used under: MIT
-  texts:      [168] MIT, [169] MIT
+  texts:      [172] MIT, [173] MIT
 
 mio 1.2.3
   source:     https://crates.io/crates/mio/1.2.3
@@ -1279,25 +1309,25 @@ multiversion 0.9.0
   source:     https://crates.io/crates/multiversion/0.9.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [153] MIT
+  texts:      [157] MIT
 
 multiversion-macros 0.9.0
   source:     https://crates.io/crates/multiversion-macros/0.9.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [153] MIT
+  texts:      [157] MIT
 
 multiversion_no_op 1.0.0
   source:     https://crates.io/crates/multiversion_no_op/1.0.0
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [155] MIT
+  texts:      [159] MIT
 
 nibble_vec 0.1.0
   source:     https://crates.io/crates/nibble_vec/0.1.0
   declared:   MIT
   used under: MIT
-  texts:      [187] MIT
+  texts:      [191] MIT
 
 nom 7.1.3
   source:     https://crates.io/crates/nom/7.1.3
@@ -1309,7 +1339,7 @@ nonempty 0.12.0
   source:     https://crates.io/crates/nonempty/0.12.0
   declared:   MIT
   used under: MIT
-  texts:      [118] MIT
+  texts:      [122] MIT
 
 notify 8.2.0
   source:     https://crates.io/crates/notify/8.2.0
@@ -1321,25 +1351,25 @@ notify-debouncer-full 0.6.0
   source:     https://crates.io/crates/notify-debouncer-full/0.6.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [138] MIT
+  texts:      [142] MIT
 
 notify-types 2.1.0
   source:     https://crates.io/crates/notify-types/2.1.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [138] MIT
+  texts:      [142] MIT
 
 nu-ansi-term 0.50.3
   source:     https://crates.io/crates/nu-ansi-term/0.50.3
   declared:   MIT
   used under: MIT
-  texts:      [200] MIT
+  texts:      [204] MIT
 
 num-conv 0.2.2
   source:     https://crates.io/crates/num-conv/0.2.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [145] MIT
+  texts:      [149] MIT
 
 num-traits 0.2.19
   source:     https://crates.io/crates/num-traits/0.2.19
@@ -1351,7 +1381,7 @@ once_cell 1.21.4
   source:     https://crates.io/crates/once_cell/1.21.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 openssl-probe 0.1.6
   source:     https://crates.io/crates/openssl-probe/0.1.6
@@ -1363,19 +1393,19 @@ parking_lot 0.12.5
   source:     https://crates.io/crates/parking_lot/0.12.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [85] MIT
+  texts:      [87] MIT
 
 parking_lot_core 0.9.12
   source:     https://crates.io/crates/parking_lot_core/0.9.12
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [85] MIT
+  texts:      [87] MIT
 
 pastey 0.2.3
   source:     https://crates.io/crates/pastey/0.2.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 percent-encoding 2.3.2
   source:     https://crates.io/crates/percent-encoding/2.3.2
@@ -1387,61 +1417,61 @@ pin-project-lite 0.2.17
   source:     https://crates.io/crates/pin-project-lite/0.2.17
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 plist 1.10.1
   source:     https://crates.io/crates/plist/1.10.1
   declared:   MIT
   used under: MIT
-  texts:      [67] MIT
+  texts:      [68] MIT
 
 png 0.18.1
   source:     https://crates.io/crates/png/0.18.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [76] MIT
+  texts:      [78] MIT
 
 potential_utf 0.1.6
   source:     https://crates.io/crates/potential_utf/0.1.6
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 powerfmt 0.2.0
   source:     https://crates.io/crates/powerfmt/0.2.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [137] MIT
+  texts:      [141] MIT
 
 ppv-lite86 0.2.21
   source:     https://crates.io/crates/ppv-lite86/0.2.21
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [122] MIT
+  texts:      [126] MIT
 
 proc-macro2 1.0.107
   source:     https://crates.io/crates/proc-macro2/1.0.107
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 prodash 31.0.0
   source:     https://crates.io/crates/prodash/31.0.0
   declared:   MIT
   used under: MIT
-  texts:      [199] MIT
+  texts:      [203] MIT
 
 pulldown-cmark 0.13.4
   source:     https://crates.io/crates/pulldown-cmark/0.13.4
   declared:   MIT
   used under: MIT
-  texts:      [178] MIT
+  texts:      [182] MIT
 
 pulldown-cmark-escape 0.11.0
   source:     https://crates.io/crates/pulldown-cmark-escape/0.11.0
   declared:   MIT
   used under: MIT
-  texts:      [178] MIT
+  texts:      [182] MIT
 
 pxfm 0.1.30
   source:     https://crates.io/crates/pxfm/0.1.30
@@ -1453,79 +1483,79 @@ qrcode 0.14.1
   source:     https://crates.io/crates/qrcode/0.14.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [87] MIT
+  texts:      [90] MIT
 
 quick-error 2.0.1
   source:     https://crates.io/crates/quick-error/2.0.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [72] MIT
+  texts:      [73] MIT
 
 quick-xml 0.42.0
   source:     https://crates.io/crates/quick-xml/0.42.0
   declared:   MIT
   used under: MIT
-  texts:      [192] MIT
+  texts:      [196] MIT
 
 quinn 0.11.12
   source:     https://crates.io/crates/quinn/0.11.12
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [108] MIT
+  texts:      [111] MIT
 
 quinn-proto 0.11.18
   source:     https://crates.io/crates/quinn-proto/0.11.18
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [108] MIT
+  texts:      [111] MIT
 
 quinn-udp 0.5.15
   source:     https://crates.io/crates/quinn-udp/0.5.15
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [108] MIT
+  texts:      [111] MIT
 
 quote 1.0.47
   source:     https://crates.io/crates/quote/1.0.47
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 radix_trie 0.2.1
   source:     https://crates.io/crates/radix_trie/0.2.1
   declared:   MIT
   used under: MIT
-  texts:      [187] MIT
+  texts:      [191] MIT
 
 rand 0.10.3
   source:     https://crates.io/crates/rand/0.10.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [152] MIT
+  texts:      [156] MIT
 
 rand 0.8.8
   source:     https://crates.io/crates/rand/0.8.8
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [152] MIT
+  texts:      [156] MIT
 
 rand_chacha 0.3.1
   source:     https://crates.io/crates/rand_chacha/0.3.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [152] MIT
+  texts:      [156] MIT
 
 rand_core 0.10.1
   source:     https://crates.io/crates/rand_core/0.10.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [115] MIT
+  texts:      [119] MIT
 
 rand_core 0.6.4
   source:     https://crates.io/crates/rand_core/0.6.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [152] MIT
+  texts:      [156] MIT
 
 rand_pcg 0.10.2
   source:     https://crates.io/crates/rand_pcg/0.10.2
@@ -1549,13 +1579,13 @@ reqwest 0.12.28
   source:     https://crates.io/crates/reqwest/0.12.28
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [91] MIT
+  texts:      [94] MIT
 
 resolv-conf 0.7.6
   source:     https://crates.io/crates/resolv-conf/0.7.6
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [77] MIT
+  texts:      [79] MIT
 
 ring 0.17.14
   source:     https://crates.io/crates/ring/0.17.14
@@ -1566,53 +1596,59 @@ ring 0.17.14
               [25] ISC, [28] ISC, [29] ISC, [30] ISC, [31] ISC, [32] ISC,
               [33] ISC, [34] ISC, [35] ISC, [36] ISC, [37] ISC, [40] ISC
 
+rusqlite 0.31.0
+  source:     https://crates.io/crates/rusqlite/0.31.0
+  declared:   MIT
+  used under: MIT
+  texts:      [63] MIT
+
 rustc-hash 2.1.3
   source:     https://crates.io/crates/rustc-hash/2.1.3
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [173] MIT
+  texts:      [177] MIT
 
 rustix 1.1.5
   source:     https://crates.io/crates/rustix/1.1.5
   declared:   Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 rustls 0.21.12
   source:     https://crates.io/crates/rustls/0.21.12
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 rustls 0.23.45
   source:     https://crates.io/crates/rustls/0.23.45
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 rustls-native-certs 0.7.3
   source:     https://crates.io/crates/rustls-native-certs/0.7.3
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 rustls-pemfile 1.0.4
   source:     https://crates.io/crates/rustls-pemfile/1.0.4
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 rustls-pemfile 2.2.0
   source:     https://crates.io/crates/rustls-pemfile/2.2.0
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 rustls-pki-types 1.15.1
   source:     https://crates.io/crates/rustls-pki-types/1.15.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [136] MIT
+  texts:      [140] MIT
 
 rustls-webpki 0.101.7
   source:     https://crates.io/crates/rustls-webpki/0.101.7
@@ -1630,7 +1666,7 @@ rustversion 1.0.23
   source:     https://crates.io/crates/rustversion/1.0.23
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 ryu 1.0.23
   source:     https://crates.io/crates/ryu/1.0.23
@@ -1642,61 +1678,61 @@ same-file 1.0.6
   source:     https://crates.io/crates/same-file/1.0.6
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [194] MIT
+  texts:      [198] MIT
 
 scopeguard 1.2.0
   source:     https://crates.io/crates/scopeguard/1.2.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [90] MIT
+  texts:      [93] MIT
 
 sct 0.7.1
   source:     https://crates.io/crates/sct/0.7.1
   declared:   Apache-2.0 OR ISC OR MIT
   used under: MIT
-  texts:      [83] MIT
+  texts:      [85] MIT
 
 security-framework 2.11.1
   source:     https://crates.io/crates/security-framework/2.11.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [189] MIT
+  texts:      [193] MIT
 
 security-framework-sys 2.17.0
   source:     https://crates.io/crates/security-framework-sys/2.17.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [189] MIT
+  texts:      [193] MIT
 
 serde 1.0.229
   source:     https://crates.io/crates/serde/1.0.229
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 serde_core 1.0.229
   source:     https://crates.io/crates/serde_core/1.0.229
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 serde_derive 1.0.229
   source:     https://crates.io/crates/serde_derive/1.0.229
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 serde_json 1.0.151
   source:     https://crates.io/crates/serde_json/1.0.151
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 serde_urlencoded 0.7.1
   source:     https://crates.io/crates/serde_urlencoded/0.7.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [81] MIT
+  texts:      [83] MIT
 
 sha1 0.10.7
   source:     https://crates.io/crates/sha1/0.10.7
@@ -1708,61 +1744,61 @@ sha1 0.11.0
   source:     https://crates.io/crates/sha1/0.11.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [92] MIT
+  texts:      [95] MIT
 
 sha1-checked 0.10.0
   source:     https://crates.io/crates/sha1-checked/0.10.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [142] MIT
+  texts:      [146] MIT
 
 sharded-slab 0.1.7
   source:     https://crates.io/crates/sharded-slab/0.1.7
   declared:   MIT
   used under: MIT
-  texts:      [120] MIT
+  texts:      [124] MIT
 
 shell-words 1.1.1
   source:     https://crates.io/crates/shell-words/1.1.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [86] MIT
+  texts:      [89] MIT
 
 signal-hook 0.3.18
   source:     https://crates.io/crates/signal-hook/0.3.18
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [102] MIT
+  texts:      [105] MIT
 
 signal-hook-registry 1.4.8
   source:     https://crates.io/crates/signal-hook-registry/1.4.8
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [102] MIT
+  texts:      [105] MIT
 
 simd-adler32 0.3.10
   source:     https://crates.io/crates/simd-adler32/0.3.10
   declared:   MIT
   used under: MIT
-  texts:      [166] MIT
+  texts:      [170] MIT
 
 simdutf8 0.1.5
   source:     https://crates.io/crates/simdutf8/0.1.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [171] MIT
+  texts:      [175] MIT
 
 slab 0.4.12
   source:     https://crates.io/crates/slab/0.4.12
   declared:   MIT
   used under: MIT
-  texts:      [119] MIT
+  texts:      [123] MIT
 
 smallvec 1.16.1
   source:     https://crates.io/crates/smallvec/1.16.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [107] MIT
+  texts:      [110] MIT
 
 socket2 0.6.5
   source:     https://crates.io/crates/socket2/0.6.5
@@ -1774,19 +1810,19 @@ stable_deref_trait 1.2.1
   source:     https://crates.io/crates/stable_deref_trait/1.2.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [98] MIT
+  texts:      [101] MIT
 
 static_assertions 1.1.0
   source:     https://crates.io/crates/static_assertions/1.1.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [156] MIT
+  texts:      [160] MIT
 
 strsim 0.11.1
   source:     https://crates.io/crates/strsim/0.11.1
   declared:   MIT
   used under: MIT
-  texts:      [186] MIT
+  texts:      [190] MIT
 
 subtle 2.6.1
   source:     https://crates.io/crates/subtle/2.6.1
@@ -1798,13 +1834,13 @@ syn 2.0.119
   source:     https://crates.io/crates/syn/2.0.119
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 syn 3.0.6
   source:     https://crates.io/crates/syn/3.0.6
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 sync_wrapper 1.0.2
   source:     https://crates.io/crates/sync_wrapper/1.0.2
@@ -1816,200 +1852,200 @@ synstructure 0.14.0
   source:     https://crates.io/crates/synstructure/0.14.0
   declared:   MIT
   used under: MIT
-  texts:      [150] MIT
+  texts:      [154] MIT
 
 syntect 5.3.0
   source:     https://crates.io/crates/syntect/5.3.0
   declared:   MIT
   used under: MIT
-  texts:      [158] MIT
+  texts:      [162] MIT
 
 tempfile 3.27.0
   source:     https://crates.io/crates/tempfile/3.27.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [68] MIT
+  texts:      [69] MIT
 
 terminal_size 0.4.4
   source:     https://crates.io/crates/terminal_size/0.4.4
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [73] MIT
+  texts:      [75] MIT
 
 thiserror 1.0.69
   source:     https://crates.io/crates/thiserror/1.0.69
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 thiserror 2.0.20
   source:     https://crates.io/crates/thiserror/2.0.20
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 thiserror-impl 1.0.69
   source:     https://crates.io/crates/thiserror-impl/1.0.69
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 thiserror-impl 2.0.20
   source:     https://crates.io/crates/thiserror-impl/2.0.20
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 thread_local 1.1.10
   source:     https://crates.io/crates/thread_local/1.1.10
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [85] MIT
+  texts:      [87] MIT
 
 time 0.3.55
   source:     https://crates.io/crates/time/0.3.55
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [146] MIT
+  texts:      [150] MIT
 
 time-core 0.1.9
   source:     https://crates.io/crates/time-core/0.1.9
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [146] MIT
+  texts:      [150] MIT
 
 tinystr 0.8.4
   source:     https://crates.io/crates/tinystr/0.8.4
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 tinyvec 1.13.3
   source:     https://crates.io/crates/tinyvec/1.13.3
   declared:   Zlib OR Apache-2.0 OR MIT
   used under: MIT
-  texts:      [177] MIT
+  texts:      [181] MIT
 
 tokio 1.53.1
   source:     https://crates.io/crates/tokio/1.53.1
   declared:   MIT
   used under: MIT
-  texts:      [165] MIT
+  texts:      [169] MIT
 
 tokio-macros 2.7.2
   source:     https://crates.io/crates/tokio-macros/2.7.2
   declared:   MIT
   used under: MIT
-  texts:      [163] MIT
+  texts:      [167] MIT
 
 tokio-rustls 0.24.1
   source:     https://crates.io/crates/tokio-rustls/0.24.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [101] MIT
+  texts:      [104] MIT
 
 tokio-rustls 0.26.5
   source:     https://crates.io/crates/tokio-rustls/0.26.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [101] MIT
+  texts:      [104] MIT
 
 tokio-tungstenite 0.30.0
   source:     https://crates.io/crates/tokio-tungstenite/0.30.0
   declared:   MIT
   used under: MIT
-  texts:      [96] MIT
+  texts:      [99] MIT
 
 tokio-util 0.7.19
   source:     https://crates.io/crates/tokio-util/0.7.19
   declared:   MIT
   used under: MIT
-  texts:      [165] MIT
+  texts:      [169] MIT
 
 tower 0.5.3
   source:     https://crates.io/crates/tower/0.5.3
   declared:   MIT
   used under: MIT
-  texts:      [124] MIT
+  texts:      [128] MIT
 
 tower-http 0.6.11
   source:     https://crates.io/crates/tower-http/0.6.11
   declared:   MIT
   used under: MIT
-  texts:      [125] MIT
+  texts:      [129] MIT
 
 tower-layer 0.3.3
   source:     https://crates.io/crates/tower-layer/0.3.3
   declared:   MIT
   used under: MIT
-  texts:      [124] MIT
+  texts:      [128] MIT
 
 tower-service 0.3.3
   source:     https://crates.io/crates/tower-service/0.3.3
   declared:   MIT
   used under: MIT
-  texts:      [124] MIT
+  texts:      [128] MIT
 
 tracing 0.1.44
   source:     https://crates.io/crates/tracing/0.1.44
   declared:   MIT
   used under: MIT
-  texts:      [123] MIT
+  texts:      [127] MIT
 
 tracing-attributes 0.1.31
   source:     https://crates.io/crates/tracing-attributes/0.1.31
   declared:   MIT
   used under: MIT
-  texts:      [123] MIT
+  texts:      [127] MIT
 
 tracing-core 0.1.36
   source:     https://crates.io/crates/tracing-core/0.1.36
   declared:   MIT
   used under: MIT
-  texts:      [123] MIT, [180] MIT
+  texts:      [127] MIT, [184] MIT
 
 tracing-log 0.2.0
   source:     https://crates.io/crates/tracing-log/0.2.0
   declared:   MIT
   used under: MIT
-  texts:      [123] MIT
+  texts:      [127] MIT
 
 tracing-subscriber 0.3.23
   source:     https://crates.io/crates/tracing-subscriber/0.3.23
   declared:   MIT
   used under: MIT
-  texts:      [123] MIT
+  texts:      [127] MIT
 
 try-lock 0.2.5
   source:     https://crates.io/crates/try-lock/0.2.5
   declared:   MIT
   used under: MIT
-  texts:      [111] MIT
+  texts:      [115] MIT
 
 tungstenite 0.30.0
   source:     https://crates.io/crates/tungstenite/0.30.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [93] MIT
+  texts:      [96] MIT
 
 typenum 1.20.1
   source:     https://crates.io/crates/typenum/1.20.1
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [181] MIT
+  texts:      [185] MIT
 
 uluru 3.1.0
   source:     https://crates.io/crates/uluru/3.1.0
   declared:   MPL-2.0
   used under: MPL-2.0
-  texts:      [203] MPL-2.0
+  texts:      [208] MPL-2.0
   Source Code Form (MPL-2.0 section 3.2): https://crates.io/api/v1/crates/uluru/3.1.0/download
 
 unicase 2.9.0
   source:     https://crates.io/crates/unicase/2.9.0
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [65] MIT
+  texts:      [66] MIT
 
 unicode-bom 2.0.3
   source:     https://crates.io/crates/unicode-bom/2.0.3
@@ -2021,31 +2057,31 @@ unicode-ident 1.0.26
   source:     https://crates.io/crates/unicode-ident/1.0.26
   declared:   (MIT OR Apache-2.0) AND Unicode-3.0
   used under: MIT AND Unicode-3.0
-  texts:      [174] MIT, [204] Unicode-3.0
+  texts:      [178] MIT, [209] Unicode-3.0
 
 unicode-normalization 0.1.25
   source:     https://crates.io/crates/unicode-normalization/0.1.25
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 unicode-segmentation 1.13.3
   source:     https://crates.io/crates/unicode-segmentation/1.13.3
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 unicode-width 0.1.14
   source:     https://crates.io/crates/unicode-width/0.1.14
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 unicode-width 0.2.2
   source:     https://crates.io/crates/unicode-width/0.2.2
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [70] MIT
+  texts:      [71] MIT
 
 untrusted 0.9.0
   source:     https://crates.io/crates/untrusted/0.9.0
@@ -2063,13 +2099,13 @@ utf8_iter 1.0.4
   source:     https://crates.io/crates/utf8_iter/1.0.4
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [155] MIT
+  texts:      [159] MIT
 
 utf8parse 0.2.2
   source:     https://crates.io/crates/utf8parse/0.2.2
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [82] MIT
+  texts:      [84] MIT
 
 uuid 1.26.1
   source:     https://crates.io/crates/uuid/1.26.1
@@ -2081,13 +2117,13 @@ walkdir 2.5.0
   source:     https://crates.io/crates/walkdir/2.5.0
   declared:   Unlicense OR MIT
   used under: MIT
-  texts:      [184] MIT
+  texts:      [188] MIT
 
 want 0.3.1
   source:     https://crates.io/crates/want/0.3.1
   declared:   MIT
   used under: MIT
-  texts:      [109] MIT
+  texts:      [113] MIT
 
 webpki-roots 0.26.11
   source:     https://crates.io/crates/webpki-roots/0.26.11
@@ -2105,13 +2141,13 @@ weezl 0.1.12
   source:     https://crates.io/crates/weezl/0.1.12
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [198] MIT
+  texts:      [202] MIT
 
 which 7.0.3
   source:     https://crates.io/crates/which/7.0.3
   declared:   MIT
   used under: MIT
-  texts:      [75] MIT
+  texts:      [77] MIT
 
 wincode 0.5.5
   source:     https://crates.io/crates/wincode/0.5.5
@@ -2129,91 +2165,91 @@ writeable 0.6.4
   source:     https://crates.io/crates/writeable/0.6.4
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 yaml-rust 0.4.5
   source:     https://crates.io/crates/yaml-rust/0.4.5
   declared:   MIT OR Apache-2.0
   used under: MIT
-  texts:      [185] MIT
+  texts:      [189] MIT
 
 yoke 0.8.3
   source:     https://crates.io/crates/yoke/0.8.3
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 yoke-derive 0.8.3
   source:     https://crates.io/crates/yoke-derive/0.8.3
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 zerocopy 0.8.57
   source:     https://crates.io/crates/zerocopy/0.8.57
   declared:   BSD-2-Clause OR Apache-2.0 OR MIT
   used under: MIT
-  texts:      [154] MIT
+  texts:      [158] MIT
 
 zerofrom 0.1.8
   source:     https://crates.io/crates/zerofrom/0.1.8
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 zerofrom-derive 0.1.8
   source:     https://crates.io/crates/zerofrom-derive/0.1.8
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 zeroize 1.9.0
   source:     https://crates.io/crates/zeroize/1.9.0
   declared:   Apache-2.0 OR MIT
   used under: MIT
-  texts:      [116] MIT
+  texts:      [120] MIT
 
 zerotrie 0.2.5
   source:     https://crates.io/crates/zerotrie/0.2.5
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 zerovec 0.11.8
   source:     https://crates.io/crates/zerovec/0.11.8
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 zerovec-derive 0.11.6
   source:     https://crates.io/crates/zerovec-derive/0.11.6
   declared:   Unicode-3.0
   used under: Unicode-3.0
-  texts:      [205] Unicode-3.0
+  texts:      [210] Unicode-3.0
 
 zlib-rs 0.6.8
   source:     https://crates.io/crates/zlib-rs/0.6.8
   declared:   Zlib
   used under: Zlib
-  texts:      [206] Zlib
+  texts:      [211] Zlib
 
 zmij 1.0.23
   source:     https://crates.io/crates/zmij/1.0.23
   declared:   MIT
   used under: MIT
-  texts:      [174] MIT
+  texts:      [178] MIT
 
 zune-core 0.5.3
   source:     https://crates.io/crates/zune-core/0.5.3
   declared:   MIT OR Apache-2.0 OR Zlib
   used under: MIT
-  texts:      [167] MIT
+  texts:      [171] MIT
 
 zune-jpeg 0.5.15
   source:     https://crates.io/crates/zune-jpeg/0.5.15
   declared:   MIT OR Apache-2.0 OR Zlib
   used under: MIT
-  texts:      [167] MIT
+  texts:      [171] MIT
 
 
 Licence texts
@@ -5722,6 +5758,31 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
 
 [63] MIT: MIT License
+Used by: libsqlite3-sys 0.28.0, rusqlite 0.31.0
+
+Copyright (c) 2014-2021 The rusqlite developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+------------------------------------------------------------------------------
+
+[64] MIT: MIT License
 Used by: flate2 1.1.10
 
 Copyright (c) 2014-2026 Alex Crichton
@@ -5752,7 +5813,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[64] MIT: MIT License
+[65] MIT: MIT License
 Used by: hyper 1.11.1
 
 Copyright (c) 2014-2026 Sean McArthur
@@ -5777,7 +5838,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[65] MIT: MIT License
+[66] MIT: MIT License
 Used by: unicase 2.9.0
 
 Copyright (c) 2014-2026 Sean McArthur
@@ -5802,7 +5863,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[66] MIT: MIT License
+[67] MIT: MIT License
 Used by: either 1.18.0
 
 Copyright (c) 2015
@@ -5833,7 +5894,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[67] MIT: MIT License
+[68] MIT: MIT License
 Used by: plist 1.10.1
 
 Copyright (c) 2015 Edward Barnard
@@ -5858,7 +5919,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[68] MIT: MIT License
+[69] MIT: MIT License
 Used by: tempfile 3.27.0
 
 Copyright (c) 2015 Steven Allen
@@ -5889,7 +5950,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[69] MIT: MIT License
+[70] MIT: MIT License
 Used by: hickory-proto 0.24.4, hickory-resolver 0.24.4
 
 Copyright (c) 2015 The Hickory DNS Developers
@@ -5915,7 +5976,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[70] MIT: MIT License
+[71] MIT: MIT License
 Used by: heck 0.5.0, linked-hash-map 0.5.6, lru-cache 0.1.2,
          unicode-normalization 0.1.25, unicode-segmentation 1.13.3,
          unicode-width 0.1.14, unicode-width 0.2.2
@@ -5948,7 +6009,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[71] MIT: MIT License
+[72] MIT: MIT License
 Used by: hickory-client 0.24.4
 
 Copyright (c) 2015 The hickory-dns Developers
@@ -5974,7 +6035,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[72] MIT: MIT License
+[73] MIT: MIT License
 Used by: quick-error 2.0.1
 
 Copyright (c) 2015 The quick-error Developers
@@ -5999,7 +6060,32 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[73] MIT: MIT License
+[74] MIT: MIT License
+Used by: fallible-iterator 0.3.0
+
+Copyright (c) 2015 The rust-openssl-verify Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------------
+
+[75] MIT: MIT License
 Used by: terminal_size 0.4.4
 
 Copyright (c) 2015 The terminal-size Developers
@@ -6024,7 +6110,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[74] MIT: MIT License
+[76] MIT: MIT License
 Used by: enum-as-inner 0.6.1
 
 Copyright (c) 2015 The trust-dns Developers
@@ -6050,7 +6136,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[75] MIT: MIT License
+[77] MIT: MIT License
 Used by: which 7.0.3
 
 Copyright (c) 2015 fangyuanziti
@@ -6075,7 +6161,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[76] MIT: MIT License
+[78] MIT: MIT License
 Used by: png 0.18.1
 
 Copyright (c) 2015 nwin
@@ -6106,7 +6192,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[77] MIT: MIT License
+[79] MIT: MIT License
 Used by: resolv-conf 0.7.6
 
 Copyright (c) 2015-2016 The resolv-conf Developers
@@ -6131,7 +6217,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[78] MIT: MIT License
+[80] MIT: MIT License
 Used by: httparse 1.10.1
 
 Copyright (c) 2015-2025 Sean McArthur
@@ -6156,7 +6242,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[79] MIT: MIT License
+[81] MIT: MIT License
 Used by: futures 0.3.34, futures-channel 0.3.34, futures-core 0.3.34,
          futures-executor 0.3.34, futures-io 0.3.34, futures-macro 0.3.34,
          futures-sink 0.3.34, futures-task 0.3.34, futures-util 0.3.34
@@ -6190,7 +6276,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[80] MIT: MIT License
+[82] MIT: MIT License
 Used by: hashbrown 0.14.5, hashbrown 0.16.1, hashbrown 0.17.1
 
 Copyright (c) 2016 Amanieu d'Antras
@@ -6221,7 +6307,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[81] MIT: MIT License
+[83] MIT: MIT License
 Used by: serde_urlencoded 0.7.1
 
 Copyright (c) 2016 Anthony Ramine
@@ -6252,7 +6338,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[82] MIT: MIT License
+[84] MIT: MIT License
 Used by: utf8parse 0.2.2
 
 Copyright (c) 2016 Joe Wilm
@@ -6283,7 +6369,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[83] MIT: MIT License
+[85] MIT: MIT License
 Used by: hyper-rustls 0.27.10, rustls 0.21.12, rustls 0.23.45,
          rustls-native-certs 0.7.3, rustls-pemfile 1.0.4,
          rustls-pemfile 2.2.0, sct 0.7.1
@@ -6316,7 +6402,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[84] MIT: MIT License
+[86] MIT: MIT License
 Used by: httpdate 1.0.3
 
 Copyright (c) 2016 Pyfisch
@@ -6341,7 +6427,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[85] MIT: MIT License
+[87] MIT: MIT License
 Used by: lock_api 0.4.14, parking_lot 0.12.5, parking_lot_core 0.9.12,
          thread_local 1.1.10
 
@@ -6373,7 +6459,32 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[86] MIT: MIT License
+[88] MIT: MIT License
+Used by: fallible-streaming-iterator 0.1.9
+
+Copyright (c) 2016 The fallible-streaming-iterator Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------------
+
+[89] MIT: MIT License
 Used by: shell-words 1.1.1
 
 Copyright (c) 2016 Tomasz Miąsko
@@ -6404,7 +6515,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[87] MIT: MIT License
+[90] MIT: MIT License
 Used by: qrcode 0.14.1
 
 Copyright (c) 2016 kennytm
@@ -6428,7 +6539,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[88] MIT: MIT License
+[91] MIT: MIT License
 Used by: indexmap 2.14.2
 
 Copyright (c) 2016--2017
@@ -6459,7 +6570,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[89] MIT: MIT License
+[92] MIT: MIT License
 Used by: equivalent 1.0.2
 
 Copyright (c) 2016--2023
@@ -6490,7 +6601,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[90] MIT: MIT License
+[93] MIT: MIT License
 Used by: scopeguard 1.2.0
 
 Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers
@@ -6521,7 +6632,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[91] MIT: MIT License
+[94] MIT: MIT License
 Used by: reqwest 0.12.28
 
 Copyright (c) 2016-2025 Sean McArthur
@@ -6546,7 +6657,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[92] MIT: MIT License
+[95] MIT: MIT License
 Used by: sha1 0.11.0
 
 Copyright (c) 2016-2026 The RustCrypto Project Developers
@@ -6580,7 +6691,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[93] MIT: MIT License
+[96] MIT: MIT License
 Used by: tungstenite 0.30.0
 
 Copyright (c) 2017 Alexey Galakhov
@@ -6606,7 +6717,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[94] MIT: MIT License
+[97] MIT: MIT License
 Used by: digest 0.10.7
 
 Copyright (c) 2017 Artyom Pavlov
@@ -6637,7 +6748,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[95] MIT: MIT License
+[98] MIT: MIT License
 Used by: fnv 1.0.7
 
 Copyright (c) 2017 Contributors
@@ -6668,7 +6779,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[96] MIT: MIT License
+[99] MIT: MIT License
 Used by: tokio-tungstenite 0.30.0
 
 Copyright (c) 2017 Daniel Abramov
@@ -6694,7 +6805,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[97] MIT: MIT License
+[100] MIT: MIT License
 Used by: heapless 0.8.0
 
 Copyright (c) 2017 Jorge Aparicio
@@ -6725,7 +6836,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[98] MIT: MIT License
+[101] MIT: MIT License
 Used by: stable_deref_trait 1.2.1
 
 Copyright (c) 2017 Robert Grosse
@@ -6756,7 +6867,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[99] MIT: MIT License
+[102] MIT: MIT License
 Used by: arc-swap 1.9.2
 
 Copyright (c) 2017 arc-swap developers
@@ -6787,7 +6898,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[100] MIT: MIT License
+[103] MIT: MIT License
 Used by: http 1.5.0
 
 Copyright (c) 2017 http-rs authors
@@ -6818,7 +6929,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[101] MIT: MIT License
+[104] MIT: MIT License
 Used by: tokio-rustls 0.24.1, tokio-rustls 0.26.5
 
 Copyright (c) 2017 quininer kel
@@ -6849,7 +6960,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[102] MIT: MIT License
+[105] MIT: MIT License
 Used by: signal-hook 0.3.18, signal-hook-registry 1.4.8
 
 Copyright (c) 2017 tokio-jsonrpc developers
@@ -6880,7 +6991,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[103] MIT: MIT License
+[106] MIT: MIT License
 Used by: core_detect 1.0.0
 
 Copyright (c) 2017-2020 The Rust Project Developers
@@ -6911,7 +7022,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[104] MIT: MIT License
+[107] MIT: MIT License
 Used by: digest 0.11.3
 
 Copyright (c) 2017-2025 RustCrypto Developers
@@ -6943,7 +7054,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[105] MIT: MIT License
+[108] MIT: MIT License
 Used by: bytes 1.12.1
 
 Copyright (c) 2018 Carl Lerche
@@ -6974,7 +7085,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[106] MIT: MIT License
+[109] MIT: MIT License
 Used by: hash32 0.3.1
 
 Copyright (c) 2018 Jorge Aparicio
@@ -7005,7 +7116,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[107] MIT: MIT License
+[110] MIT: MIT License
 Used by: smallvec 1.16.1
 
 Copyright (c) 2018 The Servo Project Developers
@@ -7036,7 +7147,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[108] MIT: MIT License
+[111] MIT: MIT License
 Used by: quinn 0.11.12, quinn-proto 0.11.18, quinn-udp 0.5.15
 
 Copyright (c) 2018 The quinn Developers
@@ -7049,7 +7160,38 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[109] MIT: MIT License
+[112] MIT: MIT License
+Used by: ahash 0.8.12
+
+Copyright (c) 2018 Tom Kaitchuck
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------
+
+[113] MIT: MIT License
 Used by: want 0.3.1
 
 Copyright (c) 2018-2019 Sean McArthur
@@ -7074,7 +7216,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[110] MIT: MIT License
+[114] MIT: MIT License
 Used by: block-buffer 0.10.4
 
 Copyright (c) 2018-2019 The RustCrypto Project Developers
@@ -7105,7 +7247,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[111] MIT: MIT License
+[115] MIT: MIT License
 Used by: try-lock 0.2.5
 
 Copyright (c) 2018-2023 Sean McArthur
@@ -7131,7 +7273,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[112] MIT: MIT License
+[116] MIT: MIT License
 Used by: getrandom 0.2.17
 
 Copyright (c) 2018-2024 The rust-random Project Developers
@@ -7163,7 +7305,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[113] MIT: MIT License
+[117] MIT: MIT License
 Used by: block-buffer 0.12.1
 
 Copyright (c) 2018-2025 The RustCrypto Project Developers
@@ -7194,7 +7336,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[114] MIT: MIT License
+[118] MIT: MIT License
 Used by: getrandom 0.3.4
 
 Copyright (c) 2018-2025 The rust-random Project Developers
@@ -7226,7 +7368,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[115] MIT: MIT License
+[119] MIT: MIT License
 Used by: rand_core 0.10.1
 
 Copyright (c) 2018-2026 The Rand Project Developers
@@ -7257,7 +7399,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[116] MIT: MIT License
+[120] MIT: MIT License
 Used by: zeroize 1.9.0
 
 Copyright (c) 2018-2026 The RustCrypto Project Developers
@@ -7288,7 +7430,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[117] MIT: MIT License
+[121] MIT: MIT License
 Used by: getrandom 0.4.3
 
 Copyright (c) 2018-2026 The rust-random Project Developers
@@ -7320,7 +7462,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[118] MIT: MIT License
+[122] MIT: MIT License
 Used by: nonempty 0.12.0
 
 Copyright (c) 2019 Alexis Sellier
@@ -7345,7 +7487,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[119] MIT: MIT License
+[123] MIT: MIT License
 Used by: slab 0.4.12
 
 Copyright (c) 2019 Carl Lerche
@@ -7376,7 +7518,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[120] MIT: MIT License
+[124] MIT: MIT License
 Used by: sharded-slab 0.1.7
 
 Copyright (c) 2019 Eliza Weisman
@@ -7401,7 +7543,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[121] MIT: MIT License
+[125] MIT: MIT License
 Used by: matchers 0.2.0
 
 Copyright (c) 2019 Eliza Weisman
@@ -7426,7 +7568,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[122] MIT: MIT License
+[126] MIT: MIT License
 Used by: ppv-lite86 0.2.21
 
 Copyright (c) 2019 The CryptoCorrosion Contributors
@@ -7457,7 +7599,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[123] MIT: MIT License
+[127] MIT: MIT License
 Used by: tracing 0.1.44, tracing-attributes 0.1.31, tracing-core 0.1.36,
          tracing-log 0.2.0, tracing-subscriber 0.3.23
 
@@ -7489,7 +7631,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[124] MIT: MIT License
+[128] MIT: MIT License
 Used by: tower 0.5.3, tower-layer 0.3.3, tower-service 0.3.3
 
 Copyright (c) 2019 Tower Contributors
@@ -7520,7 +7662,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[125] MIT: MIT License
+[129] MIT: MIT License
 Used by: tower-http 0.6.11
 
 Copyright (c) 2019-2021 Tower Contributors
@@ -7551,7 +7693,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[126] MIT: MIT License
+[130] MIT: MIT License
 Used by: http-body 1.1.0, http-body-util 0.1.5
 
 Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
@@ -7582,7 +7724,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[127] MIT: MIT License
+[131] MIT: MIT License
 Used by: chacha20 0.10.2
 
 Copyright (c) 2019-2026 The RustCrypto Project Developers
@@ -7613,7 +7755,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[128] MIT: MIT License
+[132] MIT: MIT License
 Used by: maybe-async 0.2.11
 
 Copyright (c) 2020 Guoli Lyu
@@ -7638,7 +7780,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[129] MIT: MIT License
+[133] MIT: MIT License
 Used by: memmap2 0.9.11
 
 Copyright (c) 2020 Yevhenii Reizner
@@ -7670,7 +7812,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[130] MIT: MIT License
+[134] MIT: MIT License
 Used by: clru 0.6.3
 
 Copyright (c) 2020 Élie ROUDNINSKI (marmeladema) <xademax@gmail.com>
@@ -7695,7 +7837,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[131] MIT: MIT License
+[135] MIT: MIT License
 Used by: cpufeatures 0.2.17
 
 Copyright (c) 2020-2025 The RustCrypto Project Developers
@@ -7726,7 +7868,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[132] MIT: MIT License
+[136] MIT: MIT License
 Used by: const-oid 0.10.2, cpufeatures 0.3.1
 
 Copyright (c) 2020-2026 The RustCrypto Project Developers
@@ -7757,7 +7899,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[133] MIT: MIT License
+[137] MIT: MIT License
 Used by: crypto-common 0.1.7
 
 Copyright (c) 2021 RustCrypto Developers
@@ -7788,7 +7930,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[134] MIT: MIT License
+[138] MIT: MIT License
 Used by: crypto-common 0.2.2
 
 Copyright (c) 2021-2026 RustCrypto Developers
@@ -7819,7 +7961,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[135] MIT: MIT License
+[139] MIT: MIT License
 Used by: hybrid-array 0.4.15
 
 Copyright (c) 2022-2026 The RustCrypto Project Developers
@@ -7850,7 +7992,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[136] MIT: MIT License
+[140] MIT: MIT License
 Used by: rustls-pki-types 1.15.1
 
 Copyright (c) 2023 Dirkjan Ochtman <dirkjan@ochtman.nl>
@@ -7881,7 +8023,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[137] MIT: MIT License
+[141] MIT: MIT License
 Used by: powerfmt 0.2.0
 
 Copyright (c) 2023 Jacob Pratt et al.
@@ -7906,7 +8048,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[138] MIT: MIT License
+[142] MIT: MIT License
 Used by: file-id 0.2.3, notify-debouncer-full 0.6.0, notify-types 2.1.0
 
 Copyright (c) 2023 Notify Contributors
@@ -7937,7 +8079,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[139] MIT: MIT License
+[143] MIT: MIT License
 Used by: bit-set 0.8.0, bit-vec 0.8.0
 
 Copyright (c) 2023 The Rust Project Developers
@@ -7968,7 +8110,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[140] MIT: MIT License
+[144] MIT: MIT License
 Used by: hyper-util 0.1.20
 
 Copyright (c) 2023-2025 Sean McArthur
@@ -7993,7 +8135,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[141] MIT: MIT License
+[145] MIT: MIT License
 Used by: deranged 0.5.8
 
 Copyright (c) 2024 Jacob Pratt et al.
@@ -8018,7 +8160,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[142] MIT: MIT License
+[146] MIT: MIT License
 Used by: sha1-checked 0.10.0
 
 Copyright (c) 2024 The RustCrypto Project Developers
@@ -8049,7 +8191,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[143] MIT: MIT License
+[147] MIT: MIT License
 Used by: lru-slab 0.1.3
 
 Copyright (c) 2024 The lru-slab Developers
@@ -8062,7 +8204,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[144] MIT: MIT License
+[148] MIT: MIT License
 Used by: anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0,
          anstyle-query 1.1.5, clap 4.6.7, clap_builder 4.6.7,
          clap_derive 4.6.7, clap_lex 1.1.1, colorchoice 1.0.5,
@@ -8090,7 +8232,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[145] MIT: MIT License
+[149] MIT: MIT License
 Used by: num-conv 0.2.2
 
 Copyright (c) Jacob Pratt
@@ -8115,7 +8257,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[146] MIT: MIT License
+[150] MIT: MIT License
 Used by: time 0.3.55, time-core 0.1.9
 
 Copyright (c) Jacob Pratt et al.
@@ -8140,7 +8282,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[147] MIT: MIT License
+[151] MIT: MIT License
 Used by: libc 0.2.189
 
 Copyright (c) The Rust Project Developers
@@ -8171,7 +8313,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[148] MIT: MIT License
+[152] MIT: MIT License
 Used by: idna_adapter 1.2.2
 
 Copyright (c) The rust-url developers
@@ -8202,7 +8344,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[149] MIT: MIT License
+[153] MIT: MIT License
 Used by: arrayvec 0.7.8
 
 Copyright (c) Ulrik Sverdrup "bluss" 2015-2023
@@ -8233,7 +8375,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[150] MIT: MIT License
+[154] MIT: MIT License
 Used by: synstructure 0.14.0
 
 Copyright 2016 Nika Layzell
@@ -8246,7 +8388,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[151] MIT: MIT License
+[155] MIT: MIT License
 Used by: ipnet 2.12.2
 
 Copyright 2017 Juniper Networks, Inc.
@@ -8259,7 +8401,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[152] MIT: MIT License
+[156] MIT: MIT License
 Used by: rand 0.10.3, rand 0.8.8, rand_chacha 0.3.1, rand_core 0.6.4
 
 Copyright 2018 Developers of the Rand project
@@ -8291,7 +8433,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[153] MIT: MIT License
+[157] MIT: MIT License
 Used by: multiversion 0.9.0, multiversion-macros 0.9.0
 
 Copyright 2019 Caleb Zulawski
@@ -8304,7 +8446,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[154] MIT: MIT License
+[158] MIT: MIT License
 Used by: zerocopy 0.8.57
 
 Copyright 2023 The Fuchsia Authors
@@ -8335,7 +8477,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[155] MIT: MIT License
+[159] MIT: MIT License
 Used by: encoding_rs 0.8.41, multiversion_no_op 1.0.0, utf8_iter 1.0.4
 
 Copyright Mozilla Foundation
@@ -8366,7 +8508,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[156] MIT: MIT License
+[160] MIT: MIT License
 Used by: static_assertions 1.1.0
 
 MIT License
@@ -8393,7 +8535,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[157] MIT: MIT License
+[161] MIT: MIT License
 Used by: darling 0.23.0, darling_core 0.23.0, darling_macro 0.23.0
 
 MIT License
@@ -8420,7 +8562,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[158] MIT: MIT License
+[162] MIT: MIT License
 Used by: syntect 5.3.0
 
 MIT License
@@ -8447,7 +8589,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[159] MIT: MIT License
+[163] MIT: MIT License
 Used by: faster-hex 0.10.0
 
 MIT License
@@ -8474,7 +8616,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[160] MIT: MIT License
+[164] MIT: MIT License
 Used by: crc32fast 1.5.2
 
 MIT License
@@ -8501,7 +8643,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[161] MIT: MIT License
+[165] MIT: MIT License
 Used by: dashmap 6.2.1
 
 MIT License
@@ -8528,7 +8670,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[162] MIT: MIT License
+[166] MIT: MIT License
 Used by: bytemuck 1.25.2
 
 MIT License
@@ -8543,7 +8685,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[163] MIT: MIT License
+[167] MIT: MIT License
 Used by: tokio-macros 2.7.2
 
 MIT License
@@ -8571,7 +8713,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[164] MIT: MIT License
+[168] MIT: MIT License
 Used by: cloudflare-quick-tunnel 0.3.1
 
 MIT License
@@ -8598,7 +8740,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[165] MIT: MIT License
+[169] MIT: MIT License
 Used by: tokio 1.53.1, tokio-util 0.7.19
 
 MIT License
@@ -8625,7 +8767,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[166] MIT: MIT License
+[170] MIT: MIT License
 Used by: simd-adler32 0.3.10
 
 MIT License
@@ -8652,7 +8794,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[167] MIT: MIT License
+[171] MIT: MIT License
 Used by: zune-core 0.5.3, zune-jpeg 0.5.15
 
 MIT License
@@ -8679,7 +8821,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[168] MIT: MIT License
+[172] MIT: MIT License
 Used by: miniz_oxide 0.8.9, miniz_oxide 0.9.1
 
 MIT License
@@ -8710,7 +8852,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[169] MIT: MIT License
+[173] MIT: MIT License
 Used by: miniz_oxide 0.8.9, miniz_oxide 0.9.1
 
 MIT License
@@ -8740,7 +8882,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[170] MIT: MIT License
+[174] MIT: MIT License
 Used by: fdeflate 0.3.7, image 0.25.10, image-webp 0.2.4
 
 MIT License
@@ -8771,7 +8913,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[171] MIT: MIT License
+[175] MIT: MIT License
 Used by: simdutf8 0.1.5
 
 MIT License
@@ -8796,7 +8938,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[172] MIT: MIT License
+[176] MIT: MIT License
 Used by: ident_case 1.0.1
 
 MIT License
@@ -8821,7 +8963,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[173] MIT: MIT License
+[177] MIT: MIT License
 Used by: rustc-hash 2.1.3
 
 Permission is hereby granted, free of charge, to any
@@ -8850,7 +8992,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[174] MIT: MIT License
+[178] MIT: MIT License
 Used by: adler2 2.0.1, anyhow 1.0.104, async-trait 0.1.92, atomic-waker 1.1.2,
          displaydoc 0.2.7, env_home 0.1.0, fastrand 2.5.0, itoa 1.0.18,
          linux-raw-sys 0.12.1, minimal-lexical 0.2.1, once_cell 1.21.4,
@@ -8887,7 +9029,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[175] MIT: MIT License
+[179] MIT: MIT License
 Used by: allocator-api2 0.2.21
 
 Permission is hereby granted, free of charge, to any
@@ -8916,7 +9058,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[176] MIT: MIT License
+[180] MIT: MIT License
 Used by: gix 0.84.0, gix-actor 0.41.2, gix-attributes 0.33.2,
          gix-bitmap 0.3.3, gix-chunk 0.7.3, gix-command 0.9.2,
          gix-commitgraph 0.37.1, gix-config 0.57.0, gix-config-value 0.18.1,
@@ -8954,7 +9096,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[177] MIT: MIT License
+[181] MIT: MIT License
 Used by: tinyvec 1.13.3
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
@@ -8965,7 +9107,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ------------------------------------------------------------------------------
 
-[178] MIT: MIT License
+[182] MIT: MIT License
 Used by: pulldown-cmark 0.13.4, pulldown-cmark-escape 0.11.0
 
 The MIT License
@@ -8992,7 +9134,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[179] MIT: MIT License
+[183] MIT: MIT License
 Used by: fancy-regex 0.16.2
 
 The MIT License
@@ -9019,7 +9161,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[180] MIT: MIT License
+[184] MIT: MIT License
 Used by: tracing-core 0.1.36
 
 The MIT License (MIT)
@@ -9046,7 +9188,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[181] MIT: MIT License
+[185] MIT: MIT License
 Used by: typenum 1.20.1
 
 The MIT License (MIT)
@@ -9073,7 +9215,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[182] MIT: MIT License
+[186] MIT: MIT License
 Used by: endian-type 0.1.2
 
 The MIT License (MIT)
@@ -9100,7 +9242,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[183] MIT: MIT License
+[187] MIT: MIT License
 Used by: base64 0.21.7, base64 0.22.1
 
 The MIT License (MIT)
@@ -9127,7 +9269,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[184] MIT: MIT License
+[188] MIT: MIT License
 Used by: aho-corasick 1.1.5, byteorder 1.5.0, byteorder-lite 0.1.0,
          globset 0.4.20, ignore 0.4.33, jiff 0.2.37, jiff-core 0.1.1,
          memchr 2.8.3, walkdir 2.5.0
@@ -9156,7 +9298,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[185] MIT: MIT License
+[189] MIT: MIT License
 Used by: yaml-rust 0.4.5
 
 The MIT License (MIT)
@@ -9183,7 +9325,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[186] MIT: MIT License
+[190] MIT: MIT License
 Used by: strsim 0.11.1
 
 The MIT License (MIT)
@@ -9212,7 +9354,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[187] MIT: MIT License
+[191] MIT: MIT License
 Used by: nibble_vec 0.1.0, radix_trie 0.2.1
 
 The MIT License (MIT)
@@ -9239,7 +9381,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[188] MIT: MIT License
+[192] MIT: MIT License
 Used by: fsevent-sys 4.1.0
 
 The MIT License (MIT)
@@ -9266,7 +9408,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[189] MIT: MIT License
+[193] MIT: MIT License
 Used by: security-framework 2.11.1, security-framework-sys 2.17.0
 
 The MIT License (MIT)
@@ -9292,7 +9434,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[190] MIT: MIT License
+[194] MIT: MIT License
 Used by: gif 0.14.2
 
 The MIT License (MIT)
@@ -9319,7 +9461,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[191] MIT: MIT License
+[195] MIT: MIT License
 Used by: data-encoding 2.11.1
 
 The MIT License (MIT)
@@ -9347,7 +9489,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[192] MIT: MIT License
+[196] MIT: MIT License
 Used by: quick-xml 0.42.0
 
 The MIT License (MIT)
@@ -9376,7 +9518,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[193] MIT: MIT License
+[197] MIT: MIT License
 Used by: color_quant 1.1.0
 
 The MIT License (MIT)
@@ -9403,7 +9545,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[194] MIT: MIT License
+[198] MIT: MIT License
 Used by: same-file 1.0.6
 
 The MIT License (MIT)
@@ -9430,7 +9572,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[195] MIT: MIT License
+[199] MIT: MIT License
 Used by: bstr 1.13.1
 
 The MIT License (MIT)
@@ -9457,7 +9599,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[196] MIT: MIT License
+[200] MIT: MIT License
 Used by: crossbeam-channel 0.5.17, crossbeam-deque 0.8.8,
          crossbeam-epoch 0.9.21, crossbeam-utils 0.8.23
 
@@ -9491,7 +9633,7 @@ DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[197] MIT: MIT License
+[201] MIT: MIT License
 Used by: base64 0.23.1
 
 The MIT License (MIT)
@@ -9518,7 +9660,7 @@ THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[198] MIT: MIT License
+[202] MIT: MIT License
 Used by: weezl 0.1.12
 
 The MIT License (MIT)
@@ -9545,7 +9687,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[199] MIT: MIT License
+[203] MIT: MIT License
 Used by: prodash 31.0.0
 
 The MIT License (MIT)
@@ -9576,7 +9718,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[200] MIT: MIT License
+[204] MIT: MIT License
 Used by: nu-ansi-term 0.50.3
 
 The MIT License (MIT)
@@ -9604,7 +9746,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[201] MIT: MIT License
+[205] MIT: MIT License
 Used by: bincode 1.3.3
 
 The MIT License (MIT)
@@ -9631,7 +9773,7 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[202] MIT: MIT License
+[206] MIT: MIT License
 Used by: generic-array 0.14.7
 
 The MIT License (MIT)
@@ -9658,7 +9800,39 @@ SOFTWARE.
 
 ------------------------------------------------------------------------------
 
-[203] MPL-2.0: Mozilla Public License 2.0
+[207] MIT: MIT License
+Used by: hashlink 0.9.1
+
+This work is derived in part from the `linked-hash-map` crate, Copyright (c)
+2015 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------
+
+[208] MPL-2.0: Mozilla Public License 2.0
 Used by: uluru 3.1.0
 
  Mozilla Public License Version 2.0
@@ -10037,7 +10211,7 @@ defined by the Mozilla Public License, v. 2.0.
 
 ------------------------------------------------------------------------------
 
-[204] Unicode-3.0: Unicode License v3
+[209] Unicode-3.0: Unicode License v3
 Used by: unicode-ident 1.0.26
 
 UNICODE LICENSE V3
@@ -10082,7 +10256,7 @@ authorization of the copyright holder.
 
 ------------------------------------------------------------------------------
 
-[205] Unicode-3.0: Unicode License v3
+[210] Unicode-3.0: Unicode License v3
 Used by: icu_collections 2.3.0, icu_locale_core 2.3.0, icu_normalizer 2.3.0,
          icu_normalizer_data 2.3.0, icu_properties 2.3.0,
          icu_properties_data 2.3.0, icu_provider 2.3.1, litemap 0.8.3,
@@ -10139,7 +10313,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ------------------------------------------------------------------------------
 
-[206] Zlib: zlib License
+[211] Zlib: zlib License
 Used by: zlib-rs 0.6.8
 
 (C) 2024 Trifecta Tech Foundation 
@@ -10164,7 +10338,7 @@ freely, subject to the following restrictions:
 
 ------------------------------------------------------------------------------
 
-[207] Zlib: zlib License
+[212] Zlib: zlib License
 Used by: foldhash 0.2.0
 
 Copyright (c) 2024 Orson Peters

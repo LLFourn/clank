@@ -39,7 +39,7 @@ impl Holder {
     pub(crate) fn here() -> Self {
         Self {
             pid: std::process::id() as i32,
-            session: std::env::var("ZELLIJ_SESSION_NAME").ok(),
+            session: here_session(),
             pane: std::env::var("ZELLIJ_PANE_ID").ok(),
             at: crate::age::now_rfc3339(),
             birth: crate::proc_identity::token_for(std::process::id() as i32),
@@ -58,6 +58,19 @@ impl Holder {
         }
         out.push_str(&format!(" since {}", self.at));
         out
+    }
+}
+
+/// The session this process runs in, for a person to find it by: its name
+/// now, else its socket. Read from this process's own ancestry.
+fn here_session() -> Option<String> {
+    use crate::cli::zellij_endpoint::{Resolved, ZellijIndex, own_endpoint};
+    match own_endpoint() {
+        Resolved::Found(ep) => Some(
+            ep.current_name(&ZellijIndex)
+                .unwrap_or_else(|_| ep.to_string()),
+        ),
+        Resolved::NotInZellij | Resolved::Unknown(_) => None,
     }
 }
 
