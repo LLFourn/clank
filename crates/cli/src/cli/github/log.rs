@@ -1,7 +1,7 @@
 //! The per-agent github event WAL (github-offline-catchup): an
 //! append-only JSONL inbox with an explicit handled/unhandled
-//! lifecycle. Every ingested github event — poll feed or realtime
-//! relay — is appended here BEFORE it is presented, so a crash between
+//! lifecycle. Every ingested github event is appended here BEFORE it
+//! is presented, so a crash between
 //! append and emit re-presents the event on the next arm
 //! (at-least-once, never silent loss).
 //!
@@ -16,8 +16,8 @@
 //!   log can mark an event seen without also holding its presentable
 //!   payload.
 //! - **Independent identity horizons** (codex 82a221a): poll events
-//!   carry a `feed_id`; relay events carry only a content-derived
-//!   `action_key` (their payloads have no feed id). Either may be
+//!   carry a `feed_id`; rows from the webhook relay older clanks ran
+//!   carry only a content-derived `action_key`. Either may be
 //!   absent; records persist whichever identities exist so both the
 //!   feed-id cursor and the coordinator's action-key horizon rebuild
 //!   from the log alone.
@@ -114,6 +114,7 @@ pub(crate) const DISPLAY_CAP: usize = 200;
 pub(crate) enum Transport {
     Timer,
     Poll,
+    /// Written by the webhook relay of older clanks; still read.
     Relay,
     /// A line a command source's producer printed
     /// (a-command-is-an-event-source-like-any-other). It shares this
@@ -260,9 +261,9 @@ enum Record {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         baseline: bool,
     },
-    /// Deliveries were evicted at intake before this watch classified
-    /// them, so it owed the feed a reconcile. A diagnostic: it carries
-    /// no identity and decides nothing.
+    /// Written by the webhook relay of older clanks when deliveries
+    /// were evicted at intake; still read. A diagnostic: it carries no
+    /// identity and decides nothing.
     RelayOverflow { v: u64, at: u64, dropped: u64 },
     /// Secondary: marks an inbox seq handled. A PLAIN ack (no
     /// `ident`) covers every row of its seq; a DISCRIMINATED ack
@@ -732,10 +733,6 @@ impl SharedWal {
     /// The atomic durable decision for a non-presentable observation.
     pub(crate) fn obs(&self, feed_id: Option<&str>, action_key: Option<&str>, baseline: bool) {
         self.with(|log| log.append_observation(feed_id, action_key, baseline));
-    }
-
-    pub(crate) fn relay_overflow(&self, dropped: u64) {
-        self.with(|log| log.append_relay_overflow(dropped));
     }
 
     pub(crate) fn save_state(
@@ -1575,14 +1572,6 @@ impl EventLog {
             feed_id: feed_id.map(str::to_owned),
             action_key: action_key.map(str::to_owned),
             baseline,
-        })
-    }
-
-    pub(crate) fn append_relay_overflow(&mut self, dropped: u64) -> std::io::Result<()> {
-        self.append(&Record::RelayOverflow {
-            v: CURRENT_V,
-            at: now_epoch(),
-            dropped,
         })
     }
 

@@ -2,14 +2,13 @@
 //!
 //! A PR is not green because a check suite is: a suite summarizes the
 //! runs of ONE GitHub App, and a repo's checks routinely come from
-//! several, plus the older commit-status API. So no single suite,
-//! run, or webhook delivery is evidence about the PR — the result is
-//! a reduction over every check that reports on the head commit.
+//! several, plus the older commit-status API. So no single suite or
+//! run is evidence about the PR — the result is a reduction over every
+//! check that reports on the head commit.
 //!
-//! Everything here is pure. Readers (the poll's REST calls, and the
-//! relay's reconciliation after a webhook) normalize whatever they
-//! fetched into [`CheckReport`]s and reduce them the same way, so a
-//! conclusion cannot depend on which transport observed it.
+//! Everything here is pure. The reader normalizes what it fetched into
+//! [`CheckReport`]s and reduces them, so a conclusion cannot depend on
+//! which endpoint reported which check.
 
 use clank_core::agent_config::GithubEventKind;
 use clank_core::wait::WaitItem;
@@ -267,9 +266,9 @@ pub(crate) fn is_ci_key(key: &str) -> bool {
 /// The dedup identity of a conclusion: which PR, which head, which
 /// way it went.
 ///
-/// Minted by whichever path observed it — the poll's read or the
-/// webhook-triggered re-read — so the coordinator collapses the two
-/// into one wake with no machinery of its own. A rollup read carries
+/// Every read of an unchanged conclusion mints the same key, so the
+/// coordinator wakes for it once with no machinery of its own. A
+/// rollup read carries
 /// no feed id, so this key is the ONLY identity a CI row has: without
 /// it the log groups rows by a hash of their content and two runs of
 /// one build become indistinguishable.

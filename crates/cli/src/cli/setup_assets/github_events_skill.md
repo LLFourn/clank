@@ -1,13 +1,12 @@
 ---
 name: clank-github
-description: Handle github_event wake items from clank's github wake sources — the event inbox, the react-then-ack loop, catch-up semantics, and webhook caveats. Load this when a clank wait wakes you with github_event items or when configuring github wait_events.
+description: Handle github_event wake items from clank's github wake sources — the event inbox, the react-then-ack loop, polling and catch-up semantics. Load this when a clank wait wakes you with github_event items or when configuring github wait_events.
 ---
 
 # Clank github events
 
 `clank wait` can watch GitHub repos (`wait_events` entries with
-`"kind":"github"`). Every event those sources ingest — whether it
-arrived by webhook or by a read of GitHub — is written to
+`"kind":"github"`). Every event those sources ingest is written to
 YOUR per-agent event inbox (a write-ahead log under
 `.clank/agents/<label>/events/`) BEFORE it is presented. Events stay
 **unhandled** there until you explicitly mark them handled.
@@ -127,25 +126,29 @@ A watch that does not name `review_submitted` is unaffected: it still
 records these as `pr_comment` with detail `review`, still filtered by
 its own-actions setting, keyed exactly as before.
 
-## Catch-up semantics
+## Polling and catch-up
 
-- Every watch listens by webhook. Each time it STARTS listening —
-  the monitor starting it, its forwarder restarting, a takeover from
-  another wait — it reads once in the background: the event feed is
-  reconciled against the inbox and presents what you missed, and a CI
-  watch reads every PR in scope's checks. A start counts only once
-  GitHub's `ping` for the new hook has arrived.
-- After that nothing is read on a timer unless the watch sets
-  `"poll_interval"` (e.g. `"5m"`): events come by webhook, CI is read
-  on cues. A failed read is retried until it succeeds; a healthy idle
-  watch makes no API calls.
-- **The stated gap.** GitHub's event feed lags real activity by 30
-  seconds to six hours, and a failed webhook delivery is not retried.
-  An action taken just before the watch started listening can be
-  missing from that start's catch-up and is never delivered by the new
-  hook (it predates it). That holds for every start, including the
-  forwarder restart when a watch widens what its repo subscribes to.
-  `poll_interval` closes it; nothing else does.
+- Every watch POLLS GitHub: once when it starts, then every 60
+  seconds. Set `"poll_interval"` (e.g. `"5m"`) on the watch to change
+  that; GitHub's `X-Poll-Interval` header, when longer, wins. Polling
+  the event feed is cheap — an unchanged feed answers `304`, which
+  costs no rate limit. GitHub has no subscription API, so there is
+  nothing to listen to instead.
+- A failed read is retried with backoff (honouring a rate limit's
+  reset) and polling never stops while the monitor hosts the watch.
+  `clank status` and the TUI's sources row show each watch's last
+  completed check, and turn it red with the reason when a read fails
+  or no poll has completed for three intervals.
+- **How timely an event is.** PRs, comments and reviews come from
+  GitHub's repository events feed, which GitHub documents as having
+  30 seconds to six hours of latency
+  (https://docs.github.com/en/rest/activity/events#list-repository-events).
+  clank adds at most one interval on top. CI conclusions are not in
+  that feed — see below — so they arrive within about one interval of
+  GitHub reporting them.
+- After an outage — no monitor running, a long failure — the first
+  successful poll reconciles the feed against your inbox and presents
+  what you missed.
 - The feed only retains ~300 events; a longer outage logs one loud
   "may have been missed" warning — treat it as a cue to sweep the
   watched repo manually.
@@ -172,14 +175,8 @@ head is asked what its checks say, and the answer is reduced to one
 result for the PR (a check suite is one App's view, and a repo's
 checks routinely come from several, plus the older commit statuses).
 
-They are read when the watch starts listening and then when a
-webhook cue says they may have moved: a finished check suite, a commit
-status, or the PR's head moving. Cues that arrive close together are
-COALESCED, never dropped — they schedule one read at the end of a
-short window, which sees the state after the last of them. A read that
-fails is retried until it succeeds. The webhook is only a cue: the
-conclusion always comes from the same read, so a cue's read and a
-timer's read cannot tell you different things.
+They are read on the same cadence as the feed: when the watch starts,
+then every interval. A read that fails is retried until it succeeds.
 
 Two consequences worth knowing:
 
@@ -194,20 +191,3 @@ Two consequences worth knowing:
   head is announced once; a new push is a new head and so a new
   result. A re-run going red → green → red announces red once, not
   twice.
-
-## Webhook notes
-
-- The webhook needs `gh`, the `cli/gh-webhook` extension
-  (`gh extension install cli/gh-webhook`) and ADMIN on the repo, since
-  it creates a hook. Without them the watch is NOT listening: it says
-  why, on every retry, and the status panel shows it as degraded
-  (still polling, when `poll_interval` is set) or not listening
-  (nothing is read). Watching a repo you don't administer means
-  setting `poll_interval`.
-- GitHub allows one CLI forwarder per repo. Your monitor shares one
-  between every watch of a repo; a second clank monitor (another
-  repo, another machine) or your own `gh webhook forward` on the same
-  repo holds the slot instead, reported as exactly that, retried every
-  few minutes.
-- A webhook delivery and the feed's copy of the same action are ONE
-  event — one inbox entry, one ack.

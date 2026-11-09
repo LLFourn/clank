@@ -309,8 +309,7 @@ impl Selection {
     ///
     /// Only for callers that subscribe or bound work, where asking
     /// for too much costs requests and asking for too little loses
-    /// events: the webhook names to forward, and whether to read
-    /// checks at all. NEVER for deciding that an event reaches the
+    /// events: whether to read checks at all. NEVER for deciding that an event reaches the
     /// agent — a clause names an event AND the objects it is about,
     /// and twice now a caller that forgot the second half delivered
     /// something no clause had asked for (codex 9dc8a13, bcda3c8).
@@ -796,7 +795,7 @@ mod tests {
     /// Clauses select; they do not fan out. Two clauses matching one
     /// event is one admission, and the log's own identity is what
     /// makes the second match a no-op — the same mechanism that stops
-    /// a poll and a webhook delivering one event twice.
+    /// two reads of one event delivering it twice.
     #[test]
     fn two_clauses_matching_one_event_admit_it_once() {
         let sel = nested(

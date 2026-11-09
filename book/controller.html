@@ -62,17 +62,10 @@
   <li><strong>Your own actions don’t wake you</strong>, unless you set <code>"include_own_actions": true</code>. The exception is <code>review_submitted</code>, which is never filtered, because a submitted review is the thing a team waits on.</li>
   <li><strong>CI conclusions are read, not received.</strong> <code>ci_passed</code> and <code>ci_failed</code> come from asking each watched PR’s head what its checks say. The repo’s monitor reads them for every agent on the roster, whether or not that agent is waiting, and a conclusion it sees stays in the inbox until acknowledged. What it never sees is lost: a red build that turned green between two reads, or while no monitor was running, is simply gone.</li>
 </ul>
-<p>Every source listens through GitHub’s webhook forwarding. It reads GitHub once each time it starts listening, to catch up, and then only when a webhook says something moved. Add <code>"poll_interval": "5m"</code> for a background poll on top: GitHub’s event feed can lag by minutes to hours, so an action taken just before a watch starts listening can be missed without one. What each needs:</p>
-<div class="table-scroll">
-<table>
-  <thead><tr><th scope="col">Path</th><th scope="col">Needs</th></tr></thead>
-  <tbody>
-    <tr><td>Reads</td><td>A token from <code>GH_TOKEN</code> or <code>GITHUB_TOKEN</code>, or else one <code>gh auth token</code> call. With neither, the source waits and says so. It never reads unauthenticated.</td></tr>
-    <tr><td>Webhook</td><td>The <code>gh</code> binary, its <code>cli/gh-webhook</code> extension, and admin on the watched repo, because it creates a webhook. Without them the source is not listening: it says why on every retry, and keeps polling only if <code>poll_interval</code> is set.</td></tr>
-  </tbody>
-</table>
-</div>
-<p>The <code>clank-github</code> skill carries the full vocabulary, catch-up rules and webhook caveats. Agents load it when GitHub events wake them.</p>
+<p>Every source polls GitHub: once when it starts, then every 60 seconds. Set <code>"poll_interval": "5m"</code> to change that; GitHub’s own <code>X-Poll-Interval</code> wins when it is longer. GitHub has no subscription API, so there is nothing to listen to instead, and an unchanged feed costs no rate limit. A read that fails is retried with backoff, and polling never stops while the monitor hosts the source.</p>
+<p>How timely an event is depends on where it comes from. PRs, comments and reviews come from GitHub’s repository events feed, which GitHub documents as lagging by 30 seconds to six hours; the poll adds at most one interval. CI conclusions are read from each PR’s checks, so they arrive within about one interval of GitHub reporting them.</p>
+<p>Reads need a token from <code>GH_TOKEN</code> or <code>GITHUB_TOKEN</code>, or else one <code>gh auth token</code> call. With neither, the source waits and says so. It never reads unauthenticated. <code>clank status</code> and the TUI’s sources row show each source’s last completed check, and turn red with the reason when its reads fail or no poll has completed for three intervals.</p>
+<p>The <code>clank-github</code> skill carries the full vocabulary and catch-up rules. Agents load it when GitHub events wake them.</p>
 
 <h2 id="inbox">The inbox: react, then ack</h2>
 <p>Every event a source delivers, and every message <code>clank send</code> delivers, goes into the recipient’s inbox, a log under its agent directory in <code>.clank/agents/</code>. It stays unhandled, and keeps waking its agent each time a wait is armed, until the agent acknowledges it. Delivery is therefore at least once. An event that fires while the agent is offline is waiting when it comes back, and one it half-handled before a crash comes round again.</p>

@@ -1,12 +1,10 @@
 //! The events feed: what an event MEANS, and the cursor that decides
 //! which of them are new.
 //!
-//! Both classifiers are PURE and fixture-tested, and they agree: the
-//! same underlying action yields the same action key whether it
-//! arrived as an `/events` row or as a webhook payload. The transport
-//! is INJECTED (`EventFetcher`) so the whole poll state machine is
-//! driven deterministically in tests, and the production fetcher is
-//! an async, cancellation-safe `gh` child (killed on task abort).
+//! The classifier is PURE and fixture-tested. The transport is
+//! INJECTED (`EventFetcher`) so the whole poll state machine is driven
+//! deterministically in tests; the production fetcher is the shared
+//! HTTP session.
 //!
 //! ## Cursor model
 //!
@@ -41,8 +39,7 @@ pub(super) const SEEN_CAP: usize = 1000;
 /// key is computed HERE, at classification time, because the raw
 /// identities it needs (comment/review ids, the PR head sha, the push
 /// ref+sha) live in the payload and are discarded by `WaitItem`
-/// (codex e89be23). Both payload forms (events feed / webhook) yield
-/// the SAME key for the same underlying action.
+/// (codex e89be23).
 #[derive(Debug)]
 pub(crate) struct Classified {
     pub(crate) item: WaitItem,
@@ -52,13 +49,11 @@ pub(crate) struct Classified {
     /// a manufactured shared key (codex bf1e1ea).
     pub(crate) key: Option<String>,
     /// The `/events` feed id — TRANSPORT metadata stamped by
-    /// [`map_page`], not by the classifiers (webhook payloads have no
-    /// feed id, and the classifiers must stay payload-symmetric). The
-    /// WAL's durable cursor rides on it (github-offline-catchup).
+    /// [`map_page`], not by the classifier. The WAL's durable cursor
+    /// rides on it (github-offline-catchup).
     pub(crate) feed_id: Option<String>,
     /// The event's github-side time (epoch), best effort from the
-    /// payload — the feed's `created_at`, or a per-kind webhook
-    /// timestamp. `None` when the payload carried nothing usable;
+    /// event's `created_at`. `None` when it carried nothing usable;
     /// timeline surfaces fall back to ingest time
     /// (log-timeline-github-events).
     pub(crate) event_at: Option<u64>,
@@ -66,7 +61,7 @@ pub(crate) struct Classified {
 
 /// Epoch seconds from an RFC3339 timestamp (the shapes github emits:
 /// `Z`-suffixed, numeric offsets, optional fractional seconds).
-/// Externally supplied feed/webhook data: anything malformed —
+/// Externally supplied feed data: anything malformed —
 /// impossible dates, out-of-range offsets — is `None` (fall back to
 /// ingest time), never a plausible-but-wrong epoch that silently
 /// reorders the timeline (codex 6219148). The `time` crate is already
@@ -74,27 +69,6 @@ pub(crate) struct Classified {
 fn parse_iso8601_epoch(s: &str) -> Option<u64> {
     let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
     u64::try_from(t.unix_timestamp()).ok()
-}
-
-/// Best-effort event time from a WEBHOOK payload: the per-kind
-/// timestamps the common shapes carry. Absent → `None`, and the
-/// timeline falls back to ingest time.
-fn webhook_event_at(payload: &serde_json::Value) -> Option<u64> {
-    let paths: [&[&str]; 3] = [
-        &["comment", "created_at"],
-        &["review", "submitted_at"],
-        &["head_commit", "timestamp"],
-    ];
-    for path in paths {
-        let mut v = Some(payload);
-        for k in path {
-            v = v.and_then(|x| x.get(k));
-        }
-        if let Some(t) = v.and_then(|x| x.as_str()).and_then(parse_iso8601_epoch) {
-            return Some(t);
-        }
-    }
-    None
 }
 
 /// One classified event, or `None` if it doesn't match a wanted
@@ -126,7 +100,7 @@ pub(crate) fn classify_event(
     };
 
     // Action names follow the REST Events API (docs.github.com
-    // github-event-types), which differs from webhook payloads. A
+    // github-event-types), not the webhook vocabulary. A
     // merge is `action == "closed"` with `pull_request.merged == true`
     // (the API's shape); `"merged"` is accepted too for
     // forward/legacy tolerance.
@@ -211,8 +185,8 @@ pub(crate) fn classify_event(
             }
         }
         // Events API PullRequestReviewEvent action is `created` (a new
-        // submitted review, empty-body approvals included), NOT the
-        // webhook `submitted`; accept both for tolerance.
+        // submitted review, empty-body approvals included);
+        // `submitted` is accepted too for tolerance.
         "PullRequestReviewEvent" if matches!(action, Some("created") | Some("submitted")) => (
             GithubEventKind::ReviewSubmitted,
             review_state.as_deref(),
@@ -344,11 +318,10 @@ fn html_url(v: &serde_json::Value) -> Option<String> {
 /// carries its own anchored `html_url`, which opens the thing the
 /// event announced instead of the top of a long thread.
 ///
-/// Shared by both classifiers on purpose. They see different payloads
-/// — the Events API sends a `pull_request` stub of five keys with no
-/// `html_url` at all, a webhook sends the full object — and two copies
-/// of this decision is how the poll came to record no link for every
-/// review comment while the webhook recorded its PR's.
+/// The Events API sends a `pull_request` stub of five keys with no
+/// `html_url` at all, so the container cannot be the first answer:
+/// that is how the poll came to record no link for every review
+/// comment.
 ///
 /// Only `html_url` is ever read. The stub's `url` is an
 /// `api.github.com` address, which is not something an operator can
@@ -369,8 +342,8 @@ fn subject_url(payload: &serde_json::Value, obj: &serde_json::Value) -> Option<S
 /// same `review` object, and two copies of one payload decision is
 /// how the poll came to record no link for every review comment.
 ///
-/// Lowercased because it is rendered. The feed and the webhook both
-/// send it lowercase, but GitHub's reviews endpoint sends `APPROVED`,
+/// Lowercased because it is rendered. The feed sends it lowercase, but
+/// GitHub's reviews endpoint sends `APPROVED`,
 /// and one state an operator has to learn as two words is worse than
 /// a normalization that can only ever be a no-op here.
 fn review_state(payload: &serde_json::Value) -> Option<String> {
@@ -432,7 +405,7 @@ fn content_ref(
         // A push has no single object to read a body from.
         GithubEventKind::BranchPush => None,
         // Not classified from a payload: a CI conclusion is read from
-        // a PR's checks, never from the feed or a webhook body
+        // a PR's checks, never from the feed
         // (`github_ci`).
         GithubEventKind::CiPassed | GithubEventKind::CiFailed => {
             unreachable!("ci kinds are not classified from a payload")
@@ -440,11 +413,10 @@ fn content_ref(
     }
 }
 
-/// The normalized action identity for the non-push kinds — SHARED by
-/// both classifiers so the two payload forms cannot derive different
-/// keys for one action. Feed event ids and webhook delivery GUIDs are
-/// different id spaces and deliberately not used; the key is built
-/// from the objects both forms carry.
+/// The normalized action identity for the non-push kinds, built from
+/// the objects the payload carries rather than the feed's event id, so
+/// a key recorded by an older clank's webhook relay names the same
+/// action.
 fn action_key(
     kind: GithubEventKind,
     detail: Option<&str>,
@@ -513,146 +485,6 @@ pub(crate) fn kind_str(kind: GithubEventKind) -> &'static str {
         GithubEventKind::CiPassed => "ci_passed",
         GithubEventKind::CiFailed => "ci_failed",
     }
-}
-
-/// Classify one WEBHOOK delivery (github-http-client-and-realtime
-/// M2). The relay hands us standard webhook payloads, which differ
-/// from the events feed: the event NAME arrives out-of-band (the
-/// `X-GitHub-Event` header), the action vocabulary is the webhook one
-/// (`submitted` reviews, `synchronize`), the actor is `sender.login`,
-/// and a push carries `after`/`ref` with a commits array. It asks the
-/// SAME [`Selection`] as [`classify_event`]; tag pushes are ignored by
-/// the same `refs/heads/` gate.
-pub(crate) fn classify_webhook(
-    repo: &str,
-    event_name: &str,
-    payload: &serde_json::Value,
-    sel: &Selection,
-    own_login: Option<&str>,
-) -> Option<Classified> {
-    let event_at = webhook_event_at(payload);
-    let actor = payload
-        .get("sender")
-        .and_then(|a| a.get("login"))
-        .and_then(|l| l.as_str());
-    let action = payload.get("action").and_then(|a| a.as_str());
-    let is_own = own_login.is_some() && own_login == actor;
-    let review_state = review_state(payload);
-    let pr = || {
-        payload
-            .get("pull_request")
-            .unwrap_or(&serde_json::Value::Null)
-    };
-
-    if event_name == "push" {
-        let full_ref = payload.get("ref").and_then(|r| r.as_str())?;
-        let branch = full_ref.strip_prefix("refs/heads/")?;
-        admitted_as(
-            sel,
-            repo,
-            &[(GithubEventKind::BranchPush, None)],
-            None,
-            Some(branch),
-            is_own,
-        )?;
-        let size = payload
-            .get("commits")
-            .and_then(|c| c.as_array())
-            .map(|c| c.len())
-            .unwrap_or(0);
-        let url = payload
-            .get("before")
-            .and_then(|b| b.as_str())
-            .zip(payload.get("after").and_then(|h| h.as_str()))
-            .map(|(before, after)| format!("https://github.com/{repo}/compare/{before}...{after}"));
-        let after = payload.get("after").and_then(|h| h.as_str());
-        return Some(Classified {
-            item: WaitItem::GithubEvent {
-                presentation: None,
-                repo: repo.to_string(),
-                event: kind_str(GithubEventKind::BranchPush).to_string(),
-                detail: None,
-                number: None,
-                title: Some(format!("{branch} +{size}")),
-                actor: actor.map(str::to_string),
-                url,
-                // Never at classification (github-watch-prompts):
-                // the WAL stores no prompt; presentation stamps it.
-                instructions: None,
-                content: None,
-            },
-            key: after.map(|a| format!("push@{full_ref}+{a}")),
-            feed_id: None,
-            event_at,
-        });
-    }
-
-    let (kind, detail, obj): (GithubEventKind, Option<&str>, &serde_json::Value) = match event_name
-    {
-        "pull_request" => {
-            let merged = pr().get("merged").and_then(|m| m.as_bool()) == Some(true);
-            match action {
-                Some("opened") => (GithubEventKind::PrOpened, None, pr()),
-                Some("synchronize") => (GithubEventKind::PrUpdated, None, pr()),
-                Some("closed") if merged => (GithubEventKind::PrMerged, None, pr()),
-                _ => return None,
-            }
-        }
-        "issues" => {
-            let issue = payload.get("issue").unwrap_or(&serde_json::Value::Null);
-            match action {
-                Some("opened") => (GithubEventKind::IssueOpened, None, issue),
-                Some("closed") => (GithubEventKind::IssueClosed, None, issue),
-                _ => return None,
-            }
-        }
-        "issue_comment" if action == Some("created") => {
-            let issue = payload.get("issue").unwrap_or(&serde_json::Value::Null);
-            if issue.get("pull_request").is_some() {
-                (
-                    GithubEventKind::PrComment,
-                    Some("issue_comment_on_pr"),
-                    issue,
-                )
-            } else {
-                (GithubEventKind::IssueComment, None, issue)
-            }
-        }
-        // Webhook vocabulary: a new review is SUBMITTED.
-        "pull_request_review" if action == Some("submitted") => (
-            GithubEventKind::ReviewSubmitted,
-            review_state.as_deref(),
-            pr(),
-        ),
-        "pull_request_review_comment" if action == Some("created") => {
-            (GithubEventKind::PrComment, Some("review_comment"), pr())
-        }
-        _ => return None,
-    };
-    let number = obj.get("number").and_then(|n| n.as_u64());
-    let (kind, detail) = admitted_as(sel, repo, &recordings(kind, detail), number, None, is_own)?;
-    let key = action_key(kind, detail, payload, obj);
-    Some(Classified {
-        item: WaitItem::GithubEvent {
-            presentation: None,
-            repo: repo.to_string(),
-            event: kind_str(kind).to_string(),
-            detail: detail.map(str::to_string),
-            number,
-            title: obj
-                .get("title")
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            actor: actor.map(str::to_string),
-            url: subject_url(payload, obj),
-            instructions: None,
-            content: content_ref(kind, detail, payload, obj),
-        },
-        key,
-        feed_id: None,
-        event_at,
-    })
 }
 
 /// New items from one page (ids not in `seen`, matching + filtered),
@@ -886,26 +718,36 @@ pub(crate) async fn poll_once<F: EventFetcher>(
     }
 }
 
-/// How a github watch is configured to be delivered. Configured, not
-/// observed: the server's `X-Poll-Interval` may lengthen the polling,
-/// and whether the webhook is listening right now is the monitor's
-/// live account, not this.
-pub(crate) fn configured_delivery(src: &clank_core::agent_config::GithubSource) -> String {
+/// How often a watch polls when its config does not say.
+pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The watch's configured cadence: its `poll_interval`, or
+/// [`DEFAULT_POLL_INTERVAL`] when that is absent, zero or unreadable.
+pub(crate) fn configured_interval(src: &GithubSource) -> Duration {
+    src.poll_interval
+        .as_deref()
+        .and_then(|s| crate::cli::wait::parse_duration_str(s).ok().flatten())
+        .unwrap_or(DEFAULT_POLL_INTERVAL)
+}
+
+/// How a github watch is configured to poll. Configured, not observed:
+/// the server's `X-Poll-Interval` may lengthen it, and what the watch
+/// is doing now is the monitor's live account.
+pub(crate) fn configured_polling(src: &GithubSource) -> String {
+    let every = configured_interval(src).as_secs();
     match src
         .poll_interval
         .as_deref()
         .map(crate::cli::wait::parse_duration_str)
     {
-        None | Some(Ok(None)) => "webhook, catching up each time it starts listening".to_string(),
-        Some(Ok(Some(d))) => format!("webhook, plus a poll every {}s", d.as_secs()),
-        Some(Err(_)) => "webhook; poll interval unreadable".to_string(),
+        Some(Err(_)) => format!("poll interval unreadable; polled every {every}s"),
+        _ => format!("polled every {every}s"),
     }
 }
 
-/// The optional timer's effective interval: the server's
-/// `X-Poll-Interval` is a FLOOR the client must obey, so take the max
-/// of it and the configured cadence. There is no default: a watch
-/// without `poll_interval` runs no timer at all.
+/// The effective interval: the server's `X-Poll-Interval` is a FLOOR
+/// the client must obey, so the longer of it and the configured
+/// cadence.
 pub(crate) fn effective_interval(configured: Duration, server_floor: Option<u64>) -> Duration {
     let server = server_floor
         .map(Duration::from_secs)
@@ -1015,9 +857,10 @@ impl FeedHorizon {
         // valid WAL — minus the one state it cannot distinguish: a
         // log holding ONLY checks rows, which is evidence about the
         // checks and none about the feed. An empty feed baseline
-        // followed by a relay delivery leaves exactly such a log
-        // except that its rows are the feed's, so the question is
-        // whose rows they are, not whether any exist.
+        // followed by a delivery from the webhook relay older clanks
+        // ran leaves exactly such a log except that its rows are the
+        // feed's, so the question is whose rows they are, not whether
+        // any exist.
         let evidence = loaded.warm
             && (!loaded.feed_ids.is_empty()
                 || loaded
@@ -1033,8 +876,7 @@ impl FeedHorizon {
             // Conditional-request metadata belongs to the horizon it
             // was taken against: an ETag restored for a feed that has
             // not established makes every fetch a 304, so the
-            // baseline never completes and pre-baseline relay
-            // deliveries buffer for good.
+            // baseline never completes.
             etag: established.then(|| loaded.etag.clone()).flatten(),
             floor: established.then_some(loaded.poll_interval_floor).flatten(),
             established,
@@ -1100,24 +942,6 @@ pub(super) mod tests {
         classify_event(
             repo,
             event,
-            &flat_selection(wanted, include_own, branches),
-            own_login,
-        )
-    }
-
-    pub(in crate::cli::github) fn classify_webhook_flat(
-        repo: &str,
-        event_name: &str,
-        payload: &serde_json::Value,
-        wanted: &[GithubEventKind],
-        own_login: Option<&str>,
-        include_own: bool,
-        branches: &[String],
-    ) -> Option<Classified> {
-        classify_webhook(
-            repo,
-            event_name,
-            payload,
             &flat_selection(wanted, include_own, branches),
             own_login,
         )
@@ -1445,10 +1269,10 @@ pub(super) mod tests {
         assert!(!bt.contains("a"));
     }
 
-    /// A watch's delivery as configured: always the webhook, and a
-    /// background poll only when one is asked for.
+    /// Every watch polls: every 60s unless its config says otherwise,
+    /// and an interval it cannot read is said, not hidden.
     #[test]
-    fn a_watch_states_its_configured_delivery() {
+    fn a_watch_states_its_configured_polling() {
         let src = |interval: Option<&str>| clank_core::agent_config::GithubSource {
             interrupt: false,
             interrupt_message: None,
@@ -1461,17 +1285,14 @@ pub(super) mod tests {
             prs: Vec::new(),
             prompt: None,
         };
-        let webhook_only = "webhook, catching up each time it starts listening";
-        assert_eq!(configured_delivery(&src(None)), webhook_only);
-        assert_eq!(configured_delivery(&src(Some("0"))), webhook_only);
+        assert_eq!(configured_polling(&src(None)), "polled every 60s");
+        assert_eq!(configured_polling(&src(Some("0"))), "polled every 60s");
+        assert_eq!(configured_polling(&src(Some("2m"))), "polled every 120s");
         assert_eq!(
-            configured_delivery(&src(Some("2m"))),
-            "webhook, plus a poll every 120s"
+            configured_polling(&src(Some("5x"))),
+            "poll interval unreadable; polled every 60s"
         );
-        assert_eq!(
-            configured_delivery(&src(Some("5x"))),
-            "webhook; poll interval unreadable"
-        );
+        assert_eq!(configured_interval(&src(Some("5x"))), DEFAULT_POLL_INTERVAL);
     }
 
     #[test]
@@ -1660,34 +1481,6 @@ pub(super) mod tests {
             classify_event_flat("o/r", &review("created"), legacy, mine, false, &[]).is_none(),
             "and its own-actions filter still applies to it",
         );
-
-        // The webhook says `submitted`; same answer.
-        let hook = serde_json::json!({
-            "action": "submitted",
-            "sender": {"login": "LLFourn"},
-            "review": {"id": 9, "state": "approved"},
-            "pull_request": {"number": 603}
-        });
-        let got =
-            classify_webhook_flat("o/r", "pull_request_review", &hook, wants, mine, false, &[])
-                .expect("the webhook reaches its own watcher too");
-        let WaitItem::GithubEvent {
-            event,
-            detail,
-            content,
-            ..
-        } = &got.item
-        else {
-            panic!("not a github event")
-        };
-        assert_eq!(
-            (event.as_str(), detail.as_deref()),
-            ("review_submitted", Some("approved"))
-        );
-        assert_eq!(
-            *content,
-            Some(clank_core::wait::ContentRef::Review { number: 603, id: 9 }),
-        );
     }
 
     /// A pending review is not an event, and its drafts are not it
@@ -1708,13 +1501,6 @@ pub(super) mod tests {
             assert!(
                 classify_event("o/r", &poll, &sel, None).is_none(),
                 "a {action} review is not a submission",
-            );
-            let hook = serde_json::json!({
-                "action": action, "sender": {"login": "x"},
-                "review": {"id": 9, "state": "approved"}, "pull_request": {"number": 1}});
-            assert!(
-                classify_webhook("o/r", "pull_request_review", &hook, &sel, None).is_none(),
-                "nor on the webhook",
             );
         }
 
@@ -1743,8 +1529,7 @@ pub(super) mod tests {
     /// covers every PR. A review on the scoped PR is the specific
     /// recording; a review on any OTHER PR is still a comment the
     /// broad clause asked for, and deciding the kind from membership
-    /// alone dropped it (codex 9dc8a13). Both transports, because a
-    /// fixture from one proves nothing about the other.
+    /// alone dropped it (codex 9dc8a13).
     #[test]
     fn a_review_outside_one_clause_is_taken_by_another() {
         let sel = watch_selection(
@@ -1757,24 +1542,14 @@ pub(super) mod tests {
                 "payload": {"action": "created", "review": {"id": 9, "state": "approved"},
                             "pull_request": {"number": number}}})
         };
-        let hook = |number| {
-            serde_json::json!({
-                "action": "submitted", "sender": {"login": "someone"},
-                "review": {"id": 9, "state": "approved"},
-                "pull_request": {"number": number}})
-        };
         let recorded = |c: Classified| match c.item {
             WaitItem::GithubEvent { event, detail, .. } => (event, detail, c.key),
             _ => panic!("not a github event"),
         };
         let both = |number: u64| {
-            [
-                recorded(classify_event("o/r", &poll(number), &sel, None).expect("poll")),
-                recorded(
-                    classify_webhook("o/r", "pull_request_review", &hook(number), &sel, None)
-                        .expect("webhook"),
-                ),
-            ]
+            [recorded(
+                classify_event("o/r", &poll(number), &sel, None).expect("poll"),
+            )]
         };
 
         for got in both(603) {
@@ -1800,10 +1575,9 @@ pub(super) mod tests {
         let only =
             watch_selection(r#"[{"pr": {"numbers": [603], "events": ["review_submitted"]}}]"#);
         assert!(classify_event("o/r", &poll(604), &only, None).is_none());
-        assert!(classify_webhook("o/r", "pull_request_review", &hook(604), &only, None).is_none());
     }
 
-    /// A submitted review's STATE is its detail, on both transports.
+    /// A submitted review's STATE is its detail.
     ///
     /// The slot used to hold the constant `review`, which the kind
     /// already says. The state is what a watcher actually needs beside
@@ -1834,26 +1608,9 @@ pub(super) mod tests {
                 .expect("classifies"),
             )
         };
-        let hook = |review: serde_json::Value, wanted: &[GithubEventKind]| {
-            detail_of(
-                classify_webhook_flat(
-                    "o/r",
-                    "pull_request_review",
-                    &serde_json::json!({"action": "submitted", "sender": {"login": "x"},
-                                        "review": review, "pull_request": {"number": 603}}),
-                    wanted,
-                    None,
-                    false,
-                    &[],
-                )
-                .expect("classifies"),
-            )
-        };
-
         for state in ["approved", "changes_requested", "commented"] {
             let review = serde_json::json!({"id": 9, "state": state});
-            assert_eq!(feed(review.clone(), wants).as_deref(), Some(state));
-            assert_eq!(hook(review, wants).as_deref(), Some(state), "{state}");
+            assert_eq!(feed(review, wants).as_deref(), Some(state), "{state}");
         }
 
         // GitHub's reviews endpoint shouts it. One state an operator
@@ -1868,7 +1625,6 @@ pub(super) mod tests {
         // submitted, so putting `review` back would be a word that
         // carries nothing.
         assert_eq!(feed(serde_json::json!({"id": 9}), wants), None);
-        assert_eq!(hook(serde_json::json!({"id": 9}), wants), None);
 
         // And the legacy kind's detail is untouched by any of it — a
         // constant then, a constant now, whatever the state says.
@@ -1876,20 +1632,16 @@ pub(super) mod tests {
             serde_json::json!({"id": 9, "state": "changes_requested"}),
             serde_json::json!({"id": 9}),
         ] {
-            assert_eq!(feed(review.clone(), legacy).as_deref(), Some("review"));
-            assert_eq!(hook(review, legacy).as_deref(), Some("review"));
+            assert_eq!(feed(review, legacy).as_deref(), Some("review"));
         }
     }
 
-    /// THE SUBJECT'S OWN LINK, for each transport's REAL payload.
+    /// THE SUBJECT'S OWN LINK, for the feed's REAL payload.
     ///
-    /// The two classifiers see different shapes, so a fixture from one
-    /// proves nothing about the other. The poll reads the Events API,
-    /// whose `pull_request` for a review-comment event is five keys —
-    /// `base, head, id, number, url` — with no `html_url` at all; a
-    /// webhook sends the full object. Feeding a full PR to the poll's
-    /// classifier is what let `url: null` go unnoticed on every
-    /// poll-sourced review comment.
+    /// The Events API's `pull_request` for a review-comment event is
+    /// five keys — `base, head, id, number, url` — with no `html_url`
+    /// at all. Feeding a full PR to the classifier is what let
+    /// `url: null` go unnoticed on every poll-sourced review comment.
     #[test]
     fn an_event_links_to_the_object_it_announces() {
         let all = &[GithubEventKind::PrComment];
@@ -1923,61 +1675,6 @@ pub(super) mod tests {
             "the stub carries no title to record"
         );
 
-        // The webhook's full pull_request: the comment still wins.
-        let hook = serde_json::json!({
-            "action": "created",
-            "sender": {"login": "x"},
-            "comment": {"id": 7, "html_url": "https://github.com/o/r/pull/602#discussion_r7"},
-            "pull_request": {
-                "number": 602, "title": "t",
-                "html_url": "https://github.com/o/r/pull/602"
-            }
-        });
-        let got = classify_webhook_flat(
-            "o/r",
-            "pull_request_review_comment",
-            &hook,
-            all,
-            Some("me"),
-            false,
-            &[],
-        )
-        .expect("classified");
-        let WaitItem::GithubEvent { url, title, .. } = &got.item else {
-            panic!("not a github event")
-        };
-        assert_eq!(
-            url.as_deref(),
-            Some("https://github.com/o/r/pull/602#discussion_r7"),
-            "the anchored comment beats the container, on this transport too",
-        );
-        assert_eq!(title.as_deref(), Some("t"));
-
-        // A review carries its own link under a different key.
-        let review = serde_json::json!({
-            "action": "submitted",
-            "sender": {"login": "x"},
-            "review": {"id": 9, "html_url": "https://github.com/o/r/pull/587#pullrequestreview-9"},
-            "pull_request": {"number": 587, "html_url": "https://github.com/o/r/pull/587"}
-        });
-        let got = classify_webhook_flat(
-            "o/r",
-            "pull_request_review",
-            &review,
-            all,
-            Some("me"),
-            false,
-            &[],
-        )
-        .expect("classified");
-        let WaitItem::GithubEvent { url, .. } = &got.item else {
-            panic!("not a github event")
-        };
-        assert_eq!(
-            url.as_deref(),
-            Some("https://github.com/o/r/pull/587#pullrequestreview-9"),
-        );
-
         // No object link: the container is the fallback, and a payload
         // with neither records NOTHING rather than an api address.
         let bare = serde_json::json!({
@@ -2005,24 +1702,19 @@ pub(super) mod tests {
         // that renders as a blank, which read as content rather than
         // as absence.
         let empty = serde_json::json!({
-            "action": "created",
-            "sender": {"login": "x"},
-            "comment": {"id": 7, "html_url": ""},
-            "pull_request": {
-                "number": 602, "title": "",
-                "html_url": "https://github.com/o/r/pull/602"
+            "type": "PullRequestReviewCommentEvent",
+            "actor": {"login": "x"},
+            "payload": {
+                "action": "created",
+                "comment": {"id": 7, "html_url": ""},
+                "pull_request": {
+                    "number": 602, "title": "",
+                    "html_url": "https://github.com/o/r/pull/602"
+                }
             }
         });
-        let got = classify_webhook_flat(
-            "o/r",
-            "pull_request_review_comment",
-            &empty,
-            all,
-            Some("me"),
-            false,
-            &[],
-        )
-        .expect("classified");
+        let got =
+            classify_event_flat("o/r", &empty, all, Some("me"), false, &[]).expect("classified");
         let WaitItem::GithubEvent { url, title, .. } = &got.item else {
             panic!("not a github event")
         };
@@ -2103,29 +1795,6 @@ pub(super) mod tests {
             "the comment's anchor, not the top of the thread",
         );
 
-        // The same family on the webhook.
-        let hook_issue = serde_json::json!({
-            "action": "created",
-            "sender": {"login": "x"},
-            "comment": {"id": 5, "html_url": "https://github.com/o/r/issues/12#issuecomment-5"},
-            "issue": issue,
-        });
-        assert_eq!(
-            url_of(
-                &classify_webhook_flat(
-                    "o/r",
-                    "issue_comment",
-                    &hook_issue,
-                    all,
-                    Some("me"),
-                    false,
-                    &[]
-                )
-                .expect("classified")
-            ),
-            Some("https://github.com/o/r/issues/12#issuecomment-5".into()),
-        );
-
         // A comment on a PR's conversation tab is the same resource
         // and must answer the same way.
         let pr_issue = serde_json::json!({
@@ -2151,115 +1820,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn webhook_classifier_maps_the_webhook_vocabulary() {
-        use GithubEventKind::*;
-        let all = &[
-            PrOpened,
-            PrUpdated,
-            PrMerged,
-            PrComment,
-            IssueOpened,
-            IssueClosed,
-            IssueComment,
-            BranchPush,
-        ][..];
-        let wh = |event: &str, payload: serde_json::Value| {
-            classify_webhook_flat("o/r", event, &payload, all, Some("me"), false, &[])
-        };
-        // Webhook shapes: top-level action, sender.login actor, review
-        // action SUBMITTED (not the feed's created), push uses after.
-        let cases = vec![
-            (
-                "pull_request",
-                serde_json::json!({"action":"opened","sender":{"login":"x"},
-                "pull_request":{"number":1,"title":"t","html_url":"u"}}),
-                "pr_opened",
-            ),
-            (
-                "pull_request",
-                serde_json::json!({"action":"synchronize","sender":{"login":"x"},
-                "pull_request":{"number":1}}),
-                "pr_updated",
-            ),
-            (
-                "pull_request",
-                serde_json::json!({"action":"closed","sender":{"login":"x"},
-                "pull_request":{"number":1,"merged":true}}),
-                "pr_merged",
-            ),
-            (
-                "pull_request_review",
-                serde_json::json!({"action":"submitted","sender":{"login":"x"},
-                "pull_request":{"number":1}}),
-                "pr_comment",
-            ),
-            (
-                "issue_comment",
-                serde_json::json!({"action":"created","sender":{"login":"x"},
-                "issue":{"number":2}}),
-                "issue_comment",
-            ),
-        ];
-        for (event, payload, want) in cases {
-            let item = wh(event, payload)
-                .unwrap_or_else(|| panic!("{event} → {want}"))
-                .item;
-            let WaitItem::GithubEvent { event: got, .. } = item else {
-                unreachable!()
-            };
-            assert_eq!(got, want);
-        }
-        // push: branch gate + compare url from before/after; tag ignored;
-        // own sender filtered.
-        let push = serde_json::json!({"ref":"refs/heads/main","before":"aa","after":"bb",
-            "commits":[{},{}],"sender":{"login":"x"}});
-        let item = wh("push", push).expect("branch push").item;
-        let WaitItem::GithubEvent { title, url, .. } = item else {
-            unreachable!()
-        };
-        assert_eq!(title.as_deref(), Some("main +2"));
-        assert_eq!(
-            url.as_deref(),
-            Some("https://github.com/o/r/compare/aa...bb")
-        );
-        assert!(
-            wh(
-                "push",
-                serde_json::json!({"ref":"refs/tags/v1","before":"a","after":"b",
-            "commits":[],"sender":{"login":"x"}})
-            )
-            .is_none(),
-            "tag push ignored"
-        );
-        assert!(
-            wh(
-                "push",
-                serde_json::json!({"ref":"refs/heads/main","before":"a","after":"b",
-            "commits":[],"sender":{"login":"me"}})
-            )
-            .is_none(),
-            "own push filtered"
-        );
-        // Non-creating webhook actions stay unmapped.
-        assert!(
-            wh(
-                "pull_request_review",
-                serde_json::json!({"action":"dismissed",
-            "sender":{"login":"x"},"pull_request":{}})
-            )
-            .is_none()
-        );
-        assert!(
-            wh(
-                "pull_request",
-                serde_json::json!({"action":"closed",
-            "sender":{"login":"x"},"pull_request":{"merged":false}})
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
     fn classification_actually_persists_the_reference() {
         // The helper being right proves nothing if the classifier does
         // not call it. Drive the REAL entry point and read the field
@@ -2267,17 +1827,17 @@ pub(super) mod tests {
         use clank_core::wait::ContentRef;
         let all = &[GithubEventKind::PrComment, GithubEventKind::PrOpened][..];
         let got = |event: &str, payload: serde_json::Value| {
-            classify_webhook_flat("o/r", event, &payload, all, Some("me"), false, &[]).map(|c| {
-                match c.item {
-                    WaitItem::GithubEvent { content, .. } => content,
-                    other => panic!("unexpected {other:?}"),
-                }
+            let event =
+                serde_json::json!({"type": event, "actor": {"login": "x"}, "payload": payload});
+            classify_event_flat("o/r", &event, all, Some("me"), false, &[]).map(|c| match c.item {
+                WaitItem::GithubEvent { content, .. } => content,
+                other => panic!("unexpected {other:?}"),
             })
         };
 
         assert_eq!(
             got(
-                "pull_request_review_comment",
+                "PullRequestReviewCommentEvent",
                 serde_json::json!({
                     "action": "created",
                     "pull_request": {"number": 42, "title": "t", "html_url": "u"},
@@ -2288,9 +1848,9 @@ pub(super) mod tests {
         );
         assert_eq!(
             got(
-                "pull_request_review",
+                "PullRequestReviewEvent",
                 serde_json::json!({
-                    "action": "submitted",
+                    "action": "created",
                     "pull_request": {"number": 42, "title": "t", "html_url": "u"},
                     "review": {"id": 901}
                 })
@@ -2302,7 +1862,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             got(
-                "pull_request",
+                "PullRequestEvent",
                 serde_json::json!({
                     "action": "opened",
                     "pull_request": {"number": 42, "title": "t", "html_url": "u"}
@@ -2472,149 +2032,38 @@ pub(super) mod tests {
                 assert_ne!(a, b, "same numeric id, different family → distinct keys");
             }
         }
-        // …and a MISSING required identity yields None on both
-        // transports (never a manufactured shared key).
+        // …and a MISSING required identity yields None (never a
+        // manufactured shared key).
         let missing_feed = feed_key(
             "PullRequestReviewEvent",
             serde_json::json!({"action":"created","pull_request":{"number":1}}),
         );
         assert_eq!(missing_feed, None, "no review.id → no key");
-        let missing_hook = classify_webhook_flat(
-            "o/r",
-            "pull_request",
-            &serde_json::json!({"action":"synchronize","sender":{"login":"x"},
-                "pull_request":{"number":12}}), // no head.sha
-            &[PrUpdated],
-            None,
-            false,
-            &[],
-        )
-        .expect("classifies")
-        .key;
-        assert_eq!(missing_hook, None, "no head sha → no key");
-        // Push without its sha: item still wakes, key is None.
-        let pushless = classify_webhook_flat(
-            "o/r",
-            "push",
-            &serde_json::json!({"ref":"refs/heads/main","before":"aa",
-                "commits":[],"sender":{"login":"x"}}),
-            &[BranchPush],
-            None,
-            false,
-            &[],
-        )
-        .expect("classifies")
-        .key;
-        assert_eq!(pushless, None);
-    }
-
-    #[test]
-    fn action_keys_are_identical_across_the_two_payload_forms() {
-        // THE coordinator invariant's foundation (codex e89be23): one
-        // underlying action, arriving as a feed event AND a webhook
-        // delivery, derives ONE key — from the objects both forms
-        // carry, never from feed ids or delivery GUIDs.
-        use GithubEventKind::*;
-        let all = &[
-            PrOpened,
-            PrUpdated,
-            PrMerged,
-            PrComment,
-            IssueOpened,
-            IssueClosed,
-            IssueComment,
-            BranchPush,
-        ][..];
-        let feed = |ty: &str, payload: serde_json::Value| {
+        let flat_key = |ty: &str, payload: serde_json::Value, kinds: &[GithubEventKind]| {
             classify_event_flat(
                 "o/r",
-                &serde_json::json!({"id":"40001","type":ty,"actor":{"login":"x"},"payload":payload}),
-                all, None, false, &[],
+                &serde_json::json!({"id":"1","type":ty,"actor":{"login":"x"},"payload":payload}),
+                kinds,
+                None,
+                false,
+                &[],
             )
-            .expect("feed classifies")
+            .expect("classifies")
             .key
         };
-        let hook = |name: &str, payload: serde_json::Value| {
-            classify_webhook_flat("o/r", name, &payload, all, None, false, &[])
-                .expect("webhook classifies")
-                .key
-        };
-        // pr_updated: head sha from pull_request.head.sha in both.
-        let pr = serde_json::json!({"number":12,"head":{"sha":"beef"}});
-        assert_eq!(
-            feed(
-                "PullRequestEvent",
-                serde_json::json!({"action":"synchronize","pull_request":pr})
-            ),
-            hook(
-                "pull_request",
-                serde_json::json!({"action":"synchronize","sender":{"login":"x"},
-                "pull_request":{"number":12,"head":{"sha":"beef"}}})
-            ),
+        let headless = flat_key(
+            "PullRequestEvent",
+            serde_json::json!({"action":"synchronize","pull_request":{"number":12}}),
+            &[PrUpdated],
         );
-        // review comment: comment.id in both.
-        assert_eq!(
-            feed(
-                "PullRequestReviewCommentEvent",
-                serde_json::json!({"action":"created",
-                "comment":{"id":77},"pull_request":{"number":12}})
-            ),
-            hook(
-                "pull_request_review_comment",
-                serde_json::json!({"action":"created",
-                "sender":{"login":"x"},"comment":{"id":77},"pull_request":{"number":12}})
-            ),
+        assert_eq!(headless, None, "no head sha → no key");
+        // Push without its sha: item still wakes, key is None.
+        let pushless = flat_key(
+            "PushEvent",
+            serde_json::json!({"ref":"refs/heads/main","before":"aa"}),
+            &[BranchPush],
         );
-        // submitted review: review.id in both (feed action created,
-        // webhook action submitted — same review).
-        assert_eq!(
-            feed(
-                "PullRequestReviewEvent",
-                serde_json::json!({"action":"created",
-                "review":{"id":88},"pull_request":{"number":12}})
-            ),
-            hook(
-                "pull_request_review",
-                serde_json::json!({"action":"submitted",
-                "sender":{"login":"x"},"review":{"id":88},"pull_request":{"number":12}})
-            ),
-        );
-        // push: feed head == webhook after for one push.
-        assert_eq!(
-            feed(
-                "PushEvent",
-                serde_json::json!({"ref":"refs/heads/main","size":2,
-                "before":"aa","head":"bb"})
-            ),
-            hook(
-                "push",
-                serde_json::json!({"ref":"refs/heads/main","before":"aa","after":"bb",
-                "commits":[{},{}],"sender":{"login":"x"}})
-            ),
-        );
-        // pr_opened / issues: number-keyed.
-        assert_eq!(
-            feed(
-                "PullRequestEvent",
-                serde_json::json!({"action":"opened","pull_request":{"number":5}})
-            ),
-            hook(
-                "pull_request",
-                serde_json::json!({"action":"opened","sender":{"login":"x"},
-                "pull_request":{"number":5}})
-            ),
-        );
-        assert_eq!(
-            feed(
-                "IssuesEvent",
-                serde_json::json!({"action":"closed","issue":{"number":9}})
-            ),
-            hook(
-                "issues",
-                serde_json::json!({"action":"closed","sender":{"login":"x"},
-                "issue":{"number":9}})
-            ),
-        );
+        assert_eq!(pushless, None);
     }
 
     // ── injected-runner poll state machine ─────────────────────
@@ -2953,49 +2402,6 @@ pub(super) mod tests {
         let c = classify_event_flat("o/r", &ev, &[GithubEventKind::IssueOpened], None, true, &[])
             .unwrap();
         assert_eq!(c.event_at, None);
-        // Webhook comment.created_at.
-        let c = classify_webhook_flat(
-            "o/r",
-            "issue_comment",
-            &serde_json::json!({"action":"created","sender":{"login":"them"},
-                "issue":{"number":2},
-                "comment":{"id":9,"created_at":"2026-07-29T01:02:03Z"}}),
-            &[GithubEventKind::IssueComment],
-            None,
-            true,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(c.event_at, Some(1_785_286_923));
-        // Webhook review.submitted_at.
-        let c = classify_webhook_flat(
-            "o/r",
-            "pull_request_review",
-            &serde_json::json!({"action":"submitted","sender":{"login":"them"},
-                "pull_request":{"number":3},
-                "review":{"id":8,"submitted_at":"2026-07-29T01:02:03Z"}}),
-            &[GithubEventKind::PrComment],
-            None,
-            true,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(c.event_at, Some(1_785_286_923));
-        // Webhook push head_commit.timestamp (offset form).
-        let c = classify_webhook_flat(
-            "o/r",
-            "push",
-            &serde_json::json!({"sender":{"login":"them"},
-                "ref":"refs/heads/main","before":"a","after":"b",
-                "commits":[{}],
-                "head_commit":{"timestamp":"2026-07-29T11:02:03+10:00"}}),
-            &[GithubEventKind::BranchPush],
-            None,
-            true,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(c.event_at, Some(1_785_286_923));
     }
 
     // ── what a loaded log means for the feed ─────────────────
@@ -3051,7 +2457,7 @@ pub(super) mod tests {
         l.action_keys = vec!["issue_opened#4".into()];
         assert!(
             FeedHorizon::restore(&l).established,
-            "a relay row is the feed's too — an empty baseline then a webhook",
+            "a row of the webhook relay older clanks ran is the feed's too",
         );
 
         let mut l = loaded(true);

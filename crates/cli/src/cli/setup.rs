@@ -2524,14 +2524,12 @@ mod tests {
             ci.contains("announced once"),
             "and that an unchanged build stays quiet: {ci}",
         );
-        // The two claims a reader could act on wrongly: that a
-        // conclusion between reads is kept (it is gone), and that a cue
-        // inside the window is lost (it is coalesced into one read).
+        // The claim a reader could act on wrongly: that a conclusion
+        // between reads is kept (it is gone).
         assert!(
             ci.contains("between two reads, or while no monitor ran"),
             "only what a read sees is kept: {ci}",
         );
-        assert!(ci.contains("COALESCED, never dropped"), "{ci}");
     }
 
     #[test]

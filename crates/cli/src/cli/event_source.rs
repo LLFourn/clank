@@ -40,14 +40,8 @@ pub(crate) enum Lifecycle {
     Stopped {
         why: String,
     },
-    /// A github watch's webhook is proven listening.
-    Listening,
-    /// A github watch's webhook is not listening; `polling` says
-    /// whether its optional timer keeps it reading meanwhile.
-    Degraded {
-        why: String,
-        polling: bool,
-    },
+    /// A github watch polling, as of its last attempt.
+    Polling(crate::cli::github::progress::PollRecord),
     /// Waiting to start it again after it ended or failed to start.
     BackingOff {
         until: u64,
