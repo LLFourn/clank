@@ -98,6 +98,7 @@ mod wake_receipt;
 pub(crate) mod wake_render;
 pub(crate) mod wake_repeat;
 pub(crate) mod web;
+pub(crate) mod zellij_endpoint;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {

@@ -10,6 +10,8 @@ use anyhow::Context;
 
 use crate::proc_run::{self, Group, Out, RunError, Spec, Stdin};
 
+use super::zellij_endpoint::{self, Endpoint, Resolved, Session};
+
 use super::OpenArgs;
 use super::{repo_basename, resolve_repo};
 
@@ -29,24 +31,28 @@ pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     if !args.print {
         require_zellij()?;
     }
-    // Capture the route once. Both lookup and creation use the current session
-    // implicitly, or the same deterministic named session outside Zellij.
-    let current = in_session().then(|| SessionTarget::Current {
-        name: std::env::var("ZELLIJ_SESSION_NAME").ok(),
-    });
-    run_with(&mut RealOpenIo, &args, current).await
+    let current = match zellij_endpoint::own_endpoint() {
+        Resolved::Found(ep) => Some(ep),
+        Resolved::NotInZellij => None,
+        Resolved::Unknown(_) if args.print => None,
+        Resolved::Unknown(why) => anyhow::bail!(
+            "could not tell which zellij session this shell runs in ({why}), so where to \
+             open is unknown. Nothing was opened; retry."
+        ),
+    };
+    run_with(&mut RealOpenIo, &args, current.as_ref()).await
 }
 
-/// [`run`] with its I/O and the caller's session supplied.
+/// [`run`] with its I/O and the caller's own server supplied.
 ///
 /// Whether a target is already open is decided by one scan of every
-/// session on the machine, by the repo path its panes name: never by a tab
+/// server on the machine, by the repo path its panes name: never by a tab
 /// or session name, which only place what is opened. A target open
 /// anywhere is reported where it is and not opened again.
 async fn run_with(
     io: &mut impl OpenIo,
     args: &OpenArgs,
-    current: Option<SessionTarget>,
+    current: Option<&Endpoint>,
 ) -> anyhow::Result<()> {
     let source = resolve_repo(args.repo.as_deref())?;
     // --all = the pwd repo AND all its worktrees (`git worktree list`),
@@ -62,63 +68,109 @@ async fn run_with(
         vec![source.clone()]
     };
     // --print is a layout preview, not a query against the user's server.
-    let (targets, hosts) = if args.print {
-        (targets, Vec::new())
+    let (targets, host) = if args.print {
+        (targets, None)
     } else {
         let scan = io.scan().await;
         require_complete(&scan)?;
-        let sorted = sort_targets(&scan, targets, current.as_ref());
+        let sorted = sort_targets(&scan, targets, current);
         for report in &sorted.reports {
             io.report(report);
         }
-        (sorted.missing, sorted.hosts)
+        let host = if args.all && current.is_none() && !sorted.missing.is_empty() {
+            repo_host(&scan, &source)?
+        } else {
+            None
+        };
+        (sorted.missing, host)
     };
     if targets.is_empty() {
         return Ok(());
     }
+    if let Some(current) = current {
+        // Inside a session: add each target's tab to the caller's own
+        // server. The in-session tab add does not block, so the loop runs
+        // to completion (unlike an outside create per target, which would
+        // block on the first — codex 03be1fb).
+        return open_current_targets(io, current, &targets, args.print).await;
+    }
     if args.all {
-        if let Some(current) = &current {
-            // Inside a session: add each target's tab to the CURRENT
-            // session. `open_one`'s in-session tab spawn is non-blocking,
-            // so the loop runs to completion (unlike an outside
-            // attach/create per target, which would block on the first —
-            // codex 03be1fb).
-            open_current_targets(io, current, &targets, args.print).await?;
-        } else {
-            open_all(io, &source, &targets, &hosts, args.print).await?;
-        }
-        return Ok(());
+        return open_all(io, &source, &targets, host.as_ref(), args.print).await;
     }
-    let target = &targets[0];
-    let session = current.unwrap_or(SessionTarget::Named(session_name(&repo_basename(target)?)));
-    open_one(io, &session, target, args.print, None).await
+    open_new_session(io, &targets[0], args.print).await
 }
 
-/// `Current` deliberately retains Zellij's implicit in-session routing for
-/// both query and creation. The optional name is diagnostic context only; it
-/// does not select a different server or authorize a fallback session.
-#[derive(Debug)]
-enum SessionTarget {
-    Current { name: Option<String> },
-    Named(String),
-}
-
-impl SessionTarget {
-    fn description(&self) -> String {
-        match self {
-            Self::Current { name: Some(name) } => format!("the shell's current session `{name}`"),
-            Self::Current { name: None } => "the shell's current session ($ZELLIJ is set)".into(),
-            Self::Named(name) => format!("session `{name}`"),
+/// The one live session running `repo`'s TUI, from a complete scan:
+/// `None` when no session does, and a refusal naming each when several do.
+fn repo_host(scan: &SessionScan, repo: &Path) -> anyhow::Result<Option<Session>> {
+    let mut hosts: Vec<&Session> = Vec::new();
+    for sp in &scan.panes {
+        if is_anchor(&sp.pane, repo) && !sp.pane.exited && !hosts.contains(&&sp.session) {
+            hosts.push(&sp.session);
         }
     }
+    match hosts.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => anyhow::bail!(
+            "{}'s TUI runs in {} sessions ({}), so which one its workspace is cannot be \
+             known. Nothing was opened; close all but one, then retry.",
+            repo.display(),
+            many.len(),
+            many.iter()
+                .map(|s| describe_session(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
 
-    fn tab_query_argv(&self) -> Vec<String> {
-        let mut argv = vec!["zellij".into()];
-        if let Self::Named(name) = self {
-            argv.extend(["-s".into(), name.clone()]);
+/// The session a repo's workspace is in: this process's own server when
+/// it runs under one, else the one live session running the repo's TUI,
+/// from a complete scan. Refuses when that can't be told, or no session or
+/// several run it.
+pub(crate) fn workspace_session(repo: &Path) -> anyhow::Result<Session> {
+    match zellij_endpoint::own_endpoint() {
+        Resolved::Found(ep) => {
+            let name = ep
+                .current_name(&zellij_endpoint::ZellijIndex)
+                .map_err(anyhow::Error::msg)?;
+            return Ok(Session::new(ep, name));
         }
-        argv.extend(["action".into(), "query-tab-names".into()]);
-        argv
+        Resolved::Unknown(why) => {
+            anyhow::bail!("which zellij server this process runs under could not be told: {why}")
+        }
+        Resolved::NotInZellij => {}
+    }
+    let scan = panes_in_all_sessions(std::time::Duration::from_secs(3));
+    require_complete(&scan)?;
+    repo_host(&scan, repo)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no zellij session runs {}'s TUI — `clank open` opens one",
+            repo.display()
+        )
+    })
+}
+
+/// Where an `open` call goes: an endpoint, under the name it has at the
+/// call, or `zellij` on PATH addressing no session (a listing of names to
+/// avoid, or a new session's start).
+#[derive(Debug, Clone, Copy)]
+enum At<'a> {
+    Endpoint(&'a Endpoint),
+    Path,
+}
+
+impl At<'_> {
+    fn display(&self, args: &[String]) -> String {
+        let head = match self {
+            At::Endpoint(ep) => format!("zellij (at {ep})"),
+            At::Path => "zellij".to_string(),
+        };
+        std::iter::once(head)
+            .chain(args.iter().map(|a| crate::shell_quote::shell_quote(a)))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -132,9 +184,9 @@ struct QueryOutput {
 /// A narrow seam for the actual open path. Fixtures exercise lookup, layout
 /// writes and spawn decisions together without starting a Zellij server.
 trait OpenIo {
-    async fn query(&mut self, argv: &[String]) -> anyhow::Result<QueryOutput>;
-    fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()>;
-    /// Every pane of every zellij session on the machine.
+    async fn query(&mut self, at: At<'_>, args: &[String]) -> anyhow::Result<QueryOutput>;
+    async fn spawn(&mut self, at: At<'_>, args: &[String]) -> anyhow::Result<()>;
+    /// Every pane of every zellij server on the machine.
     async fn scan(&mut self) -> SessionScan;
     /// Record that clank owns `repo`'s panes for `labels`.
     fn own(
@@ -157,17 +209,54 @@ trait OpenIo {
 
 struct RealOpenIo;
 
+const OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl OpenIo for RealOpenIo {
-    async fn query(&mut self, argv: &[String]) -> anyhow::Result<QueryOutput> {
-        run_open_query(argv, std::time::Duration::from_secs(3)).await
+    async fn query(&mut self, at: At<'_>, args: &[String]) -> anyhow::Result<QueryOutput> {
+        match at {
+            At::Path => {
+                let argv: Vec<String> = std::iter::once("zellij".to_string())
+                    .chain(args.iter().cloned())
+                    .collect();
+                run_open_query(&argv, OPEN_BUDGET).await
+            }
+            At::Endpoint(ep) => match zellij_async(ep, args, OPEN_BUDGET).await {
+                Err(CallFailed::Unnamed(why)) => {
+                    anyhow::bail!("`{}`: {why}; nothing was asked", at.display(args))
+                }
+                Err(CallFailed::Run(e)) => query_output(&at.display(args), Err(e), OPEN_BUDGET),
+                Ok(out) => query_output(&at.display(args), Ok(out), OPEN_BUDGET),
+            },
+        }
     }
 
-    fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()> {
-        spawn_zellij(argv)
+    async fn spawn(&mut self, at: At<'_>, args: &[String]) -> anyhow::Result<()> {
+        match at {
+            At::Path => {
+                let argv: Vec<String> = std::iter::once("zellij".to_string())
+                    .chain(args.iter().cloned())
+                    .collect();
+                spawn_zellij(&argv)
+            }
+            // Adding tabs to a live server returns at once, so it runs
+            // captured: its stderr is what tells a rename apart.
+            At::Endpoint(_) => {
+                let out = self.query(at, args).await?;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "zellij failed to {} (exit {}): {}",
+                        spawn_kind(args),
+                        out.status,
+                        out.stderr.trim()
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     async fn scan(&mut self) -> SessionScan {
-        panes_in_all_sessions_async(std::time::Duration::from_secs(3)).await
+        panes_in_all_sessions_async(OPEN_BUDGET).await
     }
 
     fn own(
@@ -208,7 +297,7 @@ async fn run_open_query(
     budget: std::time::Duration,
 ) -> anyhow::Result<QueryOutput> {
     let out = proc_run::run(query_spec(Spec::new(&argv[0]).args(&argv[1..])), budget).await;
-    query_output(argv, out, budget)
+    query_output(&display_argv(argv), out, budget)
 }
 
 const QUERY_STDOUT_CAP: usize = 1024 * 1024;
@@ -230,27 +319,27 @@ fn query_spec(spec: Spec) -> Spec {
 }
 
 fn query_output(
-    argv: &[String],
+    shown: &str,
     out: Result<proc_run::Output, RunError>,
     budget: std::time::Duration,
 ) -> anyhow::Result<QueryOutput> {
     let out = match out {
         Ok(out) => out,
         Err(RunError::Spawn(e)) => {
-            return Err(e).with_context(|| format!("could not run `{}`", display_argv(argv)));
+            return Err(e).with_context(|| format!("could not run `{}`", shown));
         }
         Err(e @ RunError::Overflow { .. }) => anyhow::bail!(
             "`{}`: {e}; stdout exceeded {QUERY_STDOUT_CAP} bytes; listing is unknown",
-            display_argv(argv)
+            shown
         ),
         Err(e @ RunError::Timeout { .. }) => anyhow::bail!(
             "`{}` timed out after {budget:?}; stderr (last {QUERY_STDERR_CAP} bytes): {}",
-            display_argv(argv),
+            shown,
             e.stderr()
         ),
         Err(e) => anyhow::bail!(
             "`{}` {e}; stderr (last {QUERY_STDERR_CAP} bytes): {}",
-            display_argv(argv),
+            shown,
             e.stderr()
         ),
     };
@@ -258,7 +347,7 @@ fn query_output(
     let stdout = String::from_utf8(out.stdout).with_context(|| {
         format!(
             "`{}` returned non-UTF-8 stdout; listing is unknown; stderr: {stderr}",
-            display_argv(argv)
+            shown
         )
     })?;
     Ok(QueryOutput {
@@ -268,37 +357,110 @@ fn query_output(
     })
 }
 
-/// Replaceable per thread, so a test can stand in for a zellij that hangs.
-fn zellij_program() -> std::ffi::OsString {
+/// The program a call runs: `default` (the endpoint's server executable,
+/// or `zellij` on PATH where no endpoint is addressed). Replaceable per
+/// thread, so a test can stand in for a zellij that hangs.
+fn zellij_program(default: impl Into<std::ffi::OsString>) -> std::ffi::OsString {
     #[cfg(test)]
     if let Some(stand_in) = tests::ZELLIJ_STAND_IN.with(|s| s.borrow().clone()) {
         return stand_in.into();
     }
-    "zellij".into()
+    default.into()
 }
 
-fn zellij_sync(args: &[&str]) -> Result<proc_run::Output, RunError> {
-    proc_run::run_blocking(
-        query_spec(Spec::new(zellij_program()).args(args)),
-        ZELLIJ_BUDGET,
+/// Why a call to an endpoint produced no output.
+#[derive(Debug)]
+pub(crate) enum CallFailed {
+    /// The endpoint's current name could not be learned, so nothing ran.
+    Unnamed(String),
+    Run(RunError),
+}
+
+impl std::fmt::Display for CallFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unnamed(why) => f.write_str(why),
+            Self::Run(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn failed_stderr(out: &Result<proc_run::Output, RunError>) -> Option<&str> {
+    match out {
+        Ok(o) if !o.status.success() => std::str::from_utf8(&o.stderr).ok(),
+        _ => None,
+    }
+}
+
+/// `zellij --session <its name now> <args>` against `ep`, bounded, the
+/// name looked up just before the call and once more on a miss.
+fn zellij_sync(ep: &Endpoint, args: &[&str]) -> Result<proc_run::Output, CallFailed> {
+    zellij_endpoint::dispatch(
+        || ep.client(),
+        |c| {
+            proc_run::run_blocking(
+                query_spec(c.spec(zellij_program(&c.program), args)),
+                ZELLIJ_BUDGET,
+            )
+        },
+        failed_stderr,
     )
+    .map_err(CallFailed::Unnamed)?
+    .map_err(CallFailed::Run)
 }
 
-fn lookup_context(target: &SessionTarget, subject: &str) -> String {
+/// [`zellij_sync`] from async code, under `budget`.
+async fn zellij_async(
+    ep: &Endpoint,
+    args: &[String],
+    budget: std::time::Duration,
+) -> Result<proc_run::Output, CallFailed> {
+    run_at(
+        || ep.client(),
+        |c| query_spec(c.spec(zellij_program(&c.program), args)),
+        budget,
+    )
+    .await
+    .map_err(CallFailed::Unnamed)?
+    .map_err(CallFailed::Run)
+}
+
+/// [`zellij_endpoint::dispatch`]'s rule from async code: run the spec
+/// for the client `lookup` gives, and once more for a fresh lookup when
+/// zellij answered that it knows no such name.
+async fn run_at(
+    lookup: impl Fn() -> Result<zellij_endpoint::Client, String>,
+    spec: impl Fn(&zellij_endpoint::Client) -> Spec,
+    budget: std::time::Duration,
+) -> Result<Result<proc_run::Output, RunError>, String> {
+    let client = lookup()?;
+    let out = proc_run::run(spec(&client), budget).await;
+    if failed_stderr(&out).is_some_and(|e| client.missed(e)) {
+        let again = lookup()?;
+        return Ok(proc_run::run(spec(&again), budget).await);
+    }
+    Ok(out)
+}
+
+fn lookup_context(at: At<'_>, subject: &str) -> String {
+    let what = match at {
+        At::Endpoint(ep) => format!("the session at `{ep}`"),
+        At::Path => "zellij's sessions".to_string(),
+    };
     format!(
-        "could not determine {subject} for {}. No tab/session creation was requested after this failed lookup; check this shell's Zellij session/socket access",
-        target.description()
+        "could not determine {subject} for {what}. No tab/session creation was requested after this failed lookup; check this shell's Zellij session/socket access"
     )
 }
 
-async fn query_tabs(io: &mut impl OpenIo, target: &SessionTarget) -> anyhow::Result<Vec<String>> {
-    let argv = target.tab_query_argv();
+async fn query_tabs(io: &mut impl OpenIo, ep: &Endpoint) -> anyhow::Result<Vec<String>> {
+    let args = ["action", "query-tab-names"].map(str::to_string);
+    let at = At::Endpoint(ep);
     let query = async {
-        let out = io.query(&argv).await?;
+        let out = io.query(at, &args).await?;
         if !out.status.success() {
             anyhow::bail!(
                 "`{}` exited {}; stderr (last 4096 bytes): {}",
-                display_argv(&argv),
+                at.display(&args),
                 out.status,
                 out.stderr
             );
@@ -306,40 +468,40 @@ async fn query_tabs(io: &mut impl OpenIo, target: &SessionTarget) -> anyhow::Res
         Ok(out.stdout.lines().map(str::to_string).collect())
     }
     .await;
-    query.with_context(|| lookup_context(target, "whether the tab already exists"))
+    query.with_context(|| lookup_context(at, "whether the tab already exists"))
 }
 
-/// The `list-sessions -n` listing, for deciding where to create.
-async fn query_listing(io: &mut impl OpenIo, target: &SessionTarget) -> anyhow::Result<String> {
-    let argv = vec!["zellij".into(), "list-sessions".into(), "-n".into()];
+/// The `list-sessions -n` listing, for choosing a new session's name.
+async fn query_listing(io: &mut impl OpenIo) -> anyhow::Result<String> {
+    let args = ["list-sessions", "-n"].map(str::to_string);
     let query: anyhow::Result<String> = async {
-        let out = io.query(&argv).await?;
+        let out = io.query(At::Path, &args).await?;
         interpret_listing(out.status.success(), &out.stdout, &out.stderr).with_context(|| {
             format!(
                 "`{}` exited {}; stderr (last 4096 bytes): {}",
-                display_argv(&argv),
+                At::Path.display(&args),
                 out.status,
                 out.stderr
             )
         })
     }
     .await;
-    query.with_context(|| lookup_context(target, "whether the session exists"))
+    query.with_context(|| lookup_context(At::Path, "which session names are taken"))
 }
 
 async fn open_current_targets(
     io: &mut impl OpenIo,
-    session: &SessionTarget,
+    current: &Endpoint,
     targets: &[PathBuf],
     print: bool,
 ) -> anyhow::Result<()> {
     let mut tabs = if print {
         Vec::new()
     } else {
-        query_tabs(io, session).await?
+        query_tabs(io, current).await?
     };
     for target in targets {
-        let tab = open_tab(io, session, target, print, Some(&tabs)).await?;
+        let tab = open_tab(io, current, target, print, &tabs).await?;
         // A successfully requested tab is known locally. Reuse this one query
         // throughout --all rather than querying the same session per worktree.
         tabs.push(tab);
@@ -391,72 +553,21 @@ struct TabSpec {
     reviewers: Vec<String>,
 }
 
-/// How `--all` outside a session places the targets that are not open
-/// anywhere. Pure / testable.
-#[derive(Clone, PartialEq, Debug)]
-enum AllPlan {
-    /// (Re)create a fresh session with every target tab. `delete_first`
-    /// clears a dead same-named session first.
-    CreateFresh { delete_first: bool },
-    /// Add the tabs to a live session this repo already lives in.
-    AddTabs,
-}
-
-/// Where `--all` outside a session puts `targets`: the conventional
-/// `clank-<repo>` session only when this repo is already open in it (`hosts`
-/// names the sessions that hold any of its targets), otherwise a session of
-/// its own, never one that belongs to another repo.
-fn plan_all(listing: &str, conventional: &str, hosts: &[String]) -> (bool, AllPlan) {
-    match decide_session(listing, conventional) {
-        SessionPlan::Attach if hosts.iter().any(|h| h == conventional) => (true, AllPlan::AddTabs),
-        SessionPlan::Attach => (
-            false,
-            AllPlan::CreateFresh {
-                delete_first: false,
-            },
-        ),
-        SessionPlan::DeleteDeadThenCreate => (true, AllPlan::CreateFresh { delete_first: true }),
-        SessionPlan::Create => (
-            true,
-            AllPlan::CreateFresh {
-                delete_first: false,
-            },
-        ),
-    }
-}
-
 /// `--all` outside a session: open a tab for every target not open
-/// anywhere. Into the `clank-<repo>` session when this repo already lives
-/// there (adding tabs, since a plain `attach` would ignore the layout —
-/// codex a0c53c9); else a fresh session, under its conventional name unless
-/// another repo holds that, then attach. Each tab gets a name no other tab
-/// there has. Teamless worktrees are skipped with a notice.
+/// anywhere. Into the one live session running this repo's TUI, as added
+/// tabs (a plain `attach` would ignore the layout — codex a0c53c9); else a
+/// fresh session under a name no listed session has. Each tab gets a name
+/// no other tab there has. Teamless worktrees are skipped with a notice.
 async fn open_all(
     io: &mut impl OpenIo,
     source: &Path,
     targets: &[PathBuf],
-    hosts: &[String],
+    host: Option<&Session>,
     print: bool,
 ) -> anyhow::Result<()> {
-    let conventional = session_name(&repo_basename(source)?);
-    let (name, plan, mut taken) = if print {
-        (
-            conventional,
-            AllPlan::CreateFresh {
-                delete_first: false,
-            },
-            Vec::new(),
-        )
-    } else {
-        let listing = query_listing(io, &SessionTarget::Named(conventional.clone())).await?;
-        match plan_all(&listing, &conventional, hosts) {
-            (true, AllPlan::AddTabs) => {
-                let tabs = query_tabs(io, &SessionTarget::Named(conventional.clone())).await?;
-                (conventional, AllPlan::AddTabs, tabs)
-            }
-            (true, plan) => (conventional, plan, Vec::new()),
-            (false, plan) => (unused_session_name(source, &listing)?, plan, Vec::new()),
-        }
+    let mut taken = match host {
+        Some(host) if !print => query_tabs(io, host.endpoint()).await?,
+        _ => Vec::new(),
     };
     let mut named = Vec::new();
     for target in targets {
@@ -472,27 +583,25 @@ async fn open_all(
     let (rows, cols) = io.term_size();
     let kdl = compose_multitab(&tabs, (cols, rows))?;
     let layout_path = layout_file_path(source);
-    let (pre, spawn) = match plan {
-        AllPlan::CreateFresh { delete_first } => (
-            delete_first.then(|| delete_argv(&name)),
-            create_argv(&layout_path, &name),
-        ),
-        AllPlan::AddTabs => (None, add_tabs_argv(&layout_path, &name)),
+    let (at, spawn) = match host {
+        Some(host) => (At::Endpoint(host.endpoint()), add_tabs_args(&layout_path)),
+        None => {
+            let name = if print {
+                session_name(&repo_basename(source)?)
+            } else {
+                unused_session_name(source, &query_listing(io).await?)?
+            };
+            (At::Path, create_args(&layout_path, &name))
+        }
     };
 
     if print {
         println!("{kdl}");
-        if let Some(pre) = &pre {
-            eprintln!("pre-spawn: {}", pre.join(" "));
-        }
-        eprintln!("spawn: {}", spawn.join(" "));
+        eprintln!("spawn: {}", at.display(&spawn));
         return Ok(());
     }
     write_layout_file(source, &kdl)?;
-    if let Some(pre) = &pre {
-        let _ = io.spawn(pre);
-    }
-    io.spawn(&spawn)?;
+    io.spawn(at, &spawn).await?;
     for tab in &tabs {
         own_opened(io, Path::new(&tab.repo_path), &tab.master, &tab.reviewers);
     }
@@ -530,7 +639,7 @@ fn resolve_tabs(targets: &[(PathBuf, String)]) -> anyhow::Result<Vec<TabSpec>> {
 /// say what clank was doing and what to try — not to repeat an exit
 /// code the user can see.
 fn spawn_zellij(argv: &[String]) -> anyhow::Result<()> {
-    let what = spawn_kind(argv);
+    let what = spawn_kind(&argv[1..]);
     let status = proc_run::interactive(
         Spec::new(&argv[0])
             .args(&argv[1..])
@@ -554,13 +663,15 @@ fn spawn_zellij(argv: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What a spawn argv is FOR, in the user's terms, for error messages.
-fn spawn_kind(argv: &[String]) -> &'static str {
-    match argv.get(1).map(String::as_str) {
-        Some("attach") => "attach to the repo's session",
-        Some("action") => "add a tab to the current session",
-        Some("--layout") | Some("-l") => "start the repo's session",
-        _ => "open the workspace",
+/// What a spawn's arguments (after the program) are FOR, in the user's
+/// terms, for error messages.
+fn spawn_kind(args: &[String]) -> &'static str {
+    if args.iter().any(|a| a == "--new-session-with-layout") {
+        "start the repo's session"
+    } else if args.iter().any(|a| a == "--layout" || a == "-l") {
+        "add the repo's tab"
+    } else {
+        "open the workspace"
     }
 }
 
@@ -607,83 +718,65 @@ fn compose_multitab(tabs: &[TabSpec], term: (u16, u16)) -> anyhow::Result<String
     with_pane_keys(&s)
 }
 
-/// Open the agent workspace for one repo/worktree that is not open
-/// anywhere: a tab in the current session, or a session of its own outside
-/// one. A tab or session already using the conventional name is another
-/// repo's, so the target gets a name nothing there has.
-async fn open_one(
-    io: &mut impl OpenIo,
-    target: &SessionTarget,
-    repo: &Path,
-    print: bool,
-    known_tabs: Option<&[String]>,
-) -> anyhow::Result<()> {
-    open_tab(io, target, repo, print, known_tabs)
-        .await
-        .map(drop)
+/// Outside zellij: open `repo`, open nowhere, as a session of its own
+/// under a name no listed session has, live or exited. A session already
+/// using the conventional name is another repo's, or dead, and is left
+/// alone.
+async fn open_new_session(io: &mut impl OpenIo, repo: &Path, print: bool) -> anyhow::Result<()> {
+    let name = if print {
+        session_name(&repo_basename(repo)?)
+    } else {
+        unused_session_name(repo, &query_listing(io).await?)?
+    };
+    let (team, kdl) = compose_for(io, repo, &repo_basename(repo)?)?;
+    let args = create_args(&layout_file_path(repo), &name);
+    launch(io, repo, team, kdl, At::Path, &args, print).await
 }
 
-/// [`open_one`], saying the name of the tab it opened.
+/// Inside zellij: open `repo`'s tab in the caller's own server, named so
+/// no tab in `tabs` shares it, and say the name it got.
 async fn open_tab(
     io: &mut impl OpenIo,
-    target: &SessionTarget,
+    current: &Endpoint,
     repo: &Path,
     print: bool,
-    known_tabs: Option<&[String]>,
+    tabs: &[String],
 ) -> anyhow::Result<String> {
-    let repo = repo.to_path_buf();
-    let basename = repo_basename(&repo)?;
+    let tab = if print {
+        repo_basename(repo)?
+    } else {
+        unused_tab_name(repo, tabs)?
+    };
+    let (team, kdl) = compose_for(io, repo, &tab)?;
+    let args = in_session_tab_args(&layout_file_path(repo));
+    launch(io, repo, team, kdl, At::Endpoint(current), &args, print).await?;
+    Ok(tab)
+}
+
+struct Team {
+    master: String,
+    reviewers: Vec<String>,
+}
+
+/// `repo`'s team and the single-tab layout for it, its tab named `tab`.
+fn compose_for(io: &impl OpenIo, repo: &Path, tab: &str) -> anyhow::Result<(Team, String)> {
     // Registration is the resolved roster
     // (`teams-based-agent-registration`): exactly one master plus
     // its reviewers, no role-triage needed.
-    let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
+    let Some(set) = crate::agent_store::try_resolve_via_team(repo)? else {
         anyhow::bail!(
             "this repo has no agents configured. Run `clank agent add <name>` (the first \
              agent becomes master) to build a roster, or `clank init --team <name>` \
              to seed one from a template."
         );
     };
-    let master_label = set.master.as_str().to_string();
-    let reviewer_labels: Vec<String> = set
-        .members
-        .iter()
-        .map(|r| r.label.as_str().to_string())
-        .collect();
-    let repo_path_str = repo.display().to_string();
-    let layout_path = layout_file_path(&repo);
-    // --print is a layout preview, not a query against the user's server.
-    let (tab, pre_argv, spawn_argv) = match target {
-        SessionTarget::Current { .. } => {
-            let tab = if print {
-                basename.clone()
-            } else {
-                let queried;
-                let tabs = match known_tabs {
-                    Some(tabs) => tabs,
-                    None => {
-                        queried = query_tabs(io, target).await?;
-                        &queried
-                    }
-                };
-                unused_tab_name(&repo, tabs)?
-            };
-            (tab, None, in_session_tab_argv(&layout_path))
-        }
-        SessionTarget::Named(name) => {
-            let listing = if print {
-                String::new()
-            } else {
-                query_listing(io, target).await?
-            };
-            let (pre, name) = match decide_session(&listing, name) {
-                SessionPlan::Create => (None, name.clone()),
-                SessionPlan::DeleteDeadThenCreate => (Some(delete_argv(name)), name.clone()),
-                // Live, and not this repo's (the scan found it nowhere):
-                // another repo's session, never attached to.
-                SessionPlan::Attach => (None, unused_session_name(&repo, &listing)?),
-            };
-            (basename.clone(), pre, create_argv(&layout_path, &name))
-        }
+    let team = Team {
+        master: set.master.as_str().to_string(),
+        reviewers: set
+            .members
+            .iter()
+            .map(|r| r.label.as_str().to_string())
+            .collect(),
     };
     // User-authored layout chrome from `~/.clank/config.json`
     // (`zellij-layout-config-around-agent-panes`); None → the
@@ -696,39 +789,41 @@ async fn open_tab(
     // (cols, rows).
     let (rows, cols) = io.term_size();
     let kdl = compose_kdl(
-        &tab,
-        &repo_path_str,
-        &master_label,
-        &reviewer_labels,
+        tab,
+        &repo.display().to_string(),
+        &team.master,
+        &team.reviewers,
         user_template.as_deref(),
         Orientation::detect((cols, rows)),
     )?;
+    Ok((team, kdl))
+}
 
+/// Print, or write the layout and run the spawn, then record ownership.
+async fn launch(
+    io: &mut impl OpenIo,
+    repo: &Path,
+    team: Team,
+    kdl: String,
+    at: At<'_>,
+    args: &[String],
+    print: bool,
+) -> anyhow::Result<()> {
     if print {
         println!("{kdl}");
-        if let Some(pre) = &pre_argv {
-            eprintln!("pre-spawn: {}", pre.join(" "));
-        }
-        eprintln!("spawn: {}", spawn_argv.join(" "));
-        return Ok(tab);
+        eprintln!("spawn: {}", at.display(args));
+        return Ok(());
     }
-
-    write_layout_file(&repo, &kdl)?;
-
-    if let Some(pre) = &pre_argv {
-        // Best-effort: a failed delete of a dead session just means
-        // the create below errors visibly.
-        let _ = io.spawn(pre);
-    }
-    io.spawn(&spawn_argv)?;
-    own_opened(io, &repo, &master_label, &reviewer_labels);
-    Ok(tab)
+    write_layout_file(repo, &kdl)?;
+    io.spawn(at, args).await?;
+    own_opened(io, repo, &team.master, &team.reviewers);
+    Ok(())
 }
 
 /// Where a repo is already open: one tab of one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Location {
-    session: String,
+    session: Session,
     tab_id: Option<u32>,
     /// The tab's place in the tab bar, from 0, as zellij reports it: what
     /// a person counts, unlike `tab_id`.
@@ -819,23 +914,12 @@ struct Sorted {
     missing: Vec<PathBuf>,
     /// Where each open target is, and how to get there.
     reports: Vec<String>,
-    /// The sessions holding any open target.
-    hosts: Vec<String>,
 }
 
-fn sort_targets(
-    scan: &SessionScan,
-    targets: Vec<PathBuf>,
-    caller: Option<&SessionTarget>,
-) -> Sorted {
-    let here = match caller {
-        Some(SessionTarget::Current { name }) => name.as_deref(),
-        _ => None,
-    };
+fn sort_targets(scan: &SessionScan, targets: Vec<PathBuf>, caller: Option<&Endpoint>) -> Sorted {
     let mut sorted = Sorted {
         missing: Vec::new(),
         reports: Vec::new(),
-        hosts: Vec::new(),
     };
     for target in targets {
         let found = locations(scan, &target);
@@ -843,10 +927,7 @@ fn sort_targets(
             sorted.missing.push(target);
             continue;
         }
-        sorted
-            .reports
-            .push(describe(&target, &found, caller.is_some(), here));
-        sorted.hosts.extend(found.into_iter().map(|l| l.session));
+        sorted.reports.push(describe(&target, &found, caller));
     }
     sorted
 }
@@ -877,8 +958,9 @@ fn require_complete(scan: &SessionScan) -> anyhow::Result<()> {
 
 /// Where `repo` is open, and how to get there from the caller: outside
 /// zellij (`here` is `None`), inside the session it is in, or inside
-/// another (`here` names the caller's session, when known).
-fn describe(repo: &Path, found: &[Location], inside: bool, here: Option<&str>) -> String {
+/// another. Several places name each session by its socket too, since two
+/// roots can hold sessions of one name.
+fn describe(repo: &Path, found: &[Location], here: Option<&Endpoint>) -> String {
     let mut out = format!("`{}` is already open:", repo.display());
     for l in found {
         let tab = match l.position {
@@ -891,20 +973,24 @@ fn describe(repo: &Path, found: &[Location], inside: bool, here: Option<&str>) -
         };
         let attach = format!(
             "zellij attach {}",
-            crate::shell_quote::shell_quote(&l.session)
+            crate::shell_quote::shell_quote(l.session.name())
         );
-        let way = match (inside, here) {
-            (false, _) => format!("run `{attach}`, then go to {tab}"),
-            (true, Some(here)) if here == l.session => format!("switch to {tab} in this session"),
-            (true, _) => format!(
+        let way = match here {
+            None => format!("run `{attach}`, then go to {tab}"),
+            Some(here) if here == l.session.endpoint() => {
+                format!("switch to {tab} in this session")
+            }
+            Some(_) => format!(
                 "this is another session: switch to it with zellij's session manager \
                  (Ctrl+o w), or detach and run `{attach}`, then go to {tab}"
             ),
         };
-        out.push_str(&format!(
-            "\n  session `{}`, {tab}{agents}: {way}",
-            l.session
-        ));
+        let session = if found.len() > 1 {
+            describe_session(&l.session)
+        } else {
+            format!("`{}`", l.session)
+        };
+        out.push_str(&format!("\n  session {session}, {tab}{agents}: {way}"));
     }
     out
 }
@@ -999,20 +1085,6 @@ fn listed_sessions(listing: &str) -> impl Iterator<Item = ListedSession<'_>> {
         })
 }
 
-/// `zellij list-sessions -n` stdout, or `None` when the command could
-/// not run or returned an unrecognized failure.
-///
-/// A non-zero exit is an answer only for the recognized no-sessions
-/// response. Other exits and spawn failures mean nothing was learned.
-fn zellij_list_sessions_checked() -> Option<String> {
-    let out = zellij_sync(&["list-sessions", "-n"]).ok()?;
-    interpret_listing(
-        out.status.success(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    )
-}
-
 /// What zellij says when there are none — verbatim from the binary.
 /// It exits non-zero to say it, which is why a bare status check
 /// cannot tell that answer from a failure.
@@ -1097,7 +1169,7 @@ pub(crate) fn compose_live_layout(
 /// retained rather than closed. Writes the layout file `clank open`
 /// uses, so the file on disk tracks the roster too. Returns whether the
 /// override itself was accepted; the caller reads placement back.
-pub(crate) fn override_tab_layout(repo: &Path, tab_id: u32, kdl: &str) -> bool {
+pub(crate) fn override_tab_layout(ep: &Endpoint, repo: &Path, tab_id: u32, kdl: &str) -> bool {
     let Ok(path) = write_layout_file(repo, kdl) else {
         return false;
     };
@@ -1105,8 +1177,8 @@ pub(crate) fn override_tab_layout(repo: &Path, tab_id: u32, kdl: &str) -> bool {
     override_transaction(
         tab_id,
         &path,
-        |args| zellij_action(args).is_some(),
-        active_tab_id,
+        |args| zellij_action(ep, args).is_some(),
+        || active_tab_id(ep),
     )
 }
 
@@ -1343,8 +1415,8 @@ fn ensure_pane_keys(doc: &mut kdl::KdlDocument) {
 /// when no client is identifiable. Never worse than the pane
 /// measurement (zellij-in-session-orientation).
 fn layout_term_size() -> (u16, u16) {
-    if in_session()
-        && let Some(size) = zellij_client_window_size()
+    if let Resolved::Found(own) = zellij_endpoint::own_endpoint()
+        && let Some(size) = zellij_client_window_size(&own)
     {
         return size;
     }
@@ -1352,12 +1424,12 @@ fn layout_term_size() -> (u16, u16) {
 }
 
 /// Measure the real window from inside a session: find the zellij
-/// client process for `$ZELLIJ_SESSION_NAME` in `ps` output and read
-/// its controlling tty's winsize. Subprocess justified: zellij's CLI
+/// client process attached to `own` by its current name in `ps` output
+/// and read its controlling tty's winsize. Subprocess justified: zellij's CLI
 /// exposes no window geometry (`list-panes`/`list-tabs` carry none),
 /// and escape-sequence size queries are answered with PANE dimensions
 /// — the very trap this exists to avoid.
-fn zellij_client_window_size() -> Option<(u16, u16)> {
+fn zellij_client_window_size(own: &Endpoint) -> Option<(u16, u16)> {
     let out = proc_run::run_blocking(
         Spec::new("ps")
             .args(["-axo", "tty=,command="])
@@ -1367,7 +1439,7 @@ fn zellij_client_window_size() -> Option<(u16, u16)> {
     )
     .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
+    let session = own.current_name(&zellij_endpoint::ZellijIndex).ok();
     let tty = pick_zellij_client_tty(&text, session.as_deref())?;
     crate::cli::term::winsize_of_tty(&format!("/dev/{tty}"))
 }
@@ -1890,7 +1962,7 @@ impl std::fmt::Display for Unresolved {
                 "this repo's TUI pane is open in {} places ({})",
                 at.len(),
                 at.iter()
-                    .map(|(s, t)| format!("session `{s}`, tab `{t}`"))
+                    .map(|(s, t)| format!("session {s}, tab `{t}`"))
                     .collect::<Vec<_>>()
                     .join("; ")
             ),
@@ -1905,7 +1977,7 @@ pub(crate) fn scan_workspace(
     scan: &SessionScan,
     repo: &Path,
     candidates: std::collections::BTreeSet<String>,
-) -> Result<(String, Workspace), Unresolved> {
+) -> Result<(Session, Workspace), Unresolved> {
     if scan.listing_failed {
         return Err(Unresolved::ListingFailed);
     }
@@ -1925,7 +1997,7 @@ pub(crate) fn scan_workspace(
         },
         many => Err(Unresolved::ManyAnchors(
             many.iter()
-                .map(|sp| (sp.session.clone(), sp.pane.tab_name.clone()))
+                .map(|sp| (describe_session(&sp.session), sp.pane.tab_name.clone()))
                 .collect(),
         )),
     }
@@ -2060,50 +2132,21 @@ fn is_anchor(pane: &ZellijPane, repo: &Path) -> bool {
     pane_for(pane, repo) == Some(None)
 }
 
-/// One `--json` pane listing for a whole reconcile pass
+/// One `--json` pane listing of `ep` for a whole reconcile pass
 /// (zellij-one-listing-per-pass: this call is the measured ~1.1s unit,
 /// so the worker takes it ONCE and threads it through the primitives).
-/// `None` outside zellij or on failure.
-pub(crate) fn snapshot_panes() -> Option<Vec<ZellijPane>> {
-    if !in_session() {
-        return None;
-    }
-    list_agent_panes()
+/// `None` on failure.
+pub(crate) fn snapshot_panes(ep: &Endpoint) -> Option<Vec<ZellijPane>> {
+    list_agent_panes(ep).ok()
 }
 
-/// The session `clank open` names for `repo` — the convention, not
-/// necessarily where the repo's panes ARE: `open_one` adds a tab to
-/// whatever session the caller is in. A caller that needs the truth
-/// verifies the listing (`repo_tab_id`).
-pub(crate) fn repo_session_name(repo: &Path) -> String {
-    let basename = repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
-    session_name(basename)
-}
-
-/// The session this process runs inside, if any.
-pub(crate) fn current_session() -> Option<String> {
-    std::env::var("ZELLIJ_SESSION_NAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// [`snapshot_panes`] for a NAMED session, from inside it or not.
-/// The remote runs wherever the TUI was started and asks about the
-/// session it was pointed at.
-pub(crate) fn snapshot_panes_in(session: &str) -> Option<Vec<ZellijPane>> {
-    let out = zellij_sync(&[
-        "--session",
-        session,
-        "action",
-        "list-panes",
-        "--json",
-        "--command",
-    ])
-    .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
+/// Why a pane listing of an endpoint has no panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unlisted {
+    /// The endpoint's name could not be learned; nothing was asked.
+    Unnamed(String),
+    /// It was asked and did not answer with a listing.
+    Unanswered,
 }
 
 /// One agent pane as the web page needs it: identity, size, and
@@ -2141,21 +2184,14 @@ pub(crate) fn agent_pane_table(panes: &[ZellijPane], ws: &Workspace) -> Vec<Pane
 /// subscription to no panes is not a subscription. `--ansi` because
 /// the page renders through a terminal emulator that wants the
 /// escapes; `--format json` because each line then names its pane.
-pub(crate) fn subscribe_argv(session: &str, panes: &[String]) -> Option<Vec<String>> {
+pub(crate) fn subscribe_argv(panes: &[String]) -> Option<Vec<String>> {
     if panes.is_empty() {
         return None;
     }
-    let mut argv: Vec<String> = [
-        "--session",
-        session,
-        "subscribe",
-        "--format",
-        "json",
-        "--ansi",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let mut argv: Vec<String> = ["subscribe", "--format", "json", "--ansi"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     for p in panes {
         argv.push("-p".to_string());
         argv.push(p.clone());
@@ -2179,37 +2215,36 @@ impl SubscribeChild {
     }
 }
 
-/// Start streaming `panes`' viewports from `session`. `None` for no
-/// panes, or when zellij could not be started.
-pub(crate) fn subscribe_panes(session: &str, panes: &[String]) -> Option<SubscribeChild> {
-    let argv = subscribe_argv(session, panes)?;
-    proc_run::start(Spec::new(zellij_program()).args(&argv).stdout(Out::Piped))
-        .ok()
-        .map(SubscribeChild)
+/// Start streaming `panes`' viewports from `ep`. `None` for no panes, or
+/// when zellij could not be started. A stream outlives any one name, so
+/// the name is looked up once, at its start.
+pub(crate) fn subscribe_panes(ep: &Endpoint, panes: &[String]) -> Option<SubscribeChild> {
+    let argv = subscribe_argv(panes)?;
+    let client = ep.client().ok()?;
+    proc_run::start(
+        client
+            .spec(zellij_program(&client.program), &argv)
+            .stdout(Out::Piped),
+    )
+    .ok()
+    .map(SubscribeChild)
 }
 
 // Terminal transport and provider key knowledge live in one module.
 #[cfg(test)]
 use super::pane_input::{codex_submit_argv, say_argvs, stop_argv};
 
-/// `pane`'s screen in `session`, its colours kept, or `None` when zellij
+/// `pane`'s screen in `ep`, its colours kept, or `None` when zellij
 /// does not answer within its budget.
-pub(crate) async fn dump_pane_screen(session: &str, pane: &str) -> Option<String> {
-    let argv = [
-        "zellij",
-        "--session",
-        session,
-        "action",
-        "dump-screen",
-        "--pane-id",
-        pane,
-        "--ansi",
-    ]
-    .map(str::to_string);
-    let out = run_open_query(&argv, std::time::Duration::from_secs(3))
+pub(crate) async fn dump_pane_screen(ep: &Endpoint, pane: &str) -> Option<String> {
+    let argv = ["action", "dump-screen", "--pane-id", pane, "--ansi"].map(str::to_string);
+    let out = zellij_async(ep, &argv, std::time::Duration::from_secs(3))
         .await
         .ok()?;
-    out.status.success().then_some(out.stdout)
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).ok())
+        .flatten()
 }
 
 /// Why a terminal write did not complete, as what it may have done.
@@ -2233,30 +2268,44 @@ impl std::fmt::Display for PaneWrite {
 /// admission rule belong to pane_input, its one caller; a timeout is an
 /// uncertain mutation, not evidence that the server ignored the bytes, so
 /// callers must not resend it. Says whether a failure wrote nothing.
+///
+/// The name is looked up immediately before the write. A write zellij
+/// refused for not knowing the name wrote nothing, so it is retried once
+/// under a fresh lookup.
 pub(crate) async fn write_pane_action_classified(
-    session: &str,
+    ep: &Endpoint,
     pane: &str,
     argv: &[String],
 ) -> Result<(), PaneWrite> {
-    let spec = Spec::new("zellij").args(["--session", session]).args(argv);
-    run_pane_write(spec, std::time::Duration::from_secs(3))
-        .await
-        .map(|_| ())
-        .map_err(|e| match e {
-            PaneWrite::Unknown(e) => PaneWrite::Unknown(format!("terminal input for {pane}: {e}")),
-            not_started => not_started,
-        })
+    let budget = std::time::Duration::from_secs(3);
+    let ran = run_at(
+        || ep.client(),
+        |c| pane_write_spec(c.spec(zellij_program(&c.program), argv)),
+        budget,
+    )
+    .await
+    .map_err(|why| PaneWrite::NotStarted(format!("terminal input for {pane}: {why}")))?;
+    pane_write_outcome(ran).map(|_| ()).map_err(|e| match e {
+        PaneWrite::Unknown(e) => PaneWrite::Unknown(format!("terminal input for {pane}: {e}")),
+        not_started => not_started,
+    })
 }
 
+fn pane_write_spec(spec: Spec) -> Spec {
+    spec.stderr(Out::Ring { bytes: 4096 }).group(Group::New)
+}
+
+#[cfg(test)]
 async fn run_pane_write(
     spec: Spec,
     budget: std::time::Duration,
 ) -> Result<std::process::ExitStatus, PaneWrite> {
-    let ran = proc_run::run(
-        spec.stderr(Out::Ring { bytes: 4096 }).group(Group::New),
-        budget,
-    )
-    .await;
+    pane_write_outcome(proc_run::run(pane_write_spec(spec), budget).await)
+}
+
+fn pane_write_outcome(
+    ran: Result<proc_run::Output, RunError>,
+) -> Result<std::process::ExitStatus, PaneWrite> {
     match ran {
         Ok(out) if out.status.success() => Ok(out.status),
         Ok(out) => Err(PaneWrite::Unknown(format!(
@@ -2388,6 +2437,7 @@ pub(crate) fn tab_orientation(panes: &[ZellijPane], tab_id: u32) -> Orientation 
 /// `new-pane` opens in. Returns the id zellij printed for the new pane,
 /// so the caller can believe it live before a listing lists it.
 pub(crate) fn open_agent_pane(
+    ep: &Endpoint,
     repo: &Path,
     label: &str,
     panes: &[ZellijPane],
@@ -2395,10 +2445,10 @@ pub(crate) fn open_agent_pane(
 ) -> Option<String> {
     let in_tab = open_beside(panes, ws, label)?;
     let repo_str = repo.to_string_lossy();
-    zellij_action(&["focus-pane-id", &in_tab]);
+    zellij_action(ep, &["focus-pane-id", &in_tab]);
     let new_pane = new_pane_argv(label, &repo_str);
     let refs: Vec<&str> = new_pane.iter().map(String::as_str).collect();
-    let out = zellij_action(&refs)?;
+    let out = zellij_action(ep, &refs)?;
     let created = String::from_utf8_lossy(&out).trim().to_string();
     (!created.is_empty()).then_some(created)
 }
@@ -2438,8 +2488,8 @@ pub(crate) fn live_agent_labels(
 /// captures once before its first action and restores once after the
 /// last, replacing the old per-op capture/restore. See
 /// [`pass_focus_target`] for how the target is derived.
-pub(crate) fn focus_pane(id: &str) {
-    zellij_action(&["focus-pane-id", id]);
+pub(crate) fn focus_pane(ep: &Endpoint, id: &str) {
+    zellij_action(ep, &["focus-pane-id", id]);
 }
 
 /// The pass's focus-restore target: the pane the USER has focused,
@@ -2455,8 +2505,8 @@ pub(crate) fn focus_pane(id: &str) {
 /// `current-tab-info`. The cost tracks processes on the MACHINE, not
 /// panes in the session, so it grows with every agent started
 /// anywhere — for one integer.
-pub(crate) fn pass_focus_target(panes: &[ZellijPane]) -> Option<String> {
-    focus_target_from(focused_pane_in(panes, active_tab_id()), caller_pane_id())
+pub(crate) fn pass_focus_target(ep: &Endpoint, panes: &[ZellijPane]) -> Option<String> {
+    focus_target_from(focused_pane_in(panes, active_tab_id(ep)), caller_pane_id())
 }
 
 fn focus_target_from(focused: Option<String>, caller: Option<String>) -> Option<String> {
@@ -2475,8 +2525,8 @@ fn focused_pane_in(panes: &[ZellijPane], tab: Option<u32>) -> Option<String> {
 }
 
 /// The active tab's id, from `current-tab-info`'s `id:` line.
-fn active_tab_id() -> Option<u32> {
-    let out = zellij_action(&["current-tab-info"])?;
+fn active_tab_id(ep: &Endpoint) -> Option<u32> {
+    let out = zellij_action(ep, &["current-tab-info"])?;
     parse_active_tab_id(&String::from_utf8_lossy(&out))
 }
 
@@ -2567,10 +2617,12 @@ fn inside_stack(foreign: &ZellijPane, first: &ZellijPane, span: &StackSpan) -> b
     }
 }
 
-/// The pane the current clank process runs in, identified authoritatively
-/// from the `ZELLIJ_PANE_ID` env var zellij sets per-pane. A clank command
-/// always runs in a terminal pane (never the plugin pane that can share
-/// the same numeric id), so the ref is `terminal_<id>`. `None` when unset.
+/// The pane the current clank process runs in, from the `ZELLIJ_PANE_ID`
+/// env var zellij sets per-pane. A clank command always runs in a terminal
+/// pane (never the plugin pane that can share the same numeric id), so the
+/// ref is `terminal_<id>`. `None` when unset. Inherited, so it names a pane
+/// only inside the server this process descends from, and never selects a
+/// pane to type into.
 pub(crate) fn caller_pane_id() -> Option<String> {
     let id = std::env::var("ZELLIJ_PANE_ID").ok()?;
     (!id.is_empty()).then(|| format!("terminal_{id}"))
@@ -2587,18 +2639,19 @@ pub(crate) enum CallerIdentity {
     /// and there is no way to tell which.
     Unidentified,
     /// Pane ids repeat across sessions, so the pair is the identity.
-    Pane { session: String, pane_id: String },
+    Pane { session: Endpoint, pane_id: String },
 }
 
+/// The caller's server from its own ancestry, and its pane there. An
+/// ancestry that could not be read is unidentified, never outside zellij.
 pub(crate) fn caller_identity() -> CallerIdentity {
-    if !in_session() {
-        return CallerIdentity::NotInZellij;
-    }
-    let session = std::env::var("ZELLIJ_SESSION_NAME")
-        .ok()
-        .filter(|s| !s.is_empty());
-    match (session, caller_pane_id()) {
-        (Some(session), Some(pane_id)) => CallerIdentity::Pane { session, pane_id },
+    caller_identity_from(zellij_endpoint::own_endpoint(), caller_pane_id())
+}
+
+fn caller_identity_from(own: Resolved, pane: Option<String>) -> CallerIdentity {
+    match (own, pane) {
+        (Resolved::NotInZellij, _) => CallerIdentity::NotInZellij,
+        (Resolved::Found(session), Some(pane_id)) => CallerIdentity::Pane { session, pane_id },
         _ => CallerIdentity::Unidentified,
     }
 }
@@ -2606,7 +2659,7 @@ pub(crate) fn caller_identity() -> CallerIdentity {
 /// A pane tagged with the session it lives in.
 #[derive(Debug)]
 pub(crate) struct SessionPane {
-    pub(crate) session: String,
+    pub(crate) session: Session,
     pub(crate) pane: ZellijPane,
 }
 
@@ -2628,9 +2681,9 @@ pub(crate) struct SessionScan {
     pub(crate) listing_failed: bool,
 }
 
-/// What one session's `list-panes` produced: its panes, or nothing
+/// What one endpoint's `list-panes` produced: its panes, or nothing
 /// learned.
-pub(crate) type Listed = (String, Option<Vec<ZellijPane>>);
+pub(crate) type Listed = (Session, Option<Vec<ZellijPane>>);
 
 /// Fold per-session outcomes into a scan. Pure, so the fail-closed
 /// contract is testable without a zellij server: every `None` becomes
@@ -2649,44 +2702,40 @@ pub(crate) fn assemble_scan(listing: Option<Vec<Listed>>) -> SessionScan {
                 session: session.clone(),
                 pane,
             })),
-            None => scan.unanswered.push(session),
+            None => scan.unanswered.push(describe_session(&session)),
         }
     }
     scan
 }
 
-/// The names of sessions whose server is up, from `list-sessions -n`
-/// output: the first token of each line, skipping the EXITED ones
-/// (their server is gone and would not answer an action anyway).
-fn live_session_names(list_output: &str) -> Vec<String> {
-    listed_sessions(list_output)
-        .filter_map(|s| match s {
-            ListedSession::Live(name) => Some(name.to_string()),
-            _ => None,
-        })
-        .collect()
+/// A session for a message that may name several: its name and socket,
+/// since two roots can hold sessions of one name.
+pub(crate) fn describe_session(session: &Session) -> String {
+    format!("`{session}` ({})", session.endpoint())
 }
 
-/// The lines of a listing that name no session clank can read: each is a
-/// session not seen, so a scan reports it unanswered.
-fn unreadable_sessions(list_output: &str) -> Vec<String> {
-    listed_sessions(list_output)
-        .filter_map(|s| match s {
-            ListedSession::Unreadable(line) => Some(line.to_string()),
-            _ => None,
-        })
-        .collect()
+/// One endpoint's scan outcome: unreachable before any query (its name
+/// unknown), or its name and the listing it answered with.
+enum Probed {
+    Unnamed(String),
+    Asked(Session, Option<Vec<ZellijPane>>),
 }
 
-/// Every pane of every live session, each tagged with its session:
-/// one `list-panes` per session, all started at once, collected until
-/// `deadline`. A session that has not answered by then is killed and
-/// dropped — measured here: two stale two-month-old servers took 8.7 s
-/// and 4.8 s to answer while every healthy one took under 0.2 s, and
-/// an agent launch cannot wait on that. Dropping a session means its
-/// panes are not seen, which fails OPEN (no holder found).
+/// Every pane of every live server of this user, each tagged with its
+/// session: one `list-panes` per server, all started at once, collected
+/// until `deadline`. A session that has not answered by then is killed
+/// and dropped — measured here: two stale two-month-old servers took 8.7
+/// s and 4.8 s to answer while every healthy one took under 0.2 s, and an
+/// agent launch cannot wait on that. Dropping a session means its panes
+/// are not seen, which fails OPEN (no holder found).
+///
+/// Servers are found by process, not by name, so a renamed session, one
+/// missing from zellij's index and one under another socket root are all
+/// seen.
 pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> SessionScan {
-    scan_sessions(deadline, zellij_list_sessions_checked, list_panes_of)
+    scan_sessions(zellij_endpoint::live_servers(), |ep| {
+        list_panes_of(ep, deadline)
+    })
 }
 
 /// Scoped async discovery for event/nudge control. Every query owns its client
@@ -2694,99 +2743,116 @@ pub(crate) fn panes_in_all_sessions(deadline: std::time::Duration) -> SessionSca
 /// blocking global session listing can outlive cancellation or retirement.
 pub(crate) async fn panes_in_all_sessions_async(deadline: std::time::Duration) -> SessionScan {
     use futures_util::StreamExt;
-    let argv = vec!["zellij".into(), "list-sessions".into(), "-n".into()];
-    let Some(listing) = (match run_open_query(&argv, deadline).await {
-        Ok(output) => interpret_listing(output.status.success(), &output.stdout, &output.stderr),
-        Err(_) => None,
-    }) else {
+    let servers = match tokio::task::spawn_blocking(zellij_endpoint::live_servers).await {
+        Ok(servers) => servers,
+        Err(_) => Err("the server table read did not finish".to_string()),
+    };
+    let Ok(servers) = servers else {
         return assemble_scan(None);
     };
+    let mut unreadable = Vec::new();
     let mut queries = futures_util::stream::FuturesUnordered::new();
-    let mut outcomes: Vec<Listed> = unreadable_sessions(&listing)
-        .into_iter()
-        .map(|line| (line, None))
-        .collect();
-    for session in live_session_names(&listing) {
+    for server in servers {
+        let ep = match server {
+            Ok(ep) => ep,
+            Err(why) => {
+                unreadable.push(why);
+                continue;
+            }
+        };
         queries.push(async move {
-            let argv = vec![
-                "zellij".into(),
-                "-s".into(),
-                session.clone(),
-                "action".into(),
-                "list-panes".into(),
-                "--json".into(),
-                "--command".into(),
-                "--tab".into(),
-            ];
-            let panes = match run_open_query(&argv, deadline).await {
-                Ok(output) if output.status.success() => {
-                    serde_json::from_str::<Vec<ZellijPane>>(&output.stdout).ok()
+            let shown = match ep.current_name(&zellij_endpoint::ZellijIndex) {
+                Ok(name) => name,
+                Err(why) => return Probed::Unnamed(format!("{ep}: {why}")),
+            };
+            let argv = list_panes_argv().map(str::to_string);
+            let panes = match zellij_async(&ep, &argv, deadline).await {
+                Ok(out) if out.status.success() => {
+                    serde_json::from_slice::<Vec<ZellijPane>>(&out.stdout).ok()
                 }
                 _ => None,
             };
-            (session, panes)
+            Probed::Asked(Session::new(ep, shown), panes)
         });
     }
-    while let Some(outcome) = queries.next().await {
-        outcomes.push(outcome);
+    let mut outcomes = Vec::new();
+    while let Some(probed) = queries.next().await {
+        match probed {
+            Probed::Asked(session, panes) => outcomes.push((session, panes)),
+            Probed::Unnamed(why) => unreadable.push(why),
+        }
     }
-    assemble_scan(Some(outcomes))
+    let mut scan = assemble_scan(Some(outcomes));
+    scan.unanswered.extend(unreadable);
+    scan
 }
 
-/// `session`'s panes, or `None` when they could not be learned in time.
-fn list_panes_of(session: &str, deadline: std::time::Duration) -> Option<Vec<ZellijPane>> {
-    let out = proc_run::run_blocking(
-        query_spec(Spec::new(zellij_program()).args([
-            "-s",
-            session,
-            "action",
-            "list-panes",
-            "--json",
-            "--command",
-            "--tab",
-        ])),
-        deadline,
+fn list_panes_argv() -> [&'static str; 5] {
+    ["action", "list-panes", "--json", "--command", "--tab"]
+}
+
+/// `ep`'s session as named now, and its panes, or why they could not be
+/// learned in time.
+fn list_panes_of(ep: &Endpoint, deadline: std::time::Duration) -> Result<Listed, String> {
+    let shown = ep
+        .current_name(&zellij_endpoint::ZellijIndex)
+        .map_err(|why| format!("{ep}: {why}"))?;
+    let panes = zellij_endpoint::dispatch(
+        || ep.client(),
+        |c| {
+            proc_run::run_blocking(
+                query_spec(c.spec(zellij_program(&c.program), list_panes_argv())),
+                deadline,
+            )
+        },
+        failed_stderr,
     )
-    .ok()?;
-    out.status
-        .success()
-        .then(|| serde_json::from_slice(&out.stdout).ok())
-        .flatten()
+    .ok()
+    .and_then(Result::ok)
+    .filter(|out| out.status.success())
+    .and_then(|out| serde_json::from_slice(&out.stdout).ok());
+    Ok((Session::new(ep.clone(), shown), panes))
 }
 
-/// [`panes_in_all_sessions`] with the session listing and each
-/// session's query supplied, so the blind case is reachable in a test.
-/// `None` means the listing could not be run; `Some("")` means it ran
-/// and found nothing, and the two must not converge.
+/// [`panes_in_all_sessions`] with the server table and each server's query
+/// supplied, so the blind case is reachable in a test. `Err` means the
+/// table could not be read; an empty one means it was read and holds no
+/// server, and the two must not converge.
 fn scan_sessions(
-    deadline: std::time::Duration,
-    list: impl FnOnce() -> Option<String>,
-    query: impl Fn(&str, std::time::Duration) -> Option<Vec<ZellijPane>> + Sync,
+    servers: Result<Vec<Result<Endpoint, String>>, String>,
+    query: impl Fn(&Endpoint) -> Result<Listed, String> + Sync,
 ) -> SessionScan {
-    let Some(listing) = list() else {
+    let Ok(servers) = servers else {
         return assemble_scan(None);
     };
-    // A session whose `list-panes` could not even START is one whose
-    // panes are unknown, not one with none — it used to vanish here.
-    let mut outcomes: Vec<Listed> = unreadable_sessions(&listing)
-        .into_iter()
-        .map(|line| (line, None))
-        .collect();
+    // A server whose argv could not be read, or whose name could not be
+    // learned, is one whose panes are unknown, not one with none.
+    let mut unreadable = Vec::new();
+    let mut endpoints = Vec::new();
+    for server in servers {
+        match server {
+            Ok(ep) => endpoints.push(ep),
+            Err(why) => unreadable.push(why),
+        }
+    }
     let query = &query;
-    let answered: Vec<Listed> = std::thread::scope(|scope| {
-        let asked: Vec<_> = live_session_names(&listing)
-            .into_iter()
-            .map(|session| {
-                scope.spawn(move || {
-                    let panes = query(&session, deadline);
-                    (session, panes)
-                })
-            })
+    let answered: Vec<Result<Listed, String>> = std::thread::scope(|scope| {
+        let asked: Vec<_> = endpoints
+            .iter()
+            .map(|ep| scope.spawn(move || query(ep)))
             .collect();
         asked.into_iter().filter_map(|a| a.join().ok()).collect()
     });
-    outcomes.extend(answered);
-    assemble_scan(Some(outcomes))
+    let mut outcomes = Vec::new();
+    for listed in answered {
+        match listed {
+            Ok(listed) => outcomes.push(listed),
+            Err(why) => unreadable.push(why),
+        }
+    }
+    let mut scan = assemble_scan(Some(outcomes));
+    scan.unanswered.extend(unreadable);
+    scan
 }
 
 /// The `new-pane` argv, split out so it is assertable without
@@ -2814,19 +2880,19 @@ fn new_pane_argv(label: &str, repo: &str) -> Vec<String> {
 
 /// Whether zellij accepted the rename. Accepted is not applied: a
 /// caller that needs the name reads it back.
-pub(crate) fn rename_tab(id: u32, name: &str) -> bool {
+pub(crate) fn rename_tab(ep: &Endpoint, id: u32, name: &str) -> bool {
     // Captured, never inherited: a rename error must not bleed onto the
     // alt-screen the TUI owns. The loop is event-driven, so an inherited
     // error line would PERSIST until the next watcher event, not
     // flicker (ruthless 9c38523).
-    zellij_sync(&["action", "rename-tab-by-id", &id.to_string(), name])
+    zellij_sync(ep, &["action", "rename-tab-by-id", &id.to_string(), name])
         .is_ok_and(|out| out.status.success())
 }
 
 /// This session's tabs by stable id, with their names; `None` when the
 /// listing fails or does not parse.
-pub(crate) fn list_tabs() -> Option<Vec<(u32, String)>> {
-    let out = zellij_sync(&["action", "list-tabs", "--json"]).ok()?;
+pub(crate) fn list_tabs(ep: &Endpoint) -> Option<Vec<(u32, String)>> {
+    let out = zellij_sync(ep, &["action", "list-tabs", "--json"]).ok()?;
     out.status
         .success()
         .then(|| parse_tabs(&out.stdout))
@@ -2860,17 +2926,17 @@ pub(crate) fn owned_tab(panes: &[ZellijPane], caller: &str) -> Option<u32> {
     one.tab_id
 }
 
-pub(crate) fn rename_pane(id: &str, name: &str) {
-    let _ = rename_pane_checked(id, name);
+pub(crate) fn rename_pane(ep: &Endpoint, id: &str, name: &str) {
+    let _ = rename_pane_checked(ep, id, name);
 }
 
-/// Rename the pane `id` in this session, or say what zellij answered.
-pub(crate) fn rename_pane_checked(id: &str, name: &str) -> Result<(), String> {
+/// Rename the pane `id` in `ep`, or say what zellij answered.
+pub(crate) fn rename_pane_checked(ep: &Endpoint, id: &str, name: &str) -> Result<(), String> {
     // Captured, never inherited: a stale pane id (closed between
     // list-panes and the rename) or any zellij hiccup must not bleed an
     // error line onto the TUI, which the event-driven loop would leave
     // until the next watcher event (ruthless 9c38523).
-    let out = zellij_sync(&rename_pane_args(id, name))
+    let out = zellij_sync(ep, &rename_pane_args(id, name))
         .map_err(|e| format!("could not run zellij: {e}"))?;
     if out.status.success() {
         return Ok(());
@@ -2935,7 +3001,7 @@ pub fn placement_capability() -> PlacementCapability {
     // build can report a version AHEAD of the latest release, so
     // version arithmetic answers a different question than "does this
     // binary have the action".
-    match zellij_sync(&["action", "override-layout", "--help"]) {
+    match zellij_path_sync(&["action", "override-layout", "--help"]) {
         Err(RunError::Spawn(_)) => PlacementCapability::NoZellij,
         Err(_) => PlacementCapability::ClientTooOld,
         Ok(o) if o.status.success() => PlacementCapability::ClientSupports,
@@ -2947,14 +3013,29 @@ pub fn placement_capability() -> PlacementCapability {
 /// by construction: a zellij hiccup must never fail the caller (the
 /// roster mutation already persisted) nor bleed onto a pane. Returns
 /// stdout on success.
-fn zellij_action(args: &[&str]) -> Option<Vec<u8>> {
-    let out = zellij_sync(&[&["action"], args].concat()).ok()?;
+fn zellij_action(ep: &Endpoint, args: &[&str]) -> Option<Vec<u8>> {
+    let out = zellij_sync(ep, &[&["action"], args].concat()).ok()?;
     out.status.success().then_some(out.stdout)
 }
 
-fn list_agent_panes() -> Option<Vec<ZellijPane>> {
-    let stdout = zellij_action(&["list-panes", "--json", "--command"])?;
-    serde_json::from_slice(&stdout).ok()
+/// `zellij <args>` from PATH, addressing no session: a capability probe or
+/// the listing a new session's name is chosen against.
+fn zellij_path_sync(args: &[&str]) -> Result<proc_run::Output, RunError> {
+    proc_run::run_blocking(
+        query_spec(Spec::new(zellij_program("zellij")).args(args)),
+        ZELLIJ_BUDGET,
+    )
+}
+
+/// `ep`'s panes, or why there are none to show.
+pub(crate) fn list_agent_panes(ep: &Endpoint) -> Result<Vec<ZellijPane>, Unlisted> {
+    match zellij_sync(ep, &["action", "list-panes", "--json", "--command"]) {
+        Err(CallFailed::Unnamed(why)) => Err(Unlisted::Unnamed(why)),
+        Ok(out) if out.status.success() => {
+            serde_json::from_slice(&out.stdout).map_err(|_| Unlisted::Unanswered)
+        }
+        _ => Err(Unlisted::Unanswered),
+    }
 }
 
 /// The full `(cols, rows)` extent of a zellij tab, from the live
@@ -3034,9 +3115,14 @@ pub(crate) fn reviewers_are_stacked(
 /// entries; codex 5d498d0). Closing kills each pane's process tree —
 /// that is the agent-exit guarantee. Focus restoration is the worker's
 /// pass-level transaction.
-pub(crate) fn remove_reviewer_panes(labels: &[String], panes: &[ZellijPane], ws: &Workspace) {
+pub(crate) fn remove_reviewer_panes(
+    ep: &Endpoint,
+    labels: &[String],
+    panes: &[ZellijPane],
+    ws: &Workspace,
+) {
     for id in remove_target_ids(labels, panes, ws) {
-        zellij_action(&["close-pane", "--pane-id", &id]);
+        zellij_action(ep, &["close-pane", "--pane-id", &id]);
     }
 }
 
@@ -3099,36 +3185,24 @@ fn kdl_escape(s: &str) -> String {
     out
 }
 
-/// The argv used to spawn zellij — also emitted on stderr in
-/// `--print` mode so tests + tools can inspect without observing
-/// the spawn.
-///
-/// Session serialization is disabled: clank sessions are cheap to
-/// regenerate from the layout, and each serializing server polls
-/// `ps -ao ppid,args` on an interval — accumulated detached
-/// sessions congest the whole machine (observed ~320 servers
-/// pinning every core with concurrent `ps` scans).
-/// Max generated session-name length. Zellij embeds the name in its
-/// UNIX socket path (`$TMPDIR/zellij-<uid>/<version>/<name>`) and
-/// refuses names past the budget at arg-parse time; macOS's long
-/// `$TMPDIR` leaves exactly 24 chars (probed on zellij 0.44: 24 OK,
-/// 25 refused — the error's "less than 0 characters" number is
-/// zellij's display bug). Linux runtime dirs are shorter, so the
-/// macOS bound is the binding one (zellij-session-name-budget).
+/// Max generated session-name length, for a zellij from before session
+/// IDs. Such a zellij names the socket after the session
+/// (`$TMPDIR/zellij-<uid>/<version>/<name>`) and refuses names past the
+/// socket-path budget at arg-parse time; macOS's long `$TMPDIR` leaves
+/// exactly 24 chars (probed on zellij 0.44: 24 OK, 25 refused). An ID-era
+/// zellij names the socket by a fixed-length ID and takes any name
+/// (`validate_session`, zellij-utils/src/cli.rs at 87276681), so there the
+/// cap only shortens a display name. Which era the PATH `zellij` is can't
+/// be read without starting it, so the stricter rule is the one applied.
 const SESSION_NAME_MAX: usize = 24;
 
-/// Deterministic per-repo session name (`zellij-session-dedup`):
-/// zellij enforces NAME UNIQUENESS, so a stable name makes
-/// duplicate clank sessions unrepresentable — re-running
-/// `clank open` attaches instead of minting another
-/// randomly-named session full of fresh agent instances.
+/// The display name a new session for a repo is given: a name only.
+/// Which session a repo lives in is found by what runs in it, never by
+/// this name.
 ///
 /// Long basenames are CAPPED to [`SESSION_NAME_MAX`]: truncated, with a
 /// short hash of the FULL basename appended so distinct long repos
-/// sharing a prefix never collide — and still deterministic, which
-/// reconciliation (find-session-by-name, add missing tabs) depends on.
-/// Short names are byte-identical to before, so existing sessions keep
-/// matching.
+/// sharing a prefix get distinct names.
 fn session_name(basename: &str) -> String {
     let full = format!("clank-{basename}");
     if full.len() <= SESSION_NAME_MAX {
@@ -3160,59 +3234,21 @@ fn fnv1a_short(bytes: &[u8]) -> String {
     format!("{:04x}", (h >> 16) ^ (h & 0xffff))
 }
 
-/// What to do about the named session, decided PURELY over
-/// `zellij list-sessions -n` output (`-n` = no ANSI; each line is
-/// `<name> [Created …]` with a trailing `(EXITED - …)` marker for
-/// dead sessions and `(current)` for the one we're inside).
-/// First-whitespace-token name match keeps the parse robust to
-/// trailing-format drift; the EXITED marker is the only other
-/// thing we read (ruthless a9ac348 concern 2).
-///
-/// Race note (concern 1, pinned by probe): zellij can't create
-/// two sessions with one name, so if a session appears between
-/// the list and the spawn, `--session` fails with a visible
-/// "already exists" error — the race fails SAFE (an error, never
-/// a silent duplicate).
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum SessionPlan {
-    Create,
-    Attach,
-    DeleteDeadThenCreate,
-}
-
-fn decide_session(list_output: &str, name: &str) -> SessionPlan {
-    for session in listed_sessions(list_output) {
-        if session.name() != name {
-            continue;
-        }
-        if let ListedSession::Exited(_) = session {
-            // Serialization is off for clank sessions, so a dead
-            // one can't resurrect meaningfully — clear and recreate.
-            return SessionPlan::DeleteDeadThenCreate;
-        }
-        return SessionPlan::Attach;
-    }
-    SessionPlan::Create
-}
-
-/// Create a fresh named session with the layout. Session
-/// serialization is disabled: clank sessions are cheap to
-/// regenerate from the layout, and each serializing server polls
-/// `ps -ao ppid,args` on an interval — accumulated detached
-/// sessions congest the whole machine (observed ~320 servers
-/// pinning every core with concurrent `ps` scans).
-fn create_argv(layout_path: &Path, name: &str) -> Vec<String> {
+/// Start a fresh session named `name` with the layout. Session
+/// serialization is disabled: clank sessions are cheap to regenerate from
+/// the layout, and each serializing server polls `ps -ao ppid,args` on an
+/// interval — accumulated detached sessions congest the whole machine
+/// (observed ~320 servers pinning every core with concurrent `ps` scans).
+fn create_args(layout_path: &Path, name: &str) -> Vec<String> {
     vec![
-        "zellij".to_string(),
         "--session".to_string(),
         name.to_string(),
         // MUST be `--new-session-with-layout`, NOT `--layout`:
         // alongside `--session`, plain `--layout` means "add this
         // layout as a tab to session <name>", which errors with
         // "There is no active session!" when the session doesn't
-        // exist yet (the Create case). `--new-session-with-layout`
-        // always starts a fresh session. (Verified live against
-        // zellij 0.44.)
+        // exist yet. `--new-session-with-layout` always starts a fresh
+        // session. (Verified live against zellij 0.44.)
         "--new-session-with-layout".to_string(),
         layout_path.display().to_string(),
         "options".to_string(),
@@ -3221,35 +3257,16 @@ fn create_argv(layout_path: &Path, name: &str) -> Vec<String> {
     ]
 }
 
-/// Add the layout's tabs to the LIVE session `name`. Alongside
-/// `--session`, plain `--layout` means "add as tab(s)" — the inverse of
-/// [`create_argv`]'s `--new-session-with-layout`. It errors when the
-/// session isn't live, so callers MUST gate on a live session (the
-/// `--all` Attach branch).
-fn add_tabs_argv(layout_path: &Path, name: &str) -> Vec<String> {
-    vec![
-        "zellij".to_string(),
-        "--session".to_string(),
-        name.to_string(),
-        "--layout".to_string(),
-        layout_path.display().to_string(),
-    ]
+/// Add the layout's tabs to a live endpoint: alongside the `--session`
+/// the endpoint's client adds, plain `--layout` means "add as tab(s)".
+fn add_tabs_args(layout_path: &Path) -> Vec<String> {
+    vec!["--layout".to_string(), layout_path.display().to_string()]
 }
 
-fn delete_argv(name: &str) -> Vec<String> {
+/// The caller's own server's tab add. The caller queries that server's
+/// tabs before issuing this, and skips creation when the tab is present.
+fn in_session_tab_args(layout_path: &Path) -> Vec<String> {
     vec![
-        "zellij".to_string(),
-        "delete-session".to_string(),
-        name.to_string(),
-    ]
-}
-
-/// Retain the existing implicit current-session layout routing. The caller
-/// queries that same current session before issuing this argv, and skips
-/// creation when the tab is already present.
-fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
-    vec![
-        "zellij".to_string(),
         "--layout".to_string(),
         layout_path.display().to_string(),
         "options".to_string(),
@@ -3276,22 +3293,21 @@ mod tests {
         let hang = dir.path().join("zellij");
         std::fs::write(&hang, "#!/bin/sh\nexec sleep 300\n").unwrap();
         std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o700)).unwrap();
-        type Call = (&'static str, fn() -> bool);
+        type Call = (&'static str, fn(&Endpoint) -> bool);
         let calls: Vec<Call> = vec![
-            ("rename_pane_checked", || {
-                super::rename_pane_checked("terminal_1", "x").is_err()
+            ("rename_pane_checked", |ep| {
+                super::rename_pane_checked(ep, "terminal_1", "x").is_err()
             }),
-            ("rename_tab", || !super::rename_tab(1, "x")),
-            ("list_tabs", || super::list_tabs().is_none()),
-            ("list_agent_panes", || super::list_agent_panes().is_none()),
-            ("snapshot_panes_in", || {
-                super::snapshot_panes_in("s").is_none()
+            ("rename_tab", |ep| !super::rename_tab(ep, 1, "x")),
+            ("list_tabs", |ep| super::list_tabs(ep).is_none()),
+            ("list_agent_panes", |ep| {
+                super::list_agent_panes(ep).is_err()
             }),
-            ("list_sessions", || {
-                super::zellij_list_sessions_checked().is_none()
+            ("current_tab", |ep| {
+                super::zellij_action(ep, &["current-tab-info"]).is_none()
             }),
-            ("current_tab", || {
-                super::zellij_action(&["current-tab-info"]).is_none()
+            ("list_panes_of", |ep| {
+                super::list_panes_of(ep, super::ZELLIJ_BUDGET).is_ok_and(|(_, p)| p.is_none())
             }),
         ];
         let started = std::time::Instant::now();
@@ -3301,7 +3317,7 @@ mod tests {
                 let hang = hang.clone();
                 std::thread::spawn(move || {
                     ZELLIJ_STAND_IN.with(|s| *s.borrow_mut() = Some(hang));
-                    let failed = call();
+                    let failed = call(Session::fixture("s").endpoint());
                     (name, failed, started.elapsed())
                 })
             })
@@ -3364,13 +3380,22 @@ mod tests {
         }
     }
 
+    /// A call as the fake records it: where it went, then its arguments.
+    fn call_at(at: At<'_>, args: &[String]) -> Vec<String> {
+        let to = match at {
+            At::Endpoint(ep) => format!("@{ep}"),
+            At::Path => "zellij".to_string(),
+        };
+        std::iter::once(to).chain(args.iter().cloned()).collect()
+    }
+
     impl OpenIo for FakeOpenIo {
-        async fn query(&mut self, argv: &[String]) -> anyhow::Result<QueryOutput> {
-            self.calls.push(("query", argv.to_vec()));
+        async fn query(&mut self, at: At<'_>, args: &[String]) -> anyhow::Result<QueryOutput> {
+            self.calls.push(("query", call_at(at, args)));
             self.replies.pop_front().expect("unexpected query")
         }
-        fn spawn(&mut self, argv: &[String]) -> anyhow::Result<()> {
-            self.calls.push(("spawn", argv.to_vec()));
+        async fn spawn(&mut self, at: At<'_>, args: &[String]) -> anyhow::Result<()> {
+            self.calls.push(("spawn", call_at(at, args)));
             Ok(())
         }
         async fn scan(&mut self) -> SessionScan {
@@ -3407,10 +3432,16 @@ mod tests {
         })
     }
 
-    fn current_session() -> SessionTarget {
-        SessionTarget::Current {
-            name: Some("user-workspace".into()),
-        }
+    /// The caller's own server, in the tests that open from inside one.
+    fn here() -> Endpoint {
+        Session::fixture("user-workspace").endpoint().clone()
+    }
+
+    fn tab_query() -> Vec<String> {
+        call_at(
+            At::Endpoint(&here()),
+            &["action", "query-tab-names"].map(str::to_string),
+        )
     }
 
     fn openable_repo(root: &Path, name: &str) -> PathBuf {
@@ -3430,25 +3461,26 @@ mod tests {
         repo
     }
 
+    async fn open_here(io: &mut FakeOpenIo, repo: &Path, print: bool) -> anyhow::Result<()> {
+        open_current_targets(io, &here(), &[repo.to_path_buf()], print).await
+    }
+
     #[tokio::test]
     async fn explicit_query_failure_after_auto_open_does_not_undo_the_visible_tab() {
         let root = tempfile::tempdir().unwrap();
         let repo = openable_repo(root.path(), "changeless-hub-research");
-        let session = current_session();
         let mut io = FakeOpenIo::with([
             query_output(0, "other-tab\n", ""),
             query_output(1, "", "permission denied opening session socket"),
         ]);
         super::super::fork::open_created_fork(&repo, true, false, |args| {
             assert_eq!(args.repo.as_deref(), Some(repo.as_path()));
-            open_one(&mut io, &session, &repo, args.print, None)
+            open_here(&mut io, &repo, args.print)
         })
         .await
         .unwrap();
         let first_layout = std::fs::read(layout_file_path(&repo)).unwrap();
-        let error = open_one(&mut io, &session, &repo, false, None)
-            .await
-            .unwrap_err();
+        let error = open_here(&mut io, &repo, false).await.unwrap_err();
         let text = format!("{error:#}");
         assert!(
             text.contains("user-workspace") && text.contains("query-tab-names"),
@@ -3468,7 +3500,11 @@ mod tests {
         );
         assert_eq!(
             io.spawned(),
-            [in_session_tab_argv(&layout_file_path(&repo)).as_slice()]
+            [call_at(
+                At::Endpoint(&here()),
+                &in_session_tab_args(&layout_file_path(&repo))
+            )
+            .as_slice()]
         );
         assert_eq!(
             std::fs::read(layout_file_path(&repo)).unwrap(),
@@ -3490,9 +3526,7 @@ mod tests {
             Err(anyhow::anyhow!("query timed out")),
         ] {
             let mut io = FakeOpenIo::with([reply]);
-            let error = open_one(&mut io, &current_session(), &repo, false, None)
-                .await
-                .unwrap_err();
+            let error = open_here(&mut io, &repo, false).await.unwrap_err();
             let text = format!("{error:#}");
             assert!(
                 text.contains("could not determine whether the tab already exists"),
@@ -3510,14 +3544,13 @@ mod tests {
     async fn a_same_named_tab_is_another_repos_and_the_target_opens_beside_it() {
         let root = tempfile::tempdir().unwrap();
         let repo = openable_repo(root.path(), "fork");
-        let mut io = FakeOpenIo::with([query_output(0, "👀 fork\n", "")]);
-        open_one(&mut io, &current_session(), &repo, false, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            io.spawned(),
-            [in_session_tab_argv(&layout_file_path(&repo)).as_slice()]
+        let tab_add = call_at(
+            At::Endpoint(&here()),
+            &in_session_tab_args(&layout_file_path(&repo)),
         );
+        let mut io = FakeOpenIo::with([query_output(0, "👀 fork\n", "")]);
+        open_here(&mut io, &repo, false).await.unwrap();
+        assert_eq!(io.spawned(), [tab_add.as_slice()]);
         let layout = std::fs::read_to_string(layout_file_path(&repo)).unwrap();
         let parent = parent_name(&repo).unwrap();
         assert!(
@@ -3526,38 +3559,33 @@ mod tests {
         );
         std::fs::remove_file(layout_file_path(&repo)).unwrap();
         let mut io = FakeOpenIo::with([query_output(0, "unrelated\n", "")]);
-        open_one(&mut io, &current_session(), &repo, false, None)
-            .await
-            .unwrap();
-        assert_eq!(io.calls[0].1, current_session().tab_query_argv());
-        assert_eq!(
-            io.spawned(),
-            [in_session_tab_argv(&layout_file_path(&repo)).as_slice()]
-        );
+        open_here(&mut io, &repo, false).await.unwrap();
+        assert_eq!(io.calls[0].1, tab_query());
+        assert_eq!(io.spawned(), [tab_add.as_slice()]);
         assert!(layout_file_path(&repo).exists());
     }
 
     #[tokio::test]
-    async fn outside_all_does_not_turn_an_unanswered_live_session_into_missing_tabs() {
+    async fn outside_all_does_not_turn_an_unanswered_host_into_missing_tabs() {
         let root = tempfile::tempdir().unwrap();
         let source = openable_repo(root.path(), "proj");
         let fork = openable_repo(root.path(), "fork");
-        let mut io = FakeOpenIo::with([
-            query_output(0, "clank-proj [Created 1m ago]\n", ""),
-            query_output(1, "", "permission denied opening clank-proj socket"),
-        ]);
-        let hosts = ["clank-proj".to_string()];
-        let error = open_all(&mut io, &source, &[source.clone(), fork], &hosts, false)
-            .await
-            .unwrap_err();
+        let host = Session::fixture("right");
+        let mut io =
+            FakeOpenIo::with([query_output(1, "", "permission denied opening the socket")]);
+        let error = open_all(
+            &mut io,
+            &source,
+            &[source.clone(), fork],
+            Some(&host),
+            false,
+        )
+        .await
+        .unwrap_err();
         let text = format!("{error:#}");
         assert!(
-            text.contains("session `clank-proj`") && text.contains("permission denied"),
+            text.contains(&host.endpoint().to_string()) && text.contains("permission denied"),
             "{text}"
-        );
-        assert_eq!(
-            io.calls[1].1,
-            SessionTarget::Named("clank-proj".into()).tab_query_argv()
         );
         assert!(io.spawned().is_empty());
         assert!(!layout_file_path(&source).exists());
@@ -3568,87 +3596,69 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = openable_repo(root.path(), "proj");
         let mut io = FakeOpenIo::with([query_output(1, "", "socket directory: permission denied")]);
-        open_one(
-            &mut io,
-            &SessionTarget::Named("clank-proj".into()),
-            &source,
-            false,
-            None,
-        )
-        .await
-        .unwrap_err();
+        open_new_session(&mut io, &source, false).await.unwrap_err();
         assert!(io.spawned().is_empty());
         let mut io = FakeOpenIo::with([query_output(1, "", "socket directory: permission denied")]);
-        open_all(&mut io, &source, std::slice::from_ref(&source), &[], false)
+        open_all(&mut io, &source, std::slice::from_ref(&source), None, false)
             .await
             .unwrap_err();
         assert!(io.spawned().is_empty());
         assert!(!layout_file_path(&source).exists());
     }
 
-    /// Outside a session: create the conventional session, or recreate a
-    /// dead one; a live one of that name is another repo's (the scan found
-    /// this one nowhere), so it is never attached to, and the target gets a
-    /// session of its own.
+    /// Outside a session, a repo open nowhere gets a session of its own,
+    /// under a name no listed session has, live or exited. A session
+    /// holding the conventional name is another repo's or dead, and is
+    /// neither attached to nor deleted.
     #[tokio::test]
-    async fn outside_single_creates_its_own_session_and_never_attaches_to_anothers() {
+    async fn outside_single_creates_its_own_session_and_never_touches_anothers() {
         let root = tempfile::tempdir().unwrap();
         let source = openable_repo(root.path(), "proj");
         let layout = layout_file_path(&source);
         let own = session_name(&format!("proj-{}", parent_name(&source).unwrap()));
-        for (response, expected) in [
-            (
-                query_output(1, "", NO_SESSIONS),
-                vec![create_argv(&layout, "clank-proj")],
-            ),
-            (
-                query_output(0, "clank-proj [Created 1m ago]\n", ""),
-                vec![create_argv(&layout, &own)],
-            ),
+        for (response, name) in [
+            (query_output(1, "", NO_SESSIONS), "clank-proj"),
+            (query_output(0, "clank-proj [Created 1m ago]\n", ""), &own),
             (
                 query_output(0, "clank-proj [Created 1m ago] (EXITED)\n", ""),
-                vec![
-                    delete_argv("clank-proj"),
-                    create_argv(&layout, "clank-proj"),
-                ],
+                &own,
             ),
         ] {
             let mut io = FakeOpenIo::with([response]);
-            open_one(
-                &mut io,
-                &SessionTarget::Named("clank-proj".into()),
-                &source,
-                false,
-                None,
-            )
-            .await
-            .unwrap();
+            open_new_session(&mut io, &source, false).await.unwrap();
             assert_eq!(
                 io.spawned(),
-                expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
+                [call_at(At::Path, &create_args(&layout, name)).as_slice()]
             );
         }
     }
 
-    /// `--all` outside: the missing targets are added to the conventional
-    /// session when this repo lives there; when another repo holds that
-    /// name, they get a session of their own.
+    /// `--all` outside: the missing targets are added as tabs to the one
+    /// session running this repo's TUI; with none, they get a session of
+    /// their own.
     #[tokio::test]
-    async fn outside_all_adds_to_its_own_session_and_never_to_anothers() {
+    async fn outside_all_adds_to_the_tui_session_or_creates_its_own() {
         let root = tempfile::tempdir().unwrap();
         let source = openable_repo(root.path(), "proj");
         let fork = openable_repo(root.path(), "fork");
-        let hosts = ["clank-proj".to_string()];
-        let mut io = FakeOpenIo::with([
-            query_output(0, "clank-proj [Created 1m ago]\n", ""),
-            query_output(0, "🔨 proj\n", ""),
-        ]);
-        open_all(&mut io, &source, std::slice::from_ref(&fork), &hosts, false)
-            .await
-            .unwrap();
+        let host = Session::fixture("cd24109dee91");
+        let mut io = FakeOpenIo::with([query_output(0, "🔨 proj\n", "")]);
+        open_all(
+            &mut io,
+            &source,
+            std::slice::from_ref(&fork),
+            Some(&host),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             io.spawned(),
-            [add_tabs_argv(&layout_file_path(&source), "clank-proj").as_slice()]
+            [call_at(
+                At::Endpoint(host.endpoint()),
+                &add_tabs_args(&layout_file_path(&source))
+            )
+            .as_slice()]
         );
         let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
         assert!(layout.contains("tab name=\"fork\""));
@@ -3656,13 +3666,13 @@ mod tests {
         std::fs::remove_file(layout_file_path(&source)).unwrap();
 
         let mut io = FakeOpenIo::with([query_output(0, "clank-proj [Created 1m ago]\n", "")]);
-        open_all(&mut io, &source, &[source.clone(), fork], &[], false)
+        open_all(&mut io, &source, &[source.clone(), fork], None, false)
             .await
             .unwrap();
         let own = session_name(&format!("proj-{}", parent_name(&source).unwrap()));
         assert_eq!(
             io.spawned(),
-            [create_argv(&layout_file_path(&source), &own).as_slice()]
+            [call_at(At::Path, &create_args(&layout_file_path(&source), &own)).as_slice()]
         );
     }
 
@@ -3672,13 +3682,17 @@ mod tests {
         let source = openable_repo(root.path(), "proj");
         let fork = openable_repo(root.path(), "fork");
         let mut io = FakeOpenIo::with([query_output(1, NO_SESSIONS, "")]);
-        open_all(&mut io, &source, &[source.clone(), fork], &[], false)
+        open_all(&mut io, &source, &[source.clone(), fork], None, false)
             .await
             .unwrap();
         assert_eq!(io.calls.len(), 2, "one listing, one creation, no tab query");
         assert_eq!(
             io.spawned(),
-            [create_argv(&layout_file_path(&source), "clank-proj").as_slice()]
+            [call_at(
+                At::Path,
+                &create_args(&layout_file_path(&source), "clank-proj")
+            )
+            .as_slice()]
         );
         let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
         assert!(layout.contains("tab name=\"fork\"") && layout.contains("tab name=\"proj\""));
@@ -3701,7 +3715,7 @@ mod tests {
         let a = openable_repo(&root.path().join("a"), "fork");
         let b = openable_repo(&root.path().join("b"), "fork");
         let mut io = FakeOpenIo::with([query_output(0, "🔨 proj\n", "")]);
-        open_current_targets(&mut io, &current_session(), &[a.clone(), b.clone()], false)
+        open_current_targets(&mut io, &here(), &[a.clone(), b.clone()], false)
             .await
             .unwrap();
         assert_eq!(
@@ -3717,25 +3731,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = openable_repo(root.path(), "proj");
         let mut io = FakeOpenIo::default();
-        open_one(&mut io, &current_session(), &source, true, None)
+        open_here(&mut io, &source, true).await.unwrap();
+        open_new_session(&mut io, &source, true).await.unwrap();
+        open_all(&mut io, &source, std::slice::from_ref(&source), None, true)
             .await
             .unwrap();
-        open_one(
+        open_all(
             &mut io,
-            &SessionTarget::Named("clank-proj".into()),
             &source,
-            true,
-            None,
-        )
-        .await
-        .unwrap();
-        open_all(&mut io, &source, std::slice::from_ref(&source), &[], true)
-            .await
-            .unwrap();
-        open_current_targets(
-            &mut io,
-            &current_session(),
             std::slice::from_ref(&source),
+            Some(&Session::fixture("right")),
             true,
         )
         .await
@@ -3850,43 +3855,54 @@ mod tests {
         );
     }
 
-    /// "I could not ask" and "there are none" must not converge.
-    ///
-    /// Zellij exits non-zero when no sessions exist, but a scan must not
-    /// fold every failed command into an empty listing and report a confident
-    /// absence after learning nothing (codex on 1eec51b). Neither case
-    /// starts a zellij process: one never lists, the other lists none.
+    /// "I could not ask" and "there are none" must not converge: a process
+    /// table that could not be read is blind, one read with no server in
+    /// it is an answer (codex on 1eec51b). Neither starts a process.
     #[test]
     fn a_scan_that_could_not_list_is_blind_not_empty() {
-        let quick = std::time::Duration::from_millis(1);
-        let blind = scan_sessions(quick, || None, |_, _| None);
+        let blind = scan_sessions(Err("ps failed".into()), |_| unreachable!());
         assert!(blind.listing_failed, "nothing was learned");
 
-        let empty = scan_sessions(quick, || Some(String::new()), |_, _| None);
-        assert!(
-            !empty.listing_failed,
-            "the listing answered: there are none"
-        );
+        let empty = scan_sessions(Ok(Vec::new()), |_| unreachable!());
+        assert!(!empty.listing_failed, "the table answered: there are none");
         assert!(empty.panes.is_empty() && empty.unanswered.is_empty());
     }
 
-    /// A session that cannot be probed is UNANSWERED, through the real
+    /// A server that cannot be probed, whose argv could not be read, or
+    /// whose name could not be learned is UNANSWERED, through the real
     /// mapping — a test of `assemble_scan` alone passes against a scan
-    /// that never reaches it (codex on 66afcf2). The fake starter
-    /// begins no process, so this spawns no zellij.
+    /// that never reaches it (codex on 66afcf2). The fake query begins no
+    /// process.
     #[test]
-    fn a_session_that_cannot_be_probed_is_unanswered_not_absent() {
+    fn a_server_that_cannot_be_probed_is_unanswered_not_absent() {
+        let alpha = Session::fixture("alpha");
+        let beta = Session::fixture("beta");
+        let named = Session::fixture("named");
         let scan = scan_sessions(
-            std::time::Duration::from_millis(1),
-            || Some("alpha [Created 1s ago]\nbeta [Created 1s ago]\n".to_string()),
-            |_, _| None,
+            Ok(vec![
+                Ok(alpha.endpoint().clone()),
+                Ok(beta.endpoint().clone()),
+                Err("zellij process 9: denied".into()),
+                Ok(named.endpoint().clone()),
+            ]),
+            |ep| {
+                if ep == named.endpoint() {
+                    Err(format!("{ep}: zellij's session index is locked"))
+                } else {
+                    Ok((Session::new(ep.clone(), ep.id().unwrap().into()), None))
+                }
+            },
         );
-        assert_eq!(
-            scan.unanswered,
-            vec!["alpha".to_string(), "beta".to_string()]
-        );
+        assert_eq!(scan.unanswered.len(), 4, "{:?}", scan.unanswered);
+        for missed in ["alpha", "beta", "denied", "locked"] {
+            assert!(
+                scan.unanswered.iter().any(|u| u.contains(missed)),
+                "{missed}: {:?}",
+                scan.unanswered
+            );
+        }
         assert!(scan.panes.is_empty());
-        assert!(!scan.listing_failed, "the listing itself was fine");
+        assert!(!scan.listing_failed, "the table itself was fine");
     }
 
     /// zellij exits NON-ZERO to say there are no sessions, so a status
@@ -4799,8 +4815,8 @@ ttys004   zellij attach clank-foo
             (
                 scan(vec![tui("s", 0), tui("t", 0)], &[], false),
                 Unresolved::ManyAnchors(vec![
-                    ("s".into(), String::new()),
-                    ("t".into(), String::new()),
+                    (describe_session(&"s".into()), String::new()),
+                    (describe_session(&"t".into()), String::new()),
                 ]),
             ),
             (
@@ -4955,25 +4971,22 @@ ttys004   zellij attach clank-foo
     }
 
     /// Every spawn shape names what clank was DOING, in the user's
-    /// terms, so a failure reads as "could not attach" rather than a
-    /// bare exit code. The argv shapes are the three `open` produces
+    /// terms, so a failure reads as "could not start the session" rather
+    /// than a bare exit code. The shapes are the ones `open` produces
     /// plus the fallback.
     #[test]
     fn spawn_failures_say_what_was_being_attempted() {
-        let s = |v: &[&str]| spawn_kind(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        let layout = Path::new("l.kdl");
         assert_eq!(
-            s(&["zellij", "attach", "clank-foo"]),
-            "attach to the repo's session"
-        );
-        assert_eq!(
-            s(&["zellij", "--layout", "l.kdl"]),
+            spawn_kind(&create_args(layout, "clank-foo")),
             "start the repo's session"
         );
+        assert_eq!(spawn_kind(&add_tabs_args(layout)), "add the repo's tab");
         assert_eq!(
-            s(&["zellij", "action", "new-tab", "--layout", "l.kdl"]),
-            "add a tab to the current session"
+            spawn_kind(&in_session_tab_args(layout)),
+            "add the repo's tab"
         );
-        assert_eq!(s(&["zellij"]), "open the workspace");
+        assert_eq!(spawn_kind(&[]), "open the workspace");
     }
 
     /// A spawn that cannot start at all (binary vanished between the
@@ -4981,12 +4994,14 @@ ttys004   zellij attach clank-foo
     /// at `doctor` rather than surfacing a raw OS error.
     #[test]
     fn an_unstartable_spawn_points_at_doctor() {
-        let err =
-            spawn_zellij(&["/nonexistent/zellij".to_string(), "attach".to_string()]).unwrap_err();
+        let argv: Vec<String> = std::iter::once("/nonexistent/zellij".to_string())
+            .chain(create_args(Path::new("l.kdl"), "clank-foo"))
+            .collect();
+        let err = spawn_zellij(&argv).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("could not start zellij"), "{msg}");
         assert!(
-            msg.contains("attach to the repo's session"),
+            msg.contains("start the repo's session"),
             "names the attempt: {msg}"
         );
         assert!(msg.contains("clank doctor"), "says where to look: {msg}");
@@ -5663,19 +5678,6 @@ keybinds {
         }
     }
 
-    // ── session dedup (zellij-session-dedup) ──
-
-    #[test]
-    fn live_session_names_skip_the_dead_and_keep_the_current() {
-        let listing = "\
-clank-clank [Created 31m 15s ago] (current)
-other-repo [Created 2h ago]
-dead-one [Created 10h ago] (EXITED - attach to resurrect)
-";
-        assert_eq!(live_session_names(listing), ["clank-clank", "other-repo"]);
-        assert!(live_session_names("").is_empty());
-    }
-
     /// An exited pane is still its agent's, and live presence says it is
     /// not running.
     #[test]
@@ -5688,47 +5690,6 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         assert_eq!(ws.agent_of(&panes[0]).as_deref(), Some("codex"));
         assert!(live_agent_labels(&panes, &ws).is_empty());
         assert_eq!(panes[0].tab_name(), "r");
-    }
-
-    #[test]
-    fn decide_session_three_branches() {
-        // Canned `list-sessions -n` output, per the live probe:
-        // `<name> [Created …]` + `(EXITED - attach to resurrect)`
-        // for dead sessions, `(current)` for the one we're inside.
-        let listing = "\
-clank-clank [Created 31m 15s ago] (current)
-other-repo [Created 2h ago]
-dead-one [Created 10h ago] (EXITED - attach to resurrect)
-";
-        assert_eq!(
-            decide_session(listing, "clank-clank"),
-            SessionPlan::Attach,
-            "live (even current) → attach"
-        );
-        assert_eq!(decide_session(listing, "other-repo"), SessionPlan::Attach);
-        assert_eq!(
-            decide_session(listing, "dead-one"),
-            SessionPlan::DeleteDeadThenCreate,
-            "EXITED → delete + recreate (serialization is off)"
-        );
-        assert_eq!(
-            decide_session(listing, "clank-absent"),
-            SessionPlan::Create,
-            "absent → create"
-        );
-        assert_eq!(
-            decide_session("", "anything"),
-            SessionPlan::Create,
-            "empty listing (zellij errors when no sessions) → create"
-        );
-    }
-
-    #[test]
-    fn decide_session_matches_whole_name_token_only() {
-        // `clank-foo` must not match `clank-foobar` (first-token
-        // equality, not prefix).
-        let listing = "clank-foobar [Created 1m ago]\n";
-        assert_eq!(decide_session(listing, "clank-foo"), SessionPlan::Create);
     }
 
     /// A tab's name is taken, glyphs aside, whichever repo it is; the
@@ -5754,48 +5715,20 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     }
 
     /// A session's name is everything before its `[Created …]`: one with
-    /// spaces is kept whole when listed, scanned and matched.
+    /// spaces is kept whole when a new session's name is chosen against it.
     #[test]
     fn a_session_name_with_spaces_is_kept_whole() {
-        let listing = "my work [Created 1m ago] (current)\nclank-x [Created 2m ago]\n";
-        assert_eq!(live_session_names(listing), ["my work", "clank-x"]);
-        assert_eq!(decide_session(listing, "my work"), SessionPlan::Attach);
-        assert_eq!(decide_session(listing, "my"), SessionPlan::Create);
-    }
-
-    /// `--all` outside adds to the conventional session only when this
-    /// repo lives there; a live one holding another repo is never used.
-    #[test]
-    fn plan_all_routes_by_session_state_and_ownership() {
-        let none = "";
-        let live = "clank-proj [Created 1m ago]\n";
-        let dead = "clank-proj [Created 1m ago] (EXITED)\n";
-        let ours = ["clank-proj".to_string()];
+        let listing = "clank-my work [Created 1m ago] (current)\nclank-x [Created 2m ago]\n";
+        let repo = Path::new("/src/b/my work");
         assert_eq!(
-            plan_all(none, "clank-proj", &[]),
-            (
-                true,
-                AllPlan::CreateFresh {
-                    delete_first: false
-                }
-            )
+            unused_session_name(repo, listing).unwrap(),
+            "clank-my work-b",
+            "the whole spaced name is taken"
         );
         assert_eq!(
-            plan_all(dead, "clank-proj", &[]),
-            (true, AllPlan::CreateFresh { delete_first: true })
-        );
-        assert_eq!(
-            plan_all(live, "clank-proj", &ours),
-            (true, AllPlan::AddTabs)
-        );
-        assert_eq!(
-            plan_all(live, "clank-proj", &[]),
-            (
-                false,
-                AllPlan::CreateFresh {
-                    delete_first: false
-                }
-            )
+            unused_session_name(Path::new("/src/b/my"), listing).unwrap(),
+            "clank-my",
+            "a prefix of a name is not that name"
         );
     }
 
@@ -5896,9 +5829,8 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     fn argv_shapes_for_each_plan() {
         let layout = Path::new("/r/.clank/zellij/layout.kdl");
         assert_eq!(
-            create_argv(layout, "clank-r"),
+            create_args(layout, "clank-r"),
             vec![
-                "zellij",
                 "--session",
                 "clank-r",
                 "--new-session-with-layout",
@@ -5908,33 +5840,17 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                 "false",
             ]
         );
-        assert_eq!(
-            delete_argv("clank-r"),
-            vec!["zellij", "delete-session", "clank-r"]
-        );
-        // Add-tabs (live session): plain `--layout`, NOT
+        // Add-tabs (live endpoint): plain `--layout`, NOT
         // `--new-session-with-layout` — adds the layout's tabs to the
-        // running session rather than starting a new one.
+        // running session rather than starting a new one. The endpoint's
+        // client supplies `--session <its name now>`.
         assert_eq!(
-            add_tabs_argv(layout, "clank-r"),
-            vec![
-                "zellij",
-                "--session",
-                "clank-r",
-                "--layout",
-                "/r/.clank/zellij/layout.kdl",
-            ]
+            add_tabs_args(layout),
+            vec!["--layout", "/r/.clank/zellij/layout.kdl"]
         );
-        // The in-session tab path carries NO --session flag: inside
-        // zellij even an explicit --session is overridden into
-        // new-tab behavior (probed live, the hard way — a stray
-        // probe tabbed a duplicate agent set into the operator's
-        // session). Within-session dedup is the pidfile guard's
-        // job, out of scope here (concern 3).
         assert_eq!(
-            in_session_tab_argv(layout),
+            in_session_tab_args(layout),
             vec![
-                "zellij",
                 "--layout",
                 "/r/.clank/zellij/layout.kdl",
                 "options",
@@ -6081,12 +5997,10 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     /// no panes is no subscription.
     #[test]
     fn the_subscribe_argv_names_every_pane_or_nothing() {
-        let argv = subscribe_argv("clank-a", &["terminal_1".into(), "terminal_7".into()]).unwrap();
+        let argv = subscribe_argv(&["terminal_1".into(), "terminal_7".into()]).unwrap();
         assert_eq!(
             argv,
             vec![
-                "--session",
-                "clank-a",
                 "subscribe",
                 "--format",
                 "json",
@@ -6097,7 +6011,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                 "terminal_7"
             ]
         );
-        assert_eq!(subscribe_argv("clank-a", &[]), None);
+        assert_eq!(subscribe_argv(&[]), None);
     }
 
     /// Text, then Enter as byte 13 — two actions — and a message that
@@ -6152,16 +6066,6 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                 "{tool:?} still receives Escape"
             );
         }
-    }
-
-    /// The convention is deterministic per repo, and it is only a
-    /// convention: the caller verifies where the panes actually are.
-    #[test]
-    fn the_repo_session_name_is_the_open_convention() {
-        assert_eq!(
-            repo_session_name(Path::new("/x/y/penlock-experiment")),
-            "clank-penlock-experiment"
-        );
     }
 
     /// The stage is read from GEOMETRY — the biggest agent pane in its
@@ -6499,32 +6403,40 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
             "exited, and the twin is not the repo"
         );
 
-        let outside = describe(&repo, &found, false, None);
+        let outside = describe(&repo, &found, None);
         assert!(
             outside.contains("tab 3 `proj`"),
             "the position, not the id: {outside}"
         );
         assert!(outside.contains("zellij attach 'work space'"), "{outside}");
-        let same = describe(&repo, &found[..1], true, Some("work space"));
+        assert!(
+            outside.contains(&Session::fixture("work space").endpoint().to_string())
+                && outside.contains(&Session::fixture("other").endpoint().to_string()),
+            "two places name each by its socket: {outside}"
+        );
+        let work = Session::fixture("work space");
+        let same = describe(&repo, &found[..1], Some(work.endpoint()));
         assert!(
             same.contains("switch to tab 3 `proj` in this session"),
             "{same}"
         );
-        let foreign = describe(&repo, &found[..1], true, Some("elsewhere"));
+        let elsewhere = Session::fixture("elsewhere");
+        let foreign = describe(&repo, &found[..1], Some(elsewhere.endpoint()));
         assert!(
             foreign.contains("another session") && foreign.contains("zellij attach 'work space'"),
             "the session first: {foreign}"
         );
 
-        let caller = SessionTarget::Current {
-            name: Some("other".into()),
-        };
-        let sorted = sort_targets(&scan, vec![repo.clone(), twin.clone()], Some(&caller));
+        let caller = Session::fixture("other");
+        let sorted = sort_targets(
+            &scan,
+            vec![repo.clone(), twin.clone()],
+            Some(caller.endpoint()),
+        );
         assert_eq!(sorted.missing, [twin]);
         assert_eq!(sorted.reports.len(), 1);
         assert!(
-            sorted.reports[0].contains("session `work space`")
-                && sorted.reports[0].contains("session `other`")
+            sorted.reports[0].contains("`work space`") && sorted.reports[0].contains("`other`")
         );
     }
 
@@ -6556,7 +6468,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
             )]),
             ..Default::default()
         };
-        run_with(&mut io, &args(&repo), Some(current_session()))
+        run_with(&mut io, &args(&repo), Some(&here()))
             .await
             .unwrap();
         assert_eq!(
@@ -6613,14 +6525,16 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
 
         let mut io = FakeOpenIo::with([query_output(0, "proj\n", "")]);
         io.scan = open_a();
-        run_with(&mut io, &args(&b), Some(current_session()))
-            .await
-            .unwrap();
+        run_with(&mut io, &args(&b), Some(&here())).await.unwrap();
         assert!(io.reports.is_empty());
         let b = dunce::canonicalize(&b).unwrap();
         assert_eq!(
             io.spawned(),
-            [in_session_tab_argv(&layout_file_path(&b)).as_slice()]
+            [call_at(
+                At::Endpoint(&here()),
+                &in_session_tab_args(&layout_file_path(&b))
+            )
+            .as_slice()]
         );
         let layout = std::fs::read_to_string(layout_file_path(&b)).unwrap();
         assert!(layout.contains("tab name=\"proj (b)\""), "{layout}");
@@ -6638,7 +6552,11 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         run_with(&mut io, &args(&b), None).await.unwrap();
         assert_eq!(
             io.spawned(),
-            [create_argv(&layout_file_path(&b), "clank-proj-b").as_slice()]
+            [call_at(
+                At::Path,
+                &create_args(&layout_file_path(&b), "clank-proj-b")
+            )
+            .as_slice()]
         );
     }
 
@@ -6651,7 +6569,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         let a = openable_repo(&root.path().join("a"), "fork");
         let b = openable_repo(&root.path().join("b"), "fork");
         let mut io = FakeOpenIo::with([query_output(1, NO_SESSIONS, "")]);
-        open_all(&mut io, &source, &[a, b], &[], false)
+        open_all(&mut io, &source, &[a, b], None, false)
             .await
             .unwrap();
         let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
@@ -6662,8 +6580,8 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     }
 
     /// A session's state is read from its listing's suffix, never its
-    /// name: one named with `EXITED` in it is live and scanned; a line that
-    /// cannot be read is a session not seen, never an absent one.
+    /// name: one named with `EXITED` in it is live; a line that cannot be
+    /// read is a name not known, so a new session never takes it.
     #[test]
     fn a_sessions_state_is_its_suffix_not_its_name() {
         let listing = "EXITED research [Created 1m ago] (current)\n\
@@ -6671,31 +6589,16 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                        gone [Created 2d ago] (EXITED - attach to resurrect)\n\
                        garbled\n\
                        unclosed [Created 1m ago\n";
+        let read: Vec<ListedSession> = listed_sessions(listing).collect();
         assert_eq!(
-            live_session_names(listing),
-            ["EXITED research", "research [Created (EXITED note"]
-        );
-        assert_eq!(
-            unreadable_sessions(listing),
-            ["garbled", "unclosed [Created 1m ago"]
-        );
-        assert_eq!(
-            decide_session(listing, "EXITED research"),
-            SessionPlan::Attach
-        );
-        assert_eq!(
-            decide_session(listing, "gone"),
-            SessionPlan::DeleteDeadThenCreate
-        );
-        let scan = scan_sessions(
-            std::time::Duration::from_millis(10),
-            || Some(listing.to_string()),
-            |_, _| None,
-        );
-        assert!(
-            scan.unanswered.contains(&"garbled".to_string())
-                && scan.unanswered.contains(&"EXITED research".to_string()),
-            "{scan:?}"
+            read,
+            [
+                ListedSession::Live("EXITED research"),
+                ListedSession::Live("research [Created (EXITED note"),
+                ListedSession::Exited("gone"),
+                ListedSession::Unreadable("garbled"),
+                ListedSession::Unreadable("unclosed [Created 1m ago"),
+            ]
         );
     }
 
@@ -6798,12 +6701,239 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         let source = dunce::canonicalize(&source).unwrap();
         assert_eq!(
             io.spawned(),
-            [create_argv(&layout_file_path(&source), "clank-proj").as_slice()]
+            [call_at(
+                At::Path,
+                &create_args(&layout_file_path(&source), "clank-proj")
+            )
+            .as_slice()]
         );
         let layout = std::fs::read_to_string(layout_file_path(&source)).unwrap();
         assert!(
             layout.contains("tab name=\"wt\"") && !layout.contains("tab name=\"proj\""),
             "{layout}"
         );
+    }
+
+    #[test]
+    fn an_unreadable_ancestry_is_an_unidentified_caller_never_one_outside_zellij() {
+        let ep: Endpoint = "work".into();
+        assert_eq!(
+            caller_identity_from(
+                Resolved::Unknown("denied".into()),
+                Some("terminal_1".into())
+            ),
+            CallerIdentity::Unidentified
+        );
+        assert_eq!(
+            caller_identity_from(Resolved::NotInZellij, Some("terminal_1".into())),
+            CallerIdentity::NotInZellij,
+            "an inherited pane id does not put a process in zellij"
+        );
+        assert_eq!(
+            caller_identity_from(Resolved::Found(ep.clone()), None),
+            CallerIdentity::Unidentified
+        );
+        assert_eq!(
+            caller_identity_from(Resolved::Found(ep.clone()), Some("terminal_1".into())),
+            CallerIdentity::Pane {
+                session: ep,
+                pane_id: "terminal_1".into()
+            }
+        );
+    }
+
+    fn tui_in(session: &str, repo: &Path) -> SessionPane {
+        pane_in(
+            session,
+            1,
+            0,
+            "proj",
+            &format!("clank tui --repo {}", repo.display()),
+            false,
+        )
+    }
+
+    /// A session renamed since its panes started, or named only by its ID,
+    /// is found by the TUI running in it like any other.
+    #[tokio::test]
+    async fn a_renamed_or_nameless_session_is_still_found() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = openable_repo(root.path(), "proj");
+        for session in ["right", "cd24109dee91"] {
+            let mut io = FakeOpenIo {
+                scan: scan_of(vec![tui_in(session, &repo)]),
+                ..Default::default()
+            };
+            run_with(&mut io, &args(&repo), None).await.unwrap();
+            assert!(io.spawned().is_empty(), "{session}");
+            assert!(
+                io.reports[0].contains(&format!("session `{session}`")),
+                "{:?}",
+                io.reports
+            );
+        }
+    }
+
+    /// `--all` outside: the one session running the repo's TUI is where the
+    /// missing tabs go; two refuse, naming each by name and socket, and
+    /// nothing is created; an incomplete scan refuses too.
+    #[tokio::test]
+    async fn outside_all_uses_the_one_tui_session_and_refuses_two() {
+        let root = tempfile::tempdir().unwrap();
+        let source = openable_repo(root.path(), "proj");
+        let all = OpenArgs {
+            all: true,
+            ..args(&source)
+        };
+        crate::git_plumbing::init_repo(&source).unwrap();
+        let source_c = dunce::canonicalize(&source).unwrap();
+        let twin = repo_host(
+            &scan_of(vec![tui_in("right", &source), tui_in("left", &source)]),
+            &source,
+        )
+        .unwrap_err();
+        let text = format!("{twin:#}");
+        for s in ["right", "left"] {
+            assert!(
+                text.contains(&format!("`{s}`"))
+                    && text.contains(&Session::fixture(s).endpoint().to_string()),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            repo_host(&scan_of(vec![tui_in("right", &source)]), &source).unwrap(),
+            Some(Session::fixture("right"))
+        );
+        assert_eq!(repo_host(&scan_of(vec![]), &source).unwrap(), None);
+
+        let mut io = FakeOpenIo {
+            scan: SessionScan {
+                unanswered: vec!["`right` (/x)".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = run_with(&mut io, &all, None).await.unwrap_err();
+        assert!(format!("{error:#}").contains("did not answer"), "{error:#}");
+        assert!(io.spawned().is_empty());
+        assert!(!layout_file_path(&source_c).exists());
+    }
+
+    /// A stand-in zellij that records each call's `--session` name, and
+    /// fails as zellij does for a name it no longer lists.
+    fn recording_zellij(dir: &Path, refuse: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("calls");
+        let script = dir.join("zellij");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$2\" \"$ZELLIJ_SOCKET_DIR\" >> '{}'\n\
+                 if [ \"$2\" = '{refuse}' ]; then echo \"Session '$2' not found. The following sessions are active:\" >&2; exit 1; fi\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (script, log)
+    }
+
+    fn indexed_endpoint() -> Endpoint {
+        Endpoint::fixture_here("/tmp/zellij-test-root/contract_version_1/cd24109dee91")
+    }
+
+    fn rename_in_index(index: &Path, name: &str) {
+        let conn = rusqlite::Connection::open(index).unwrap();
+        conn.execute("DELETE FROM sessions", []).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (name, created_at, last_used_at, id) VALUES (?1, 1, 1, 'cd24109dee91')",
+            [name],
+        )
+        .unwrap();
+    }
+
+    /// A write looks the endpoint's name up immediately before it runs,
+    /// never from a cache: a rename between two writes reaches the second
+    /// under the new name, with the endpoint's socket root each time.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_looks_its_name_up_at_each_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, log) = recording_zellij(dir.path(), "never");
+        let index =
+            zellij_endpoint::tests::index_with(dir.path(), &[("left", Some("cd24109dee91"))]);
+        ZELLIJ_STAND_IN.with(|s| *s.borrow_mut() = Some(script));
+        zellij_endpoint::tests::INDEX_STAND_IN.with(|s| *s.borrow_mut() = Some(index.clone()));
+        let ep = indexed_endpoint();
+        let argv = ["action", "write-chars", "x"].map(str::to_string);
+        write_pane_action_classified(&ep, "terminal_3", &argv)
+            .await
+            .unwrap();
+        rename_in_index(&index, "right");
+        write_pane_action_classified(&ep, "terminal_3", &argv)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "left /tmp/zellij-test-root\nright /tmp/zellij-test-root\n"
+        );
+    }
+
+    /// A rename that lands between the lookup and the call is retried once
+    /// under a fresh lookup, and a name still missing after that is the
+    /// answer, through the real async path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_missed_name_is_retried_once_through_the_real_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, log) = recording_zellij(dir.path(), "old");
+        ZELLIJ_STAND_IN.with(|s| *s.borrow_mut() = Some(script));
+        let names = std::cell::RefCell::new(vec!["new", "old"]);
+        let client = |name: &str| zellij_endpoint::Client {
+            program: "/bin/zellij".into(),
+            socket_root: "/r".into(),
+            session: name.into(),
+        };
+        let out = run_at(
+            || Ok(client(names.borrow_mut().pop().unwrap())),
+            |c| query_spec(c.spec(zellij_program(&c.program), ["action", "x"])),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "old /r\nnew /r\n");
+
+        std::fs::remove_file(&log).unwrap();
+        let out = run_at(
+            || Ok(client("old")),
+            |c| query_spec(c.spec(zellij_program(&c.program), ["action", "x"])),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!out.status.success(), "the second miss is the answer");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "old /r\nold /r\n");
+    }
+
+    /// An endpoint whose name can't be learned is never written to: the
+    /// write did not start.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unknown_name_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, log) = recording_zellij(dir.path(), "never");
+        ZELLIJ_STAND_IN.with(|s| *s.borrow_mut() = Some(script));
+        let unreadable = dir.path().join("unreadable.sqlite");
+        std::fs::create_dir(&unreadable).unwrap();
+        zellij_endpoint::tests::INDEX_STAND_IN.with(|s| *s.borrow_mut() = Some(unreadable));
+        let err = write_pane_action_classified(
+            &indexed_endpoint(),
+            "terminal_3",
+            &["action", "x"].map(str::to_string),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PaneWrite::NotStarted(_)), "{err}");
+        assert!(!log.exists(), "nothing ran");
     }
 }

@@ -244,6 +244,12 @@ impl Spec {
             .join(" ")
     }
 
+    /// The environment the child would get.
+    #[cfg(test)]
+    pub(crate) fn get_environment(&self) -> std::collections::BTreeMap<OsString, OsString> {
+        self.environment()
+    }
+
     /// The child's environment, with the identity precedence applied.
     fn environment(&self) -> std::collections::BTreeMap<OsString, OsString> {
         let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();

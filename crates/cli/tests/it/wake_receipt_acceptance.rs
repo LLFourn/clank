@@ -1002,8 +1002,23 @@ async fn shared_monitor_claims_due_interrupt_without_waiter_and_does_not_probe_o
     .unwrap();
     let bin = fixture.home.join("probe-bin");
     std::fs::create_dir(&bin).unwrap();
+    // Pane discovery finds zellij servers in the process table, so the
+    // table is the seam: this `ps` answers the discovery read with no
+    // servers and counts it, and passes every other read to the real one.
+    // A zellij call of any kind would be counted too, and fail the count.
+    let ps = bin.join("ps");
+    std::fs::write(
+        &ps,
+        "#!/bin/sh\nif [ \"$*\" = '-axo pid=,uid=,comm=' ]; then printf 'query\\n' >> \"$CLANK_TEST_QUERY_COUNT\"; exit 0; fi\nexec /bin/ps \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
     let shim = bin.join("zellij");
-    std::fs::write(&shim, "#!/bin/sh\nprintf 'query\\n' >> \"$CLANK_TEST_QUERY_COUNT\"\nprintf 'No active zellij sessions found.\\n' >&2\nexit 1\n").unwrap();
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nprintf 'zellij\\n' >> \"$CLANK_TEST_QUERY_COUNT\"\nexit 1\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
     let count = fixture.home.join("queries");
     let mut monitor = fixture

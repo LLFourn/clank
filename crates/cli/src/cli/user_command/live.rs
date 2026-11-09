@@ -253,6 +253,29 @@ struct Live {
     asks: tokio::sync::mpsc::UnboundedSender<Ask>,
 }
 
+/// Why a request recorded by an older clank is not written to.
+const UNADDRESSED: &str = "its pane was recorded without its zellij server; it needs a new request";
+
+/// A recorded pane's terminal: the pane in the server it was found in, or
+/// none for an entry that never recorded one, which reads and writes
+/// nothing.
+pub(crate) struct Recorded<'a>(Option<crate::cli::pane_input::Zellij<'a>>);
+
+impl crate::cli::pane_input::Terminal for Recorded<'_> {
+    async fn dump(&self) -> Option<String> {
+        self.0.as_ref()?.dump().await
+    }
+
+    async fn write(&self, argv: Vec<String>) -> Result<(), crate::cli::open_zellij::PaneWrite> {
+        match &self.0 {
+            Some(term) => term.write(argv).await,
+            None => Err(crate::cli::open_zellij::PaneWrite::NotStarted(
+                UNADDRESSED.to_string(),
+            )),
+        }
+    }
+}
+
 impl Seams for Live {
     fn now(&self) -> u64 {
         crate::cli::recovery::unix_now()
@@ -276,8 +299,9 @@ impl Seams for Live {
             .map_err(|e| format!("{e:#}"))?;
         Ok((
             PaneSeen {
-                session: target.session,
+                session: target.session.to_string(),
                 pane: target.pane,
+                server: Some(target.session.endpoint().clone()),
             },
             target.tool,
         ))
@@ -309,20 +333,28 @@ impl Seams for Live {
     }
 
     async fn lock_pane(&self, pane: &PaneSeen) -> Result<Box<dyn Send>, String> {
+        let server = pane
+            .server
+            .as_ref()
+            .ok_or_else(|| UNADDRESSED.to_string())?;
         crate::cli::event_interrupt::blocking(|| {
-            crate::cli::pane_input::lock_pane(&pane.session, &pane.pane)
+            crate::cli::pane_input::lock_pane(server, &pane.pane)
         })
         .map(|lock| Box::new(lock) as Box<dyn Send>)
         .map_err(|e| format!("{e:#}"))
     }
 
-    type Term<'a> = crate::cli::pane_input::Zellij<'a>;
+    type Term<'a> = Recorded<'a>;
 
     fn terminal<'a>(&'a self, pane: &'a PaneSeen) -> Self::Term<'a> {
-        crate::cli::pane_input::Zellij {
-            session: &pane.session,
-            pane: &pane.pane,
-        }
+        Recorded(
+            pane.server
+                .as_ref()
+                .map(|server| crate::cli::pane_input::Zellij {
+                    session: server,
+                    pane: &pane.pane,
+                }),
+        )
     }
 
     fn evidence(&self) -> Option<&UserCommandEvidence> {

@@ -259,7 +259,8 @@ If the repo is already open in any zellij session on the machine,
 `clank open` says where instead (the session, the tab, and how to get
 there from where you are) and opens nothing. A tab or session that only
 shares the repo's name is not it: the repo opens beside it, under a name
-of its own.
+of its own. A session is found by what runs in it, never by its name, so
+renaming a session changes nothing clank does with it.
 
 (`clank agent start <label>` launches ONE agent — resuming its session
 if it has one, or starting a fresh one if it doesn't. `clank open` is
@@ -553,7 +554,7 @@ Run `clank <cmd> --help` for details; the skills carry the depth.
 | `agent` | Roster: `add` / `make-master` / `remove` / `list` / `set-review` / `swap` / `config` / `start` |
 | `team` | Your saved teams (`save` / `list` / `show` / `remove`) and your agent library (`agent add` / `agent remove` / `agent list`), shared across repos |
 | `fork` | `create` a linked worktree with the whole team's sessions forked into it (`--fresh` starts them new instead, orientation prompt intact; it seeds a fork being created, and reopening one never re-seeds); `list` / `remove`; `recover <agent> --child <id>` / `--forget` settles an OpenCode fork whose reply was lost |
-| `open` | The team workspace in zellij: a tab inside a session, attach-or-create outside one |
+| `open` | The team workspace in zellij: a tab inside a session, a session of its own outside one |
 | `remote` | This repo's remote, through the `clank tui` that owns it: `status` / `on` / `off` |
 | `log` | Chronological commit + review timeline (`--oneline`, `-j`); `--diagnostics` inspects history reconstruction issues |
 | `html` | Render the event log + status to a static site; `html open` |

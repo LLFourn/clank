@@ -45,11 +45,28 @@ impl State {
 /// The pane a request's agent was found in at the monitor's first look.
 // Unknown fields are ignored, not refused: an entry admitted by an older
 // clank also names the process it found there, which nothing reads now.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+//
+// Equal by server and pane alone: the session's name is only what it was
+// called then, and a rename since is the same pane.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PaneSeen {
+    /// The session's name when it was found, for messages.
     pub(crate) session: String,
     pub(crate) pane: String,
+    /// The server it was found in. An entry admitted by an older clank has
+    /// none: it named the server only by a name that may since have
+    /// changed, so it never equals a pane found now and is never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) server: Option<crate::cli::zellij_endpoint::Endpoint>,
 }
+
+impl PartialEq for PaneSeen {
+    fn eq(&self, other: &Self) -> bool {
+        self.server == other.server && self.pane == other.pane
+    }
+}
+
+impl Eq for PaneSeen {}
 
 /// One request's entry: the exact envelope as admitted, and clank's own
 /// state machine. No unsigned copy of the command, target, id or times:
@@ -548,7 +565,8 @@ mod tests {
     }
 
     /// An entry an older clank saved, its pane naming the process found in
-    /// it, still loads, as the pane alone.
+    /// it, still loads, as the pane alone: with no server, so it never
+    /// equals the same pane id found in a server now.
     #[test]
     fn an_entry_whose_pane_names_a_process_still_loads() {
         let mut saved = serde_json::to_value(record()).unwrap();
@@ -559,13 +577,17 @@ mod tests {
             "birth": {"v": "mac1", "sec": 1, "usec": 0},
         });
         let loaded: Record = serde_json::from_value(saved).unwrap();
+        let pane = loaded.pane.expect("the pane loads");
         assert_eq!(
-            loaded.pane,
-            Some(PaneSeen {
-                session: "zs".into(),
-                pane: "terminal_3".into(),
-            })
+            (pane.session.as_str(), pane.pane.as_str(), &pane.server),
+            ("zs", "terminal_3", &None)
         );
+        let found_now = PaneSeen {
+            session: "zs".into(),
+            pane: "terminal_3".into(),
+            server: Some("zs".into()),
+        };
+        assert_ne!(pane, found_now);
     }
 
     #[test]

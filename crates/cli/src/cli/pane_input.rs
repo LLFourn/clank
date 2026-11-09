@@ -21,6 +21,7 @@
 use super::composer::Composer;
 use super::open_zellij::PaneWrite;
 use super::prompt_record::{Offloaded, Receipts, Stored};
+use super::zellij_endpoint::Endpoint;
 use clank_core::Tool;
 
 /// The two actions that say `text` to a pane and press Enter, as
@@ -86,7 +87,7 @@ pub(crate) fn stop_argv(pane: &str, tool: clank_core::vocab::Tool) -> Vec<String
 
 /// Interrupt `pane`'s turn with its tool's key, under the pane's lock.
 /// Writes no text, so it needs no reading of the input.
-pub(crate) fn stop_pane(session: &str, pane: &str, tool: Tool) -> anyhow::Result<()> {
+pub(crate) fn stop_pane(session: &Endpoint, pane: &str, tool: Tool) -> anyhow::Result<()> {
     run_sync(async {
         let _lock = lock_pane(session, pane)?;
         Zellij { session, pane }
@@ -210,7 +211,7 @@ pub(crate) trait Terminal {
 
 /// A zellij pane.
 pub(crate) struct Zellij<'a> {
-    pub(crate) session: &'a str,
+    pub(crate) session: &'a Endpoint,
     pub(crate) pane: &'a str,
 }
 
@@ -232,10 +233,16 @@ pub(crate) struct PaneLock {
 
 /// Block until this process holds the lock of `pane` in `session`. Async
 /// callers take it through `event_interrupt::blocking`, off the executor.
-pub(crate) fn lock_pane(session: &str, pane: &str) -> anyhow::Result<PaneLock> {
+pub(crate) fn lock_pane(session: &Endpoint, pane: &str) -> anyhow::Result<PaneLock> {
     super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
     let dir = super::monitor::runtime_dir(rustix::process::getuid().as_raw());
-    lock_pane_in(&dir, session, pane)
+    lock_pane_in(&dir, &lock_key(session), pane)
+}
+
+/// A server's lock namespace: its socket path, which no two live servers
+/// share, so pane ids that repeat across servers lock apart.
+fn lock_key(session: &Endpoint) -> String {
+    session.socket().to_string_lossy().into_owned()
 }
 
 fn lock_pane_in(dir: &std::path::Path, session: &str, pane: &str) -> anyhow::Result<PaneLock> {
@@ -299,11 +306,12 @@ fn pane_lock_path(dir: &std::path::Path, session: &str, pane: &str) -> std::path
     dir.join(format!("pane-{}.lock", &hash.finalize().to_hex()[..32]))
 }
 
-async fn lock_pane_async(session: &str, pane: &str, how: Reserve) -> Result<PaneLock, String> {
+async fn lock_pane_async(session: &Endpoint, pane: &str, how: Reserve) -> Result<PaneLock, String> {
+    let key = lock_key(session);
     let taken = super::event_interrupt::blocking(|| {
         super::monitor::ensure_runtime_dir().map_err(anyhow::Error::msg)?;
         let dir = super::monitor::runtime_dir(rustix::process::getuid().as_raw());
-        reserve_in(&dir, session, pane, how)
+        reserve_in(&dir, &key, pane, how)
     });
     match taken {
         Ok(Some(lock)) => Ok(lock),
@@ -332,7 +340,7 @@ fn run_sync<F: std::future::Future>(work: F) -> F::Output {
 /// whose binding names the record that confirms it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Target<'a> {
-    pub(crate) session: &'a str,
+    pub(crate) session: &'a Endpoint,
     pub(crate) pane: &'a str,
     pub(crate) tool: Tool,
     pub(crate) repo: &'a std::path::Path,
@@ -855,7 +863,7 @@ impl std::error::Error for Unconfirmed {}
 /// submit-sequence knowledge lives here once. Codex's terminal fallback
 /// waits past its paste-burst window, then sends a kitty-protocol Enter.
 pub(crate) fn say_to_pane_for_tool(
-    session: &str,
+    session: &Endpoint,
     pane: &str,
     tool: Tool,
     text: &Admitted,
@@ -962,7 +970,7 @@ mod tests {
 
     fn target(tool: Tool) -> Target<'static> {
         Target {
-            session: "s",
+            session: Box::leak(Box::new(Endpoint::from("s"))),
             pane: "7",
             tool,
             repo: std::path::Path::new("/nowhere"),
@@ -2106,7 +2114,7 @@ mod tests {
     /// a test-only pane, so they return before any terminal is reached.
     #[test]
     fn the_monitors_writers_defer_on_a_reserved_pane() {
-        let session = format!("clank-test-{}", std::process::id());
+        let session = Endpoint::from(format!("clank-test-{}", std::process::id()).as_str());
         let pane = "reserved-pane";
         let held = lock_pane(&session, pane).unwrap();
         let (done, answers) = std::sync::mpsc::channel();
@@ -2141,7 +2149,7 @@ mod tests {
         );
         drop(held);
         let dir = super::super::monitor::runtime_dir(rustix::process::getuid().as_raw());
-        let _ = std::fs::remove_file(pane_lock_path(&dir, &session, pane));
+        let _ = std::fs::remove_file(pane_lock_path(&dir, &lock_key(&session), pane));
     }
 
     /// Lock names are length-delimited: no two (session, pane) pairs alias.

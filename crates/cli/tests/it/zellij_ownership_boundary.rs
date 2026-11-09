@@ -67,7 +67,19 @@ fn spawn_violation(line: &str) -> Option<String> {
     if code.contains(r#"var_os("ZELLIJ")"#) || code.contains(r#"var("ZELLIJ")"#) {
         return Some("raw `$ZELLIJ` read".to_string());
     }
-    None
+    session_name_read(code)
+}
+
+/// Whether a line reads the inherited session name — banned EVERYWHERE,
+/// the spawner included. zellij sets it once, at a pane's spawn, so a
+/// renamed session, or one missing from zellij's index, leaves every pane
+/// holding a name zellij no longer answers to. A session is found from the
+/// process's own ancestry (`zellij_endpoint`).
+fn session_name_read(code: &str) -> Option<String> {
+    ["var", "var_os"]
+        .iter()
+        .any(|f| code.contains(&format!(r#"{f}("ZELLIJ_SESSION_NAME")"#)))
+        .then(|| "read of the inherited `$ZELLIJ_SESSION_NAME`".to_string())
 }
 
 /// Whether a line calls a pane MUTATION — legal in the spawner and
@@ -114,7 +126,17 @@ fn only_the_pane_io_modules_operate_on_panes() {
     let mut violations: Vec<String> = Vec::new();
     for f in &files {
         let unix = f.to_string_lossy().replace('\\', "/");
-        if unix.ends_with(SPAWNER) || is_gate(&unix) {
+        if is_gate(&unix) {
+            continue;
+        }
+        if unix.ends_with(SPAWNER) {
+            let body = std::fs::read_to_string(f).unwrap_or_default();
+            for (i, line) in body.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if let Some(what) = session_name_read(code) {
+                    violations.push(format!("{}:{} — {what}", f.display(), i + 1));
+                }
+            }
             continue;
         }
         // The reconciler may mutate panes but may not spawn: its only
@@ -178,6 +200,18 @@ fn scanner_catches_both_ways_around_the_seam() {
     assert!(
         line_violation("    let panes = open_zellij::snapshot_panes();").is_none(),
         "reading panes creates no second owner"
+    );
+    assert!(
+        line_violation(r#"    let s = std::env::var("ZELLIJ_SESSION_NAME").ok();"#).is_some(),
+        "the inherited session name addresses nothing"
+    );
+    assert!(
+        session_name_read(r#"    std::env::var_os("ZELLIJ_SESSION_NAME")"#).is_some(),
+        "in the spawner too"
+    );
+    assert!(
+        session_name_read(r#"        .env_remove("ZELLIJ_SESSION_NAME")"#).is_none(),
+        "keeping it from a client is not a read"
     );
     assert!(is_gate("crates/cli/tests/zellij_ownership_boundary.rs"));
     assert!(!is_gate("crates/cli/src/cli/status_tui/mod.rs"));

@@ -252,6 +252,48 @@ mod tests {
         );
     }
 
+    /// Pane authority stays with the name, inside the TUI-anchored
+    /// workspace, whatever a process's ancestry or environment says: a
+    /// background Claude shown by `claude attach` is found by its pane's
+    /// name, an agent with no binding needs none, the pane id this process
+    /// inherited picks nothing, and a session named only by its ID is a
+    /// session like any other.
+    #[test]
+    fn the_agents_pane_is_its_name_never_the_callers_ancestry() {
+        let inherited = open_zellij::caller_pane_id()
+            .and_then(|id| id.strip_prefix("terminal_")?.parse::<u32>().ok())
+            .filter(|id| *id != 3)
+            .unwrap_or(8);
+        let session = "cd24109dee91";
+        let found = find(
+            &scan(
+                vec![
+                    tui(session, 1, 0, repo()),
+                    pane(
+                        session,
+                        3,
+                        0,
+                        "claude",
+                        Some("claude attach cebe8245"),
+                        false,
+                    ),
+                    named(session, inherited, 0, "rev", false),
+                ],
+                &[],
+            ),
+            "claude",
+        )
+        .expect("the pane named for the agent is its pane");
+        assert_eq!(
+            found,
+            Found {
+                session: session.into(),
+                pane: "terminal_3".into(),
+            }
+        );
+        assert_eq!(found.session.to_string(), session);
+    }
+
     /// A pane is its name: one started by hand as `rev` is found, and one
     /// running rev's exact launch command under another name is not.
     #[test]
@@ -401,10 +443,11 @@ mod tests {
     #[test]
     fn a_session_that_could_not_be_probed_counts_as_unanswered() {
         let scan = open_zellij::assemble_scan(Some(vec![
-            ("healthy".to_string(), Some(Vec::new())),
-            ("unprobeable".to_string(), None),
+            ("healthy".into(), Some(Vec::new())),
+            ("unprobeable".into(), None),
         ]));
-        assert_eq!(scan.unanswered, vec!["unprobeable".to_string()]);
+        assert_eq!(scan.unanswered.len(), 1, "{:?}", scan.unanswered);
+        assert!(scan.unanswered[0].contains("unprobeable"));
         assert!(!scan.listing_failed);
     }
 
