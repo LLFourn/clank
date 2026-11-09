@@ -1205,61 +1205,37 @@ unsupported.
   the building block for a "controller" repo whose agents manage other
   repos — the `clank-master` skill documents the pattern.
 
-  **How a github watch hears about things.** Every watch listens by
-  webhook (`gh webhook forward` into a loopback listener). It does not
-  poll by default:
-  - **It catches up once each time it starts listening** — when the
-    monitor starts it, after the forwarder restarts, and when a watch
-    takes over from another wait. The forwarder counts as listening
-    only once GitHub's `ping` for the fresh hook has reached clank;
-    then one background read reconciles GitHub's event feed against
-    the inbox, and a CI watch reads every PR in scope's checks once.
-  - **After that it reads nothing on a timer.** Feed events arrive by
-    webhook. CI conclusions are read when a cue says they may have
-    moved — a finished check suite, a commit status, a PR's head
-    moving — and cues that arrive close together share one read. A
-    healthy idle watch makes no API calls.
-  - **`"poll_interval": "5m"` adds an optional background poll** of
-    the feed and the checks on that interval, on top of the webhook.
-    It is also how to watch a repo you don't administer.
-  - **Unfinished work is retried until it succeeds** — a catch-up or a
-    cue's read that failed (login, network, half a page), deliveries
-    the intake had to evict, a rate limit's reset — and stops once it
-    does.
+  **How a github watch hears about things.** Every watch polls.
+  GitHub offers no subscription API, and its webhooks need a public
+  endpoint, so reading is the only way in:
+  - **It reads both halves when it starts** — GitHub's repository
+    event feed, reconciled against the inbox, and for a CI watch every
+    PR in scope's checks — **and then every 60 seconds.** Set
+    `"poll_interval": "5m"` on the watch to change the cadence; GitHub's
+    `X-Poll-Interval` header wins when it is longer. An unchanged feed
+    answers `304` to the ETag-conditioned read, which costs no rate
+    limit.
+  - **A failed read is retried with backoff** — the login, the network,
+    half a page, a rate limit's reset — and polling never stops while
+    the monitor hosts the watch.
+  - **You can see it.** `clank status` and the TUI's sources row show
+    each watch polling and when it last completed a check, and turn
+    bright red with the reason when a read fails or no poll has
+    completed for three intervals.
 
-  **What this does not catch without `poll_interval`.** GitHub's
-  repository event feed lags real activity by 30 seconds to six hours
-  (https://docs.github.com/en/rest/activity/events#list-repository-events),
-  and GitHub does not retry a failed webhook delivery. An action taken
-  shortly before a watch starts listening can therefore be missing from
-  that start's one catch-up read, and the new hook will not deliver it
-  either, because it predates the hook. Each catch-up is bounded by that
-  lag — including the restart a watch causes when it widens what its
-  repo's forwarder subscribes to. Set `poll_interval` to close the gap.
+  **How timely events are.** PRs, comments and reviews come from
+  GitHub's repository events feed, which lags real activity by 30
+  seconds to six hours and keeps a bounded history
+  (https://docs.github.com/en/rest/activity/events#list-repository-events);
+  clank's poll adds at most one interval on top. CI conclusions are not
+  in that feed: they are read from each watched PR's checks, so they
+  arrive within about one interval of GitHub reporting them.
 
-  What the github sources need:
-  - **Reads** (the catch-up, cue reads and any timer) talk to the REST
-    API directly. The token comes from `GH_TOKEN` / `GITHUB_TOKEN` if
-    set, else from one `gh auth token` call. With neither, the source
-    waits (loudly, fail-closed) rather than reading unauthenticated.
-  - **The webhook** needs the `gh` binary, the `cli/gh-webhook`
-    extension, and ADMIN on the watched repo (it creates a webhook).
-    Without them the watch is not listening: it says why and how to
-    fix it, loudly and on every retry, and the status panel shows it
-    as degraded when `poll_interval` keeps it polling, or as not
-    listening when nothing does. It is never shown as a working
-    webhook.
-  - **One forwarder per repo.** GitHub lets one CLI forwarder hold a
-    repo's webhook slot at a time
-    (https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/using-the-github-cli-to-forward-webhooks-for-testing),
-    so a monitor runs one forwarder per upstream repo and shares it
-    between every agent's watches of that repo, each still filtering,
-    logging and acking on its own. Two clank monitors in different
-    repos that watch the same upstream conflict: the second reports
-    that another forwarder holds the slot, and retries every few
-    minutes.
-  - The rest of clank's GitHub surface (`fork create --pr`) still
-    shells `gh` directly.
+  What the github sources need: a token, from `GH_TOKEN` /
+  `GITHUB_TOKEN` if set, else from one `gh auth token` call — the only
+  thing clank runs `gh` for. With neither, the source waits (loudly,
+  fail-closed) rather than reading unauthenticated. `fork create --pr`
+  reads the PR's title over the same session.
 
   Every ingested github event lands in a per-agent **inbox**
   (`.clank/agents/<label>/events/`, a write-ahead log) before it wakes
@@ -1267,8 +1243,8 @@ unsupported.
   until acked with `clank events ack`. That makes presentation
   at-least-once. Sources run in the repo's monitor for every roster
   agent whether or not it is waiting, and events that fired while no
-  monitor ran are caught up when it next starts listening, within the
-  feed-lag limit above. CI conclusions are not in that feed: they are
+  monitor ran are caught up by its first poll when it next starts,
+  within the feed-lag limit above. CI conclusions are not in that feed: they are
   read from each watched PR's checks, and a read keeps only what it
   sees, so a build that went red and was replaced by a green one
   between reads, or while no monitor ran, is not recoverable.

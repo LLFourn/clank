@@ -713,7 +713,8 @@ fn ignored_delivery(config: &clank_user_config::Document) -> Option<String> {
         .collect();
     (!repos.is_empty()).then(|| {
         format!(
-            "the `delivery` field on the watch of {} is ignored: every github watch now              listens by webhook, catches up when it starts, and polls only on its              `poll_interval`. Remove the field.",
+            "the `delivery` field on the watch of {} is ignored: every github watch polls, \
+             every 60s unless `poll_interval` says otherwise. Remove the field.",
             repos.join(", ")
         )
     })
@@ -2577,7 +2578,7 @@ mod tests {
         );
     }
 
-    /// An agent config from before every watch was realtime: its
+    /// An agent config from when watches chose a delivery: its
     /// `delivery` is ignored on load and named here so it can go.
     #[test]
     fn repo_checks_name_an_ignored_delivery_field() {

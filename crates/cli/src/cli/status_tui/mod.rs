@@ -5415,7 +5415,11 @@ pub(crate) async fn run_tui(
             Err(mpsc::RecvTimeoutError::Timeout) if spinner_visible => {
                 frame = frame.wrapping_add(1);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // The sources account lives outside the repo and only a
+            // monitor of this build's protocol wakes us for it, so the
+            // idle tick asks the nothing-changed gate whether it moved:
+            // a source's last check must not freeze into a false red.
+            Err(mpsc::RecvTimeoutError::Timeout) => refresh_pending = true,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("event channel disconnected")
             }

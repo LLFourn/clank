@@ -150,16 +150,13 @@ this agent's `.clank/agents/<label>/config.json` under `wait_events`
   two events get different filters; `numbers` scopes EVERY event
   beneath it where flat `prs` leaves `pr_opened` out, so the shapes
   mean different things and are refused together. The `clank-github`
-  skill has the full vocabulary. Every watch
-  listens by webhook: clank runs one `gh webhook forward` per repo
-  into a loopback listener, catches up once each time it starts
-  listening, and otherwise reads only on cues. That needs ADMIN on the
-  watched repo (it creates a webhook) and the `cli/gh-webhook`
-  extension; GitHub bills the relay as dev tooling. `"poll_interval"`
-  (`"5m"`) adds an optional background poll — the backstop for actions
-  GitHub's feed still lags on when a watch starts listening, and how to
-  watch a repo you don't administer. Without it, a watch whose webhook
-  can't start reads nothing and says so loudly.
+  skill has the full vocabulary. Every watch polls GitHub when it
+  starts and then every 60s; `"poll_interval"` (`"5m"`) changes that,
+  and GitHub's `X-Poll-Interval` wins when longer. Feed events are only
+  as timely as GitHub's events feed (30 seconds to six hours); CI
+  conclusions are read from each PR's checks, so they arrive within
+  about one interval. A watch whose reads fail retries with backoff and
+  shows red in `clank status` and the TUI's sources row.
 - `{"kind":"command","name":"label","command":["prog","arg",…]}` — a
   long-running producer that streams events as JSONL on stdout, one
   object per line (`id` unique within the source; optional `content`,

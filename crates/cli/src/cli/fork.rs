@@ -799,7 +799,7 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
     }
 
     // ── Network + mutation side of the fail-closed line ──
-    // The PR fetch (and the best-effort gh title lookup) are side
+    // The PR fetch (and the best-effort title lookup) are side
     // effects, so they sit AFTER every precondition (ruthless
     // 91ecaf2 edge 1): `fork create --pr` against a repo with an unbound
     // session bails before touching the network.
@@ -813,7 +813,10 @@ pub async fn run_fork(args: &ForkCreateArgs, home: Option<&Path>) -> anyhow::Res
         .unwrap_or("HEAD");
     let purpose_owned: Option<String> = match (args.prompt.as_deref(), args.pr) {
         (Some(p), _) => Some(p.to_string()),
-        (None, Some(pr)) => Some(default_pr_purpose(pr, gh_pr_title(&source, pr).as_deref())),
+        (None, Some(pr)) => Some(default_pr_purpose(
+            pr,
+            pr_title(&source, pr).await.as_deref(),
+        )),
         (None, None) => None,
     };
 
@@ -1164,42 +1167,142 @@ fn parse_worktrees(porcelain: &str) -> Vec<(&str, &str)> {
     pairs
 }
 
-/// Best-effort PR title for the orientation prompt. Runs gh IN
-/// THE SOURCE DIR (ruthless 91ecaf2 edge 3 — gh infers the repo
-/// from cwd, so `--source /other` must not read the caller's
-/// repo). Missing/unauthenticated gh, or any failure → None (the
-/// prompt degrades to "reviewing PR #N").
-fn gh_pr_title(source: &Path, pr: u32) -> Option<String> {
-    const GH_PR_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
-    use crate::proc_run::{Group, Out, Spec};
-    let out = crate::proc_run::run_blocking(
-        Spec::new("gh")
-            .cwd(source)
-            .args([
-                "pr",
-                "view",
-                &pr.to_string(),
-                "--json",
-                "title",
-                "-q",
-                ".title",
-            ])
-            .stdout(Out::Capture { cap: 1 << 20 })
-            .stderr(Out::Ring { bytes: 4096 })
-            .group(Group::New),
-        GH_PR_BUDGET,
-    )
-    .ok()?;
-    if !out.status.success() {
-        return None;
+/// Best-effort PR title for the orientation prompt, read from the
+/// GitHub repo `source`'s `origin` names — the remote the PR head was
+/// fetched from, so `--source /other` reads that repo's PR, not the
+/// caller's. Any failure → None (the prompt degrades to
+/// "reviewing PR #N").
+async fn pr_title(source: &Path, pr: u32) -> Option<String> {
+    let repo = github_repo(&crate::git_io::origin_url(source)?)?;
+    crate::cli::github::session::pr_title(&crate::cli::github::session::shared_session(), &repo, pr)
+        .await
+}
+
+/// The `owner/name` of a github.com remote URL, in any of the forms git
+/// accepts for it; `None` for any other host.
+fn github_repo(url: &str) -> Option<String> {
+    let path = ["https://", "http://", "ssh://git@", "git://", "ssh://"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme)?.strip_prefix("github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    match path.split('/').collect::<Vec<_>>()[..] {
+        [owner, name] if !owner.is_empty() && !name.is_empty() => Some(format!("{owner}/{name}")),
+        _ => None,
     }
-    let title = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if title.is_empty() { None } else { Some(title) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::github::session::{GithubSession, HttpSend, MiniResponse, pr_title};
+
+    #[test]
+    fn a_github_remote_names_its_repo_in_every_spelling() {
+        for url in [
+            "https://github.com/LLFourn/clank",
+            "https://github.com/LLFourn/clank.git",
+            "https://github.com/LLFourn/clank/",
+            "git@github.com:LLFourn/clank.git",
+            "ssh://git@github.com/LLFourn/clank.git",
+            "git://github.com/LLFourn/clank",
+        ] {
+            assert_eq!(github_repo(url).as_deref(), Some("LLFourn/clank"), "{url}");
+        }
+        for url in [
+            "/srv/git/origin.git",
+            "https://gitlab.com/LLFourn/clank",
+            "https://github.com/LLFourn",
+            "https://github.com/LLFourn/clank/pulls",
+        ] {
+            assert_eq!(github_repo(url), None, "{url}");
+        }
+    }
+
+    /// Answers every request with one status and body, and records the
+    /// URL it was asked for.
+    struct Answer(u16, &'static str, std::sync::Mutex<Vec<String>>);
+
+    impl HttpSend for Answer {
+        async fn send(
+            &self,
+            url: &str,
+            _bearer: &str,
+            _etag: Option<&str>,
+        ) -> anyhow::Result<MiniResponse> {
+            self.2.lock().unwrap().push(url.to_string());
+            Ok(MiniResponse {
+                status: self.0,
+                headers: Default::default(),
+                body: self.1.to_string(),
+            })
+        }
+    }
+
+    struct Unreachable;
+
+    impl HttpSend for Unreachable {
+        async fn send(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<MiniResponse> {
+            anyhow::bail!("network unreachable")
+        }
+    }
+
+    fn token() -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
+    {
+        Box::pin(async { Ok("tok".to_string()) })
+    }
+
+    fn no_token()
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> {
+        Box::pin(async { anyhow::bail!("no GH_TOKEN/GITHUB_TOKEN and `gh auth token` failed") })
+    }
+
+    #[tokio::test]
+    async fn the_pr_title_is_read_over_the_http_session() {
+        let session = GithubSession::for_tests(
+            Answer(
+                200,
+                r#"{"number": 7, "title": " Fix the frobnicator "}"#,
+                Default::default(),
+            ),
+            token,
+        );
+        assert_eq!(
+            pr_title(&session, "o/r", 7).await.as_deref(),
+            Some("Fix the frobnicator")
+        );
+        let asked = session_urls(&session);
+        assert_eq!(asked, ["https://api.github.com/repos/o/r/pulls/7"]);
+    }
+
+    fn session_urls(session: &GithubSession<Answer>) -> Vec<String> {
+        session.http_for_tests().2.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn any_failure_degrades_to_no_title() {
+        let missing = GithubSession::for_tests(Answer(404, "{}", Default::default()), token);
+        assert_eq!(pr_title(&missing, "o/r", 7).await, None, "a status");
+        let tokenless = GithubSession::for_tests(
+            Answer(200, r#"{"title":"t"}"#, Default::default()),
+            no_token,
+        );
+        assert_eq!(pr_title(&tokenless, "o/r", 7).await, None, "no token");
+        assert!(
+            session_urls(&tokenless).is_empty(),
+            "nothing asked without one"
+        );
+        let offline = GithubSession::for_tests(Unreachable, token);
+        assert_eq!(pr_title(&offline, "o/r", 7).await, None, "no network");
+        let blank =
+            GithubSession::for_tests(Answer(200, r#"{"title":"  "}"#, Default::default()), token);
+        assert_eq!(pr_title(&blank, "o/r", 7).await, None, "a blank title");
+        assert_eq!(
+            default_pr_purpose(7, pr_title(&offline, "o/r", 7).await.as_deref()),
+            "reviewing PR #7"
+        );
+    }
 
     #[test]
     fn derivation_matrix() {

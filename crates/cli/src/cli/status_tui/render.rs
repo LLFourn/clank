@@ -920,11 +920,17 @@ pub(super) fn scrollable_header(
             .enumerate()
         {
             let members = group.members(&snap.sources);
+            let now = crate::cli::github::log::now_epoch();
             head_out.push(row_line(
                 &[
                     plain(format!("  {} {}", members[0].glyph, group.name)),
                     dim(format!("  {}", row_agents(&members))),
-                    dim(format!("  {}", group_state(&members, &snap.sources_live))),
+                    state_span(
+                        format!("  {}", group_state(&members, &snap.sources_live, now)),
+                        members
+                            .iter()
+                            .any(|s| health(s, &snap.sources_live, now).failing()),
+                    ),
                 ],
                 mode.selected() == at(PanelRow::Source(i)),
                 color,
@@ -933,11 +939,17 @@ pub(super) fn scrollable_header(
         }
         let timers = super::input::active_timers(&snap.sources);
         if !timers.is_empty() {
+            let now = crate::cli::github::log::now_epoch();
             head_out.push(row_line(
                 &[
                     plain("  ⏰ timers".to_string()),
                     dim(format!("  {}", row_agents(&timers))),
-                    dim(format!("  {}", timers_summary(&timers, crate::age::now()))),
+                    state_span(
+                        format!("  {}", timers_summary(&timers, now as i64)),
+                        timers
+                            .iter()
+                            .any(|s| health(s, &snap.sources_live, now).failing()),
+                    ),
                 ],
                 mode.selected() == at(PanelRow::Timers),
                 color,
@@ -947,34 +959,6 @@ pub(super) fn scrollable_header(
     }
 
     head_out
-}
-
-/// A timer's state in words at `now`: when it fires, or since when it
-/// has been owed, or why it has no time.
-pub(super) fn timer_words(
-    source: &crate::cli::source_status::ConfiguredSource,
-    now: i64,
-) -> String {
-    use crate::cli::timer_source::TimerState;
-    let recurring = matches!(
-        &source.config,
-        clank_core::agent_config::WaitEventSource::Timer(t) if t.repeat_every.is_some()
-    );
-    match &source.timer {
-        Some(TimerState::Due(at)) if *at as i64 > now => {
-            format!("in {}", crate::age::short(*at as i64 - now))
-        }
-        Some(TimerState::Due(at)) => {
-            let since = crate::age::short(now - *at as i64);
-            match recurring {
-                true => format!("catch-up owed since {since}"),
-                false => format!("owed since {since}"),
-            }
-        }
-        Some(TimerState::AwaitingAck) => "awaiting ack".to_string(),
-        Some(TimerState::Unknown(why)) => format!("unknown: {why}"),
-        Some(TimerState::Fired) | None => String::new(),
-    }
 }
 
 /// The timers row's summary at `now`: how many are owed, when the next
@@ -1033,10 +1017,17 @@ pub(super) fn render_timers_list(
     let room = rows.saturating_sub(out.len() + 1).max(1);
     let first = sel.saturating_sub(room - 1);
     for (i, timer) in timers.iter().enumerate().skip(first).take(room) {
+        let words = format!(
+            "  {}",
+            crate::cli::source_status::timer_text(timer, now as u64)
+        );
         let mut spans = vec![
             plain(format!("  {}", timer.name)),
             dim(format!("  @{}", timer.agent)),
-            plain(format!("  {}", timer_words(timer, now))),
+            match health(timer, &snap.sources_live, now as u64).failing() {
+                true => colored(FAILING, words),
+                false => plain(words),
+            },
         ];
         if let clank_core::agent_config::WaitEventSource::Timer(t) = &timer.config
             && let Some(every) = &t.repeat_every
@@ -1057,25 +1048,47 @@ pub(super) fn render_timers_list(
     (out, 0)
 }
 
+const FAILING: &str = crate::cli::source_status::FAILING_SGR;
+
+/// A source's state, bright red when failing and dim otherwise.
+fn state_span(text: String, failing: bool) -> Span {
+    match failing {
+        true => colored(FAILING, text),
+        false => dim(text),
+    }
+}
+
+/// [`crate::cli::source_status::source_health`] of `source` as the
+/// monitor's account records it.
+pub(super) fn health(
+    source: &crate::cli::source_status::ConfiguredSource,
+    live: &crate::cli::source_status::Live,
+    now: u64,
+) -> crate::cli::source_status::Health {
+    crate::cli::source_status::source_health(source, live.of(source), now)
+}
+
 /// What a source row's agents are doing: the one agent's state in full,
 /// or how many of several are in each.
 pub(super) fn group_state(
     members: &[&crate::cli::source_status::ConfiguredSource],
     live: &crate::cli::source_status::Live,
+    now: u64,
 ) -> String {
+    use crate::cli::source_status::{state_text, state_word};
     if let [only] = members {
-        return source_state(only, live);
+        return state_text(only, live, now);
     }
-    // A watch's state is its configured delivery, which only its whole
+    // A watch's state is its configured polling, which only its whole
     // text tells apart: two intervals are two states.
     let github = members
         .iter()
         .all(|s| s.backend == crate::cli::github::timeline::Backend::Github);
     if github {
-        let states: Vec<String> = members.iter().map(|s| source_state(s, live)).collect();
+        let states: Vec<String> = members.iter().map(|s| state_text(s, live, now)).collect();
         return tally(states.iter().map(String::as_str), false);
     }
-    tally(members.iter().map(|s| source_word(s, live)), true)
+    tally(members.iter().map(|s| state_word(s, live, now)), true)
 }
 
 /// `n state` per distinct state, in first-seen order; one state shared
@@ -1120,30 +1133,6 @@ fn row_agents(members: &[&crate::cli::source_status::ConfiguredSource]) -> Strin
         .join(",")
 }
 
-/// [`source_state`] in a word, for counting.
-fn source_word(
-    source: &crate::cli::source_status::ConfiguredSource,
-    live: &crate::cli::source_status::Live,
-) -> &'static str {
-    use crate::cli::event_source::Lifecycle;
-    use crate::cli::source_status::Live;
-    let Live::Monitor(..) = live else {
-        return "monitor not running";
-    };
-    match live.of(source).map(|h| &h.lifecycle) {
-        None => "not hosted",
-        Some(None) => "hosted",
-        Some(Some(Lifecycle::Running { .. })) => "running",
-        Some(Some(Lifecycle::Following)) => "held elsewhere",
-        Some(Some(Lifecycle::Settling { .. })) => "settling",
-        Some(Some(Lifecycle::Stopped { .. })) => "stopped",
-        Some(Some(Lifecycle::BackingOff { .. })) => "restarting",
-        Some(Some(Lifecycle::Listening)) => "listening",
-        Some(Some(Lifecycle::Degraded { polling: true, .. })) => "degraded",
-        Some(Some(Lifecycle::Degraded { polling: false, .. })) => "not listening",
-    }
-}
-
 /// The agents configuring one source row's source, each with what its
 /// own copy is doing. Enter opens that copy's page.
 pub(super) fn render_source_members(
@@ -1163,14 +1152,18 @@ pub(super) fn render_source_members(
     let room = rows.saturating_sub(out.len() + 1).max(1);
     let first = sel.saturating_sub(room - 1);
     for (i, source) in members.iter().enumerate().skip(first).take(room) {
+        let now = crate::cli::github::log::now_epoch();
         let mut spans = vec![plain(format!("  @{}", source.agent))];
         if let Some(subscription) = &source.subscription {
             spans.push(plain(format!("  {subscription}")));
         }
-        spans.push(dim(format!(
-            "  {}",
-            source_state(source, &snap.sources_live)
-        )));
+        spans.push(state_span(
+            format!(
+                "  {}",
+                crate::cli::source_status::state_text(source, &snap.sources_live, now)
+            ),
+            health(source, &snap.sources_live, now).failing(),
+        ));
         out.push(row_line(&spans, i == sel, &color, cols));
     }
     while out.len() < rows.saturating_sub(1) {
@@ -1183,72 +1176,6 @@ pub(super) fn render_source_members(
         cols,
     ));
     (out, 0)
-}
-
-/// What the monitor says `source` is doing, in a few words. Without a
-/// running monitor nothing is known, which is said, not taken for stopped.
-pub(super) fn source_state(
-    source: &crate::cli::source_status::ConfiguredSource,
-    live: &crate::cli::source_status::Live,
-) -> String {
-    use crate::cli::event_source::Lifecycle;
-    use crate::cli::github::timeline::Backend;
-    use crate::cli::source_status::Live;
-    let hosted = match live {
-        Live::Unavailable => return "monitor not running".to_string(),
-        Live::Monitor(..) => match live.of(source) {
-            Some(hosted) => hosted,
-            None => return "not hosted".to_string(),
-        },
-    };
-    let now = crate::cli::github::log::now_epoch();
-    let state = match (&hosted.lifecycle, source.backend) {
-        (None, Backend::Command) => "starting".to_string(),
-        (None, Backend::Github) => source.delivery.clone().unwrap_or_default(),
-        (None, _) => "hosted".to_string(),
-        (Some(Lifecycle::Following), _) => match live.producer(source) {
-            Some(pid) => format!("held elsewhere · producer pid {pid}"),
-            None => "held elsewhere · producer unknown".to_string(),
-        },
-        (Some(Lifecycle::Settling { why }), _) => format!("settling: {why}"),
-        (Some(Lifecycle::Stopped { why }), _) => format!("stopped: {why}"),
-        (Some(Lifecycle::Listening), _) => format!(
-            "listening · {}",
-            source.delivery.clone().unwrap_or_default()
-        ),
-        (Some(Lifecycle::Degraded { why, polling }), _) => match polling {
-            true => format!("degraded, polling only: {why}"),
-            false => format!("not listening, nothing is read: {why}"),
-        },
-        (Some(Lifecycle::Running { pid, since }), _) => format!(
-            "running · pid {pid} · {}",
-            crate::age::short(crate::age::elapsed(*since as i64))
-        ),
-        (
-            Some(Lifecycle::BackingOff {
-                until,
-                failures,
-                exit,
-                error,
-            }),
-            _,
-        ) => {
-            let why = match (exit, error) {
-                (_, Some(error)) => format!("did not start: {error}"),
-                (Some(code), None) => format!("exited {code}"),
-                (None, None) => "ended".to_string(),
-            };
-            format!(
-                "{why} · restarting in {}s · {failures} in a row",
-                until.saturating_sub(now)
-            )
-        }
-    };
-    if hosted.accepted != crate::cli::source_status::fingerprint(&source.config) {
-        format!("{state} · an edit was rejected; runs the earlier config")
-    } else {
-        state
-    }
 }
 
 /// Whether a source page offers Restart: a command source the running
@@ -1360,15 +1287,17 @@ pub(super) fn render_source_page(
     const LABEL: usize = 11;
     let color = state_color(snap).sgr();
     let mut body = vec![String::new()];
+    let now = crate::cli::github::log::now_epoch();
+    let failing = health(source, &snap.sources_live, now).failing();
     let mut fact = |key: &str, value: &str| {
         let width = cols.saturating_sub(LABEL + 2).max(1);
         for (i, line) in wrap(value, width).into_iter().enumerate() {
             let label = if i == 0 { key } else { "" };
-            body.push(emit(
-                &[dim(format!("  {label:<LABEL$}")), plain(line)],
-                "",
-                cols,
-            ));
+            let value = match key == "state" && failing {
+                true => colored(FAILING, line),
+                false => plain(line),
+            };
+            body.push(emit(&[dim(format!("  {label:<LABEL$}")), value], "", cols));
         }
     };
     if let Some(subscription) = &source.subscription {
@@ -1379,8 +1308,11 @@ pub(super) fn render_source_page(
         fact(&key, &value);
     }
     match source.timer {
-        Some(_) => fact("state", &timer_words(source, crate::age::now())),
-        None => fact("state", &source_state(source, &snap.sources_live)),
+        Some(_) => fact("state", &crate::cli::source_status::timer_text(source, now)),
+        None => fact(
+            "state",
+            &crate::cli::source_status::state_text(source, &snap.sources_live, now),
+        ),
     }
     if matches!(&source.config, clank_core::agent_config::WaitEventSource::Github(g) if g.poll_interval.is_some())
     {
@@ -9169,6 +9101,13 @@ mod tests {
         assert_eq!(age_gutter(&row, 3).1, "");
     }
 
+    fn source_state(
+        source: &crate::cli::source_status::ConfiguredSource,
+        live: &crate::cli::source_status::Live,
+    ) -> String {
+        crate::cli::source_status::state_text(source, live, crate::cli::github::log::now_epoch())
+    }
+
     fn source(name: &str) -> crate::cli::source_status::ConfiguredSource {
         crate::cli::source_status::ConfiguredSource::of(
             &clank_core::ids::AgentLabel::parse("alpha").unwrap(),
@@ -9201,6 +9140,7 @@ mod tests {
                     key: source.key.clone(),
                     accepted,
                     lifecycle,
+                    foreign: None,
                 }],
             },
             Default::default(),
@@ -9287,6 +9227,7 @@ mod tests {
                         key: s.key.clone(),
                         accepted: crate::cli::source_status::fingerprint(&s.config),
                         lifecycle: Some(lifecycle.clone()),
+                        foreign: None,
                     })
                     .collect(),
             },
@@ -9449,6 +9390,7 @@ mod tests {
                         key: s.key.clone(),
                         accepted: crate::cli::source_status::fingerprint(&s.config),
                         lifecycle: None,
+                        foreign: None,
                     })
                     .collect(),
             },
@@ -9462,7 +9404,7 @@ mod tests {
 
     /// fs-war-room's shape: one agent's three watches on one repo. The
     /// row names the agent once with its count and their one shared
-    /// delivery; the agent list tells the three apart by what each
+    /// cadence; the agent list tells the three apart by what each
     /// subscribes to; the page leads with the subscription and its key.
     #[test]
     fn three_watches_on_one_repo_say_what_each_watches() {
@@ -9489,10 +9431,7 @@ mod tests {
             .iter()
             .find(|l| l.contains("frostsnap/frostsnap"))
             .unwrap();
-        assert!(
-            row.contains("@claude ×3  webhook, plus a poll every 120s"),
-            "{row}"
-        );
+        assert!(row.contains("@claude ×3  polled every 120s"), "{row}");
         assert!(!row.contains("hosted"), "{row}");
 
         let group = super::super::input::GroupRef::of(&s.sources[0]);
@@ -9520,8 +9459,7 @@ mod tests {
             assert!(
                 members
                     .iter()
-                    .any(|l| l
-                        .contains(&format!("@claude  {want}  webhook, plus a poll every 120s"))),
+                    .any(|l| l.contains(&format!("@claude  {want}  polled every 120s"))),
                 "{want}: {list:#?}"
             );
         }
@@ -9687,10 +9625,16 @@ mod tests {
     fn a_due_time_passing_turns_scheduled_into_owed() {
         use crate::cli::timer_source::TimerState::Due;
         let once = timer_of("a", "once", None, Due(1_000));
-        assert_eq!(timer_words(&once, 900), "in 1m");
-        assert_eq!(timer_words(&once, 1_120), "owed since 2m");
+        assert_eq!(crate::cli::source_status::timer_text(&once, 900), "in 1m");
+        assert_eq!(
+            crate::cli::source_status::timer_text(&once, 1_120),
+            "owed since 2m"
+        );
         let every = timer_of("a", "every", Some("1h"), Due(1_000));
-        assert_eq!(timer_words(&every, 1_120), "catch-up owed since 2m");
+        assert_eq!(
+            crate::cli::source_status::timer_text(&every, 1_120),
+            "catch-up owed since 2m"
+        );
         assert_eq!(
             timers_summary(&[&once, &every], 900),
             "next in 1m",
@@ -9699,19 +9643,19 @@ mod tests {
         assert_eq!(timers_summary(&[&once, &every], 1_120), "2 owed");
     }
 
-    /// Watches whose deliveries differ are counted, not collapsed; and a
+    /// Watches whose cadences differ are counted, not collapsed; and a
     /// watch the monitor does not host, or whose edit it rejected, says
-    /// so rather than naming its delivery as if it ran.
+    /// so rather than naming its cadence as if it ran.
     #[test]
-    fn a_watchs_delivery_never_hides_what_the_monitor_says() {
+    fn a_watchs_cadence_never_hides_what_the_monitor_says() {
         use crate::cli::source_status::Live;
         use clank_core::agent_config::GithubEventKind::*;
         let fast = watch("claude", &[PrUpdated], Some("30s"));
         let slow = watch("claude", &[PrComment], None);
         let both = hosted_watches(&[&fast, &slow]);
         assert_eq!(
-            group_state(&[&fast, &slow], &both),
-            "1 webhook, plus a poll every 30s · 1 webhook, catching up each time it starts listening"
+            group_state(&[&fast, &slow], &both, 0),
+            "1 polled every 30s · 1 polled every 60s"
         );
         assert_eq!(source_state(&fast, &hosted_watches(&[&slow])), "not hosted");
         assert_eq!(
@@ -9724,44 +9668,99 @@ mod tests {
         account.sources[0].accepted = "an earlier config".into();
         assert_eq!(
             source_state(&fast, &Live::Monitor(account, producers)),
-            "webhook, plus a poll every 30s · an edit was rejected; runs the earlier config"
+            "polled every 30s · an edit was rejected; runs the earlier config"
         );
     }
 
-    /// A watch whose webhook is down never reads as a working one:
-    /// polling through it is degraded, and without a timer it says
-    /// nothing is read.
+    /// A watch's row says when it last checked, dim while it keeps
+    /// checking and bright red with the reason once it fails; `clank
+    /// status` judges it with the same function and says the same.
     #[test]
-    fn a_watchs_webhook_health_is_what_its_state_says() {
+    fn a_failing_watch_is_red_in_its_own_row() {
         use crate::cli::event_source::Lifecycle;
+        use crate::cli::github::progress::{PollError, PollRecord};
         use crate::cli::source_status::Live;
         use clank_core::agent_config::GithubEventKind::*;
-        let timed = watch("claude", &[PrUpdated], Some("30s"));
-        let state = |lifecycle: Lifecycle| {
-            let Live::Monitor(mut account, producers) = hosted_watches(&[&timed]) else {
+        let now = crate::cli::github::log::now_epoch();
+        let w = watch("alpha", &[PrUpdated], None);
+        let live = |record: PollRecord| {
+            let Live::Monitor(mut account, producers) = hosted_watches(&[&w]) else {
                 unreachable!()
             };
-            account.sources[0].lifecycle = Some(lifecycle);
-            source_state(&timed, &Live::Monitor(account, producers))
+            account.sources[0].lifecycle = Some(Lifecycle::Polling(record));
+            Live::Monitor(account, producers)
+        };
+        let checked = PollRecord {
+            since: now - 600,
+            every: 60,
+            backoff: 0,
+            checked: Some(now - 20),
+            errors: Vec::new(),
+        };
+        let failing = PollRecord {
+            backoff: 20,
+            errors: vec![PollError {
+                why: "feed read failed: github /events: 502".into(),
+                since: now - 5,
+                retry_at: now + 15,
+                rate_limited: false,
+            }],
+            ..checked.clone()
+        };
+        let row = |live: Live| {
+            let mut s = two_agent_snap();
+            s.sources = vec![w.clone()];
+            s.sources_live = live;
+            render_at(
+                &s,
+                40,
+                160,
+                0,
+                0,
+                &PanelView::just(Mode::AgentPanel { sel: 0 }),
+            )
+            .0
+            .into_iter()
+            .find(|l| visible(l).contains("frostsnap/frostsnap"))
+            .expect("a sources row")
+        };
+        let red = format!("\x1b[{FAILING}m");
+
+        let healthy = row(live(checked.clone()));
+        assert!(
+            visible(&healthy).contains("polling every 1m · checked just now"),
+            "{}",
+            visible(&healthy)
+        );
+        assert!(!healthy.contains(&red), "a source still checking is dim");
+
+        let broken = row(live(failing.clone()));
+        assert!(
+            visible(&broken).contains(
+                "feed read failed: github /events: 502 · retrying in 15s · checked just now"
+            ),
+            "{}",
+            visible(&broken)
+        );
+        assert!(broken.contains(&red), "a failing source is red: {broken:?}");
+
+        let stale = row(live(PollRecord {
+            checked: Some(now - 200),
+            ..checked.clone()
+        }));
+        assert!(stale.contains(&red), "three intervals unchecked is failing");
+
+        let lines = |live: Live, paint| {
+            crate::cli::source_status::status_lines(std::slice::from_ref(&w), &live, now, paint)
         };
         assert_eq!(
-            state(Lifecycle::Listening),
-            "listening · webhook, plus a poll every 30s"
+            lines(live(failing.clone()), false),
+            [
+                "source: \u{1f419} frostsnap/frostsnap @alpha → feed read failed: github /events: 502 · retrying in 15s · checked just now"
+            ]
         );
-        assert_eq!(
-            state(Lifecycle::Degraded {
-                why: "needs admin on o/r to create a webhook".into(),
-                polling: true,
-            }),
-            "degraded, polling only: needs admin on o/r to create a webhook"
-        );
-        assert_eq!(
-            state(Lifecycle::Degraded {
-                why: "needs admin on o/r to create a webhook".into(),
-                polling: false,
-            }),
-            "not listening, nothing is read: needs admin on o/r to create a webhook"
-        );
+        assert!(lines(live(failing), true)[0].contains(&red));
+        assert!(!lines(live(checked), true)[0].contains(&red));
     }
 
     /// The sources sit in the panel with their icon and state, and a

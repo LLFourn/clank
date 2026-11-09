@@ -863,6 +863,14 @@ impl StatusSnapshot {
             let _ = writeln!(out, "head:   {s}");
         }
         let _ = writeln!(out, "monitor: {}", self.monitor.line());
+        for line in crate::cli::source_status::status_lines(
+            &self.sources,
+            &self.sources_live,
+            crate::cli::github::log::now_epoch(),
+            paint,
+        ) {
+            let _ = writeln!(out, "{line}");
+        }
         for error in &self.config_errors {
             let _ = writeln!(out, "config: FAILED — {error}");
         }

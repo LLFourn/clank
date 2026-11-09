@@ -25,6 +25,7 @@ mod feedback_read_integration;
 mod feedback_write_integration;
 mod finish_integration;
 mod fork_integration;
+mod gh_spawn_boundary;
 mod git_boundary;
 mod grok_launch_acceptance;
 mod harness_support;

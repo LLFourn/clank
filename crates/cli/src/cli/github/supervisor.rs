@@ -2,9 +2,9 @@
 //! the takeover when the holder goes away.
 //!
 //! One process may have several agents waiting on the same repo. Only
-//! the LEASE holder runs the transports and writes the WAL; the rest
-//! tail what it wrote and present from there, and whoever gets the
-//! lease next takes over mid-stream. This module is the arm-to-exit
+//! the LEASE holder polls GitHub and writes the WAL; the rest tail what
+//! it wrote and present from there, and whoever gets the lease next
+//! takes over mid-stream. This module is the arm-to-exit
 //! lifecycle around that; [`super::coordinator`] is the tick it runs.
 
 use clank_core::agent_config::GithubSource;
@@ -15,7 +15,6 @@ use crate::cli::event_source::SourceOrigin;
 use super::ci::{CiReader, GhCi};
 use super::coordinator::{ChecksSide, FeedSide, poll_loop};
 use super::feed::{EventFetcher, GhFetcher, row_in_scope};
-use super::relay::{Subscription, shared_transports, webhook_event_names};
 use super::selection::Selection;
 use super::session::{GhLogin, LoginResolver, shared_session};
 
@@ -54,8 +53,7 @@ pub(crate) fn write_watch_sidecar(
 
 /// One github wake source: the production entry point. Every source
 /// in the process shares ONE host-scoped session (one token
-/// acquisition, one 401 story — codex f9807c3) and, per upstream repo,
-/// ONE webhook transport that its watches subscribe to.
+/// acquisition, one 401 story — codex f9807c3).
 pub(crate) async fn run_github_source(
     src: GithubSource,
     tx: crate::cli::event_source::EmissionSink,
@@ -78,8 +76,6 @@ pub(crate) async fn run_github_source(
         session: session.clone(),
     };
     let login = GhLogin(session);
-    let repo = src.repo.clone();
-    let names = webhook_event_names(&Selection::of(&src).kinds());
     source_supervisor(
         &src,
         FeedSide {
@@ -89,7 +85,6 @@ pub(crate) async fn run_github_source(
         &ci,
         &tx,
         events_dir,
-        move || shared_transports().subscribe(&repo, &names),
         key,
     )
     .await;
@@ -116,32 +111,27 @@ fn with_prompt(
 /// local file reads, never GitHub's.
 const TAIL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The lease-gated source runtime (wal-single-ingest-writer): the
-/// INGEST LEASE is acquired before ANY transport exists — only the
-/// holder subscribes to the webhook or reads github; a non-holder
-/// TAILS the WAL, presenting logged unhandled entries, and takes over
-/// (subscribing only then, which is a new start of listening with its
-/// own catch-up) when the holder dies.
+/// The lease-gated source runtime (wal-single-ingest-writer): only the
+/// INGEST LEASE holder reads github; a non-holder TAILS the WAL,
+/// presenting logged unhandled entries, and takes over (polling only
+/// then, starting with a catch-up) when the holder dies.
 /// Presentation never acknowledges: `clank wait` — leased or tailing
 /// — writes no ack records, ever.
-async fn source_supervisor<F, R, C, RF>(
+async fn source_supervisor<F, R, C>(
     src: &GithubSource,
     feed_side: FeedSide<'_, F, R>,
     reader: &C,
     tx: &crate::cli::event_source::EmissionSink,
     events_dir: Option<std::path::PathBuf>,
-    relay_start: RF,
     key: String,
 ) where
     F: EventFetcher,
     R: LoginResolver,
     C: CiReader,
-    RF: FnOnce() -> Subscription,
 {
     // Ad-hoc unbound waits have no persistence dir: memory-only
     // ingest, lease-free — nothing durable to contend over.
     let Some(dir) = events_dir else {
-        let relay = relay_start();
         poll_loop(
             src,
             FeedSide {
@@ -153,7 +143,6 @@ async fn source_supervisor<F, R, C, RF>(
                 state: None,
             },
             tx,
-            &relay.inbox,
             &key,
             None,
             Default::default(),
@@ -161,9 +150,6 @@ async fn source_supervisor<F, R, C, RF>(
         .await;
         return;
     };
-    // FnOnce discipline across the loop: the transports start at most
-    // once, exactly at lease acquisition.
-    let mut relay_start = Some(relay_start);
     let mut warned_tail = false;
     // Presented LOGICAL EVENT keys — (seq, ident), never seq alone:
     // damaged logs can hold distinct events at one seq and each must
@@ -185,10 +171,6 @@ async fn source_supervisor<F, R, C, RF>(
                      polling without persistence",
                     src.repo
                 );
-                let Some(start) = relay_start.take() else {
-                    return;
-                };
-                let relay = start();
                 poll_loop(
                     src,
                     FeedSide {
@@ -200,7 +182,6 @@ async fn source_supervisor<F, R, C, RF>(
                         state: ci_state(&dir, &key),
                     },
                     tx,
-                    &relay.inbox,
                     &key,
                     None,
                     Default::default(),
@@ -221,10 +202,6 @@ async fn source_supervisor<F, R, C, RF>(
                     None
                 }
             };
-            let Some(start) = relay_start.take() else {
-                return;
-            };
-            let relay = start();
             poll_loop(
                 src,
                 FeedSide {
@@ -236,19 +213,16 @@ async fn source_supervisor<F, R, C, RF>(
                     state: ci_state(&dir, &key),
                 },
                 tx,
-                &relay.inbox,
                 &key,
                 log,
                 presented,
             )
             .await;
             drop(lease);
-            // The subscription drops here (and on task abort); the
-            // last one off a repo stops its forwarder.
-            drop(relay);
             return;
         }
         if !warned_tail {
+            tx.report(&key, crate::cli::event_source::Lifecycle::Following);
             eprintln!(
                 "wait: github {} — another wait is already watching this source for this \
                  agent; tailing its event log instead of polling",
@@ -351,7 +325,6 @@ mod tests {
     use crate::cli::github::feed::tests::{ScriptFetcher, classified, ev, gh_item, ok, src};
     use crate::cli::github::feed::{GhResponse, tests::classify_event_flat};
     use crate::cli::github::log::tests::wal_tempdir;
-    use crate::cli::github::relay::tests::listening;
     use crate::cli::github::session::tests::FixedLogin;
 
     #[tokio::test(start_paused = true)]
@@ -384,9 +357,8 @@ mod tests {
                 .replace("\"number\":7", "\"number\":8");
             std::fs::write(&path, format!("{text}{line}\n")).unwrap();
         }
-        // The second wait's supervisor: its relay starter and fetcher
-        // must go UNUSED while tailing.
-        let relay_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The second wait's supervisor: its fetcher must go UNUSED
+        // while tailing.
         let fetched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         struct CountFetcher(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl EventFetcher for CountFetcher {
@@ -399,7 +371,6 @@ mod tests {
         let tx = crate::cli::event_source::EmissionSink::from(tx);
         let s = src(&[GithubEventKind::IssueOpened], true);
         let d = dir.clone();
-        let rs = relay_started.clone();
         let f = CountFetcher(fetched.clone());
         let run = tokio::spawn(async move {
             source_supervisor(
@@ -411,10 +382,6 @@ mod tests {
                 &NoCi,
                 &tx,
                 Some(d),
-                move || {
-                    rs.store(true, std::sync::atomic::Ordering::SeqCst);
-                    listening()
-                },
                 source_key(&src(&[GithubEventKind::IssueOpened], true)),
             )
             .await;
@@ -432,17 +399,12 @@ mod tests {
         }
         got.sort();
         assert_eq!(got, vec![7, 8], "both distinct same-seq events present");
-        // …without starting transports or touching github.
-        assert!(!relay_started.load(std::sync::atomic::Ordering::SeqCst));
+        // …without touching github.
         assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 0);
         // Holder dies → the tailer's next cycle takes the lease and
-        // becomes the ingester: transports start, github is polled.
+        // becomes the ingester: github is polled.
         drop(lease);
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        assert!(
-            relay_started.load(std::sync::atomic::Ordering::SeqCst),
-            "takeover must start transports after acquiring the lease"
-        );
         assert!(
             fetched.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "takeover must begin polling"
@@ -515,7 +477,6 @@ mod tests {
                 &NoCi,
                 &tx,
                 Some(d),
-                listening,
                 source_key(&s),
             )
             .await;

@@ -167,17 +167,13 @@ pub struct GithubSource {
     /// Empty only when [`watch`](Self::watch) says it instead.
     #[serde(default)]
     pub events: Vec<GithubEventKind>,
-    /// An OPTIONAL background poll on top of the webhook, as a
-    /// duration string (`"60s"`, `"5m"`); validated at use site.
-    /// Absent means no timer: the watch reads GitHub only when it
-    /// starts listening and when a webhook cue asks. Set, the
-    /// effective interval is max(this, the server's
-    /// `X-Poll-Interval`). It is the backstop for actions the feed
-    /// still lags on when the watch starts listening, and how to watch
-    /// a repo whose webhook can't be forwarded.
+    /// How often the watch polls, as a duration string (`"60s"`,
+    /// `"5m"`); validated at use site. Absent, zero or unreadable means
+    /// every 60s. The effective interval is max(this, the server's
+    /// `X-Poll-Interval`).
     ///
     /// A `delivery` field from older configs is ignored on read
-    /// (every watch is realtime now) and dropped on the next write.
+    /// (every watch polls) and dropped on the next write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_interval: Option<String>,
     /// Whether events actored by the authenticated `gh` login wake
@@ -1241,7 +1237,7 @@ mod tests {
         );
     }
 
-    /// Configs written before every watch was realtime still carry
+    /// Configs written when watches chose a delivery still carry
     /// `delivery`. They must load, whatever the value said, and say
     /// the same thing as the config without it.
     #[test]

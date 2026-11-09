@@ -10,8 +10,7 @@
 /// The GitHub token, reusing gh's credential without shelling gh per
 /// poll: `GH_TOKEN` / `GITHUB_TOKEN` env first (the standard
 /// overrides gh itself honors), else ONE `gh auth token` subprocess —
-/// the last place gh is invoked on the polling path
-/// (github-http-client-and-realtime M1).
+/// the only thing clank runs gh for (`gh_spawn_boundary` holds it).
 async fn acquire_github_token() -> anyhow::Result<String> {
     if let Some(t) = env_token(|k| std::env::var(k).ok()) {
         return Ok(t);
@@ -265,6 +264,11 @@ impl<S: HttpSend> GithubSession<S> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn http_for_tests(&self) -> &S {
+        &self.http
+    }
+
     /// Test knob for paused-clock deadline proofs.
     #[cfg(test)]
     pub(super) fn with_timeouts(
@@ -353,6 +357,29 @@ pub(super) async fn fetch_authenticated_login<S: HttpSend>(
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("github /user returned no login"))
+}
+
+/// A PR's title, `GET /repos/{repo}/pulls/{pr}` over the session.
+/// `None` on any failure — a missing token, the network, a status, a
+/// body without one: callers only decorate with it.
+pub(crate) async fn pr_title<S: HttpSend>(
+    session: &GithubSession<S>,
+    repo: &str,
+    pr: u32,
+) -> Option<String> {
+    let resp = session
+        .get(
+            &format!("https://api.github.com/repos/{repo}/pulls/{pr}"),
+            None,
+        )
+        .await
+        .ok()?;
+    if !(200..300).contains(&resp.status) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp.body).ok()?;
+    let title = v.get("title")?.as_str()?.trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 /// Resolves the authenticated login for the own-action filter —
