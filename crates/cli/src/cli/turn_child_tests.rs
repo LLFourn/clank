@@ -82,12 +82,6 @@ fn stop(session: &str, deadline: u64) -> Report {
             tool: clank_core::Tool::Claude,
             session: clank_core::SessionId::parse(session).unwrap(),
             place: Default::default(),
-            tasks: clank_core::turn_policy::TaskSnapshot::Known(vec![
-                serde_json::from_value(serde_json::json!({
-                    "id": "a1", "type": "subagent", "status": "running", "description": "sleeper",
-                }))
-                .unwrap(),
-            ]),
         },
         deadline,
         questions: Vec::new(),
@@ -223,9 +217,10 @@ async fn a_hook_gone_before_its_report_ends_the_child() {
 }
 
 /// Grok's handoff is answered as the monitor answers it, with no monitor
-/// and no fold: a request for the wait while none runs, silence while one
-/// does. It is carried without holding the session, so it can never take
-/// the place of the very wait it reports.
+/// and no fold: with no monitor no wait is registered, so it asks for
+/// one, and only the continuation of that ask is silent. It is carried
+/// without holding the session, so it can never take the place of the
+/// very wait it reports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handoff_alone_is_answered_by_the_native_rule_and_holds_no_wait() {
     let (repo, author) = repo_with(false);
@@ -237,12 +232,9 @@ async fn a_handoff_alone_is_answered_by_the_native_rule_and_holds_no_wait() {
         &session,
     )
     .unwrap();
-    let handoff = |wait_running| Report::Handoff {
-        handoff: clank_core::turn_policy::Handoff {
-            session: session.clone(),
-            wait_running,
-            continued: false,
-        },
+    let handoff = |continued| Report::Handoff {
+        session: session.clone(),
+        continued,
         deadline: u64::MAX,
     };
     let frames = alone(repo.path(), &author, &handoff(false)).await;

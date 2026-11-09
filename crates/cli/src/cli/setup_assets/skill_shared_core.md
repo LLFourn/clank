@@ -18,12 +18,18 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
   you started by hand. Your ROLE is roster-derived — master, reviewer
   or standby because the roster says so, not a flag.
 {{WORK_LOOP}}
-- **Long background work**: shell work as `clank run --desc "two words"
-  -- <cmd>`, a subagent with `clank attend "<name>"`; attend several at
-  once. Stopping with live work you don't attend wakes you. Past
-  `--expect` (5m): one check-in. Its completion still wakes you:
-  never poll it or start a wait. Owing work, a turn silent 45m (default)
-  is nudged, which interrupts it.
+- **Mark all background work**: anything outliving a command (builds,
+  tests, servers, subagents) runs as `clank run --desc "two words" --
+  <cmd>`, {{BACKGROUND_RUN}}, or is declared with `clank attend
+  "<name>"`. No exceptions, for any tool.
+- **Never wait for it in a turn**: start it, end the turn. A run wakes
+  you when its process ends; its output and exit status are where you
+  launched it. A declaration lasts until your next turn and checks in
+  once at `--expect` (5m): re-declare what still runs. Never poll it or
+  start a wait.
+- **clank detects no background work**: what you don't mark isn't
+  tracked; messages wait for your turn to end. A turn silent 45m while
+  owing work is nudged, which interrupts it.
 
 ## Core commands (run via {{SHELL}})
 

@@ -386,6 +386,46 @@ fn turn_state_with_stacked_attendances_reads_and_writes_back_unchanged() {
     );
 }
 
+/// The entries a build that resolved attendance against task listings
+/// wrote: a run keeps its registration, so its end is still recorded, and
+/// a named attendance stands until the agent's next turn starts.
+#[test]
+fn turn_state_with_listed_attendances_reads_as_declared_work() {
+    let dir = tempfile::tempdir().unwrap();
+    place(
+        &dir.path().join("turn.json"),
+        fixture!("turn-listed-attendances.json"),
+    );
+    let stored = crate::cli::turn_custody::load_stored(dir.path()).unwrap();
+    assert_eq!(stored.next_seq, 38);
+    assert_eq!(
+        serde_json::to_value(&stored.attendances).unwrap(),
+        json!([
+            {
+                "work": {"Declared": {"name": "Implement the example plan", "seen_turn_end": true}},
+                "desc": "Implement the example plan",
+                "started": 1793845190330u64,
+                "since": 1793845190330u64,
+                "expect": 7200000,
+                "check_in": "Armed"
+            },
+            {
+                "work": {"Run": {"pid": 7001, "token": "mac1:7001:1"}},
+                "desc": "test run",
+                "started": 1793845200000u64,
+                "since": 1793845200000u64,
+                "expect": 600000,
+                "check_in": "Armed"
+            }
+        ])
+    );
+    crate::cli::turn_custody::write_stored(dir.path(), &stored).unwrap();
+    assert_eq!(
+        crate::cli::turn_custody::load_stored(dir.path()),
+        Some(stored)
+    );
+}
+
 #[test]
 fn turn_state_with_one_old_attendance_reads_as_its_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -398,22 +438,20 @@ fn turn_state_with_one_old_attendance_reads_as_its_entries() {
         serde_json::to_value(&stored.attendances).unwrap(),
         json!([
             {
-                "selector": {"Name": "capture-probe sleeper"},
-                "resolved": {"task_id": "a0000000000000002", "kind": "Subagent"},
+                "work": {"Declared": {"name": "capture-probe sleeper", "seen_turn_end": true}},
                 "desc": "capture-probe sleeper",
+                "started": 1000000,
                 "since": 1000000,
                 "expect": 600000,
-                "shell": null,
                 "check_in": "Armed"
             },
             {
-                "selector": {"TaskId": "legacy-shell"},
-                "resolved": null,
+                "work": {"Run": {"pid": 7001, "token": "mac1:7001:1"}},
                 "desc": "test run",
+                "started": 1120000,
                 "since": 1120000,
                 "expect": 1200000,
-                "shell": {"pid": 7001, "token": "mac1:7001:1"},
-                "check_in": "Unarmed"
+                "check_in": "Armed"
             }
         ]),
         "the standing attendance and its renewal for another task"
@@ -492,7 +530,7 @@ fn a_published_state_with_one_attendance_reads_as_a_list() {
         state.attending[0].desc.as_deref(),
         Some("Implement the example plan")
     );
-    assert!(state.attending[0].subagent);
+    assert!(state.attending[0].declared);
     crate::cli::agent_state::store(dir.path(), &state);
     assert_eq!(crate::cli::agent_state::load(dir.path()), Some(state));
     assert!(raw(&dir.path().join("state.json"))["attending"].is_array());

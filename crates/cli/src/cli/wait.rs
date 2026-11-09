@@ -2774,6 +2774,17 @@ pub(crate) enum WaitJsonItem<'a> {
         answer: &'a str,
         carries: &'a clank_core::wait::AnswerRef,
     },
+    #[serde(rename = "run_ended")]
+    RunEnded {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<&'a clank_core::wait::EventPresentation>,
+        run: &'a str,
+        desc: &'a str,
+        started: u64,
+        ended_seen: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selector: Option<&'a str>,
+    },
 }
 
 fn plan_path(plan: &PlanKey) -> String {
@@ -2845,6 +2856,21 @@ pub(crate) fn render_json(item: &WaitItem) -> WaitJsonItem<'_> {
             repo: repo.as_deref(),
             subject,
             body,
+            selector: selector.as_deref(),
+        },
+        WaitItem::RunEnded {
+            presentation: _,
+            run,
+            desc,
+            started,
+            ended_seen,
+            selector,
+        } => WaitJsonItem::RunEnded {
+            presentation: item.presentation(),
+            run,
+            desc,
+            started: *started,
+            ended_seen: *ended_seen,
             selector: selector.as_deref(),
         },
         WaitItem::GithubEvent {
@@ -3005,6 +3031,7 @@ fn render_human(item: &WaitItem) -> String {
             "message  {handle}  {}  {subject}",
             crate::inbox::sender_words(from.as_deref(), repo.as_deref())
         ),
+        WaitItem::RunEnded { desc, .. } => format!("run_ended  \"{desc}\"  its process is gone"),
         // ONE arm for every event source. The github and command
         // variants had separate arms building the same line from
         // differently-named fields; a third backend needed a third

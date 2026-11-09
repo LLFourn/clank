@@ -11176,8 +11176,7 @@ pub(crate) mod tests {
                 .then(|| pid.and_then(crate::proc_identity::token_for))
                 .flatten(),
             at: at.to_string(),
-            subagent: false,
-            pending: false,
+            declared: false,
             check_in: None,
             unqualified: None,
         }

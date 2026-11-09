@@ -1934,12 +1934,8 @@ pub struct TuiArgs {
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// TWO WORDS for what you are waiting on — `--desc "test run"`.
-    ///
-    /// Required, and load-bearing twice over: it is what `clank tui`
-    /// shows, AND it is how clank recognises this run among the tool's
-    /// live background tasks. The monitor reads the command line the
-    /// harness reported, so the description has to be ON it — which is
-    /// why clank cannot just generate an id for you.
+    /// What `clank tui` shows, and the name `clank attend` renews or
+    /// clears the run by.
     #[arg(long, value_name = "TEXT")]
     pub desc: String,
     /// How long you expect this to take (`30s`, `5m`, `1h`; default
@@ -1961,13 +1957,13 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct AttendArgs {
-    /// The subagent you are waiting on, by its name. Shell work is
-    /// attended by launching it with `clank run`; its `--desc` here renews
-    /// that run's expectation. With `--clear`, the one entry to clear.
+    /// The work you are waiting on, by its name. Shell work is run with
+    /// `clank run`; its `--desc` here renews that run's expectation. With
+    /// `--clear`, the one entry to clear.
     #[arg(value_name = "NAME")]
     pub selector: Option<String>,
     /// TWO WORDS for what you are waiting on — `--desc "test run"`. What
-    /// `clank tui` shows; the subagent's name otherwise.
+    /// `clank tui` shows; the name otherwise.
     #[arg(long, value_name = "TEXT")]
     pub desc: Option<String>,
     /// How long you expect this to take (`30s`, `5m`, `1h`; default

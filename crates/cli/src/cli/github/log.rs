@@ -83,9 +83,19 @@ pub(crate) const LOG_IDENTITY_CAP: usize = 1000;
 /// left to produce a key under this prefix.
 pub(crate) const MIGRATED_MESSAGE_PREFIX: &str = "migrated-message#";
 
+/// The key a `clank run`'s terminal record is logged under. Pinned for
+/// the same reason a migrated message is: the monitor writes the record
+/// before it retires the registration, so a crash between the two
+/// restores a registration that will replay the record, however many
+/// identities the log has taken since. One identity per run, kept for the
+/// life of the log, is the price of never waking an agent twice for one
+/// run.
+pub(crate) const RUN_ENDED_PREFIX: &str = "run-ended#";
+
 /// Whether this action key must survive the horizon.
 pub(crate) fn identity_is_pinned(action_key: Option<&str>) -> bool {
-    action_key.is_some_and(|k| k.starts_with(MIGRATED_MESSAGE_PREFIX))
+    action_key
+        .is_some_and(|k| k.starts_with(MIGRATED_MESSAGE_PREFIX) || k.starts_with(RUN_ENDED_PREFIX))
 }
 
 /// Total-line threshold that triggers compaction on ingest appends.

@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::turn_wire::WireVerdict;
-use clank_core::turn_policy::{AttendRequest, TaskSnapshot, TurnEndReport, TurnPlace};
+use clank_core::turn_policy::{AttendRequest, TurnEndReport, TurnPlace};
 
 /// A check-in falling due for an agent unbound since it was armed is
 /// retired with the binding, not left due: a deadline already passed would
@@ -12,15 +12,6 @@ fn unbinding_an_attended_agent_removes_its_due_timer() {
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
     attend_name(&mut turns, "claude", "session-one", &g);
-    turns
-        .answer(
-            &author,
-            1,
-            &stop(Tool::Claude, "session-one", running_subagent(), None),
-            true,
-            &g,
-        )
-        .unwrap();
     let due = turns.next_deadline().expect("armed");
     crate::agent_store::release_binding(repo.path(), &author, &sid("session-one")).unwrap();
     let unbound = gathered(repo.path(), "claude", &[]).at(due);
@@ -86,17 +77,7 @@ fn gathered(repo: &Path, who: &str, owed: &[clank_core::wait::WaitItem]) -> Gath
     Gathered::of(repo, &label(who), Some((owed, None)))
 }
 
-fn running_subagent() -> TaskSnapshot {
-    TaskSnapshot::Known(vec![
-        serde_json::from_value(serde_json::json!({
-            "id": "a25eee2eef81caf3e", "type": "subagent", "status": "running",
-            "description": SUBAGENT, "agent_type": "general-purpose",
-        }))
-        .unwrap(),
-    ])
-}
-
-fn stop(tool: Tool, session: &str, tasks: TaskSnapshot, position: Option<u64>) -> Report {
+fn stop(tool: Tool, session: &str, position: Option<u64>) -> Report {
     Report::TurnEnd {
         stop: TurnEndReport {
             tool,
@@ -106,7 +87,6 @@ fn stop(tool: Tool, session: &str, tasks: TaskSnapshot, position: Option<u64>) -
                 position,
                 human_turn: false,
             },
-            tasks,
         },
         deadline: u64::MAX,
         questions: Vec::new(),
@@ -117,12 +97,11 @@ fn attend_name(turns: &mut Turns, who: &str, session: &str, g: &Gathered) -> Str
     turns
         .attend(
             &label(who),
-            AttendRequest::Attend {
+            AttendRequest::Declare {
                 session: sid(session),
-                selector: Selector::Name(SUBAGENT.into()),
+                name: SUBAGENT.into(),
                 desc: None,
                 expect: 10 * MINUTE,
-                shell: None,
             },
             g,
         )
@@ -133,83 +112,255 @@ fn silent(why: SilentReason) -> WireVerdict {
     WireVerdict::Silent { why }
 }
 
-/// Attend a subagent by name, and the Stop that lists it is quiet: the
+/// A declaration is in force the moment it is made, for every tool: the
 /// whole path through the monitor's custody, persisted beside the agent
-/// and shown in its projection.
+/// and shown in its projection. Nothing waits for a Stop to prove it.
 #[test]
-fn a_subagent_attended_by_name_quiets_the_stop_that_lists_it() {
-    let repo = repo_with("claude", Tool::Claude, "session-one");
-    let mut turns = Turns::new(repo.path().to_path_buf());
-    let g = gathered(repo.path(), "claude", &[]);
-    let said = attend_name(&mut turns, "claude", "session-one", &g);
-    assert!(said.contains("from your next turn-end"), "{said}");
-    assert!(said.contains("after 10m"), "{said}");
-    let shown = turns.projection(&label("claude"), &g).attended;
-    assert!(
-        matches!(shown.as_slice(), [a] if a.pending && a.unqualified.as_deref() == Some("not seen in a listing yet")),
-        "{shown:?}"
-    );
-
-    let frame = turns
-        .answer(
-            &label("claude"),
-            1,
-            &stop(Tool::Claude, "session-one", running_subagent(), None),
-            true,
-            &g,
-        )
-        .unwrap();
-    assert_eq!(frame.verdict, WireVerdict::Park);
-    let shown = turns.projection(&label("claude"), &g).attended;
-    let [shown] = shown.as_slice() else {
-        panic!("one entry: {shown:?}");
-    };
-    assert!(shown.subagent && !shown.pending, "{shown:?}");
-    assert_eq!(shown.unqualified, None, "it covers its task");
-    assert_eq!(shown.task, "a25eee2eef81caf3e");
-    assert_eq!(shown.subject(), SUBAGENT);
-    assert!(
-        crate::agent_store::agents_root(repo.path())
-            .join("claude/turn.json")
-            .exists(),
-        "the monitor keeps it beside the agent"
-    );
+fn a_declaration_is_in_force_at_once_and_shown() {
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        let repo = repo_with("agent", tool, "session-one");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "agent", &[]);
+        let said = attend_name(&mut turns, "agent", "session-one", &g);
+        assert!(said.contains("until your next turn starts"), "{said}");
+        assert!(said.contains("after 10m"), "{said}");
+        assert!(!said.contains("listed"), "{said}");
+        let shown = turns.projection(&label("agent"), &g).attended;
+        let [shown] = shown.as_slice() else {
+            panic!("one entry: {shown:?}");
+        };
+        assert!(shown.declared, "{shown:?}");
+        assert_eq!(shown.unqualified, None, "{tool:?}: it covers its work now");
+        assert_eq!(shown.task, SUBAGENT);
+        assert_eq!(
+            turns.recovery_quiet(&label("agent"), &g),
+            Some(Quiet::Attending),
+            "{tool:?}"
+        );
+        assert!(
+            crate::agent_store::agents_root(repo.path())
+                .join("agent/turn.json")
+                .exists(),
+            "the monitor keeps it beside the agent"
+        );
+    }
 }
 
-/// A restarted monitor keeps the attendance with its original deadline,
-/// and it quiets nothing until the next Stop proves it again.
+/// A restarted monitor keeps the declaration in force with its original
+/// deadline.
 #[test]
-fn a_restart_keeps_the_deadline_and_proves_nothing_until_the_next_stop() {
+fn a_restart_keeps_the_declaration_and_its_deadline() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
     attend_name(&mut turns, "claude", "session-one", &g);
-    turns
-        .answer(
-            &author,
-            1,
-            &stop(Tool::Claude, "session-one", running_subagent(), None),
-            true,
-            &g,
-        )
-        .unwrap();
     let due = turns.next_deadline().expect("a check-in is owed");
 
     let mut back = Turns::new(repo.path().to_path_buf());
-    assert_eq!(back.recovery_quiet(&author, &g), None);
+    assert_eq!(back.recovery_quiet(&author, &g), Some(Quiet::Attending));
     assert_eq!(back.next_deadline(), Some(due));
-    let frame = back
-        .answer(
+}
+
+/// With nothing attended a Stop is the owed-work decision alone, for
+/// every tool: no notice about background work, because none is read.
+#[test]
+fn a_stop_with_nothing_attended_carries_no_notice() {
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        let repo = repo_with("agent", tool, "session-one");
+        let mut turns = Turns::new(repo.path().to_path_buf());
+        let g = gathered(repo.path(), "agent", &[]);
+        let frame = turns
+            .answer(
+                &label("agent"),
+                1,
+                &stop(tool, "session-one", None),
+                true,
+                &g,
+            )
+            .unwrap();
+        assert_eq!(frame.verdict, WireVerdict::Park, "{tool:?}");
+        assert_eq!(frame.rendered, None, "{tool:?}");
+    }
+}
+
+/// A `clank run`'s registration: this test's own process, which is alive,
+/// or the same pid under another birth, which is a reused pid and so a
+/// gone run.
+fn run_request(
+    session: &str,
+    desc: &str,
+    proof: clank_core::turn_policy::ShellProof,
+) -> AttendRequest {
+    AttendRequest::Run {
+        session: sid(session),
+        proof,
+        desc: desc.into(),
+        expect: 10 * MINUTE,
+    }
+}
+
+fn this_process() -> clank_core::turn_policy::ShellProof {
+    let pid = std::process::id() as i32;
+    shell_proof(
+        pid,
+        &crate::proc_identity::token_for(pid).expect("our own token"),
+    )
+}
+
+fn reborn() -> clank_core::turn_policy::ShellProof {
+    let pid = std::process::id() as i32;
+    shell_proof(
+        pid,
+        &crate::proc_identity::ProcToken::MacStart { sec: 1, usec: 1 },
+    )
+}
+
+fn run_ends(repo: &Path, who: &str) -> Vec<(String, u64)> {
+    crate::inbox::pending(repo, &label(who))
+        .into_iter()
+        .filter_map(|item| match item {
+            clank_core::wait::WaitItem::RunEnded {
+                desc,
+                presentation: Some(p),
+                ..
+            } => Some((desc, p.seq)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A run in flight keeps the agent attending; once its registered process
+/// is gone (a reused pid here) its end is written once to the agent's
+/// message log and wakes it until acked, and no listing is involved.
+#[test]
+fn a_gone_run_is_recorded_once_and_wakes_until_acked() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]);
+    turns
+        .attend(
             &author,
-            2,
-            &stop(Tool::Claude, "session-one", running_subagent(), None),
-            true,
+            run_request("session-one", "live run", this_process()),
             &g,
         )
         .unwrap();
-    assert_eq!(frame.verdict, WireVerdict::Park);
-    assert_eq!(back.recovery_quiet(&author, &g), Some(Quiet::Attending));
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "test run", reborn()),
+            &g,
+        )
+        .unwrap();
+    turns.end_gone_runs(&author, &g);
+    assert_eq!(run_ends(repo.path(), "claude").len(), 1);
+    let [(desc, seq)] = &run_ends(repo.path(), "claude")[..] else {
+        panic!("one run ended");
+    };
+    let seq = *seq;
+    assert_eq!(desc, "test run");
+    let shown = turns.projection(&author, &g).attended;
+    assert_eq!(
+        shown.iter().map(|a| a.task.as_str()).collect::<Vec<_>>(),
+        ["live run"],
+        "the live run still attends"
+    );
+
+    turns.end_gone_runs(&author, &g);
+    assert_eq!(run_ends(repo.path(), "claude").len(), 1, "never twice");
+
+    let rows = crate::cli::github::log::EventLog::open(
+        &crate::agent_store::agents_root(repo.path()).join("claude/events"),
+        crate::inbox::MESSAGES_SOURCE,
+    )
+    .unwrap()
+    .read_rows()
+    .unwrap()
+    .unwrap()
+    .rows;
+    let row = rows.iter().find(|r| r.seq == seq).unwrap();
+    let mut log = crate::cli::github::log::EventLog::open(
+        &crate::agent_store::agents_root(repo.path()).join("claude/events"),
+        crate::inbox::MESSAGES_SOURCE,
+    )
+    .unwrap();
+    log.append_checked_ack(seq, &row.ident).unwrap();
+    assert!(
+        run_ends(repo.path(), "claude").is_empty(),
+        "acked, it is done"
+    );
+    turns.end_gone_runs(&author, &g);
+    assert!(
+        run_ends(repo.path(), "claude").is_empty(),
+        "and not re-recorded"
+    );
+}
+
+/// A monitor that restarts after a run ended, with the run still in its
+/// saved state, records it once; another restart records nothing more. A
+/// crash between the record and forgetting the run is the same case.
+#[test]
+fn a_restart_records_a_run_that_ended_unwatched_exactly_once() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let g = gathered(repo.path(), "claude", &[]);
+    Turns::new(repo.path().to_path_buf())
+        .attend(
+            &author,
+            run_request("session-one", "test run", reborn()),
+            &g,
+        )
+        .unwrap();
+    let saved = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
+    let before = std::fs::read(&saved).unwrap();
+
+    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
+    assert_eq!(run_ends(repo.path(), "claude").len(), 1);
+    std::fs::write(&saved, &before).unwrap();
+    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
+    assert_eq!(
+        run_ends(repo.path(), "claude").len(),
+        1,
+        "the run was still saved, and its record is not written twice"
+    );
+    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
+    assert_eq!(run_ends(repo.path(), "claude").len(), 1);
+}
+
+/// Killing the command ends the run like any other end: one record.
+#[test]
+fn a_killed_run_is_recorded_once() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]);
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    let token = crate::proc_identity::token_for(pid).expect("the child's token");
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "server", shell_proof(pid, &token)),
+            &g,
+        )
+        .unwrap();
+    turns.end_gone_runs(&author, &g);
+    assert!(run_ends(repo.path(), "claude").is_empty(), "still running");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    turns.end_gone_runs(&author, &g);
+    turns.end_gone_runs(&author, &g);
+    assert_eq!(
+        run_ends(repo.path(), "claude")
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect::<Vec<_>>(),
+        ["server"]
+    );
 }
 
 /// The drive gate as the monitor holds it: auto off is a silence, an
@@ -219,7 +370,7 @@ fn a_restart_keeps_the_deadline_and_proves_nothing_until_the_next_stop() {
 fn the_drive_gate_answers_before_anything_is_presented() {
     let repo = repo_with("codex", Tool::Codex, "sess-gate");
     let author = label("codex");
-    let report = stop(Tool::Codex, "sess-gate", TaskSnapshot::Unavailable, None);
+    let report = stop(Tool::Codex, "sess-gate", None);
     let mut turns = Turns::new(repo.path().to_path_buf());
     let owed = [message("1")];
 
@@ -277,7 +428,7 @@ fn the_drive_gate_answers_before_anything_is_presented() {
 }
 
 /// Owed work is presented once, rendered by the monitor for the agent's
-/// role, and the live listing adds the recipe that ends the loop.
+/// role, with nothing added about background work.
 #[test]
 fn owed_work_is_presented_with_the_text_the_hook_frames() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
@@ -289,7 +440,7 @@ fn owed_work_is_presented_with_the_text_the_hook_frames() {
         .answer(
             &author,
             1,
-            &stop(Tool::Claude, "session-one", running_subagent(), None),
+            &stop(Tool::Claude, "session-one", None),
             true,
             &g,
         )
@@ -301,18 +452,13 @@ fn owed_work_is_presented_with_the_text_the_hook_frames() {
         "{text}"
     );
     assert!(text.contains("message: 7"), "{text}");
-    assert!(text.contains("`clank attend \"<name>\"`"), "{text}");
+    assert!(!text.contains("clank attend"), "{text}");
 
     let parked = turns
         .answer(
             &author,
             2,
-            &stop(
-                Tool::Claude,
-                "session-one",
-                TaskSnapshot::Known(Vec::new()),
-                None,
-            ),
+            &stop(Tool::Claude, "session-one", None),
             true,
             &g,
         )
@@ -341,12 +487,7 @@ fn repeated_delivery_is_counted_by_delivery_and_escalates_with_its_duties() {
             .answer(
                 &author,
                 conn,
-                &stop(
-                    Tool::Codex,
-                    "sess-repeat",
-                    TaskSnapshot::Unavailable,
-                    Some(position),
-                ),
+                &stop(Tool::Codex, "sess-repeat", Some(position)),
                 true,
                 &g,
             )
@@ -396,13 +537,7 @@ fn a_count_below_the_threshold_is_not_shown() {
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "codex", &[message("1")]);
     let frame = turns
-        .answer(
-            &author,
-            1,
-            &stop(Tool::Codex, "sess-below", TaskSnapshot::Unavailable, None),
-            true,
-            &g,
-        )
+        .answer(&author, 1, &stop(Tool::Codex, "sess-below", None), true, &g)
         .unwrap();
     let presentation = frame.presentation().unwrap().clone();
     turns
@@ -424,12 +559,7 @@ fn a_result_from_another_connection_is_not_credited() {
         .answer(
             &author,
             10,
-            &stop(
-                Tool::Claude,
-                "session-one",
-                TaskSnapshot::Known(Vec::new()),
-                None,
-            ),
+            &stop(Tool::Claude, "session-one", None),
             true,
             &g,
         )
@@ -481,12 +611,7 @@ fn a_closed_carrier_fails_its_presentation_and_the_work_is_presented_fresh() {
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[message("1")]);
-    let report = stop(
-        Tool::Claude,
-        "session-one",
-        TaskSnapshot::Known(Vec::new()),
-        None,
-    );
+    let report = stop(Tool::Claude, "session-one", None);
     let first = turns.answer(&author, 1, &report, true, &g).unwrap();
     let failed = first.presentation().unwrap().clone();
     turns.closed(&author, 1, &g);
@@ -518,7 +643,7 @@ fn a_silence_needs_no_route_and_a_lost_check_in_is_recorded() {
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
     attend_name(&mut turns, "claude", "session-one", &g);
-    let report = stop(Tool::Claude, "session-one", running_subagent(), None);
+    let report = stop(Tool::Claude, "session-one", None);
     let frame = turns.answer(&author, 1, &report, true, &g).unwrap();
     assert_eq!(frame.verdict, WireVerdict::Park);
     let due = turns.next_deadline().expect("armed by the first Stop");
@@ -595,12 +720,7 @@ fn a_stops_question_evidence_ends_the_question() {
     );
     assert!(super::super::question_state::asking(&dir, "session-one").is_some());
     let turns = Turns::new(repo.path().to_path_buf());
-    let Report::TurnEnd { stop, deadline, .. } = stop(
-        Tool::Claude,
-        "session-one",
-        TaskSnapshot::Known(Vec::new()),
-        None,
-    ) else {
+    let Report::TurnEnd { stop, deadline, .. } = stop(Tool::Claude, "session-one", None) else {
         unreachable!()
     };
     turns.observe_questions(
@@ -641,13 +761,8 @@ fn present_receipt(
         Some((std::slice::from_ref(&fixture.item), Some(&fixture.cwd))),
     );
     let report = match tool {
-        Tool::Claude => stop(
-            tool,
-            &fixture.session,
-            TaskSnapshot::Known(Vec::new()),
-            None,
-        ),
-        _ => stop(tool, &fixture.session, TaskSnapshot::Unavailable, None),
+        Tool::Claude => stop(tool, &fixture.session, None),
+        _ => stop(tool, &fixture.session, None),
     };
     let frame = turns
         .answer(&fixture.author, conn, &report, true, &g)
@@ -890,7 +1005,7 @@ fn alone_mode_is_never_quiet_on_attendance() {
         .answer(
             &author,
             1,
-            &stop(Tool::Claude, "session-one", running_subagent(), None),
+            &stop(Tool::Claude, "session-one", None),
             true,
             &g,
         )
@@ -957,7 +1072,7 @@ fn a_presentation_is_worded_for_the_role_the_roster_gives_now() {
     let repo = repo_with("codex", Tool::Codex, "sess-role");
     let author = label("codex");
     let mut turns = Turns::new(repo.path().to_path_buf());
-    let report = stop(Tool::Codex, "sess-role", TaskSnapshot::Unavailable, None);
+    let report = stop(Tool::Codex, "sess-role", None);
     let parked = turns
         .answer(
             &author,
@@ -1004,16 +1119,13 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
     let author = label("grok");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let unfolded = Gathered::of(repo.path(), &author, None);
-    let handoff = |wait_running| Report::Handoff {
-        handoff: clank_core::turn_policy::Handoff {
-            session: sid("session-one"),
-            wait_running,
-            continued: false,
-        },
+    let handoff = Report::Handoff {
+        session: sid("session-one"),
+        continued: false,
         deadline: u64::MAX,
     };
     let frame = turns
-        .answer(&author, 1, &handoff(false), true, &unfolded)
+        .answer(&author, 1, &handoff, true, &unfolded)
         .expect("answered unfolded");
     assert_eq!(frame.verdict, WireVerdict::Notify);
     assert_eq!(
@@ -1021,10 +1133,32 @@ fn a_grok_handoff_is_answered_without_waiting_for_a_fold() {
         Some(super::super::wake_render::ARM_WAIT)
     );
     let frame = turns
-        .answer(&author, 2, &handoff(true), true, &unfolded)
+        .answer(
+            &author,
+            2,
+            &handoff,
+            true,
+            &Gathered::of(repo.path(), &author, None).waiting(true),
+        )
         .unwrap();
     assert_eq!(frame.verdict, silent(SilentReason::WaitArmed));
     assert!(turns.state(&author).is_none_or(|s| s.outstanding.is_none()));
+
+    attend_name(&mut turns, "grok", "session-one", &unfolded);
+    turns.answer(&author, 3, &handoff, true, &unfolded).unwrap();
+    turns
+        .answer(&author, 3, &handoff, false, &unfolded)
+        .unwrap();
+    assert_eq!(
+        turns.projection(&author, &unfolded).attended.len(),
+        1,
+        "the Stop it was declared before ended its turn; a re-step is no Stop"
+    );
+    turns.answer(&author, 4, &handoff, true, &unfolded).unwrap();
+    assert!(
+        turns.projection(&author, &unfolded).attended.is_empty(),
+        "the next Stop is a turn later: the declaration is over"
+    );
 }
 
 fn ask_and_answer(repo: &Path, who: &str, name: &str, question: &str, answer: &str) {
@@ -1042,12 +1176,7 @@ fn receipt_marker(repo: &Path, who: &str, name: &str) -> PathBuf {
 }
 
 fn idle_stop() -> Report {
-    stop(
-        Tool::Claude,
-        "session-one",
-        TaskSnapshot::Known(Vec::new()),
-        None,
-    )
+    stop(Tool::Claude, "session-one", None)
 }
 
 /// Present what is owed now on connection `conn`, and return the frame
@@ -1219,14 +1348,20 @@ async fn a_late_receipt_after_identical_reuse_receives_nothing() {
 fn an_attending_delivery_renders_only_unreceived_work_across_a_restart() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
-    let report = stop(Tool::Claude, "session-one", running_subagent(), None);
+    let report = stop(Tool::Claude, "session-one", None);
     let mut turns = Turns::new(repo.path().to_path_buf());
     let one = gathered(repo.path(), "claude", &[message("1")]);
-    attend_name(&mut turns, "claude", "session-one", &one);
     let frame = turns.answer(&author, 1, &report, true, &one).unwrap();
     let presentation = frame.presentation().expect("never received").clone();
     turns
         .result(&author, 1, TurnResult::Delivered { presentation }, &one)
+        .unwrap();
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "test run", this_process()),
+            &one,
+        )
         .unwrap();
 
     let mut back = Turns::new(repo.path().to_path_buf());
@@ -1250,7 +1385,7 @@ fn a_parked_report_ends_while_a_user_command_waits_for_its_agent() {
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
-    let report = stop(Tool::Claude, "session-uc", TaskSnapshot::Unavailable, None);
+    let report = stop(Tool::Claude, "session-uc", None);
     let first = turns.answer(&author, 1, &report, true, &g).unwrap();
     assert_eq!(first.verdict, WireVerdict::Park);
     turns.set_user_commands([author.clone()].into_iter().collect());
@@ -1261,73 +1396,243 @@ fn a_parked_report_ends_while_a_user_command_waits_for_its_agent() {
     assert_eq!(parked.verdict, WireVerdict::Park);
 }
 
-/// A Stop that leaves live work nothing attends wakes the agent with the
-/// hook text naming it: shell work by the `clank run` it is, or as not
-/// attended, never by the tool's description of the shell command. The
-/// same listing, attended, parks.
+/// Only the kernel's word that the process ended, or another birth under
+/// its pid, is gone; a denied, failed or unrecognisable read is unknown.
 #[test]
-fn the_hook_names_unattended_live_work_and_never_by_its_shell_description() {
+fn only_an_explicit_end_or_another_birth_is_a_gone_process() {
+    use crate::proc_identity::ProcToken;
+    use crate::proc_identity::inspect::{Inspection, ProcessDetails, ProcessState, Unavailable};
+    let token = ProcToken::MacStart { sec: 5, usec: 6 };
+    let proof = shell_proof(4242, &token);
+    let details = |state| {
+        Inspection::Verified(ProcessDetails {
+            pid: 4242,
+            birth: token.clone(),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            argv: Ok(Vec::new()),
+            state,
+            parent: Ok(1),
+            group: Ok(1),
+        })
+    };
+    let cases = [
+        (details(Ok(ProcessState::Sleeping)), Presence::Live),
+        (
+            details(Err(Unavailable::Io(std::io::ErrorKind::PermissionDenied))),
+            Presence::Live,
+        ),
+        (details(Ok(ProcessState::Zombie)), Presence::Gone),
+        (Inspection::Ended, Presence::Gone),
+        (Inspection::Mismatched, Presence::Gone),
+        (
+            Inspection::Unavailable(Unavailable::Io(std::io::ErrorKind::PermissionDenied)),
+            Presence::Unknown,
+        ),
+        (
+            Inspection::Unavailable(Unavailable::Io(std::io::ErrorKind::Interrupted)),
+            Presence::Unknown,
+        ),
+        (
+            Inspection::Unavailable(Unavailable::Unsupported),
+            Presence::Unknown,
+        ),
+        (
+            Inspection::Unavailable(Unavailable::Malformed),
+            Presence::Unknown,
+        ),
+    ];
+    for (seen, want) in cases {
+        let label = format!("{seen:?}");
+        assert_eq!(presence_of(&proof, |_, _| seen), want, "{label}");
+    }
+    for token in ["not json", r#"{"v":"future9","x":1}"#] {
+        let unreadable = clank_core::turn_policy::ShellProof {
+            pid: 4242,
+            token: token.into(),
+        };
+        let seen = presence_of(&unreadable, |pid, t| {
+            if matches!(t, ProcToken::Unrecognised) {
+                Inspection::Unavailable(Unavailable::Unsupported)
+            } else {
+                panic!("{pid}: a malformed token is never inspected")
+            }
+        });
+        assert_eq!(seen, Presence::Unknown, "{token}");
+    }
+}
+
+/// A registered run whose identity cannot be read is kept and records no
+/// end; the same run under a confirmed other birth records one.
+#[test]
+fn an_unreadable_run_is_kept_and_records_no_end() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
     let g = gathered(repo.path(), "claude", &[]);
-    let listing = || {
-        TaskSnapshot::Known(vec![
-            serde_json::from_value(serde_json::json!({
-                "id": "bash-1", "type": "shell", "status": "running",
-                "description": "Run the full integration test harness",
-                "command": "cargo test --test it",
-            }))
-            .unwrap(),
-            serde_json::from_value(serde_json::json!({
-                "id": "a25eee2eef81caf3e", "type": "subagent", "status": "running",
-                "description": SUBAGENT,
-            }))
-            .unwrap(),
-        ])
+    let unreadable = clank_core::turn_policy::ShellProof {
+        pid: std::process::id() as i32,
+        token: r#"{"v":"future9"}"#.into(),
     };
-    let frame = turns
-        .answer(
+    turns
+        .attend(
             &author,
-            1,
-            &stop(Tool::Claude, "session-one", listing(), Some(1)),
-            true,
+            run_request("session-one", "odd run", unreadable),
             &g,
         )
         .unwrap();
-    assert!(
-        matches!(frame.verdict, WireVerdict::Deliver { .. }),
-        "a demand is a counted presentation: {:?}",
-        frame.verdict
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "test run", reborn()),
+            &g,
+        )
+        .unwrap();
+    turns.end_gone_runs(&author, &g);
+    turns.end_gone_runs(&author, &g);
+    assert_eq!(
+        run_ends(repo.path(), "claude")
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect::<Vec<_>>(),
+        ["test run"]
     );
-    let text = frame.rendered.unwrap_or_default();
-    assert!(
-        text.starts_with("clank: You have live background work"),
-        "{text}"
+    let shown = turns.projection(&author, &g).attended;
+    assert_eq!(
+        shown.iter().map(|a| a.task.as_str()).collect::<Vec<_>>(),
+        ["odd run"]
     );
-    assert!(
-        text.contains("shell work (bash-1): not attended — relaunch it with `clank run"),
-        "{text}"
+    assert_eq!(
+        shown[0].unqualified.as_deref(),
+        Some("process cannot be seen")
     );
-    assert!(
-        text.contains(&format!("attend it with `clank attend \"{SUBAGENT}\"`")),
-        "{text}"
-    );
-    assert!(!text.contains("integration test harness"), "{text}");
+}
 
-    attend_name(&mut turns, "claude", "session-one", &g);
-    let frame = turns
-        .answer(
+/// A registration that cannot be written is refused and leaves nothing
+/// behind: the monitor never acknowledges a run a restart would lose, so
+/// `clank run` never execs it.
+#[test]
+fn a_registration_that_cannot_be_written_is_refused() {
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "claude", &[]);
+    let stored = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
+    std::fs::create_dir_all(&stored).unwrap();
+    let refused = turns
+        .attend(
             &author,
-            2,
-            &stop(Tool::Claude, "session-one", listing(), Some(2)),
-            true,
+            run_request("session-one", "test run", this_process()),
+            &g,
+        )
+        .expect_err("not durable, not accepted");
+    assert!(refused.contains("nothing was recorded"), "{refused}");
+    assert!(turns.projection(&author, &g).attended.is_empty());
+    assert_eq!(turns.next_deadline(), None);
+    turns.end_gone_runs(&author, &g);
+    assert!(run_ends(repo.path(), "claude").is_empty());
+
+    std::fs::remove_dir(&stored).unwrap();
+    turns
+        .attend(
+            &author,
+            run_request("session-one", "test run", this_process()),
+            &g,
+        )
+        .expect("once it can be written, it is accepted");
+    assert!(stored.is_file());
+}
+
+/// A crash between writing a run's end and retiring its registration
+/// restores a registration that replays the record; the record is never
+/// written twice however far the log's identity horizon has moved on and
+/// however it was compacted and acked meanwhile.
+#[test]
+fn a_replayed_end_is_not_written_again_past_the_identity_horizon() {
+    use crate::cli::github::log::{COMPACT_AT, EventLog, LOG_IDENTITY_CAP, Transport};
+    let repo = repo_with("claude", Tool::Claude, "session-one");
+    let author = label("claude");
+    let g = gathered(repo.path(), "claude", &[]);
+    Turns::new(repo.path().to_path_buf())
+        .attend(
+            &author,
+            run_request("session-one", "test run", reborn()),
             &g,
         )
         .unwrap();
-    let text = frame.rendered.unwrap_or_default();
+    let saved = crate::agent_store::agents_root(repo.path()).join("claude/turn.json");
+    let stale = std::fs::read(&saved).unwrap();
+    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
+    let [(_, seq)] = run_ends(repo.path(), "claude")[..] else {
+        panic!("one end");
+    };
+
+    let events = crate::agent_store::agents_root(repo.path()).join("claude/events");
+    let mut log = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE).unwrap();
+    log.load();
+    let ident = log
+        .read_rows()
+        .unwrap()
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|r| r.seq == seq)
+        .unwrap()
+        .ident;
+    log.append_checked_ack(seq, &ident).unwrap();
+    for i in 0..COMPACT_AT {
+        let item = message(&format!("filler-{i}"));
+        log.append_inbox(
+            Transport::Message,
+            None,
+            Some(&format!("message#claude/filler-{i}")),
+            None,
+            &item,
+        )
+        .unwrap();
+    }
+    assert!(log.maybe_compact().is_ok());
+    let mut log = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE).unwrap();
+    log.load();
+    for i in 0..=LOG_IDENTITY_CAP {
+        log.append_inbox(
+            Transport::Message,
+            None,
+            Some(&format!("message#claude/later-{i}")),
+            None,
+            &message(&format!("later-{i}")),
+        )
+        .unwrap();
+    }
+    let horizon = EventLog::open(&events, crate::inbox::MESSAGES_SOURCE)
+        .unwrap()
+        .load()
+        .action_keys;
     assert!(
-        !text.contains(SUBAGENT) && text.contains("bash-1"),
-        "only the task still uncovered: {text}"
+        !horizon.contains(&"message#claude/filler-0".to_string()),
+        "the horizon moved past older keys"
+    );
+    assert!(
+        horizon.iter().any(|k| k.starts_with("run-ended#")),
+        "and kept the pinned end: {} keys, {:?}",
+        horizon.len(),
+        horizon
+            .iter()
+            .filter(|k| !k.starts_with("message#"))
+            .collect::<Vec<_>>()
+    );
+    assert!(horizon.len() <= LOG_IDENTITY_CAP + 1);
+
+    std::fs::write(&saved, &stale).unwrap();
+    Turns::new(repo.path().to_path_buf()).end_gone_runs(&author, &g);
+    assert!(
+        run_ends(repo.path(), "claude").is_empty(),
+        "the replay wrote no second end"
+    );
+    assert!(
+        Turns::new(repo.path().to_path_buf())
+            .projection(&author, &g)
+            .attended
+            .is_empty(),
+        "and the stale registration is retired"
     );
 }

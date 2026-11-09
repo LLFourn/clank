@@ -109,6 +109,8 @@ pub(crate) struct WaitItem {
     handle: Option<String>,
     from: Option<String>,
     subject: Option<String>,
+    /// An ended `clank run`'s `--desc`.
+    desc: Option<String>,
 }
 
 impl WaitItem {
@@ -272,6 +274,10 @@ pub(crate) fn classify(
         ),
         K::GithubEvent => (
             Until("fires until the event is acked — `clank events ack`"),
+            Duty::Event,
+        ),
+        K::RunEnded => (
+            Until("fires until the run's end is acked — `clank events ack`"),
             Duty::Event,
         ),
         K::AdHocReview => (
@@ -565,6 +571,18 @@ pub(crate) fn render_wait_items_ref(items: &[&WaitItem], label: &AgentLabel, rol
                     .unwrap_or_default();
                 out.push_str(&format!("  - message: {handle} {from}: {subject}{ack}\n"));
             }
+            K::RunEnded => {
+                let desc = item.desc.as_deref().unwrap_or("?");
+                let ack = item
+                    .selector
+                    .as_deref()
+                    .map(|s| format!(" — ack `clank events ack {s}`"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - run ended: `clank run` \"{desc}\": its process is gone; read its output \
+                     and exit status where you launched it{ack}\n"
+                ));
+            }
             K::PromoteFromQueue => {
                 let name = item.name.as_deref().unwrap_or("?");
                 let priority = item.priority.unwrap_or(0);
@@ -714,6 +732,7 @@ pub(crate) fn selected_presentations<'a>(
                 item.wake_kind(),
                 Some(
                     clank_core::wait::WaitKind::Message
+                        | clank_core::wait::WaitKind::RunEnded
                         | clank_core::wait::WaitKind::GithubEvent
                         | clank_core::wait::WaitKind::CommandEvent
                         | clank_core::wait::WaitKind::TimerEvent
@@ -761,126 +780,20 @@ pub(crate) fn receipt_candidates<'a>(
 
 /// The heartbeat a parked hook wakes with at its deadline. It must not
 /// read as work: an agent woken with no items and no explanation will
-/// look for a reason and invent one.
+/// look for a reason and invent one. It starts a turn like any wake, so
+/// it ends every `clank attend` declaration.
 pub(crate) const REARM_REASON: &str = "clank: no work pending — the wait reached its ceiling and \
-is re-arming. This is a heartbeat, not a task. End your turn; the next hook parks a fresh wait.";
+is re-arming. This is a heartbeat, not a task. Re-declare with `clank attend` any declared work \
+still running, then end your turn; the next hook parks a fresh wait.";
 
 /// What an agent is told when no monitor can present its work.
 pub(crate) const MONITOR_UNAVAILABLE: &str =
     "clank's monitor is unavailable; work is owed — run `clank status`.";
 
-/// How to attend background work instead of ending a turn to poll it.
-const ATTEND_RECIPE: &str = "a subagent by its name — `clank attend \"<name>\"` — and shell work \
-by launching it through clank — `clank run --desc \"two words\" -- <command>` — which records \
-what it is attending and then becomes the command, so clank knows exactly when the work ends. \
-You can attend several things at once; each attend adds one and leaves the others alone";
-
-/// A task as a notice lists it. Shell work is named by the `clank run`
-/// that is it, never by the tool's description of the shell command: that
-/// description is not a handle anything can attend by.
-fn task_line(t: &clank_core::turn_policy::TaskSummary) -> String {
-    use clank_core::turn_policy::TaskKind;
-    let mut line = match (&t.kind, &t.run) {
-        (TaskKind::Subagent, _) => match &t.description {
-            Some(name) => format!("  - subagent \"{name}\""),
-            None => "  - subagent".to_string(),
-        },
-        (TaskKind::Shell, Some(desc)) => format!("  - `clank run` \"{desc}\""),
-        (TaskKind::Shell, None) => {
-            "  - shell work, not attended — relaunch it with `clank run`".to_string()
-        }
-        (TaskKind::Unknown(kind), _) => format!(
-            "  - {}{}",
-            kind.as_deref().unwrap_or("task"),
-            t.description
-                .as_deref()
-                .map(|d| format!(" \"{d}\""))
-                .unwrap_or_default()
-        ),
-    };
-    if let Some(id) = &t.id {
-        line.push_str(&format!(" ({id})"));
-    }
-    line
-}
-
-fn uncovered_line(u: &clank_core::turn_policy::Uncovered) -> String {
-    use clank_core::turn_policy::{Attendable, Unqualified};
-    let id = &u.task_id;
-    match (&u.work, &u.entry) {
-        (Attendable::Shell { run: Some(desc) }, Some(Unqualified::PastDeadline)) => format!(
-            "  - `clank run` \"{desc}\" ({id}): past its --expect — give it longer with `clank \
-             attend \"{desc}\" --expect <longer>`"
-        ),
-        (Attendable::Shell { run: Some(desc) }, Some(Unqualified::ProcessGone)) => format!(
-            "  - `clank run` \"{desc}\" ({id}): its process is gone; its task ends with the \
-             harness's next listing"
-        ),
-        (Attendable::Shell { run: Some(desc) }, _) => format!(
-            "  - `clank run` \"{desc}\" ({id}): not attended — its attendance was never taken \
-             or has ended; relaunch it with `clank run` to attend it"
-        ),
-        (Attendable::Shell { run: None }, _) => format!(
-            "  - shell work ({id}): not attended — relaunch it with `clank run --desc \"two \
-             words\" -- <command>`"
-        ),
-        (Attendable::Subagent { name }, Some(Unqualified::PastDeadline)) => format!(
-            "  - subagent \"{name}\" ({id}): past its --expect — give it longer with `clank \
-             attend \"{name}\" --expect <longer>`"
-        ),
-        (Attendable::Subagent { name }, _) => {
-            format!("  - subagent \"{name}\" ({id}): attend it with `clank attend \"{name}\"`")
-        }
-    }
-}
-
-/// What an attendance notice tells the agent, so it can attend the right
-/// thing next time instead of being woken again.
+/// The text a notice wakes with.
 pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
     use clank_core::turn_policy::Notice;
-    let attend = |selector: &clank_core::turn_policy::Selector| {
-        crate::cli::turn_custody::selector_words(selector)
-    };
     match notice {
-        Notice::NoMatch { selector, live } => {
-            let listed = if live.is_empty() {
-                "No background work is live.".to_string()
-            } else {
-                format!(
-                    "Live now:\n{}",
-                    live.iter().map(task_line).collect::<Vec<_>>().join("\n")
-                )
-            };
-            format!(
-                "clank: attending {} matched no live background work, so it is dropped; \
-                 nothing else you attend changed. {listed}\nAttend {ATTEND_RECIPE}.",
-                attend(selector)
-            )
-        }
-        Notice::Ambiguous { selector, matches } => format!(
-            "clank: attending {} matched {} live tasks, so it attends none of them; nothing \
-             else you attend changed:\n{}\nAttend one by a name only it has.",
-            attend(selector),
-            matches.len(),
-            matches.iter().map(task_line).collect::<Vec<_>>().join("\n")
-        ),
-        Notice::ShellNamed { name, task_id } => format!(
-            "clank: `{name}` is shell work ({task_id}); shell work is attended by launching it \
-             with `clank run --desc \"two words\" -- <command>`, so this attend is dropped. \
-             Nothing else you attend changed."
-        ),
-        Notice::Uncovered(tasks) => format!(
-            "clank: You have live background work you are not attending, so ending your turn \
-             woke you:\n{}\nAttend {ATTEND_RECIPE}. Each takes `--expect 30m` when the work \
-             will outlast the five-minute default; past that you are checked in on once, and \
-             nothing is cancelled. Until each is attended or done, every turn-end wakes you \
-             again. Do not end your turn to poll it.",
-            tasks
-                .iter()
-                .map(uncovered_line)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
         Notice::MonitorUnavailable => MONITOR_UNAVAILABLE.to_string(),
         Notice::ArmWait => ARM_WAIT.to_string(),
     }
@@ -896,31 +809,37 @@ pub(crate) const ARM_WAIT: &str = "Run `clank wait` as one background terminal t
 /// an agent with no context. It must not read as an error or as work, and
 /// every value in its recipe is filled in, so it can be pasted. One line:
 /// it is typed into the agent's pane.
+///
+/// It starts a turn, which ends every declaration: the recipe re-declares,
+/// and only a `clank run` is said to wake the agent when it ends.
 pub(crate) fn check_in_text(lines: &[clank_core::turn_policy::CheckInLine]) -> String {
     use crate::shell_quote::shell_quote;
     let each: Vec<String> = lines
         .iter()
         .map(|line| {
-            let subject = line
-                .desc
-                .as_deref()
-                .map(str::trim)
+            let subject = Some(line.desc.trim())
                 .filter(|d| !d.is_empty())
-                .unwrap_or(&line.task_id);
+                .unwrap_or(&line.name);
             let again = crate::cli::attend::duration_arg((line.expect / 1000).saturating_mul(2));
+            let (what, keep) = if line.run {
+                ("the `clank run`", "give it longer")
+            } else {
+                ("declared work", "if it is still running, declare it again")
+            };
             format!(
-                "\"{subject}\" has been running for {} — you expected {}; if it just needs \
-                 longer run `clank attend {} --expect {again}`",
+                "{what} \"{subject}\" has been going for {} — you expected {}; {keep} with \
+                 `clank attend {} --expect {again}`",
                 crate::age::short((line.elapsed / 1000) as i64),
                 crate::cli::attend::duration_arg(line.expect / 1000),
-                shell_quote(line.selector.text()),
+                shell_quote(&line.name),
             )
         })
         .collect();
     format!(
-        "clank check-in: {}. Each is still running; nothing has been cancelled and nothing has \
-         failed. This is a check-in, not a task: look at its output so far, renew what needs \
-         longer, and end your turn — its completion still wakes you.",
+        "clank check-in: {}. Nothing has been cancelled and nothing has failed. This is a \
+         check-in, not a task: look at its output so far, renew what needs longer, and end your \
+         turn. A `clank run` wakes you when its process ends; nothing tells you when declared \
+         work finishes.",
         each.join("; ")
     )
 }
@@ -951,85 +870,21 @@ mod tests {
         Ok(envelope.items)
     }
 
-    fn uncovered(
-        task_id: &str,
-        work: clank_core::turn_policy::Attendable,
-        entry: Option<clank_core::turn_policy::Unqualified>,
-    ) -> clank_core::turn_policy::Uncovered {
-        clank_core::turn_policy::Uncovered {
-            task_id: task_id.into(),
-            work,
-            entry,
-        }
-    }
-
-    /// The uncovered-work notice names each task and how to attend it:
-    /// a subagent by its name, shell work by the `clank run` it is, and
-    /// never by the tool's description of a shell command.
-    #[test]
-    fn uncovered_work_is_named_with_the_way_to_attend_it() {
-        use clank_core::turn_policy::{Attendable, Notice, Unqualified};
-        let shell = |run: Option<&str>| Attendable::Shell {
-            run: run.map(str::to_string),
-        };
-        let text = notice_text(&Notice::Uncovered(vec![
-            uncovered(
-                "task-42",
-                Attendable::Subagent {
-                    name: "sleeper".into(),
-                },
-                None,
-            ),
-            uncovered("b1", shell(None), None),
-            uncovered(
-                "b2",
-                shell(Some("test run")),
-                Some(Unqualified::PastDeadline),
-            ),
-            uncovered("b3", shell(Some("build")), Some(Unqualified::ProcessGone)),
-        ]));
-        assert!(text.contains("You have live background work"), "{text}");
-        assert!(
-            text.contains(
-                "subagent \"sleeper\" (task-42): attend it with `clank attend \"sleeper\"`"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("shell work (b1): not attended — relaunch it with `clank run"),
-            "{text}"
-        );
-        assert!(
-            text.contains("`clank run` \"test run\" (b2): past its --expect"),
-            "{text}"
-        );
-        assert!(
-            text.contains("`clank attend \"test run\" --expect"),
-            "{text}"
-        );
-        assert!(
-            text.contains("\"build\" (b3): its process is gone"),
-            "{text}"
-        );
-        assert!(text.contains("several things at once"), "{text}");
-        assert!(!text.contains("--pid"), "{text}");
-    }
-
     fn line(
-        selector: clank_core::turn_policy::Selector,
+        name: &str,
         desc: &str,
+        run: bool,
         elapsed: u64,
         expect: u64,
     ) -> clank_core::turn_policy::CheckInLine {
         clank_core::turn_policy::CheckInLine {
             check_in: clank_core::turn_policy::CheckInRef {
-                key: clank_core::turn_policy::EntryKey::Name(selector.text().into()),
+                key: clank_core::turn_policy::EntryKey::Name(name.into()),
                 since: 0,
             },
-            task_id: "t".into(),
-            kind: clank_core::turn_policy::TaskKind::Subagent,
-            desc: Some(desc.into()),
-            selector,
+            desc: desc.into(),
+            name: name.into(),
+            run,
             elapsed: elapsed * 1000,
             expect: expect * 1000,
         }
@@ -1037,18 +892,13 @@ mod tests {
 
     /// One check-in names every entry due with it, each with a renewal
     /// that is one shell-safe line however its name reads: user text must
-    /// arrive as the same letters, not run.
+    /// arrive as the same letters, not run. Only a run is promised a wake
+    /// at its end; declared work is told to declare it again.
     #[test]
     fn one_check_in_names_each_due_entry_with_a_shell_safe_renewal() {
-        use clank_core::turn_policy::Selector;
         let text = check_in_text(&[
-            line(
-                Selector::RunDesc("say $(rm -rf /) `id` \"hi\" it's".into()),
-                "say it",
-                720,
-                300,
-            ),
-            line(Selector::Name("sleeper".into()), "sleeper", 60, 1800),
+            line("say $(rm -rf /) `id` \"hi\" it's", "say it", true, 720, 300),
+            line("sleeper", "sleeper", false, 60, 1800),
         ]);
         assert!(
             text.contains("clank attend 'say $(rm -rf /) `id` \"hi\" it'\\''s' --expect 10m"),
@@ -1056,16 +906,31 @@ mod tests {
         );
         assert!(text.contains("clank attend sleeper --expect 1h"), "{text}");
         assert!(
-            text.contains("\"say it\" has been running for 12m"),
+            text.contains("the `clank run` \"say it\" has been going for 12m"),
             "{text}"
         );
         assert!(
-            text.contains("\"sleeper\" has been running for 1m"),
+            text.contains("declared work \"sleeper\" has been going for 1m"),
             "{text}"
         );
+        assert!(text.contains("declare it again"), "{text}");
         assert!(text.contains("check-in, not a"), "{text}");
+        assert!(
+            text.contains("nothing tells you when declared work finishes"),
+            "{text}"
+        );
+        assert!(!text.contains("its completion still wakes you"), "{text}");
         assert!(!text.contains('\n'), "it is typed into a pane: one line");
-        assert!(!text.contains("--pid"), "{text}");
+    }
+
+    #[test]
+    fn a_notice_is_its_fixed_text() {
+        use clank_core::turn_policy::Notice;
+        assert_eq!(
+            notice_text(&Notice::MonitorUnavailable),
+            MONITOR_UNAVAILABLE
+        );
+        assert_eq!(notice_text(&Notice::ArmWait), ARM_WAIT);
     }
 
     /// The heartbeat a parked hook wakes with at its deadline cannot be
@@ -1077,69 +942,6 @@ mod tests {
         assert!(r.contains("no work"), "must say nothing is pending");
         assert!(r.contains("re-arm"), "must name itself a re-arm");
         assert!(r.contains("end your turn"), "and the correct response");
-    }
-
-    /// Each resolution notice says what it matched, lists the live work,
-    /// and names how to attend it next time.
-    #[test]
-    fn a_resolution_notice_lists_the_live_work_and_the_recipe() {
-        use clank_core::turn_policy::{Notice, Selector, TaskKind, TaskSummary};
-        let live = vec![
-            TaskSummary {
-                id: Some("a25eee2".into()),
-                kind: TaskKind::Subagent,
-                description: Some("sleeper".into()),
-                run: None,
-            },
-            TaskSummary {
-                id: Some("b1".into()),
-                kind: TaskKind::Shell,
-                description: Some("Run the full integration test harness".into()),
-                run: None,
-            },
-            TaskSummary {
-                id: Some("b2".into()),
-                kind: TaskKind::Shell,
-                description: Some("Run the build".into()),
-                run: Some("build".into()),
-            },
-        ];
-        let none = notice_text(&Notice::NoMatch {
-            selector: Selector::Name("sleper".into()),
-            live: live.clone(),
-        });
-        assert!(none.contains("\"sleper\" matched no live"), "{none}");
-        assert!(none.contains("subagent \"sleeper\" (a25eee2)"), "{none}");
-        assert!(none.contains("`clank attend"), "{none}");
-        assert!(
-            none.contains("shell work, not attended — relaunch it with `clank run` (b1)"),
-            "{none}"
-        );
-        assert!(none.contains("`clank run` \"build\" (b2)"), "{none}");
-        assert!(
-            !none.contains("integration test harness") && !none.contains("Run the build"),
-            "shell work is never listed by its description: {none}"
-        );
-        let two = notice_text(&Notice::Ambiguous {
-            selector: Selector::RunDesc("build".into()),
-            matches: vec![live[0].clone(), live[0].clone()],
-        });
-        assert!(two.contains("matched 2 live tasks"), "{two}");
-        let shell = notice_text(&Notice::ShellNamed {
-            name: "Run the full integration test harness".into(),
-            task_id: "b1".into(),
-        });
-        assert!(
-            shell.contains(
-                "`Run the full integration test harness` is shell work (b1); shell work is \
-                 attended by launching it with `clank run --desc"
-            ),
-            "{shell}"
-        );
-        assert_eq!(
-            notice_text(&Notice::MonitorUnavailable),
-            MONITOR_UNAVAILABLE
-        );
     }
 
     /// Every kind's discharge says the right KIND of thing, and the

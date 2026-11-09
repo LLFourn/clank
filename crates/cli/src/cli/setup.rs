@@ -147,8 +147,8 @@ const WORK_LOOP_CODEX: WorkLoop = WorkLoop {
 const WORK_LOOP_GROK: WorkLoop = WorkLoop {
     arrival: "\
 - **Use one background wait.** On first start/resume, end your
-  turn so the native Stop hook can check running tasks. If it
-  requests arming, run `clank wait` with `run_terminal_command`
+  turn so the native Stop hook can ask the monitor whether your wait
+  is registered. If it requests arming, run `clank wait` with `run_terminal_command`
   and `block_until_ms: 0`, with no positive timeout.
   Keep exactly one such task. Its completion wakes you: act on the
   printed items immediately, then re-arm `clank wait` and end your turn.
@@ -183,6 +183,21 @@ const WORK_LOOP_OPENCODE: WorkLoop = WorkLoop {
   deliveries. Do not re-run `clank status` waiting for state to
   change. End your turn; work finds you.",
 };
+
+/// How a tool starts `clank run` without blocking its own turn: the run
+/// must outlive the tool call, or ending the turn would wait on it.
+/// Exhaustive over `Tool`, so a new tool must say how, or that it can't.
+pub(crate) fn background_run(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Claude => "via Bash's `run_in_background: true`",
+        Tool::Codex => {
+            "via `exec_command` with a short `yield_time_ms` (it returns while the command \
+             runs; never `write_stdin` to wait)"
+        }
+        Tool::Grok => "via `run_terminal_command` with `block_until_ms: 0`",
+        Tool::OpenCode => "via `shell` with `background: true`",
+    }
+}
 
 /// The loop a (tool, mode) pair teaches. Exhaustive over `Tool`, so a
 /// tool added to the vocabulary must state its own discipline here
@@ -244,13 +259,15 @@ pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String 
         Tool::Claude => "Bash",
         Tool::Codex => "shell",
         Tool::Grok => "run_terminal_command",
-        Tool::OpenCode => "bash",
+        Tool::OpenCode => "shell",
     };
     let teaching = work_loop(tool, claude_async);
-    out.replace("{{SHELL}}", shell).replace(
-        "{{WORK_LOOP}}",
-        &format!("{}\n{}", teaching.arrival, teaching.prohibition),
-    )
+    out.replace("{{SHELL}}", shell)
+        .replace(
+            "{{WORK_LOOP}}",
+            &format!("{}\n{}", teaching.arrival, teaching.prohibition),
+        )
+        .replace("{{BACKGROUND_RUN}}", background_run(tool))
 }
 
 /// Per-tool hook timeout we write into the agent's hook config.
@@ -2772,39 +2789,78 @@ mod tests {
         // 5,667B before the compression that introduced this test, at
         // 5,300. Raised by the 285B the inbox section costs — every role
         // must be told how a message is handled
-        // (a-message-wakes-its-agent-until-it-is-handled).
-        const CEILING: usize = 5_700;
+        // (a-message-wakes-its-agent-until-it-is-handled) — and by the
+        // 450B that every role must be told to mark all background work
+        // and how its tool starts a run without blocking
+        // (all-background-work-is-attended).
+        const CEILING: usize = 6_150;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
             len <= CEILING,
             "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
-             before compression, 5,300B until the inbox, 5,600B until standby) — \
+             before compression, 5,300B until the inbox, 5,600B until standby, 5,700B \
+             until marking background work) — \
              re-read in full every reviewing turn, so growth here is paid again \
              on every wake"
         );
     }
 
-    /// Every role on every tool is taught to hand long background work to
-    /// clank: `run` for shell work, `attend` by name for a subagent,
-    /// several at once, that unattended live work wakes it, and no polling
-    /// while it runs.
+    /// Every role on every tool is taught the rule: mark all background
+    /// work through `run` or `attend`, never wait on it in a turn, and
+    /// nothing unmarked is tracked. Each tool's text names its own way to
+    /// start a run without blocking its turn, and none promises a wake for
+    /// unmarked work.
     #[test]
-    fn every_skill_teaches_background_attendance() {
+    fn every_skill_teaches_that_all_background_work_is_marked() {
+        // Each tool's own documented shell tool and background switch,
+        // written out here rather than read back from `background_run`.
+        for (tool, form) in [
+            (Tool::Claude, "Bash's `run_in_background: true`"),
+            (Tool::Codex, "`exec_command` with a short `yield_time_ms`"),
+            (
+                Tool::Grok,
+                "`run_terminal_command` with `block_until_ms: 0`",
+            ),
+            (Tool::OpenCode, "`shell` with `background: true`"),
+        ] {
+            let skill = compose_skill(Role::Master, tool);
+            assert!(skill.contains(form), "{tool:?} must name {form}");
+        }
+        assert!(
+            compose_skill(Role::Master, Tool::OpenCode).contains("(run via shell)"),
+            "OpenCode 2.x's tool is `shell`"
+        );
         for tool in [Tool::Claude, Tool::Codex, Tool::Grok, Tool::OpenCode] {
             for role in [Role::Master, Role::Reviewer, Role::Standby] {
                 let skill = compose_skill(role, tool);
                 for needle in [
                     "clank run --desc",
-                    "clank attend \"<name>\"",
-                    "attend several at\n  once",
-                    "live work you don't attend wakes you",
-                    "never poll it",
+                    "clank attend\n  \"<name>\"",
+                    "No exceptions, for any tool",
+                    "Never wait for it in a turn",
+                    "A run wakes\n  you when its process ends",
+                    "re-declare what still runs",
+                    "Never poll it or",
+                    "clank detects no background work",
+                    "what you don't mark isn't\n  tracked",
+                    background_run(tool),
                 ] {
                     assert!(
                         skill.contains(needle),
                         "{role:?} skill for {tool:?} does not teach `{needle}`"
                     );
                 }
+                for promise in [
+                    "Its completion still wakes you",
+                    "live work you don't attend wakes you",
+                    "listed running",
+                ] {
+                    assert!(
+                        !skill.contains(promise),
+                        "{role:?} skill for {tool:?} still promises `{promise}`"
+                    );
+                }
+                assert!(!skill.contains("{{"), "{role:?} {tool:?}");
             }
         }
     }
@@ -3010,7 +3066,11 @@ mod tests {
         let mc = compose_skill(Role::Master, Tool::Claude);
         let mx = compose_skill(Role::Master, Tool::Codex);
         assert!(mc.contains("Stop hook owns the"));
-        assert!(!mc.contains("run_in_background"));
+        assert_eq!(
+            mc.matches("run_in_background").count(),
+            1,
+            "only `clank run` is launched in the background, never a wait"
+        );
         assert!(mx.contains("Act on Stop-hook work IMMEDIATELY"));
         assert!(!mx.contains("run_in_background"));
         // opencode is plugin-driven: work is INJECTED as a prompt;

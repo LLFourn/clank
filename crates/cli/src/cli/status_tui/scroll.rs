@@ -126,6 +126,7 @@ fn oldest_obligation(
             | WaitItem::FixCommitTag { .. }
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Message { .. }
+            | WaitItem::RunEnded { .. }
             | WaitItem::GithubEvent { .. }
             | WaitItem::CommandEvent { .. }
             | WaitItem::TimerEvent { .. }

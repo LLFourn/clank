@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>clank attend | The clank book</title>
-<meta name="description" content="Tell clank which subagent you are waiting on">
+<meta name="description" content="Declare background work clank cannot observe, such as a subagent">
 <script>try{var t=new URLSearchParams(location.search).get("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t}catch(e){}</script>
 <link rel="stylesheet" href="../book.css">
 </head>
@@ -18,22 +18,22 @@
   <article class="page">
 <p class="chapter-no"><a href="index.html">Command reference</a></p>
 <h1>clank attend</h1>
-<p class="lede">Tell clank which subagent you are waiting on</p>
-<p>A subagent by its name (<code>clank attend &quot;&lt;name&gt;&quot;</code>); shell work is attended by launching it through <code>clank run</code>. You can attend several things at once: each attend adds one, or renews the one already attending that work, and <code>--clear &lt;name&gt;</code> drops one. While the work is listed running, work you have already been shown does not wake you again; new work still does. Say how long you expect it to take (<code>--expect</code>, default 5m): if it is still running past that you are checked in on once, so a hang cannot hold you asleep. Nothing is cancelled. Ending your turn with live background work you are not attending wakes you with a notice naming it.</p>
+<p class="lede">Declare background work clank cannot observe, such as a subagent</p>
+<p><code>clank attend &quot;&lt;name&gt;&quot;</code> takes effect at once: work you have already been shown does not wake you again while it stands, and new work still does. It lasts until your next turn starts, whatever wakes you, so declare it again then if it is still running; clank never learns whether it finished. You can declare several things at once, and a name a <code>clank run</code> carries renews that run. Say how long you expect it to take (<code>--expect</code>, default 5m): if it still stands past that you are checked in on once. <code>--clear &lt;name&gt;</code> drops one. Clank detects no background work: what you do not mark is not tracked.</p>
 <h2 id="usage">Usage</h2>
 <p class="usage"><samp>clank attend [OPTIONS] [NAME]</samp></p>
 <h2 id="arguments">Arguments</h2>
 <dl class="terms">
   <dt id="arg-selector"><code>[NAME]</code></dt>
   <dd>
-<p>The subagent you are waiting on, by its name. Shell work is attended by launching it with <code>clank run</code>; its <code>--desc</code> here renews that run&#39;s expectation. With <code>--clear</code>, the one entry to clear</p>
+<p>The work you are waiting on, by its name. Shell work is run with <code>clank run</code>; its <code>--desc</code> here renews that run&#39;s expectation. With <code>--clear</code>, the one entry to clear</p>
   </dd>
 </dl>
 <h2 id="options">Options</h2>
 <dl class="terms">
   <dt id="option-desc"><code>--desc &lt;TEXT&gt;</code></dt>
   <dd>
-<p>TWO WORDS for what you are waiting on — <code>--desc &quot;test run&quot;</code>. What <code>clank tui</code> shows; the subagent&#39;s name otherwise</p>
+<p>TWO WORDS for what you are waiting on — <code>--desc &quot;test run&quot;</code>. What <code>clank tui</code> shows; the name otherwise</p>
   </dd>
   <dt id="option-expect"><code>--expect &lt;DURATION&gt;</code></dt>
   <dd>

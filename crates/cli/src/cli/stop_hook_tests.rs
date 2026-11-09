@@ -426,7 +426,6 @@ fn stop_report() -> Report {
             tool: Tool::Claude,
             session: clank_core::SessionId::parse("sess-handshake").unwrap(),
             place: Default::default(),
-            tasks: TaskSnapshot::Known(Vec::new()),
         },
         deadline: u64::MAX,
         questions: Vec::new(),
@@ -783,21 +782,23 @@ async fn a_binding_replaced_before_the_emit_sends_nothing() {
     ));
 }
 
-/// The Stop's evidence is what the report carries: the provider's own
-/// listing when it sent one, however empty; `Unavailable` when it sent
-/// none; and the deadline the hook can wait to.
+/// The Stop's evidence is what the report carries: the session, its place
+/// and the deadline the hook can wait to. A harness's task listing in the
+/// payload parses and reaches nothing.
 #[tokio::test]
 async fn the_report_carries_the_stops_evidence() {
     let dir = init_repo();
     let repo = dunce::canonicalize(dir.path()).unwrap();
     bind_tool(&repo, "claude", "sess-evidence", Tool::Claude);
-    let mut input = hook_input("sess-evidence");
-    input.background_tasks = Some(vec![
-        serde_json::from_value(serde_json::json!({
-            "id": "a1", "type": "subagent", "status": "running", "description": "sleeper",
-        }))
-        .unwrap(),
-    ]);
+    let input: HookInput = serde_json::from_value(serde_json::json!({
+        "session_id": "sess-evidence",
+        "cwd": repo,
+        "stop_hook_active": false,
+        "background_tasks": [
+            {"id": "a1", "type": "subagent", "status": "running", "description": "sleeper"},
+        ],
+    }))
+    .unwrap();
     let recorder = Recorder::default();
     let before = super::super::turn_custody::now_ms();
     let turn = stop(
@@ -812,47 +813,30 @@ async fn the_report_carries_the_stops_evidence() {
     assert!(
         matches!(turn.outcome, HookOutcome::Diagnostic { ref message } if message == "recorded")
     );
-    {
-        let carried = recorder.0.borrow();
-        let (
-            at,
-            who,
-            Report::TurnEnd {
-                stop: reported,
-                deadline,
-                ..
-            },
-        ) = &carried[0]
-        else {
-            panic!("a Stop's report");
-        };
-        assert_eq!(at, &repo);
-        assert_eq!(who, "claude");
-        assert!(
-            matches!(&reported.tasks, TaskSnapshot::Known(listed) if listed[0].raw["description"] == "sleeper")
-        );
-        assert!(*deadline > before, "the deadline is ahead of the Stop");
-    }
-
-    bind_tool(&repo, "codex", "sess-unlisted", Tool::Codex);
-    stop(
-        Tool::Codex,
-        Some(&repo),
-        hook_input("sess-unlisted"),
-        std::time::Instant::now(),
-        false,
-        &recorder,
-    )
-    .await;
     let carried = recorder.0.borrow();
-    let (_, _, Report::TurnEnd { stop: reported, .. }) = &carried[1] else {
+    let (
+        at,
+        who,
+        Report::TurnEnd {
+            stop: reported,
+            deadline,
+            ..
+        },
+    ) = &carried[0]
+    else {
         panic!("a Stop's report");
     };
+    assert_eq!(at, &repo);
+    assert_eq!(who, "claude");
     assert_eq!(
-        reported.tasks,
-        TaskSnapshot::Unavailable,
-        "codex sends no listing"
+        reported,
+        &TurnEndReport {
+            tool: Tool::Claude,
+            session: clank_core::SessionId::parse("sess-evidence").unwrap(),
+            place: Default::default(),
+        }
     );
+    assert!(*deadline > before, "the deadline is ahead of the Stop");
 }
 
 #[tokio::test]

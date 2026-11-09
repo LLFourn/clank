@@ -307,7 +307,7 @@ pub enum Command {
     /// records the binding in the agent's local config: Claude Code's
     /// CLAUDE_CODE_SESSION_ID, Codex's CODEX_THREAD_ID, Grok's
     /// GROK_SESSION_ID, or OpenCode's OPENCODE_SESSION_ID (set by
-    /// OpenCode in its bash tool's shells). Agents clank launches are
+    /// OpenCode in its `shell` tool's shells). Agents clank launches are
     /// already bound; this is for a session started by hand, or a fork.
     As(crate::cli::AsArgs),
     /// Manage this agent's auto-mode
@@ -362,18 +362,17 @@ pub enum Command {
     /// An agent asks when it needs a decision it must not make itself,
     /// and waits; the human's answer wakes it.
     Block(crate::cli::BlockArgs),
-    /// Tell clank which subagent you are waiting on
+    /// Declare background work clank cannot observe, such as a subagent
     ///
-    /// A subagent by its name (`clank attend "<name>"`); shell work is
-    /// attended by launching it through `clank run`. You can attend
-    /// several things at once: each attend adds one, or renews the one
-    /// already attending that work, and `--clear <name>` drops one. While
-    /// the work is listed running, work you have already been shown does
-    /// not wake you again; new work still does. Say how long you expect it
-    /// to take (`--expect`, default 5m): if it is still running past that
-    /// you are checked in on once, so a hang cannot hold you asleep.
-    /// Nothing is cancelled. Ending your turn with live background work
-    /// you are not attending wakes you with a notice naming it.
+    /// `clank attend "<name>"` takes effect at once: work you have already
+    /// been shown does not wake you again while it stands, and new work
+    /// still does. It lasts until your next turn starts, whatever wakes
+    /// you, so declare it again then if it is still running; clank never
+    /// learns whether it finished. You can declare several things at once,
+    /// and a name a `clank run` carries renews that run. Say how long you
+    /// expect it to take (`--expect`, default 5m): if it still stands past
+    /// that you are checked in on once. `--clear <name>` drops one. Clank
+    /// detects no background work: what you do not mark is not tracked.
     Attend(crate::cli::AttendArgs),
     /// The full-screen pane for driving a running team
     ///
@@ -382,15 +381,15 @@ pub enum Command {
     Tui(crate::cli::TuiArgs),
     /// Run a command under clank, so it knows when the work ends
     ///
-    /// Background this instead of the bare command:
-    /// `clank run --desc "test run" -- cargo test`. Clank records what
-    /// it is attending, beside anything else you attend, then BECOMES the
-    /// command — same pid, same stdio, same exit status — so the harness
-    /// task's lifetime is the work's lifetime and nothing has to be told
-    /// when it finished. `--expect 30m` says how long it should take; past
-    /// that you are checked in on once, and nothing is cancelled. Two
-    /// attended runs cannot share a `--desc`: the second is refused and
-    /// does not run.
+    /// Start this in the background instead of the bare command:
+    /// `clank run --desc "test run" -- cargo test`. Clank registers the
+    /// run with the monitor, beside anything else you attend, then BECOMES
+    /// the command — same pid, same stdio, same exit status. When that
+    /// process is gone you are woken once; its output and exit status are
+    /// wherever you launched it. `--expect 30m` says how long it should
+    /// take; past that you are checked in on once, and nothing is
+    /// cancelled. With no monitor to take the registration the command is
+    /// refused and does not run.
     Run(crate::cli::RunArgs),
     /// Read or write clank config values
     ///

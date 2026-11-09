@@ -1,16 +1,18 @@
 //! `clank run --desc "two words" -- <cmd>` — run a command under clank
 //! so it knows exactly when the work ends.
 //!
-//! Clank asks the monitor to attend this run, and then `exec`s the
+//! Clank registers this run with the monitor, and then `exec`s the
 //! command, replacing itself. One process does both jobs, which is what
-//! keeps every property aligned: the pid in the request is the pid the
-//! work runs under, the harness's background task ends exactly when the
-//! work ends, and stdio, exit status and signals are the command's own
-//! because nothing is wrapping them.
+//! keeps every property aligned: the pid in the registration is the pid
+//! the work runs under, so the run ends exactly when the work does, and
+//! stdio, exit status and signals are the command's own because nothing
+//! is wrapping them. The agent reads output and status wherever it
+//! launched the run; clank captures neither.
 //!
 //! A spawn-and-wait supervisor would break the middle one. Killed while
-//! its child kept running, the harness task would end with the work still
-//! going — liveness lying in the direction that puts an agent to sleep.
+//! its child kept running, the registered process would be gone with the
+//! work still going — liveness lying in the direction that puts an agent
+//! to sleep.
 
 use super::{RunArgs, resolve_repo};
 use crate::cli::monitor::Control;
@@ -29,7 +31,7 @@ pub async fn run(_args: RunArgs) -> anyhow::Result<()> {
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     use crate::proc_run::{Out, Spec, Stdin};
     let repo = resolve_repo(args.repo.as_deref())?;
-    let (attend, clear) = requests(&args, &repo)?;
+    let (register, clear) = requests(&args, &repo)?;
     let (program, rest) = args
         .command
         .split_first()
@@ -37,7 +39,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let submit = |control: Control| -> Submitted<'_> {
         Box::pin(crate::cli::attend::submit(&repo, control))
     };
-    let not_run = launch(attend, clear, &submit, || {
+    let not_run = launch(register, clear, &submit, || {
         crate::proc_run::exec(
             Spec::new(program)
                 .args(rest)
@@ -48,6 +50,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     })
     .await;
     Err(match not_run {
+        NotRun::Unattended(why) => anyhow::anyhow!(
+            "{why}; `{program}` was not run. Retry, or run it some other way knowing nothing \
+             will wake you when it ends"
+        ),
         NotRun::Refused(why) => anyhow::anyhow!("{why}; `{program}` was not run"),
         NotRun::Exec(err) => anyhow::anyhow!("cannot run `{program}`: {err}"),
     })
@@ -61,45 +67,42 @@ type Submitted<'a> = std::pin::Pin<
 /// Why the command is not running.
 #[derive(Debug)]
 enum NotRun {
-    /// The monitor refused the attendance, so the command was never run.
+    /// No monitor took the registration, so nothing could record the run's
+    /// end, and the command was never run.
+    Unattended(crate::cli::attend::NotDone),
+    /// The monitor refused the registration, so the command was never run.
     Refused(crate::cli::attend::NotDone),
     Exec(std::io::Error),
 }
 
-/// Ask for the attendance, then become the command. Only a FAILED exec
-/// returns once the command was tried, and then nothing is running: the
-/// entry this run registered is taken back by its own process proof, so
-/// nothing else the agent attends is touched. Only when no monitor took
-/// the request does the command run unattended; a monitor's refusal,
-/// such as a `--desc` another attended run holds, stops it before it runs.
+/// Register, then become the command. Only a FAILED exec returns once the
+/// command was tried, and then nothing is running: the registration is
+/// taken back by its own process proof, so nothing else the agent attends
+/// is touched. A command runs only once a monitor holds its registration:
+/// the run's end is a wake only a monitor can deliver.
 async fn launch<'a>(
-    attend: Control,
+    register: Control,
     clear: Control,
     submit: &'a dyn Fn(Control) -> Submitted<'a>,
     exec: impl FnOnce() -> std::io::Error,
 ) -> NotRun {
-    let attended = match submit(attend).await {
-        Ok(_) => true,
-        Err(crate::cli::attend::NotDone::NotTaken(why)) => {
-            eprintln!("clank: this run is not attended ({why}); it runs anyway");
-            false
-        }
+    match submit(register).await {
+        Ok(_) => {}
+        Err(why @ crate::cli::attend::NotDone::NotTaken(_)) => return NotRun::Unattended(why),
         Err(refused) => return NotRun::Refused(refused),
-    };
+    }
     let err = exec();
-    if attended && let Err(why) = submit(clear).await {
-        eprintln!("clank: the failed run's attendance could not be cleared: {why}");
+    if let Err(why) = submit(clear).await {
+        eprintln!("clank: the failed run's registration could not be taken back: {why}");
     }
     NotRun::Exec(err)
 }
 
-/// The requests a run makes: to attend it, and to take back exactly that
-/// entry.
+/// The requests a run makes: to register it, and to take back exactly
+/// that registration.
 ///
 /// The process identity is THIS process's, and it stays correct across
-/// the exec: `exec` replaces the process image, not the process. The
-/// description is the correlator, since the tool assigns a task id only
-/// after launching the command.
+/// the exec: `exec` replaces the process image, not the process.
 fn requests(args: &RunArgs, repo: &std::path::Path) -> anyhow::Result<(Control, Control)> {
     let label = match args.author.as_deref() {
         Some(raw) => clank_core::ids::AgentLabel::parse(raw)
@@ -123,13 +126,12 @@ fn requests(args: &RunArgs, repo: &std::path::Path) -> anyhow::Result<(Control, 
     let session = crate::cli::attend::session_of(repo, &label)?;
     let proof = crate::cli::turn_custody::shell_proof(pid, &token);
     Ok((
-        Control::Attend {
+        Control::Run {
             author: label.to_string(),
             session: session.clone(),
-            selector: clank_core::turn_policy::Selector::RunDesc(desc.clone()),
-            desc: Some(desc),
+            desc,
             expect_ms: args.expect.as_millis() as u64,
-            shell: Some(proof.clone()),
+            proof: proof.clone(),
         },
         Control::Clear {
             author: label.to_string(),
@@ -161,8 +163,7 @@ mod tests {
         let t = T::try_parse_from(["t", "--desc", "test run", "--expect", "45m", "--", "make"])
             .unwrap();
         assert_eq!(t.a.expect, std::time::Duration::from_secs(2700));
-        // The description is the correlator, so a run without one could
-        // never be recognised among the harness's live tasks.
+        // The description is what the run is shown, renewed and cleared by.
         assert!(
             T::try_parse_from(["t", "--", "echo", "hi"]).is_err(),
             "--desc required"
@@ -222,32 +223,27 @@ mod tests {
         }
     }
 
-    /// The request names THIS process — the pid the command will run
+    /// The registration names THIS process — the pid the command will run
     /// under, because `exec` replaces the image and not the process — with
-    /// the identity that proves it, and the description as the correlator.
+    /// the identity that proves it.
     #[test]
     fn the_request_names_this_process_and_its_description() {
         let dir = bound_repo();
-        let (attend, clear) = requests(&run_args("  test run  ", dir.path()), dir.path()).unwrap();
-        let Control::Attend {
-            selector,
+        let (register, clear) =
+            requests(&run_args("  test run  ", dir.path()), dir.path()).unwrap();
+        let Control::Run {
             desc,
             expect_ms,
-            shell,
+            proof: shell,
             session,
             ..
-        } = attend
+        } = register
         else {
-            panic!("{attend:?}");
+            panic!("{register:?}");
         };
-        assert_eq!(
-            selector,
-            clank_core::turn_policy::Selector::RunDesc("test run".into())
-        );
-        assert_eq!(desc.as_deref(), Some("test run"));
+        assert_eq!(desc, "test run");
         assert_eq!(expect_ms, 300_000);
         assert_eq!(session.as_str(), "sess-run");
-        let shell = shell.expect("its process proof");
         assert_eq!(shell.pid, std::process::id() as i32);
         assert_eq!(
             clear,
@@ -273,13 +269,12 @@ mod tests {
             token: "mac1:7003:1".into(),
         };
         (
-            Control::Attend {
+            Control::Run {
                 author: "claude".into(),
                 session: session.clone(),
-                selector: clank_core::turn_policy::Selector::RunDesc("test run".into()),
-                desc: Some("test run".into()),
+                desc: "test run".into(),
                 expect_ms: 1,
-                shell: Some(proof.clone()),
+                proof: proof.clone(),
             },
             Control::Clear {
                 author: "claude".into(),
@@ -289,7 +284,7 @@ mod tests {
         )
     }
 
-    /// Drive `launch` against a monitor answering the attend with
+    /// Drive `launch` against a monitor answering the registration with
     /// `answer`: what was sent to it, whether the command was tried, and
     /// why it is not running.
     async fn launched(
@@ -330,46 +325,25 @@ mod tests {
         assert_eq!(sent, vec![attend, clear]);
     }
 
-    /// A `--desc` another attended run holds stops this one before it
-    /// runs: two tasks carrying it could never be told apart.
+    /// No monitor took the registration: the command is refused and never
+    /// runs, since nothing could deliver its end. A monitor's refusal stops
+    /// it the same way.
     #[tokio::test]
-    async fn a_desc_in_use_is_refused_and_never_execs() {
-        let (sent, execed, not_run) = launched(Err(crate::cli::attend::NotDone::DescInUse(
-            "test run".into(),
-        )))
-        .await;
-        assert!(!execed, "the command is not run");
-        assert_eq!(sent.len(), 1, "nothing was registered, so nothing to clear");
-        let NotRun::Refused(why) = not_run else {
-            panic!("{not_run:?}");
-        };
-        assert_eq!(
-            why.to_string(),
-            "another `clank run` is already attended as `test run`; give this one a different \
-             --desc"
-        );
-    }
-
-    /// Only a request no monitor took still runs the command, unattended.
-    #[tokio::test]
-    async fn without_a_monitor_the_command_still_runs() {
+    async fn without_a_monitor_the_command_is_refused_and_never_runs() {
         let (sent, execed, not_run) = launched(Err(crate::cli::attend::NotDone::NotTaken(
             "no monitor".into(),
         )))
         .await;
-        assert!(execed);
-        assert!(matches!(not_run, NotRun::Exec(_)));
-        assert_eq!(
-            sent.len(),
-            1,
-            "an attendance never accepted has nothing to clear"
-        );
+        assert!(!execed, "the command is not run");
+        assert!(matches!(not_run, NotRun::Unattended(_)), "{not_run:?}");
+        assert_eq!(sent.len(), 1, "nothing was registered, so nothing to clear");
 
-        let (sent, execed, _) = launched(Err(crate::cli::attend::NotDone::Refused(
+        let (sent, execed, not_run) = launched(Err(crate::cli::attend::NotDone::Refused(
             "this session no longer holds the label".into(),
         )))
         .await;
         assert!(!execed, "a monitor's refusal stops the run");
+        assert!(matches!(not_run, NotRun::Refused(_)), "{not_run:?}");
         assert_eq!(sent.len(), 1);
     }
 }

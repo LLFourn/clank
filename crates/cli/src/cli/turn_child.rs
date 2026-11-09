@@ -271,11 +271,15 @@ async fn alone(
     owner: &mut Owner,
     out: &mut impl Write,
 ) {
-    if let Report::Handoff { handoff, .. } = report {
+    // No monitor holds a registration of any wait, so none is running.
+    if let Report::Handoff {
+        session, continued, ..
+    } = report
+    {
         let g = super::turn_custody::Gathered::of(repo, author, None);
         let _ = emit(
             out,
-            &super::turn_custody::frame_of(g.handoff_verdict(handoff)),
+            &super::turn_custody::frame_of(g.handoff_verdict(session, *continued)),
         );
         return;
     }

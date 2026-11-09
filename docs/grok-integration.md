@@ -12,10 +12,12 @@ is no tool-call registration handshake.
 2. The native SessionStart hook binds Grok's actual `sessionId` to the launched
    `CLANK_AGENT`. A lookup-only session cannot silently claim another label.
 3. At a main-session turn end (`reason: end_turn`; subagent stops are ignored),
-   the native Stop hook reports to the repo's monitor whether `backgroundTasks`
-   shows a running `clank wait` and whether this Stop is a continuation
-   (`stopHookActive`). The monitor decides: nothing if a wait is running, this is
-   the continuation, or the drive gate (auto off, a block) says so; otherwise
+   the native Stop hook reports to the repo's monitor whether this Stop is a
+   continuation (`stopHookActive`); it reads no `backgroundTasks`. The monitor
+   knows whether the session's wait runs from its own registration of it: a
+   wait connected for that session and still open. It decides: nothing if a
+   wait is registered, this is the continuation (whose just-armed wait may not
+   have registered yet), or the drive gate (auto off, a block) says so; otherwise
    Stop blocks with the request to run `clank wait` as one background terminal
    task (`block_until_ms: 0`, no positive timeout). The hook never rewrites a
    tool call or waits for work itself.
@@ -87,8 +89,8 @@ Stop decision support; neither that advertisement nor a version proves that an
 authenticated model consumes background completion notifications. Notifications
 must be enabled in the actual Grok session.
 
-The official hook documentation describes in-flight `backgroundTasks` and the
-native `stopHookActive` continuation flag. The terminal-tool source's current
+The official hook documentation describes in-flight `backgroundTasks`, which
+Clank does not read, and the native `stopHookActive` continuation flag. The terminal-tool source's current
 contract maps `block_until_ms: 0` directly to background execution and returns
 `BackgroundTaskStarted` from that path, independently of whether the command has
 already completed. This is not an inline foreground-return path that Clank must

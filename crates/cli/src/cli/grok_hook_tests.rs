@@ -6,20 +6,32 @@ use serde_json::json;
 
 const ARM: &str = crate::cli::wake_render::ARM_WAIT;
 
-/// A native event as Grok is answered: the evidence routed here, decided
-/// by the monitor's own rule, framed on Grok's wire. The reason the Stop
-/// is blocked with, if it is.
-fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<String>> {
-    let Some((label, handoff)) = route(input, repo, env)? else {
+/// A native event as Grok is answered while the monitor does (`true`) or
+/// does not hold a registration of the session's wait: routed here,
+/// decided by the monitor's own rule, framed on Grok's wire. The reason
+/// the Stop is blocked with, if it is.
+fn handle_with(
+    input: &Input,
+    repo: &Path,
+    env: &dyn Ambient,
+    wait_registered: bool,
+) -> Result<Option<String>> {
+    let Some(label) = route(input, repo, env)? else {
         return Ok(None);
     };
-    let g = crate::cli::turn_custody::Gathered::of(repo, &label, None);
-    let frame = crate::cli::turn_custody::frame_of(g.handoff_verdict(&handoff));
+    let g = crate::cli::turn_custody::Gathered::of(repo, &label, None).waiting(wait_registered);
+    let frame = crate::cli::turn_custody::frame_of(
+        g.handoff_verdict(&input.session_id, input.stop_hook_active),
+    );
     Ok(wire(&frame).0.map(|out| {
         let block: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(block["decision"], "block");
         block["reason"].as_str().unwrap().to_string()
     }))
+}
+
+fn handle(input: &Input, repo: &Path, env: &dyn Ambient) -> Result<Option<String>> {
+    handle_with(input, repo, env, false)
 }
 
 fn fixture() -> (tempfile::TempDir, PathBuf, AgentLabel, SessionId, Stated) {
@@ -61,8 +73,12 @@ fn input(repo: &Path, session: &SessionId, event: &str, tasks: serde_json::Value
     .unwrap()
 }
 
+/// The Stop reads no task list: a listed running `clank wait` and an
+/// absent `backgroundTasks` decide the same. Only the monitor's
+/// registration of the wait says it runs, and the continuation of the turn
+/// asked to arm one treats its not-yet-registered wait as pending.
 #[test]
-fn stop_uses_native_snapshot_and_never_rewrites_a_command() {
+fn the_waiter_is_the_monitors_registration_never_a_task_list() {
     let (_temp, repo, label, session, env) = fixture();
     handle(
         &input(&repo, &session, "session_start", json!([])),
@@ -71,32 +87,25 @@ fn stop_uses_native_snapshot_and_never_rewrites_a_command() {
     )
     .unwrap();
     assert!(binding_matches(&repo, &label, Tool::Grok, session.as_str()));
-    let mut stop = input(&repo, &session, "stop", json!([]));
-    assert_eq!(handle(&stop, &repo, &env).unwrap(), Some(ARM.to_string()));
-    for command in [
-        "clank wait",
-        "clank wait --repo '/same path'",
-        "exec /usr/bin/clank wait",
-    ] {
-        stop.background_tasks = Some(vec![Task {
-            kind: "shell".into(),
-            status: "running".into(),
-            command: Some(command.into()),
-        }]);
-        assert_eq!(handle(&stop, &repo, &env).unwrap(), None);
+    let listed = input(
+        &repo,
+        &session,
+        "stop",
+        json!([{"type": "shell", "status": "running", "command": "clank wait"}]),
+    );
+    let bare: Input = serde_json::from_value(json!({"hookEventName": "stop",
+        "sessionId": session, "cwd": repo, "reason": "end_turn"}))
+    .unwrap();
+    for stop in [&listed, &bare] {
+        assert_eq!(handle(stop, &repo, &env).unwrap(), Some(ARM.to_string()));
+        assert_eq!(handle_with(stop, &repo, &env, true).unwrap(), None);
     }
-    stop.background_tasks = Some(vec![Task {
-        kind: "shell".into(),
-        status: "running".into(),
-        command: Some("echo clank wait".into()),
-    }]);
-    assert_eq!(handle(&stop, &repo, &env).unwrap(), Some(ARM.to_string()));
-    stop.background_tasks = Some(vec![]);
-    stop.stop_hook_active = true;
+    let mut continued = bare;
+    continued.stop_hook_active = true;
     assert_eq!(
-        handle(&stop, &repo, &env).unwrap(),
+        handle(&continued, &repo, &env).unwrap(),
         None,
-        "failed or immediate waits must not cause a repair loop"
+        "a wait just armed may not have registered yet; a failed one must not loop"
     );
 }
 

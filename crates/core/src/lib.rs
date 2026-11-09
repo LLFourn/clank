@@ -79,7 +79,7 @@ pub use ids::{
 
 pub use agent_config::{AgentConfig, Session};
 pub use hook_io::{
-    BackgroundTask, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput,
-    HookOutcome, SilentReason,
+    CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
+    SilentReason,
 };
 pub use identity::{Caller, ResolveError, bound_to, resolve_agent_identity};

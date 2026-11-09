@@ -832,41 +832,35 @@ hook. Without it every request is refused at dispatch.
 
 ### Background work: run and attend
 
-An agent that starts long work in the background (a test suite, a build,
-a subagent) would otherwise be woken at each turn-end with work it is
-already doing. To attend the work keeps work the agent has already been
-shown from waking it again while the work is listed running, and only where
-the harness wakes the agent itself when the work completes (Claude). New
-work still wakes it.
+Clank detects no background work, for any harness. An agent marks all of
+it, and what it does not mark is not tracked: messages wait until its turn
+ends. Marked work keeps work the agent has already been shown from waking
+it again while the work runs; new work still wakes it.
 
-- `clank attend "<name>"` attends a subagent by its name.
-- `clank run --desc "two words" -- <command>` is the one way for shell work.
-  Clank asks to attend the run, then becomes the command (same pid, stdio
-  and exit status), so the task's lifetime is the work's lifetime. A shell
-  task's description is the harness's, not a handle, so `clank attend`
-  refuses a name that matches only shell work. Two attended runs cannot
-  share a `--desc`: the second is refused and its command does not run.
+- `clank run --desc "two words" -- <command>` is how shell work runs,
+  started without blocking the agent's turn (each tool's skill names its
+  form). Clank registers the run with the monitor, then becomes the
+  command (same pid, stdio and exit status). When that process is gone,
+  by exit, kill or a reused pid, the agent is woken once with a
+  `run_ended` item, which stays owed until acked; its output and exit
+  status are wherever it was launched. With no monitor to take the
+  registration, the command is refused and does not run.
+- `clank attend "<name>"` declares work clank cannot observe, such as a
+  subagent. It takes effect at once and lasts until the agent's next turn
+  starts, whatever wakes it, so an agent woken while that work still runs
+  declares it again. Clank never says the named work finished.
 
 An agent attends several things at once. Each `attend` or `run` adds one
-entry, or renews the one already attending the same work, and never
-touches another; each has its own `--expect` and check-in. A request takes
-effect from the next turn-end, whose list of running work must show
-exactly one match. Each takes `--expect` (default 5m): if the work is
-still running past that, the work already shown wakes the agent again
-through its wait, and it is checked in on once in its pane where clank can
-type there; entries due together share one check-in. Nothing is cancelled
-and nothing times out. The harness's own notification that the task
-finished is still what wakes the agent when it ends. `clank attend "<name>"
---expect 1h` renews an entry, a run's by its `--desc`; `clank attend
---clear "<name>"` withdraws one, and `clank attend --clear` all of them.
-
-Ending a turn with live background work no entry covers wakes the agent
-with a notice naming each such task and how to attend it, at every
-turn-end until it is attended or done. Only work a command could attend
-counts: a subagent or shell task, on a harness that reports its background
-work and wakes the agent when it completes (Claude). `clank tui` shows
-every entry on the agent's row and its detail page, with the reason for
-any that covers nothing yet.
+entry, or renews what already stands under that name or process, and
+never touches another. Each takes `--expect` (default 5m): if it still
+stands past that, the work already shown wakes the agent again through
+its wait, and it is checked in on once in its pane where clank can type
+there; entries due together share one check-in. Nothing is cancelled and
+nothing times out. `clank attend "<name>" --expect 1h` renews an entry, a
+run's by its `--desc`; `clank attend --clear "<name>"` withdraws one, and
+`clank attend --clear` all of them. `clank tui` shows every entry on the
+agent's row and its detail page, with the reason for any that covers
+nothing now.
 
 ## Layout
 

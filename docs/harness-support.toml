@@ -30,7 +30,7 @@ acceptance = []
 version = "2.1.223"
 readme = "2.1.223 or later for the async loop; older versions get the legacy loop"
 file = "crates/cli/src/cli/setup.rs"
-line = 1616
+line = 1633
 
 [[harness]]
 name = "Codex"
@@ -69,4 +69,4 @@ acceptance = []
 version = "2"
 readme = "2.x"
 file = "crates/cli/src/cli/setup.rs"
-line = 362
+line = 379

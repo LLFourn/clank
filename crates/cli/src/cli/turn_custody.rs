@@ -11,10 +11,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clank_core::turn_policy::{
-    AttendReply, AttendRequest, CheckIn, CheckInRef, Effect, Entry, Event, Facts, Handoff,
-    Liveness, Ms, Output, OwedItem, Persisted, PresentationId, Qualifies, Quiet, ResultOutcome,
-    Selector, SessionState, ShellProof, SilentWhy, TaskKind, Unqualified, Unwatched, Verdict,
-    Withheld,
+    AttendReply, AttendRequest, Attending, CheckIn, CheckInRef, Effect, Entry, Event, Facts,
+    Handoff, Liveness, Ms, Output, OwedItem, Persisted, Presence, PresentationId, Qualifies, Quiet,
+    ResultOutcome, SessionState, ShellProof, SilentWhy, Unqualified, Unwatched, Verdict, Withheld,
 };
 use clank_core::{AgentLabel, AutoMode, Role, SessionId, SilentReason, Tool};
 
@@ -41,6 +40,9 @@ pub(crate) struct Gathered {
     /// `None` before the monitor has folded the repo, when what is owed
     /// is not known.
     owed: Option<Vec<(OwedItem, WaitItem)>>,
+    /// The monitor holds a live registration of this agent's session's
+    /// background `clank wait`. Never true without a monitor.
+    waiter: bool,
 }
 
 impl Gathered {
@@ -83,7 +85,15 @@ impl Gathered {
             asking,
             blocked: super::wait::blocked(repo, author),
             owed: owed.map(|(items, cwd)| owed_items(items, cwd)),
+            waiter: false,
         }
+    }
+
+    /// The same agent, with the monitor's word on whether its session's
+    /// background wait is registered.
+    pub(crate) fn waiting(mut self, registered: bool) -> Self {
+        self.waiter = registered;
+        self
     }
 
     /// What the hook does when no monitor can decide for it: the local
@@ -93,10 +103,14 @@ impl Gathered {
         clank_core::turn_policy::alone_verdict(session, &facts(self, None, &owed, &Process))
     }
 
-    /// Grok's native Stop, as the monitor would answer it.
-    pub(crate) fn handoff_verdict(&self, handoff: &Handoff) -> Verdict {
+    /// Grok's native Stop for `session`, as the monitor would answer it.
+    pub(crate) fn handoff_verdict(&self, session: &SessionId, continued: bool) -> Verdict {
         clank_core::turn_policy::handoff_verdict(
-            handoff,
+            &Handoff {
+                session: session.clone(),
+                wait_registered: self.waiter,
+                continued,
+            },
             &facts(self, Some(Tool::Grok), &[], &Process),
         )
     }
@@ -173,12 +187,37 @@ fn owed_items(
 
 /// Whether a recorded process is still the one recorded, asked when a
 /// transition evaluates it.
-struct Process;
+pub(crate) struct Process;
 
 impl Liveness for Process {
-    fn holds(&self, proof: &ShellProof) -> bool {
-        serde_json::from_str::<crate::proc_identity::ProcToken>(&proof.token)
-            .is_ok_and(|token| token.still_holds(proof.pid))
+    fn presence(&self, proof: &ShellProof) -> Presence {
+        presence_of(proof, crate::proc_identity::inspect::inspect)
+    }
+}
+
+/// What `inspect` says of `proof`'s process, by the kernel's own
+/// distinctions: only an explicit end or another birth is gone. A token
+/// this build cannot read, and any read that fails, claim nothing.
+fn presence_of(
+    proof: &ShellProof,
+    inspect: impl FnOnce(
+        i32,
+        &crate::proc_identity::ProcToken,
+    ) -> crate::proc_identity::inspect::Inspection,
+) -> Presence {
+    use crate::proc_identity::inspect::{Inspection, ProcessState};
+    let Ok(token) = serde_json::from_str::<crate::proc_identity::ProcToken>(&proof.token) else {
+        return Presence::Unknown;
+    };
+    match inspect(proof.pid, &token) {
+        Inspection::Verified(details)
+            if matches!(details.state, Ok(ProcessState::Zombie | ProcessState::Dead)) =>
+        {
+            Presence::Gone
+        }
+        Inspection::Verified(_) => Presence::Live,
+        Inspection::Mismatched | Inspection::Ended => Presence::Gone,
+        Inspection::Unavailable(_) => Presence::Unknown,
     }
 }
 
@@ -266,14 +305,6 @@ pub(crate) struct CheckInDue {
     pub(crate) author: AgentLabel,
     pub(crate) session: SessionId,
     pub(crate) check_ins: Vec<CheckInRef>,
-}
-
-/// Why an attend or clear request was not carried out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Refused {
-    /// Another attended `clank run` already holds this `--desc`.
-    DescInUse(String),
-    Other(String),
 }
 
 struct Custody {
@@ -385,18 +416,23 @@ impl Turns {
     }
 
     fn persist(&mut self, author: &AgentLabel) {
+        if let Err(e) = self.try_persist(author) {
+            eprintln!("monitor: could not record `{author}`'s turn state: {e}");
+        }
+    }
+
+    fn try_persist(&mut self, author: &AgentLabel) -> std::io::Result<()> {
         let dir = self.agent_dir(author);
         let Some(custody) = self.agents.get_mut(author) else {
-            return;
+            return Ok(());
         };
         let now = custody.state.persisted();
         if custody.stored.as_ref() == Some(&now) {
-            return;
+            return Ok(());
         }
-        match write_stored(&dir, &now) {
-            Ok(()) => custody.stored = Some(now),
-            Err(e) => eprintln!("monitor: could not record `{author}`'s turn state: {e}"),
-        }
+        write_stored(&dir, &now)?;
+        custody.stored = Some(now);
+        Ok(())
     }
 
     fn step(
@@ -406,18 +442,28 @@ impl Turns {
         tool: Option<Tool>,
         event: Event,
     ) -> Option<Output> {
+        let out = self.step_in_memory(author, g, tool, event);
+        self.persist(author);
+        out
+    }
+
+    fn step_in_memory(
+        &mut self,
+        author: &AgentLabel,
+        g: &Gathered,
+        tool: Option<Tool>,
+        event: Event,
+    ) -> Option<Output> {
         let releasing = self.user_commands.contains(author);
         let custody = self.custody(author, g)?;
         let owed = g.owed_now(Some(&custody.state));
-        let out = custody.state.step(
+        Some(custody.state.step(
             event,
             &Facts {
                 user_command: releasing,
                 ..facts(g, tool, &owed, &Process)
             },
-        );
-        self.persist(author);
-        Some(out)
+        ))
     }
 
     /// The agents whose next Stop, or parked report, ends rather than parks
@@ -455,7 +501,14 @@ impl Turns {
         g: &Gathered,
     ) -> Option<Frame> {
         let event = match report {
-            Report::Handoff { handoff, .. } => return Some(frame_of(g.handoff_verdict(handoff))),
+            Report::Handoff {
+                session, continued, ..
+            } => {
+                if first {
+                    self.step(author, g, None, Event::NativeTurnEnd(session.clone()));
+                }
+                return Some(frame_of(g.handoff_verdict(session, *continued)));
+            }
             _ if g.owed.is_none() => return None,
             Report::TurnEnd { stop, .. } if first => Event::TurnEnd(stop.clone()),
             Report::TurnEnd { stop, .. } | Report::Compacted { stop, .. } => {
@@ -475,7 +528,6 @@ impl Turns {
                 identities,
                 repeat,
                 escalated,
-                notices,
             } => {
                 let items: Vec<&WaitItem> = g
                     .owed
@@ -498,10 +550,6 @@ impl Turns {
                     if let Some(more) = super::wake_repeat::escalation(repeat, &duties) {
                         text.push_str(&more);
                     }
-                }
-                for notice in &notices {
-                    text.push_str("\n\n");
-                    text.push_str(&super::wake_render::notice_text(notice));
                 }
                 let text = text.trim_start().to_string();
                 // A session start's context earns receipts only where it
@@ -690,33 +738,53 @@ impl Turns {
         }
     }
 
-    /// An attendance request, from `clank attend` or `clank run`.
+    /// An attendance request, from `clank attend` or `clank run`, or why
+    /// it was not carried out.
     pub(crate) fn attend(
         &mut self,
         author: &AgentLabel,
         request: AttendRequest,
         g: &Gathered,
-    ) -> Result<String, Refused> {
+    ) -> Result<String, String> {
         let said = match &request {
-            AttendRequest::Attend {
-                selector, expect, ..
-            } => Some((selector.clone(), *expect)),
+            AttendRequest::Run { desc, expect, .. } => {
+                Some((format!("the `clank run` \"{desc}\""), true, *expect))
+            }
+            AttendRequest::Declare { name, expect, .. } => {
+                Some((format!("\"{name}\""), false, *expect))
+            }
             AttendRequest::Clear { .. } => None,
         };
         let attending = |verb: &str| {
-            let (selector, expect) = said.clone().expect("an attend names its selector");
+            let (what, run, expect) = said.clone().expect("an attend names what it attends");
+            let ends = if run {
+                "until its process ends, which wakes you once"
+            } else {
+                "until your next turn starts, whatever wakes you; declare it again then if it \
+                 is still running"
+            };
             format!(
-                "{verb} {}: while it is listed running, work you have already been shown stays \
-                 quiet and new work still wakes you; if it is still going after {} you are \
-                 checked in on once. Anything else you attend is unchanged.",
-                selector_words(&selector),
+                "{verb} {what} {ends}. Work you have already been shown stays quiet and new work \
+                 still wakes you; if it is still going after {} you are checked in on once. \
+                 Anything else you attend is unchanged.",
                 super::attend::duration_arg(expect / 1000),
             )
         };
-        match self.step(author, g, None, Event::Attend(request)) {
-            Some(Output::Attend(AttendReply::Accepted)) => {
-                Ok(attending("from your next turn-end, attending"))
+        let before = self.custody(author, g).map(|c| c.state.clone());
+        let out = self.step_in_memory(author, g, None, Event::Attend(request));
+        // A run acknowledged here execs at once, and only turn.json brings
+        // its registration back after a restart: an unwritten one is not
+        // accepted, and is undone so memory never claims more than disk.
+        if let Err(e) = self.try_persist(author) {
+            if let (Some(custody), Some(before)) = (self.agents.get_mut(author), before) {
+                custody.state = before;
             }
+            return Err(format!(
+                "could not record this in `{author}`'s turn state ({e}), so nothing was recorded"
+            ));
+        }
+        match out {
+            Some(Output::Attend(AttendReply::Accepted)) => Ok(attending("attending")),
             Some(Output::Attend(AttendReply::Renewed)) => Ok(attending("renewed: attending")),
             Some(Output::Attend(AttendReply::Cleared { removed: 0 })) => {
                 Ok("that was not attended; nothing changed".into())
@@ -726,19 +794,34 @@ impl Turns {
                 if removed == 1 { "thing" } else { "things" },
                 if removed == 1 { "it" } else { "they" },
             )),
-            Some(Output::Attend(AttendReply::Ambiguous(named))) => Err(Refused::Other(format!(
-                "that name is both {}; nothing changed. Clear or renew them by a name only \
-                 one has",
-                named
-                    .iter()
-                    .map(selector_words)
-                    .collect::<Vec<_>>()
-                    .join(" and ")
-            ))),
-            Some(Output::Attend(AttendReply::DescInUse(desc))) => Err(Refused::DescInUse(desc)),
-            _ => Err(Refused::Other(
-                "this session no longer holds the label, so nothing was recorded".into(),
-            )),
+            _ => Err("this session no longer holds the label, so nothing was recorded".into()),
+        }
+    }
+
+    /// Write the one terminal record of every run of `author`'s whose
+    /// registered process is gone, then forget it. The record is written
+    /// first and is idempotent per run, so a crash or restart between the
+    /// two writes it again rather than losing it, and never twice.
+    pub(crate) fn end_gone_runs(&mut self, author: &AgentLabel, g: &Gathered) {
+        let repo = self.repo.clone();
+        let Some(custody) = self.custody(author, g) else {
+            return;
+        };
+        let mut ended = false;
+        for run in custody.state.ended_runs(&Process, g.now) {
+            match crate::inbox::record_run_end(&repo, author, &run) {
+                Ok(()) => {
+                    custody.state.end_run(&run.proof);
+                    ended = true;
+                }
+                Err(e) => eprintln!(
+                    "monitor: could not record that `{author}`'s run \"{}\" ended: {e:#}",
+                    run.desc
+                ),
+            }
+        }
+        if ended {
+            self.persist(author);
         }
     }
 
@@ -827,8 +910,7 @@ impl Turns {
             || load_stored(&self.agent_dir(author)).is_some_and(|p| p.repeat.is_some())
     }
 
-    /// Whether recovery must leave `author` alone: the model's own answer,
-    /// from its latest listing.
+    /// Whether recovery must leave `author` alone: the model's own answer.
     pub(crate) fn recovery_quiet(&mut self, author: &AgentLabel, g: &Gathered) -> Option<Quiet> {
         let custody = self.custody(author, g)?;
         let owed = g.owed_now(Some(&custody.state));
@@ -918,26 +1000,20 @@ fn rfc3339(ms: Ms) -> String {
 /// One entry as status and the TUI show it, with why it covers nothing
 /// when it does not.
 fn attended(entry: &Entry, qualifies: &Qualifies) -> super::agent_state::Attended {
-    let shell = entry.shell.as_ref();
+    let shell = entry.proof();
     super::agent_state::Attended {
-        task: entry
-            .task()
-            .map_or_else(|| entry.selector.text().to_string(), str::to_string),
+        task: entry.name().to_string(),
         expect: Some(super::agent_state::Expectation {
             since: rfc3339(entry.since),
             secs: entry.expect / 1000,
         }),
-        desc: entry.desc.clone(),
+        desc: Some(entry.desc.clone()),
         pid: shell.map(|p| p.pid),
         token: shell.and_then(|p| serde_json::from_str(&p.token).ok()),
         at: rfc3339(entry.since),
-        subagent: match &entry.resolved {
-            Some(r) => r.kind == TaskKind::Subagent,
-            None => matches!(entry.selector, Selector::Name(_)),
-        },
-        pending: entry.resolved.is_none(),
+        declared: matches!(entry.work, Attending::Declared { .. }),
         check_in: match &entry.check_in {
-            CheckIn::Unarmed | CheckIn::Armed => None,
+            CheckIn::Armed => None,
             CheckIn::Fired => Some("checked in".into()),
             CheckIn::Withheld(why) => Some(format!(
                 "check-in withheld: {}",
@@ -952,7 +1028,6 @@ fn attended(entry: &Entry, qualifies: &Qualifies) -> super::agent_state::Attende
         },
         unqualified: match qualifies {
             Qualifies::Yes => None,
-            Qualifies::Ended => Some("ended".into()),
             Qualifies::No(why) => Some(unqualified_text(why).into()),
         },
     }
@@ -961,22 +1036,9 @@ fn attended(entry: &Entry, qualifies: &Qualifies) -> super::agent_state::Attende
 /// Why an entry covers nothing, as a status row says it.
 pub(crate) fn unqualified_text(why: &Unqualified) -> &'static str {
     match why {
-        Unqualified::NotResolved => "not seen in a listing yet",
-        Unqualified::Uncorrelated => "waiting for a fresh listing",
-        Unqualified::NoCompletionWake => "this tool sends no completion wake",
-        Unqualified::NoProcessProof => "shell work not launched with clank run",
         Unqualified::ProcessGone => "process gone",
-        Unqualified::UnknownKind => "neither a subagent nor shell work",
+        Unqualified::ProcessUnknown => "process cannot be seen",
         Unqualified::PastDeadline => "past its deadline",
-    }
-}
-
-/// What a selector names, as a sentence says it.
-pub(crate) fn selector_words(selector: &Selector) -> String {
-    match selector {
-        Selector::Name(name) => format!("\"{name}\""),
-        Selector::RunDesc(desc) => format!("the `clank run` \"{desc}\""),
-        Selector::TaskId(id) => format!("task `{id}`"),
     }
 }
 
