@@ -387,6 +387,7 @@ pub(crate) fn load(agent_dir: &Path) -> Obligations {
 
 /// Store `obligations`, or remove the file when there are none.
 pub(crate) fn store(agent_dir: &Path, obligations: &Obligations) -> std::io::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     let path = path(agent_dir);
     if obligations.is_empty() {
         return match std::fs::remove_file(&path) {

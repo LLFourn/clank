@@ -245,6 +245,12 @@ impl<O: Opener> Remote<O> {
         }
     }
 
+    /// Whether a remote is up, coming up or going down: a session or
+    /// tunnel that restarting this process would cut.
+    pub(super) fn hosting(&self) -> bool {
+        !matches!(self.state, State::Off | State::Failed { .. })
+    }
+
     /// The address the remote serves at, while on: a base address only.
     pub(super) fn base_url(&self) -> Option<String> {
         match &self.state {
@@ -1700,6 +1706,7 @@ mod tests {
             crate::cli::web::STOP_GRACE,
         );
         let snap = snap();
+        assert!(!r.hosting(), "nothing a restart would cut");
         let pressed = std::time::Instant::now();
         assert_eq!(r.toggle(&snap), None);
         assert!(
@@ -1707,8 +1714,10 @@ mod tests {
             "not on the loop"
         );
         assert_eq!(r.shown(), Shown::Starting);
+        assert!(r.hosting(), "a remote coming up is already hosted");
         assert!(settle(&mut r, &snap).await.is_empty());
         assert_eq!(r.shown(), Shown::On);
+        assert!(r.hosting());
         let url = r.detail().unwrap();
         let port = port_of(&url);
         assert_eq!(
@@ -1828,6 +1837,7 @@ mod tests {
         }
         r.stop().await;
         assert_eq!(r.shown(), Shown::Off);
+        assert!(!r.hosting());
         assert!(reqwest::get(&url).await.is_err());
     }
 

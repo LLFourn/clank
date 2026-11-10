@@ -737,6 +737,16 @@ pub(crate) fn lock(repo: &Path, agent: &clank_core::AgentLabel) -> anyhow::Resul
 }
 
 fn publish(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    publish_under(path, bytes, &crate::upgrade::writing()?)
+}
+
+/// [`publish`] under a permit the caller holds: how an answer that
+/// reached its agent is recorded as received.
+fn publish_under(
+    path: &Path,
+    bytes: &[u8],
+    _permit: &crate::upgrade::Permit,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let dir = path.parent().context("a block file has a directory")?;
     std::fs::create_dir_all(dir)?;
@@ -750,6 +760,7 @@ fn publish(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn remove_if_present(path: &Path) -> std::io::Result<bool> {
+    let _permit = crate::upgrade::writing()?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1205,6 +1216,7 @@ pub(crate) fn receive(
     repo: &Path,
     carries: &AnswerRef,
     current: impl Fn() -> bool,
+    permit: &crate::upgrade::Permit,
 ) -> anyhow::Result<Receipt> {
     validate_name(&carries.name)?;
     let _lock = lock(repo, &carries.agent)?;
@@ -1252,10 +1264,11 @@ pub(crate) fn receive(
             // Answer first: an unstamped question still pairs with it, so
             // a crash between the two leaves the pair answered and owed.
             let o = mint_id()?;
-            publish(&f.answer, stamp(&o, None, answer).as_bytes())?;
-            publish(
+            publish_under(&f.answer, stamp(&o, None, answer).as_bytes(), permit)?;
+            publish_under(
                 &f.question,
                 stamp_question(&o, kind, &pair.question)?.as_bytes(),
+                permit,
             )?;
             o
         }
@@ -1265,7 +1278,7 @@ pub(crate) fn receive(
         question_digest: carries.question_digest.clone(),
         answer_digest: carries.answer_digest.clone(),
     };
-    publish(&f.marker, &serde_json::to_vec(&marker)?)?;
+    publish_under(&f.marker, &serde_json::to_vec(&marker)?, permit)?;
     Ok(Receipt::Retired)
 }
 
@@ -1956,7 +1969,10 @@ mod tests {
             "for its asker, not before the answer is received"
         );
 
-        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        assert_eq!(
+            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            Receipt::Retired
+        );
         written_at(&marker(repo, "q"), 7600);
         assert_eq!(ended(repo, &alice()), [(key("alice", "q"), 7600)].into());
         assert_eq!(ended(repo, &bob)[&key("alice", "q")], 7000);
@@ -1966,13 +1982,45 @@ mod tests {
         assert!(ended(repo, &bob).is_empty());
     }
 
+    /// A process that has seen a newer clank installed takes no new
+    /// question and no new answer, and still marks as received an answer
+    /// its agent was already shown.
+    #[test]
+    fn a_stale_process_asks_and_answers_nothing_and_still_receives() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let shown = asked_and_answered(repo, "q", "Proceed?", "yes");
+
+        installed.replace(1);
+        let refused = ask(repo, &alice(), "later", "And then?").unwrap_err();
+        assert!(
+            format!("{refused:#}").contains(crate::upgrade::STALE_BADGE),
+            "{refused:#}"
+        );
+        assert!(answer_block(repo, "alice", "q", "no", None).is_err());
+        assert!(!repo.join(".clank/agents/alice/blocks/later.md").exists());
+
+        assert_eq!(
+            receive(repo, &shown, || true, &authority.settling()).unwrap(),
+            Receipt::Retired
+        );
+        assert!(marker(repo, "q").exists());
+    }
+
     #[test]
     fn a_received_answer_is_retired_by_its_marker_alone() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("yes"));
-        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        assert_eq!(
+            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            Receipt::Retired
+        );
         assert!(marker(repo, "q").exists());
         assert!(
             repo.join(".clank/agents/alice/blocks/q.md").exists()
@@ -2013,6 +2061,7 @@ mod tests {
                             let _ = observed.send(());
                             authorized.load(Ordering::SeqCst)
                         },
+                        &crate::upgrade::process().settling(),
                     )
                 });
                 // A pre-lock check reports in at once; one read under the
@@ -2037,16 +2086,22 @@ mod tests {
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
         let landed_after_marker = std::thread::scope(|s| {
             let rebind = std::cell::OnceCell::new();
-            receive(repo, &a, || {
-                rebind.get_or_init(|| {
-                    s.spawn(|| {
-                        crate::agent_store::update_agent_config(repo, &alice(), |_| {}).unwrap();
-                        marker(repo, "q").exists()
-                    })
-                });
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                true
-            })
+            receive(
+                repo,
+                &a,
+                || {
+                    rebind.get_or_init(|| {
+                        s.spawn(|| {
+                            crate::agent_store::update_agent_config(repo, &alice(), |_| {})
+                                .unwrap();
+                            marker(repo, "q").exists()
+                        })
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    true
+                },
+                &crate::upgrade::process().settling(),
+            )
             .unwrap();
             rebind.into_inner().unwrap().join().unwrap()
         });
@@ -2058,9 +2113,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
-        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        assert_eq!(
+            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            Receipt::Retired
+        );
         let first = std::fs::read(marker(repo, "q")).unwrap();
-        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        assert_eq!(
+            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            Receipt::Retired
+        );
         assert_eq!(std::fs::read(marker(repo, "q")).unwrap(), first);
         let markers = std::fs::read_dir(repo.join(".clank/agents/alice/unblocks"))
             .unwrap()
@@ -2115,7 +2176,7 @@ mod tests {
             );
             assert_ne!(first.occurrence, second.occurrence, "{interleave}");
             assert_eq!(
-                receive(repo, &late, || true).unwrap(),
+                receive(repo, &late, || true, &crate::upgrade::process().settling()).unwrap(),
                 Receipt::Stale,
                 "{interleave}"
             );
@@ -2129,7 +2190,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
-        receive(repo, &a, || true).unwrap();
+        receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap();
         ask(repo, &alice(), "q", "Proceed?").unwrap();
         assert!(!repo.join(".clank/agents/alice/unblocks/q.md").exists());
         assert!(!marker(repo, "q").exists());
@@ -2137,7 +2198,10 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].answer, None, "owed to the human again");
         assert!(owed(repo).is_empty(), "no old answer is rendered for it");
-        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Stale);
+        assert_eq!(
+            receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap(),
+            Receipt::Stale
+        );
         answer_block(repo, "alice", "q", "no", None).unwrap();
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("no"));
     }
@@ -2149,7 +2213,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let a = asked_and_answered(repo, "q", "Proceed?", "yes");
-        receive(repo, &a, || true).unwrap();
+        receive(repo, &a, || true, &crate::upgrade::process().settling()).unwrap();
         let answer = std::fs::read(repo.join(".clank/agents/alice/unblocks/q.md")).unwrap();
         let receipt = std::fs::read(marker(repo, "q")).unwrap();
         ask(repo, &alice(), "q", "Proceed?").unwrap();
@@ -2187,7 +2251,13 @@ mod tests {
         assert_eq!(carries[0].occurrence, None);
 
         assert_eq!(
-            receive(repo, &carries[0], || true).unwrap(),
+            receive(
+                repo,
+                &carries[0],
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         let (qo, ao) = (
@@ -2215,7 +2285,13 @@ mod tests {
         assert_eq!(carries.len(), 1);
         assert_eq!(scan_blocks(repo)[0].answer.as_deref(), Some("yes"));
         assert_eq!(
-            receive(repo, &carries[0], || true).unwrap(),
+            receive(
+                repo,
+                &carries[0],
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
             Receipt::Retired
         );
         assert!(owed(repo).is_empty());
@@ -2240,7 +2316,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         let done = asked_and_answered(repo, "done", "Proceed?", "yes");
-        receive(repo, &done, || true).unwrap();
+        receive(repo, &done, || true, &crate::upgrade::process().settling()).unwrap();
         let owed_now = asked_and_answered(repo, "owed", "Which?", "B");
         ask(repo, &alice(), "pending", "Why?").unwrap();
         write(
@@ -3225,7 +3301,16 @@ mod tests {
                 carries.occurrence.clone().unwrap()
             ),
         );
-        assert_eq!(receive(repo, &carries, || true).unwrap(), Receipt::Stale);
+        assert_eq!(
+            receive(
+                repo,
+                &carries,
+                || true,
+                &crate::upgrade::process().settling()
+            )
+            .unwrap(),
+            Receipt::Stale
+        );
         assert!(!marker(repo, "q").exists());
     }
 

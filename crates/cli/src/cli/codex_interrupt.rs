@@ -17,6 +17,7 @@ pub(crate) async fn try_wake(
     label: &AgentLabel,
     hint: &super::pane_input::Admitted,
 ) -> anyhow::Result<bool> {
+    let _permit = crate::upgrade::writing()?;
     let hint = hint.as_str();
     let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
         return Ok(false);
@@ -210,6 +211,9 @@ pub(crate) async fn start_if_failed(
     authorize: impl std::future::Future<Output = bool>,
 ) -> crate::cli::recovery::Answer {
     use crate::cli::recovery::Answer;
+    let Ok(_permit) = crate::upgrade::writing() else {
+        return Answer::Unavailable;
+    };
     let wake = wake.as_str();
     let Some((thread, socket)) = super::event_interrupt::blocking(|| target(repo, label)) else {
         return Answer::Unavailable;

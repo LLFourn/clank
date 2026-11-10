@@ -116,6 +116,7 @@ pub(crate) fn path(agent_dir: &Path) -> PathBuf {
 /// leaves a torn record, which the reader skips. Its failure is the
 /// caller's to ignore: the attempt it describes has already happened.
 pub(crate) fn append(agent_dir: &Path, record: &Record) -> std::io::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     use std::io::Write as _;
     use std::os::unix::fs::FileExt as _;
     let mut file = std::fs::OpenOptions::new()

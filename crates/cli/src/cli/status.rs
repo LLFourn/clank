@@ -337,6 +337,11 @@ fn roster_auto_rows(
                 clank_core::vocab::AutoMode::Off
             });
         let session = cfg.as_ref().and_then(|c| c.session.clone());
+        if let Err(why) = crate::cli::agent_state::read(
+            &crate::agent_store::agents_root(repo).join(label.as_str()),
+        ) {
+            config_failed(config_errors, anyhow::anyhow!(why));
+        }
         let state =
             crate::cli::agent_state::view(repo, label, session.as_ref().map(|s| s.id.as_str()));
         // What the monitor holds of the agent's turns, only while what it
@@ -1131,8 +1136,21 @@ async fn run_watch(
 
     let mut last_emitted: Option<String> = None;
     let mut last_sig: Option<InputSignature> = None;
+    // A watch holds nothing a restart would lose: the installed build
+    // prints the snapshot afresh.
+    let mut replacing = crate::upgrade::Replacing::new(crate::upgrade::process().clone(), |_| {
+        crate::upgrade::exec_installed_as_started()
+    });
+    let mut said_stale = false;
 
     loop {
+        // Ahead of the nothing-changed gate, which an install never
+        // moves: a watch on a quiet repo still finds out.
+        let stale = replacing.pass(crate::upgrade::Hosting::Nothing).stale();
+        if stale && !said_stale {
+            eprintln!("status watch: {}", crate::upgrade::STALE_BADGE);
+        }
+        said_stale = stale;
         // Nothing-changed gate (lloyd's invariant): only rebuild when an
         // input the snapshot depends on actually changed. The signature
         // probe is far cheaper than the fold + render it guards.
@@ -1183,7 +1201,7 @@ async fn run_watch(
         // changes all arrive as watcher events now, so no fast
         // poll. The long timeout is a backstop against watcher
         // pathologies the error channel doesn't surface.
-        match rx.recv_timeout(Duration::from_secs(60)) {
+        match rx.recv_timeout(Duration::from_secs(60).min(replacing.due_in())) {
             Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2795,6 +2813,31 @@ mod dirty_and_wake_tests {
         }
     }
 
+    /// The watch loop is not run here, so its order is read: it looks for
+    /// an install on every turn, ahead of the gate an install never moves,
+    /// and sleeps no longer than until the next look.
+    #[test]
+    fn status_watch_looks_for_an_install_ahead_of_its_gate() {
+        let src = include_str!("status.rs");
+        let from = src.find("async fn run_watch(").expect("run_watch");
+        let body = &src[from..from + src[from..].find("\n}\n").expect("its end")];
+        let turn = body.find("    loop {").expect("the loop");
+        let pass = body
+            .find("replacing.pass(crate::upgrade::Hosting::Nothing)")
+            .expect("the pass");
+        let gate = body.find("match input_signature(&repo)").expect("the gate");
+        assert!(turn < pass && pass < gate, "{body}");
+        assert!(
+            body.contains("crate::upgrade::process().clone()")
+                && body.contains("crate::upgrade::exec_installed_as_started()"),
+            "this process's own authority, restarted as it was started"
+        );
+        assert!(
+            body.contains("rx.recv_timeout(Duration::from_secs(60).min(replacing.due_in()))"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn input_signature_is_stable_when_nothing_changes() {
         let dir = fixture_repo();
@@ -3267,6 +3310,7 @@ mod dirty_and_wake_tests {
                     asking: Some("Life monitor".into()),
                     repeated: Some(count),
                 },
+                &crate::upgrade::process().permit().unwrap(),
             );
 
             let set = crate::cli::teams_config::RegisteredSet {
@@ -3289,6 +3333,52 @@ mod dirty_and_wake_tests {
             shown(5, "session-old"),
             (None, None),
             "another session's count and question"
+        );
+    }
+
+    /// The invisible attendance of 10 Nov: a state a newer build wrote,
+    /// in a shape this one cannot read. Its row has no attendance to draw,
+    /// and the status says why: the file is another build's, not absent.
+    #[test]
+    fn a_state_from_another_build_is_said_to_be_one() {
+        let repo = fixture_repo();
+        let label = clank_core::ids::AgentLabel::parse("claude").unwrap();
+        let dir = crate::agent_store::agents_root(repo.path()).join("claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = crate::cli::teams_config::RegisteredSet {
+            master: label,
+            master_desc: crate::cli::teams_config::AgentDescription {
+                tool: clank_core::Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+            members: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        roster_auto_rows(repo.path(), None, &set, &mut errors);
+        assert_eq!(errors, Vec::<String>::new(), "no state is no error");
+
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"role":"master","session":"s","attending":[{"attended":{"by":"a newer shape"}}]}"#,
+        )
+        .unwrap();
+        let rows = roster_auto_rows(repo.path(), None, &set, &mut errors);
+        assert!(rows[0].attending.is_empty());
+        let [said] = errors.as_slice() else {
+            panic!("{errors:?}");
+        };
+        assert!(
+            said.contains("state.json was written by a clank build this one cannot read")
+                && said.contains("not absent"),
+            "{said}"
+        );
+        let mut snap = minimal_snapshot();
+        snap.config_errors = errors;
+        assert!(
+            snap.to_human().contains("cannot read"),
+            "{}",
+            snap.to_human()
         );
     }
 

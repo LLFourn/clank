@@ -363,6 +363,7 @@ pub(crate) fn add(
     priority: u16,
     source: BodySource,
 ) -> anyhow::Result<PathBuf> {
+    let _permit = crate::upgrade::writing()?;
     validate_name(name)?;
     priority_dir::check_priority(priority)?;
     let scanned = scan_queue(repo);
@@ -430,6 +431,7 @@ fn find_unique<'a>(entries: &'a [QueueEntry], name: &str) -> anyhow::Result<&'a 
 }
 
 fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     let entries = scan_queue(repo);
     let entry = find_unique(&entries, name)?;
     std::fs::remove_file(&entry.path)?;
@@ -491,6 +493,7 @@ pub fn save_entry(
     expected_revision: &str,
     body: String,
 ) -> anyhow::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     let entry = entry_by_stem(repo, stem)?;
     let body = normalize_and_validate(
         &entry.name,

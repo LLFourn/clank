@@ -201,10 +201,41 @@ repair them on their own. `clank doctor` warns about a missing one.
 
 ### Upgrading
 
-- **Monitors retire on their own.** A running monitor retires itself when a
-  different build is installed, and its successor runs the new one. Agent
-  panes keep running through it. `clank monitor upgrade` moves monitors
-  from before that onto this build.
+- **Running agents see nothing.** An install needs no restart of anything
+  an agent is running. Within a few seconds of it:
+  - a monitor finishes what it has already handed to a hook, retires, and
+    its successor runs the new build;
+  - a parked Stop hook, the wait under it, and a Grok or hand-armed
+    `clank wait` each replace themselves with the installed build, in
+    place: the same process, the same pipes, so the agent's harness sees
+    one hook or one wait throughout, and no turn is spent on the upgrade.
+    One that is in the middle of delivering work finishes that first, and
+    a wait started while the old monitor is still on its way out waits
+    for it, well past the minute after which an outage is reported. A
+    wait given its own `--event` sources, `--for` or `--peek` runs those
+    itself and is left as it is.
+
+  From the moment a process sees the newer build it writes no shared state,
+  so nothing an old build writes lands on top of a new one's files. If the
+  new binary cannot be started (it is missing mid-install, say), the old
+  process keeps waiting as it was and tries again, a little later each
+  time.
+- **`clank tui` and `clank status --watch` restart themselves** the same
+  way. A TUI that is hosting a remote session or a tunnel, or has a text
+  input open, does not: restarting it would drop your connection. It shows
+  "newer clank installed · restart to upgrade" in its bar instead, and
+  changes nothing until you restart it: a key or a remote action that
+  would write, type into an agent's pane, stop it or open one is refused,
+  and says so under the same words. The remote's own
+  login sessions are the one thing it keeps up to date, since they are
+  what keeps you connected. A status watch that could
+  not restart says the same on stderr.
+- **A file from another build is said to be one.** An agent state or a
+  monitor's source account that this build cannot read is reported as
+  written by another clank build, never shown as an agent with no state or
+  a monitor that is not running.
+- **`clank monitor upgrade`** moves monitors from before all of this onto
+  the installed build.
 - **A config written by a newer clank is refused.** `~/.clank/config.json`,
   `.clank/config.json` and each `.clank/agents/<label>/config.json` carry a
   `version`. A file without one is read as version 1, and the next write

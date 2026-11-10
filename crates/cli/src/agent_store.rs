@@ -918,6 +918,7 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Opti
 }
 
 fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    let _permit = crate::upgrade::writing()?;
     match serde_json::to_value(value)? {
         serde_json::Value::Object(doc) => versioned::write(path, &doc, AGENT_CONFIG_VERSION),
         _ => anyhow::bail!("`{}` did not serialize as an object", path.display()),

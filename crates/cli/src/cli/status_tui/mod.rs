@@ -3049,6 +3049,31 @@ fn paint_interval(spinner_visible: bool) -> Duration {
     }
 }
 
+/// What restarting this TUI into a newer build would break: a remote
+/// somebody may be connected through, or words somebody is typing.
+fn restart_breaks(hosting_remote: bool, mid_input: bool) -> crate::upgrade::Hosting {
+    match hosting_remote || mid_input {
+        true => crate::upgrade::Hosting::Someone,
+        false => crate::upgrade::Hosting::Nothing,
+    }
+}
+
+/// What a TUI kept running on a replaced build shows when something it
+/// was asked this turn was refused. Read off the authority's own count,
+/// not off each action's result: most of them discard it.
+fn refusal_notice(before: u64, after: u64) -> Option<Overlay> {
+    (after > before).then(|| {
+        Overlay::error(
+            crate::upgrade::STALE_BADGE.to_string(),
+            "That was not done. This clank was replaced by a newer build while it was \
+             running, and it stayed up only so that a remote session or what you were \
+             typing was not cut off. It changes nothing until it is restarted: quit it \
+             and run `clank tui` again."
+                .to_string(),
+        )
+    })
+}
+
 /// The panel's own probe for a waker that died.
 ///
 /// Every other snapshot input announces itself: a watcher event fires
@@ -3361,7 +3386,16 @@ pub(crate) async fn run_tui(
     };
     served.armed(runtime.unavailable.clone(), &remote);
 
-    let _guard = AltScreen::enter();
+    let mut screen = Some(AltScreen::enter());
+    let mut replacing = crate::upgrade::Replacing::new(crate::upgrade::process().clone(), |_| {
+        // The terminal goes back first, so the installed build takes
+        // it over as it would from a shell; a failed exec takes it
+        // again and this TUI carries on.
+        screen.take();
+        let failed = crate::upgrade::exec_installed_as_started();
+        screen = Some(AltScreen::enter());
+        failed
+    });
     {
         let ev_tx = ev_tx.clone();
         std::thread::spawn(move || {
@@ -3503,6 +3537,16 @@ pub(crate) async fn run_tui(
     // Labeled so a `Quit` key inside the per-key drain loop exits the
     // event loop, not just the inner `for`.
     'evloop: loop {
+        // Every pass, whatever woke it: an install changes none of the
+        // inputs the rebuild below is gated on, so a quiet repo would
+        // otherwise never notice one.
+        let stale_build = replacing
+            .pass(restart_breaks(
+                remote.hosting(),
+                detail.is_some() || plan_input.is_some(),
+            ))
+            .stale();
+        let refused_before = crate::upgrade::process().refusals();
         reconcile_wait_process(
             &mut mode,
             &mut wait_page,
@@ -3787,6 +3831,7 @@ pub(crate) async fn run_tui(
             remote_page,
             presence,
             lost: reconcile_worker.lost(),
+            stale_build,
         };
         // An overlay mounted here is drawn by the branch at the TOP of
         // the loop, which this pass is already past: without going
@@ -3885,6 +3930,7 @@ pub(crate) async fn run_tui(
             Some(due) => wait.min(due),
             None => wait,
         };
+        let wait = wait.min(replacing.due_in());
 
         match ev_rx.recv_timeout(wait) {
             // Drain the whole queued burst in ONE pass: keystrokes apply
@@ -5434,6 +5480,10 @@ pub(crate) async fn run_tui(
             || crate::cli::status::process_health(&repo),
         )
         .refresh_pending;
+
+        if let Some(notice) = refusal_notice(refused_before, crate::upgrade::process().refusals()) {
+            detail = Some(notice);
+        }
 
         // Trailing-edge refresh flush: the COALESCED snapshot rebuild, run
         // at most once per REBUILD_MIN (the only throttled work; keys and
@@ -8392,6 +8442,136 @@ pub(crate) mod tests {
     /// Offsets and balanced delimiters only: no character windows and
     /// no indentation, so a reflow cannot switch it off and a comment
     /// cannot make it red.
+    /// A TUI under a newer install restarts into it when that breaks
+    /// nothing. Hosting a remote, or holding somebody's half-typed words,
+    /// it is never restarted: it stays, stale, and its bar says so.
+    #[test]
+    fn a_stale_tui_restarts_unless_that_would_cut_someone_off() {
+        use crate::upgrade::{Hosting, Pass};
+        assert_eq!(restart_breaks(false, false), Hosting::Nothing);
+        for (remote, typing) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(restart_breaks(remote, typing), Hosting::Someone);
+        }
+
+        let installed = crate::upgrade::tests::Installed::current();
+        installed.replace(1);
+        let tried = std::cell::Cell::new(0);
+        let mut replacing = crate::upgrade::Replacing::new(installed.authority(), |_| {
+            tried.set(tried.get() + 1);
+            std::io::Error::other("no exec in a test")
+        });
+        let hosting = replacing.pass(restart_breaks(true, false));
+        assert_eq!((hosting.clone(), tried.get()), (Pass::Held, 0));
+        assert!(hosting.stale(), "which is what puts the badge in the bar");
+        assert!(matches!(
+            replacing.pass(restart_breaks(false, false)),
+            Pass::Failed { .. }
+        ));
+        assert_eq!(tried.get(), 1, "hosting nothing, it restarts");
+    }
+
+    /// A TUI kept running on a replaced build does nothing it is asked
+    /// that would change shared state, and what it refused is said on
+    /// screen though the action itself swallowed the error. On its own
+    /// build again, the same key works.
+    #[test]
+    fn a_stale_tui_refuses_what_it_is_asked_and_says_so() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let repo = detail_repo();
+        let mut s = two_agent_snap();
+        let label = clank_core::ids::AgentLabel::parse(&s.agents[1].label).unwrap();
+        let armed = |repo: &std::path::Path| {
+            crate::agent_store::load_agent_config(repo, &label)
+                .unwrap()
+                .and_then(|cfg| cfg.auto_mode)
+        };
+        let shown = s.agents[1].auto_mode;
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let toggle = |s: &mut StatusSnapshot| {
+            apply_detail_action(DetailAction::ToggleAuto, 1, 0, s, repo.path(), &mut None, 1)
+        };
+
+        installed.replace(1);
+        let before = crate::upgrade::process().refusals();
+        toggle(&mut s);
+        assert_eq!(
+            armed(repo.path()),
+            None,
+            "a stale TUI wrote an agent's config"
+        );
+        assert_eq!(s.agents[1].auto_mode, shown, "and the row claims no change");
+        let Some(Overlay {
+            data: OverlayData::Error { title, message },
+            ..
+        }) = refusal_notice(before, crate::upgrade::process().refusals())
+        else {
+            panic!("a refused action said nothing");
+        };
+        assert_eq!(title, crate::upgrade::STALE_BADGE);
+        assert!(message.contains("was not done"), "{message}");
+        assert!(
+            refusal_notice(3, 3).is_none(),
+            "nothing refused, nothing said"
+        );
+
+        installed.install(crate::build_stamp::running());
+        toggle(&mut s);
+        assert_eq!(armed(repo.path()), Some(flip_auto(shown)));
+    }
+
+    /// The loop takes the count at the top of a turn and compares it once
+    /// the turn's input is done, before the flush.
+    #[test]
+    fn the_loop_says_what_a_turn_refused() {
+        let whole = include_str!("mod.rs");
+        let prod = &whole[..whole
+            .find("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("the test module still opens with that attribute")];
+        let flat: String = prod.split_whitespace().collect();
+        let taken = flat
+            .find("letrefused_before=crate::upgrade::process().refusals();")
+            .expect("the count is taken");
+        let recv = flat
+            .find("matchev_rx.recv_timeout(wait){")
+            .expect("the panel's own receive");
+        let said = flat
+            .find(
+                "ifletSome(notice)=refusal_notice(refused_before,crate::upgrade::process().refusals()){detail=Some(notice);}",
+            )
+            .expect("the notice is mounted");
+        assert!(taken < recv && recv < said);
+    }
+
+    /// The loop asks on every pass, ahead of the gate an install never
+    /// moves, with what the TUI hosts now, and wakes for the next look.
+    #[test]
+    fn the_loop_looks_for_an_install_on_every_pass() {
+        let whole = include_str!("mod.rs");
+        let prod = &whole[..whole
+            .find("\n#[cfg(test)]\npub(crate) mod tests {")
+            .expect("the test module still opens with that attribute")];
+        let flat: String = prod.split_whitespace().collect();
+        let opens = "'evloop:loop{";
+        let top = flat.find(opens).expect("the loop") + opens.len();
+        let pass = top
+            + flat[top..]
+                .find("letstale_build=replacing.pass(restart_breaks(remote.hosting(),")
+                .expect("the pass");
+        assert!(
+            !flat[top..pass].contains(['{', ';']),
+            "the loop's first statement, under no condition"
+        );
+        let capped = flat
+            .find("letwait=wait.min(replacing.due_in());")
+            .expect("the wait is capped at the next look");
+        let recv = flat
+            .find("matchev_rx.recv_timeout(wait){")
+            .expect("the panel's own receive");
+        assert!(pass < capped && capped < recv);
+    }
+
     #[test]
     fn the_loop_closes_every_turn_after_its_receive_and_before_the_flush() {
         // Compiler anchors for every name the token patterns below
@@ -9329,6 +9509,7 @@ pub(crate) mod tests {
             remote_page: None,
             presence: None,
             lost: Default::default(),
+            stale_build: false,
             lift: 0,
         }
     }
@@ -11218,6 +11399,7 @@ pub(crate) mod tests {
                 asking: None,
                 repeated: None,
             },
+            &crate::upgrade::process().permit().unwrap(),
         );
     }
 

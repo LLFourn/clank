@@ -30,6 +30,7 @@ fn git(repo: &Path) -> Spec {
 }
 
 fn output(spec: Spec, budget: Duration) -> anyhow::Result<proc_run::Output> {
+    let _permit = crate::upgrade::writing()?;
     let what = spec.display();
     proc_run::run_blocking(
         spec.stdout(Out::Capture {
@@ -43,6 +44,7 @@ fn output(spec: Spec, budget: Duration) -> anyhow::Result<proc_run::Output> {
 }
 
 fn open(repo: &Path) -> anyhow::Result<gix::Repository> {
+    let _permit = crate::upgrade::writing()?;
     gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))
 }
 
@@ -757,6 +759,7 @@ fn run_spec(repo: &Path, args: &[&str]) -> Spec {
 }
 
 fn on_the_terminal(spec: Spec) -> anyhow::Result<std::process::ExitStatus> {
+    let _permit = crate::upgrade::writing()?;
     Ok(proc_run::run_blocking(spec, GIT_HOOKED_BUDGET)?.status)
 }
 

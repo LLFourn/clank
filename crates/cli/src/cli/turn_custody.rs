@@ -275,6 +275,9 @@ pub(crate) struct Carried {
     session: SessionId,
     delivered: super::presentation::Carried,
     prepared: super::wake_receipt::Prepared,
+    /// Taken before the presentation left, so its result is recorded and
+    /// its receipts written even if a newer clank is installed meanwhile.
+    settling: crate::upgrade::Permit,
 }
 
 /// What a `Delivered` commits: carried out by the monitor off its loop.
@@ -312,8 +315,17 @@ impl Commit {
             carried.session.as_str(),
             &carried.delivered,
             current,
+            &carried.settling,
         );
-        super::wake_receipt::dispatch(repo, &author, carried.prepared, carried.tool, current).await;
+        super::wake_receipt::dispatch(
+            repo,
+            &author,
+            carried.prepared,
+            carried.tool,
+            current,
+            &carried.settling,
+        )
+        .await;
     }
 }
 
@@ -334,12 +346,18 @@ struct Custody {
     stored: Option<Persisted>,
 }
 
+fn refused_as_stale(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<crate::upgrade::Stale>())
+}
+
 /// Every agent's turn-end state, as the monitor's loop drives it.
 pub(crate) struct Turns {
     repo: PathBuf,
     agents: BTreeMap<AgentLabel, Custody>,
     /// The agents whose park a verified user command is waiting on.
     user_commands: std::collections::BTreeSet<AgentLabel>,
+    authority: crate::upgrade::Authority,
 }
 
 fn store_path(agent_dir: &Path) -> PathBuf {
@@ -354,7 +372,11 @@ pub(crate) fn load_stored(agent_dir: &Path) -> Option<Persisted> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
-pub(crate) fn write_stored(agent_dir: &Path, state: &Persisted) -> std::io::Result<()> {
+pub(crate) fn write_stored(
+    agent_dir: &Path,
+    state: &Persisted,
+    _permit: &crate::upgrade::Permit,
+) -> std::io::Result<()> {
     let path = store_path(agent_dir);
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(state).map_err(std::io::Error::other)?;
@@ -369,7 +391,15 @@ impl Turns {
             repo,
             agents: BTreeMap::new(),
             user_commands: Default::default(),
+            authority: crate::upgrade::process().clone(),
         }
+    }
+
+    /// Answer to `authority` instead of this process's own.
+    #[cfg(test)]
+    pub(crate) fn guarded_by(mut self, authority: crate::upgrade::Authority) -> Self {
+        self.authority = authority;
+        self
     }
 
     fn agent_dir(&self, author: &AgentLabel) -> PathBuf {
@@ -413,6 +443,10 @@ impl Turns {
     /// session that is no longer its, so they end here and on disk.
     pub(crate) fn retire(&mut self, author: &AgentLabel) {
         self.agents.remove(author);
+        // Left for the monitor that follows, which retires it the same way.
+        let Ok(_permit) = self.authority.permit() else {
+            return;
+        };
         match std::fs::remove_file(store_path(&self.agent_dir(author))) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 eprintln!("monitor: could not retire `{author}`'s turn state: {e}")
@@ -434,14 +468,25 @@ impl Turns {
         }
     }
 
-    fn persist(&mut self, author: &AgentLabel) {
-        if let Err(e) = self.try_persist(author) {
-            eprintln!("monitor: could not record `{author}`'s turn state: {e}");
+    fn persist(&mut self, author: &AgentLabel, held: Option<&crate::upgrade::Permit>) {
+        match self.try_persist(author, held) {
+            Ok(()) => {}
+            Err(e) if refused_as_stale(&e) => {
+                tracing::debug!(%author, %e, "turn state left unwritten")
+            }
+            Err(e) => eprintln!("monitor: could not record `{author}`'s turn state: {e}"),
         }
     }
 
-    fn try_persist(&mut self, author: &AgentLabel) -> std::io::Result<()> {
+    /// Write `author`'s state if it changed, under `held`, else under its
+    /// presentation in flight's permit, else under a new one.
+    fn try_persist(
+        &mut self,
+        author: &AgentLabel,
+        held: Option<&crate::upgrade::Permit>,
+    ) -> std::io::Result<()> {
         let dir = self.agent_dir(author);
+        let authority = &self.authority;
         let Some(custody) = self.agents.get_mut(author) else {
             return Ok(());
         };
@@ -449,7 +494,15 @@ impl Turns {
         if custody.stored.as_ref() == Some(&now) {
             return Ok(());
         }
-        write_stored(&dir, &now)?;
+        let fresh;
+        let permit = match held.or(custody.carried.as_ref().map(|c| &c.settling)) {
+            Some(permit) => permit,
+            None => {
+                fresh = authority.permit()?;
+                &fresh
+            }
+        };
+        write_stored(&dir, &now, permit)?;
         custody.stored = Some(now);
         Ok(())
     }
@@ -462,7 +515,20 @@ impl Turns {
         event: Event,
     ) -> Option<Output> {
         let out = self.step_in_memory(author, g, tool, event);
-        self.persist(author);
+        self.persist(author, None);
+        out
+    }
+
+    fn step_under(
+        &mut self,
+        author: &AgentLabel,
+        g: &Gathered,
+        tool: Option<Tool>,
+        event: Event,
+        permit: &crate::upgrade::Permit,
+    ) -> Option<Output> {
+        let out = self.step_in_memory(author, g, tool, event);
+        self.persist(author, Some(permit));
         out
     }
 
@@ -519,6 +585,9 @@ impl Turns {
         first: bool,
         g: &Gathered,
     ) -> Option<Frame> {
+        // Before anything is stepped: a stale monitor answers nothing, so
+        // the report is still whole for the monitor that follows it.
+        let permit = self.authority.permit().ok()?;
         let event = match report {
             Report::Handoff {
                 session,
@@ -528,7 +597,7 @@ impl Turns {
             } => {
                 let event = Event::NativeTurnEnd(g.handoff(session, *continued, tasks.clone()));
                 let stepped = first
-                    .then(|| self.step(author, g, Some(Tool::Grok), event))
+                    .then(|| self.step_under(author, g, Some(Tool::Grok), event, &permit))
                     .flatten();
                 return Some(frame_of(match stepped {
                     Some(Output::Verdict(verdict)) => verdict,
@@ -543,7 +612,8 @@ impl Turns {
             Report::SessionStart { session, .. } => Event::SessionStart(session.clone()),
         };
         let tool = report.tool();
-        let Some(Output::Verdict(verdict)) = self.step(author, g, Some(tool), event) else {
+        let Some(Output::Verdict(verdict)) = self.step_under(author, g, Some(tool), event, &permit)
+        else {
             return Some(Frame::bare(WireVerdict::Silent {
                 why: SilentReason::StaleBinding,
             }));
@@ -607,6 +677,7 @@ impl Turns {
                         session: report.session().clone(),
                         delivered,
                         prepared,
+                        settling: permit,
                     });
                 }
                 Frame::text(WireVerdict::Deliver { presentation }, text)
@@ -701,7 +772,7 @@ impl Turns {
         }
         custody.park = Some(conn);
         custody.state.unwatched = None;
-        self.persist(author);
+        self.persist(author, None);
     }
 
     /// Deliverer `conn` ended unanswered. If it was `author`'s park,
@@ -725,7 +796,7 @@ impl Turns {
             record,
             read,
         });
-        self.persist(author);
+        self.persist(author, None);
     }
 
     /// Recovery saw `author`'s record move off `unwatched`'s cursor: that
@@ -739,7 +810,7 @@ impl Turns {
             return;
         };
         custody.state.unwatched = None;
-        self.persist(author);
+        self.persist(author, None);
     }
 
     fn settle(
@@ -748,8 +819,12 @@ impl Turns {
         g: &Gathered,
         event: Event,
     ) -> Result<Option<Commit>, String> {
+        // Stepped and written while the presentation still holds its
+        // permit: taking it first would leave the result unwritten by a
+        // monitor that has since seen a newer clank installed.
+        let out = self.step(author, g, None, event);
         let carried = self.agents.get_mut(author).and_then(|c| c.carried.take());
-        match self.step(author, g, None, event) {
+        match out {
             Some(Output::Result(ResultOutcome::Resolved(effects))) => Ok(effects
                 .iter()
                 .any(|e| matches!(e, Effect::CommitReceipts(_)))
@@ -809,7 +884,7 @@ impl Turns {
         // A run acknowledged here execs at once, and only turn.json brings
         // its registration back after a restart: an unwritten one is not
         // accepted, and is undone so memory never claims more than disk.
-        if let Err(e) = self.try_persist(author) {
+        if let Err(e) = self.try_persist(author, None) {
             if let (Some(custody), Some(before)) = (self.agents.get_mut(author), before) {
                 custody.state = before;
             }
@@ -855,7 +930,7 @@ impl Turns {
             }
         }
         if ended {
-            self.persist(author);
+            self.persist(author, None);
         }
     }
 

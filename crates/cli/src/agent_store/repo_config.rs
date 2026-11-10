@@ -126,6 +126,7 @@ fn locked<T>(
     repo: &Path,
     f: impl FnOnce(Option<Stored>) -> anyhow::Result<(Option<Document>, T)>,
 ) -> anyhow::Result<T> {
+    let _permit = crate::upgrade::writing()?;
     let path = path(repo);
     let dir = repo.join(".clank");
     std::fs::create_dir_all(&dir)?;

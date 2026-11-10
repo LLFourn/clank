@@ -441,11 +441,29 @@ pub(crate) fn attended_now(repo: &Path, label: &str) -> Vec<Attended> {
 }
 
 pub(crate) fn load(agent_dir: &Path) -> Option<AgentState> {
-    serde_json::from_slice(&std::fs::read(path(agent_dir)).ok()?).ok()
+    read(agent_dir).ok().flatten()
+}
+
+/// The state published in `agent_dir`: `Ok(None)` when none is, and `Err`
+/// when one is there that this build cannot read, which a reader shows
+/// as that rather than as an agent with no state.
+pub(crate) fn read(agent_dir: &Path) -> Result<Option<AgentState>, String> {
+    let path = path(agent_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+        format!(
+            "{} was written by a clank build this one cannot read ({e}); what it says of the              agent is unknown here, not absent",
+            path.display()
+        )
+    })
 }
 
 /// Publish `state`. Best effort: a failed write changes nothing else.
-pub(crate) fn store(agent_dir: &Path, state: &AgentState) {
+pub(crate) fn store(agent_dir: &Path, state: &AgentState, _permit: &crate::upgrade::Permit) {
     let path = path(agent_dir);
     let tmp = path.with_extension("json.tmp");
     if let Ok(bytes) = serde_json::to_vec_pretty(state) {

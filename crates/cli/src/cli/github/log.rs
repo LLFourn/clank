@@ -629,6 +629,12 @@ impl SharedWal {
         };
         match f(log) {
             Ok(()) => Durability::Logged,
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<crate::upgrade::Stale>()) =>
+            {
+                Durability::Refused
+            }
             Err(e) => {
                 if !warned {
                     eprintln!(
@@ -782,6 +788,12 @@ pub(crate) struct EventLog {
     /// compaction trigger. Approximate is fine: compaction re-reads
     /// under the exclusive lock.
     lines: usize,
+    /// Asked before every write of the log: a process that has seen a
+    /// newer clank installed appends nothing to it.
+    guard: crate::upgrade::Authority,
+    /// Opened under a permit its caller holds, which every write here
+    /// goes under instead of asking for one.
+    held: bool,
     #[cfg(test)]
     sync_fault: std::cell::Cell<Option<DurableSync>>,
 }
@@ -812,9 +824,35 @@ impl EventLog {
             lock_path: events_dir.join(format!("{source_key}.lock")),
             next_seq: Some(1),
             lines: 0,
+            guard: crate::upgrade::process().clone(),
+            held: false,
             #[cfg(test)]
             sync_fault: std::cell::Cell::new(None),
         })
+    }
+
+    /// Write under `held`, the permit of work already in flight, for as
+    /// long as the caller keeps it: the record of a delivery is written
+    /// even by a process that has since seen a newer clank installed.
+    pub(crate) fn under(mut self, _held: &crate::upgrade::Permit) -> Self {
+        self.held = true;
+        self
+    }
+
+    /// What a write of the log goes under: nothing more when its caller
+    /// holds a permit, else a new one, refused to a stale process.
+    fn permit(&self) -> std::io::Result<Option<crate::upgrade::Permit>> {
+        match self.held {
+            true => Ok(None),
+            false => Ok(Some(self.guard.permit()?)),
+        }
+    }
+
+    /// Answer to `authority` instead of this process's own.
+    #[cfg(test)]
+    pub(crate) fn guarded_by(mut self, authority: crate::upgrade::Authority) -> Self {
+        self.guard = authority;
+        self
     }
 
     /// Parse the raw log text into the THREE-way classification
@@ -1405,6 +1443,7 @@ impl EventLog {
     }
 
     fn append_unlocked(&mut self, record: &Record) -> std::io::Result<()> {
+        let _permit = self.permit()?;
         // Open AFTER the lock: the fd must name the current inode,
         // never one a compactor just renamed away.
         let mut f = std::fs::OpenOptions::new()
@@ -1762,6 +1801,7 @@ impl EventLog {
     /// Caller holds the exclusive append lock. Even a no-op retry repairs the
     /// framing before another producer can append after a crash-torn tail.
     fn repaired_log_file(&self) -> std::io::Result<std::fs::File> {
+        let _permit = self.permit()?;
         let bytes = match std::fs::read(&self.log_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -1790,6 +1830,7 @@ impl EventLog {
         poll_interval_floor: Option<u64>,
         feed_baselined: bool,
     ) -> std::io::Result<()> {
+        let _permit = self.permit()?;
         let state = StateFile {
             etag: etag.map(str::to_owned),
             poll_interval_floor,
@@ -2145,6 +2186,7 @@ impl EventLog {
     /// Caller holds the exclusive sidecar lock. Both ordinary history and
     /// recurring progress use this one crash-safe WAL replacement boundary.
     fn rewrite_compacted_unlocked(&mut self, bytes: &[u8], lines: usize) -> std::io::Result<()> {
+        let _permit = self.permit()?;
         let tmp = self.log_path.with_extension("jsonl.tmp");
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;
@@ -2528,6 +2570,54 @@ pub(crate) mod tests {
 
     fn log_in(dir: &Path) -> EventLog {
         EventLog::open(dir, "github-o-r-abcd").unwrap()
+    }
+
+    /// A process that has seen a newer clank installed changes no log:
+    /// no row, no durable record, no compaction. Under the permit of work
+    /// it had in flight before it saw that, each still goes through: what
+    /// it already delivered is still recorded.
+    #[test]
+    fn a_stale_process_writes_a_log_only_under_a_permit_it_already_held() {
+        let installed = crate::upgrade::tests::Installed::current();
+        let authority = installed.authority();
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = log_in(dir.path()).guarded_by(authority.clone());
+        let seq = log
+            .append_inbox(Transport::Poll, Some("a"), None, None, &item(1))
+            .expect("current");
+        let shown = log.presentation_key(seq, Transport::Poll, Some("a"), None, None, &item(1));
+        let in_flight = authority.permit().expect("current");
+        installed.replace(1);
+
+        let file = dir.path().join("github-o-r-abcd.jsonl");
+        let before = std::fs::read(&file).unwrap();
+        let each = |log: &mut EventLog| {
+            log.load();
+            let row = log
+                .append_inbox(Transport::Poll, Some("b"), None, None, &item(2))
+                .map(drop);
+            let record = log
+                .append_presentations(std::slice::from_ref(&shown), 100, || true)
+                .map(drop);
+            log.lines = COMPACT_AT;
+            let compaction = log.maybe_compact().map(drop);
+            [row, record, compaction]
+        };
+
+        let mut fresh = log_in(dir.path()).guarded_by(authority.clone());
+        for refused in each(&mut fresh) {
+            let why = refused.expect_err("a stale process wrote").to_string();
+            assert!(why.contains("no longer writes"), "{why}");
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+
+        let mut settling = log_in(dir.path())
+            .guarded_by(authority.clone())
+            .under(&in_flight);
+        for written in each(&mut settling) {
+            written.expect("written under the permit held");
+        }
+        assert_ne!(std::fs::read(&file).unwrap(), before);
     }
 
     /// Rows the retired PR-review draft watch wrote, copied VERBATIM

@@ -148,6 +148,9 @@ pub(crate) async fn dispatch<F>(
 where
     F: Future<Output = InterruptOutcome>,
 {
+    // Before a claim is made: a process on a replaced build interrupts
+    // nobody, and the request stays pending for the one that follows.
+    let _permit = crate::upgrade::writing()?;
     let claim_dir = dir.clone();
     let (claims, mut errors) = blocking(|| claim_pending(claim_dir))?;
     if claims.is_empty() {
@@ -397,6 +400,45 @@ mod tests {
             .unwrap()
             .unwrap()
             .rows
+    }
+
+    /// A process on a replaced build interrupts nobody: nothing is
+    /// claimed, the sender is not called, and the request is still there
+    /// for the process that follows.
+    #[tokio::test]
+    async fn a_stale_process_claims_and_sends_no_interrupt() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let dir = tempfile::tempdir().unwrap();
+        add(dir.path(), "messages", "one", true);
+        let before = std::fs::read(dir.path().join("messages.jsonl")).unwrap();
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let calls = AtomicUsize::new(0);
+        let perform = |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            InterruptOutcome::Submitted
+        };
+
+        installed.replace(1);
+        let refused = dispatch(dir.path().into(), Duration::from_secs(1), perform)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains(crate::upgrade::STALE_BADGE),
+            "{refused:#}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(dir.path().join("messages.jsonl")).unwrap(),
+            before
+        );
+
+        installed.install(crate::build_stamp::running());
+        dispatch(dir.path().into(), Duration::from_secs(1), perform)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "still pending, and sent");
     }
 
     #[tokio::test]

@@ -73,6 +73,7 @@ pub(crate) fn transact_user_config<T>(
     home: &Path,
     f: impl FnOnce(&mut clank_user_config::Document) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    let _permit = crate::upgrade::writing()?;
     clank_user_config::transact(home, check_user_config, f)
 }
 

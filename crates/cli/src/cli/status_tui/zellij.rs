@@ -463,6 +463,9 @@ pub(super) enum ReopenOutcome {
     Unplaced,
     NotOnRoster,
     NotInSession,
+    /// This TUI runs a build that is no longer the installed one, and
+    /// opens nothing.
+    Stale,
     /// A pane may already be the label's: its name reads as this label
     /// and another.
     Ambiguous(Vec<crate::cli::open_zellij::Ambiguity>),
@@ -481,6 +484,10 @@ impl ReopenOutcome {
             ),
             Self::NotOnRoster => format!("`{label}` is not on the roster"),
             Self::NotInSession => "not inside a zellij session; nothing to reopen into".to_string(),
+            Self::Stale => format!(
+                "{}: this TUI opens no pane until it is restarted",
+                crate::upgrade::STALE_BADGE
+            ),
             Self::Ambiguous(doubts) => format!(
                 "`{label}` may already have a pane, so none was opened: {}. Rename that pane \
                  to one agent's label",
@@ -1480,6 +1487,15 @@ impl WorkerState {
             reopens,
             probe,
         } = batch;
+        // The worker is where every pane is opened, closed, moved and
+        // named. On a replaced build it does none of that: it goes on
+        // listing, which is all the display needs, and answers a reopen
+        // with why not.
+        let permit = crate::upgrade::writing();
+        let (roster, glyphs) = match permit.is_ok() {
+            true => (roster, glyphs),
+            false => (None, None),
+        };
         if let Some(view) = roster {
             // Invalidate on any TARGET change, not just on our own
             // actions: another TUI may already have converged the live
@@ -1496,6 +1512,7 @@ impl WorkerState {
             .into_iter()
             .map(|label| {
                 let outcome = match &self.last_roster {
+                    _ if permit.is_err() => ReopenOutcome::Stale,
                     Some(view) => self.reconciler.reopen(view, &label, io),
                     None => ReopenOutcome::NotOnRoster,
                 };
@@ -1509,7 +1526,7 @@ impl WorkerState {
             self.tab.want(&g.tab);
             self.glyphs = Some(g);
         }
-        let retitle = self.glyphs.is_some() && self.glyphs != self.listed_for;
+        let retitle = permit.is_ok() && self.glyphs.is_some() && self.glyphs != self.listed_for;
         let listed = probe || retitle;
         let listing = if listed {
             let record = io.owned();
@@ -1521,14 +1538,14 @@ impl WorkerState {
         } else {
             None
         };
-        if let (true, Some(g)) = (listed, &self.glyphs) {
+        if let (true, true, Some(g)) = (listed, permit.is_ok(), &self.glyphs) {
             let rows = listing.as_ref().map(|snap| io.title_rows(snap));
             self.panes.update_with(g, rows, rename);
             if listing.is_some() {
                 self.listed_for = Some(g.clone());
             }
         }
-        if let Some(snap) = &listing {
+        if let (Some(snap), true) = (&listing, permit.is_ok()) {
             self.tab.reconcile(|caller| io.tab_of(snap, caller), tabs);
         }
         if listed {
@@ -2002,6 +2019,51 @@ mod tests {
     /// unconditional `snapshot()` after `handle`, which turned the
     /// converged steady state from zero zellij calls into one per
     /// batch (codex on d855068). This pins the count.
+    /// The worker of a TUI on a replaced build opens, closes and names
+    /// nothing: a roster change moves no pane, a reopen is answered with
+    /// why not, and it still lists, which is all the display needs. On
+    /// its own build again the same roster is acted on.
+    #[test]
+    fn a_stale_tuis_worker_drives_no_pane() {
+        use crate::upgrade::tests::{AsProcess, Installed};
+        let installed = Installed::current();
+        let authority = installed.authority();
+        let _as = AsProcess::of(&authority);
+        let mut io = FakeIo::new(vec![Some(live(&[])), Some(live(&[])), Some(live(&[]))]);
+        let mut state = WorkerState::new(None);
+        let roster = view(&["claude"], Some("claude"));
+
+        installed.replace(1);
+        let mut renamed = 0;
+        let reports = state.handle(
+            WorkerBatch {
+                probe: true,
+                ..wb(Some(roster.clone()), None, vec!["claude".into()])
+            },
+            &mut io,
+            |_, _| renamed += 1,
+        );
+        assert_eq!(io.log, Vec::<String>::new(), "a stale TUI drove a pane");
+        assert_eq!(renamed, 0);
+        assert!(
+            reports.contains(&Report::Reopened("claude".into(), ReopenOutcome::Stale)),
+            "a reopen it refused was not answered"
+        );
+        assert!(
+            ReopenOutcome::Stale
+                .describe("claude")
+                .starts_with(crate::upgrade::STALE_BADGE)
+        );
+        assert!(
+            reports.iter().any(|r| matches!(r, Report::Presence(_))),
+            "it still lists"
+        );
+
+        installed.install(crate::build_stamp::running());
+        state.handle(wb(Some(roster), None, Vec::new()), &mut io, |_, _| {});
+        assert!(io.log.iter().any(|did| did == "add claude"), "{:?}", io.log);
+    }
+
     #[test]
     fn observing_reach_adds_no_snapshot() {
         let seen = std::cell::Cell::new(None);

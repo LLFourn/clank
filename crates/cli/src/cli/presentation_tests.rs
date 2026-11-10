@@ -31,6 +31,7 @@ fn deliver(repo: &Path, session: &str, identity: &str) {
             identities: vec![identity.to_string()],
         },
         || true,
+        &crate::upgrade::process().settling(),
     );
 }
 
@@ -68,6 +69,7 @@ fn deliver_against(
             session,
             &[identity.to_string()],
             1,
+            &crate::upgrade::process().settling(),
             |agent_dir| {
                 let held = !binding_lock_is_free(agent_dir);
                 *paused.borrow_mut() = Some((held, std::thread::spawn(rival)));
@@ -146,10 +148,73 @@ fn an_obsolete_delivery_publishes_nothing() {
     );
     let agent = label();
     let guard = crate::agent_store::hold_binding(repo.path(), &agent).unwrap();
-    assert!(!receive(&guard, Tool::Codex, "session-old", &["late".into()], 9).unwrap());
     assert!(
-        !receive(&guard, Tool::Claude, "session-new", &["late".into()], 9).unwrap(),
+        !receive(
+            &guard,
+            Tool::Codex,
+            "session-old",
+            &["late".into()],
+            9,
+            &crate::upgrade::process().settling()
+        )
+        .unwrap()
+    );
+    assert!(
+        !receive(
+            &guard,
+            Tool::Claude,
+            "session-new",
+            &["late".into()],
+            9,
+            &crate::upgrade::process().settling()
+        )
+        .unwrap(),
         "nor another tool's session of the same id"
     );
-    assert!(receive(&guard, Tool::Codex, "session-new", &["more".into()], 9).unwrap());
+    assert!(
+        receive(
+            &guard,
+            Tool::Codex,
+            "session-new",
+            &["more".into()],
+            9,
+            &crate::upgrade::process().settling()
+        )
+        .unwrap()
+    );
+}
+
+/// A process that has seen a newer clank installed begins no write of an
+/// agent's config, and still records a wake that already reached its
+/// agent: the receipt is the one write that goes under a permit of its
+/// own rather than asking for one.
+#[test]
+fn a_stale_process_records_a_delivery_and_begins_nothing_else() {
+    use crate::upgrade::tests::{AsProcess, Installed};
+    let repo = tempfile::tempdir().unwrap();
+    bind(repo.path(), "session-one");
+    let installed = Installed::current();
+    let authority = installed.authority();
+    let _as = AsProcess::of(&authority);
+    installed.replace(1);
+
+    let refused =
+        crate::agent_store::set_auto_mode(repo.path(), &label(), clank_core::AutoMode::Off)
+            .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains(crate::upgrade::STALE_BADGE),
+        "{refused:#}"
+    );
+    assert!(crate::upgrade::writing().is_err());
+
+    deliver(repo.path(), "session-one", "mine");
+    assert!(delivered_to(&dir(repo.path()), "session-one").contains_key("mine"));
+    assert!(
+        authority.standing().stale().is_some()
+            && matches!(
+                authority.standing(),
+                crate::upgrade::Standing::Replaceable { .. }
+            ),
+        "settled, and free to go"
+    );
 }

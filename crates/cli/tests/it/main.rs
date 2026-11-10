@@ -47,6 +47,7 @@ mod release_workflow;
 mod rereview_integration;
 mod security_md;
 mod signal_boundary;
+mod stale_write_boundary;
 mod standby_wakes;
 mod stash_dwim;
 mod stash_integration;

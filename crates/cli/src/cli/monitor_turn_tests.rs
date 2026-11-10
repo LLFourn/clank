@@ -795,6 +795,7 @@ fn carrier(
                     crate::cli::turn_child::Owner::reading(owner),
                     &mut frames,
                     &attach,
+                    &crate::upgrade::Authority::unwatched(),
                 )
                 .await;
             })
@@ -2111,8 +2112,14 @@ impl crate::cli::stop_hook::Spawn for Reaching {
 }
 
 impl crate::cli::stop_hook::Host for Compacting {
-    fn input(&mut self) -> Result<clank_core::HookInput, String> {
-        serde_json::from_str(&self.stdin).map_err(|e| e.to_string())
+    fn input(&mut self) -> Result<String, String> {
+        Ok(self.stdin.clone())
+    }
+    fn authority(&self) -> crate::upgrade::Authority {
+        crate::upgrade::Authority::unwatched()
+    }
+    fn become_installed(&self, _: &std::path::Path) -> std::io::Error {
+        panic!("nothing is installed over a test")
     }
     fn spawner(&self) -> &dyn crate::cli::stop_hook::Spawn {
         &self.spawner
@@ -2395,4 +2402,40 @@ async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
         Gate::Go,
         "the agent moves to recovery"
     );
+}
+
+/// A check-in that falls due on a monitor of a replaced build is not
+/// typed: the pane is not looked for, no last look is asked, and it is
+/// recorded undelivered with the reason.
+#[tokio::test]
+async fn a_stale_monitor_types_no_check_in() {
+    use crate::upgrade::tests::{AsProcess, Installed};
+    let repo = tempfile::tempdir().unwrap();
+    let installed = Installed::current();
+    let authority = installed.authority();
+    let _as = AsProcess::of(&authority);
+    installed.replace(1);
+    let typist = std::sync::Arc::new(Recorded {
+        typed: Default::default(),
+        lost: false,
+    });
+    let asked = std::cell::Cell::new(false);
+    let done = check_in_through(
+        repo.path(),
+        crate::cli::turn_custody::CheckInDue {
+            author: AgentLabel::parse("test").unwrap(),
+            session: clank_core::SessionId::parse("session-one").unwrap(),
+            check_ins: Vec::new(),
+        },
+        typist.clone(),
+        |_| {
+            asked.set(true);
+            Ok("still going?".into())
+        },
+    )
+    .await;
+    let why = done.outcome.expect_err("typed by a stale monitor");
+    assert!(why.contains(crate::upgrade::STALE_BADGE), "{why}");
+    assert!(!asked.get());
+    assert!(typist.typed.lock().unwrap().is_empty());
 }

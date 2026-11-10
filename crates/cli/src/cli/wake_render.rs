@@ -801,10 +801,6 @@ pub(crate) const MONITOR_UNANSWERED: &str = "clank's monitor did not answer in t
 notice, not work: nothing was checked for you, because only the monitor decides what you are \
 owed. Ending your turn asks it again; if this repeats, tell the user.";
 
-/// What a waiter refused by a newer build's monitor wakes its agent with.
-pub(crate) const UPGRADED: &str = "clank was upgraded; ending this wait so the next one uses the \
-new build. This is a notice, not work. End your turn; the next wait runs the installed clank.";
-
 /// A listed task as a declaration notice names it.
 fn task_line(t: &clank_core::turn_policy::TaskSummary) -> String {
     let mut line = format!("  - {}", t.kind.as_deref().unwrap_or("task"));
@@ -855,7 +851,6 @@ pub(crate) fn notice_text(notice: &clank_core::turn_policy::Notice) -> String {
         ),
         Notice::MonitorOutage { why } => monitor_outage(why),
         Notice::MonitorUnanswered => MONITOR_UNANSWERED.to_string(),
-        Notice::Upgraded => UPGRADED.to_string(),
         Notice::ArmWait => ARM_WAIT.to_string(),
     }
 }
@@ -1038,7 +1033,6 @@ mod tests {
     #[test]
     fn a_notice_is_its_fixed_text() {
         use clank_core::turn_policy::Notice;
-        assert_eq!(notice_text(&Notice::Upgraded), UPGRADED);
         assert_eq!(notice_text(&Notice::ArmWait), ARM_WAIT);
     }
 
@@ -1055,11 +1049,10 @@ mod tests {
             "{outage}"
         );
         assert_eq!(notice_text(&Notice::MonitorUnanswered), MONITOR_UNANSWERED);
-        for text in [outage.as_str(), UPGRADED, MONITOR_UNANSWERED] {
+        for text in [outage.as_str(), MONITOR_UNANSWERED] {
             assert!(text.contains("a notice, not work"), "{text}");
             assert!(!text.to_lowercase().contains("no work pending"), "{text}");
         }
-        assert!(UPGRADED.starts_with("clank was upgraded;"), "{UPGRADED}");
     }
 
     /// The heartbeat a parked hook wakes with at its deadline cannot be

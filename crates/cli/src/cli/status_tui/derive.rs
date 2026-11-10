@@ -802,6 +802,7 @@ mod tests {
                 crate::cli::status_tui::zellij::ZellijReach::NotInSession,
                 Default::default(),
                 true,
+                false,
             );
             let sgr = line
                 .strip_prefix("\x1b[")
