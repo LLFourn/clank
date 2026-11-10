@@ -414,6 +414,18 @@ impl View {
             None => brief(&self.state, now),
         }
     }
+
+    /// [`Self::brief`] for a roster row: an agent waiting for work is the
+    /// resting state and says nothing, keeping only its clauses.
+    pub(crate) fn row(&self, now: u64) -> Option<String> {
+        match self.activity() {
+            Some(Activity::Unobserved) => {
+                let clauses = nudge_clauses(&self.state, now);
+                (!clauses.is_empty()).then(|| clauses.join(" · "))
+            }
+            _ => Some(self.brief(now)),
+        }
+    }
 }
 
 /// `label`'s published state, judged against its binding (`session`), its
@@ -461,23 +473,29 @@ fn brief(state: &AgentState, now: u64) -> String {
         // would deliver the next thing.
         Activity::Unobserved => "waiting for work".to_string(),
     };
-    match &state.nudge {
-        Nudge::Nothing => {}
-        Nudge::At(at) => out.push_str(&format!(
-            " · nudge in {}",
-            crate::age::duration(at.saturating_sub(now))
-        )),
-        Nudge::InFlight => out.push_str(" · nudged"),
-        Nudge::Silent { since, at } => {
-            let show = crate::age::duration;
-            out.push_str(&format!(" · silent {}", show(now.saturating_sub(*since))));
-            if let Some(at) = at {
-                out.push_str(&format!(" — nudging in {}", show(at.saturating_sub(now))));
-            }
-        }
-        Nudge::WaitingForYou(_) => out.push_str(" · waiting for you"),
+    for clause in nudge_clauses(state, now) {
+        out.push_str(" · ");
+        out.push_str(&clause);
     }
     out
+}
+
+/// What clank means to do about the agent.
+fn nudge_clauses(state: &AgentState, now: u64) -> Vec<String> {
+    let show = crate::age::duration;
+    match &state.nudge {
+        Nudge::Nothing => Vec::new(),
+        Nudge::At(at) => vec![format!("nudge in {}", show(at.saturating_sub(now)))],
+        Nudge::InFlight => vec!["nudged".to_string()],
+        Nudge::Silent { since, at } => {
+            let mut clause = format!("silent {}", show(now.saturating_sub(*since)));
+            if let Some(at) = at {
+                clause.push_str(&format!(" — nudging in {}", show(at.saturating_sub(now))));
+            }
+            vec![clause]
+        }
+        Nudge::WaitingForYou(_) => vec!["waiting for you".to_string()],
+    }
 }
 
 /// `state` in one line: [`brief`], then what holds a nudge back, why the
@@ -594,9 +612,39 @@ mod tests {
         assert_eq!(crate::cli::config::show_duration(90), "90s");
     }
 
-    /// The TUI row reads the same words through `brief`, waiter or not.
+    /// A roster row leaves the resting state unsaid and keeps its clauses,
+    /// while `line` still says it; every other activity reads as `brief`.
     #[test]
-    fn the_tui_row_reads_waiting_for_work_either_way() {
+    fn an_idle_roster_row_says_nothing_but_status_still_does() {
+        let waiting = View {
+            state: unobserved(Vec::new()),
+            stale: None,
+        };
+        assert_eq!(waiting.row(1000), None);
+        assert_eq!(waiting.line(1000), "waiting for work");
+        let nudging = View {
+            state: AgentState {
+                nudge: Nudge::InFlight,
+                ..unobserved(Vec::new())
+            },
+            stale: None,
+        };
+        assert_eq!(nudging.row(1000).as_deref(), Some("nudged"));
+        for activity in [Activity::Working, Activity::Idle, Activity::Interrupted] {
+            let v = View {
+                state: AgentState {
+                    activity,
+                    ..state()
+                },
+                stale: None,
+            };
+            assert_eq!(v.row(1000), Some(v.brief(1000)));
+        }
+    }
+
+    /// `brief` keeps the words for `clank status` and the agent page.
+    #[test]
+    fn brief_says_waiting_for_work_either_way() {
         for suppressors in [vec![Suppressor::Delivering], Vec::new()] {
             assert_eq!(brief(&unobserved(suppressors), 1000), "waiting for work");
         }

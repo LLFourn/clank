@@ -769,7 +769,8 @@ pub(super) fn scrollable_header(
                 if gone {
                     spans.push(dim("  gone".to_string()));
                 } else if let Some(s) = not_working {
-                    let brief = s.brief(crate::cli::recovery::unix_now());
+                    let now = crate::cli::recovery::unix_now();
+                    let brief = s.brief(now);
                     if s.interrupted() {
                         let owes = owes(snap, &a.label)
                             .text()
@@ -779,8 +780,8 @@ pub(super) fn scrollable_header(
                             crate::cli::agent_state::INTERRUPTED_SGR,
                             format!("  {brief}{owes}"),
                         ));
-                    } else {
-                        spans.push(dim(format!("  {brief}")));
+                    } else if let Some(row) = s.row(now) {
+                        spans.push(dim(format!("  {row}")));
                     }
                 } else if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
@@ -11853,9 +11854,10 @@ mod tests {
     }
 
     /// A master owing a plan action is drawn working only while its state
-    /// says it is working, or nothing current is known; a current idle,
-    /// failed or unobserved state is drawn as itself, and a stale one claims
-    /// nothing. With no pane and no process, it is gone.
+    /// says it is working, or nothing current is known; a current idle or
+    /// failed state is drawn as itself, an unobserved one keeps only its
+    /// clauses, and a stale one claims nothing. With no pane and no process,
+    /// it is gone.
     #[test]
     fn the_agent_row_shows_what_the_agent_is_doing_not_what_it_owes() {
         use crate::cli::agent_state::Activity;
@@ -11872,14 +11874,15 @@ mod tests {
                 Some(view_of(Activity::Failed("overloaded".into()), None)),
                 "failed (overloaded)",
             ),
-            (
-                Some(view_of(Activity::Unobserved, None)),
-                "waiting for work",
-            ),
+            (Some(view_of(Activity::Unobserved, None)), "waiting for you"),
         ] {
             let r = row(state, &plain);
             assert!(r.contains(says) && !r.contains(SPINNER[0]), "{r}");
             assert!(r.contains("waiting for you"), "{r}");
+            assert!(
+                !r.contains("waiting for work"),
+                "the resting state is unsaid: {r}"
+            );
         }
         for state in [
             Some(view_of(Activity::Working, None)),
