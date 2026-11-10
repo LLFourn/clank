@@ -43,6 +43,40 @@ pub(crate) fn bound(tool: clank_core::vocab::Tool, id: &str) -> clank_core::Sess
     }
 }
 
+/// A current state holding evidence that its agent is working: the
+/// record moved just now.
+pub(crate) fn working_view() -> crate::cli::agent_state::View {
+    use crate::cli::agent_state::{Activity, AgentState, Moving, Nudge, Observer, View};
+    let now = crate::cli::recovery::unix_now();
+    View::at(
+        AgentState {
+            role: String::new(),
+            session: "s1".into(),
+            tool: clank_core::Tool::Claude,
+            monitor: Observer {
+                pid: 1,
+                birth: None,
+            },
+            activity: Activity::Working(Moving {
+                moved: now,
+                until: now + 3600,
+            }),
+            since: now,
+            reachability: Default::default(),
+            owed: None,
+            nudge: Nudge::Nothing,
+            cannot_resume: None,
+            attending: Vec::new(),
+            asking: None,
+            repeated: None,
+        },
+        None,
+        now,
+    )
+}
+
+/// A master and a commit reviewer, each seen working: a row then draws
+/// what its role owes, which is what most row tests are about.
 pub(crate) fn two_agent_snap() -> StatusSnapshot {
     use crate::cli::teams_config::RosterRole;
     use clank_core::vocab::AutoMode;
@@ -51,6 +85,9 @@ pub(crate) fn two_agent_snap() -> StatusSnapshot {
         agent_row("claude", RosterRole::Master, AutoMode::On),
         agent_row("codex", RosterRole::Commit, AutoMode::Off),
     ];
+    for agent in &mut s.agents {
+        agent.state = Some(working_view());
+    }
     s
 }
 

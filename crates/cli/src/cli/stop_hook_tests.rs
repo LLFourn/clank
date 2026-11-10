@@ -1110,9 +1110,9 @@ fn a_stop_proves_which_turns_are_over() {
     std::fs::write(&transcript, format!("{}\n{}\n", user("p1"), user("p2"))).unwrap();
     let mut input = hook_input("session-one");
     input.transcript_path = Some(transcript.display().to_string());
-    let boundary = native_boundary(Tool::Claude, &input);
+    let place = super::super::wake_repeat::place(Tool::Claude, Some(&transcript), None);
     assert_eq!(
-        question_evidence(Tool::Claude, &input, boundary.as_ref()),
+        question_evidence(Tool::Claude, &input, &place),
         vec![
             Observation::TurnOver {
                 session: "session-one".into(),
@@ -1124,7 +1124,15 @@ fn a_stop_proves_which_turns_are_over() {
             },
         ]
     );
-    assert!(question_evidence(Tool::Codex, &input, boundary.as_ref()).is_empty());
+    assert!(question_evidence(Tool::Codex, &input, &place).is_empty());
+    let unplaced = TurnPlace {
+        position: None,
+        ..place
+    };
+    assert!(
+        question_evidence(Tool::Claude, &input, &unplaced).is_empty(),
+        "a turn named without its boundary proves nothing of its questions"
+    );
 }
 
 #[test]
@@ -1768,6 +1776,7 @@ async fn a_resumed_stop_carries_the_report_it_was_handed() {
                 turn: Some("the-turn-the-first-build-read".into()),
                 position: Some(4242),
                 human_turn: true,
+                read_to: None,
             },
             tasks: TaskSnapshot::Unavailable,
         },

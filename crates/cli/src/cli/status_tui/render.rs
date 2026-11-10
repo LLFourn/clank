@@ -756,39 +756,41 @@ pub(super) fn scrollable_header(
             // one says it in its own marker below.
             // What the agent owes is its role's; what it is doing is its
             // published state's. The spinner claims both, so it is drawn only
-            // while a current state says the agent is working, or no state is
-            // known; otherwise the row says what the agent is doing instead.
+            // while a current state holds evidence that the agent is working.
+            // Any other current state says what the agent is doing instead,
+            // and with none the row says that nothing is known.
             // Gone: no pane, and no process still running its binding. A
             // process without a pane is lost, not gone.
             let gone =
                 view.presence_of(&a.label) == Presence::Missing && !view.lost.contains(&a.label);
-            let not_working = a
-                .state
-                .as_ref()
-                .filter(|s| s.activity().is_some() && !s.working());
+            let now = crate::cli::recovery::unix_now();
+            let current = a.state.as_ref().filter(|s| s.activity().is_some());
+            let working = current.is_some_and(|s| s.working(now));
             if !waiting {
                 if gone {
                     spans.push(dim("  gone".to_string()));
-                } else if let Some(s) = not_working {
-                    let now = crate::cli::recovery::unix_now();
+                } else if let Some(s) = current.filter(|_| !working) {
+                    use crate::cli::agent_state::Alarm;
                     let brief = s.brief(now);
-                    if s.undelivered(now).is_some() {
-                        spans.push(colored(
-                            crate::cli::agent_state::UNDELIVERED_SGR,
-                            format!("  {brief}"),
-                        ));
-                    } else if s.interrupted() {
-                        let owes = owes(snap, &a.label)
-                            .text()
-                            .map(|o| format!(" · owes {o}"))
-                            .unwrap_or_default();
-                        spans.push(colored(
-                            crate::cli::agent_state::INTERRUPTED_SGR,
-                            format!("  {brief}{owes}"),
-                        ));
-                    } else if let Some(row) = s.row(now) {
-                        spans.push(dim(format!("  {row}")));
+                    match s.alarm(now) {
+                        Some(alarm @ (Alarm::Undelivered | Alarm::Unreachable)) => {
+                            spans.push(colored(alarm.sgr(), format!("  {brief}")));
+                        }
+                        Some(alarm @ Alarm::Interrupted) => {
+                            let owes = owes(snap, &a.label)
+                                .text()
+                                .map(|o| format!(" · owes {o}"))
+                                .unwrap_or_default();
+                            spans.push(colored(alarm.sgr(), format!("  {brief}{owes}")));
+                        }
+                        None => {
+                            if let Some(row) = s.row(now) {
+                                spans.push(dim(format!("  {row}")));
+                            }
+                        }
                     }
+                } else if !working {
+                    spans.push(dim(format!("  {}", crate::cli::agent_state::UNKNOWN)));
                 } else if let Some((verb, since)) = verb_for(&a.label) {
                     spans.push(dim(format!("  {}", spinner_glyph(frame))));
                     spans.push(italic(format!(" {verb}…")));
@@ -11903,6 +11905,7 @@ mod tests {
                 },
                 activity,
                 since: 0,
+                reachability: Default::default(),
                 owed: None,
                 nudge: Nudge::WaitingForYou("resuming this harness is not enabled".into()),
                 cannot_resume: Some("no evidence".into()),
@@ -11914,14 +11917,25 @@ mod tests {
         }
     }
 
-    /// A master owing a plan action is drawn working only while its state
-    /// says it is working, or nothing current is known; a current idle or
-    /// failed state is drawn as itself, an unobserved one keeps only its
-    /// clauses, and a stale one claims nothing. With no pane and no process,
-    /// it is gone.
+    /// Evidence that a record moved, standing for an hour from now.
+    fn moving() -> crate::cli::agent_state::Activity {
+        let now = crate::cli::recovery::unix_now();
+        crate::cli::agent_state::Activity::Working(crate::cli::agent_state::Moving {
+            moved: now,
+            until: now + 3600,
+        })
+    }
+
+    /// A master owing a plan action is drawn working only while a current
+    /// state holds evidence that it is working. A current idle or failed
+    /// state is drawn as itself, one resting on a connected waiter keeps
+    /// only its clauses, and with no state, a stale one, or evidence that
+    /// has run out the row says nothing is known or that the turn is open,
+    /// never that the agent is working. With no pane and no process, it is
+    /// gone.
     #[test]
     fn the_agent_row_shows_what_the_agent_is_doing_not_what_it_owes() {
-        use crate::cli::agent_state::Activity;
+        use crate::cli::agent_state::{Activity, Moving, Reachability};
         let row = |state: Option<crate::cli::agent_state::View>, view: &PanelView<'_>| {
             let mut s = two_agent_snap();
             s.active_plan = Some(plan_state("foo", WaitingOn::MasterToContinue));
@@ -11935,23 +11949,48 @@ mod tests {
                 Some(view_of(Activity::Failed("overloaded".into()), None)),
                 "failed (overloaded)",
             ),
-            (Some(view_of(Activity::Unobserved, None)), "waiting for you"),
+            (Some(view_of(Activity::Unobserved, None)), "unknown"),
+            (
+                Some(view_of(
+                    Activity::Working(Moving { moved: 0, until: 1 }),
+                    None,
+                )),
+                "turn open",
+            ),
+            (Some(view_of(Activity::TurnOpen, None)), "turn open"),
         ] {
             let r = row(state, &plain);
             assert!(r.contains(says) && !r.contains(SPINNER[0]), "{r}");
             assert!(r.contains("waiting for you"), "{r}");
             assert!(
-                !r.contains("waiting for work"),
-                "the resting state is unsaid: {r}"
+                !r.contains("waiting for work") && !r.contains("working"),
+                "the resting state is unsaid, and nothing claims work: {r}"
             );
         }
+        for activity in [Activity::Unobserved, Activity::Idle] {
+            let mut resting = view_of(activity, None);
+            resting.state.reachability = Reachability::Waiter {
+                since: 0,
+                build: None,
+            };
+            let r = row(Some(resting), &plain);
+            assert!(
+                r.ends_with("waiting for you") && !r.contains("idle") && !r.contains("unknown"),
+                "a resting row keeps only its clauses: {r}"
+            );
+        }
+        let r = row(Some(view_of(moving(), None)), &plain);
+        assert!(r.contains(SPINNER[0]) && r.contains("working"), "{r}");
         for state in [
-            Some(view_of(Activity::Working, None)),
             Some(view_of(Activity::Idle, Some("its monitor is gone"))),
+            Some(view_of(moving(), Some("its monitor is gone"))),
             None,
         ] {
             let r = row(state, &plain);
-            assert!(r.contains(SPINNER[0]) && !r.contains("idle"), "{r}");
+            assert!(
+                r.ends_with("unknown") && !r.contains(SPINNER[0]) && !r.contains("working"),
+                "nothing known is drawn as unknown: {r}"
+            );
         }
         let mut paneless = PanelView::just(Mode::LogScroll);
         paneless.presence = Some(Default::default());
@@ -12007,7 +12046,7 @@ mod tests {
         };
 
         s.agents[1].state = Some(owing_view(
-            Activity::Working,
+            Activity::TurnOpen,
             Delivery::NotDelivered,
             Case::Recovering,
         ));
@@ -12021,7 +12060,7 @@ mod tests {
         assert!(!visible(&codex).contains("working"), "{codex:?}");
 
         s.agents[1].state = Some(owing_view(
-            Activity::Working,
+            Activity::TurnOpen,
             Delivery::Delivered,
             Case::Recovering,
         ));
@@ -12031,13 +12070,78 @@ mod tests {
         assert!(!codex.contains(SPINNER[0]), "{codex:?}");
 
         s.agents[1].state = Some(owing_view(
-            Activity::Working,
+            moving(),
             Delivery::Delivered,
             Case::Active(Active::Turn),
         ));
         let codex = row(&s);
         assert!(codex.contains(SPINNER[0]), "evidence spins: {codex:?}");
         assert!(!codex.contains(&red), "{codex:?}");
+    }
+
+    /// An agent whose turn is over with no waiter connected reads
+    /// `unreachable <age>` on its own row: dim while it is owed nothing,
+    /// bright red once it is owed work, and never the spinner, whatever its
+    /// role owes. On a connected waiter the same turn rests and says nothing.
+    #[test]
+    fn an_unreachable_agent_row_is_dim_until_work_is_owed_and_then_red() {
+        use crate::cli::agent_state::{Activity, Case, Nudge, Reachability, UNDELIVERED_SGR};
+        use crate::cli::ledger::Delivery;
+        let now = crate::cli::recovery::unix_now();
+        let red = format!("\x1b[{UNDELIVERED_SGR}m");
+        let mut s = two_agent_snap();
+        s.active_plan = Some(plan_state("foo", reviewer_missing("codex")));
+        let row = |s: &StatusSnapshot| {
+            let out = render_at(s, 40, 140, 0, 0, &PanelView::just(Mode::LogScroll)).0;
+            line_with(&out, "codex").to_string()
+        };
+        let waiting = |reachability: Reachability, owed: bool| {
+            let mut v = match owed {
+                true => owing_view(Activity::Idle, Delivery::Delivered, Case::Recovering),
+                false => view_of(Activity::Idle, None),
+            };
+            v.state.since = now - 2520;
+            v.state.nudge = Nudge::Nothing;
+            v.state.reachability = reachability;
+            v
+        };
+        let gone = Reachability::NoWaiter {
+            since: Some(now - 2520),
+        };
+
+        s.agents[1].state = Some(waiting(gone.clone(), false));
+        let codex = row(&s);
+        assert!(visible(&codex).ends_with("unreachable 42m"), "{codex:?}");
+        assert!(!codex.contains(&red), "owed nothing: dim: {codex:?}");
+        assert!(!codex.contains(SPINNER[0]), "{codex:?}");
+
+        s.agents[1].state = Some(waiting(gone, true));
+        let codex = row(&s);
+        assert!(
+            codex.contains(&format!("{red}  unreachable 42m")),
+            "owed work: red: {codex:?}"
+        );
+        assert!(!codex.contains(SPINNER[0]), "{codex:?}");
+
+        s.agents[1].state = Some(waiting(Reachability::NoWaiter { since: None }, false));
+        assert!(
+            visible(&row(&s)).ends_with("unreachable age unknown"),
+            "{:?}",
+            row(&s)
+        );
+
+        s.agents[1].state = Some(waiting(
+            Reachability::Waiter {
+                since: now - 2520,
+                build: None,
+            },
+            false,
+        ));
+        let codex = visible(&row(&s)).to_string();
+        assert!(
+            codex.trim_end().ends_with("commit"),
+            "on a waiter it rests: {codex:?}"
+        );
     }
 
     /// An interrupted agent's row is drawn in capitals and the orange, not

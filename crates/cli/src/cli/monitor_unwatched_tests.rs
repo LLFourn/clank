@@ -1,5 +1,6 @@
 //! A lost park through the monitor's own deliverer seams: [`tend`]
-//! registering and reaping waits, and [`ended`] judging a close.
+//! registering and reaping waits, and [`ended`] judging a close. A loss
+//! dates the agent's having no waiter; it is never a turn's end.
 
 use super::*;
 use crate::cli::agent_state::Activity;
@@ -23,9 +24,6 @@ const CODEX_ANSWERED: [&str; 3] = [
     r#"{"type":"event_msg","payload":{"type":"item_completed","turn_id":"T","item":{"type":"AgentMessage"}}}"#,
     r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FINISHED"}]}}"#,
 ];
-const CODEX_RAN: &str = r#"{"type":"event_msg","payload":{"type":"item_completed","turn_id":"t1","item":{"type":"Reasoning"}}}"#;
-const CODEX_ABORTED: &str =
-    r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"t1"}}"#;
 
 fn answered() -> Vec<String> {
     CODEX_ANSWERED
@@ -128,6 +126,7 @@ impl Handing {
             farewell: None,
             shown: Default::default(),
             conn,
+            admitted: Default::default(),
             report: None,
         });
         self.sockets.insert(conn, socket);
@@ -224,6 +223,10 @@ impl Handing {
         crate::cli::agent_state::load(&self.dir()).unwrap().activity
     }
 
+    fn working(&self) -> bool {
+        matches!(self.activity(), Activity::Working(_))
+    }
+
     fn nudges_at(&mut self, now: u64) -> usize {
         self.recovery
             .due(now, |_, _| crate::cli::recovery::Gate::Go)
@@ -244,21 +247,22 @@ impl Handing {
     }
 }
 
-/// A wait lost with its turn left running in the record: unwatched, and
-/// nudged once the idle settle has passed, under this monitor or the next.
+/// A wait lost with its turn left running in the record is a lost wait
+/// and nothing more: the loss is dated, and the turn is still as the
+/// record has it. No Stop said it ended, so it is not idle and is not
+/// nudged as idle, under this monitor or the next.
 #[tokio::test]
-async fn a_lost_wait_leaves_the_agent_unwatched_and_nudged() {
+async fn a_lost_wait_alone_ends_no_turn() {
     let mut a = Handing::incident();
     assert!(a.unwatched().is_some());
     a.fold(true, 10);
-    assert_eq!(a.activity(), Activity::Unwatched);
-    assert_eq!(a.nudges_at(10 + 179), 0, "it settles first");
-    assert_eq!(a.nudges_at(10 + 180), 1);
+    assert!(a.working(), "{:?}", a.activity());
+    assert_eq!(a.nudges_at(10 + 180), 0);
 
     let mut b = Handing::incident().restart();
     b.fold(true, 10);
-    assert_eq!(b.activity(), Activity::Unwatched, "after a restart");
-    assert_eq!(b.nudges_at(10 + 180), 1);
+    assert!(b.working(), "after a restart: {:?}", b.activity());
+    assert_eq!(b.nudges_at(10 + 180), 0);
 }
 
 /// A wait the monitor woke, or one a newer wait replaced, leaves nothing
@@ -281,90 +285,4 @@ async fn only_the_newest_wait_lost_unanswered_is_recorded() {
     assert!(b.unwatched().is_some());
     b.wait();
     assert_eq!(b.unwatched(), None, "a new wait");
-}
-
-/// Anything written after the loss is the agent doing something, and the
-/// loss is retired for good: a record cut back to the old cursor does not
-/// revive it, under a new monitor either.
-#[tokio::test]
-async fn record_growth_retires_a_lost_wait_for_good() {
-    let mut a = Handing::incident();
-    a.fold(true, 10);
-    let before = std::fs::read(&a.record).unwrap();
-    a.append(&[CODEX_RAN.into()], 11);
-    a.fold(true, 12);
-    assert_eq!(a.activity(), Activity::Working);
-    assert_eq!(a.unwatched(), None, "retired in custody");
-    std::fs::write(&a.record, &before).unwrap();
-    let mut a = a.restart();
-    a.fold(true, 13);
-    assert_eq!(a.activity(), Activity::Working, "not revived");
-    assert_eq!(a.nudges_at(10_000), 0);
-}
-
-/// An interruption in the record, there at the loss or written after it,
-/// and a native retry are the record's own word.
-#[tokio::test]
-async fn an_interruption_or_native_retry_is_not_unwatched() {
-    for late in [false, true] {
-        let mut a = Handing::new(Tool::Codex);
-        a.append(&answered(), 0);
-        if !late {
-            a.append(&[CODEX_ABORTED.into()], 0);
-        }
-        let conn = a.wait();
-        a.fold(true, 0);
-        a.lose(conn);
-        assert!(a.unwatched().is_some(), "late: {late}");
-        if late {
-            a.append(&[CODEX_ABORTED.into()], 5);
-        }
-        a.fold(true, 10);
-        assert_eq!(a.activity(), Activity::Interrupted, "late: {late}");
-        assert_eq!(a.nudges_at(10_000), 0, "late: {late}");
-    }
-
-    let mut a = Handing::new(Tool::OpenCode);
-    a.append(
-        &[
-            r#"{"session":"session-one","turn":"started","id":"u1"}"#.into(),
-            r#"{"session":"session-one","turn":"retry"}"#.into(),
-        ],
-        0,
-    );
-    let conn = a.wait();
-    a.fold(true, 0);
-    a.lose(conn);
-    assert!(a.unwatched().is_some());
-    a.fold(true, 10);
-    assert_eq!(a.activity(), Activity::Working);
-    assert_eq!(a.nudges_at(10_000), 0);
-}
-
-/// A record replaced, or cut short in place below the lost wait's
-/// cursor, is no longer the record the loss was read against: the loss
-/// is retired, under this monitor and the next.
-#[tokio::test]
-async fn a_replaced_or_truncated_record_retires_a_lost_wait() {
-    for replaced in [true, false] {
-        let mut a = Handing::incident();
-        a.fold(true, 10);
-        assert_eq!(a.activity(), Activity::Unwatched);
-        let body: String = answered()[..1].iter().map(|l| format!("{l}\n")).collect();
-        if replaced {
-            let fresh = a.repo.path().join("fresh.jsonl");
-            std::fs::write(&fresh, body).unwrap();
-            std::fs::rename(&fresh, &a.record).unwrap();
-        } else {
-            std::fs::write(&a.record, body).unwrap();
-        }
-        a.changed(11);
-        a.fold(true, 12);
-        assert_eq!(a.activity(), Activity::Working, "replaced: {replaced}");
-        assert_eq!(a.unwatched(), None, "replaced: {replaced}");
-        let mut a = a.restart();
-        a.fold(true, 13);
-        assert_eq!(a.activity(), Activity::Working, "restarted: {replaced}");
-        assert_eq!(a.nudges_at(10_000), 0, "replaced: {replaced}");
-    }
 }

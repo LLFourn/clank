@@ -66,6 +66,10 @@ mod turn_tests;
 #[path = "monitor_unwatched_tests.rs"]
 mod unwatched_tests;
 
+#[cfg(test)]
+#[path = "monitor_reach_tests.rs"]
+mod reach_tests;
+
 #[path = "monitor_keeper.rs"]
 pub(crate) mod keeper;
 
@@ -234,6 +238,10 @@ pub(crate) struct Hello {
     /// is not a guarantee.
     pub(crate) repo: String,
     pub(crate) who: Who,
+    /// The build the client runs, as it says itself. `None` from a client
+    /// built before clients said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) build: Option<String>,
 }
 
 /// What the monitor answers.
@@ -814,7 +822,7 @@ pub(crate) fn accept_hello(line: &str, repo: &std::path::Path) -> Result<Hello, 
 /// What an opening frame turns out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Greeting {
-    Client(Hello),
+    Client(Box<Hello>),
     /// Declined, and the decline says this monitor is OBSOLETE: the
     /// client speaks a NEWER version than it does.
     ///
@@ -886,7 +894,7 @@ pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
     let Ok(open) = serde_json::from_str::<Opening>(line) else {
         // Not even the floor. Whatever it is, it decides nothing.
         return match accept_hello(line, repo) {
-            Ok(hello) => Greeting::Client(hello),
+            Ok(hello) => Greeting::Client(Box::new(hello)),
             Err(d) => Greeting::Decline(d),
         };
     };
@@ -923,7 +931,7 @@ pub(crate) fn greeting_of(line: &str, repo: &std::path::Path) -> Greeting {
         };
     }
     match accept_hello(line, repo) {
-        Ok(hello) => Greeting::Client(hello),
+        Ok(hello) => Greeting::Client(Box::new(hello)),
         Err(d) => Greeting::Decline(d),
     }
 }
@@ -1868,6 +1876,7 @@ pub(crate) fn greet_at(
 
     let hello = Hello {
         proto: PROTO,
+        build: Some(crate::build_stamp::running().to_string()),
         repo: repo.to_string_lossy().to_string(),
         who,
     };
@@ -3180,7 +3189,18 @@ struct Client {
     /// connection that carried the presentation.
     conn: u64,
     /// The hook's report this connection carries, until its verdict.
-    report: Option<Reporting>,
+    /// Boxed: most connections carry none, and a client moves by value
+    /// through the loop's channels.
+    report: Option<Box<Reporting>>,
+    admitted: Admitted,
+}
+
+/// When a connection was admitted, and the build its client said it runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Admitted {
+    /// Unix seconds.
+    at: u64,
+    build: Option<String>,
 }
 
 /// A report waiting on its verdict.
@@ -3465,6 +3485,7 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
     let records = crate::cli::recovery::RecordWatch::spawn(record_changes);
     // Every agent's turn-ends, decided here and nowhere else.
     let mut turns = crate::cli::turn_custody::Turns::new(repo.as_ref().clone());
+    let serving_since = std::time::Instant::now();
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel::<(u64, Heard)>();
     let (check_in_asks, mut check_in_authorizations) =
         tokio::sync::mpsc::unbounded_channel::<CheckInAsk>();
@@ -3518,10 +3539,15 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     .and_then(|timers| timers.next_deadline())
             })
             .min();
-        let recovery_due = recovery.next_due().map(|at| {
-            let wait = at.saturating_sub(crate::cli::recovery::unix_now());
-            tokio::time::Instant::now() + Duration::from_secs(wait)
-        });
+        let recovery_due = recovery
+            .next_due()
+            .into_iter()
+            .chain(recovery.evidence_due())
+            .min()
+            .map(|at| {
+                let wait = at.saturating_sub(crate::cli::recovery::unix_now());
+                tokio::time::Instant::now() + Duration::from_secs(wait)
+            });
         let turns_due = [turns.next_deadline(), report_deadline(&clients)]
             .into_iter()
             .flatten()
@@ -3674,7 +3700,11 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
             }
             Wake::TurnsDue => {
                 let now = crate::cli::turn_custody::now_ms();
-                leaving.extend(expire_reports(&mut clients, now));
+                leaving.extend(expire_reports(
+                    &mut clients,
+                    owner.then_some(&mut turns),
+                    now,
+                ));
                 if owner {
                     leaving.extend(expire_deliveries(
                         &repo,
@@ -4260,6 +4290,21 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        if owner {
+            let acts = recovery.reach(
+                waiters(&clients, serving_since.elapsed()),
+                crate::cli::recovery::unix_now(),
+            );
+            act_on_recovery(
+                &repo,
+                &clients,
+                acts,
+                &recovery_answers,
+                &asks,
+                &records,
+                &mut owned,
+            );
         }
         if let Some(changed) = uc_round
             && owner
@@ -5064,7 +5109,7 @@ async fn typed_send(
     };
     let (target, screen) = match typist.locate(repo.clone(), author.clone()).await {
         Ok(located) => located,
-        Err(why) => return Answer::Unreachable(why),
+        Err(why) => return Answer::NoPane(why),
     };
     let screen = Some((target.tool, screen));
     if !authorized(asks, &repo, author, attempt, screen, Transport::Typed).await {
@@ -6921,10 +6966,8 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         return Ok(Greeted::StandDown);
     }
 
-    if let Greeting::Client(Hello {
-        who: Who::Control { request },
-        ..
-    }) = &greeting
+    if let Greeting::Client(hello) = &greeting
+        && let Who::Control { request } = &hello.who
     {
         let request = request.clone();
         io.get_mut()
@@ -6957,12 +7000,16 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
     let admitted = match greeting {
         Greeting::Decline(d) => Err(d),
         Greeting::Obsolete(_) => unreachable!("returned above"),
-        Greeting::Client(hello) => served_for(repo, hello.who.clone()).map(|who| match hello.who {
-            Who::Agent {
-                holder, turn_end, ..
-            } => (who, holder, turn_end),
-            Who::RecoveryHelper { holder, .. } => (who, Some(holder), None),
-            Who::Observer | Who::Control { .. } => (who, None, None),
+        Greeting::Client(hello) => served_for(repo, hello.who.clone()).map(|who| {
+            let hello = *hello;
+            let (holder, report) = match hello.who {
+                Who::Agent {
+                    holder, turn_end, ..
+                } => (holder, turn_end),
+                Who::RecoveryHelper { holder, .. } => (Some(holder), None),
+                Who::Observer | Who::Control { .. } => (None, None),
+            };
+            (who, holder, report, hello.build)
         }),
     };
 
@@ -6974,7 +7021,7 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         .write_all(format!("{}\n", serde_json::to_string(&welcome)?).as_bytes())
         .await?;
 
-    let (who, holder, report) = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
+    let (who, holder, report, build) = admitted.map_err(|d| anyhow::anyhow!("{d:?}"))?;
     if let Served::Agent { author, .. } = &who {
         tracing::debug!(%author, "monitor agent wait admitted");
     }
@@ -6997,11 +7044,11 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
             ));
             (
                 writer,
-                Some(Reporting {
+                Some(Box::new(Reporting {
                     report,
                     stepped: false,
                     reader: Some((early, read)),
-                }),
+                })),
             )
         }
         None => (
@@ -7022,6 +7069,10 @@ async fn admit(stream: tokio::net::UnixStream, repo: &std::path::Path) -> anyhow
         writer: Some(writer),
         shown: Default::default(),
         conn: next_conn(),
+        admitted: Admitted {
+            at: crate::cli::recovery::unix_now(),
+            build,
+        },
         report,
         farewell: Some(farewell),
     }))
@@ -7497,6 +7548,7 @@ fn claim_late_arrivals(
                     writer: Some(writer),
                     shown: Default::default(),
                     conn: 0,
+                    admitted: Default::default(),
                     report: None,
                     farewell: None,
                 };
@@ -7869,8 +7921,7 @@ fn gather(
 }
 
 /// Each agent's waits held here are its deliverers, the newest its park;
-/// one whose socket closed under it has [`ended`]. And a lost park whose
-/// record recovery has seen move on is over.
+/// one whose socket closed under it has [`ended`].
 #[allow(clippy::too_many_arguments)]
 fn tend(
     repo: &std::path::Path,
@@ -7881,9 +7932,6 @@ fn tend(
     turns: &mut crate::cli::turn_custody::Turns,
     recovery: &mut crate::cli::recovery::Driver,
 ) -> Vec<tokio::task::JoinHandle<Wrote>> {
-    for (author, unwatched) in recovery.watched_again() {
-        turns.watched_again(&author, unwatched);
-    }
     let mut closed = Vec::new();
     for c in clients.iter() {
         let Served::Agent { author } = &c.who else {
@@ -7941,7 +7989,7 @@ fn ended(
         pending,
     );
     turns.closed(&author, conn, &g);
-    turns.lost(&author, conn, || recovery.read_to(&author), &g);
+    turns.lost(&author, conn, &g);
     project(recovery, turns, &author, &g);
     leaving.extend(serve_reports(
         repo,
@@ -8042,9 +8090,61 @@ fn registered_waiter(c: &Client) -> Option<(&AgentLabel, &str)> {
     }
 }
 
+/// How long a monitor serves before a missing connection means a missing
+/// waiter: a waiter that outlived the last monitor notices the silence,
+/// backs off, and attaches again within this.
+const WAITERS_SETTLE: Duration = BEAT_GRACE
+    .saturating_add(OUTAGE_RETRY_CAP)
+    .saturating_add(ATTACH_BUDGET);
+
+/// The deliverer `c` is, if it is one: an agent's open connection that
+/// work can be handed down, a wait or a report that parks, with the tool
+/// and session it holds. An observer, a recovery helper, a report answered
+/// once and a wait holding no session are none. Whether it holds the
+/// binding its label has now is recovery's to say, against the binding it
+/// already holds: nothing is read from disk for it.
+fn waiter(c: &Client) -> Option<(AgentLabel, crate::cli::recovery::Waiter)> {
+    let Served::Agent { author } = &c.who else {
+        return None;
+    };
+    let holder = c.holder.as_ref()?;
+    if c.out.is_closed() || c.report.as_ref().is_some_and(|r| !r.report.parks()) {
+        return None;
+    }
+    Some((
+        author.clone(),
+        crate::cli::recovery::Waiter {
+            tool: holder.tool,
+            session: holder.session.clone(),
+            since: c.admitted.at,
+            build: c.admitted.build.clone(),
+        },
+    ))
+}
+
+/// The connection table as recovery is told it: each label's deliverers
+/// in the order they were admitted, and whether this monitor has `served`
+/// long enough for an agent with none to have none.
+fn waiters(clients: &[Client], served: Duration) -> crate::cli::recovery::Waiters {
+    let mut connected: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+    for (author, waiter) in clients.iter().filter_map(waiter) {
+        connected.entry(author).or_default().push(waiter);
+    }
+    crate::cli::recovery::Waiters {
+        connected,
+        settled: served >= WAITERS_SETTLE,
+    }
+}
+
 /// The parked reports whose hook can wait no longer: each gets the verdict
-/// its tool takes at its deadline, and is retired.
-fn expire_reports(clients: &mut Vec<Client>, now: u64) -> Vec<tokio::task::JoinHandle<Wrote>> {
+/// its tool takes at its deadline, and is retired. One woken by it is past
+/// the Stop it reported, which the monitor that owns the repo records in
+/// `turns`; one that no longer does records nothing.
+fn expire_reports(
+    clients: &mut Vec<Client>,
+    mut turns: Option<&mut crate::cli::turn_custody::Turns>,
+    now: u64,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
     let mut leaving = Vec::new();
     let (expired, kept): (Vec<Client>, Vec<Client>) =
         std::mem::take(clients).into_iter().partition(|c| {
@@ -8059,10 +8159,13 @@ fn expire_reports(clients: &mut Vec<Client>, now: u64) -> Vec<tokio::task::JoinH
             .as_ref()
             .map(|r| r.report.tool())
             .unwrap_or(clank_core::Tool::Claude);
-        send_note(
-            &client,
-            &Note::Verdict(crate::cli::turn_custody::Turns::deadline_frame(tool)),
-        );
+        let frame = crate::cli::turn_custody::Turns::deadline_frame(tool);
+        if let (Served::Agent { author }, super::turn_wire::WireVerdict::Notify, Some(turns)) =
+            (&client.who, &frame.verdict, turns.as_deref_mut())
+        {
+            turns.woken(author);
+        }
+        send_note(&client, &Note::Verdict(frame));
         if let Some(writer) = client.writer {
             leaving.push(writer);
         }
@@ -8263,6 +8366,7 @@ mod recovery_tests {
                 }),
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             },
@@ -8825,7 +8929,7 @@ mod recovery_tests {
         for (panes, why) in cases {
             let (answer, typed, shown, _) = nudged_among(panes, whole).await;
             assert!(
-                matches!(&answer, Answer::Unreachable(said) if said.contains(why)),
+                matches!(&answer, Answer::NoPane(said) if said.contains(why)),
                 "{why}: {answer:?}"
             );
             assert!(typed.is_empty(), "{why}: {typed:?}");
@@ -9055,7 +9159,7 @@ mod recovery_tests {
             )
         };
         assert!(
-            matches!(send().await, Answer::Unreachable(_)),
+            matches!(send().await, Answer::NoPane(_)),
             "on its own build it looks for the pane, which this listing lacks"
         );
         let installed = Installed::current();
@@ -9288,6 +9392,7 @@ mod recovery_tests {
                         turn: None,
                         position: Some(n),
                         human_turn: false,
+                        read_to: None,
                     },
                 },
                 deadline: u64::MAX,
@@ -9718,7 +9823,10 @@ mod recovery_tests {
             late.line(arrived + warn),
             "UNDELIVERED 40m · message from claude · silent 40m — nudging in 5m"
         );
-        assert!(!late.working(), "a silent open turn is not working");
+        assert!(
+            !late.working(arrived + warn),
+            "a silent open turn is not working"
+        );
         assert_eq!(late.owed.as_ref().unwrap().age, Some(warn));
 
         assert_eq!(
@@ -10094,6 +10202,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -10162,6 +10271,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             }
@@ -10220,6 +10330,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             }
@@ -10395,6 +10506,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             }))
@@ -10510,6 +10622,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -10644,6 +10757,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             }))
@@ -10840,6 +10954,7 @@ mod tests {
         let hello = |proto: u32| {
             serde_json::to_string(&Hello {
                 proto,
+                build: None,
                 repo: repo.path().to_string_lossy().to_string(),
                 who: agent("codex"),
             })
@@ -10896,6 +11011,7 @@ mod tests {
         let hello = |proto: u32| {
             serde_json::to_string(&Hello {
                 proto,
+                build: None,
                 repo: repo.path().to_string_lossy().to_string(),
                 who: agent("codex"),
             })
@@ -10925,6 +11041,7 @@ mod tests {
         let hello = |proto: u32| {
             serde_json::to_string(&Hello {
                 proto,
+                build: None,
                 repo: repo.path().to_string_lossy().to_string(),
                 who: agent("codex"),
             })
@@ -10968,6 +11085,7 @@ mod tests {
         // Addressed to a DIFFERENT repo.
         let elsewhere = serde_json::to_string(&Hello {
             proto: newer,
+            build: None,
             repo: "/some/other/repo".into(),
             who: agent("codex"),
         })
@@ -10999,6 +11117,7 @@ mod tests {
         // And the one that SHOULD: this repo, a known agent, newer.
         let known = serde_json::to_string(&Hello {
             proto: newer,
+            build: None,
             repo: here.clone(),
             who: agent("codex"),
         })
@@ -11120,6 +11239,7 @@ mod tests {
         let repo = repo_with_roster();
         let elsewhere = serde_json::to_string(&Hello {
             proto: PROTO,
+            build: None,
             repo: "/some/other/repo".into(),
             who: agent("codex"),
         })
@@ -11131,6 +11251,7 @@ mod tests {
 
         let ghost = serde_json::to_string(&Hello {
             proto: PROTO,
+            build: None,
             repo: repo.path().to_string_lossy().to_string(),
             who: agent("ghost"),
         })
@@ -11168,6 +11289,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let line = serde_json::to_string(&Hello {
             proto: PROTO + 1,
+            build: None,
             repo: repo.path().to_string_lossy().to_string(),
             who: agent("codex"),
         })
@@ -11291,6 +11413,7 @@ mod tests {
     fn a_wait_that_holds_nothing_says_so() {
         let hello = Hello {
             proto: PROTO,
+            build: None,
             repo: "/w/proj".into(),
             who: agent("claude"),
         };
@@ -14439,6 +14562,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             };
@@ -14554,6 +14678,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         };
@@ -14622,6 +14747,7 @@ mod tests {
     fn hello_for(repo: &std::path::Path, author: &str) -> String {
         serde_json::to_string(&Hello {
             proto: PROTO,
+            build: None,
             repo: repo.to_string_lossy().to_string(),
             who: agent(author),
         })
@@ -14856,6 +14982,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             });
@@ -15170,6 +15297,7 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             let line = serde_json::to_string(&Hello {
                 proto: PROTO,
+                build: None,
                 repo: repo.to_string_lossy().to_string(),
                 who,
             })
@@ -16028,6 +16156,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16062,6 +16191,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         };
@@ -16153,6 +16283,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16218,6 +16349,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16299,6 +16431,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16355,6 +16488,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16432,6 +16566,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             },
@@ -16488,6 +16623,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16544,6 +16680,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             },
@@ -16629,6 +16766,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16718,6 +16856,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         };
@@ -16774,6 +16913,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -16798,6 +16938,7 @@ mod tests {
                     holder: None,
                     shown: Default::default(),
                     conn: 0,
+                    admitted: Default::default(),
                     report: None,
                     farewell: None,
                 },
@@ -16840,6 +16981,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         };
@@ -16853,6 +16995,7 @@ mod tests {
                 holder: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: None,
             },
@@ -16905,6 +17048,7 @@ mod tests {
             holder: None,
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: None,
         }];
@@ -17036,6 +17180,7 @@ something to promote
     fn every_frame_round_trips() {
         let hello = Hello {
             proto: PROTO,
+            build: None,
             repo: "/w/proj".into(),
             who: Who::Agent {
                 author: "codex".into(),
@@ -18129,6 +18274,7 @@ mod superseding_tests {
                 writer: None,
                 shown: Default::default(),
                 conn: 0,
+                admitted: Default::default(),
                 report: None,
                 farewell: Some(farewell),
             },
@@ -18240,6 +18386,7 @@ mod superseding_tests {
             writer: Some(writer),
             shown: Default::default(),
             conn: 0,
+            admitted: Default::default(),
             report: None,
             farewell: Some(farewell),
         };
@@ -18329,7 +18476,8 @@ mod user_command_tests {
             writer: None,
             shown: Default::default(),
             conn: 7,
-            report: Some(Reporting {
+            admitted: Default::default(),
+            report: Some(Box::new(Reporting {
                 report: crate::cli::turn_wire::Report::TurnEnd {
                     stop: clank_core::turn_policy::TurnEndReport {
                         tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
@@ -18342,7 +18490,7 @@ mod user_command_tests {
                 },
                 stepped: false,
                 reader: None,
-            }),
+            })),
             farewell: None,
         };
         (client, queued)

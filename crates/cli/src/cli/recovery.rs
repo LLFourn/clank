@@ -100,6 +100,11 @@ pub(crate) struct TurnRec {
 /// The recent turns of one session, in order: the current-turn state every
 /// recovery decision is made from.
 ///
+/// `turns` is the record's word and nothing else writes it. What a Stop
+/// says of the latest turn is held beside it, and every reader goes
+/// through [`Self::latest`], [`Self::find`] or [`Self::after`], which
+/// answer with the two together.
+///
 /// Bounded: a decision needs the latest turn and the turns since an
 /// attempt was claimed, never the whole history.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,18 +114,34 @@ pub(crate) struct Snapshot {
     /// not read: the record was entered mid-turn, and the latest turn is
     /// not here.
     unanchored: bool,
-    /// The latest turn reads as ended by [`Self::set_unwatched`].
-    unwatched: bool,
+    /// What a Stop said of the latest turn, and that turn as it reads on
+    /// the Stop's word. It stands only while it is still about the turn
+    /// the record has latest, and the record still leaves that turn
+    /// running: a newer turn, an end, an interruption or a native retry
+    /// is the record's own word and needs nothing undone.
+    stop: Option<(Stop, TurnRec)>,
+}
+
+/// What says a turn the record leaves running is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// Its Stop hook reported it, and the record has not moved past that
+    /// report's place.
+    Reported,
+    /// Its Stop hook reported a turn's end that cannot be placed: the
+    /// record is not what the hook saw, or the hook did not say what it
+    /// saw, and nothing says whether the turn went on. The turn is left
+    /// as the record has it and read as neither running nor over.
+    Unplaced,
 }
 
 const SNAPSHOT_TURNS: usize = 64;
 
 impl Snapshot {
     pub(crate) fn apply(&mut self, fact: Fact) {
-        self.set_unwatched(false);
         match fact {
             Fact::Started { id, text } => {
-                if self.latest().is_some_and(|t| t.id == id) {
+                if self.turns.back().is_some_and(|t| t.id == id) {
                     return;
                 }
                 if self.turns.len() == SNAPSHOT_TURNS {
@@ -155,29 +176,43 @@ impl Snapshot {
         }
     }
 
+    /// The latest turn: as the record has it, or as over where a Stop
+    /// that still stands says so.
     pub(crate) fn latest(&self) -> Option<&TurnRec> {
-        self.turns.back()
+        match self.standing_stop() {
+            Some((Stop::Reported, over)) => Some(over),
+            _ => self.turns.back(),
+        }
     }
 
-    /// A lost park with the record unmoved since: a latest turn the record
-    /// leaves running ended at its Stop. An interruption or a native retry
-    /// is the record's own word, and stands.
-    fn set_unwatched(&mut self, on: bool) {
-        if on == self.unwatched {
-            return;
-        }
-        let (from, to) = match on {
-            true => (Outcome::Running, Outcome::Completed),
-            false => (Outcome::Completed, Outcome::Running),
-        };
-        if let Some(t) = self
-            .turns
-            .back_mut()
-            .filter(|t| t.outcome == from && !t.retrying)
-        {
-            t.outcome = to;
-            self.unwatched = on;
-        }
+    /// What a Stop says of the latest turn, while it stands.
+    fn stop(&self) -> Option<Stop> {
+        self.standing_stop().map(|(said, _)| *said)
+    }
+
+    fn standing_stop(&self) -> Option<&(Stop, TurnRec)> {
+        let recorded = self.turns.back()?;
+        self.stop.as_ref().filter(|(_, turn)| {
+            turn.id == recorded.id && recorded.outcome == Outcome::Running && !recorded.retrying
+        })
+    }
+
+    /// Hold what a Stop says of the latest turn, or that none says
+    /// anything.
+    fn set_stop(&mut self, said: Option<Stop>) {
+        self.stop = said.zip(self.turns.back()).map(|(said, recorded)| {
+            let outcome = match said {
+                Stop::Reported => Outcome::Completed,
+                Stop::Unplaced => recorded.outcome.clone(),
+            };
+            (
+                said,
+                TurnRec {
+                    outcome,
+                    ..recorded.clone()
+                },
+            )
+        });
     }
 
     /// Whether [`Self::latest`] is the record's latest turn: not when the
@@ -199,11 +234,19 @@ impl Snapshot {
             .iter()
             .position(|t| t.id == id)
             .map_or(0, |i| i + 1);
-        self.turns.iter().skip(from).collect()
+        let last = self.turns.len().saturating_sub(1);
+        (from..self.turns.len())
+            .filter_map(|i| match i == last {
+                true => self.latest(),
+                false => self.turns.get(i),
+            })
+            .collect()
     }
 
     fn find(&self, id: &str) -> Option<&TurnRec> {
-        self.turns.iter().rev().find(|t| t.id == id)
+        self.latest()
+            .filter(|t| t.id == id)
+            .or_else(|| self.turns.iter().rev().find(|t| t.id == id))
     }
 }
 
@@ -752,7 +795,7 @@ pub(crate) enum Answer {
     Unavailable,
     /// No one pane named for the agent could be found to type into, and
     /// why; nothing was sent.
-    Unreachable(String),
+    NoPane(String),
     /// It may have reached the harness. Never replayed.
     Indeterminate,
 }
@@ -797,6 +840,10 @@ pub(crate) struct Ctx<'a> {
     pub(crate) in_flight_until: Option<u64>,
     /// Something is owed to the agent.
     pub(crate) obligated: bool,
+    /// No waiter of its session is connected to take what it is owed, by
+    /// the monitor's connection table. It needs no settle here: it only
+    /// ever keeps clank's hands off, and is never a reason to send.
+    pub(crate) no_waiter: bool,
     /// Its record is being read, and shows where its turns stand.
     pub(crate) readable: bool,
     pub(crate) fallback: Option<Fallback>,
@@ -881,6 +928,10 @@ pub(crate) enum Trigger {
 /// failed. In order: a reason the fold gave to keep hands off, an
 /// interrupted turn, a delivery inside its bound, then what the record
 /// calls for.
+///
+/// A turn that is over is recovered as idle at once, whoever said it was
+/// over. With no waiter connected and no way to resume the harness, clank
+/// keeps its hands off: a missing waiter is no permission to type.
 pub(crate) fn standing(snap: &Snapshot, ctx: &Ctx) -> Option<Standing> {
     use crate::cli::agent_state::HandsOff;
     if let Some(why) = &ctx.hold {
@@ -919,10 +970,14 @@ pub(crate) fn standing(snap: &Snapshot, ctx: &Ctx) -> Option<Standing> {
     if !ctx.readable {
         return Some(blind());
     }
-    Some(match latest {
-        None => Standing::Recover(Trigger::Idle {
-            turn: AT_PROMPT.to_string(),
+    let idle = |turn: &str| match (ctx.no_waiter, ctx.transport) {
+        (true, Err(why)) => Standing::HandsOff(HandsOff::CannotResume(why.to_string())),
+        _ => Standing::Recover(Trigger::Idle {
+            turn: turn.to_string(),
         }),
+    };
+    Some(match latest {
+        None => idle(AT_PROMPT),
         Some(t) if t.outcome == Outcome::Running => match (ctx.stall, &ctx.period, ctx.quiet_since)
         {
             (None, _, _) => Standing::HandsOff(HandsOff::StallWarnOff),
@@ -935,7 +990,7 @@ pub(crate) fn standing(snap: &Snapshot, ctx: &Ctx) -> Option<Standing> {
             // read for this purpose.
             (Some(_), _, _) => blind(),
         },
-        Some(t) => Standing::Recover(Trigger::Idle { turn: t.id.clone() }),
+        Some(t) => idle(&t.id),
     })
 }
 
@@ -1552,7 +1607,7 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
                 "it was not where clank left it when clank went to act",
             );
         }
-        Answer::Unavailable | Answer::Unreachable(_) if e.kind == Kind::Fallback => {
+        Answer::Unavailable | Answer::NoPane(_) if e.kind == Kind::Fallback => {
             a.disposition = Disposition::Unavailable;
             if e.unavailable() >= FALLBACK_CHECKS {
                 escalate(
@@ -1565,7 +1620,7 @@ pub(crate) fn answered(mut e: Episode, n: u32, answer: Answer, ctx: &Ctx) -> Epi
                 e.next_at = Some(ctx.now + fallback_wait(&e));
             }
         }
-        Answer::Unavailable | Answer::Unreachable(_) => {
+        Answer::Unavailable | Answer::NoPane(_) => {
             a.disposition = Disposition::Unavailable;
             if e.unavailable() >= UNAVAILABLE_LIMIT {
                 escalate(&mut e, ctx, "its recovery transport never answered");
@@ -1621,6 +1676,33 @@ pub(crate) struct Projection {
     pub(crate) asking: Option<String>,
     pub(crate) repeated: Option<u32>,
     pub(crate) unwatched: Option<clank_core::turn_policy::Unwatched>,
+    /// The Stop its hook last reported, durable in its turn state.
+    pub(crate) stopped: Option<clank_core::turn_policy::Stopped>,
+}
+
+/// A deliverer the monitor holds a connection from, for the `tool` and
+/// `session` it said it holds. It is an agent's waiter only while those
+/// are what the agent is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Waiter {
+    pub(crate) tool: Tool,
+    pub(crate) session: String,
+    /// Unix seconds: when its connection was admitted.
+    pub(crate) since: u64,
+    /// The build it said it runs.
+    pub(crate) build: Option<String>,
+}
+
+/// The monitor's connection table, as recovery is told it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Waiters {
+    /// Every deliverer connected under each label, oldest first, whatever
+    /// binding it holds.
+    pub(crate) connected: std::collections::BTreeMap<clank_core::ids::AgentLabel, Vec<Waiter>>,
+    /// The monitor has served long enough that a waiter still alive would
+    /// have reached it: only then is a missing connection a missing
+    /// waiter.
+    pub(crate) settled: bool,
 }
 
 /// What the monitor must do for an agent.
@@ -1720,13 +1802,21 @@ struct Watched {
     published: Option<crate::cli::agent_state::AgentState>,
     /// Why its last typed attempt found no pane to type into, until one is
     /// submitted or it is bound again.
-    unreachable: Option<String>,
+    no_pane: Option<String>,
     /// The binding it holds: binding again, even to the same session, is a
     /// new binding.
     binding: Option<clank_core::agent_config::Session>,
     /// A verified user command waits for its turn to end, so its record is
     /// read whether or not it owes anything.
     user_command: bool,
+    /// How the monitor could reach it, by the connection table it last
+    /// told recovery of.
+    reach: crate::cli::agent_state::Reachability,
+    /// What the Stop its hook reported says of its latest turn, as of the
+    /// Stop and the place in the record it was judged at.
+    stop_checked: Option<(clank_core::turn_policy::Stopped, (u64, u64), Option<Stop>)>,
+    /// When its published evidence of working is next renewed or runs out.
+    working_look: Option<u64>,
 }
 
 struct Reading {
@@ -1737,9 +1827,9 @@ struct Reading {
 
 /// Every agent's recovery, as the monitor's loop drives it.
 ///
-/// A record is armed only while its agent is obligated and has no
-/// deliverer. It is read once when armed, then only when its watch reports a
-/// change, and once more before a deadline decides.
+/// A record is armed only while something is decided or shown from it
+/// ([`reads`]). It is read once when armed, then only when its watch
+/// reports a change, and once more before a deadline decides.
 pub(crate) struct Driver {
     agents: std::collections::BTreeMap<clank_core::ids::AgentLabel, Watched>,
     /// The watches the watcher holds. The driver is their one owner, and
@@ -1758,6 +1848,9 @@ pub(crate) struct Driver {
         std::collections::BTreeMap<(clank_core::ids::AgentLabel, AttemptRef), (PathBuf, Pending)>,
     /// This monitor, as each published state names it.
     observer: crate::cli::agent_state::Observer,
+    /// The monitor's connection table as last told. `None` until it is:
+    /// then nothing is known of anyone's reachability.
+    waiters: Option<Waiters>,
 }
 
 /// What an attempt's history record needs, as it was when dispatched, and
@@ -1836,7 +1929,7 @@ impl Pending {
             Answer::Unavailable => Outcome::Refused {
                 reason: format!("no {} was there to try", self.transport),
             },
-            Answer::Unreachable(why) => Outcome::Refused {
+            Answer::NoPane(why) => Outcome::Refused {
                 reason: why.clone(),
             },
             Answer::Indeterminate => Outcome::Indeterminate {
@@ -1867,7 +1960,33 @@ impl Driver {
             home,
             pending: Default::default(),
             observer: crate::cli::agent_state::Observer::me(),
+            waiters: None,
         }
+    }
+
+    /// The monitor's connection table changed, or may have: each agent's
+    /// reachability is what it says now, and an agent with no waiter has
+    /// its record read whether or not it is owed anything, since only the
+    /// record says whether it is waiting or working. The watches to
+    /// install and release.
+    pub(crate) fn reach(&mut self, waiters: Waiters, now: u64) -> Vec<Act> {
+        if self.waiters.as_ref() == Some(&waiters) {
+            return Vec::new();
+        }
+        for (author, w) in self.agents.iter_mut() {
+            reached(author, w, &waiters, now);
+            match (reads(w), w.binding.clone()) {
+                (true, Some(binding)) => {
+                    watch_record(w, &binding, &self.cwd, &self.home);
+                }
+                (false, _) => disarm(w),
+                _ => {}
+            }
+        }
+        self.waiters = Some(waiters);
+        let acts = self.sync_watches();
+        self.publish(now);
+        acts
     }
 
     /// Remember each dispatch in `acts` as pending history.
@@ -2036,6 +2155,13 @@ impl Driver {
             .min()
     }
 
+    /// The soonest moment published evidence that an agent is working
+    /// must be looked at again, by [`Driver::due`]: to renew it from the
+    /// record, or to stop saying it.
+    pub(crate) fn evidence_due(&self) -> Option<u64> {
+        self.agents.values().filter_map(|w| w.working_look).min()
+    }
+
     /// Bring every agent in line with the latest fold.
     pub(crate) fn reconcile(&mut self, facts: Vec<Facts>, now: u64) -> Vec<Act> {
         let mut acts = Vec::new();
@@ -2089,9 +2215,12 @@ impl Driver {
                     stall: None,
                     activity: None,
                     published: crate::cli::agent_state::load(&f.agent_dir),
-                    unreachable: None,
+                    no_pane: None,
                     binding: None,
                     user_command: false,
+                    reach: Default::default(),
+                    stop_checked: None,
+                    working_look: None,
                 });
             w.auto = f.auto;
             w.obligated = !f.ledger.owed().is_empty();
@@ -2100,13 +2229,13 @@ impl Driver {
             w.role = f.role.clone();
             if w.binding.as_ref() != Some(&f.session) {
                 w.binding = Some(f.session.clone());
-                w.unreachable = None;
+                w.no_pane = None;
             }
             w.attended = f.attended;
             w.blocked_on = f.blocked_on.clone();
             w.asking = f.asking;
             w.projection = f.projection.clone();
-            unwatched(w);
+            stopped(w);
             w.fallback = f.blind_nudge.map(|every| Fallback {
                 identity: fallback_identity(&f.work),
                 every,
@@ -2125,6 +2254,10 @@ impl Driver {
                 w.tool = f.session.tool;
                 w.snap = Snapshot::default();
                 w.activity = None;
+                w.reach = Default::default();
+            }
+            if let Some(waiters) = &self.waiters {
+                reached(&f.author, w, waiters, now);
             }
             if !w.obligated {
                 acts.extend(decision(
@@ -2134,7 +2267,7 @@ impl Driver {
                     Some(Gate::ObligationCleared),
                     None,
                 ));
-                if f.asking || w.user_command {
+                if reads(w) {
                     watch_record(w, &f.session, &self.cwd, &self.home);
                 } else {
                     disarm(w);
@@ -2170,39 +2303,11 @@ impl Driver {
                 (true, Some(binding)) => {
                     watch_record(w, &binding, &self.cwd, &self.home);
                 }
-                (false, _) if !w.obligated && !w.asking => disarm(w),
+                (false, _) if !reads(w) => disarm(w),
                 _ => {}
             }
         }
         self.sync_watches()
-    }
-
-    /// The lost parks whose record recovery has read moving off their
-    /// cursor, each forgotten here as it is handed over.
-    pub(crate) fn watched_again(
-        &mut self,
-    ) -> Vec<(
-        clank_core::ids::AgentLabel,
-        clank_core::turn_policy::Unwatched,
-    )> {
-        let mut over = Vec::new();
-        for (author, w) in self.agents.iter_mut() {
-            if let (Some(u), Some(r)) = (w.projection.unwatched, w.read.as_ref())
-                && r.tail.at() != (u.record, u.read)
-            {
-                w.projection.unwatched = None;
-                over.push((author.clone(), u));
-            }
-        }
-        over
-    }
-
-    /// How far `author`'s record has been read, read afresh: its inode and
-    /// offset.
-    pub(crate) fn read_to(&mut self, author: &clank_core::ids::AgentLabel) -> Option<(u64, u64)> {
-        let w = self.agents.get_mut(author)?;
-        read_afresh(w, &self.cwd, &self.home);
-        Some(w.read.as_ref()?.tail.at())
     }
 
     /// Whether `author`'s record, read afresh, shows `session`'s latest
@@ -2221,9 +2326,9 @@ impl Driver {
             return Err("the monitor follows another of its sessions".into());
         }
         read_afresh(w, &self.cwd, &self.home);
-        match activity(w) {
-            Activity::Idle | Activity::Unwatched => Ok(()),
-            Activity::Working => Err("its turn is running".into()),
+        match activity(w, unix_now()) {
+            Activity::Idle => Ok(()),
+            Activity::Working(_) | Activity::TurnOpen => Err("its turn is running".into()),
             Activity::Asking => Err("a question to the user is pending".into()),
             Activity::Failed(class) => Err(format!("its latest turn failed ({class})")),
             Activity::Interrupted => Err("its latest turn was interrupted".into()),
@@ -2356,8 +2461,8 @@ impl Driver {
         if let Some(w) = self.agents.get_mut(author) {
             if attempt.session == w.session {
                 match &answer {
-                    Answer::Unreachable(why) => w.unreachable = Some(why.clone()),
-                    Answer::Submitted { .. } => w.unreachable = None,
+                    Answer::NoPane(why) => w.no_pane = Some(why.clone()),
+                    Answer::Submitted { .. } => w.no_pane = None,
                     _ => {}
                 }
             }
@@ -2435,22 +2540,39 @@ impl Driver {
     ) {
         if let Some(w) = self.agents.get_mut(author) {
             w.projection = projection;
-            unwatched(w);
+            stopped(w);
             self.publish(now);
         }
     }
 
     /// Publish each agent's state that changed in meaning.
     fn publish(&mut self, now: u64) {
+        use crate::cli::agent_state::{Activity, Reachability};
         for w in self.agents.values_mut() {
-            let activity = activity(w);
+            let held = w.published.as_ref().filter(|p| p.session == w.session);
+            let activity = evidenced(activity(w, now), held, now);
+            w.working_look = working_look(&activity, now);
             // A monitor that takes over an agent takes over its clock: the
             // activity it finds published has lasted since it was.
             let since = match (&w.activity, &w.published) {
-                (Some((a, since)), _) if *a == activity => *since,
-                (None, Some(p)) if p.activity == activity && p.session == w.session => p.since,
+                (Some((a, since)), _) if continues(a, &activity) => *since,
+                (None, Some(p)) if continues(&p.activity, &activity) && p.session == w.session => {
+                    p.since
+                }
                 _ => now,
             };
+            // A turn this monitor saw end with no waiter connected dates
+            // itself: whenever the last waiter went, the agent has waited
+            // without one from here.
+            let was_open = matches!(
+                w.activity,
+                Some((Activity::Working(_) | Activity::TurnOpen, _))
+            );
+            if let (true, Activity::Idle, Reachability::NoWaiter { since: None }) =
+                (was_open, &activity, &w.reach)
+            {
+                w.reach = Reachability::NoWaiter { since: Some(now) };
+            }
             w.activity = Some((activity.clone(), since));
             let state = crate::cli::agent_state::AgentState {
                 role: w.role.clone(),
@@ -2459,10 +2581,11 @@ impl Driver {
                 monitor: self.observer.clone(),
                 activity,
                 since,
+                reachability: w.reach.clone(),
                 owed: owing(w),
                 nudge: nudge(w.episode.as_ref()),
                 cannot_resume: match transport_for(w.tool) {
-                    Ok(_) => w.unreachable.clone(),
+                    Ok(_) => w.no_pane.clone(),
                     Err(why) => Some(why.to_string()),
                 },
                 attending: w.projection.attended.clone(),
@@ -2549,7 +2672,7 @@ fn arm(w: &mut Watched, path: PathBuf) -> bool {
     w.last_activity = Some(written);
     w.read = Some(Reading { path, tail, reader });
     w.snap = snap;
-    unwatched(w);
+    stopped(w);
     let seen = w.snap.ids().map(str::to_string).collect();
     question_evidence(w, seen, Vec::new(), true);
     true
@@ -2614,16 +2737,109 @@ fn read_afresh(w: &mut Watched, cwd: &Path, home: &Path) {
     }
 }
 
-/// Whether custody's lost park still describes `w`'s record: read to
-/// exactly where it was when the park was lost. Growth, truncation or a
-/// replacement moves the reading off it.
-fn unwatched(w: &mut Watched) {
-    let on = w
-        .projection
-        .unwatched
-        .zip(w.read.as_ref())
-        .is_some_and(|(u, r)| r.tail.at() == (u.record, u.read));
-    w.snap.set_unwatched(on);
+/// Bring the snapshot in line with the one thing besides the record's own
+/// word that says a turn is over: the Stop its hook reported.
+fn stopped(w: &mut Watched) {
+    let said = stop_reported(w);
+    w.snap.set_stop(said);
+}
+
+/// What the Stop `w`'s hook reported says of its latest turn, read again
+/// only when the Stop or the record has moved.
+///
+/// Only what the hook itself saw of the record ends a turn. A placed Stop
+/// speaks for its turn by name while the place the hook read is still
+/// that turn's newest boundary. A Stop with no place speaks for the
+/// latest turn only while the record is exactly the file and length the
+/// hook had in front of it: anything written since, before the monitor
+/// was told or after, may be the agent going again.
+///
+/// Where the Stop ends nothing, it says nothing of a turn it did not
+/// name, or, naming none, of a record written after the monitor was
+/// told; otherwise the latest turn cannot be placed, and is neither
+/// running nor over.
+fn stop_reported(w: &mut Watched) -> Option<Stop> {
+    let (Some(stop), Some(r)) = (w.projection.stopped.clone(), w.read.as_ref()) else {
+        w.stop_checked = None;
+        return None;
+    };
+    let at = r.tail.at();
+    if let Some((_, _, said)) = w
+        .stop_checked
+        .as_ref()
+        .filter(|(checked, read, _)| *checked == stop && *read == at)
+    {
+        return *said;
+    }
+    let latest = w.snap.latest().filter(|_| w.snap.anchored());
+    let named = stop.turn.as_deref();
+    let said = match (latest, stop.position) {
+        (None, _) => None,
+        (Some(t), _) if named.is_some_and(|turn| turn != t.id) => None,
+        (Some(_), Some(position)) => named
+            .and_then(|turn| match w.tool {
+                Tool::Claude => crate::cli::wake_repeat::claude_boundary(&r.path),
+                Tool::Codex => crate::cli::wake_repeat::codex_boundary(&r.path, turn),
+                Tool::Grok | Tool::OpenCode => None,
+            })
+            .is_some_and(|b| Some(b.turn.as_str()) == named && b.position == position)
+            .then_some(Stop::Reported),
+        (Some(_), None) if stop.read_to.is_some_and(|seen| (seen.file, seen.len) == at) => {
+            Some(Stop::Reported)
+        }
+        (Some(_), None) => match (named, written_ms(&r.path)) {
+            (None, Some(written)) if written > stop.at => None,
+            _ => Some(Stop::Unplaced),
+        },
+    };
+    w.stop_checked = Some((stop, at, said));
+    said
+}
+
+/// When the record at `path` was last written, in unix milliseconds. Set
+/// against the moment the monitor was told of a Stop it can only show
+/// that the record moved after it, never that it did not.
+fn written_ms(path: &Path) -> Option<u64> {
+    let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
+}
+
+/// Whether `w`'s record is read: it is owed work, it asked a question or
+/// a person's command waits on its turn, or no waiter is connected, when
+/// only the record says whether it is waiting or working.
+fn reads(w: &Watched) -> bool {
+    use crate::cli::agent_state::Reachability;
+    w.obligated || w.asking || w.user_command || matches!(w.reach, Reachability::NoWaiter { .. })
+}
+
+/// Bring `w`'s reachability in line with the monitor's connection table:
+/// the oldest deliverer connected for the tool and session it is bound
+/// to, or none once a missing connection means that. A connection of a
+/// binding since replaced holds another session, and is nobody's waiter. The moment its last waiter went is when this
+/// was seen, else when custody recorded its park lost; otherwise undated.
+fn reached(author: &clank_core::ids::AgentLabel, w: &mut Watched, waiters: &Waiters, now: u64) {
+    use crate::cli::agent_state::Reachability;
+    let connected = waiters
+        .connected
+        .get(author)
+        .into_iter()
+        .flatten()
+        .find(|waiter| waiter.tool == w.tool && waiter.session == w.session);
+    let park_lost = w.projection.unwatched.map(|u| u.since / 1000);
+    w.reach = match (connected, &w.reach) {
+        (Some(waiter), _) => Reachability::Waiter {
+            since: waiter.since,
+            build: waiter.build.clone(),
+        },
+        (None, Reachability::Waiter { .. }) => Reachability::NoWaiter { since: Some(now) },
+        (None, Reachability::NoWaiter { since }) => Reachability::NoWaiter {
+            since: since.or(park_lost),
+        },
+        (None, Reachability::Unknown) if waiters.settled => {
+            Reachability::NoWaiter { since: park_lost }
+        }
+        (None, Reachability::Unknown) => Reachability::Unknown,
+    };
 }
 
 fn disarm(w: &mut Watched) {
@@ -2675,7 +2891,7 @@ fn refresh(w: &mut Watched) -> bool {
             w.snap.apply(fact);
         }
     }
-    unwatched(w);
+    stopped(w);
     question_evidence(w, seen, returned, false);
     true
 }
@@ -2711,6 +2927,10 @@ fn decision(
         hold: hold(w),
         in_flight_until: w.in_flight_until,
         obligated: w.obligated,
+        no_waiter: matches!(
+            w.reach,
+            crate::cli::agent_state::Reachability::NoWaiter { .. }
+        ),
         readable: legible(w),
         fallback: w.fallback.clone(),
         role: &w.role,
@@ -2919,6 +3139,52 @@ fn next_look(w: &Watched) -> Option<u64> {
         .map(|at| at.max(held))
 }
 
+/// Published evidence of working is kept while more than half its window
+/// is left, so a record that moves many times a second rewrites nothing.
+fn evidenced(
+    activity: crate::cli::agent_state::Activity,
+    published: Option<&crate::cli::agent_state::AgentState>,
+    now: u64,
+) -> crate::cli::agent_state::Activity {
+    use crate::cli::agent_state::Activity;
+    match (&activity, published.map(|p| &p.activity)) {
+        (Activity::Working(new), Some(Activity::Working(held)))
+            if new.moved >= held.moved && now < half_life(held) =>
+        {
+            Activity::Working(*held)
+        }
+        _ => activity,
+    }
+}
+
+fn half_life(m: &crate::cli::agent_state::Moving) -> u64 {
+    m.until - m.until.saturating_sub(m.moved) / 2
+}
+
+/// When published evidence of working is looked at again: at its half
+/// life, to renew it from the record, and then as it runs out.
+fn working_look(activity: &crate::cli::agent_state::Activity, now: u64) -> Option<u64> {
+    let crate::cli::agent_state::Activity::Working(m) = activity else {
+        return None;
+    };
+    Some(match half_life(m) {
+        half if half > now => half,
+        _ => m.until,
+    })
+}
+
+/// Whether `now` is the activity `was` going on, for its clock. An open
+/// turn is one turn whether or not its record is moving: the clock is the
+/// turn's, and evidence coming or going does not restart it.
+fn continues(
+    was: &crate::cli::agent_state::Activity,
+    now: &crate::cli::agent_state::Activity,
+) -> bool {
+    use crate::cli::agent_state::Activity;
+    let open = |a: &Activity| matches!(a, Activity::Working(_) | Activity::TurnOpen);
+    (open(was) && open(now)) || was == now
+}
+
 /// The reason the last fold gave to keep hands off `w`: manual mode, its
 /// own question or block, or attendance. Another agent's block is not
 /// one: what it withholds is not owed, and what it does not withhold is.
@@ -2938,9 +3204,10 @@ fn hold(w: &Watched) -> Option<crate::cli::agent_state::HandsOff> {
 }
 
 /// Whether `w`'s record says where its turns stand: it is being read,
-/// and its latest turn is the record's.
+/// its latest turn is the record's, and no Stop was reported that the
+/// record cannot place.
 fn legible(w: &Watched) -> bool {
-    w.read.is_some() && w.snap.anchored()
+    w.read.is_some() && w.snap.anchored() && w.snap.stop() != Some(Stop::Unplaced)
 }
 
 /// Since when `w`'s record has been silent with work owed: the latest of
@@ -2963,14 +3230,16 @@ fn period(w: &Watched) -> Option<String> {
     Some(format!("{STALL}-{file:x}-{read}"))
 }
 
-/// What the agent is doing, by what its record shows.
-fn activity(w: &Watched) -> crate::cli::agent_state::Activity {
-    use crate::cli::agent_state::Activity;
+/// What the agent is doing at `now`, by what its record shows. A turn
+/// the record leaves open is working only on evidence: no Stop says it
+/// is over, and the record moved inside the stall window.
+fn activity(w: &Watched, now: u64) -> crate::cli::agent_state::Activity {
+    use crate::cli::agent_state::{Activity, Moving};
     if w.asking {
         return Activity::Asking;
     }
     if w.read.is_none() {
-        if !w.obligated {
+        if !reads(w) {
             return Activity::Unobserved;
         }
         return Activity::Unknown(
@@ -2982,13 +3251,26 @@ fn activity(w: &Watched) -> crate::cli::agent_state::Activity {
             .into(),
         );
     }
-    if w.snap.unwatched {
-        return Activity::Unwatched;
+    match w.snap.stop() {
+        Some(Stop::Unplaced) => {
+            return Activity::Unknown(
+                "its Stop hook reported a turn's end that its record cannot place".into(),
+            );
+        }
+        Some(Stop::Reported) | None => {}
     }
+    let window = w.stall.map_or(STALL_WARN_DEFAULT, |s| s.warn);
     match w.snap.latest().filter(|_| w.snap.anchored()) {
         None => Activity::Unknown("its record shows no turn yet".into()),
         Some(t) => match &t.outcome {
-            Outcome::Running => Activity::Working,
+            Outcome::Running => w
+                .last_activity
+                .map(|moved| Moving {
+                    moved,
+                    until: moved.saturating_add(window),
+                })
+                .filter(|m| now < m.until)
+                .map_or(Activity::TurnOpen, Activity::Working),
             Outcome::Completed => Activity::Idle,
             Outcome::Failed(class) => Activity::Failed(class.clone()),
             Outcome::Interrupted => Activity::Interrupted,
@@ -3513,6 +3795,7 @@ pub(crate) mod tests {
             hold: None,
             in_flight_until: None,
             obligated: false,
+            no_waiter: false,
             readable: true,
             fallback: None,
             role: "",
@@ -6885,7 +7168,10 @@ pub(crate) mod tests {
         std::fs::write(&other, bytes).unwrap();
         std::fs::rename(&other, &record).unwrap();
         touched(&mut d, &record, 1);
-        assert_eq!(published(dir.path()).unwrap().activity, Activity::Working);
+        assert!(matches!(
+            published(dir.path()).unwrap().activity,
+            Activity::Working(_)
+        ));
     }
 
     /// A new binding's state is its own: its age starts when it was bound.
@@ -7328,7 +7614,7 @@ pub(crate) mod tests {
         d.answer(
             &label(),
             &attempt,
-            Answer::Unreachable(why.into()),
+            Answer::NoPane(why.into()),
             IDLE_WAITS[0] + 1,
         );
         let state = crate::cli::agent_state::load(dir.path()).unwrap();
@@ -8005,7 +8291,7 @@ pub(crate) mod tests {
             let mut d = driver();
             d.reconcile(vec![f], 1000);
             assert_eq!(case_of(dir.path()), Some(Case::Recovering), "{end}");
-            assert!(!shown(dir.path(), 1000).working(), "{end}");
+            assert!(!shown(dir.path(), 1000).working(1000), "{end}");
             assert!(d.next_due().is_some_and(|at| at < 1000 + WARN), "{end}");
         }
     }
@@ -8205,7 +8491,7 @@ pub(crate) mod tests {
                 line.starts_with("UNDELIVERED"),
                 "{reason}: owed and never delivered, so shouted: {line}"
             );
-            assert!(!shown(dir.path(), 10 * WARN).working(), "{reason}");
+            assert!(!shown(dir.path(), 10 * WARN).working(10 * WARN), "{reason}");
             enable(Tool::Codex, Some(Transport::Typed));
         }
     }
@@ -8627,7 +8913,10 @@ pub(crate) mod tests {
                 line.contains("silent 40m — nudging in 5m"),
                 "{ended}: {line}"
             );
-            assert!(!shown(dir.path(), 1000 + WARN).working(), "{ended}");
+            assert!(
+                !shown(dir.path(), 1000 + WARN).working(1000 + WARN),
+                "{ended}"
+            );
 
             d.reconcile(vec![f.clone()], 1000 + WARN + 10);
             assert!(dispatches(&go(&mut d, 1000 + WARN + NUDGE - 1)).is_empty());
@@ -9249,5 +9538,110 @@ pub(crate) mod tests {
             assert!(dispatches(&go(&mut d, WARN + NUDGE)).is_empty(), "{how}");
             assert_eq!(d.next_due(), Some(WARN + 10 + WARN), "{how}");
         }
+    }
+
+    /// A turn that is over with work owed is to be recovered as idle,
+    /// reachable or not. Only with no waiter connected and no way to
+    /// resume its harness does clank keep its hands off, saying so: an
+    /// agent it can neither hand work to nor start is not typed at.
+    #[test]
+    fn an_agent_with_no_waiter_that_clank_cannot_resume_is_held_not_recovered() {
+        use crate::cli::agent_state::HandsOff;
+        let owing = |no_waiter, transport| Ctx {
+            obligated: true,
+            no_waiter,
+            ..ctx(100, transport, None)
+        };
+        let idle = |turn: &str| {
+            Some(Standing::Recover(Trigger::Idle {
+                turn: turn.to_string(),
+            }))
+        };
+        let held = Some(Standing::HandsOff(HandsOff::CannotResume(
+            crate::cli::resume::NO_CANDIDATE.into(),
+        )));
+        let over = snap([started("t1"), ended("t1", Outcome::Completed)]);
+        let at_prompt = Snapshot::default();
+        for (snapshot, turn) in [(&over, "t1"), (&at_prompt, AT_PROMPT)] {
+            assert_eq!(standing(snapshot, &owing(true, HELPER)), idle(turn));
+            assert_eq!(standing(snapshot, &owing(false, HELPER)), idle(turn));
+            assert_eq!(
+                standing(snapshot, &owing(false, None)),
+                idle(turn),
+                "a waiter may yet take it: {turn}"
+            );
+            assert_eq!(standing(snapshot, &owing(true, None)), held, "{turn}");
+        }
+        let (ep, effects) = decide(None, &over, &owing(true, None));
+        assert_eq!(ep, None, "nothing is opened under the hold");
+        assert!(effects.is_empty());
+        assert_eq!(
+            standing(
+                &over,
+                &Ctx {
+                    obligated: false,
+                    ..owing(true, None)
+                }
+            ),
+            None,
+            "owed nothing, there is nothing to hold"
+        );
+    }
+
+    /// A Stop makes the latest turn read as over only while the record
+    /// leaves it running, and never by rewriting what the record said: the
+    /// record's own word for a turn stands, anything it says next ends
+    /// what the Stop said with nothing to undo, and every way of reading a
+    /// turn gives the same answer.
+    #[test]
+    fn a_reported_stop_ends_only_a_turn_the_record_leaves_running() {
+        let mut open = snap([
+            started("t0"),
+            ended("t0", Outcome::Completed),
+            started("t1"),
+        ]);
+        let recorded = open.turns.clone();
+        open.set_stop(Some(Stop::Reported));
+        assert_eq!(open.turns, recorded, "the record's word is not rewritten");
+        assert_eq!(open.latest().unwrap().outcome, Outcome::Completed);
+        assert_eq!(open.find("t1").unwrap().outcome, Outcome::Completed);
+        assert_eq!(
+            open.after("t0")
+                .iter()
+                .map(|t| &t.outcome)
+                .collect::<Vec<_>>(),
+            [&Outcome::Completed]
+        );
+        open.set_stop(Some(Stop::Unplaced));
+        assert_eq!(open.stop(), Some(Stop::Unplaced));
+        assert_eq!(open.latest().unwrap().outcome, Outcome::Running);
+        open.set_stop(None);
+        assert_eq!(open.latest().unwrap().outcome, Outcome::Running);
+
+        open.set_stop(Some(Stop::Reported));
+        open.apply(started("t2"));
+        assert_eq!(open.stop(), None, "a newer turn: with no reset");
+        assert_eq!(open.latest().unwrap().outcome, Outcome::Running, "t2 runs");
+        assert_eq!(
+            open.find("t1").unwrap().outcome,
+            Outcome::Running,
+            "and what the Stop said of t1 was never the record's word"
+        );
+
+        for own in [Outcome::Interrupted, Outcome::Failed("overloaded".into())] {
+            let mut said = snap([started("t1")]);
+            said.set_stop(Some(Stop::Reported));
+            said.apply(ended("t1", own.clone()));
+            assert_eq!(said.stop(), None, "{own:?}");
+            assert_eq!(said.latest().unwrap().outcome, own);
+            said.set_stop(Some(Stop::Reported));
+            assert_eq!(said.stop(), None, "{own:?}: an ended turn takes no Stop");
+            assert_eq!(said.latest().unwrap().outcome, own);
+        }
+        let mut retrying = snap([started("t1")]);
+        retrying.set_stop(Some(Stop::Reported));
+        retrying.apply(Fact::NativeRetry);
+        assert_eq!(retrying.stop(), None, "the harness is retrying it");
+        assert_eq!(retrying.latest().unwrap().outcome, Outcome::Running);
     }
 }

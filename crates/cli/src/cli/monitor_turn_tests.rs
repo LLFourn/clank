@@ -147,11 +147,12 @@ async fn a_presentation_its_carrier_never_received_fails_at_once() {
         farewell: None,
         shown: Default::default(),
         conn: 7,
-        report: Some(Reporting {
+        admitted: Default::default(),
+        report: Some(Box::new(Reporting {
             report: stop_report(),
             stepped: false,
             reader: None,
-        }),
+        })),
     }];
     let mut turns = Turns::new(repo.path().to_path_buf());
     let pending = transient(&author);
@@ -1334,6 +1335,7 @@ async fn a_killed_carrier_fails_its_presentation_and_commits_nothing() {
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let hello = Hello {
         proto: PROTO,
+        build: None,
         repo: repo.path().to_string_lossy().to_string(),
         who: Who::Agent {
             author: author.to_string(),
@@ -1391,6 +1393,7 @@ async fn a_result_on_a_foreign_connection_is_never_credited() {
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
     let hello = |report: Report| Hello {
         proto: PROTO,
+        build: None,
         repo: repo.path().to_string_lossy().to_string(),
         who: Who::Agent {
             author: author.to_string(),
@@ -1855,11 +1858,12 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
         farewell: None,
         shown: Default::default(),
         conn: 2,
-        report: Some(Reporting {
+        admitted: Default::default(),
+        report: Some(Box::new(Reporting {
             report: stop_report(),
             stepped: true,
             reader: None,
-        }),
+        })),
     }];
     let mut recovery =
         crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
@@ -1923,17 +1927,33 @@ fn answered_without_an_end(repo: &std::path::Path, author: &AgentLabel) {
 
 /// The incident through the monitor's own admission, reader and seams: a
 /// Stop parks, the round registers it, its hook dies having been handed
-/// nothing, and the close the reader hears leaves the agent unwatched,
+/// nothing, and the close the reader hears dates the agent's having no
+/// waiter. Its turn is over on the Stop that hook reported, placed in its
+/// record as the hook read it, and on nothing else: so it is idle, and
 /// nudged once work is owed and the idle settle has passed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_park_whose_hook_dies_leaves_its_agent_unwatched_and_nudged() {
+async fn a_park_whose_hook_dies_is_nudged_on_the_stop_it_reported() {
     let (repo, author, timer) = timer_repo();
     answered_without_an_end(repo.path(), &author);
     let state = folded(repo.path()).await.unwrap();
     let mut recovery = recovering(repo.path(), &author);
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-    let hook = Hook::carrying(repo.path(), &author, &stop_report(), ours);
+    let Report::TurnEnd { mut stop, .. } = stop_report() else {
+        unreachable!()
+    };
+    stop.place = crate::cli::wake_repeat::place(
+        clank_core::Tool::Claude,
+        Some(&repo.path().join("record.jsonl")),
+        None,
+    );
+    assert_eq!(stop.place.turn.as_deref(), Some("P"));
+    let report = Report::TurnEnd {
+        stop,
+        deadline: u64::MAX,
+        questions: Vec::new(),
+    };
+    let hook = Hook::carrying(repo.path(), &author, &report, ours);
     let client = admitted(theirs, repo.path(), &heard_tx).await;
     let conn = client.conn;
     let mut clients = vec![client];
@@ -1992,7 +2012,7 @@ async fn a_park_whose_hook_dies_leaves_its_agent_unwatched_and_nudged() {
     let dir = crate::agent_store::agents_root(repo.path()).join(author.as_str());
     assert_eq!(
         crate::cli::agent_state::load(&dir).unwrap().activity,
-        crate::cli::agent_state::Activity::Unwatched
+        crate::cli::agent_state::Activity::Idle
     );
     let nudges = |recovery: &mut crate::cli::recovery::Driver, at| {
         recovery

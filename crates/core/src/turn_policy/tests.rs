@@ -97,6 +97,7 @@ fn persons_stop(turn: &str, tasks: TaskSnapshot) -> Event {
             turn: Some(turn.into()),
             position: None,
             human_turn: true,
+            read_to: None,
         },
         tasks,
         ..report(Tool::Claude)
@@ -1419,6 +1420,7 @@ fn repeated_deliveries_count_and_a_human_turn_resets() {
         turn: Some(turn.into()),
         position: None,
         human_turn: human,
+        read_to: None,
     };
     let one = count_delivery(None, &items, &place("t1", false));
     let RepeatDecision::Counted(r1) = &one else {
@@ -1576,6 +1578,7 @@ fn a_presentation_id_names_one_payload() {
         turn: Some("later".into()),
         position: Some(99),
         human_turn: true,
+        read_to: None,
     };
     let changed = owed("event:a", "read:a2");
     assert_eq!(
@@ -1925,6 +1928,7 @@ fn an_overtaken_capture_states_no_count_and_changes_none() {
         turn: None,
         position: Some(position),
         human_turn: false,
+        read_to: None,
     };
     let b = RepeatRecord {
         items: vec!["b".into()],
@@ -1965,6 +1969,7 @@ fn only_a_known_persons_newer_turn_resets() {
             turn: Some(turn.into()),
             position: Some(position),
             human_turn: human,
+            read_to: None,
         };
         let RepeatDecision::Counted(next) = count_delivery(prev.as_ref(), &items, &place) else {
             panic!("{turn}");
@@ -2203,4 +2208,240 @@ fn a_presentation_saved_without_a_hand_over_time_still_loads() {
     let st = SessionState::restored(persisted);
     assert_eq!(st.outstanding, None);
     assert_eq!(st.resolved.map(|(_, how)| how), Some(Resolution::Failed));
+}
+
+/// A Stop placed at `turn`'s boundary `position`.
+fn placed_stop(turn: &str, position: u64) -> TurnEndReport {
+    TurnEndReport {
+        place: TurnPlace {
+            turn: Some(turn.into()),
+            position: Some(position),
+            human_turn: false,
+            read_to: None,
+        },
+        ..report(Tool::Codex)
+    }
+}
+
+fn stopped_at(turn: &str, position: u64, at: Ms) -> Option<Stopped> {
+    Some(Stopped {
+        turn: Some(turn.into()),
+        position: Some(position),
+        read_to: None,
+        at,
+    })
+}
+
+/// A Stop of `turn` whose boundary the adapter could not read.
+fn unplaced_stop(turn: Option<&str>) -> TurnEndReport {
+    TurnEndReport {
+        place: TurnPlace {
+            turn: turn.map(str::to_string),
+            position: None,
+            human_turn: false,
+            read_to: None,
+        },
+        ..report(Tool::Claude)
+    }
+}
+
+fn unplaced_at(turn: Option<&str>, at: Ms) -> Option<Stopped> {
+    Some(Stopped {
+        turn: turn.map(str::to_string),
+        position: None,
+        read_to: None,
+        at,
+    })
+}
+
+/// Only a turn-end report is evidence that a turn is over, and it is
+/// kept against the place the hook read it at. A park stepped again, a
+/// compaction arriving as one, a session start and a Stop from a session
+/// that is not bound record nothing. A Stop the adapter could not place
+/// is kept as that: it replaces what the last one said and is never
+/// dropped, since a turn did end.
+#[test]
+fn only_a_turn_end_report_records_a_stop() {
+    let s = session();
+    let none: [OwedItem; 0] = [];
+    let mut st = SessionState::new(s.clone());
+    for not_a_stop in [
+        Event::Parked(placed_stop("t1", 40)),
+        Event::SessionStart(s.clone()),
+        Event::Observed,
+        Event::CheckInDue,
+    ] {
+        st.step(not_a_stop.clone(), &facts(T0, &s, &none));
+        assert_eq!(st.stopped, None, "{not_a_stop:?}");
+    }
+    let elsewhere = TurnEndReport {
+        session: other_session(),
+        ..placed_stop("t1", 40)
+    };
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(elsewhere), &facts(T0, &s, &none))),
+        Verdict::Silent(SilentWhy::StaleBinding)
+    );
+    assert_eq!(st.stopped, None, "another session's Stop");
+
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(placed_stop("t1", 40)), &facts(T0, &s, &none))),
+        Verdict::Park
+    );
+    assert_eq!(st.stopped, stopped_at("t1", 40, T0));
+    st.step(
+        Event::TurnEnd(placed_stop("t1", 40)),
+        &facts(T0 + MINUTE, &s, &none),
+    );
+    assert_eq!(
+        st.stopped,
+        stopped_at("t1", 40, T0),
+        "the same Stop reported again keeps when it was first reported"
+    );
+    st.step(
+        Event::TurnEnd(placed_stop("t1", 90)),
+        &facts(T0 + 2 * MINUTE, &s, &none),
+    );
+    assert_eq!(
+        st.stopped,
+        stopped_at("t1", 90, T0 + 2 * MINUTE),
+        "a later Stop of the same turn is another"
+    );
+    st.step(
+        Event::TurnEnd(unplaced_stop(Some("t1"))),
+        &facts(T0 + 3 * MINUTE, &s, &none),
+    );
+    assert_eq!(
+        st.stopped,
+        unplaced_at(Some("t1"), T0 + 3 * MINUTE),
+        "a Stop with no place replaces the precise one and is kept"
+    );
+    st.step(
+        Event::TurnEnd(unplaced_stop(Some("t1"))),
+        &facts(T0 + 4 * MINUTE, &s, &none),
+    );
+    assert_eq!(
+        st.stopped,
+        unplaced_at(Some("t1"), T0 + 3 * MINUTE),
+        "reported again for the turn it named, it keeps its time"
+    );
+    st.step(stop(), &facts(T0 + 5 * MINUTE, &s, &none));
+    assert_eq!(st.stopped, unplaced_at(None, T0 + 5 * MINUTE));
+    st.step(stop(), &facts(T0 + 6 * MINUTE, &s, &none));
+    assert_eq!(
+        st.stopped,
+        unplaced_at(None, T0 + 6 * MINUTE),
+        "naming no turn, it cannot be told from a later Stop and is dated afresh"
+    );
+
+    let seen = |len| TurnEndReport {
+        place: TurnPlace {
+            read_to: Some(ReadTo { file: 7, len }),
+            ..TurnPlace::default()
+        },
+        ..report(Tool::Claude)
+    };
+    st.step(
+        Event::TurnEnd(seen(400)),
+        &facts(T0 + 7 * MINUTE, &s, &none),
+    );
+    st.step(
+        Event::TurnEnd(seen(400)),
+        &facts(T0 + 8 * MINUTE, &s, &none),
+    );
+    let kept = st.stopped.clone().unwrap();
+    assert_eq!(
+        (kept.read_to, kept.at),
+        (Some(ReadTo { file: 7, len: 400 }), T0 + 7 * MINUTE),
+        "the same report replayed, known by what its hook saw, is the same Stop"
+    );
+    st.step(
+        Event::TurnEnd(seen(900)),
+        &facts(T0 + 9 * MINUTE, &s, &none),
+    );
+    let later = st.stopped.clone().unwrap();
+    assert_eq!(
+        (later.read_to, later.at),
+        (Some(ReadTo { file: 7, len: 900 }), T0 + 9 * MINUTE),
+        "a hook that saw more of the record reports another Stop"
+    );
+
+    let off = Facts {
+        auto: Ok(AutoMode::Off),
+        ..facts(T0, &s, &none)
+    };
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(placed_stop("t2", 10)), &off)),
+        Verdict::Silent(SilentWhy::AutoOff)
+    );
+    assert_eq!(
+        st.stopped,
+        stopped_at("t2", 10, T0),
+        "a turn clank does not drive still ended"
+    );
+}
+
+/// The Stop stands until clank wakes the agent past it: a delivery that
+/// reached it, or a notice. A delivery that failed woke nothing, and a
+/// new binding owns none of the old one's evidence. It survives the
+/// file.
+#[test]
+fn a_stop_stands_until_the_agent_is_woken_past_it() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let none: [OwedItem; 0] = [];
+
+    let mut st = SessionState::new(s.clone());
+    let Verdict::Deliver { presentation, .. } =
+        verdict(st.step(Event::TurnEnd(placed_stop("t1", 40)), &facts(T0, &s, &a)))
+    else {
+        panic!("owed work is delivered");
+    };
+    assert_eq!(st.stopped, stopped_at("t1", 40, T0), "in flight");
+    st.step(Event::EmitFailed(presentation), &facts(T0 + 1, &s, &a));
+    assert_eq!(
+        st.stopped,
+        stopped_at("t1", 40, T0),
+        "a delivery that failed woke nothing"
+    );
+    let restored = SessionState::restored(
+        serde_json::from_str(&serde_json::to_string(&st.persisted()).unwrap()).unwrap(),
+    );
+    assert_eq!(restored.stopped, st.stopped, "kept across a restart");
+
+    let Verdict::Deliver { presentation, .. } =
+        verdict(st.step(Event::Parked(placed_stop("t1", 40)), &facts(T0 + 2, &s, &a)))
+    else {
+        panic!("presented afresh");
+    };
+    committed(st.step(Event::Delivered(presentation), &facts(T0 + 3, &s, &a)));
+    assert_eq!(st.stopped, None, "delivered: the agent starts a turn");
+
+    let mut st = SessionState::new(s.clone());
+    st.feedback.push(Notice::ArmWait);
+    assert!(matches!(
+        verdict(st.step(Event::TurnEnd(placed_stop("t1", 40)), &facts(T0, &s, &none))),
+        Verdict::Notify(_)
+    ));
+    assert_eq!(
+        st.stopped, None,
+        "a notice wakes it with nothing to wait for"
+    );
+
+    let mut st = SessionState::new(s.clone());
+    st.step(Event::TurnEnd(placed_stop("t1", 40)), &facts(T0, &s, &none));
+    st.rebind(other_session());
+    assert_eq!(st.stopped, None, "another binding's turn");
+}
+
+/// Turn state saved before Stops were kept has none.
+#[test]
+fn state_saved_before_stops_were_kept_reports_none() {
+    for old in [
+        old_bytes::OTHER_RENEWAL,
+        old_bytes::TURN_SCOPED,
+        old_bytes::LISTED,
+    ] {
+        assert_eq!(restore(old).stopped, None);
+    }
 }

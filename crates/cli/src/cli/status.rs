@@ -939,16 +939,18 @@ impl StatusSnapshot {
             if let Some(state) = &row.state {
                 let now = crate::cli::recovery::unix_now();
                 let line = state.line(now);
-                let sgr = match (state.undelivered(now), state.interrupted()) {
-                    (Some(_), _) => Some(crate::cli::agent_state::UNDELIVERED_SGR),
-                    (None, true) => Some(crate::cli::agent_state::INTERRUPTED_SGR),
-                    (None, false) => None,
-                };
-                let line = match sgr.filter(|_| paint) {
-                    Some(sgr) => format!("\x1b[{sgr}m{line}\x1b[0m"),
+                let line = match state.alarm(now).filter(|_| paint) {
+                    Some(alarm) => format!("\x1b[{}m{line}\x1b[0m", alarm.sgr()),
                     None => line,
                 };
                 let _ = writeln!(out, "state: {} → {line}", row.label);
+            } else if row.session.is_some() {
+                let _ = writeln!(
+                    out,
+                    "state: {} → {}",
+                    row.label,
+                    crate::cli::agent_state::UNKNOWN
+                );
             }
             // A current state already says why it waits for a person.
             if let Some(why) = &row.waiting_for_you
@@ -3303,6 +3305,7 @@ mod dirty_and_wake_tests {
                     monitor: crate::cli::agent_state::Observer::me(),
                     activity: crate::cli::agent_state::Activity::Idle,
                     since: 0,
+                    reachability: Default::default(),
                     owed: None,
                     nudge: crate::cli::agent_state::Nudge::Nothing,
                     cannot_resume: None,
@@ -3414,6 +3417,7 @@ mod dirty_and_wake_tests {
                 },
                 activity: Activity::Failed("billing_error".into()),
                 since: 0,
+                reachability: Default::default(),
                 owed: None,
                 nudge: Nudge::WaitingForYou("this kind of failure needs a person".into()),
                 cannot_resume: Some("no evidence".into()),
@@ -3468,6 +3472,7 @@ mod dirty_and_wake_tests {
                     },
                     activity,
                     since: 0,
+                    reachability: Default::default(),
                     owed: None,
                     nudge: Nudge::Nothing,
                     cannot_resume: None,
@@ -3520,8 +3525,9 @@ mod dirty_and_wake_tests {
                 pid: 1,
                 birth: None,
             },
-            activity: Activity::Working,
+            activity: Activity::TurnOpen,
             since: now - 2520,
+            reachability: Default::default(),
             owed: Some(Owing {
                 oldest: item.clone(),
                 undelivered: Some(item),
@@ -3552,10 +3558,102 @@ mod dirty_and_wake_tests {
             "{painted:?}"
         );
         let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(
+            json["agents"][0]["state"]["state"]["reachability"],
+            serde_json::json!({"by": "unknown"}),
+            "{json}"
+        );
         let owed = &json["agents"][0]["state"]["owed"];
         assert_eq!(owed["age"], 7200, "{json}");
         assert_eq!(owed["kind"], "message");
         assert_eq!(owed["delivery"]["is"], "not_delivered");
+    }
+
+    /// Status says of an agent what its row says: unreachable, in red once
+    /// it is owed work, with the reachability value in the JSON; and of a
+    /// bound agent with no published state, that nothing is known.
+    #[test]
+    fn status_says_unreachable_and_unknown_as_the_row_does() {
+        use crate::cli::agent_state::{
+            Activity, AgentState, Case, HandsOff, Nudge, Observer, OwedItem, Owing, Reachability,
+            UNDELIVERED_SGR, View,
+        };
+        use crate::cli::ledger::{Delivery, Since};
+        let now = crate::cli::recovery::unix_now();
+        let item = OwedItem {
+            kind: "message".into(),
+            what: "message from claude".into(),
+            since: Since::At(now - 60),
+            delivery: Delivery::NotDelivered,
+        };
+        let state = |owed: Option<Owing>| AgentState {
+            role: "standby".into(),
+            session: "s1".into(),
+            tool: clank_core::Tool::Grok,
+            monitor: Observer {
+                pid: 1,
+                birth: None,
+            },
+            activity: Activity::Idle,
+            since: now - 2520,
+            reachability: Reachability::NoWaiter {
+                since: Some(now - 2520),
+            },
+            owed,
+            nudge: Nudge::Nothing,
+            cannot_resume: None,
+            attending: Vec::new(),
+            asking: None,
+            repeated: None,
+        };
+        let shown = |owed: Option<Owing>, paint| {
+            let mut snap = minimal_snapshot();
+            let mut row = agent_row("grok", None);
+            row.state = Some(View::at(state(owed), None, now));
+            snap.agents = vec![row];
+            (snap.human(paint), serde_json::to_value(&snap).unwrap())
+        };
+        let (dim, json) = shown(None, true);
+        assert!(dim.contains("state: grok → unreachable 42m\n"), "{dim:?}");
+        assert_eq!(
+            json["agents"][0]["state"]["state"]["reachability"],
+            serde_json::json!({"by": "none", "since": now - 2520})
+        );
+        let owing = Owing {
+            oldest: item.clone(),
+            undelivered: Some(item),
+            warn: 2400,
+            case: Case::HandsOff(HandsOff::CannotResume("no way to resume it".into())),
+        };
+        let (red, _) = shown(Some(owing.clone()), true);
+        assert!(
+            red.contains(&format!(
+                "state: grok → \x1b[{UNDELIVERED_SGR}munreachable 42m · not nudged: no way to \
+                 resume it\x1b[0m"
+            )),
+            "{red:?}"
+        );
+        let (plain, _) = shown(Some(owing), false);
+        assert!(
+            plain.contains("state: grok → unreachable 42m · not nudged: no way to resume it"),
+            "{plain}"
+        );
+
+        let mut snap = minimal_snapshot();
+        let mut bound = agent_row("claude", None);
+        bound.session = Some(
+            serde_json::from_str(
+                r#"{"id":"01a156a7-f516-7dc0-8b58-520faf122796","tool":"claude","updated_at":"x"}"#,
+            )
+            .unwrap(),
+        );
+        snap.agents = vec![bound, agent_row("codex", None)];
+        let said = snap.human(false);
+        assert!(said.contains("state: claude → unknown\n"), "{said}");
+        assert!(
+            !said.contains("state: codex"),
+            "an agent with no session has no state to be unknown: {said}"
+        );
     }
 
     #[test]

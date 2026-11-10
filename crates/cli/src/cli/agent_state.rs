@@ -20,6 +20,9 @@ pub(crate) struct AgentState {
     pub(crate) activity: Activity,
     /// Unix seconds: when `activity` last changed, as the monitor saw it.
     pub(crate) since: u64,
+    /// Unknown in a state published before reachability was.
+    #[serde(default)]
+    pub(crate) reachability: Reachability,
     /// What clank owes the agent and which of the four cases that puts it
     /// in. Absent when nothing is owed, and from a state published before
     /// owed work was accounted for.
@@ -64,24 +67,104 @@ impl Observer {
     }
 }
 
+/// How the monitor could hand the agent work right now, by its own
+/// connections and never by anything a waiter wrote of itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "by", rename_all = "snake_case")]
+pub(crate) enum Reachability {
+    /// Not established: the state predates reachability, or its monitor
+    /// has not served long enough for a missing connection to mean one is
+    /// missing.
+    #[default]
+    Unknown,
+    /// A waiter of the bound session is connected, since this unix second.
+    Waiter {
+        since: u64,
+        /// The build the waiter said it runs. `None` from a waiter built
+        /// before waiters said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
+    },
+    /// No waiter is connected. `since` is the earliest unix second a
+    /// record dates that from: the monitor saw the last one go, custody
+    /// recorded its park lost, or the monitor saw a turn end with none.
+    #[serde(rename = "none")]
+    NoWaiter { since: Option<u64> },
+}
+
 /// What the agent is doing, by its record's latest turn.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "is", content = "why", rename_all = "snake_case")]
+#[serde(
+    tag = "is",
+    content = "why",
+    rename_all = "snake_case",
+    from = "stored::Activity"
+)]
 pub(crate) enum Activity {
-    Working,
-    /// Its wait was lost without delivering, and its record has not moved
-    /// since.
-    Unwatched,
+    /// Its latest turn is open, no Stop was reported for it, and its
+    /// record moved inside the stall window.
+    Working(Moving),
+    /// Its latest turn is open and nothing shows it moving.
+    TurnOpen,
+    /// Its latest turn is over: the record says so, or its Stop hook did.
     Idle,
     Failed(String),
     /// Waiting on a person to answer its question.
     Asking,
     /// Its latest turn was stopped, by whom the record does not say.
     Interrupted,
-    /// It owes work and its record cannot be read.
+    /// Its record is wanted and cannot be read.
     Unknown(String),
-    /// It owes nothing, so its record is not being read. Never idle.
+    /// Its record is not being read. Never idle.
     Unobserved,
+}
+
+/// The evidence a working agent's record gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Moving {
+    /// Unix seconds: the record's last write the monitor saw.
+    pub(crate) moved: u64,
+    /// Unix seconds: when that write falls out of the stall window, and
+    /// stops being evidence.
+    pub(crate) until: u64,
+}
+
+mod stored {
+    /// [`super::Activity`] as any build wrote it. `working` carried no
+    /// evidence before it had to, and reads as a turn that is open.
+    /// `unwatched` took a lost wait for a turn's end, which it is not
+    /// evidence of, and reads as unknown.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "is", content = "why", rename_all = "snake_case")]
+    pub(super) enum Activity {
+        Working(Option<super::Moving>),
+        TurnOpen,
+        Unwatched,
+        Idle,
+        Failed(String),
+        Asking,
+        Interrupted,
+        Unknown(String),
+        Unobserved,
+    }
+
+    impl From<Activity> for super::Activity {
+        fn from(a: Activity) -> Self {
+            match a {
+                Activity::Working(Some(moving)) => Self::Working(moving),
+                Activity::Working(None) | Activity::TurnOpen => Self::TurnOpen,
+                Activity::Unwatched => Self::Unknown(
+                    "published by a build that read a lost wait as its turn's end".into(),
+                ),
+                Activity::Idle => Self::Idle,
+                Activity::Failed(class) => Self::Failed(class),
+                Activity::Asking => Self::Asking,
+                Activity::Interrupted => Self::Interrupted,
+                Activity::Unknown(why) => Self::Unknown(why),
+                Activity::Unobserved => Self::Unobserved,
+            }
+        }
+    }
 }
 
 /// The work clank owes an agent, and what stands between the agent and it.
@@ -528,10 +611,29 @@ impl View {
             .flatten()
     }
 
-    /// Whether a row may say the agent is working: its record shows a
-    /// turn going, and nothing owed to it says otherwise.
-    pub(crate) fn working(&self) -> bool {
-        self.activity() == Some(&Activity::Working) && proven_working(&self.state)
+    /// Whether a row may say the agent is working: a current state holds
+    /// evidence of it that still stands at `now`.
+    pub(crate) fn working(&self, now: u64) -> bool {
+        matches!(self.activity(), Some(Activity::Working(m)) if now < m.until)
+    }
+
+    /// Whether the agent is currently known to be waiting with no waiter
+    /// to take its work.
+    pub(crate) fn unreachable(&self, now: u64) -> bool {
+        self.stale.is_none() && unreachable(&self.state, now).is_some()
+    }
+
+    /// Why the state calls for a person, if it does.
+    pub(crate) fn alarm(&self, now: u64) -> Option<Alarm> {
+        if self.undelivered(now).is_some() {
+            Some(Alarm::Undelivered)
+        } else if self.unreachable(now) && self.state.owed.is_some() {
+            Some(Alarm::Unreachable)
+        } else if self.interrupted() {
+            Some(Alarm::Interrupted)
+        } else {
+            None
+        }
     }
 
     /// `state` as a reader at `now` sees it. A stale state says nothing
@@ -566,15 +668,41 @@ impl View {
         }
     }
 
-    /// [`Self::brief`] for a roster row: an agent waiting for work is the
-    /// resting state and says nothing, keeping only its clauses.
+    /// [`Self::brief`] for a roster row: an agent waiting on a connected
+    /// waiter is the resting state and says nothing, keeping only its
+    /// clauses.
     pub(crate) fn row(&self, now: u64) -> Option<String> {
-        match self.activity() {
-            Some(Activity::Unobserved) => {
-                let clauses = clauses(&self.state, now, false, false);
-                (!clauses.is_empty()).then(|| clauses.join(" · "))
-            }
-            _ => Some(self.brief(now)),
+        let resting = match (self.activity(), &self.state.reachability) {
+            (Some(Activity::Idle | Activity::Unobserved), Reachability::Waiter { .. }) => true,
+            // Its Stop hook is on its way to park.
+            (Some(Activity::Idle), Reachability::NoWaiter { .. }) => !self.unreachable(now),
+            _ => false,
+        };
+        if !resting {
+            return Some(self.brief(now));
+        }
+        let clauses = clauses(&self.state, now, false, false);
+        (!clauses.is_empty()).then(|| clauses.join(" · "))
+    }
+}
+
+/// Why a row calls for a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Alarm {
+    /// Work the bound session has gone without past the warn threshold.
+    Undelivered,
+    /// Work is owed, and nothing is connected that could deliver it.
+    Unreachable,
+    /// A person stopped its latest turn.
+    Interrupted,
+}
+
+impl Alarm {
+    /// The SGR a row in this alarm is drawn in.
+    pub(crate) fn sgr(self) -> &'static str {
+        match self {
+            Alarm::Undelivered | Alarm::Unreachable => UNDELIVERED_SGR,
+            Alarm::Interrupted => INTERRUPTED_SGR,
         }
     }
 }
@@ -637,13 +765,41 @@ fn undelivered(state: &AgentState, now: u64) -> Option<String> {
     Some(format!("{UNDELIVERED} {age} · {}", item.what))
 }
 
-/// Whether `working` is something the state proves: nothing is owed, or
-/// the owed work's case is the record's own evidence of a turn going.
-fn proven_working(state: &AgentState) -> bool {
-    state
-        .owed
-        .as_ref()
-        .is_none_or(|o| matches!(o.case, Case::Active(_)))
+/// How an agent waiting with no waiter is named wherever a person reads
+/// its state.
+pub(crate) const UNREACHABLE: &str = "unreachable";
+
+/// How long a turn that is over may go without a waiter before the agent
+/// is called unreachable: a turn's end is read moments before its Stop
+/// hook parks, and a delivery retires the waiter moments before the turn
+/// it starts is recorded.
+pub(crate) const UNREACHABLE_AFTER: u64 = 20;
+
+/// Since when the agent has waited with no waiter, if it does: its turn
+/// is over, nothing is connected that could hand it work, and that has
+/// lasted [`UNREACHABLE_AFTER`]. The inner `None` is a time no record
+/// dates.
+fn unreachable(state: &AgentState, now: u64) -> Option<Option<u64>> {
+    let (Activity::Idle, Reachability::NoWaiter { since }) = (&state.activity, &state.reachability)
+    else {
+        return None;
+    };
+    let Some(went) = since else {
+        return Some(None);
+    };
+    let at = (*went).max(state.since);
+    (now >= at.saturating_add(UNREACHABLE_AFTER)).then_some(Some(at))
+}
+
+/// `unreachable <age>`, with the age said to be unknown where it is.
+fn unreachable_text(since: Option<u64>, now: u64) -> String {
+    match since {
+        Some(at) => format!(
+            "{UNREACHABLE} {}",
+            crate::age::duration(now.saturating_sub(at))
+        ),
+        None => format!("{UNREACHABLE} age unknown"),
+    }
 }
 
 /// How an interrupted agent is named wherever a person reads its state.
@@ -668,30 +824,40 @@ fn said(state: &AgentState, now: u64, long: bool) -> String {
 
 /// What the agent is doing, by its record, and for how long.
 fn doing(state: &AgentState, now: u64) -> String {
+    if let Some(since) = unreachable(state, now) {
+        return unreachable_text(since, now);
+    }
     let age = crate::age::duration(now.saturating_sub(state.since));
     match &state.activity {
-        Activity::Working if proven_working(state) => format!("working {age}"),
-        // Its turn has not ended, and nothing shows it moving.
-        Activity::Working => format!("turn open {age}"),
-        Activity::Unwatched => format!("unwatched {age}"),
+        Activity::Working(m) if now < m.until => format!("working {age}"),
+        Activity::Working(_) | Activity::TurnOpen => format!("turn open {age}"),
         Activity::Idle => format!("idle {age}"),
         Activity::Failed(class) => format!("failed ({class}) {age}"),
         Activity::Asking => format!("asking {age}"),
         // Recovery leaves an interrupted turn alone, so a person reading
         // this is the only one who will act on it.
         Activity::Interrupted => format!("{INTERRUPTED} {age}"),
-        Activity::Unknown(_) => "unknown".to_string(),
-        // Clank has nothing for it, whether a parked wait or a nudge
-        // would deliver the next thing.
-        Activity::Unobserved => "waiting for work".to_string(),
+        Activity::Unknown(_) => UNKNOWN.to_string(),
+        Activity::Unobserved => match state.reachability {
+            Reachability::Waiter { .. } => "waiting for work".to_string(),
+            // Nothing was looked at, and nothing is connected to say it
+            // rests.
+            Reachability::Unknown | Reachability::NoWaiter { .. } => UNKNOWN.to_string(),
+        },
     }
 }
+
+/// What a row says of an agent nothing is known about.
+pub(crate) const UNKNOWN: &str = "unknown";
 
 /// What stands between the agent and its owed work, then what clank
 /// means to do. `shouted` when the row leads with the undelivered item
 /// rather than the activity, which then no longer says the reason itself.
 fn clauses(state: &AgentState, now: u64, long: bool, shouted: bool) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some(since) = unreachable(state, now).filter(|_| shouted) {
+        out.push(unreachable_text(since, now));
+    }
     match state.owed.as_ref().map(|o| &o.case) {
         Some(Case::HandsOff(why)) => {
             let headline_says = match why {
@@ -780,6 +946,7 @@ mod tests {
             },
             activity: Activity::Idle,
             since: 100,
+            reachability: Reachability::Unknown,
             owed: None,
             nudge: Nudge::Nothing,
             cannot_resume: None,
@@ -787,6 +954,19 @@ mod tests {
             asking: None,
             repeated: None,
         }
+    }
+
+    const CONNECTED: Reachability = Reachability::Waiter {
+        since: 100,
+        build: None,
+    };
+
+    /// Evidence that the record moved at `moved`, standing for 2400s.
+    fn moving(moved: u64) -> Activity {
+        Activity::Working(Moving {
+            moved,
+            until: moved + 2400,
+        })
     }
 
     /// Each stamp that no longer matches makes the state stale; all of
@@ -807,17 +987,141 @@ mod tests {
     fn unobserved() -> AgentState {
         AgentState {
             activity: Activity::Unobserved,
+            reachability: CONNECTED,
             cannot_resume: Some("no pane named `claude` in /r's tab".into()),
             ..state()
         }
     }
 
-    /// An agent owed nothing is waiting for work, said once, with no
-    /// caveat about a nudge nothing calls for.
+    /// An agent owed nothing with a waiter connected is waiting for work,
+    /// said once, with no caveat about a nudge nothing calls for. With no
+    /// waiter known to be connected nothing says it rests: it is unknown.
     #[test]
-    fn an_agent_owed_nothing_is_waiting_for_work() {
+    fn an_agent_owed_nothing_is_waiting_for_work_only_on_a_connected_waiter() {
         assert_eq!(line(&unobserved(), 1000), "waiting for work");
         assert_eq!(brief(&unobserved(), 1000), "waiting for work");
+        for unproven in [
+            Reachability::Unknown,
+            Reachability::NoWaiter { since: Some(100) },
+        ] {
+            let s = AgentState {
+                reachability: unproven.clone(),
+                ..unobserved()
+            };
+            assert_eq!(brief(&s, 1000), "unknown", "{unproven:?}");
+            assert_eq!(
+                View::at(s, None, 1000).row(1000).as_deref(),
+                Some("unknown"),
+                "{unproven:?}"
+            );
+        }
+    }
+
+    /// An agent whose turn is over with no waiter connected is unreachable
+    /// since the later of its turn's end and its last waiter going, once
+    /// that has lasted long enough to be no hook on its way; where no
+    /// record dates the waiter's going the age is said to be unknown. The
+    /// row is alarmed only when work is owed.
+    #[test]
+    fn an_agent_waiting_with_no_waiter_is_unreachable() {
+        let gone = |activity, went| AgentState {
+            activity,
+            since: 1000,
+            reachability: Reachability::NoWaiter { since: went },
+            ..state()
+        };
+        assert_eq!(
+            brief(&gone(Activity::Idle, Some(400)), 1000 + 2520),
+            "unreachable 42m",
+            "from the turn's end"
+        );
+        assert_eq!(
+            brief(&gone(Activity::Idle, Some(4000)), 4000 + 2520),
+            "unreachable 42m",
+            "from the waiter's going"
+        );
+        assert_eq!(
+            brief(&gone(Activity::Idle, None), 9000),
+            "unreachable age unknown"
+        );
+        let just = gone(Activity::Idle, Some(4000));
+        let before = View::at(just.clone(), None, 0);
+        assert!(!before.unreachable(4000 + UNREACHABLE_AFTER - 1));
+        assert_eq!(before.row(4000 + UNREACHABLE_AFTER - 1), None);
+        assert!(before.unreachable(4000 + UNREACHABLE_AFTER));
+        assert_eq!(
+            before.row(4000 + UNREACHABLE_AFTER).as_deref(),
+            Some("unreachable 20s")
+        );
+        assert_eq!(before.alarm(9000), None, "nothing is owed: dim");
+
+        let owed = AgentState {
+            owed: Some(owing(
+                message(Since::At(8990), Delivery::NotDelivered),
+                Case::Recovering,
+            )),
+            nudge: Nudge::At(9180),
+            ..just
+        };
+        let v = View::at(owed.clone(), None, 9000);
+        assert_eq!(v.alarm(9000), Some(Alarm::Unreachable), "owed work: red");
+        assert_eq!(Alarm::Unreachable.sgr(), UNDELIVERED_SGR);
+        assert_eq!(v.row(9000).as_deref(), Some("unreachable 1h · nudge in 3m"));
+        assert_eq!(
+            brief(&owed, 8990 + 2400),
+            "UNDELIVERED 40m · message from claude · unreachable 2h · nudge in 0s",
+            "a shouted row still says nothing is connected"
+        );
+        let stale = View::at(owed.clone(), Some("its monitor is gone"), 9000);
+        assert!(!stale.unreachable(9000));
+        assert_eq!(stale.alarm(9000), None);
+        for reachable in [Reachability::Unknown, CONNECTED] {
+            let s = AgentState {
+                reachability: reachable.clone(),
+                ..owed.clone()
+            };
+            let v = View::at(s, None, 9000);
+            assert!(!v.unreachable(9000), "{reachable:?}");
+            assert_eq!(v.alarm(9000), None, "{reachable:?}");
+        }
+        for busy in [moving(8000), Activity::TurnOpen, Activity::Interrupted] {
+            let s = AgentState {
+                activity: busy.clone(),
+                ..owed.clone()
+            };
+            assert!(
+                !View::at(s, None, 9000).unreachable(9000),
+                "a turn that is not over is not waiting: {busy:?}"
+            );
+        }
+    }
+
+    /// A Grok agent with no waiter and work owed says it is unreachable
+    /// and that clank will not nudge it, and why.
+    #[test]
+    fn an_unreachable_agent_clank_cannot_resume_says_so() {
+        let s = AgentState {
+            tool: Tool::Grok,
+            since: 1000,
+            reachability: Reachability::NoWaiter { since: Some(1000) },
+            owed: Some(owing(
+                message(Since::At(1000), Delivery::NotDelivered),
+                Case::HandsOff(HandsOff::CannotResume(
+                    crate::cli::resume::NO_CANDIDATE.into(),
+                )),
+            )),
+            cannot_resume: Some(crate::cli::resume::NO_CANDIDATE.into()),
+            ..state()
+        };
+        assert_eq!(brief(&s, 1300), "unreachable 5m · not nudged");
+        assert_eq!(
+            line(&s, 1300),
+            "unreachable 5m · not nudged: this harness has no way to resume that cancels nothing"
+        );
+        assert_eq!(
+            View::at(s, None, 1300).alarm(1300),
+            Some(Alarm::Unreachable)
+        );
     }
 
     /// An age is read by a person, so 20 hours reads `20h`, not the second
@@ -849,6 +1153,8 @@ mod tests {
 
     /// A roster row leaves the resting state unsaid and keeps its clauses,
     /// while `line` still says it; every other activity reads as `brief`.
+    /// Resting is a turn that is over on a connected waiter: with none
+    /// known, an idle row says so.
     #[test]
     fn an_idle_roster_row_says_nothing_but_status_still_does() {
         let waiting = View {
@@ -867,7 +1173,22 @@ mod tests {
             stale: None,
         };
         assert_eq!(nudging.row(1000).as_deref(), Some("nudged"));
-        for activity in [Activity::Working, Activity::Idle, Activity::Interrupted] {
+        let idle = View {
+            owed: None,
+            state: AgentState {
+                reachability: CONNECTED,
+                ..state()
+            },
+            stale: None,
+        };
+        assert_eq!(idle.row(1000), None);
+        assert_eq!(idle.line(1000), "idle 15m");
+        for activity in [
+            moving(900),
+            Activity::TurnOpen,
+            Activity::Idle,
+            Activity::Interrupted,
+        ] {
             let v = View {
                 owed: None,
                 state: AgentState {
@@ -877,6 +1198,22 @@ mod tests {
                 stale: None,
             };
             assert_eq!(v.row(1000), Some(v.brief(1000)));
+        }
+        for activity in [moving(900), Activity::TurnOpen, Activity::Interrupted] {
+            let v = View {
+                owed: None,
+                state: AgentState {
+                    activity: activity.clone(),
+                    reachability: CONNECTED,
+                    ..state()
+                },
+                stale: None,
+            };
+            assert_eq!(
+                v.row(1000),
+                Some(v.brief(1000)),
+                "a waiter does not make a turn rest: {activity:?}"
+            );
         }
     }
 
@@ -1033,42 +1370,54 @@ mod tests {
         );
     }
 
-    /// A row says `working` only on the record's own evidence: an open
-    /// turn clank is recovering, delivering to or keeping its hands off is
-    /// a turn that is open, and nothing more.
+    /// A row says `working` only while evidence of it stands: the record
+    /// moved, and that is still inside its window. Past it, or with a turn
+    /// that is open and nothing more, the turn is open. Whatever clank owes
+    /// the agent changes neither.
     #[test]
     fn working_is_said_only_on_evidence() {
-        let running = |case: Option<Case>| AgentState {
-            activity: Activity::Working,
+        let owed = |activity, case: Option<Case>| AgentState {
+            activity,
             owed: case.map(|case| owing(message(Since::At(100), Delivery::Delivered), case)),
             ..state()
         };
-        for proven in [
+        for case in [
             None,
             Some(Case::Active(Active::Turn)),
-            Some(Case::Active(Active::NativeRetry)),
+            Some(Case::HandsOff(HandsOff::AutoOff)),
+            Some(Case::Recovering),
         ] {
-            let s = running(proven.clone());
-            assert!(view(s.clone()).working(), "{proven:?}");
-            assert!(brief(&s, 1000).starts_with("working 15m"), "{proven:?}");
+            let proven = owed(moving(900), case.clone());
+            assert!(view(proven.clone()).working(1000), "{case:?}");
+            assert!(brief(&proven, 1000).starts_with("working 15m"), "{case:?}");
+            assert!(
+                !view(proven.clone()).working(900 + 2400),
+                "evidence runs out: {case:?}"
+            );
+            assert!(
+                brief(&proven, 900 + 2400).starts_with("turn open "),
+                "{case:?}"
+            );
+            let open = owed(Activity::TurnOpen, case.clone());
+            assert!(!view(open.clone()).working(1000), "{case:?}");
+            assert!(brief(&open, 1000).starts_with("turn open 15m"), "{case:?}");
         }
         assert_eq!(
-            brief(&running(Some(Case::Active(Active::NativeRetry))), 1000),
+            brief(
+                &owed(moving(900), Some(Case::Active(Active::NativeRetry))),
+                1000
+            ),
             "working 15m · retrying itself"
         );
-        for unproven in [
-            Case::HandsOff(HandsOff::AutoOff),
-            Case::BeingDelivered(2000),
-            Case::Recovering,
-        ] {
-            let s = running(Some(unproven.clone()));
-            assert!(!view(s.clone()).working(), "{unproven:?}");
-            assert!(brief(&s, 1000).starts_with("turn open 15m"), "{unproven:?}");
-        }
         assert_eq!(
-            brief(&running(Some(Case::BeingDelivered(2000))), 1000),
+            brief(
+                &owed(Activity::TurnOpen, Some(Case::BeingDelivered(2000))),
+                1000
+            ),
             "turn open 15m · being delivered"
         );
+        let stale = View::at(owed(moving(900), None), Some("its monitor is gone"), 1000);
+        assert!(!stale.working(1000), "a stale state proves nothing");
     }
 
     /// A stale view shouts nothing and reports nothing owed.
@@ -1105,6 +1454,12 @@ mod tests {
         assert_eq!(old.owed, None);
         assert_eq!(old.activity, Activity::Unobserved);
         assert_eq!(old.attending.len(), 1);
+        assert_eq!(old.reachability, Reachability::Unknown);
+        assert_eq!(
+            View::at(old, None, 0).row(0).as_deref(),
+            Some("unknown"),
+            "a state that says nothing of a waiter does not rest on one"
+        );
         let new: AgentState = serde_json::from_str(include_str!(
             "../../tests/fixtures/formats/state-owing.json"
         ))
@@ -1116,6 +1471,74 @@ mod tests {
             owed.undelivered.unwrap().delivery,
             Delivery::InFlight(1793845260)
         );
+    }
+
+    /// A state published before reachability and evidence were kept says
+    /// `working` with nothing behind it: it loads as a turn that is open,
+    /// reachability unknown, and no row spins on it.
+    #[test]
+    fn a_state_published_before_evidence_claims_no_work_and_no_waiter() {
+        let old: AgentState = serde_json::from_str(include_str!(
+            "../../tests/fixtures/formats/state-working.json"
+        ))
+        .unwrap();
+        assert_eq!(old.activity, Activity::TurnOpen);
+        assert_eq!(old.reachability, Reachability::Unknown);
+        let v = View::at(old, None, 1794316320);
+        assert!(!v.working(1794316320));
+        assert_eq!(v.brief(1794316320), "turn open 42m");
+    }
+
+    /// A state published when a lost wait was read as its turn's end says
+    /// `unwatched`: it loads as unknown, never as a turn that is over, so
+    /// nothing reads it as unreachable-and-idle.
+    #[test]
+    fn a_state_published_as_unwatched_claims_no_ended_turn() {
+        let old: AgentState = serde_json::from_str(include_str!(
+            "../../tests/fixtures/formats/state-unwatched.json"
+        ))
+        .unwrap();
+        assert!(matches!(old.activity, Activity::Unknown(_)), "{old:?}");
+        let v = View::at(old, None, 1794316320);
+        assert!(!v.unreachable(1794316320));
+        assert_eq!(v.brief(1794316320), "unknown");
+    }
+
+    /// What is published now reads back as itself, evidence and waiter
+    /// included, and in the words `status -j` carries.
+    #[test]
+    fn evidence_and_reachability_survive_the_file() {
+        for (reachability, said) in [
+            (
+                Reachability::Waiter {
+                    since: 7,
+                    build: Some("ab12".into()),
+                },
+                serde_json::json!({"by": "waiter", "since": 7, "build": "ab12"}),
+            ),
+            (
+                Reachability::NoWaiter { since: Some(9) },
+                serde_json::json!({"by": "none", "since": 9}),
+            ),
+            (
+                Reachability::NoWaiter { since: None },
+                serde_json::json!({"by": "none", "since": null}),
+            ),
+            (Reachability::Unknown, serde_json::json!({"by": "unknown"})),
+        ] {
+            let s = AgentState {
+                activity: moving(900),
+                reachability,
+                ..state()
+            };
+            let json = serde_json::to_value(&s).unwrap();
+            assert_eq!(json["reachability"], said);
+            assert_eq!(
+                json["activity"],
+                serde_json::json!({"is": "working", "why": {"moved": 900, "until": 3300}})
+            );
+            assert_eq!(serde_json::from_value::<AgentState>(json).unwrap(), s);
+        }
     }
 
     /// The line gives every reason the state holds: why the record cannot

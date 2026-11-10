@@ -11392,6 +11392,7 @@ pub(crate) mod tests {
                 monitor: crate::cli::agent_state::Observer::me(),
                 activity: crate::cli::agent_state::Activity::Idle,
                 since: 0,
+                reachability: Default::default(),
                 owed: None,
                 nudge: crate::cli::agent_state::Nudge::Nothing,
                 cannot_resume: None,
