@@ -57,8 +57,20 @@ pub struct AgentConfig {
     /// past the check-in window has the next start forget the binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_pending: Option<ResumePending>,
+    /// The session a hook has told that its repo has no monitor. It stands
+    /// for one outage: while it does, that session is not told again, and
+    /// the first monitor to answer it clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outage_notified: Option<OutageNotified>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// `session` was told, at `at` (RFC3339 UTC), that no monitor could be had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutageNotified {
+    pub session: SessionId,
+    pub at: String,
 }
 
 /// An unconfirmed resume of `session`.
@@ -1146,6 +1158,7 @@ mod tests {
             }),
             wait_events: Vec::new(),
             resume_pending: None,
+            outage_notified: None,
             extra: Default::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();

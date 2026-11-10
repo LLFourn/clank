@@ -20,8 +20,9 @@ use clank_core::ids::AgentLabel;
 use clank_core::wait::WaitItem;
 
 /// The wire version. Bumped for any change a previous build would
-/// misread; a mismatch is not an error but a decline, after which the
-/// client does its own local wait.
+/// misread; a mismatch is not an error but a decline, after which a
+/// waiter follows whichever monitor replaces this one, or tells its agent
+/// that none did.
 ///
 /// Skew is routine rather than exceptional here: monitors outlive
 /// `cargo install`, so a fresh client meeting an old monitor is the
@@ -92,8 +93,7 @@ pub(crate) mod keeper;
 /// make (codex on b1d5d27).
 ///
 /// So a capability change is a version change. The client refuses a
-/// monitor on any other number and watches for itself, which is the
-/// behaviour it had before this plan rather than a failure.
+/// monitor on any other number, which is a decline rather than a failure.
 ///
 /// The version, readable WITHOUT decoding the rest.
 ///
@@ -281,9 +281,9 @@ pub(crate) enum Note {
     /// answer that, and neither needs the number:
     ///
     /// - A CLIENT watches arrival. It gives up on silence past
-    ///   `BEAT_GRACE` and goes back to watching for itself, which is
-    ///   the same answer for a wedged monitor and a dead one — and
-    ///   both are the answer it can act on.
+    ///   `BEAT_GRACE` and attaches again, which is the same answer for a
+    ///   wedged monitor and a dead one — and both are the answer it can
+    ///   act on.
     /// - The WATCHDOG, inside the monitor, compares successive reads
     ///   of a private counter that only a COMPLETED fold advances.
     ///   That is the one place two of these were ever compared.
@@ -1004,15 +1004,15 @@ impl Conn {
 
 /// How a client got on, or did not.
 ///
-/// There is no error variant on purpose. Every way this can fail is a
-/// reason to do the work alone, which is what a park does today —
-/// going quiet is the one outcome this plan may not produce, so it is
-/// not representable here.
+/// There is no error variant on purpose: what having no monitor means is
+/// each caller's to say, and going quiet is not among the answers. A
+/// waiter that serves an agent does not take this at all. It keeps the
+/// typed [`Attempt`] and follows ([`Attempt::served`]).
 #[derive(Debug)]
 pub(crate) enum Attached {
     /// Admitted, with the framing intact.
     Shared(Conn),
-    /// Watch the repo yourself. The string says why, for the log.
+    /// Not admitted. The string says why, for the log.
     Alone(String),
 }
 
@@ -1078,9 +1078,8 @@ pub(crate) fn connect_within(
     // On Apple targets std sets this when it builds a socket, and
     // `main` resets SIGPIPE to SIG_DFL so ordinary pipes behave. Both
     // together mean a monitor that closes during a write would KILL the
-    // client instead of returning EPIPE — and the whole point of
-    // `Attached` is that a failure degrades to a local wait rather than
-    // taking the agent down.
+    // client instead of returning EPIPE, and a client must outlive its
+    // monitor to follow the next one.
     #[cfg(target_vendor = "apple")]
     set_nosigpipe(&owned)?;
 
@@ -1372,6 +1371,134 @@ impl From<Attempt> for Attached {
         match attempt {
             Attempt::Shared(conn) => Attached::Shared(conn),
             other => Attached::Alone(other.why().unwrap_or_default().to_string()),
+        }
+    }
+}
+
+/// Why a waiter that must have a monitor did not get one from an attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unserved {
+    /// A newer build's monitor keeps the repo. No retry by this process
+    /// can attach to it.
+    Upgraded(String),
+    /// Nothing attached this time; another attempt may.
+    Retry(String),
+}
+
+impl Attempt {
+    /// The connection, or what a waiter that never decides for itself does
+    /// about not having one.
+    pub(crate) fn served(self) -> Result<Conn, Unserved> {
+        match self {
+            Attempt::Shared(conn) => Ok(conn),
+            Attempt::Newer(why) => Err(Unserved::Upgraded(why)),
+            Attempt::Theirs(why)
+            | Attempt::Unproven(why)
+            | Attempt::Busy(why)
+            | Attempt::SpawnFailed(why)
+            | Attempt::NotStarted(why)
+            | Attempt::Unattached(why) => Err(Unserved::Retry(why)),
+        }
+    }
+}
+
+/// How long a waiter goes on trying for a monitor before it tells its
+/// agent it has none.
+///
+/// One attempt is bounded by `SPAWN_SETTLE + ATTACH_BUDGET`, and a monitor
+/// retiring for an upgrade may hold its lease for `LEASE_RETIREMENT`, so a
+/// minute covers a retirement and several whole start attempts. Longer
+/// would leave an agent parked behind a monitor that is not coming.
+pub(crate) const OUTAGE_BUDGET: Duration = Duration::from_secs(60);
+
+/// The pause after the first repeated failure, doubled up to
+/// [`OUTAGE_RETRY_CAP`].
+const OUTAGE_FIRST_RETRY: Duration = Duration::from_millis(500);
+
+/// The longest pause between attempts, and the pause of a waiter that
+/// goes on trying past the budget.
+pub(crate) const OUTAGE_RETRY_CAP: Duration = Duration::from_secs(8);
+
+/// A waiter's time without a monitor: from the first attempt or connection
+/// that ended unanswered, until a monitor answers.
+#[derive(Debug, Default)]
+pub(crate) struct Outage {
+    since: Option<tokio::time::Instant>,
+    pause: Duration,
+}
+
+impl Outage {
+    /// A monitor answered, so there is no outage.
+    pub(crate) fn answered(&mut self) {
+        *self = Outage::default();
+    }
+
+    /// An attempt, or a connection, ended without a monitor at `now`: how
+    /// long to pause before the next attempt, or `None` once the outage
+    /// has outlasted [`OUTAGE_BUDGET`].
+    ///
+    /// The first loss since a monitor answered pauses for nothing: a
+    /// monitor that retired is followed at once.
+    pub(crate) fn lost(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= OUTAGE_BUDGET {
+            return None;
+        }
+        let pause = self.pause;
+        self.pause = match pause.is_zero() {
+            true => OUTAGE_FIRST_RETRY,
+            false => (pause * 2).min(OUTAGE_RETRY_CAP),
+        };
+        Some(pause)
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    use super::*;
+
+    /// The first loss since a monitor answered is followed at once, later
+    /// ones back off to the cap, and the budget runs from the first loss
+    /// until a monitor answers.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_backs_off_until_its_budget_and_an_answer_ends_it() {
+        let mut outage = Outage::default();
+        let began = tokio::time::Instant::now();
+        let pauses: Vec<_> = (0..7).filter_map(|_| outage.lost(began)).collect();
+        assert_eq!(
+            pauses,
+            [0, 500, 1000, 2000, 4000, 8000, 8000].map(Duration::from_millis)
+        );
+        let last = began + OUTAGE_BUDGET - Duration::from_millis(1);
+        assert_eq!(outage.lost(last), Some(OUTAGE_RETRY_CAP));
+        assert_eq!(outage.lost(began + OUTAGE_BUDGET), None);
+
+        outage.answered();
+        assert_eq!(
+            outage.lost(began + OUTAGE_BUDGET),
+            Some(Duration::ZERO),
+            "an answer ends the outage, so the next loss begins a new one"
+        );
+    }
+
+    /// Only a newer build's monitor is unfollowable. Every other way an
+    /// attempt ends without a connection is tried again.
+    #[test]
+    fn only_a_newer_monitor_is_not_retried() {
+        let why = || "why".to_string();
+        assert_eq!(
+            Attempt::Newer(why()).served().err(),
+            Some(Unserved::Upgraded(why()))
+        );
+        for attempt in [
+            Attempt::Theirs(why()),
+            Attempt::Unproven(why()),
+            Attempt::Busy(why()),
+            Attempt::SpawnFailed(why()),
+            Attempt::NotStarted(why()),
+            Attempt::Unattached(why()),
+        ] {
+            assert_eq!(attempt.served().err(), Some(Unserved::Retry(why())));
         }
     }
 }
@@ -2564,8 +2691,9 @@ pub(crate) fn acquire_lease(repo: &std::path::Path) -> Result<MonitorLease, Leas
 /// descriptor then says which was chosen; a lease has no such
 /// discovery, so a second path is not a degraded lease but a second
 /// lease. The monitor therefore refuses to start and says why — and the
-/// CLIENT is what degrades, to `Attached::Alone`, watching the repo
-/// itself exactly as it does when no socket directory is usable.
+/// CLIENT is what copes, exactly as it does when no socket directory is
+/// usable: a waiter tries again and then says it has no monitor, and a
+/// status panel watches the repo itself.
 pub(crate) fn acquire_lease_in(
     repo: &std::path::Path,
     dir: &std::path::Path,

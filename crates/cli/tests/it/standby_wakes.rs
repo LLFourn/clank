@@ -205,7 +205,7 @@ async fn a_reviewer_switched_to_standby_mid_wait_is_owed_no_review_but_still_get
         repo,
         "codex",
         false,
-        Vec::new(),
+        vec![common::idle_source()],
     )));
     tokio::time::sleep(Duration::from_millis(1200)).await;
     clank::cli::agent::set_repo_review(repo, &label("codex"), ReviewKind::Standby).unwrap();

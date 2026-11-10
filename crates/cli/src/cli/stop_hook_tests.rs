@@ -730,6 +730,83 @@ async fn a_failed_or_partial_flush_is_a_failed_emit() {
     }
 }
 
+/// The notices a child with no monitor prints really wake, through each
+/// adapter's own wire: Claude's continuation exit, Codex's block decision,
+/// and OpenCode's prompt rather than its renewal. Each is the child's own
+/// frame, carries no presentation and none of the work its repo owes, and
+/// is answered with no result, so it earns no receipt.
+#[tokio::test(start_paused = true)]
+async fn the_childs_no_monitor_notices_wake_through_each_adapter() {
+    use crate::cli::turn_child::tests::{outage_frame, upgraded_frame};
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        for (frame, says) in [
+            (
+                outage_frame(tool).await,
+                "clank cannot start its monitor: starting one failed: no binary.",
+            ),
+            (upgraded_frame(tool).await, "clank was upgraded;"),
+        ] {
+            assert!(frame.presentation().is_none(), "{tool:?}: {frame:?}");
+            let text = frame.rendered.clone().expect("the notice has its text");
+            assert!(text.starts_with(says), "{tool:?}: {text}");
+            assert!(!text.contains("scheduled work"), "{tool:?}: {text}");
+            let answered = Answered::default();
+            let mut stdout = Writer::new();
+            let mut stderr = Writer::new();
+            let code = emit_turn(turn_of(frame, &answered), tool, &mut stdout, &mut stderr).await;
+            assert_eq!(answered.got(), Some(None), "{tool:?}: no result to credit");
+            match tool {
+                Tool::Claude => {
+                    assert_eq!(code, CLAUDE_CONTINUATION_EXIT);
+                    assert!(stdout.bytes.is_empty());
+                    assert_eq!(stderr.bytes, format!("{text}\n").into_bytes());
+                }
+                Tool::Codex => {
+                    assert_eq!(code, HOOK_OK_EXIT);
+                    let value: serde_json::Value = serde_json::from_slice(&stdout.bytes).unwrap();
+                    assert_eq!(value["decision"], "block");
+                    assert_eq!(value["reason"], text);
+                }
+                _ => {
+                    assert_eq!(code, HOOK_OK_EXIT);
+                    assert_eq!(stdout.bytes, format!("{text}\n").into_bytes());
+                    assert_ne!(
+                        stdout.bytes,
+                        format!("{OPENCODE_RENEW_WAIT_WIRE}\n").into_bytes(),
+                        "a prompt for the model, not a renewal the plugin swallows"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The child's ordinary diagnostic is unchanged by all that: on every
+/// adapter it goes to stderr with the quiet exit, and wakes nobody.
+#[tokio::test]
+async fn the_childs_diagnostic_still_wakes_nobody_on_any_adapter() {
+    let frame = crate::cli::turn_child::tests::unparsed_frame().await;
+    for tool in [Tool::Claude, Tool::Codex, Tool::OpenCode] {
+        let answered = Answered::default();
+        let mut stdout = Writer::new();
+        let mut stderr = Writer::new();
+        let code = emit_turn(
+            turn_of(frame.clone(), &answered),
+            tool,
+            &mut stdout,
+            &mut stderr,
+        )
+        .await;
+        assert_eq!(code, HOOK_OK_EXIT, "{tool:?}");
+        assert!(stdout.bytes.is_empty(), "{tool:?}");
+        assert!(
+            String::from_utf8_lossy(&stderr.bytes).contains("did not parse"),
+            "{tool:?}"
+        );
+        assert_eq!(answered.got(), Some(None), "{tool:?}");
+    }
+}
+
 /// What presents nothing is answered with nothing.
 #[tokio::test]
 async fn a_verdict_that_presents_nothing_answers_nothing() {
@@ -743,7 +820,7 @@ async fn a_verdict_that_presents_nothing_answers_nothing() {
         Frame::bare(WireVerdict::RenewWait),
         Frame::text(
             WireVerdict::Notify,
-            crate::cli::wake_render::MONITOR_UNAVAILABLE.into(),
+            crate::cli::wake_render::UPGRADED.into(),
         ),
     ] {
         let answered = Answered::default();
@@ -1273,14 +1350,14 @@ async fn a_session_starts_context_is_answered_after_its_flush() {
     emit_session_start(
         Frame::text(
             WireVerdict::Notify,
-            crate::cli::wake_render::MONITOR_UNAVAILABLE.into(),
+            crate::cli::wake_render::monitor_outage("no binary"),
         ),
         &binding,
         answered.clone(),
         &mut writer,
     )
     .await;
-    assert!(String::from_utf8_lossy(&writer.bytes).contains("monitor is unavailable"));
+    assert!(String::from_utf8_lossy(&writer.bytes).contains("cannot start its monitor"));
     assert_eq!(answered.got(), Some(None));
     let answered = Answered::default();
     let mut writer = Writer::new();

@@ -30,7 +30,12 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-fn wait_args(repo: &Path, events: Vec<String>) -> WaitArgs {
+/// A wait that folds for itself: with no source of its own named, it
+/// holds [`common::idle_source`].
+fn wait_args(repo: &Path, mut events: Vec<String>) -> WaitArgs {
+    if events.is_empty() {
+        events.push(common::idle_source());
+    }
     WaitArgs {
         repo: Some(repo.to_path_buf()),
         author: Some("rev".into()),
@@ -531,18 +536,6 @@ async fn returning_kills_the_whole_process_group() {
         !alive,
         "grandchild {pid} must die with the wait (group kill)"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn zero_source_wait_parks_to_its_timeout() {
-    // A wait with NO event sources parks to its deadline and returns
-    // parked. (The no-hot-loop fuse itself is pinned
-    // deterministically by the `drain_external_fuses_a_closed_channel`
-    // unit test — codex 907acd5 — since wall time can't distinguish a
-    // spin from a park.)
-    let env = idle_env();
-    let repo = env.repo();
-    common::assert_stays_parked(repo, wait_args(repo, vec![]), "idle with no sources").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

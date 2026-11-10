@@ -750,40 +750,43 @@ struct Hook {
 
 /// The `clank wait --turn-end` child's own carry, on a thread of this
 /// process: it reads its owner from `owner`, prints frames to `frames`, and
-/// reaches the test's monitor over `ours`.
+/// reaches the test's monitors over `ours`, one connection per attempt in
+/// order, and nothing once they are spent.
 fn carrier(
     repo: &std::path::Path,
     author: &AgentLabel,
     owner: std::io::PipeReader,
     mut frames: std::io::PipeWriter,
-    ours: std::os::unix::net::UnixStream,
+    ours: Vec<std::os::unix::net::UnixStream>,
 ) -> std::thread::JoinHandle<()> {
     let (repo, author) = (repo.to_path_buf(), author.clone());
-    ours.set_nonblocking(true).unwrap();
+    for stream in &ours {
+        stream.set_nonblocking(true).unwrap();
+    }
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async move {
-                let stream = std::sync::Mutex::new(Some(ours));
+                let streams = std::sync::Mutex::new(std::collections::VecDeque::from(ours));
                 let attach = |who: Who| -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Attached> + Send + '_>,
+                    Box<dyn std::future::Future<Output = Attempt> + Send + '_>,
                 > {
-                    let stream = stream.lock().unwrap().take();
+                    let stream = streams.lock().unwrap().pop_front();
                     let repo = repo.clone();
                     Box::pin(async move {
                         let Some(stream) = stream else {
-                            return Attached::Alone("connected once".into());
+                            return Attempt::Unproven("its monitors are spent".into());
                         };
-                        greet_at(
+                        settled(greet_at(
                             "test-socket",
                             &repo,
                             who,
                             std::time::Instant::now() + ATTACH_BUDGET,
                             move |_, _| stream.try_clone(),
-                        )
-                        .into()
+                        ))
+                        .unwrap_or_else(Attempt::Unproven)
                     })
                 };
                 crate::cli::turn_child::carry(
@@ -807,6 +810,17 @@ impl Hook {
         author: &AgentLabel,
         report: &Report,
         ours: std::os::unix::net::UnixStream,
+    ) -> Self {
+        Self::following(repo, author, report, vec![ours])
+    }
+
+    /// [`Hook::carrying`], over one connection per monitor the child is to
+    /// find, in the order it finds them.
+    fn following(
+        repo: &std::path::Path,
+        author: &AgentLabel,
+        report: &Report,
+        ours: Vec<std::os::unix::net::UnixStream>,
     ) -> Self {
         use std::io::Write;
         let (owner_read, mut stdin) = std::io::pipe().unwrap();
@@ -1000,6 +1014,109 @@ async fn an_attending_agents_turn_end_parks_and_a_later_event_wakes_it() {
     hook.answer(&TurnResult::Delivered { presentation });
     let (from, _) = next_heard(&mut heard).await;
     assert_eq!(from, conn);
+    hook.child.join().unwrap();
+    for writer in leaving {
+        let _ = writer.await;
+    }
+}
+
+/// How long a step the child owes may take before the test calls it lost.
+const FOLLOWED_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The artist4 case. A parked agent's monitor goes away twice under it, a
+/// message for it lands while it has none, and another agent's block is
+/// pending throughout. The child decides nothing about any of that: it
+/// follows to the monitor that replaces them, and that monitor's fold
+/// presents the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_owed_behind_anothers_block_is_delivered_by_the_monitor_replacing_two_lost() {
+    let (repo, author, _timer) = timer_repo();
+    let blocks = repo.path().join(".clank/agents/codex/blocks");
+    std::fs::create_dir_all(&blocks).unwrap();
+    std::fs::write(blocks.join("which-way.md"), "which way?").unwrap();
+    assert!(
+        crate::cli::wait::blocked(repo.path(), &author),
+        "the block is what a fold of the child's own would have parked on"
+    );
+
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let (ours, theirs): (Vec<_>, Vec<_>) = (0..3)
+        .map(|_| std::os::unix::net::UnixStream::pair().unwrap())
+        .unzip();
+    let mut theirs = theirs.into_iter();
+    let hook = Hook::following(repo.path(), &author, &stop_report(), ours);
+    let frame_of = |mut hook: Hook| async move {
+        tokio::time::timeout(
+            FOLLOWED_WITHIN,
+            tokio::task::spawn_blocking(move || (hook.frame(), hook)),
+        )
+        .await
+        .expect("the child prints what its monitor said")
+        .unwrap()
+    };
+    let mut next_monitor = async || {
+        tokio::time::timeout(
+            FOLLOWED_WITHIN,
+            admitted(theirs.next().unwrap(), repo.path(), &heard_tx),
+        )
+        .await
+        .expect("the child follows to the next monitor")
+    };
+
+    let state = folded(repo.path()).await.unwrap();
+    let mut clients = vec![next_monitor().await];
+    let _ = serve(
+        repo.path(),
+        &mut clients,
+        &state,
+        &mut Turns::new(repo.path().to_path_buf()),
+    );
+    let (parked, hook) = frame_of(hook).await;
+    assert_eq!(parked.verdict, WireVerdict::Park, "nothing is owed yet");
+    clients.clear();
+
+    drop(next_monitor().await);
+
+    crate::inbox::deliver(
+        repo.path(),
+        &author,
+        None,
+        "2026-11-10T11:10:00Z",
+        "the retakes are in",
+    )
+    .unwrap();
+    let client = next_monitor().await;
+    let conn = client.conn;
+    let mut clients = vec![client];
+    let state = folded(repo.path()).await.unwrap();
+    let leaving = serve(
+        repo.path(),
+        &mut clients,
+        &state,
+        &mut Turns::new(repo.path().to_path_buf()),
+    );
+    let (woke, mut hook) = frame_of(hook).await;
+    let presentation = woke
+        .presentation()
+        .expect("the replacement presents the message")
+        .clone();
+    assert!(
+        woke.rendered
+            .as_deref()
+            .is_some_and(|t| t.contains("the retakes are in")),
+        "{woke:?}"
+    );
+    hook.answer(&TurnResult::Delivered { presentation });
+    let said = loop {
+        match next_heard(&mut heard).await {
+            (from, said) if from == conn => break said,
+            (_, lost) => assert!(matches!(lost, Heard::Closed), "{lost:?}"),
+        }
+    };
+    assert!(
+        matches!(said, Heard::Line(_)),
+        "the result comes back on the replacement's connection: {said:?}"
+    );
     hook.child.join().unwrap();
     for writer in leaving {
         let _ = writer.await;
@@ -1982,7 +2099,7 @@ impl crate::cli::stop_hook::Spawn for Reaching {
         let (owner_read, owner_write) = std::io::pipe().unwrap();
         let (frames_read, frames_write) = std::io::pipe().unwrap();
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        carrier(repo, label, owner_read, frames_write, ours);
+        carrier(repo, label, owner_read, frames_write, vec![ours]);
         self.0.send(theirs).unwrap();
         crate::cli::stop_hook::OwnedWait::over(
             None,

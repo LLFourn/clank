@@ -41,6 +41,7 @@ fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &
         }),
         wait_events: Vec::new(),
         resume_pending: None,
+        outage_notified: None,
         extra: Default::default(),
     };
     clank::agent_store::update_agent_config(env.repo(), &l, |stored| *stored = cfg).unwrap();
@@ -434,6 +435,7 @@ fn fork_from_worktree_lands_sibling_under_main_not_nested() {
             }),
             wait_events: Vec::new(),
             resume_pending: None,
+            outage_notified: None,
             extra: Default::default(),
         };
         clank::agent_store::update_agent_config(&b, &l, |stored| *stored = cfg).unwrap();

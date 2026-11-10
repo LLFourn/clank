@@ -11,7 +11,7 @@ use anyhow::Context;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use clank_core::agent_config::{AgentConfig, ResumePending, Session};
+use clank_core::agent_config::{AgentConfig, OutageNotified, ResumePending, Session};
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::{AutoMode, Tool};
 use clank_user_config::versioned::{self, Refusal};
@@ -682,6 +682,82 @@ pub fn resume_checked_in(
         cfg.resume_pending = None;
         true
     })
+}
+
+/// What announcing an outage to a session came to.
+#[derive(Debug)]
+pub(crate) enum Announcement {
+    /// The announcement was delivered, and the session is now told.
+    Delivered,
+    /// Nothing was said: the session was already told of this outage, or
+    /// no longer holds the label.
+    Suppressed,
+    /// The delivery failed, so the session is not told.
+    Undelivered(std::io::Error),
+}
+
+/// Announce an outage to `session`, at most once until a monitor serves
+/// it ([`outage_served`]).
+///
+/// One transaction under the label's binding lock: the binding and the
+/// standing notice are checked, `deliver` runs, and the session is
+/// recorded as told only if it succeeded. Every waiter of a session
+/// announces through here, so two of them cannot both find it untold.
+pub(crate) fn announce_outage(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+    now: OffsetDateTime,
+    deliver: &mut dyn FnMut() -> std::io::Result<()>,
+) -> anyhow::Result<Announcement> {
+    let at = now.format(&Rfc3339).context("formatting timestamp")?;
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        let bound = cfg.session.as_ref().is_some_and(|s| &s.id == session);
+        if !bound || outage_told(cfg, session) {
+            return Announcement::Suppressed;
+        }
+        if let Err(e) = deliver() {
+            return Announcement::Undelivered(e);
+        }
+        cfg.outage_notified = Some(OutageNotified {
+            session: session.clone(),
+            at,
+        });
+        Announcement::Delivered
+    })
+}
+
+/// A monitor served `session`, so its outage is over and the next one is
+/// announced again. `true` when a notice stood.
+///
+/// The marker is read under the lock, never before it: an announcement
+/// holds the lock while it delivers and records only afterwards, so a
+/// read taken first would miss the marker that is about to be written
+/// and leave it standing after the recovery. A healthy attach costs the
+/// lock and a read; nothing is written unless a notice stood.
+///
+/// What serving is belongs to the caller's connection: a verdict for a
+/// hook's report, the first note for a subscription.
+pub(crate) fn outage_served(
+    repo: &Path,
+    label: &AgentLabel,
+    session: &SessionId,
+) -> anyhow::Result<bool> {
+    let guard = BindingGuard::acquire(repo, label)?;
+    mutate_locked(&guard, |cfg| {
+        if !outage_told(cfg, session) {
+            return false;
+        }
+        cfg.outage_notified = None;
+        true
+    })
+}
+
+fn outage_told(cfg: &AgentConfig, session: &SessionId) -> bool {
+    cfg.outage_notified
+        .as_ref()
+        .is_some_and(|told| &told.session == session)
 }
 
 /// Unbind `session` from `label` with its unconfirmed resume, only while
@@ -1453,6 +1529,175 @@ mod tests {
                 session: sid(RESUMED),
                 at: "2026-11-03T00:00:00Z".into(),
             })
+        );
+    }
+
+    fn told(repo: &Path, l: &AgentLabel) -> Option<OutageNotified> {
+        load_agent_config(repo, l)
+            .unwrap()
+            .and_then(|c| c.outage_notified)
+    }
+
+    #[test]
+    fn a_config_from_before_the_outage_notice_parses_and_the_notice_round_trips() {
+        let bytes =
+            format!(r#"{{"session":{{"id":"{RESUMED}","tool":"claude","updated_at":"x"}}}}"#);
+        let old: AgentConfig = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(old.outage_notified, None);
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            bytes,
+            "a config never told of an outage keeps its bytes"
+        );
+        let noted = AgentConfig {
+            outage_notified: Some(OutageNotified {
+                session: sid(RESUMED),
+                at: "2026-11-10T00:00:00Z".into(),
+            }),
+            ..old
+        };
+        let written = serde_json::to_string(&noted).unwrap();
+        assert!(
+            written.ends_with(&format!(
+                r#""outage_notified":{{"session":"{RESUMED}","at":"2026-11-10T00:00:00Z"}}}}"#
+            )),
+            "{written}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentConfig>(&written).unwrap(),
+            noted
+        );
+    }
+
+    fn announce(repo: &Path, l: &AgentLabel, session: &str, at_: &str) -> Announcement {
+        announce_outage(repo, l, &sid(session), at(at_), &mut || Ok(())).unwrap()
+    }
+
+    #[test]
+    fn an_outage_is_announced_once_to_the_bound_session_until_a_monitor_serves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        let now = "2026-11-10T00:00:00Z";
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        assert!(matches!(
+            announce(repo, &l, SUCCESSOR, now),
+            Announcement::Suppressed
+        ));
+        assert_eq!(told(repo, &l), None, "not the bound session");
+        assert!(!outage_served(repo, &l, &sid(RESUMED)).unwrap());
+
+        assert!(matches!(
+            announce(repo, &l, RESUMED, now),
+            Announcement::Delivered
+        ));
+        assert!(matches!(
+            announce(repo, &l, RESUMED, "2026-11-10T00:05:00Z"),
+            Announcement::Suppressed
+        ));
+        assert_eq!(told(repo, &l).unwrap().at, now);
+
+        assert!(!outage_served(repo, &l, &sid(SUCCESSOR)).unwrap());
+        assert!(
+            told(repo, &l).is_some(),
+            "another session's monitor clears nothing"
+        );
+        assert!(outage_served(repo, &l, &sid(RESUMED)).unwrap());
+        assert_eq!(told(repo, &l), None);
+        assert!(matches!(
+            announce(repo, &l, RESUMED, now),
+            Announcement::Delivered
+        ));
+    }
+
+    #[test]
+    fn an_announcement_that_was_not_delivered_leaves_the_session_untold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        let failed = announce_outage(
+            repo,
+            &l,
+            &sid(RESUMED),
+            at("2026-11-10T00:00:00Z"),
+            &mut || Err(std::io::ErrorKind::BrokenPipe.into()),
+        )
+        .unwrap();
+        assert!(matches!(failed, Announcement::Undelivered(_)), "{failed:?}");
+        assert_eq!(told(repo, &l), None);
+        assert!(matches!(
+            announce(repo, &l, RESUMED, "2026-11-10T00:00:00Z"),
+            Announcement::Delivered
+        ));
+    }
+
+    /// Two waiters of one session that reach the announcement together
+    /// deliver it once: the second finds the session told, however long
+    /// the first's delivery takes.
+    #[test]
+    fn two_waiters_announcing_together_deliver_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        let delivered = std::sync::atomic::AtomicUsize::new(0);
+        let together = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    together.wait();
+                    announce_outage(
+                        repo,
+                        &l,
+                        &sid(RESUMED),
+                        at("2026-11-10T00:00:00Z"),
+                        &mut || {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(delivered.into_inner(), 1);
+    }
+
+    /// A monitor serving the session while its announcement is still being
+    /// delivered waits for that announcement, and then ends the outage.
+    #[test]
+    fn a_session_served_during_its_announcement_ends_told_of_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, l) = (dir.path(), label("claude"));
+        bind_session_to_agent(repo, &l, Tool::Claude, &sid(RESUMED)).unwrap();
+        let (delivering, started) = std::sync::mpsc::channel::<()>();
+        let cleared = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                announce_outage(
+                    repo,
+                    &l,
+                    &sid(RESUMED),
+                    at("2026-11-10T00:00:00Z"),
+                    &mut || {
+                        delivering.send(()).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            });
+            started.recv().unwrap();
+            scope
+                .spawn(|| outage_served(repo, &l, &sid(RESUMED)).unwrap())
+                .join()
+                .unwrap()
+        });
+        assert!(cleared, "the recovery saw the announcement it waited for");
+        assert_eq!(
+            load_agent_config(repo, &l)
+                .unwrap()
+                .unwrap()
+                .outage_notified,
+            None
         );
     }
 

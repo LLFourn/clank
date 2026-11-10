@@ -1378,66 +1378,35 @@ fn every_older_saved_shape_loads_with_its_runs_registered() {
 }
 
 #[test]
-fn alone_mode_wakes_without_presenting_and_the_monitor_delivers_once_later() {
+fn a_hook_with_no_monitor_says_its_notice_only_to_a_session_clank_drives() {
     let s = session();
     let owed = [OwedItem {
         identity: "gate:plan:abc".into(),
         receipts: vec!["r1".into()],
     }];
+    let notice = || Notice::MonitorOutage {
+        why: "no binary".into(),
+    };
+    let mut asking = facts(T0, &s, &owed);
+    asking.asking = true;
+    let mut blocked = facts(T0, &s, &owed);
+    blocked.blocked = true;
+    for f in [facts(T0, &s, &owed), facts(T0, &s, &[]), asking, blocked] {
+        assert_eq!(
+            unmonitored_verdict(&s, &f, notice()),
+            Verdict::Notify(vec![notice()])
+        );
+    }
     assert_eq!(
-        alone_verdict(&s, &facts(T0, &s, &owed)),
-        Verdict::Notify(vec![Notice::MonitorUnavailable])
-    );
-    assert_eq!(
-        alone_verdict(&other_session(), &facts(T0, &s, &owed)),
+        unmonitored_verdict(&other_session(), &facts(T0, &s, &owed), notice()),
         Verdict::Silent(SilentWhy::StaleBinding)
     );
     let mut off = facts(T0, &s, &owed);
     off.auto = Ok(AutoMode::Off);
-    assert_eq!(alone_verdict(&s, &off), Verdict::Silent(SilentWhy::AutoOff));
-    let mut asking = facts(T0, &s, &owed);
-    asking.asking = true;
-    assert_eq!(alone_verdict(&s, &asking), Verdict::Park);
-    assert_eq!(alone_verdict(&s, &facts(T0, &s, &[])), Verdict::Park);
-
-    let mut st = SessionState::new(s.clone());
-    let v = verdict(st.step(
-        Event::TurnEnd(report(Tool::Claude)),
-        &facts(T0 + MINUTE, &s, &owed),
-    ));
-    let Verdict::Deliver {
-        presentation,
-        identities,
-        ..
-    } = v
-    else {
-        panic!("{v:?}");
-    };
-    assert_eq!(identities, vec!["gate:plan:abc".to_string()]);
-    let receipts = committed(st.step(
-        Event::Delivered(presentation.clone()),
-        &facts(T0, &s, &owed),
-    ));
-    assert_eq!(receipts[0], Effect::CommitReceipts(vec!["r1".into()]));
     assert_eq!(
-        settled(st.step(Event::Delivered(presentation), &facts(T0, &s, &owed))),
-        ResultOutcome::Duplicate
+        unmonitored_verdict(&s, &off, notice()),
+        Verdict::Silent(SilentWhy::AutoOff)
     );
-}
-
-#[test]
-fn alone_mode_is_never_quiet_on_attendance() {
-    let s = session();
-    let owed = [OwedItem {
-        identity: "gate:plan:abc".into(),
-        receipts: Vec::new(),
-    }];
-    for v in [
-        alone_verdict(&s, &facts(T0, &s, &owed)),
-        alone_verdict(&s, &facts(T0, &s, &[])),
-    ] {
-        assert!(!matches!(v, Verdict::Silent(_)), "{v:?}");
-    }
 }
 
 #[test]

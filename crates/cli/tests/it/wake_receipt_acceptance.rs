@@ -377,89 +377,6 @@ impl Drop for Fixture {
     }
 }
 
-/// With no monitor, the hook's child watches for itself — running the
-/// interrupting producer without zellij, whatever its icon or message —
-/// and owed work wakes the agent with a notice, never the work: nothing
-/// is presented, no receipt is earned, and the reply stays owed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wide_icon_hook_alone_wakes_without_zellij_presents_nothing_and_keeps_reply_owed() {
-    let mut fixture = Fixture::new(Tool::Codex, true);
-    fixture.source.interrupt = true;
-    fixture.source.glyph = Some("💬".into()); // Cosmetic width must not kill the native wait.
-    // Nor may an interruption description that cannot be typed into a pane.
-    fixture.source.interrupt_message = Some("two\nlines".into());
-    fixture.enable_receipts(); // Persist the updated source policy alongside its receipt callback.
-    let _lease = fixture.monitor_lease(); // No published monitor: attachment must fall back.
-    let hook = fixture.hook_child(false).await;
-    let ready = fixture.producer_ready().await;
-    assert_eq!(ready["cwd"], fixture.hook_cwd.to_str().unwrap());
-    fixture.emit_event();
-    let output = tokio::time::timeout(LIMIT, hook.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["decision"], "block");
-    let reason = payload["reason"].as_str().unwrap();
-    assert!(reason.contains("monitor is unavailable"), "{reason}");
-    assert!(
-        !reason.contains("do the task"),
-        "the work is not presented: {reason}"
-    );
-    assert!(
-        output.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!fixture.output.exists(), "a notice earns no receipt");
-    let selector = fixture.assert_owed().await;
-    let shown = fixture
-        .run(&[
-            "events",
-            "show",
-            &selector,
-            "--repo",
-            fixture.repo.to_str().unwrap(),
-            "--json",
-        ])
-        .await;
-    assert!(shown.status.success());
-    let row: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(row["interrupt"], true);
-    assert!(
-        row.get("woken_at").is_none_or(Value::is_null),
-        "a notice is not delivery evidence"
-    );
-    assert!(
-        row.get("interrupt_attempt").is_none_or(Value::is_null),
-        "an already-armed local hook needs no detached interrupt helper"
-    );
-    let ack = fixture
-        .run(&[
-            "events",
-            "ack",
-            &selector,
-            "--repo",
-            fixture.repo.to_str().unwrap(),
-        ])
-        .await;
-    assert!(
-        !ack.status.success(),
-        "wake receipt must not satisfy required reply"
-    );
-    assert!(
-        String::from_utf8_lossy(&ack.stderr).contains("requires a reply"),
-        "{}",
-        String::from_utf8_lossy(&ack.stderr)
-    );
-    fixture.assert_owed().await;
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_start_notifies_legacy_backlog_only_after_actual_context_emission() {
     let mut fixture = Fixture::new(Tool::Claude, false);
@@ -473,6 +390,10 @@ async fn session_start_notifies_legacy_backlog_only_after_actual_context_emissio
             "--author",
             fixture.author.as_str(),
             "--json",
+            // Only a wait with a source of its own invocation hosts its
+            // sources itself, which is what logs the event with no monitor.
+            "--event",
+            &crate::common::idle_source(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1105,6 +1026,10 @@ async fn explicit_read_earns_receipt_without_ack_and_inspection_hides_content() 
             "--author",
             fixture.author.as_str(),
             "--json",
+            // Only a wait with a source of its own invocation hosts its
+            // sources itself, which is what logs the event with no monitor.
+            "--event",
+            &crate::common::idle_source(),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
