@@ -357,3 +357,68 @@ async fn an_answer_overtaken_by_a_rebind_reaches_the_old_session_as_nothing() {
         "the session holding the label is answered"
     );
 }
+
+/// The notices a child with no monitor prints for Grok's Stop block it
+/// with their reason, which is how Grok is woken: the child's own frames,
+/// with nothing of the work the repo owes.
+#[tokio::test(start_paused = true)]
+async fn the_childs_no_monitor_notices_block_groks_stop_with_the_reason() {
+    use crate::cli::turn_child::tests::{handoff, newer, no_binary, unserved};
+    for (attempt, says) in [
+        (
+            no_binary as fn() -> crate::cli::monitor::Attempt,
+            "clank cannot start its monitor: starting one failed: no binary.",
+        ),
+        (newer, "clank was upgraded;"),
+    ] {
+        let [frame] = unserved(&handoff(), attempt)
+            .await
+            .try_into()
+            .expect("one frame");
+        assert!(frame.presentation().is_none(), "{frame:?}");
+        let (out, err) = wire(&frame);
+        assert_eq!(err, None);
+        let block: serde_json::Value = serde_json::from_str(&out.expect("a decision")).unwrap();
+        assert_eq!(block["decision"], "block");
+        let reason = block["reason"].as_str().unwrap();
+        assert!(reason.starts_with(says), "{reason}");
+        assert!(!reason.contains("scheduled work"), "{reason}");
+    }
+}
+
+/// The child's ordinary diagnostic still blocks nothing on Grok's wire.
+#[tokio::test]
+async fn the_childs_diagnostic_still_blocks_nothing() {
+    let frame = crate::cli::turn_child::tests::unparsed_frame().await;
+    let (out, err) = wire(&frame);
+    assert_eq!(out, None);
+    assert!(err.is_some_and(|e| e.contains("did not parse")));
+}
+
+/// A handoff with no monitor is told so before its hook stops waiting:
+/// the hook gives up at the instant its report names, and a deadline it
+/// framed itself would block nothing.
+#[tokio::test(start_paused = true)]
+async fn a_handoff_with_no_monitor_is_told_so_before_its_hook_gives_up() {
+    use crate::cli::turn_child::tests::{handoff_by, no_binary, unserved, within};
+    let began = tokio::time::Instant::now();
+    let [frame] = unserved(&handoff_by(within(HANDOFF_BUDGET)), no_binary)
+        .await
+        .try_into()
+        .expect("one frame");
+    let spare = HANDOFF_BUDGET.saturating_sub(began.elapsed());
+    assert!(
+        spare >= std::time::Duration::from_secs(1),
+        "the hook had {spare:?} of its wait left to read it in"
+    );
+    let (out, err) = wire(&frame);
+    assert_eq!(err, None);
+    let block: serde_json::Value = serde_json::from_str(&out.expect("a decision")).unwrap();
+    assert_eq!(block["decision"], "block");
+    assert!(
+        block["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("clank cannot start its monitor:")
+    );
+}

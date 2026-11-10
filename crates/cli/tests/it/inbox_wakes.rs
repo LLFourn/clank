@@ -40,7 +40,10 @@ fn wait_args(repo: &Path, author: &str, peek: bool) -> WaitArgs {
         deliver_to_session: None,
         turn_end: false,
         json: true,
-        events: Vec::new(),
+        events: match peek {
+            true => Vec::new(),
+            false => vec![common::idle_source()],
+        },
         r#for: None,
         peek,
         no_cache: false,

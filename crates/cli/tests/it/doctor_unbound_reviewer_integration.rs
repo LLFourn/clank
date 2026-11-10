@@ -20,6 +20,7 @@ fn skeleton(
         session,
         wait_events: Vec::new(),
         resume_pending: None,
+        outage_notified: None,
         extra: Default::default(),
     }
 }
@@ -445,6 +446,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
             )),
             wait_events: Vec::new(),
             resume_pending: None,
+            outage_notified: None,
             extra: Default::default(),
         },
     );
@@ -476,6 +478,7 @@ async fn doctor_reports_effective_auto_mode_with_provenance() {
             )),
             wait_events: Vec::new(),
             resume_pending: None,
+            outage_notified: None,
             extra: Default::default(),
         },
     );

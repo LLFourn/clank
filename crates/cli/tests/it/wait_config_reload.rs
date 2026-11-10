@@ -41,7 +41,7 @@ fn wait_args(repo: &Path, author: &str) -> WaitArgs {
         deliver_to_session: None,
         turn_end: false,
         json: true,
-        events: Vec::new(),
+        events: vec![common::idle_source()],
         r#for: None,
         peek: false,
         no_cache: false,

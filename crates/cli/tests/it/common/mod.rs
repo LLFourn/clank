@@ -208,6 +208,21 @@ pub struct Serial {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
+/// An invocation source that never fires.
+///
+/// A wait with no source of its own is the repo's monitor's to answer,
+/// and no test may start one. Holding this is what makes a wait fold and
+/// watch for itself, so these tests drive that loop and nothing else.
+pub fn idle_source() -> String {
+    serde_json::json!({
+        "kind": "timer",
+        "name": "never-in-this-test",
+        "due_at": "2999-01-01T00:00:00Z",
+        "content": "never",
+    })
+    .to_string()
+}
+
 /// Assert a wait does NOT resolve: spawn it, sample after
 /// [`parked_window`], then abort. Returns nothing — a wait that
 /// parked has no result to inspect.

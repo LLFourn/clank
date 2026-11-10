@@ -97,11 +97,18 @@ impl Gathered {
         self
     }
 
-    /// What the hook does when no monitor can decide for it: the local
-    /// fold's owed work wakes the agent with a notice, never the work.
-    pub(crate) fn alone_verdict(&self, session: &SessionId) -> Verdict {
-        let owed = self.owed_now(None);
-        clank_core::turn_policy::alone_verdict(session, &facts(self, None, &owed, &Process))
+    /// What a hook with no monitor says to `session`: `notice`, unless
+    /// clank does not drive it.
+    pub(crate) fn unmonitored_verdict(
+        &self,
+        session: &SessionId,
+        notice: clank_core::turn_policy::Notice,
+    ) -> Verdict {
+        clank_core::turn_policy::unmonitored_verdict(
+            session,
+            &facts(self, None, &[], &Process),
+            notice,
+        )
     }
 
     /// Grok's native Stop for `session`, as the monitor would answer it

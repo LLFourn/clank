@@ -52,11 +52,6 @@ struct WaitSuperseded(String);
 #[error("wait --peek found no work for this agent")]
 pub(crate) struct WaitNoWork;
 
-/// Whether `error` says this wait's session no longer holds its label.
-pub(crate) fn superseded(error: &anyhow::Error) -> bool {
-    error.is::<WaitSuperseded>()
-}
-
 impl WaitBinding {
     /// The pair this wait speaks for, as the monitor's hello wants it:
     /// both halves or neither, never a half.
@@ -155,7 +150,7 @@ pub async fn run(args: WaitArgs) -> anyhow::Result<()> {
         Some((author, binding))
     };
     let mut source_cwd = None;
-    let result = match items_with_context(args, &mut source_cwd).await {
+    let result = match items_with_context(args, &SourceStarts::default(), &mut source_cwd).await {
         Err(e) if e.is::<WaitSuperseded>() => return superseded_error(e, json),
         other => other?,
     };
@@ -239,44 +234,19 @@ async fn run_automatic_grok(
         args.events.is_empty(),
         "automatic Grok wait uses monitor-hosted sources; configure wait_events or use auto off for invocation-only --event sources"
     );
-    loop {
-        binding.ensure_current(repo, author)?;
-        let attached = crate::cli::monitor::attach_or_spawn_with(
-            repo,
-            crate::cli::monitor::Who::Agent {
-                author: author.to_string(),
-                holder: binding.holder(),
-                has_cli_sources: false,
-                turn_end: None,
-            },
-            crate::cli::monitor::spawn_monitor,
-        )
-        .await;
-        let crate::cli::monitor::Attached::Shared(conn) = attached else {
-            anyhow::bail!(
-                "automatic Grok wait could not subscribe to its repository monitor: {attached:?}"
-            );
-        };
-        tracing::debug!(%author, "monitor subscription registered");
-        let wake = shared_wait_within(conn, repo, author, binding, crate::cli::monitor::BEAT_GRACE)
-            .await?;
-        match wake {
-            Shared::Woke(items, cwd) => {
-                return deliver_grok_wake(
-                    repo,
-                    author,
-                    binding,
-                    &items,
-                    args.json,
-                    cwd.as_deref(),
-                    &mut std::io::stdout(),
-                );
-            }
-            // Reattach only after a real disconnect or the existing monitor
-            // liveness deadline. No polling, helper or Grok registration timer.
-            Shared::Alone(why) => tracing::debug!(%why, "reconnecting Grok wait"),
-        }
-    }
+    let (items, cwd) = monitored(repo, author, binding, |who| {
+        crate::cli::monitor::attempt_with(repo, who, crate::cli::monitor::spawn_monitor)
+    })
+    .await?;
+    deliver_grok_wake(
+        repo,
+        author,
+        binding,
+        &items,
+        args.json,
+        cwd.as_deref(),
+        &mut std::io::stdout(),
+    )
 }
 
 /// Grok's delivery boundary: the wake is printed, and only once the
@@ -366,62 +336,36 @@ pub async fn items_observing(
     args: WaitArgs,
     starts: &SourceStarts,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, starts, &mut None, Local::ANY).await
+    items_with_context(args, starts, &mut None).await
+}
+
+/// Why a wait may answer from its own fold of the repo.
+///
+/// An agent's wake is the monitor's alone to decide, so the fold below is
+/// reachable only by holding one of these, and neither is a wait a monitor
+/// could have served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnFold {
+    /// `--peek` reads what is owed and delivers nothing.
+    Peek,
+    /// `--event` sources belong to this one invocation, and no monitor
+    /// runs them.
+    InvocationSources,
+}
+
+impl OwnFold {
+    fn of(peek: bool, sources: &WakeSources) -> Option<Self> {
+        if peek {
+            return Some(OwnFold::Peek);
+        }
+        (!sources.monitor_hosts_all()).then_some(OwnFold::InvocationSources)
+    }
 }
 
 async fn items_with_context(
     args: WaitArgs,
-    source_cwd: &mut Option<PathBuf>,
-) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(args, &SourceStarts::default(), source_cwd, Local::ANY).await
-}
-
-/// Whether owed items end a wait. Items it declines are owed again at the
-/// next change, not lost.
-pub(crate) type Accept<'a> = &'a mut (dyn FnMut(&[WaitItem]) -> bool + Send);
-
-/// How a wait decides it is done with what it found.
-pub(crate) struct Local<'a> {
-    /// Whether it may share the monitor's watch rather than its own.
-    pub(crate) share: bool,
-    pub(crate) accept: Option<Accept<'a>>,
-}
-
-impl Local<'_> {
-    const ANY: Local<'static> = Local {
-        share: true,
-        accept: None,
-    };
-
-    fn takes(&mut self, items: &[WaitItem]) -> bool {
-        !items.is_empty() && self.accept.as_mut().is_none_or(|accept| accept(items))
-    }
-}
-
-/// A wait that never shares, ending only on items `accept` takes: the
-/// local fold a report's child falls back to when no monitor can decide.
-pub(crate) async fn items_alone(
-    args: WaitArgs,
-    source_cwd: &mut Option<PathBuf>,
-    accept: Accept<'_>,
-) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    items_with_policy(
-        args,
-        &SourceStarts::default(),
-        source_cwd,
-        Local {
-            share: false,
-            accept: Some(accept),
-        },
-    )
-    .await
-}
-
-async fn items_with_policy(
-    args: WaitArgs,
     starts: &SourceStarts,
     source_cwd: &mut Option<PathBuf>,
-    mut local: Local<'_>,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
     *source_cwd = std::env::current_dir().ok();
     // Before ANY setup: the fold and the watcher attach can block for
@@ -460,7 +404,9 @@ async fn items_with_policy(
     // Extra wake sources: the agent config's `wait_events` plus any
     // `--event` items (config first, CLI appended). Parse errors are
     // arm-time hard errors naming the offending input.
-    let event_sources = resolve_wait_event_sources(&repo, &author, &args.events)?;
+    let sources = WakeSources {
+        events: resolve_wait_event_sources(&repo, &author, &args.events)?,
+    };
     // Arm-time derivation errors stay HARD (a wait that can never
     // project is a bug to surface); the loop re-derives per wake and
     // is fail-soft there (wait-reloads-config-per-refold).
@@ -469,17 +415,27 @@ async fn items_with_policy(
     let binding = WaitBinding::capture(&args)?;
     binding.ensure_current(&repo, &author)?;
 
+    let Some(own) = OwnFold::of(args.peek, &sources) else {
+        let (items, cwd) = monitored(&repo, &author, &binding, |who| {
+            crate::cli::monitor::attempt_with(&repo, who, crate::cli::monitor::spawn_monitor)
+        })
+        .await?;
+        *source_cwd = cwd;
+        return Ok(Some(items));
+    };
+    let peek = own == OwnFold::Peek;
+
     let events_dir = crate::agent_store::agents_root(&repo)
         .join(author.as_str())
         .join("events");
-    // Mint once before native acceptance; preserve it through shared fallback.
-    let invocation = (!args.peek).then(|| new_invocation().to_string());
+    // Mint once before native acceptance.
+    let invocation = (!peek).then(|| new_invocation().to_string());
     let (source_tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut timers = if args.peek {
+    let mut timers = if peek {
         None
     } else {
         let mut timers = crate::cli::timer_source::TimerSet::new(
-            &event_sources,
+            &sources.events,
             &events_dir,
             invocation.as_deref(),
             source_tx.clone().into(),
@@ -496,7 +452,7 @@ async fn items_with_policy(
         .unwrap_or_default();
     let mut timer_backlog =
         crate::cli::timer_source::Backlog::new(events_dir.clone(), invocation_keys);
-    if args.peek {
+    if peek {
         timer_backlog = timer_backlog.inspection();
     }
 
@@ -533,20 +489,20 @@ async fn items_with_policy(
             );
             owed.events
                 .extend(timer_backlog.owed(&mut Default::default()));
-            if args.peek {
+            if peek {
                 // The hook's SessionStart actually emits this catch-up.
                 // Peek inspects custody without starting producers or receipts.
                 owed.events
                     .extend(crate::cli::event_source::owed_from_sources(
                         &repo,
                         &author,
-                        &event_sources,
+                        &sources.events,
                         &mut Default::default(),
                     ));
             }
             owed
         });
-        if (args.peek || local.takes(&items)) && !items.is_empty() {
+        if !items.is_empty() {
             binding.ensure_current(&repo, &author)?;
             return Ok(Some(items));
         }
@@ -554,46 +510,8 @@ async fn items_with_policy(
 
     // `--peek`: the initial pass found no actionable work → report empty
     // and return immediately, never entering the (blocking) watcher loop.
-    if args.peek {
+    if peek {
         return Ok(Some(Vec::new()));
-    }
-
-    // Share the repo's watch when a monitor is already doing it, which
-    // is the whole point of `a-repo-is-watched-once-not-once-per-waiter`:
-    // every parked wait used to attach its own watcher and refold on
-    // every change, measured at 98 of them for 71 agents.
-    //
-    // The monitor hosts configured sources. Invocation sources remain
-    // local, so share only when that host covers this wait's complete
-    // source scope.
-    //
-    // Derived BEFORE the decision, and the same value is what the park
-    // below spawns: a source the decision cannot see is a source
-    // nobody runs.
-    //
-    // `--peek` never reaches here: it returned above, which is what
-    // keeps it side-effect-free.
-    //
-    // Sharing is an optimisation, never a dependency: a monitor that
-    // dies mid-park sends this wait down to the local watcher below
-    // rather than back to the hook empty-handed. Returning the failure
-    // here would have been a LOST WAKE — the hook sees a failed wait,
-    // does not re-arm, and the agent is never woken again.
-    let sources = WakeSources {
-        events: event_sources,
-    };
-    let shared = match local.share {
-        true => share(&repo, &author, &binding, &sources).await,
-        false => None,
-    };
-    if let Some(conn) = shared {
-        match shared_wait(conn, &repo, &author, &binding).await? {
-            Shared::Woke(items, cwd) => {
-                *source_cwd = cwd;
-                return Ok(Some(items));
-            }
-            Shared::Alone(why) => tracing::debug!("watching {} locally: {why}", repo.display()),
-        }
     }
 
     let (tx, rx) = mpsc::channel::<()>();
@@ -754,7 +672,7 @@ async fn items_with_policy(
             // running memory-only (`events_dir: None`) has no WAL to
             // re-read them from.
             let items = owed_for(&repo, &author, &inputs, &status, &state.fold, &mut external);
-            if local.takes(&items) {
+            if !items.is_empty() {
                 binding.ensure_current(&repo, &author)?;
                 return Ok(items);
             }
@@ -984,27 +902,11 @@ pub(crate) fn derive_wait_inputs(repo: &Path, author: &AgentLabel) -> anyhow::Re
     })
 }
 
-/// The repo's monitor, if this wait may use it.
-///
-/// Sharing is the point of `a-repo-is-watched-once-not-once-per-waiter`:
-/// every parked wait used to attach its own watcher and refold on every
-/// change, measured at 98 of them for 71 agents.
-///
-/// `None` when this wait has ANY extra source. The monitor delivers the
-/// projection but does not yet run `wait_events`, so a wait with github
-/// or command sources must keep watching for itself — sharing would
-/// mean it simply never heard from them. Moving those to the monitor is
-/// the next step; until then this guard is what makes sharing safe
-/// rather than lossy.
-///
-/// `--peek` never reaches here: it returns before this, which is what
-/// keeps it side-effect-free.
 /// Everything besides the repo's own state that can wake this wait.
 ///
-/// One value, because two decisions consume it: whether this wait may
-/// share the monitor's watch, and what the park spawns. A source the
-/// share decision cannot see is a source nobody runs once the wait
-/// shares.
+/// One value, because two decisions consume it: whether a monitor can
+/// serve this wait, and what a wait that folds for itself spawns. A source
+/// the first decision cannot see is a source nobody runs.
 struct WakeSources {
     events: Vec<(
         clank_core::agent_config::WaitEventSource,
@@ -1018,7 +920,7 @@ impl WakeSources {
     /// Destructured on purpose: a source kind added later cannot be
     /// forgotten here, because the pattern stops compiling until it is
     /// named. That is the invariant this type exists to hold.
-    fn may_share(&self) -> bool {
+    fn monitor_hosts_all(&self) -> bool {
         let Self { events } = self;
         // An author's CONFIG sources the monitor runs, once per
         // repo, and routes back to that author. A `--event` source
@@ -1031,112 +933,116 @@ impl WakeSources {
     }
 }
 
-async fn share(
-    repo: &Path,
-    author: &AgentLabel,
-    binding: &WaitBinding,
-    sources: &WakeSources,
-) -> Option<crate::cli::monitor::Conn> {
-    share_with(
-        repo,
-        author,
-        binding,
-        sources,
-        crate::cli::monitor::spawn_monitor,
-    )
-    .await
-}
-
-/// [`share`] with the starting supplied.
+/// The wake of a wait that serves an agent: whatever the repo's monitor
+/// decides it is owed, and nothing this process folds.
 ///
-/// The seam is here rather than in a test's fixture because a fixture
-/// cannot be trusted to hold: a monitor that stopped admitting would
-/// send this straight to the real `spawn_monitor`, and the test's
-/// assertion would still pass — on a process that had taken the temp
-/// repo's lease and outlived the test. Measured, not imagined: two
-/// sockets under `/tmp/clank-socks` from exactly that.
-async fn share_with(
+/// A monitor that goes away is followed, every time. With none to be had
+/// within [`crate::cli::monitor::OUTAGE_BUDGET`], or one of a newer build,
+/// the wait fails saying so, which is what wakes whoever armed it. A
+/// session is told of one outage once, by this or by its hook: a wait
+/// armed again inside it goes on trying and does not fail a second time.
+///
+/// The attaching is a parameter because no test may start a monitor.
+async fn monitored<F>(
     repo: &Path,
     author: &AgentLabel,
     binding: &WaitBinding,
-    sources: &WakeSources,
-    spawn: impl Fn(&Path) -> std::io::Result<Box<dyn crate::cli::monitor::Started>>,
-) -> Option<crate::cli::monitor::Conn> {
-    if !sources.may_share() {
-        return None;
-    }
-    match crate::cli::monitor::attach_or_spawn_with(
-        repo,
-        crate::cli::monitor::Who::Agent {
+    attach: impl Fn(crate::cli::monitor::Who) -> F,
+) -> anyhow::Result<(Vec<WaitItem>, Option<PathBuf>)>
+where
+    F: std::future::Future<Output = crate::cli::monitor::Attempt>,
+{
+    use crate::cli::monitor::Unserved;
+    let mut outage = crate::cli::monitor::Outage::default();
+    let session = binding.0.as_ref().map(|(_, session)| session);
+    loop {
+        binding.ensure_current(repo, author)?;
+        let who = crate::cli::monitor::Who::Agent {
             author: author.to_string(),
             holder: binding.holder(),
-            // The monitor runs no `--event` source, and a wait that
-            // declared one never reaches here: `sources.is_empty()`
-            // above already sent it to watch for itself.
             has_cli_sources: false,
             turn_end: None,
-        },
-        spawn,
-    )
-    .await
-    {
-        crate::cli::monitor::Attached::Shared(conn) => {
-            // One debug event at the accepted-subscription boundary, useful
-            // when diagnosing a parked wait. No new idle work or timer.
-            tracing::debug!(author = %author, "monitor subscription registered");
-            Some(conn)
-        }
-        crate::cli::monitor::Attached::Alone(why) => {
-            tracing::debug!("watching {} locally: {why}", repo.display());
-            None
-        }
+        };
+        let why = match attach(who).await.served() {
+            Ok(conn) => {
+                tracing::debug!(%author, "monitor subscription registered");
+                let grace = crate::cli::monitor::BEAT_GRACE;
+                match shared_wait_within(conn, repo, author, binding, grace, &mut outage).await? {
+                    Shared::Woke(items, cwd) => return Ok((items, cwd)),
+                    Shared::Lost(why) => why,
+                }
+            }
+            Err(Unserved::Upgraded(why)) => {
+                tracing::debug!(%why, "the monitor is of a newer build");
+                anyhow::bail!(
+                    "clank was upgraded; ending this wait so the next one uses the new build"
+                );
+            }
+            Err(Unserved::Retry(why)) => why,
+        };
+        tracing::debug!(%why, "no monitor serves this wait");
+        let pause = match outage.lost(tokio::time::Instant::now()) {
+            Some(pause) => pause,
+            // Failing is all this wait can say, so committing to fail is
+            // its delivery. An unbound wait has nobody's notice to share
+            // and fails each time.
+            None => {
+                let announced = session.map(|session| {
+                    crate::agent_store::announce_outage(
+                        repo,
+                        author,
+                        session,
+                        time::OffsetDateTime::now_utc(),
+                        &mut || Ok(()),
+                    )
+                });
+                if !matches!(
+                    announced,
+                    Some(Ok(crate::agent_store::Announcement::Suppressed))
+                ) {
+                    anyhow::bail!("clank cannot start its monitor: {why}");
+                }
+                crate::cli::monitor::OUTAGE_RETRY_CAP
+            }
+        };
+        tokio::time::sleep(pause).await;
     }
 }
 
-/// How a shared wait ended.
+/// How a wait's time on one monitor connection ended.
 ///
-/// No silent variant, for the reason [`crate::cli::monitor::Attached`]
-/// has none: a wait that stops being woken is the one outcome this
-/// plan may not produce. Sharing can fail — the monitor can die
-/// mid-park — and every way it fails is a reason to watch locally, so
-/// that is what the type says. A supersession is NOT in here: being
-/// told this session no longer owns the label is a refusal to answer
-/// at all, and stays an error.
+/// No silent variant: a wait that stops being woken is the one outcome
+/// this may not produce. A supersession is NOT in here: being told this
+/// session no longer owns the label is a refusal to answer at all, and
+/// stays an error.
 #[derive(Debug)]
 enum Shared {
     /// Work, decided at the monitor's fold.
     Woke(Vec<WaitItem>, Option<PathBuf>),
-    /// The sharing ended. The string says why, for the log.
-    Alone(String),
+    /// The connection ended with nothing delivered. The string says why,
+    /// for the log.
+    Lost(String),
 }
 
-/// A wait that shares the repo's monitor instead of watching itself.
+/// One monitor connection's worth of a wait, until it delivers or ends.
 ///
 /// Items arrive already decided: the monitor derives them through
-/// `owed_for`, which is `present_with_blocks`, so a block's blast
-/// radius is settled in the one place that settles it.
+/// `owed_for`, which is `present_with_blocks`, so a block's blast radius
+/// is settled in the one place that settles it.
 ///
-/// Silence ends it: a wedged monitor and a dead one look the same to a
-/// client, and the beat is what distinguishes either from a quiet repo.
-async fn shared_wait(
-    conn: crate::cli::monitor::Conn,
-    repo: &Path,
-    author: &AgentLabel,
-    binding: &WaitBinding,
-) -> anyhow::Result<Shared> {
-    shared_wait_within(conn, repo, author, binding, crate::cli::monitor::BEAT_GRACE).await
-}
-
-/// [`shared_wait`] with the grace supplied, so silence is testable
-/// without waiting the production twenty seconds.
+/// Silence for `grace` ends it: a wedged monitor and a dead one look the
+/// same to a client, and the beat is what distinguishes either from a
+/// quiet repo. Every note heard ends `outage`.
 async fn shared_wait_within(
     conn: crate::cli::monitor::Conn,
     repo: &Path,
     author: &AgentLabel,
     binding: &WaitBinding,
     grace: Duration,
+    outage: &mut crate::cli::monitor::Outage,
 ) -> anyhow::Result<Shared> {
     let mut notes = bridge_notes(conn, grace)?;
+    let mut served = false;
     // The sharing ends exactly one way: the reader is gone. A failed
     // read is the REASON, not a second ending — giving it an arm of
     // its own would make two code paths for one rule, and each would
@@ -1145,6 +1051,15 @@ async fn shared_wait_within(
     loop {
         match notes.recv().await {
             Some(Ok(note)) => {
+                outage.answered();
+                // A subscription is served by the first thing its monitor
+                // says, whatever it is: an idle agent hears only beats.
+                if !std::mem::replace(&mut served, true)
+                    && let Some((_, session)) = &binding.0
+                    && let Err(e) = crate::agent_store::outage_served(repo, author, session)
+                {
+                    tracing::debug!(%e, "the outage's notice could not be cleared");
+                }
                 // Ownership is a LIFECYCLE check, not a condition on
                 // delivery: every note is this wait's chance to notice
                 // it has been superseded, exactly as the local loop
@@ -1164,7 +1079,7 @@ async fn shared_wait_within(
                         anyhow::bail!("monitor refused wait: {why}")
                     }
                     // Terminal: a newer wait of this session holds the
-                    // repo's delivery now. Watching locally instead would
+                    // repo's delivery now. Following the monitor again would
                     // deliver the same work a second time.
                     crate::cli::monitor::Note::Superseded => {
                         return Err(WaitSuperseded(
@@ -1179,9 +1094,7 @@ async fn shared_wait_within(
             None => break,
         }
     }
-    // Silence or a broken frame: stop sharing and watch for ourselves
-    // rather than wait on a monitor that has stopped.
-    Ok(Shared::Alone(format!(
+    Ok(Shared::Lost(format!(
         "the monitor for {} stopped answering ({why})",
         repo.display()
     )))
@@ -3258,11 +3171,13 @@ mod shared_tests {
             },
         ]);
 
-        let got = shared_wait(
+        let got = shared_wait_within(
             conn,
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
+            crate::cli::monitor::BEAT_GRACE,
+            &mut Default::default(),
         )
         .await
         .expect("the items arrive");
@@ -3284,11 +3199,13 @@ mod shared_tests {
             items: vec![promote()],
             source_cwd: Some(host_cwd.clone()),
         }]);
-        let got = shared_wait(
+        let got = shared_wait_within(
             conn,
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
+            crate::cli::monitor::BEAT_GRACE,
+            &mut Default::default(),
         )
         .await
         .unwrap();
@@ -3314,11 +3231,13 @@ mod shared_tests {
             },
         ]);
 
-        let got = shared_wait(
+        let got = shared_wait_within(
             conn,
             repo.path(),
             &AgentLabel::parse("claude").unwrap(),
             &WaitBinding(None, WaitPolicy::Manual),
+            crate::cli::monitor::BEAT_GRACE,
+            &mut Default::default(),
         )
         .await
         .unwrap();
@@ -3326,6 +3245,254 @@ mod shared_tests {
             panic!("the frame that carried items is the wake, got {got:?}")
         };
         assert_eq!(got.len(), 1, "the empty frame was not a wake: {got:?}");
+    }
+
+    /// A monitor's end of a pair that says `frames` and then goes away.
+    fn monitor_leaving_after(frames: Vec<Note>) -> Conn {
+        use std::io::Write;
+        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        for frame in frames {
+            writeln!(&theirs, "{}", serde_json::to_string(&frame).unwrap()).unwrap();
+        }
+        Conn::over(mine)
+    }
+
+    fn unbound() -> (tempfile::TempDir, AgentLabel, WaitBinding) {
+        (
+            tempfile::tempdir().unwrap(),
+            AgentLabel::parse("claude").unwrap(),
+            WaitBinding(None, WaitPolicy::Manual),
+        )
+    }
+
+    /// A monitor that goes away is followed every time, and the wake is
+    /// what the one that stays delivers. The repo here is an empty
+    /// directory nothing could fold.
+    #[tokio::test]
+    async fn a_wait_follows_a_monitor_lost_three_times_to_the_one_that_delivers() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author, binding) = unbound();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (items, _) = monitored(repo.path(), &author, &binding, |_| {
+            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Attempt::Shared(match nth {
+                    0..3 => monitor_leaving_after(vec![Note::Beat]),
+                    _ => monitor_saying(vec![Note::Items {
+                        source_cwd: None,
+                        items: vec![promote()],
+                    }]),
+                })
+            }
+        })
+        .await
+        .expect("the fourth monitor delivers");
+        assert_eq!(attempts.into_inner(), 4, "each lost monitor was followed");
+        assert!(
+            matches!(items.as_slice(), [WaitItem::PromoteFromQueue { .. }]),
+            "{items:?}"
+        );
+    }
+
+    /// With no monitor to be had, the wait goes on trying for the outage
+    /// budget and then fails with the last attempt's reason. It delivers
+    /// nothing of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_with_no_monitor_fails_with_the_reason_past_the_outage_budget() {
+        use crate::cli::monitor::{Attempt, OUTAGE_BUDGET};
+        let (repo, author, binding) = unbound();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let began = tokio::time::Instant::now();
+        let failed = monitored(repo.path(), &author, &binding, |_| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Attempt::SpawnFailed("starting one failed: no binary".into()) }
+        })
+        .await
+        .expect_err("no monitor is not a wake with work");
+        assert_eq!(
+            failed.to_string(),
+            "clank cannot start its monitor: starting one failed: no binary"
+        );
+        let took = began.elapsed();
+        assert!(
+            took >= OUTAGE_BUDGET && took < OUTAGE_BUDGET * 2,
+            "it held on for the budget and no longer: {took:?}"
+        );
+        assert!(
+            attempts.into_inner() > 4,
+            "and went on attempting throughout"
+        );
+    }
+
+    /// A session's wait ends once for one outage, with the reason. Armed
+    /// again inside it, the wait goes on trying well past the budget, and
+    /// the monitor that finally serves it ends what the session was told.
+    #[tokio::test(start_paused = true)]
+    async fn a_bound_wait_fails_once_for_an_outage_and_then_goes_on_trying() {
+        use crate::cli::monitor::{Attempt, OUTAGE_BUDGET};
+        let repo = tempfile::tempdir().unwrap();
+        let author = AgentLabel::parse("grok").unwrap();
+        let session = clank_core::SessionId::parse("session-in-an-outage").unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &author,
+            clank_core::Tool::Grok,
+            &session,
+        )
+        .unwrap();
+        let binding = WaitBinding(
+            Some((clank_core::Tool::Grok, session.clone())),
+            WaitPolicy::Manual,
+        );
+        let told = || crate::cli::turn_child::tests::told(repo.path(), &author);
+
+        let failed = monitored(repo.path(), &author, &binding, |_| async {
+            Attempt::SpawnFailed("starting one failed: no binary".into())
+        })
+        .await
+        .expect_err("the first wait of an outage says so");
+        assert_eq!(
+            failed.to_string(),
+            "clank cannot start its monitor: starting one failed: no binary"
+        );
+        assert!(told());
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let began = tokio::time::Instant::now();
+        let (items, _) = monitored(repo.path(), &author, &binding, |_| {
+            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                match nth {
+                    0..40 => Attempt::SpawnFailed("starting one failed: no binary".into()),
+                    _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                        source_cwd: None,
+                        items: vec![promote()],
+                    }])),
+                }
+            }
+        })
+        .await
+        .expect("a wait already told of the outage does not fail again");
+        assert_eq!(items.len(), 1);
+        assert!(
+            began.elapsed() > OUTAGE_BUDGET * 3,
+            "it held on well past the budget: {:?}",
+            began.elapsed()
+        );
+        assert!(!told(), "a monitor that serves it ends the outage");
+    }
+
+    /// A monitor that serves an idle agent says only beats, and that is
+    /// serving: the outage the session was told of is over, so the next
+    /// one is announced.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_after_a_healthy_quiet_subscription_is_announced_again() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author) =
+            crate::cli::turn_child::tests::repo_with(clank_core::Tool::Grok, false);
+        let session = clank_core::SessionId::parse(crate::cli::turn_child::tests::SESSION).unwrap();
+        let binding = WaitBinding(Some((clank_core::Tool::Grok, session)), WaitPolicy::Manual);
+        let told = || crate::cli::turn_child::tests::told(repo.path(), &author);
+        let no_binary = || Attempt::SpawnFailed("starting one failed: no binary".into());
+
+        monitored(repo.path(), &author, &binding, |_| async { no_binary() })
+            .await
+            .expect_err("the first outage is announced");
+        assert!(told());
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let again = monitored(repo.path(), &author, &binding, |_| {
+            let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                match nth {
+                    0 => Attempt::Shared(monitor_leaving_after(vec![Note::Beat])),
+                    1..60 => no_binary(),
+                    // Reached only by a wait that went on trying in
+                    // silence, which is what must not happen here.
+                    _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                        source_cwd: None,
+                        items: vec![promote()],
+                    }])),
+                }
+            }
+        })
+        .await
+        .expect_err("the outage after a monitor served it is a new one");
+        assert_eq!(
+            again.to_string(),
+            "clank cannot start its monitor: starting one failed: no binary"
+        );
+        assert!(told());
+    }
+
+    /// A session's hook and its background wait that reach the notice
+    /// together wake it once: the wait gets there while the hook's child
+    /// is still writing, finds the session told, and goes on trying.
+    #[test]
+    fn a_hook_and_a_background_wait_announce_one_outage_once() {
+        use crate::cli::monitor::Attempt;
+        use crate::cli::turn_child::tests::{HookPipe, announcements, handoff_child, repo_with};
+        let (repo, author) = repo_with(clank_core::Tool::Grok, false);
+        let session = clank_core::SessionId::parse(crate::cli::turn_child::tests::SESSION).unwrap();
+        let binding = WaitBinding(Some((clank_core::Tool::Grok, session)), WaitPolicy::Manual);
+        let (writing, began) = std::sync::mpsc::channel();
+        let mut hook = HookPipe {
+            bytes: Vec::new(),
+            hold: std::time::Duration::from_secs(1),
+            writing: Some(writing),
+            broken: false,
+        };
+        let waited = std::thread::scope(|scope| {
+            scope.spawn(|| handoff_child(repo.path(), &author, &mut hook));
+            began
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the hook's child reaches its notice");
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(monitored(repo.path(), &author, &binding, |_| {
+                    let nth = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        match nth {
+                            0..40 => Attempt::SpawnFailed("starting one failed: no binary".into()),
+                            _ => Attempt::Shared(monitor_saying(vec![Note::Items {
+                                source_cwd: None,
+                                items: vec![promote()],
+                            }])),
+                        }
+                    }
+                }))
+        });
+        assert_eq!(announcements(&hook), 1);
+        assert!(
+            waited.is_ok(),
+            "the wait must not announce the outage a second time: {waited:?}"
+        );
+    }
+
+    /// A monitor of a newer build cannot be followed by this process: the
+    /// wait ends at once, so the next one runs the installed build.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_refused_by_a_newer_monitor_ends_at_once() {
+        use crate::cli::monitor::Attempt;
+        let (repo, author, binding) = unbound();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let began = tokio::time::Instant::now();
+        let failed = monitored(repo.path(), &author, &binding, |_| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Attempt::Newer("the monitor speaks proto 99".into()) }
+        })
+        .await
+        .expect_err("a refusal is not a wake with work");
+        assert!(
+            failed.to_string().starts_with("clank was upgraded;"),
+            "{failed}"
+        );
+        assert_eq!(attempts.into_inner(), 1);
+        assert_eq!(began.elapsed(), Duration::ZERO);
     }
 
     /// A repo whose monitor admits anyone who asks.
@@ -3368,93 +3535,117 @@ mod shared_tests {
         (repo, dir)
     }
 
-    /// `--peek` must neither connect nor start anything.
-    ///
-    /// It is documented SIDE-EFFECT-FREE, and starting a monitor is
-    /// the largest side effect in this file. The guarantee is an
-    /// ORDERING inside one function — peek returns before the share —
-    /// and nothing observable distinguishes "returned early" from
-    /// "connected and then returned", so the order is read rather
-    /// than driven.
+    /// `--peek` must neither connect nor start anything: it is documented
+    /// side-effect-free, and starting a monitor is the largest side effect
+    /// in this file. Whatever its sources, a peek holds its own fold.
     #[test]
-    fn peek_returns_before_anything_is_shared_or_started() {
-        let src = include_str!("wait.rs");
-        let peek = src
-            .find("if args.peek {")
-            .expect("peek still returns early");
-        let share = src
-            .find("share(&repo, &author, &binding, &sources)")
-            .expect("the share is still in run");
-        assert!(
-            peek < share,
-            "peek must return BEFORE the share, or it can start a monitor"
-        );
-        assert!(
-            !src[peek..share].contains("share("),
-            "and nothing between them may share either"
+    fn a_peek_folds_for_itself_whatever_its_sources() {
+        let none = WakeSources { events: Vec::new() };
+        assert_eq!(OwnFold::of(true, &none), Some(OwnFold::Peek));
+        assert_eq!(
+            OwnFold::of(false, &none),
+            None,
+            "and the same wait without --peek is a monitor's"
         );
     }
 
     /// The one wiring no test here may run.
     ///
     /// Starting a real monitor is banned in this suite, so every test
-    /// below substitutes the starter — which leaves `share`'s own
-    /// choice of the real one unexercised. Read it instead: without
-    /// this, production could quietly stop starting anything and the
-    /// whole suite would still be green.
+    /// below substitutes the attaching, which leaves production's choice
+    /// of the real starter unexercised. Read it instead: without this,
+    /// production could quietly stop starting anything and the whole
+    /// suite would still be green.
     #[test]
-    fn share_hands_the_real_starter_to_the_seam() {
+    fn every_monitored_wait_is_handed_the_real_starter() {
         let src = include_str!("wait.rs");
-        let from = src.find("async fn share(").expect("share is still here");
-        let to = src[from..]
-            .find("async fn share_with(")
-            .expect("the seam is still here");
-        assert!(
-            src[from..from + to].contains("monitor::spawn_monitor"),
-            "`share` must pass the REAL starter, not a stub"
-        );
+        let production = &src[..src.find("mod shared_tests {").expect("this module")];
+        let calls: Vec<_> = production.match_indices("monitored(").collect();
+        assert_eq!(calls.len(), 2, "the plain wait and Grok's waiter");
+        for (at, _) in calls {
+            let call = &production[at..at + 200];
+            assert!(
+                call.contains("attempt_with(") && call.contains("monitor::spawn_monitor"),
+                "a monitored wait must pass the REAL starter, not a stub: {call}"
+            );
+        }
     }
 
-    /// Sharing against the fixture, with starting one made impossible.
+    /// The wait's own fold and watcher are behind [`OwnFold`], and nothing
+    /// a monitored wait runs reaches them.
+    #[test]
+    fn a_monitored_wait_names_no_fold_and_no_watcher() {
+        let src = include_str!("wait.rs");
+        let from = src.find("async fn monitored<F>(").expect("the agent path");
+        let to = from + src[from..].find("\n}\n").expect("its end");
+        for local in [
+            "rebuild::",
+            "repo_watch::",
+            "items_for(",
+            "owed_for(",
+            "Beat::",
+        ] {
+            assert!(
+                !src[from..to].contains(local),
+                "an agent's wake may not come from `{local}`"
+            );
+        }
+        let guard = src
+            .find("let Some(own) = OwnFold::of(args.peek, &sources) else {")
+            .expect("the fold is still guarded");
+        let fold = src
+            .find("crate::rebuild::rebuild_repo_with_policy(&repo, policy)")
+            .expect("the wait's own fold");
+        assert!(guard < fold, "the guard comes before the first fold");
+    }
+
+    /// One attach attempt for a plain wait against the fixture, with
+    /// starting a monitor made impossible.
     ///
     /// A refusal is then the fixture breaking rather than the guard
     /// working, so the assertions stay honest instead of passing on a
     /// real monitor.
-    async fn share_without_starting(
+    async fn attach_without_starting(
         repo: &Path,
         author: &AgentLabel,
         binding: &WaitBinding,
-        sources: &WakeSources,
     ) -> Option<Conn> {
-        share_with(repo, author, binding, sources, |_| {
-            Err(std::io::Error::other("a test must not start a monitor"))
-        })
+        crate::cli::monitor::attempt_with(
+            repo,
+            crate::cli::monitor::Who::Agent {
+                author: author.to_string(),
+                holder: binding.holder(),
+                has_cli_sources: false,
+                turn_end: None,
+            },
+            |_| Err(std::io::Error::other("a test must not start a monitor")),
+        )
         .await
+        .served()
+        .ok()
     }
 
-    /// A wait with its own sources must NOT share.
-    ///
-    /// The monitor delivers the projection and does not yet run
-    /// `wait_events`, so a shared wait with github or command sources
+    /// A wait is the monitor's unless it has sources of its own
+    /// invocation, which no monitor runs: one that attached with those
     /// would never hear from them.
     #[tokio::test]
-    async fn a_wait_shares_when_the_monitor_covers_all_of_its_sources() {
+    async fn a_wait_is_the_monitors_when_the_monitor_covers_all_of_its_sources() {
         let (repo, _dir) = repo_with_a_willing_monitor();
         let author = AgentLabel::parse("claude").unwrap();
         let binding = WaitBinding(None, WaitPolicy::Manual);
 
         let nothing = WakeSources { events: Vec::new() };
-        assert!(nothing.may_share());
+        assert_eq!(OwnFold::of(false, &nothing), None);
         assert!(
-            share_without_starting(repo.path(), &author, &binding, &nothing)
+            attach_without_starting(repo.path(), &author, &binding)
                 .await
                 .is_some(),
-            "with no sources it shares"
+            "and the fixture's monitor admits it"
         );
 
         // A CONFIG source is an AUTHOR's, and the monitor runs it once
-        // per repo and routes it back to that author — so having one is
-        // no longer a reason to watch alone.
+        // per repo and routes it back to that author, so having one is
+        // no reason to fold for itself.
         let agent_dir = crate::agent_store::agents_root(repo.path()).join("claude");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
@@ -3469,12 +3660,10 @@ mod shared_tests {
             !configured.events.is_empty(),
             "the fixture declares a config source"
         );
-        assert!(configured.may_share());
-        assert!(
-            share_without_starting(repo.path(), &author, &binding, &configured)
-                .await
-                .is_some(),
-            "the monitor hosts config sources, so this wait may share"
+        assert_eq!(
+            OwnFold::of(false, &configured),
+            None,
+            "the monitor hosts config sources, so this wait is the monitor's"
         );
 
         // A `--event` source belongs to ONE INVOCATION. The monitor
@@ -3488,11 +3677,9 @@ mod shared_tests {
             )
             .unwrap(),
         };
-        assert!(!invoked.may_share());
-        assert!(
-            share_without_starting(repo.path(), &author, &binding, &invoked)
-                .await
-                .is_none(),
+        assert_eq!(
+            OwnFold::of(false, &invoked),
+            Some(OwnFold::InvocationSources),
             "a source of this invocation's own keeps it watching for itself"
         );
     }
@@ -3671,7 +3858,7 @@ mod shared_tests {
             events: mine.clone(),
         };
         assert!(
-            !sources.may_share(),
+            !sources.monitor_hosts_all(),
             "an invocation's source keeps this wait watching for itself"
         );
         let (mut rx, spawned) = spawn_local(&mine, Some(&codex_dir.join("events")), Some("inv-3"));
@@ -3707,7 +3894,7 @@ mod shared_tests {
             WakeSources {
                 events: theirs.clone()
             }
-            .may_share(),
+            .monitor_hosts_all(),
             "config only, so the monitor covers everything that wakes it"
         );
         let (mut claude_rx, claude_spawned) =
@@ -3868,7 +4055,7 @@ mod shared_tests {
         spawned.shutdown().await;
     }
 
-    /// A PRE-HOSTING monitor is refused, and the wait keeps its sources.
+    /// A PRE-HOSTING monitor is never attached to.
     ///
     /// One of those can still be running after a binary update, holding
     /// its repo's lease. It accepts the same hello and serves only
@@ -3930,14 +4117,14 @@ mod shared_tests {
         .unwrap();
 
         assert!(
-            configured.may_share(),
+            configured.monitor_hosts_all(),
             "the wait itself is eligible — it is the MONITOR that cannot"
         );
         assert!(
-            share_without_starting(repo.path(), &author, &binding, &configured)
+            attach_without_starting(repo.path(), &author, &binding)
                 .await
                 .is_none(),
-            "so it watches for itself rather than losing its events"
+            "so the wait is never attached to it"
         );
     }
 
@@ -3966,6 +4153,7 @@ mod shared_tests {
                 &AgentLabel::parse("claude").unwrap(),
                 &WaitBinding(None, WaitPolicy::Manual),
                 std::time::Duration::from_secs(1),
+                &mut Default::default(),
             ),
         )
         .await
@@ -3996,13 +4184,14 @@ mod shared_tests {
                 &AgentLabel::parse("claude").unwrap(),
                 &WaitBinding(None, WaitPolicy::Manual),
                 std::time::Duration::from_millis(150),
+                &mut Default::default(),
             ),
         )
         .await
         .expect("silence must end the sharing, not be waited on")
         .expect("silence is not an error: the wait watches for itself instead");
 
-        let Shared::Alone(why) = why else {
+        let Shared::Lost(why) = why else {
             panic!("silence is not a wake, got {why:?}")
         };
         assert!(why.contains("stopped answering"), "{why}");
@@ -4040,6 +4229,7 @@ mod shared_tests {
                         &AgentLabel::parse("claude").unwrap(),
                         &WaitBinding(None, WaitPolicy::Manual),
                         std::time::Duration::from_millis(200),
+                        &mut Default::default(),
                     )
                     .await
                 }));
@@ -4059,7 +4249,7 @@ mod shared_tests {
                     .unwrap_or_else(|_| panic!("a {door} monitor must not strand a client"))
                     .expect("the client task did not panic")
                     .expect("recovery is not an error: the wait watches for itself");
-                let Shared::Alone(why) = got else {
+                let Shared::Lost(why) = got else {
                     panic!("a {door} monitor is not a wake, got {got:?}")
                 };
                 assert!(why.contains("stopped answering"), "{door}: {why}");
@@ -4113,6 +4303,7 @@ mod shared_tests {
                 &label,
                 &binding,
                 std::time::Duration::from_secs(1),
+                &mut Default::default(),
             ),
         )
         .await
@@ -4168,6 +4359,7 @@ mod shared_tests {
                 &label,
                 &binding,
                 std::time::Duration::from_secs(1),
+                &mut Default::default(),
             ),
         )
         .await

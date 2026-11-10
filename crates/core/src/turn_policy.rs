@@ -448,8 +448,15 @@ pub enum Notice {
         name: String,
         matches: Vec<TaskSummary>,
     },
-    /// Alone mode: work is owed and no monitor can present it.
-    MonitorUnavailable,
+    /// No monitor could be reached or started within the waiter's outage
+    /// budget. `why` is how the last attempt ended.
+    MonitorOutage { why: String },
+    /// A monitor took a report that never parks and gave no verdict
+    /// before its hook had to answer.
+    MonitorUnanswered,
+    /// The repo's monitor is of a newer build, which this process cannot
+    /// follow: the agent's next wait runs the installed one.
+    Upgraded,
     /// Grok's native handoff: run `clank wait` in the background, whose
     /// completion wakes the agent.
     ArmWait,
@@ -1708,20 +1715,17 @@ pub fn handoff_verdict(handoff: &Handoff, facts: &Facts<'_>) -> Verdict {
     Verdict::Notify(vec![Notice::ArmWait])
 }
 
-/// What a hook does when no monitor can decide: the generic owed-work fold
-/// only says whether work is owed. Never quiet on attendance, never a
-/// presentation, so the monitor keeps custody of every receipt.
-pub fn alone_verdict(session: &SessionId, facts: &Facts<'_>) -> Verdict {
+/// What a hook with no monitor says to `session`: nothing unless clank
+/// drives it, and then `notice`. Never work and never a park, which only a
+/// monitor decides.
+pub fn unmonitored_verdict(session: &SessionId, facts: &Facts<'_>, notice: Notice) -> Verdict {
     if facts.binding != Some(session) {
         return Verdict::Silent(SilentWhy::StaleBinding);
     }
     if let Some(gated) = drive_gate(facts) {
         return gated;
     }
-    if facts.asking || facts.blocked || facts.owed.is_empty() {
-        return Verdict::Park;
-    }
-    Verdict::Notify(vec![Notice::MonitorUnavailable])
+    Verdict::Notify(vec![notice])
 }
 
 #[cfg(test)]

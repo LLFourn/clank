@@ -979,69 +979,10 @@ async fn a_session_starts_receipt_follows_only_claudes_context() {
     }
 }
 
-/// Alone, owed work wakes the agent with a notice and presents nothing,
-/// whether or not that notice lands; once a monitor is back it presents
-/// the same work once, and its receipt commits once.
-#[tokio::test]
-async fn alone_mode_presents_nothing_and_the_monitor_delivers_once_after() {
-    let fixture = receipt_fixture(Tool::Codex);
-    let owed = std::slice::from_ref(&fixture.item);
-    let alone = Gathered::of(&fixture.repo, &fixture.author, Some((owed, None)));
-    let verdict = alone.alone_verdict(&sid(&fixture.session));
-    assert_eq!(
-        frame_of(verdict).verdict,
-        WireVerdict::Notify,
-        "owed work wakes the agent"
-    );
-    assert_eq!(
-        alone.alone_verdict(&sid("someone-else-entirely")),
-        Verdict::Silent(SilentWhy::StaleBinding)
-    );
-    assert!(
-        fixture.rows()[0].woken_at.is_none(),
-        "a notice is not a presentation"
-    );
-    assert!(!fixture.output.exists());
-
-    let mut turns = Turns::new(fixture.repo.clone());
-    let (frame, g) = present_receipt(&fixture, &mut turns, Tool::Codex, 1);
-    std::fs::write(fixture.marker(), "flushed").unwrap();
-    let presentation = frame.presentation().expect("the same work").clone();
-    turns
-        .result(
-            &fixture.author,
-            1,
-            TurnResult::Delivered {
-                presentation: presentation.clone(),
-            },
-            &g,
-        )
-        .unwrap()
-        .unwrap()
-        .run(&fixture.repo)
-        .await;
-    assert!(fixture.output.exists());
-    let first = std::fs::read(&fixture.output).unwrap();
-    std::fs::remove_file(&fixture.output).unwrap();
-    assert!(
-        turns
-            .result(
-                &fixture.author,
-                1,
-                TurnResult::Delivered { presentation },
-                &g
-            )
-            .is_err(),
-        "nothing is committed twice"
-    );
-    assert!(!fixture.output.exists());
-    assert!(!first.is_empty());
-}
-
-/// Alone mode is never quiet on attendance, and still honours auto off
-/// and a pending question.
+/// With no monitor, an attendance quiets nothing: the notice still wakes
+/// the session clank drives, and only that session.
 #[test]
-fn alone_mode_is_never_quiet_on_attendance() {
+fn a_no_monitor_notice_ignores_attendance_and_honours_the_drive_gate() {
     let repo = repo_with("claude", Tool::Claude, "session-one");
     let author = label("claude");
     let mut turns = Turns::new(repo.path().to_path_buf());
@@ -1056,18 +997,25 @@ fn alone_mode_is_never_quiet_on_attendance() {
             &g,
         )
         .unwrap();
-    let alone = gathered(repo.path(), "claude", &[message("1")]);
+    let notice = || clank_core::turn_policy::Notice::MonitorOutage {
+        why: "no binary".into(),
+    };
+    let unmonitored = Gathered::of(repo.path(), &author, None);
     assert_eq!(
-        alone.alone_verdict(&sid("session-one")),
-        Verdict::Notify(vec![clank_core::turn_policy::Notice::MonitorUnavailable])
+        unmonitored.unmonitored_verdict(&sid("session-one"), notice()),
+        Verdict::Notify(vec![notice()])
+    );
+    assert_eq!(
+        unmonitored.unmonitored_verdict(&sid("someone-else-entirely"), notice()),
+        Verdict::Silent(SilentWhy::StaleBinding)
     );
     crate::agent_store::set_auto_mode(repo.path(), &author, AutoMode::Off).unwrap();
-    let off = gathered(repo.path(), "claude", &[message("1")]);
     assert_eq!(
-        off.alone_verdict(&sid("session-one")),
+        Gathered::of(repo.path(), &author, None).unmonitored_verdict(&sid("session-one"), notice()),
         Verdict::Silent(SilentWhy::AutoOff)
     );
 }
+
 /// A receipt callback that fails leaves the delivery evidence in place and
 /// replaces only Claude's bounded diagnostic file.
 #[tokio::test]
