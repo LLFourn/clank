@@ -1424,6 +1424,52 @@ pub fn scan_blocks(repo: &Path) -> Vec<BlockEntry> {
     out
 }
 
+/// How a block is named wherever one is said to withhold work.
+pub(crate) fn key(agent: &str, name: &str) -> String {
+    format!("{agent}/{name}")
+}
+
+/// When each block that has stopped withholding work from `author` did
+/// so, by [`key`], in unix seconds: another agent's block when it was
+/// answered, `author`'s own when the answer was received. Read from the
+/// answer and receipt files' own times, so it is the same whoever asks and
+/// whenever. A block cleaned away is not here: its end cannot be dated.
+pub(crate) fn ended(
+    repo: &Path,
+    author: &clank_core::AgentLabel,
+) -> std::collections::BTreeMap<String, u64> {
+    let written = |path: &Path| {
+        let at = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        Some(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(agents_root(repo))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let Some(agent) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let dir = entry.path();
+        for name in question_names(&dir) {
+            let Some(pair) = Pair::read(&dir, &name).filter(|p| p.damage().is_none()) else {
+                continue;
+            };
+            let f = files(&dir, &name);
+            let at = match (agent == author.as_str(), pair.received, &pair.answer) {
+                (true, true, _) => written(&f.marker),
+                (false, _, Some(_)) => written(&f.answer),
+                _ => None,
+            };
+            if let Some(at) = at {
+                out.insert(key(&agent, &name), at);
+            }
+        }
+    }
+    out
+}
+
 /// An answer `agent` is owed: answered and not yet received.
 pub(crate) struct OwedAnswer {
     pub(crate) answer: String,
@@ -1873,6 +1919,53 @@ mod tests {
         carries[0].clone()
     }
 
+    fn written_at(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// A block stops withholding work from everyone else when it is
+    /// answered, and from its own asker only when the answer is received.
+    /// Both moments are the files' own, so they read the same to a
+    /// monitor that starts long after; a pending block has ended for
+    /// nobody, and one cleaned away dates nothing.
+    #[test]
+    fn a_blocks_end_is_dated_by_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let bob = clank_core::AgentLabel::parse("bob").unwrap();
+        ask(repo, &alice(), "pending", "Still open?").unwrap();
+        assert!(
+            ended(repo, &bob).is_empty(),
+            "a pending block has not ended"
+        );
+
+        let a = asked_and_answered(repo, "q", "Proceed?", "yes");
+        written_at(&repo.join(".clank/agents/alice/unblocks/q.md"), 7000);
+        assert_eq!(
+            ended(repo, &bob),
+            [(key("alice", "q"), 7000)].into(),
+            "for another agent, at the answer"
+        );
+        assert!(
+            ended(repo, &alice()).is_empty(),
+            "for its asker, not before the answer is received"
+        );
+
+        assert_eq!(receive(repo, &a, || true).unwrap(), Receipt::Retired);
+        written_at(&marker(repo, "q"), 7600);
+        assert_eq!(ended(repo, &alice()), [(key("alice", "q"), 7600)].into());
+        assert_eq!(ended(repo, &bob)[&key("alice", "q")], 7000);
+
+        clean(repo, &alice()).unwrap();
+        assert!(ended(repo, &alice()).is_empty(), "cleaned away: undatable");
+        assert!(ended(repo, &bob).is_empty());
+    }
+
     #[test]
     fn a_received_answer_is_retired_by_its_marker_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1903,16 +1996,24 @@ mod tests {
             let carried = crate::cli::presentation::Carried {
                 events: Vec::new(),
                 answers: vec![a.clone()],
+                identities: Vec::new(),
             };
             let authorized = AtomicBool::new(true);
             let (observed, seen) = std::sync::mpsc::channel();
             let held = lock(repo, &alice()).unwrap();
             std::thread::scope(|s| {
                 s.spawn(|| {
-                    crate::cli::presentation::record_delivered(repo, &alice(), &carried, || {
-                        let _ = observed.send(());
-                        authorized.load(Ordering::SeqCst)
-                    })
+                    crate::cli::presentation::record_delivered(
+                        repo,
+                        &alice(),
+                        clank_core::Tool::Claude,
+                        "s1",
+                        &carried,
+                        || {
+                            let _ = observed.send(());
+                            authorized.load(Ordering::SeqCst)
+                        },
+                    )
                 });
                 // A pre-lock check reports in at once; one read under the
                 // lock cannot until the lock is released below.

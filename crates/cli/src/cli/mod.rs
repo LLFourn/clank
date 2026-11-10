@@ -42,6 +42,7 @@ pub mod html_highlight;
 pub mod init;
 #[cfg(test)]
 pub mod js_guard;
+pub(crate) mod ledger;
 pub mod licenses;
 pub mod log;
 pub(crate) mod message;

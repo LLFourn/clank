@@ -3466,6 +3466,16 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                 let now = crate::cli::turn_custody::now_ms();
                 leaving.extend(expire_reports(&mut clients, now));
                 if owner {
+                    leaving.extend(expire_deliveries(
+                        &repo,
+                        &mut clients,
+                        folded_state.as_ref(),
+                        &pending,
+                        &hosted,
+                        &mut turns,
+                        &mut recovery,
+                        now,
+                    ));
                     let (dues, served) = deadline_round(
                         &repo,
                         &mut clients,
@@ -4004,7 +4014,6 @@ async fn start(args: super::MonitorStartArgs) -> anyhow::Result<()> {
                                 recovery_facts(
                                     &repo,
                                     &state,
-                                    &clients,
                                     &hosted,
                                     &mut timer_backlogs,
                                     &pending,
@@ -4232,14 +4241,15 @@ fn user_command_look(
 
 /// What the monitor knows about each bound roster agent, for recovery.
 ///
-/// Obligation is what a newly arriving waiter would be handed, derived as
-/// a delivery would derive it but into a set no client owns. It is only
-/// derived for an agent with no deliverer, which is the only kind that
-/// can be stuck, or one whose repeat count an owed-work change could end.
+/// What an agent is owed is what a newly arriving waiter would be handed,
+/// derived as a delivery would derive it but into a set no client owns,
+/// and kept as a ledger: each item's obligation, and whether it reached
+/// the session bound now. It is derived whether or not a deliverer is
+/// registered: a wait that is there and has not been handed the work is
+/// not a delivery.
 fn recovery_facts(
     repo: &std::path::Path,
     state: &crate::repo_state::RepoState,
-    clients: &[Client],
     hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
     timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
     pending: &[(AgentLabel, WaitItem)],
@@ -4272,33 +4282,25 @@ fn recovery_facts(
             continue;
         };
         bound.insert(author.clone());
-        let delivering = clients
-            .iter()
-            .any(|c| matches!(&c.who, Served::Agent { author: a } if a == &author));
         let auto = matches!(
             crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref()),
             Ok(clank_core::AutoMode::On)
         );
-        let counting = turns.counting(&author);
-        let owed = if delivering && !counting {
-            Vec::new()
-        } else {
-            owed_items(
-                repo,
-                state,
-                &author,
-                hosted,
-                timer_backlogs,
-                pending,
-                &reviews,
-                head.as_ref(),
-            )
-        };
-        let obligated = !delivering && !owed.is_empty();
+        let (admitted, status) = admitted_items(
+            repo,
+            state,
+            &author,
+            hosted,
+            timer_backlogs,
+            pending,
+            &reviews,
+            head.as_ref(),
+        );
+        let owed = crate::cli::wait::presented(admitted.clone());
         let cwd = std::env::current_dir().ok();
         let g =
             crate::cli::turn_custody::Gathered::of(repo, &author, Some((&owed, cwd.as_deref())));
-        if counting {
+        if turns.counting(&author) {
             turns.observed(&author, &g);
         }
         let quiet = turns.recovery_quiet(&author, &g);
@@ -4306,18 +4308,29 @@ fn recovery_facts(
         let role = crate::agent_store::resolve_role(repo, &author)
             .map(|r| r.to_string())
             .unwrap_or_default();
+        let evidence = crate::cli::ledger::Evidence {
+            delivered: crate::cli::presentation::delivered_to(&dir, session.id.as_str()),
+            in_flight: turns.in_flight(&author),
+        };
+        let ledger = crate::cli::ledger::fold_stored(
+            &dir,
+            &admissions(repo, &author, status.as_ref(), admitted),
+            &evidence,
+            &crate::cli::block::ended(repo, &author),
+            crate::cli::recovery::unix_now(),
+        );
         facts.push(crate::cli::recovery::Facts {
             agent_dir: dir,
             work: identities(&owed),
+            blocked_on: crate::cli::wait::own_block(repo, &author),
             author,
             session,
             auto,
-            delivering,
-            obligated,
+            ledger,
             role,
             blind_nudge: config.blind_nudge,
             stall: config.stall(),
-            attending: obligated && quiet.is_some(),
+            attended: quiet == Some(clank_core::turn_policy::Quiet::Attending),
             asking: projection.asking.is_some(),
             projection,
         });
@@ -4349,8 +4362,40 @@ fn owed_items(
     reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
     head: Option<&clank_core::wait::HeadCommit>,
 ) -> Vec<WaitItem> {
+    crate::cli::wait::presented(
+        admitted_items(
+            repo,
+            state,
+            author,
+            hosted,
+            timer_backlogs,
+            pending,
+            reviews,
+            head,
+        )
+        .0,
+    )
+}
+
+/// [`owed_items`] before it is flattened into a wake: each item with what
+/// the pending blocks make of it, and the work status that routed the
+/// review items among them.
+#[allow(clippy::too_many_arguments)]
+fn admitted_items(
+    repo: &std::path::Path,
+    state: &crate::repo_state::RepoState,
+    author: &AgentLabel,
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    timer_backlogs: &mut std::collections::BTreeMap<AgentLabel, crate::cli::timer_source::Backlog>,
+    pending: &[(AgentLabel, WaitItem)],
+    reviews: &crate::fs_plan_state_lookup::FsPlanStateLookup,
+    head: Option<&clank_core::wait::HeadCommit>,
+) -> (
+    Vec<crate::cli::wait::Admitted>,
+    Option<clank_core::wait::WorkStatus>,
+) {
     let Ok(inputs) = crate::cli::wait::derive_wait_inputs(repo, author) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let status = state.fold.derive_status(reviews, &inputs.work_policy, head);
     let current;
@@ -4383,7 +4428,98 @@ fn owed_items(
             .filter(|(whose, _)| whose == author)
             .map(|(_, item)| item.clone()),
     );
-    crate::cli::wait::owed_for(repo, author, &inputs, &status, &state.fold, &mut external)
+    let admitted =
+        crate::cli::wait::admitted_for(repo, author, &inputs, &status, &state.fold, &mut external);
+    (admitted, Some(status))
+}
+
+/// Each admitted item as the ledger is told of it: its stable identity,
+/// and when its own durable record says it arrived. An event is dated by
+/// its log row, a timer by when it fell due, and review work by the stage
+/// boundary that handed it to `author`'s tier. Anything else is undated.
+fn admissions(
+    repo: &std::path::Path,
+    author: &AgentLabel,
+    status: Option<&clank_core::wait::WorkStatus>,
+    admitted: Vec<crate::cli::wait::Admitted>,
+) -> Vec<crate::cli::ledger::Admission> {
+    use crate::cli::teams_config::RosterRole;
+    use clank_core::wait::HandoverTier;
+    let events_dir = crate::agent_store::agents_root(repo)
+        .join(author.as_str())
+        .join("events");
+    let mut logs: std::collections::BTreeMap<String, Vec<crate::cli::github::log::EventRow>> =
+        Default::default();
+    let mut logged = |key: &clank_core::wait::EventPresentation| {
+        logs.entry(key.source.clone())
+            .or_insert_with(|| {
+                if !events_dir.join(format!("{}.jsonl", key.source)).is_file() {
+                    return Vec::new();
+                }
+                crate::cli::github::log::EventLog::open(&events_dir, &key.source)
+                    .and_then(|log| log.read_rows())
+                    .ok()
+                    .flatten()
+                    .map(|read| read.rows)
+                    .unwrap_or_default()
+            })
+            .iter()
+            .find(|row| row.seq == key.seq && row.ident == key.ident)
+            .map(|row| row.at)
+    };
+    let tier = crate::agent_store::repo_config::read(repo)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.agents.get(author).map(|a| a.role))
+        .map(|role| match role {
+            RosterRole::Master => HandoverTier::Master,
+            role if role.in_commit_tier() => HandoverTier::Commit,
+            _ => HandoverTier::Second,
+        });
+    let handed = |item: &WaitItem| {
+        let (status, tier) = (status?, tier?);
+        let at = match item {
+            WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => status
+                .active_plan
+                .as_ref()
+                .filter(|p| &p.plan == plan)?
+                .handover
+                .since(tier),
+            WaitItem::AdHocReview { sha, .. } | WaitItem::AdHocRevise { sha } => status
+                .ad_hoc
+                .iter()
+                .find(|a| &a.sha == sha)?
+                .handover
+                .since(tier),
+            _ => None,
+        };
+        at.and_then(|at| u64::try_from(at).ok())
+    };
+    admitted
+        .into_iter()
+        .filter_map(|a| {
+            let identity = identities(std::slice::from_ref(&a.item))
+                .into_iter()
+                .next()?;
+            let arrived = a
+                .item
+                .presentation()
+                .and_then(&mut logged)
+                .or(match &a.item {
+                    WaitItem::TimerEvent { due_at, .. } => Some(*due_at),
+                    WaitItem::CommandEvent { at, .. } => *at,
+                    _ => None,
+                })
+                .or_else(|| handed(&a.item));
+            Some(crate::cli::ledger::Admission {
+                identity,
+                item: a.item,
+                standing: a.standing,
+                pausable: a.pausable,
+                arrived,
+            })
+        })
+        .collect()
 }
 
 /// Publish what the monitor holds of `author`'s turns: its attendance,
@@ -4431,10 +4567,15 @@ fn due_gate(
 }
 
 /// Whether a due recovery attempt may go ahead now, from the agent as it
-/// is at this moment rather than at the last fold: never over a pending
-/// question or an attendance that quiets all of `owed`, and never once a
-/// deliverer, a new binding or auto mode turned off has made it someone
+/// is at this moment rather than at the last fold: never over its own
+/// pending question or block, an attendance that quiets all of `owed`, a
+/// presentation still with its carrier or a report not yet answered, and
+/// never once a new binding or auto mode turned off has made it someone
 /// else's call. `owed` is what the agent is owed now, never a stand-in.
+///
+/// Another agent's block is not asked about: what it withholds is not in
+/// `owed`. Nor is a wait that is merely registered: one that has been
+/// answered and holds none of `owed` is not delivering it.
 fn recovery_gate(
     repo: &std::path::Path,
     clients: &[Client],
@@ -4454,18 +4595,20 @@ fn recovery_gate(
     {
         return Gate::SessionChanged;
     }
-    if clients
-        .iter()
-        .any(|c| matches!(&c.who, Served::Agent { author: a } if a == author))
-    {
-        return Gate::Deliverer;
-    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if !matches!(
         crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref()),
         Ok(clank_core::AutoMode::On)
     ) {
         return Gate::AutoOff;
+    }
+    let unanswered = clients.iter().any(|c| {
+        matches!(&c.who, Served::Agent { author: a } if a == author)
+            && c.report.as_ref().is_some_and(|r| !r.stepped)
+    });
+    if unanswered || turns.presenting(author) || crate::cli::wait::own_block(repo, author).is_some()
+    {
+        return Gate::Hold;
     }
     let cwd = std::env::current_dir().ok();
     let g = crate::cli::turn_custody::Gathered::of(repo, author, Some((owed, cwd.as_deref())));
@@ -4881,6 +5024,54 @@ fn deadline_round(
         ));
     }
     (dues, leaving)
+}
+
+/// Fail every presentation whose carrier has had its time and not
+/// answered, and serve each of those agents' parked waits again: what the
+/// presentation carried is owed and undelivered, and nothing else marks
+/// the moment it stopped being on its way.
+#[allow(clippy::too_many_arguments)]
+fn expire_deliveries(
+    repo: &std::path::Path,
+    clients: &mut Vec<Client>,
+    state: Option<&crate::repo_state::RepoState>,
+    pending: &[(AgentLabel, WaitItem)],
+    hosted: &std::collections::BTreeMap<AgentLabel, Hosted>,
+    turns: &mut crate::cli::turn_custody::Turns,
+    recovery: &mut crate::cli::recovery::Driver,
+    now: u64,
+) -> Vec<tokio::task::JoinHandle<Wrote>> {
+    let mut leaving = Vec::new();
+    for author in turns.overdue_authors(now) {
+        let g = gather(
+            repo,
+            state,
+            &author,
+            hosted,
+            &mut Default::default(),
+            pending,
+        )
+        .at(now);
+        if !turns.expire(&author, &g) {
+            continue;
+        }
+        eprintln!(
+            "monitor: `{author}`'s wake was handed to its hook, which never answered for it; \
+             it stays owed"
+        );
+        project(recovery, turns, &author, &g);
+        leaving.extend(serve_reports(
+            repo,
+            clients,
+            state,
+            Some(&author),
+            pending,
+            &mut Default::default(),
+            hosted,
+            turns,
+        ));
+    }
+    leaving
 }
 
 /// Settle a result from connection `conn` against `author`'s custody. A
@@ -6337,7 +6528,6 @@ pub(crate) async fn publish_one_fold(repo: &std::path::Path) {
     let facts = recovery_facts(
         repo,
         &state,
-        &[],
         &Default::default(),
         &mut Default::default(),
         &[],
@@ -7982,13 +8172,13 @@ mod recovery_tests {
                     serde_json::from_value(session).unwrap()
                 },
                 auto: true,
-                delivering: false,
-                obligated: true,
+                ledger: crate::cli::ledger::Ledger::owing_if(true),
                 role: "master".into(),
                 work: vec!["the timer".into()],
                 blind_nudge: None,
                 stall: None,
-                attending: false,
+                attended: false,
+                blocked_on: None,
                 asking: false,
                 projection: Default::default(),
             }
@@ -8072,7 +8262,6 @@ mod recovery_tests {
                     "no screen",
                     "newer turn",
                     "auto off",
-                    "deliverer",
                     "rebound",
                     "relaunched",
                     "block",
@@ -8088,7 +8277,7 @@ mod recovery_tests {
             })
         {
             let mut c = Claimed::with(route);
-            let mut clients = Vec::new();
+            let clients = Vec::new();
             let mut screen = Some(CODEX_EMPTY.to_string());
             match change {
                 "draft" => screen = Some(CODEX_EMPTY.replace("›    ", "› half")),
@@ -8100,15 +8289,6 @@ mod recovery_tests {
                     })
                     .unwrap();
                 }
-                "deliverer" => clients.push(
-                    client(
-                        Served::Agent {
-                            author: c.codex.clone(),
-                        },
-                        "session-one",
-                    )
-                    .0,
-                ),
                 "rebound" => {
                     crate::agent_store::bind_session_to_agent(
                         c.repo.path(),
@@ -8159,7 +8339,7 @@ mod recovery_tests {
                 }
                 _ => {
                     let f = crate::cli::recovery::Facts {
-                        obligated: false,
+                        ledger: Default::default(),
                         ..c.facts()
                     };
                     c.driver.reconcile(vec![f], 10_001);
@@ -8673,11 +8853,10 @@ mod recovery_tests {
         let turns = std::cell::RefCell::new(crate::cli::turn_custody::Turns::new(
             repo.path().to_path_buf(),
         ));
-        let facts = |clients: &[Client]| {
+        let facts = || {
             recovery_facts(
                 repo.path(),
                 &state,
-                clients,
                 &Default::default(),
                 &mut Default::default(),
                 &[],
@@ -8685,15 +8864,29 @@ mod recovery_tests {
             )
         };
 
-        let alone = facts(&[]);
+        let alone = facts();
         assert_eq!(
             alone.len(),
             1,
             "an agent with no bound session is not considered"
         );
-        assert!(alone[0].obligated && !alone[0].delivering, "{alone:?}");
+        let owed = alone[0].ledger.owed();
+        assert_eq!(owed.len(), 1, "{alone:?}");
+        assert_eq!(
+            (
+                owed[0].owed_since,
+                owed[0].entry.delivery,
+                owed[0].entry.what.as_str()
+            ),
+            (
+                crate::cli::ledger::Since::At(log.read_rows().unwrap().unwrap().rows[0].at),
+                crate::cli::ledger::Delivery::NotDelivered,
+                "timer check"
+            ),
+            "owed since its log row was written, and delivered to nobody"
+        );
         assert_eq!(alone[0].blind_nudge, None, "off unless configured");
-        assert!(!alone[0].attending);
+        assert!(!alone[0].attended);
         // A question from a session no longer the agent's is over at the
         // next fold.
         let qdir = crate::agent_store::agents_root(repo.path()).join("codex");
@@ -8719,9 +8912,9 @@ mod recovery_tests {
                 input: "h".into(),
             }],
         );
-        assert!(facts(&[])[0].asking, "its record is read for what ends it");
+        assert!(facts()[0].asking, "its record is read for what ends it");
         bind(clank_core::Tool::Codex, "session-one");
-        facts(&[]);
+        facts();
         assert!(
             crate::cli::question_state::load(&qdir)
                 .unwrap()
@@ -8798,26 +8991,16 @@ mod recovery_tests {
         };
         for n in 1..=4 {
             deliver("session-one", n);
-            facts(&[]);
+            facts();
         }
         assert_eq!(count(), Some(4));
-        let (waiter, _rx) = client(
-            Served::Agent {
-                author: codex.clone(),
-            },
-            "session-one",
-        );
-        facts(&[waiter]);
-        assert_eq!(
-            count(),
-            Some(4),
-            "an attached waiter does not make an unchanged count stale"
-        );
+        facts();
+        assert_eq!(count(), Some(4), "an unchanged fold keeps the count");
         std::fs::remove_file(dir.join("blocks/mic.md")).unwrap();
-        facts(&[]);
+        facts();
         assert_eq!(count(), None, "the block was answered");
         bind(clank_core::Tool::Codex, "session-two");
-        facts(&[]);
+        facts();
         assert_eq!(count(), None, "another session's count");
         bind(clank_core::Tool::Codex, "session-one");
 
@@ -8853,7 +9036,7 @@ mod recovery_tests {
             )
             .unwrap();
         assert!(
-            !facts(&[])[0].attending,
+            !facts()[0].attended,
             "received work with nothing attended does not hold recovery back"
         );
         turns
@@ -8870,46 +9053,16 @@ mod recovery_tests {
             )
             .unwrap();
         assert!(
-            facts(&[])[0].attending,
+            facts()[0].attended,
             "a declaration holds recovery back over received work, for codex too"
         );
-        assert!(
-            !facts(&[])[0].projection.attended.is_empty(),
-            "and is shown"
-        );
+        assert!(!facts()[0].projection.attended.is_empty(), "and is shown");
         bind(clank_core::Tool::Codex, "session-three");
         assert!(
-            !facts(&[])[0].attending,
+            !facts()[0].attended,
             "a new binding drops the old one's attendance"
         );
         bind(clank_core::Tool::Codex, "session-one");
-
-        let (helper, _rx) = client(
-            Served::Helper {
-                author: codex.clone(),
-            },
-            "session-one",
-        );
-        let with_helper = facts(&[helper]);
-        assert!(
-            with_helper[0].obligated && !with_helper[0].delivering,
-            "a helper is not a deliverer"
-        );
-        let (observer, _rx) = client(Served::Observer, "session-one");
-        let with_observer = facts(&[observer]);
-        assert!(
-            with_observer[0].obligated && !with_observer[0].delivering,
-            "an observer, the TUI's keeper among them, is not a deliverer"
-        );
-
-        let (waiter, _rx) = client(
-            Served::Agent {
-                author: codex.clone(),
-            },
-            "session-one",
-        );
-        let with_waiter = facts(&[waiter]);
-        assert!(with_waiter[0].delivering, "an ordinary wait is a deliverer");
 
         let ident = log.read_rows().unwrap().unwrap().rows[0].ident.clone();
         log.append_checked_ack(seq, &ident).unwrap();
@@ -8917,14 +9070,13 @@ mod recovery_tests {
         let handled = recovery_facts(
             repo.path(),
             &state,
-            &[],
             &Default::default(),
             &mut Default::default(),
             &[],
             &mut turns.borrow_mut(),
         );
         assert!(
-            !handled[0].obligated,
+            handled[0].ledger.owed().is_empty(),
             "handled work owes nothing: {handled:?}"
         );
     }
@@ -8968,7 +9120,11 @@ mod recovery_tests {
             },
             "session-one",
         );
-        assert_eq!(gate(&[waiter]), Gate::Deliverer);
+        assert_eq!(
+            gate(&[waiter]),
+            Gate::Go,
+            "a wait that is registered and holds nothing of the work is not delivering it"
+        );
 
         crate::agent_store::set_auto_mode(repo.path(), &codex, clank_core::AutoMode::Off).unwrap();
         assert_eq!(gate(&[]), Gate::AutoOff);
@@ -9033,6 +9189,455 @@ mod recovery_tests {
             [crate::cli::question_state::Observation::Result { key }],
         );
         assert_eq!(gate(&[]), Gate::Go);
+
+        // Another agent's block withholds review work from what is owed
+        // and holds nothing else back; the agent's own is its own question
+        // to a person.
+        let blocks = |who: &str| {
+            let dir = crate::agent_store::agents_root(repo.path())
+                .join(who)
+                .join("blocks");
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        std::fs::write(blocks("claude").join("stork.md"), "Which take?").unwrap();
+        assert!(crate::cli::wait::blocked(repo.path(), &codex));
+        assert_eq!(gate(&[]), Gate::Go, "another agent's block");
+        std::fs::write(blocks("codex").join("mine.md"), "Which way?").unwrap();
+        assert_eq!(gate(&[]), Gate::Hold, "its own block");
+    }
+
+    /// A Codex standby `artist`, bound and in auto, in a repo whose master
+    /// `claude` has a block pending: its record, and the turns it is
+    /// folded with.
+    struct Standby {
+        repo: tempfile::TempDir,
+        artist: AgentLabel,
+        record: std::path::PathBuf,
+        turns: crate::cli::turn_custody::Turns,
+    }
+
+    impl Standby {
+        fn under_the_masters_block() -> Self {
+            crate::cli::recovery::tests::enable(clank_core::Tool::Codex, Some(Transport::Typed));
+            let repo = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+            std::fs::write(
+                repo.path().join(".clank/config.json"),
+                r#"{"agents":{"claude":{"tool":"claude","role":"master"},"artist":{"tool":"codex","role":"standby"}}}"#,
+            )
+            .unwrap();
+            let artist = AgentLabel::parse("artist").unwrap();
+            crate::agent_store::update_agent_config(repo.path(), &artist, |c| {
+                c.auto_mode = Some(clank_core::AutoMode::On);
+            })
+            .unwrap();
+            crate::agent_store::bind_session_to_agent(
+                repo.path(),
+                &artist,
+                clank_core::Tool::Codex,
+                &clank_core::ids::SessionId::parse("session-one").unwrap(),
+            )
+            .unwrap();
+            let blocks = crate::agent_store::agents_root(repo.path()).join("claude/blocks");
+            std::fs::create_dir_all(&blocks).unwrap();
+            std::fs::write(blocks.join("stork-retakes.md"), "Which takes?").unwrap();
+            let record = repo.path().join("rollout.jsonl");
+            append(&record, &STARTED.replace("\"T\"", "\"t1\""));
+            let turns = crate::cli::turn_custody::Turns::new(repo.path().to_path_buf());
+            Standby {
+                repo,
+                artist,
+                record,
+                turns,
+            }
+        }
+
+        fn message(&self) {
+            crate::inbox::deliver(
+                self.repo.path(),
+                &self.artist,
+                Some(&crate::inbox::Sender {
+                    label: "claude".into(),
+                    repo: self.repo.path().to_path_buf(),
+                }),
+                "2026-11-10T01:00:00Z",
+                "the retakes are in",
+            )
+            .unwrap();
+        }
+
+        fn dir(&self) -> std::path::PathBuf {
+            crate::agent_store::agents_root(self.repo.path()).join("artist")
+        }
+
+        /// What a fold of the repo as it is now tells recovery of `artist`,
+        /// reading the record this fixture wrote.
+        async fn facts(&mut self) -> crate::cli::recovery::Facts {
+            let state = folded(self.repo.path()).await.unwrap();
+            let mut facts = recovery_facts(
+                self.repo.path(),
+                &state,
+                &Default::default(),
+                &mut Default::default(),
+                &[],
+                &mut self.turns,
+            )
+            .into_iter()
+            .find(|f| f.author == self.artist)
+            .unwrap();
+            facts.session.transcript = Some(self.record.display().to_string());
+            facts
+        }
+
+        /// The deadline's own gate, against the repo folded now.
+        async fn due(&mut self, driver: &mut crate::cli::recovery::Driver, now: u64) -> Vec<Act> {
+            let state = folded(self.repo.path()).await.unwrap();
+            let (repo, turns) = (self.repo.path(), &mut self.turns);
+            driver.due(now, |author, session| {
+                due_gate(
+                    repo,
+                    &[],
+                    turns,
+                    Some(&state),
+                    &Default::default(),
+                    &mut Default::default(),
+                    &[],
+                    author,
+                    session,
+                )
+            })
+        }
+
+        fn shown(&self, now: u64) -> crate::cli::agent_state::View {
+            crate::cli::agent_state::View::at(
+                crate::cli::agent_state::load(&self.dir()).unwrap(),
+                None,
+                now,
+            )
+        }
+    }
+
+    /// Date `record`'s last write.
+    fn written_at(record: &std::path::Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(record)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn dispatched(acts: &[Act]) -> usize {
+        acts.iter()
+            .filter(|a| matches!(a, Act::Dispatch { .. }))
+            .count()
+    }
+
+    /// 2026-11-10, `artist4`: a message owed to a standby whose turn has
+    /// sat open and silent since the day before, no waiter, and the
+    /// master's block pending. The block is not the standby's and
+    /// withholds nothing a message is, so the standby is owed the message
+    /// from its arrival: its row shouts it once it has gone undelivered
+    /// for the stall window, never says `working`, and it is nudged once
+    /// when the window and the nudge's delay have passed.
+    #[tokio::test]
+    async fn an_owed_message_under_another_agents_block_is_shouted_then_nudged() {
+        use crate::cli::agent_state::{Active, Case};
+        use crate::cli::ledger::{Delivery, Since};
+        let mut s = Standby::under_the_masters_block();
+        s.message();
+        written_at(&s.record, 1000);
+        assert!(
+            crate::cli::wait::blocked(s.repo.path(), &s.artist),
+            "the master's block is repo-wide"
+        );
+
+        let f = s.facts().await;
+        assert!(
+            !f.attended && f.blocked_on.is_none() && !f.asking,
+            "another agent's block is no reason to keep hands off: {f:?}"
+        );
+        let owed = f.ledger.owed();
+        let [message] = owed.as_slice() else {
+            panic!("{owed:?}");
+        };
+        assert_eq!(message.entry.what, "message from claude");
+        assert_eq!(message.entry.delivery, Delivery::NotDelivered);
+        let Since::At(arrived) = message.owed_since else {
+            panic!("the message's log row dates it: {message:?}");
+        };
+        let stall = f.stall.expect("the stall watchdog is on by default");
+        let (warn, nudge) = (stall.warn, stall.nudge.unwrap());
+
+        let mut d = crate::cli::recovery::Driver::new(
+            s.repo.path().to_path_buf(),
+            std::path::PathBuf::from("/nonexistent-home"),
+        );
+        assert_eq!(dispatched(&d.reconcile(vec![f.clone()], arrived)), 0);
+        assert_eq!(
+            d.next_due(),
+            Some(arrived + warn),
+            "silent since the message arrived, not since yesterday's last write"
+        );
+        let early = s.shown(arrived + warn - 1);
+        assert_eq!(
+            early.state.owed.as_ref().map(|o| &o.case),
+            Some(&Case::Active(Active::Turn)),
+            "an open turn inside the stall window"
+        );
+        assert_eq!(early.undelivered(arrived + warn - 1), None);
+
+        assert_eq!(dispatched(&s.due(&mut d, arrived + warn).await), 0);
+        let late = s.shown(arrived + warn);
+        assert_eq!(
+            late.line(arrived + warn),
+            "UNDELIVERED 40m · message from claude · silent 40m — nudging in 5m"
+        );
+        assert!(!late.working(), "a silent open turn is not working");
+        assert_eq!(late.owed.as_ref().unwrap().age, Some(warn));
+
+        assert_eq!(
+            dispatched(&s.due(&mut d, arrived + warn + nudge - 1).await),
+            0
+        );
+        let acts = s.due(&mut d, arrived + warn + nudge).await;
+        let [
+            Act::Dispatch {
+                attempt, text, tag, ..
+            },
+        ] = acts.as_slice()
+        else {
+            panic!("nudged once the window has passed: {acts:?}");
+        };
+        assert_eq!(text, &crate::cli::recovery::stall_text(tag));
+
+        // One owner: the same silence, folded and looked at again and
+        // again, is nudged by nothing else.
+        let attempt = attempt.clone();
+        d.answer(
+            &s.artist,
+            &attempt,
+            Answer::Submitted { started: None },
+            arrived + warn + nudge + 1,
+        );
+        for later in [1, 60, 3600, 86_400] {
+            let now = arrived + warn + nudge + 1 + later;
+            let f = s.facts().await;
+            assert_eq!(dispatched(&d.reconcile(vec![f], now)), 0, "{later}");
+            assert_eq!(dispatched(&s.due(&mut d, now).await), 0, "{later}");
+        }
+    }
+
+    /// The same standby, bound and never run: its record is there and
+    /// shows no turn. It is owed the message all the same, so it is an idle
+    /// agent at its prompt, nudged once its settle time has passed, under
+    /// the deadline's own gate and the master's block.
+    #[tokio::test]
+    async fn an_owed_message_to_an_agent_that_never_ran_is_nudged_at_its_prompt() {
+        use crate::cli::agent_state::Case;
+        let mut s = Standby::under_the_masters_block();
+        std::fs::write(&s.record, "").unwrap();
+        s.message();
+        let f = s.facts().await;
+        let now = crate::cli::recovery::unix_now();
+        let mut d = crate::cli::recovery::Driver::new(
+            s.repo.path().to_path_buf(),
+            std::path::PathBuf::from("/nonexistent-home"),
+        );
+        assert_eq!(dispatched(&d.reconcile(vec![f], now)), 0);
+        assert_eq!(
+            s.shown(now).state.owed.as_ref().map(|o| &o.case),
+            Some(&Case::Recovering),
+            "no turn to read is no reason to leave it"
+        );
+        let due = d.next_due().expect("a nudge is scheduled");
+        assert_eq!(dispatched(&s.due(&mut d, due - 1).await), 0);
+        let acts = s.due(&mut d, due).await;
+        let [
+            Act::Dispatch {
+                text, tag, target, ..
+            },
+        ] = acts.as_slice()
+        else {
+            panic!("nudged at its prompt: {acts:?}");
+        };
+        assert_eq!(text, &crate::cli::recovery::nudge_text(tag));
+        assert_eq!(target, crate::cli::recovery::AT_PROMPT);
+    }
+
+    /// A pending block that is not the agent's makes nothing owed to it:
+    /// with no event of its own it has no row to shout and no nudge. A
+    /// message is owed, block or not.
+    #[tokio::test]
+    async fn a_block_alone_owes_an_agent_nothing_and_a_message_is_still_owed() {
+        let mut s = Standby::under_the_masters_block();
+        written_at(&s.record, 1000);
+        let quiet = s.facts().await;
+        assert!(quiet.ledger.owed().is_empty(), "{quiet:?}");
+        let mut d = crate::cli::recovery::Driver::new(
+            s.repo.path().to_path_buf(),
+            std::path::PathBuf::from("/nonexistent-home"),
+        );
+        let now = crate::cli::recovery::unix_now();
+        assert_eq!(dispatched(&d.reconcile(vec![quiet], now)), 0);
+        assert_eq!(d.next_due(), None, "nothing owed schedules nothing");
+        assert_eq!(s.shown(now + 86_400).state.owed, None);
+        assert_eq!(s.shown(now + 86_400).undelivered(now + 86_400), None);
+
+        s.message();
+        let owing = s.facts().await;
+        assert_eq!(owing.ledger.owed().len(), 1);
+        d.reconcile(vec![owing], now);
+        assert!(d.next_due().is_some(), "the message is owed, block or not");
+    }
+
+    /// A delivery is proven to the session that holds the label now, by
+    /// that session's own receipt. After a rebind the old session's
+    /// receipt counts for nothing: the item is owed, undelivered, to the
+    /// new binding.
+    #[tokio::test]
+    async fn after_a_rebind_the_old_sessions_receipt_proves_nothing() {
+        use crate::cli::ledger::Delivery;
+        let mut s = Standby::under_the_masters_block();
+        s.message();
+        let delivery = |f: &crate::cli::recovery::Facts| f.ledger.owed()[0].entry.delivery;
+        let before = s.facts().await;
+        assert_eq!(delivery(&before), Delivery::NotDelivered);
+
+        let identity = before.ledger.owed()[0].entry.identity.clone();
+        let recorded = crate::cli::presentation::receive(
+            &crate::agent_store::hold_binding(s.repo.path(), &s.artist).unwrap(),
+            clank_core::Tool::Codex,
+            "session-one",
+            &[identity],
+            50,
+        );
+        assert!(recorded.unwrap(), "the bound session's receipt is taken");
+        assert_eq!(
+            delivery(&s.facts().await),
+            Delivery::Delivered,
+            "a receipt from the bound session"
+        );
+
+        crate::agent_store::bind_session_to_agent(
+            s.repo.path(),
+            &s.artist,
+            clank_core::Tool::Codex,
+            &clank_core::ids::SessionId::parse("session-two").unwrap(),
+        )
+        .unwrap();
+        let rebound = s.facts().await;
+        assert_eq!(rebound.session.id.as_str(), "session-two");
+        assert_eq!(
+            delivery(&rebound),
+            Delivery::NotDelivered,
+            "the new session was never shown it"
+        );
+        assert_eq!(rebound.ledger.owed().len(), 1, "and it is still owed");
+    }
+
+    /// A block answered while no monitor ran, and a monitor that starts
+    /// forty minutes later. The master's promotion was withheld when the
+    /// last monitor looked and is owed now: it is owed from the block's
+    /// answer, as the answer's own file dates it, so the forty minutes are
+    /// already spent and the nudge comes at forty-five, not a whole window
+    /// after the restart.
+    #[tokio::test]
+    async fn work_released_while_no_monitor_ran_is_owed_from_the_blocks_answer() {
+        use crate::cli::ledger::Since;
+        crate::cli::recovery::tests::enable(clank_core::Tool::Codex, Some(Transport::Typed));
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank/queue")).unwrap();
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"agents":{"lead":{"tool":"codex","role":"master"},"artist":{"tool":"codex","role":"standby"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join(".clank/queue/050-next-plan.md"),
+            "# next\n",
+        )
+        .unwrap();
+        let lead = AgentLabel::parse("lead").unwrap();
+        let artist = AgentLabel::parse("artist").unwrap();
+        crate::agent_store::update_agent_config(repo.path(), &lead, |c| {
+            c.auto_mode = Some(clank_core::AutoMode::On);
+        })
+        .unwrap();
+        crate::agent_store::bind_session_to_agent(
+            repo.path(),
+            &lead,
+            clank_core::Tool::Codex,
+            &clank_core::ids::SessionId::parse("session-one").unwrap(),
+        )
+        .unwrap();
+        crate::cli::block::ask(repo.path(), &artist, "takes", "Which takes?").unwrap();
+        let record = repo.path().join("rollout.jsonl");
+        append(&record, &STARTED.replace("\"T\"", "\"t1\""));
+        written_at(&record, 1000);
+
+        let facts = || async {
+            let state = folded(repo.path()).await.unwrap();
+            let mut f = recovery_facts(
+                repo.path(),
+                &state,
+                &Default::default(),
+                &mut Default::default(),
+                &[],
+                &mut crate::cli::turn_custody::Turns::new(repo.path().to_path_buf()),
+            )
+            .into_iter()
+            .find(|f| f.author == lead)
+            .unwrap();
+            f.session.transcript = Some(record.display().to_string());
+            f
+        };
+        let withheld = facts().await;
+        assert!(withheld.ledger.owed().is_empty(), "{withheld:?}");
+        assert_eq!(withheld.ledger.entries.len(), 1, "the promotion, withheld");
+
+        let answer =
+            crate::cli::block::answer_block(repo.path(), "artist", "takes", "the third", None)
+                .unwrap();
+        let answered = crate::cli::recovery::unix_now() - 40 * 60;
+        written_at(&answer, answered);
+        let restart = answered + 40 * 60;
+
+        let released = facts().await;
+        let owed = released.ledger.owed();
+        let [promotion] = owed.as_slice() else {
+            panic!("{owed:?}");
+        };
+        assert_eq!(promotion.entry.what, "promotion of next-plan");
+        assert_eq!(
+            promotion.owed_since,
+            Since::At(answered),
+            "from the answer, not from this fold"
+        );
+
+        let stall = released.stall.unwrap();
+        assert_eq!((stall.warn, stall.nudge), (40 * 60, Some(5 * 60)));
+        let mut d = crate::cli::recovery::Driver::new(
+            repo.path().to_path_buf(),
+            std::path::PathBuf::from("/nonexistent-home"),
+        );
+        d.reconcile(vec![released], restart);
+        assert_eq!(
+            d.next_due(),
+            Some(answered + 40 * 60),
+            "the window is already spent"
+        );
+        assert_eq!(dispatched(&d.due(restart, |_, _| Gate::Go)), 0, "warned");
+        assert_eq!(
+            dispatched(&d.due(answered + 45 * 60 - 1, |_, _| Gate::Go)),
+            0
+        );
+        assert_eq!(
+            dispatched(&d.due(answered + 45 * 60, |_, _| Gate::Go)),
+            1,
+            "nudged at forty-five minutes of being owed"
+        );
     }
 
     #[test]

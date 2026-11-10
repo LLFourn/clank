@@ -264,12 +264,16 @@ fn deliver_grok_wake(
     binding.ensure_current(repo, author)?;
     emit_checked(items, json, cwd, out)?;
     let mirrored = super::wake_render::mirror(items, cwd);
-    super::presentation::record_delivered(
-        repo,
-        author,
-        &super::wake_render::carried(&mirrored),
-        || binding.ensure_current(repo, author).is_ok(),
-    );
+    if let Some((tool, session)) = &binding.0 {
+        super::presentation::record_delivered(
+            repo,
+            author,
+            *tool,
+            session.as_str(),
+            &super::wake_render::carried(&mirrored),
+            || binding.ensure_current(repo, author).is_ok(),
+        );
+    }
     Ok(())
 }
 
@@ -1172,9 +1176,31 @@ pub(crate) fn owed_for(
     // door for the same reason — a source event that woke an agent
     // straight off the channel would arrive without the block context
     // the local path gives it (codex on ca2ea69).
-    present_with_blocks(check_blocks(repo, author), || {
+    presented(admitted_for(repo, author, inputs, status, fold, external))
+}
+
+/// [`owed_for`] before it is flattened into a wake: every item `author`
+/// could be handed at this fold, with what the pending blocks make of it.
+pub(crate) fn admitted_for(
+    repo: &Path,
+    author: &AgentLabel,
+    inputs: &WaitInputs,
+    status: &clank_core::wait::WorkStatus,
+    fold: &clank_core::repo_state::RepoState,
+    external: &mut Vec<WaitItem>,
+) -> Vec<Admitted> {
+    admit(check_blocks(repo, author), || {
         beat_owed(items_for(repo, author, inputs, status, fold), external)
     })
+}
+
+/// The pending block `author` itself raised, by name: its own question to
+/// a person.
+pub(crate) fn own_block(repo: &Path, author: &AgentLabel) -> Option<String> {
+    scan_blocks(repo)
+        .into_iter()
+        .find(|b| b.answer.is_none() && b.agent == author.as_str())
+        .map(|b| b.name)
 }
 
 /// The merged extra-wake-source list (extra-wait-events): the agent
@@ -2421,6 +2447,42 @@ fn items_for(
     Owed { review, events }
 }
 
+/// What a pending block makes of one item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// Owed now: it wakes the agent by itself.
+    Owed,
+    /// Review-cycle work the blocks named here
+    /// ([`crate::cli::block::key`]) pause.
+    Withheld { by: Vec<String> },
+    /// A pending block, told as context beside owed work. Only a person
+    /// discharges it, so it is never owed and never wakes alone.
+    Context,
+}
+
+/// One item of a fold, and its standing.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Admitted {
+    pub(crate) item: WaitItem,
+    pub(crate) standing: Standing,
+    /// Review-cycle work: what a block withholds while one is pending,
+    /// whether or not one is now.
+    pub(crate) pausable: bool,
+}
+
+/// The wake `admitted` amounts to: what is owed, led by the blocks that
+/// explain what is missing, or nothing when nothing is owed.
+pub(crate) fn presented(admitted: Vec<Admitted>) -> Vec<WaitItem> {
+    if !admitted.iter().any(|a| a.standing == Standing::Owed) {
+        return Vec::new();
+    }
+    admitted
+        .into_iter()
+        .filter(|a| !matches!(a.standing, Standing::Withheld { .. }))
+        .map(|a| a.item)
+        .collect()
+}
+
 /// What this turn presents, with any pending block applied.
 ///
 /// THE one place that decides what a block stops. Both callers — the
@@ -2431,11 +2493,26 @@ fn items_for(
 /// so a human answering the very question the agent is blocked on
 /// could not reach it.
 fn present_with_blocks(br: BlockResult, owed: impl FnOnce() -> Owed) -> Vec<WaitItem> {
-    let Owed { review, mut events } = owed();
+    presented(admit(br, owed))
+}
+
+/// Every item of a fold with its [`Standing`]: the one decision a wake
+/// ([`presented`]) and the monitor's ledger both read.
+fn admit(br: BlockResult, owed: impl FnOnce() -> Owed) -> Vec<Admitted> {
+    let Owed { review, events } = owed();
+    let owed = |pausable| {
+        move |item| Admitted {
+            item,
+            standing: Standing::Owed,
+            pausable,
+        }
+    };
     if !br.suppress_all {
-        let mut items = review;
-        items.extend(events);
-        return items;
+        return review
+            .into_iter()
+            .map(owed(true))
+            .chain(events.into_iter().map(owed(false)))
+            .collect();
     }
     // A block pauses the REVIEW CYCLE, and says nothing about debt
     // that accrued on its own schedule. Withholding that debt does not
@@ -2454,16 +2531,35 @@ fn present_with_blocks(br: BlockResult, owed: impl FnOnce() -> Owed) -> Vec<Wait
     // the agent at every turn end until one did. An ANSWER is news, and
     // is the thing the agent has been waiting for, so it wakes with
     // nothing else ready.
-    let answered = br
+    let by: Vec<String> = br
         .items
         .iter()
-        .any(|i| matches!(i, WaitItem::Unblocked { .. }));
-    if !answered && events.is_empty() {
-        return Vec::new();
-    }
-    let mut items = br.items;
-    items.append(&mut events);
-    items
+        .filter_map(|i| match i {
+            WaitItem::Blocked { agent, name, .. } => Some(crate::cli::block::key(agent, name)),
+            WaitItem::Unblocked { carries, .. } => Some(crate::cli::block::key(
+                carries.agent.as_str(),
+                &carries.name,
+            )),
+            _ => None,
+        })
+        .collect();
+    br.items
+        .into_iter()
+        .map(|item| Admitted {
+            standing: match item {
+                WaitItem::Unblocked { .. } => Standing::Owed,
+                _ => Standing::Context,
+            },
+            item,
+            pausable: false,
+        })
+        .chain(events.into_iter().map(owed(false)))
+        .chain(review.into_iter().map(|item| Admitted {
+            item,
+            standing: Standing::Withheld { by: by.clone() },
+            pausable: true,
+        }))
+        .collect()
 }
 
 /// This agent's unacked messages, in the order they wake. A message is
@@ -6322,6 +6418,55 @@ mod tests {
         assert!(
             matches!(out.as_slice(), [WaitItem::Unblocked { .. }]),
             "and it wakes with nothing else ready: {out:?}"
+        );
+
+        // The same decision item by item, as the monitor's ledger reads
+        // it: review work under a block is withheld by that block, an
+        // event and an answer are owed, and the pending block itself is
+        // context that nothing owes.
+        let standings = |br: BlockResult, events: Vec<WaitItem>| -> Vec<Standing> {
+            admit(br, || Owed {
+                review: review(),
+                events,
+            })
+            .into_iter()
+            .map(|a| a.standing)
+            .collect()
+        };
+        let under = standings(blocked(), event());
+        assert!(
+            matches!(
+                under.as_slice(),
+                [Standing::Context, Standing::Owed, Standing::Withheld { by }] if !by.is_empty()
+            ),
+            "{under:?}"
+        );
+        let alone = standings(blocked(), Vec::new());
+        assert!(
+            matches!(
+                alone.as_slice(),
+                [Standing::Context, Standing::Withheld { .. }]
+            ),
+            "withheld, with nothing owed beside it: {alone:?}"
+        );
+        assert_eq!(
+            standings(
+                BlockResult {
+                    items: Vec::new(),
+                    suppress_all: false,
+                },
+                event()
+            ),
+            [Standing::Owed, Standing::Owed],
+            "no block withholds nothing"
+        );
+        let received = standings(answered(), Vec::new());
+        assert!(
+            matches!(
+                received.as_slice(),
+                [Standing::Owed, Standing::Withheld { by }] if by.len() == 1
+            ),
+            "an answer is owed, and review waits for its receipt: {received:?}"
         );
     }
 

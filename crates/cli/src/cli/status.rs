@@ -932,13 +932,16 @@ impl StatusSnapshot {
                 );
             }
             if let Some(state) = &row.state {
-                let line = state.line(crate::cli::recovery::unix_now());
-                let line = match paint && state.interrupted() {
-                    true => format!(
-                        "\x1b[{}m{line}\x1b[0m",
-                        crate::cli::agent_state::INTERRUPTED_SGR
-                    ),
-                    false => line,
+                let now = crate::cli::recovery::unix_now();
+                let line = state.line(now);
+                let sgr = match (state.undelivered(now), state.interrupted()) {
+                    (Some(_), _) => Some(crate::cli::agent_state::UNDELIVERED_SGR),
+                    (None, true) => Some(crate::cli::agent_state::INTERRUPTED_SGR),
+                    (None, false) => None,
+                };
+                let line = match sgr.filter(|_| paint) {
+                    Some(sgr) => format!("\x1b[{sgr}m{line}\x1b[0m"),
+                    None => line,
                 };
                 let _ = writeln!(out, "state: {} → {line}", row.label);
             }
@@ -3257,7 +3260,7 @@ mod dirty_and_wake_tests {
                     monitor: crate::cli::agent_state::Observer::me(),
                     activity: crate::cli::agent_state::Activity::Idle,
                     since: 0,
-                    suppressors: Vec::new(),
+                    owed: None,
                     nudge: crate::cli::agent_state::Nudge::Nothing,
                     cannot_resume: None,
                     attending: Vec::new(),
@@ -3310,6 +3313,7 @@ mod dirty_and_wake_tests {
     fn plain_status_gives_each_agents_state() {
         use crate::cli::agent_state::{Activity, AgentState, Nudge, Observer, View};
         let state = |stale| View {
+            owed: None,
             state: AgentState {
                 role: "commit".into(),
                 session: "s1".into(),
@@ -3320,7 +3324,7 @@ mod dirty_and_wake_tests {
                 },
                 activity: Activity::Failed("billing_error".into()),
                 since: 0,
-                suppressors: Vec::new(),
+                owed: None,
                 nudge: Nudge::WaitingForYou("this kind of failure needs a person".into()),
                 cannot_resume: Some("no evidence".into()),
                 attending: Vec::new(),
@@ -3363,6 +3367,7 @@ mod dirty_and_wake_tests {
             let mut snap = minimal_snapshot();
             let mut row = agent_row("claude", None);
             row.state = Some(View {
+                owed: None,
                 state: AgentState {
                     role: "commit".into(),
                     session: "s1".into(),
@@ -3373,7 +3378,7 @@ mod dirty_and_wake_tests {
                     },
                     activity,
                     since: 0,
-                    suppressors: Vec::new(),
+                    owed: None,
                     nudge: Nudge::Nothing,
                     cannot_resume: None,
                     attending: Vec::new(),
@@ -3397,6 +3402,70 @@ mod dirty_and_wake_tests {
         );
         let idle = shown(Activity::Idle, true);
         assert!(!idle.contains('\x1b'), "{idle:?}");
+    }
+
+    /// Work an agent's bound session never received is said in its state
+    /// line, in red when painted, with the reason clank keeps its hands
+    /// off; and `status -j` carries the oldest owed item's age, kind and
+    /// delivery.
+    #[test]
+    fn status_shouts_undelivered_work_and_json_carries_the_owed_item() {
+        use crate::cli::agent_state::{
+            Activity, AgentState, Case, HandsOff, Nudge, Observer, OwedItem, Owing,
+            UNDELIVERED_SGR, View,
+        };
+        use crate::cli::ledger::{Delivery, Since};
+        let now = crate::cli::recovery::unix_now();
+        let item = OwedItem {
+            kind: "message".into(),
+            what: "message from claude".into(),
+            since: Since::At(now - 7200),
+            delivery: Delivery::NotDelivered,
+        };
+        let state = AgentState {
+            role: "standby".into(),
+            session: "s1".into(),
+            tool: clank_core::Tool::Codex,
+            monitor: Observer {
+                pid: 1,
+                birth: None,
+            },
+            activity: Activity::Working,
+            since: now - 2520,
+            owed: Some(Owing {
+                oldest: item.clone(),
+                undelivered: Some(item),
+                warn: 2400,
+                case: Case::HandsOff(HandsOff::AutoOff),
+            }),
+            nudge: Nudge::Nothing,
+            cannot_resume: None,
+            attending: Vec::new(),
+            asking: None,
+            repeated: None,
+        };
+        let mut snap = minimal_snapshot();
+        let mut row = agent_row("artist4", None);
+        row.state = Some(View::at(state, None, now));
+        snap.agents = vec![row];
+        let plain = snap.human(false);
+        assert!(
+            plain.contains("state: artist4 → UNDELIVERED 2h · message from claude · auto off"),
+            "{plain}"
+        );
+        assert!(!plain.contains("working"), "{plain}");
+        let painted = snap.human(true);
+        assert!(
+            painted.contains(&format!(
+                "state: artist4 → \x1b[{UNDELIVERED_SGR}mUNDELIVERED 2h"
+            )),
+            "{painted:?}"
+        );
+        let json = serde_json::to_value(&snap).unwrap();
+        let owed = &json["agents"][0]["state"]["owed"];
+        assert_eq!(owed["age"], 7200, "{json}");
+        assert_eq!(owed["kind"], "message");
+        assert_eq!(owed["delivery"]["is"], "not_delivered");
     }
 
     #[test]

@@ -749,6 +749,7 @@ pub(crate) fn carried<'a>(
 ) -> crate::cli::presentation::Carried {
     crate::cli::presentation::Carried {
         events: selected_presentations(items.clone()),
+        identities: items.clone().into_iter().map(WaitItem::identity).collect(),
         answers: items
             .into_iter()
             .filter(|item| item.wake_kind() == Some(clank_core::wait::WaitKind::Unblocked))

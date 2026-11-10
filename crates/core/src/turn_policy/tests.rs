@@ -1003,8 +1003,11 @@ fn auto_off_a_question_and_a_block_come_before_attendance() {
     assert_eq!(st.recovery_quiet(&asking), Some(Quiet::Asking));
     let mut blocked = facts(T0 + MINUTE, &s, &[]);
     blocked.blocked = true;
-    blocked.asking = true;
-    assert_eq!(st.recovery_quiet(&blocked), Some(Quiet::Blocked));
+    assert_eq!(
+        st.recovery_quiet(&blocked),
+        st.recovery_quiet(&facts(T0 + MINUTE, &s, &[])),
+        "a block withholds review work from what is owed; it holds nothing else back"
+    );
 }
 
 /// Recovery holds back only while an entry quiets everything owed, and
@@ -2125,4 +2128,79 @@ fn an_unseen_run_is_kept_and_never_ended() {
         1,
         "once seen gone, it ends"
     );
+}
+
+/// A presentation is in flight only for [`DELIVERY_RESULT_WITHIN`]. A
+/// carrier that has not answered by then failed it, terminally: the work
+/// stays owed and unreceived, the next Stop presents it afresh, and the
+/// carrier's late success finds nothing in flight to commit.
+#[test]
+fn a_presentation_nobody_answers_for_fails_at_its_bound() {
+    let s = session();
+    let a = owed("event:a", "read:a");
+    let mut st = SessionState::new(s.clone());
+    assert_eq!(st.delivery_deadline(), None);
+    let (stuck, _) = deliver(&mut st, &facts(T0, &s, &a));
+    assert_eq!(st.delivery_deadline(), Some(T0 + DELIVERY_RESULT_WITHIN));
+    assert_eq!(
+        verdict(st.step(Event::TurnEnd(report(Tool::Claude)), &facts(T0 + 1, &s, &a))),
+        Verdict::Park,
+        "one presentation at a time, while it is in flight"
+    );
+
+    let early = facts(T0 + DELIVERY_RESULT_WITHIN - 1, &s, &a);
+    assert_eq!(
+        settled(st.step(Event::ResultOverdue, &early)),
+        ResultOutcome::InTime
+    );
+    assert!(st.outstanding.is_some(), "still in flight inside its bound");
+
+    let at = facts(T0 + DELIVERY_RESULT_WITHIN, &s, &a);
+    assert_eq!(
+        settled(st.step(Event::ResultOverdue, &at)),
+        ResultOutcome::Resolved(Vec::new()),
+        "failed: nothing is committed"
+    );
+    assert_eq!(st.outstanding, None);
+    assert_eq!(st.delivery_deadline(), None);
+    assert!(st.received.is_empty(), "a silent carrier delivered nothing");
+    assert_eq!(st.resolved, Some((stuck.clone(), Resolution::Failed)));
+    assert_eq!(
+        settled(st.step(Event::ResultOverdue, &at)),
+        ResultOutcome::InTime,
+        "nothing left to fail"
+    );
+
+    assert_eq!(
+        settled(st.step(Event::Delivered(stuck.clone()), &at)),
+        ResultOutcome::ProtocolViolation(stuck.clone()),
+        "its late success commits nothing"
+    );
+    assert!(st.received.is_empty());
+    let (again, _) = deliver(&mut st, &facts(T0 + DELIVERY_RESULT_WITHIN + 5, &s, &a));
+    assert_ne!(again, stuck, "the work is presented afresh");
+    assert_eq!(
+        st.delivery_deadline(),
+        Some(T0 + 2 * DELIVERY_RESULT_WITHIN + 5),
+        "on a bound of its own"
+    );
+}
+
+/// A presentation saved before a result had a bound carries no hand-over
+/// time. It reads as handed at the epoch, so it is long overdue; and a
+/// restart fails whatever was in flight anyway, since its carrier's
+/// connection died with the monitor that held it.
+#[test]
+fn a_presentation_saved_without_a_hand_over_time_still_loads() {
+    let old = r#"{"id":{"session":"00000000-0000-4000-8000-000000000001","seq":7},"identities":["event:a"],"receipts":["read:a"],"repeat":"Uncounted"}"#;
+    let p: Presentation = serde_json::from_str(old).unwrap();
+    assert_eq!(p.handed, 0);
+    assert_eq!(p.expires(), DELIVERY_RESULT_WITHIN);
+    let stored = format!(
+        r#"{{"binding":"00000000-0000-4000-8000-000000000001","attendances":[],"repeat":null,"outstanding":{old},"outstanding_episode_broken":false,"resolved":null,"next_seq":7,"received":[],"unwatched":null}}"#
+    );
+    let persisted: Persisted = serde_json::from_str(&stored).unwrap();
+    let st = SessionState::restored(persisted);
+    assert_eq!(st.outstanding, None);
+    assert_eq!(st.resolved.map(|(_, how)| how), Some(Resolution::Failed));
 }

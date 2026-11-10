@@ -266,7 +266,6 @@ async fn an_unbinding_seen_by_a_fold_retires_the_check_in_it_owed() {
     recovery_facts(
         repo.path(),
         &state,
-        &[],
         &Default::default(),
         &mut Default::default(),
         &[],
@@ -320,12 +319,12 @@ fn recovering(repo: &std::path::Path, author: &AgentLabel) -> crate::cli::recove
             session: binding.clone(),
             auto: true,
             work: vec![],
-            delivering: false,
-            obligated: false,
+            ledger: crate::cli::ledger::Ledger::owing_if(false),
             role: "master".into(),
             blind_nudge: None,
             stall: None,
-            attending: false,
+            attended: false,
+            blocked_on: None,
             asking: false,
             projection: Default::default(),
         }],
@@ -1133,11 +1132,11 @@ enum Later {
 }
 
 /// Attendance holds recovery only over work the session received, from
-/// either source of later work. Work it received stays held; a healthy
-/// parked hook still owns the wake of work arriving after it parked; and
-/// once that hook is lost, the new work leaves the agent obligated and
-/// unquieted, so recovery's facts, the deadline's gate and the last look
-/// before a send all let recovery wake it.
+/// either source of later work. Work it received stays held. Work arriving
+/// after its hook parked is owed and unquieted whether or not that hook is
+/// still there: a wait that has not been handed the work is not delivering
+/// it, so recovery's facts, the deadline's gate and the last look before a
+/// send all let recovery wake it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attendance_holds_recovery_only_over_work_the_session_received() {
     recovery_after_a_lost_park(Later::Logged).await;
@@ -1168,14 +1167,10 @@ async fn recovery_after_a_lost_park(later: Later) {
     assert_eq!(parked.verdict, WireVerdict::Park);
 
     type Pending = [(AgentLabel, WaitItem)];
-    let facts = |state: &crate::repo_state::RepoState,
-                 pending: &Pending,
-                 clients: &[Client],
-                 turns: &mut Turns| {
+    let facts = |state: &crate::repo_state::RepoState, pending: &Pending, turns: &mut Turns| {
         let [facts] = recovery_facts(
             repo.path(),
             state,
-            clients,
             &Default::default(),
             &mut Default::default(),
             pending,
@@ -1229,8 +1224,11 @@ async fn recovery_after_a_lost_park(later: Later) {
         );
         last
     };
-    let held = facts(&state, &[], &[], &mut turns);
-    assert!(held.obligated && held.attending, "received work: {held:?}");
+    let held = facts(&state, &[], &mut turns);
+    assert!(
+        !held.ledger.owed().is_empty() && held.attended,
+        "received work: {held:?}"
+    );
     assert_eq!(look(&state, &[], &[], &mut turns), Some(Gate::Hold));
 
     let (heard_tx, _heard) = tokio::sync::mpsc::unbounded_channel();
@@ -1262,22 +1260,19 @@ async fn recovery_after_a_lost_park(later: Later) {
         }
         Later::Pending => (state.clone(), transient(&author)),
     };
-    let owned = facts(&now, &pending, &clients, &mut turns);
+    let parked = facts(&now, &pending, &mut turns);
     assert!(
-        owned.delivering && !owned.obligated,
-        "{later:?}: the parked hook owns it: {owned:?}"
+        !parked.ledger.owed().is_empty() && !parked.attended,
+        "{later:?}: owed, and no parked hook stands in for its delivery: {parked:?}"
     );
-    assert_eq!(
-        look(&now, &pending, &clients, &mut turns),
-        Some(Gate::Deliverer)
-    );
+    assert_eq!(look(&now, &pending, &clients, &mut turns), Some(Gate::Go));
 
     clients.clear();
     drop(hook.stdin);
     hook.child.join().unwrap();
-    let lost = facts(&now, &pending, &[], &mut turns);
+    let lost = facts(&now, &pending, &mut turns);
     assert!(
-        lost.obligated && !lost.attending,
+        !lost.ledger.owed().is_empty() && !lost.attended,
         "{later:?}: unseen work is recoverable: {lost:?}"
     );
     assert_eq!(look(&now, &pending, &[], &mut turns), Some(Gate::Go));
@@ -1893,7 +1888,12 @@ async fn a_parked_wait_is_presented_its_quieted_work_at_the_attendance_deadline(
         "{note}"
     );
     assert!(clients.is_empty(), "a delivery retires the parked report");
-    assert_eq!(turns.next_deadline(), None, "not due again");
+    assert!(turns.due_authors(u64::MAX).is_empty(), "not due again");
+    assert_eq!(
+        turns.next_deadline(),
+        turns.state(&author).unwrap().delivery_deadline(),
+        "only the presentation's own bound is left"
+    );
 }
 
 /// `author`'s Claude record holds a prompt and an answer with no end
@@ -1982,7 +1982,6 @@ async fn a_park_whose_hook_dies_leaves_its_agent_unwatched_and_nudged() {
     let facts = recovery_facts(
         repo.path(),
         &state,
-        &clients,
         &Default::default(),
         &mut Default::default(),
         &[],
@@ -2331,4 +2330,69 @@ async fn a_compactions_rearm_keeps_what_the_attendance_quiets() {
     let frame = turns.answer(&author, 3, &rearm, true, &g).unwrap();
     assert_eq!(frame.verdict, WireVerdict::Park, "{frame:?}");
     assert_eq!(turns.next_deadline(), Some(due));
+}
+
+/// The loop's own step at a presentation's bound. A wake handed to a
+/// carrier that never answers holds the agent's recovery only until
+/// [`clank_core::turn_policy::DELIVERY_RESULT_WITHIN`] has passed: then
+/// the loop fails it, nothing is in flight or due, and the gate a nudge
+/// asks lets recovery through.
+#[tokio::test]
+async fn the_loop_gives_up_a_presentation_its_carrier_never_answered_for() {
+    use crate::cli::recovery::Gate;
+    let (repo, author, timer) = timer_repo();
+    log_timer_event(repo.path(), &timer);
+    let state = folded(repo.path()).await.unwrap();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gather(
+        repo.path(),
+        Some(&state),
+        &author,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+    );
+    let shown = turns.answer(&author, 1, &stop_report(), true, &g).unwrap();
+    assert!(shown.presentation().is_some(), "{shown:?}");
+    let expires = turns.next_deadline().expect("the result has a bound");
+    let owed = owed_now(
+        repo.path(),
+        &state,
+        &author,
+        &Default::default(),
+        &mut Default::default(),
+        &[],
+    );
+    let mut recovery =
+        crate::cli::recovery::Driver::new(repo.path().to_path_buf(), "/nonexistent".into());
+    let mut clients = Vec::new();
+    let mut round = |turns: &mut Turns, now| {
+        drop(expire_deliveries(
+            repo.path(),
+            &mut clients,
+            Some(&state),
+            &[],
+            &Default::default(),
+            turns,
+            &mut recovery,
+            now,
+        ))
+    };
+
+    round(&mut turns, expires - 1);
+    assert!(turns.presenting(&author), "inside its bound");
+    assert_eq!(
+        recovery_gate(repo.path(), &[], &mut turns, &author, SESSION, &owed),
+        Gate::Hold,
+        "being delivered"
+    );
+
+    round(&mut turns, expires);
+    assert!(!turns.presenting(&author), "given up at the bound");
+    assert_eq!(turns.next_deadline(), None, "and never due again");
+    assert_eq!(
+        recovery_gate(repo.path(), &[], &mut turns, &author, SESSION, &owed),
+        Gate::Go,
+        "the agent moves to recovery"
+    );
 }

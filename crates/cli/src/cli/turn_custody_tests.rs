@@ -1663,3 +1663,264 @@ fn a_replayed_end_is_not_written_again_past_the_identity_horizon() {
         "and the stale registration is retired"
     );
 }
+
+fn presented(turns: &mut Turns, conn: u64, g: &Gathered) -> PresentationId {
+    let frame = turns
+        .answer(
+            &label("agent"),
+            conn,
+            &stop(Tool::Codex, "session-one", Some(conn)),
+            true,
+            g,
+        )
+        .unwrap();
+    frame
+        .presentation()
+        .unwrap_or_else(|| panic!("owed work is presented: {frame:?}"))
+        .clone()
+}
+
+fn evidence(turns: &Turns, repo: &Path, session: &str) -> crate::cli::ledger::Evidence {
+    crate::cli::ledger::Evidence {
+        delivered: crate::cli::presentation::delivered_to(
+            &crate::agent_store::agents_root(repo).join("agent"),
+            session,
+        ),
+        in_flight: turns.in_flight(&label("agent")),
+    }
+}
+
+/// A live carrier whose presentation never settles is a delivery in
+/// progress only until [`clank_core::turn_policy::DELIVERY_RESULT_WITHIN`]
+/// has passed. Then custody fails it: nothing is in flight, the item is
+/// not delivered, the carrier's late success is refused and commits
+/// nothing, and the next Stop is presented the work afresh rather than
+/// parked behind a presentation that will never end.
+#[tokio::test]
+async fn a_carrier_that_never_answers_is_given_up_at_the_result_bound() {
+    use crate::cli::ledger::{Delivery, delivery};
+    use clank_core::turn_policy::DELIVERY_RESULT_WITHIN;
+    const T0: Ms = 1_000_000;
+    let repo = repo_with("agent", Tool::Codex, "session-one");
+    let author = label("agent");
+    let owed = [message("m1")];
+    let identity = crate::cli::wake_render::mirror(&owed, None)[0].identity();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let at = |now| gathered(repo.path(), "agent", &owed).at(now);
+
+    let stuck = presented(&mut turns, 1, &at(T0));
+    let expires = T0 + DELIVERY_RESULT_WITHIN;
+    assert_eq!(
+        turns.next_deadline(),
+        Some(expires),
+        "the bound wakes the loop"
+    );
+    assert_eq!(
+        turns.in_flight(&author),
+        Some((vec![identity.clone()], expires / 1000))
+    );
+    let seen = |turns: &Turns, now: Ms| {
+        delivery(
+            &identity,
+            &evidence(turns, repo.path(), "session-one"),
+            now / 1000,
+        )
+    };
+    assert_eq!(seen(&turns, T0), Delivery::InFlight(expires / 1000));
+    let parked = turns
+        .answer(
+            &author,
+            2,
+            &stop(Tool::Codex, "session-one", Some(2)),
+            true,
+            &at(T0 + 5),
+        )
+        .unwrap();
+    assert_eq!(
+        parked.verdict,
+        WireVerdict::Park,
+        "nothing new while it flies"
+    );
+
+    assert!(turns.overdue_authors(expires - 1).is_empty());
+    assert!(!turns.expire(&author, &at(expires - 1)), "inside its bound");
+    assert!(turns.presenting(&author));
+
+    assert_eq!(
+        turns.overdue_authors(expires),
+        std::slice::from_ref(&author)
+    );
+    assert!(turns.expire(&author, &at(expires)));
+    assert!(!turns.presenting(&author));
+    assert_eq!(
+        turns.next_deadline(),
+        None,
+        "and the bound is not due again"
+    );
+    assert_eq!(turns.in_flight(&author), None);
+    assert_eq!(seen(&turns, expires), Delivery::NotDelivered);
+    assert_eq!(
+        turns.carrier(1),
+        None,
+        "its carrier answers for nothing now"
+    );
+
+    let late = turns.result(
+        &author,
+        1,
+        TurnResult::Delivered {
+            presentation: stuck.clone(),
+        },
+        &at(expires + 5),
+    );
+    assert!(
+        late.is_err(),
+        "a late success is refused: {:?}",
+        late.ok().map(|c| c.is_some())
+    );
+    assert_eq!(seen(&turns, expires + 5), Delivery::NotDelivered);
+
+    let again = presented(&mut turns, 3, &at(expires + 10));
+    assert_ne!(again, stuck, "the work is presented afresh, on a new bound");
+    assert_eq!(
+        turns.next_deadline(),
+        Some(expires + 10 + DELIVERY_RESULT_WITHIN)
+    );
+}
+
+/// Only a positive result proves a delivery. A failed emit and a closed
+/// connection leave the item undelivered; a `Delivered` writes the bound
+/// session's receipt before any backend callback runs, so a callback that
+/// is still pending, or never comes, undoes nothing.
+#[tokio::test]
+async fn only_a_positive_result_establishes_a_delivery() {
+    use crate::cli::ledger::{Delivery, delivery};
+    let repo = repo_with("agent", Tool::Codex, "session-one");
+    let author = label("agent");
+    let owed = [message("m1")];
+    let identity = crate::cli::wake_render::mirror(&owed, None)[0].identity();
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "agent", &owed);
+    let seen = |turns: &Turns| {
+        delivery(
+            &identity,
+            &evidence(turns, repo.path(), "session-one"),
+            crate::cli::recovery::unix_now(),
+        )
+    };
+
+    let failed = presented(&mut turns, 1, &g);
+    let commit = turns
+        .result(
+            &author,
+            1,
+            TurnResult::EmitFailed {
+                presentation: failed,
+                why: "nothing reached the agent".into(),
+            },
+            &g,
+        )
+        .unwrap();
+    assert!(commit.is_none(), "a failed emit commits nothing");
+    assert_eq!(seen(&turns), Delivery::NotDelivered);
+
+    presented(&mut turns, 2, &g);
+    turns.closed(&author, 2, &g);
+    assert_eq!(
+        seen(&turns),
+        Delivery::NotDelivered,
+        "a result that never came"
+    );
+
+    let delivered = presented(&mut turns, 3, &g);
+    let commit = turns
+        .result(
+            &author,
+            3,
+            TurnResult::Delivered {
+                presentation: delivered,
+            },
+            &g,
+        )
+        .unwrap()
+        .expect("a delivery commits");
+    assert_eq!(
+        seen(&turns),
+        Delivery::NotDelivered,
+        "not before it is recorded"
+    );
+    // The record alone, as `Commit::run` makes it before it dispatches a
+    // single receipt callback.
+    crate::cli::presentation::record_delivered(
+        repo.path(),
+        &author,
+        Tool::Codex,
+        "session-one",
+        &crate::cli::presentation::Carried {
+            events: Vec::new(),
+            answers: Vec::new(),
+            identities: commit.presented().to_vec(),
+        },
+        || true,
+    );
+    assert_eq!(
+        seen(&turns),
+        Delivery::Delivered,
+        "with every callback still pending"
+    );
+
+    let other = crate::cli::ledger::Evidence {
+        delivered: crate::cli::presentation::delivered_to(
+            &crate::agent_store::agents_root(repo.path()).join("agent"),
+            "session-two",
+        ),
+        in_flight: None,
+    };
+    assert_eq!(
+        delivery(&identity, &other, 0),
+        Delivery::NotDelivered,
+        "and it proves nothing to any other session"
+    );
+}
+
+/// A wake that reached the model through the monitor leaves the bound
+/// session's receipt for every item it carried; one whose session lost
+/// the label before it was recorded leaves none.
+#[tokio::test]
+async fn a_committed_delivery_leaves_the_bound_sessions_receipt() {
+    let repo = repo_with("agent", Tool::Codex, "session-one");
+    let author = label("agent");
+    let owed = [message("m1")];
+    let identity = crate::cli::wake_render::mirror(&owed, None)[0].identity();
+    let dir = crate::agent_store::agents_root(repo.path()).join("agent");
+    let mut turns = Turns::new(repo.path().to_path_buf());
+    let g = gathered(repo.path(), "agent", &owed);
+    let deliver = |turns: &mut Turns, conn| {
+        let presentation = presented(turns, conn, &g);
+        turns
+            .result(&author, conn, TurnResult::Delivered { presentation }, &g)
+            .unwrap()
+            .expect("a delivery commits")
+    };
+
+    deliver(&mut turns, 1).run(repo.path()).await;
+    assert!(
+        crate::cli::presentation::delivered_to(&dir, "session-one").contains_key(&identity),
+        "the session that saw it holds its receipt"
+    );
+
+    std::fs::remove_file(crate::cli::presentation::receipts_path(&dir)).unwrap();
+    let commit = deliver(&mut turns, 2);
+    crate::agent_store::bind_session_to_agent(
+        repo.path(),
+        &author,
+        Tool::Codex,
+        &sid("session-two"),
+    )
+    .unwrap();
+    commit.run(repo.path()).await;
+    assert!(
+        !crate::cli::presentation::receipts_path(&dir).exists(),
+        "a session that no longer holds the label is given no receipt"
+    );
+}
