@@ -24,9 +24,8 @@ Clank is a peer-review workflow for multi-agent development. Each repo's
   "<name>"`. No exceptions, for any tool.
 - **Never wait for it in a turn**: start it, end the turn. A run wakes
   you when its process ends; its output and exit status are where you
-  launched it. A declaration lasts until your next turn and checks in
-  once at `--expect` (5m): re-declare what still runs. Never poll it or
-  start a wait.
+  launched it. {{DECLARED_ENDS}} It checks in once at
+  `--expect` (5m); messages don't end it. Never poll it or start a wait.
 - **clank detects no background work**: what you don't mark isn't
   tracked; messages wait for your turn to end. A turn silent 45m while
   owing work is nudged, which interrupts it.

@@ -2,7 +2,7 @@
 //! child carries in its hello, the verdicts the monitor answers with, and
 //! the one delivery result the child forwards on the same connection.
 
-use clank_core::turn_policy::{Ms, PresentationId, TurnEndReport};
+use clank_core::turn_policy::{Ms, PresentationId, TaskSnapshot, TurnEndReport};
 use clank_core::{HookOutcome, SessionId, SilentReason, Tool};
 
 /// What a hook reports to the monitor.
@@ -34,6 +34,9 @@ pub(crate) enum Report {
         session: SessionId,
         /// This Stop continues the turn that was asked to arm the wait.
         continued: bool,
+        /// Grok's `backgroundTasks`, read only for declarations.
+        #[serde(default)]
+        tasks: TaskSnapshot,
         deadline: Ms,
     },
 }

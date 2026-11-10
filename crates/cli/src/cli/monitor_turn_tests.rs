@@ -710,6 +710,7 @@ fn log_timer_occurrence(
 fn stop_report() -> Report {
     Report::TurnEnd {
         stop: clank_core::turn_policy::TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
             tool: clank_core::Tool::Claude,
             session: clank_core::SessionId::parse(SESSION).unwrap(),
             place: Default::default(),

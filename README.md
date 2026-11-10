@@ -845,10 +845,16 @@ it again while the work runs; new work still wakes it.
   `run_ended` item, which stays owed until acked; its output and exit
   status are wherever it was launched. With no monitor to take the
   registration, the command is refused and does not run.
-- `clank attend "<name>"` declares work clank cannot observe, such as a
-  subagent. It takes effect at once and lasts until the agent's next turn
-  starts, whatever wakes it, so an agent woken while that work still runs
-  declares it again. Clank never says the named work finished.
+- `clank attend "<name>"` declares other work, such as a subagent. It
+  takes effect at once. Where the harness's Stop lists its own background
+  tasks (Claude's `background_tasks`, Grok's `backgroundTasks`), the name
+  is matched to the one live task with that description and the
+  declaration ends when a listing no longer has that task; the listing
+  never creates attendance, and a task nobody declared is ignored. A name
+  that matches several tasks, or none within two Stops, is dropped with a
+  notice saying what the harness lists. Where there is no listing (Codex,
+  OpenCode) the declaration stands until the agent clears it. A person's
+  message never ends one, and clank never says the named work finished.
 
 An agent attends several things at once. Each `attend` or `run` adds one
 entry, or renews what already stands under that name or process, and

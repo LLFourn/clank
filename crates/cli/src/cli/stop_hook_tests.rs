@@ -423,6 +423,7 @@ async fn a_session_start_out_of_time_says_nothing() {
 fn stop_report() -> Report {
     Report::TurnEnd {
         stop: TurnEndReport {
+            tasks: clank_core::turn_policy::TaskSnapshot::Unavailable,
             tool: Tool::Claude,
             session: clank_core::SessionId::parse("sess-handshake").unwrap(),
             place: Default::default(),
@@ -782,61 +783,69 @@ async fn a_binding_replaced_before_the_emit_sends_nothing() {
     ));
 }
 
-/// The Stop's evidence is what the report carries: the session, its place
-/// and the deadline the hook can wait to. A harness's task listing in the
-/// payload parses and reaches nothing.
+/// The Stop's evidence is what the report carries: the session, its place,
+/// the harness's task listing as Claude sent it (a captured payload), or
+/// that it sent none, and the deadline the hook can wait to.
 #[tokio::test]
 async fn the_report_carries_the_stops_evidence() {
     let dir = init_repo();
     let repo = dunce::canonicalize(dir.path()).unwrap();
     bind_tool(&repo, "claude", "sess-evidence", Tool::Claude);
-    let input: HookInput = serde_json::from_value(serde_json::json!({
-        "session_id": "sess-evidence",
-        "cwd": repo,
-        "stop_hook_active": false,
-        "background_tasks": [
-            {"id": "a1", "type": "subagent", "status": "running", "description": "sleeper"},
-        ],
-    }))
+    let captured: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../core/tests/fixtures/stop_hook/stop_subagent_running.json"
+    ))
     .unwrap();
-    let recorder = Recorder::default();
-    let before = super::super::turn_custody::now_ms();
-    let turn = stop(
-        Tool::Claude,
-        Some(&repo),
-        input,
-        std::time::Instant::now(),
-        false,
-        &recorder,
-    )
-    .await;
-    assert!(
-        matches!(turn.outcome, HookOutcome::Diagnostic { ref message } if message == "recorded")
-    );
-    let carried = recorder.0.borrow();
-    let (
-        at,
-        who,
-        Report::TurnEnd {
-            stop: reported,
-            deadline,
-            ..
-        },
-    ) = &carried[0]
-    else {
-        panic!("a Stop's report");
+    let listed = |payload: &serde_json::Value| -> HookInput {
+        let mut payload = payload.clone();
+        payload["session_id"] = "sess-evidence".into();
+        payload["cwd"] = repo.to_str().unwrap().into();
+        serde_json::from_value(payload).unwrap()
     };
-    assert_eq!(at, &repo);
-    assert_eq!(who, "claude");
-    assert_eq!(
-        reported,
-        &TurnEndReport {
-            tool: Tool::Claude,
-            session: clank_core::SessionId::parse("sess-evidence").unwrap(),
-            place: Default::default(),
-        }
-    );
-    assert!(*deadline > before, "the deadline is ahead of the Stop");
+    let mut bare = captured.clone();
+    bare.as_object_mut().unwrap().remove("background_tasks");
+    for (input, tasks) in [
+        (
+            listed(&captured),
+            TaskSnapshot::Known(vec![clank_core::BackgroundTask::from(
+                captured["background_tasks"][0].clone(),
+            )]),
+        ),
+        (listed(&bare), TaskSnapshot::Unavailable),
+    ] {
+        let recorder = Recorder::default();
+        let before = super::super::turn_custody::now_ms();
+        let turn = stop(
+            Tool::Claude,
+            Some(&repo),
+            input,
+            std::time::Instant::now(),
+            false,
+            &recorder,
+        )
+        .await;
+        assert!(
+            matches!(turn.outcome, HookOutcome::Diagnostic { ref message } if message == "recorded")
+        );
+        let carried = recorder.0.borrow();
+        let (
+            at,
+            who,
+            Report::TurnEnd {
+                stop: reported,
+                deadline,
+                ..
+            },
+        ) = &carried[0]
+        else {
+            panic!("a Stop's report");
+        };
+        assert_eq!(at, &repo);
+        assert_eq!(who, "claude");
+        assert_eq!(reported.tool, Tool::Claude);
+        assert_eq!(reported.session.as_str(), "sess-evidence");
+        assert_eq!(reported.tasks, tasks);
+        assert!(*deadline > before, "the deadline is ahead of the Stop");
+    }
 }
 
 #[tokio::test]

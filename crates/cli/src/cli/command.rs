@@ -366,9 +366,11 @@ pub enum Command {
     ///
     /// `clank attend "<name>"` takes effect at once: work you have already
     /// been shown does not wake you again while it stands, and new work
-    /// still does. It lasts until your next turn starts, whatever wakes
-    /// you, so declare it again then if it is still running; clank never
-    /// learns whether it finished. You can declare several things at once,
+    /// still does. On a harness whose Stop lists its background tasks
+    /// (Claude, Grok) the name is matched to the one listed task with that
+    /// description, and the declaration ends when the listing no longer
+    /// has it; elsewhere it stands until you `--clear` it. Messages you get
+    /// meanwhile never end it. You can declare several things at once,
     /// and a name a `clank run` carries renews that run. Say how long you
     /// expect it to take (`--expect`, default 5m): if it still stands past
     /// that you are checked in on once. `--clear <name>` drops one. Clank

@@ -13,9 +13,10 @@
 //! 1. **Route.** Repo from `--repo`, else the stdin `cwd`; label from the
 //!    environment, else the binding. If the binding no longer names this
 //!    session and this tool, be Silent: someone else is this label now.
-//! 2. **Report.** The Stop's evidence — its place in the agent's record
-//!    and what it proves about the agent's questions — goes to the
-//!    monitor in the hello of a `clank wait --turn-end` child.
+//! 2. **Report.** The Stop's evidence — its place in the agent's record,
+//!    what it proves about the agent's questions, and the harness's task
+//!    listing or that it sent none — goes to the monitor in the hello of a
+//!    `clank wait --turn-end` child.
 //! 3. **Carry.** Each verdict arrives as a line on the child's stdout
 //!    while the child and its connection stay alive. `Park` holds the
 //!    wait; the first terminal verdict ends it.
@@ -60,7 +61,7 @@ use super::turn_wire::{Frame, Report, TurnResult, WireVerdict};
 use super::{StopHookArgs, resolve_cwd_repo, resolve_repo};
 use crate::agent_env::{Ambient, Process, resolve_identity_for_hook_in};
 use crate::lifecycle::AgentLabel;
-use clank_core::turn_policy::{PresentationId, TurnEndReport, TurnPlace};
+use clank_core::turn_policy::{PresentationId, TaskSnapshot, TurnEndReport, TurnPlace};
 use clank_core::{
     CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
     SilentReason, Tool,
@@ -225,6 +226,7 @@ async fn stop(
                 human_turn: b.human,
             })
             .unwrap_or_default(),
+        tasks: TaskSnapshot::of(&input),
     };
     let deadline = unix_ms(poll_deadline(started));
     // A compaction ends no turn, so it is no evidence about questions.

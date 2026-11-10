@@ -9,15 +9,52 @@
 //!
 //! clank never detects background work. What an agent attends is only what
 //! it declared: a `clank run` (its registered process) or a `clank attend`
-//! declaration (standing until the agent's next turn starts).
+//! declaration. A harness's own task listing is read only to resolve and
+//! end a declaration; a listed task nobody declared is ignored.
 //!
 use serde::{Deserialize, Serialize};
 
+use crate::hook_io::{BackgroundTask, HookInput};
 use crate::ids::SessionId;
 use crate::vocab::{AutoMode, Role, Tool};
 
 /// Milliseconds since the Unix epoch.
 pub type Ms = u64;
+
+/// What the harness said of its own background work at one Stop.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "snapshot", content = "tasks", rename_all = "snake_case")]
+pub enum TaskSnapshot {
+    /// The harness sent a listing, possibly empty: a task missing from it
+    /// is not running.
+    Known(Vec<BackgroundTask>),
+    /// No listing (codex, OpenCode, a payload that omitted it). Evidence of
+    /// neither completion nor liveness.
+    #[default]
+    Unavailable,
+}
+
+impl TaskSnapshot {
+    /// The snapshot a Stop's payload carries: a list when the harness sent
+    /// one, however empty, and `Unavailable` when it omitted it.
+    pub fn of(input: &HookInput) -> Self {
+        Self::listed(input.background_tasks.clone())
+    }
+
+    pub fn listed(tasks: Option<Vec<BackgroundTask>>) -> Self {
+        match tasks {
+            Some(tasks) => Self::Known(tasks),
+            None => Self::Unavailable,
+        }
+    }
+
+    fn live(&self) -> Option<Vec<&BackgroundTask>> {
+        match self {
+            Self::Known(tasks) => Some(tasks.iter().filter(|t| t.live()).collect()),
+            Self::Unavailable => None,
+        }
+    }
+}
 
 /// Where a Stop sits in the agent's own record, for repeat counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +74,9 @@ pub struct TurnEndReport {
     pub tool: Tool,
     pub session: SessionId,
     pub place: TurnPlace,
+    /// A hook from before listings were reported again sends none.
+    #[serde(default)]
+    pub tasks: TaskSnapshot,
 }
 
 /// Work the generic owed-work fold says this agent is owed now.
@@ -153,21 +193,48 @@ pub enum Attending {
     /// A `clank run`: its registered process is the work, so the work
     /// ends exactly when that process is gone.
     Run(ShellProof),
-    /// A `clank attend` declaration of work clank cannot observe. It
-    /// claims nothing about when that work finishes.
+    /// A `clank attend` declaration. Where the harness lists its tasks it
+    /// resolves to the one live task whose description is `name`, and ends
+    /// when a known listing no longer has that task. Without a listing only
+    /// the agent's clear ends it; its deadline is a check-in, never proof
+    /// that the work finished.
     Declared {
         name: String,
-        /// A turn has ended since it was declared or renewed: the agent's
-        /// next turn start ends it.
-        #[serde(default)]
-        seen_turn_end: bool,
+        /// The harness's stable id of the task it resolved to. Bound once:
+        /// a later task reusing the description is not this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        /// Known listings in a row that had no task by this name.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        misses: u8,
     },
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
+}
+
+/// Known listings a declaration may go unmatched before it is dropped:
+/// the work may be started in the turn after the one that declared it.
+pub const MISSES_ALLOWED: u8 = 2;
+
+impl Attending {
+    pub fn declared(name: String) -> Self {
+        Self::Declared {
+            name,
+            task: None,
+            misses: 0,
+        }
+    }
 }
 
 /// What every mutation of an entry is scoped to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKey {
     Name(String),
+    /// A declaration resolved to this listed task: a renewal of the same
+    /// name may stand beside it until a listing resolves that too.
+    Task(String),
     Run(ShellProof),
 }
 
@@ -191,7 +258,18 @@ impl Entry {
     pub fn key(&self) -> EntryKey {
         match &self.work {
             Attending::Run(proof) => EntryKey::Run(proof.clone()),
+            Attending::Declared {
+                task: Some(task), ..
+            } => EntryKey::Task(task.clone()),
             Attending::Declared { name, .. } => EntryKey::Name(name.clone()),
+        }
+    }
+
+    /// The listed task this declaration resolved to.
+    pub fn task(&self) -> Option<&str> {
+        match &self.work {
+            Attending::Declared { task, .. } => task.as_deref(),
+            Attending::Run(_) => None,
         }
     }
 
@@ -214,19 +292,8 @@ impl Entry {
         self.since.saturating_add(self.expect)
     }
 
-    /// A declaration whose turn has ended: the next turn start ends it.
-    fn outlived(&self) -> bool {
-        matches!(
-            self.work,
-            Attending::Declared {
-                seen_turn_end: true,
-                ..
-            }
-        )
-    }
-
     /// A new expectation from `since`, with its check-in re-armed against
-    /// it. A renewed declaration stands for the turn it was renewed in.
+    /// it.
     fn renew(&mut self, since: Ms, expect: Ms, desc: Option<String>) {
         self.since = since;
         self.expect = expect;
@@ -234,9 +301,6 @@ impl Entry {
             self.desc = desc;
         }
         self.check_in = CheckIn::Armed;
-        if let Attending::Declared { seen_turn_end, .. } = &mut self.work {
-            *seen_turn_end = false;
-        }
     }
 }
 
@@ -367,13 +431,54 @@ pub struct Presentation {
 }
 
 /// Text a verdict carries that is not work.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Notice {
+    /// A declaration matched no listed task within [`MISSES_ALLOWED`]
+    /// listings, so it was dropped. `live` is the latest listing.
+    NoMatch {
+        name: String,
+        live: Vec<TaskSummary>,
+    },
+    /// A declaration matched one listed task that carries no id, so its end
+    /// could never be told from another task's: it was dropped.
+    Untrackable { name: String, task: TaskSummary },
+    /// A declaration's name was the description of several listed tasks,
+    /// so it was dropped rather than guess.
+    Ambiguous {
+        name: String,
+        matches: Vec<TaskSummary>,
+    },
     /// Alone mode: work is owed and no monitor can present it.
     MonitorUnavailable,
     /// Grok's native handoff: run `clank wait` in the background, whose
     /// completion wakes the agent.
     ArmWait,
+}
+
+/// A pending declaration's renewal of the one already bound to `task`.
+struct Merge {
+    task: String,
+    since: Ms,
+    expect: Ms,
+    desc: String,
+}
+
+/// A listed task, as a declaration notice names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub id: Option<String>,
+    pub kind: Option<String>,
+    pub description: Option<String>,
+}
+
+impl From<&BackgroundTask> for TaskSummary {
+    fn from(t: &BackgroundTask) -> Self {
+        Self {
+            id: t.id.clone(),
+            kind: t.kind.clone(),
+            description: t.description.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +503,7 @@ pub enum Verdict {
         identities: Vec<String>,
         repeat: u32,
         escalated: bool,
+        notices: Vec<Notice>,
     },
     /// Wake with text that is not work, never empty. Creates no
     /// presentation.
@@ -551,9 +657,9 @@ pub enum Event {
     /// A session started: its owed work, presented once and never counted
     /// as a repeat, or nothing.
     SessionStart(SessionId),
-    /// Grok's native Stop: a turn ended, though the handoff, not this
-    /// state, answers it.
-    NativeTurnEnd(SessionId),
+    /// Grok's native Stop: answered by [`handoff_verdict`], and its listing
+    /// resolves and ends declarations as a Stop's does.
+    NativeTurnEnd(Handoff),
     /// The facts changed with no event of the agent's own: an owed-work
     /// change still ends the repeat episode.
     Observed,
@@ -584,6 +690,9 @@ pub struct Persisted {
     /// it owes is quiet.
     pub received: Vec<String>,
     pub unwatched: Option<Unwatched>,
+    /// Declaration feedback a wake gate held back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feedback: Vec<Notice>,
 }
 
 /// The persisted shapes from before attending was only what an agent
@@ -609,6 +718,8 @@ mod legacy {
         received: Vec<String>,
         #[serde(default)]
         unwatched: Option<Unwatched>,
+        #[serde(default)]
+        feedback: Vec<Notice>,
     }
 
     #[derive(Deserialize)]
@@ -623,11 +734,18 @@ mod legacy {
     #[derive(Deserialize)]
     struct Listed {
         selector: Selector,
+        #[serde(default)]
+        resolved: Option<Resolved>,
         desc: Option<String>,
         since: Ms,
         expect: Ms,
         shell: Option<ShellProof>,
         check_in: CheckIn,
+    }
+
+    #[derive(Deserialize)]
+    struct Resolved {
+        task_id: String,
     }
 
     #[derive(Deserialize)]
@@ -686,6 +804,7 @@ mod legacy {
                 next_seq: s.next_seq,
                 received: s.received,
                 unwatched: s.unwatched,
+                feedback: s.feedback,
             }
         }
     }
@@ -696,6 +815,7 @@ mod legacy {
                 Self::Current(entry) => entry,
                 Self::Listed(l) => entry(
                     l.shell,
+                    l.resolved.map(|r| r.task_id),
                     l.desc.unwrap_or_else(|| l.selector.text().to_string()),
                     l.selector.text().to_string(),
                     l.since,
@@ -707,10 +827,11 @@ mod legacy {
     }
 
     /// A run keeps its registration, so its end is still recorded. A named
-    /// attendance was made in a turn that has since ended: it stands
-    /// until the agent's next turn starts, as any declaration does.
+    /// attendance keeps the task a listing resolved it to, so the next
+    /// listing still ends it.
     fn entry(
         shell: Option<ShellProof>,
+        task: Option<String>,
         desc: String,
         name: String,
         since: Ms,
@@ -722,7 +843,8 @@ mod legacy {
                 Some(proof) => Attending::Run(proof),
                 None => Attending::Declared {
                     name,
-                    seen_turn_end: true,
+                    task,
+                    misses: 0,
                 },
             },
             desc,
@@ -746,8 +868,16 @@ mod legacy {
                 check_in,
                 renewal,
             } => {
-                let named = desc.clone().unwrap_or(task_id);
-                let standing = entry(shell, named.clone(), named, since, expect, check_in);
+                let named = desc.clone().unwrap_or_else(|| task_id.clone());
+                let standing = entry(
+                    shell,
+                    Some(task_id),
+                    named.clone(),
+                    named,
+                    since,
+                    expect,
+                    check_in,
+                );
                 std::iter::once(standing)
                     .chain(renewal.map(Request::entry))
                     .collect()
@@ -760,6 +890,7 @@ mod legacy {
             let name = self.selector.text().to_string();
             entry(
                 self.shell,
+                None,
                 self.desc.unwrap_or_else(|| name.clone()),
                 name,
                 self.since,
@@ -803,6 +934,11 @@ pub struct SessionState {
     /// quiet. Never wider than what is still owed.
     pub received: Vec<String>,
     pub unwatched: Option<Unwatched>,
+    /// `NoMatch` / `Ambiguous` for declarations already dropped, not yet
+    /// handed to any wake: a gate that forbids waking holds them for the
+    /// next Stop that may wake, or that wakes anyway. Handed over once: a
+    /// presentation carrying them that fails to emit does not restore them.
+    pub feedback: Vec<Notice>,
 }
 
 impl SessionState {
@@ -817,6 +953,7 @@ impl SessionState {
             next_seq: 0,
             received: Vec::new(),
             unwatched: None,
+            feedback: Vec::new(),
         }
     }
 
@@ -831,6 +968,7 @@ impl SessionState {
             next_seq: self.next_seq,
             received: self.received.clone(),
             unwatched: self.unwatched,
+            feedback: self.feedback.clone(),
         }
     }
 
@@ -855,6 +993,7 @@ impl SessionState {
             next_seq: p.next_seq,
             received,
             unwatched: p.unwatched,
+            feedback: p.feedback,
         }
     }
 
@@ -932,12 +1071,7 @@ impl SessionState {
             }
             Event::Parked(report) => Output::Verdict(self.parked(report, facts)),
             Event::SessionStart(session) => Output::Verdict(self.session_start(session, facts)),
-            Event::NativeTurnEnd(session) => {
-                if facts.binding == Some(&session) && self.bound(facts) {
-                    self.turn_ended();
-                }
-                Output::Effects(Vec::new())
-            }
+            Event::NativeTurnEnd(handoff) => Output::Verdict(self.native_turn_end(handoff, facts)),
             Event::Observed => Output::Effects(Vec::new()),
         };
         self.prune_received(facts);
@@ -990,27 +1124,97 @@ impl SessionState {
         before - self.attendances.len()
     }
 
-    /// A turn ended. A Stop is reached only by running a turn, so a
-    /// declaration that had already seen a turn end has had its next turn
-    /// start: it is over. Every other declaration has now seen one.
-    fn turn_ended(&mut self) {
-        self.turn_started();
-        for entry in &mut self.attendances {
-            if let Attending::Declared { seen_turn_end, .. } = &mut entry.work {
-                *seen_turn_end = true;
+    /// Resolve and end declarations against THIS Stop's listing, the first
+    /// that can show work started in the turn that declared it. Runs are
+    /// untouched, and no listed task creates or names anything: a task no
+    /// declaration matches is ignored. Without a listing nothing changes.
+    ///
+    /// A resolved declaration ends when the listing lacks its task. A
+    /// pending one binds to its one live match (merging into a declaration
+    /// already bound to that task), is dropped with a notice when several
+    /// match or its one match has no id to track, and with another when it
+    /// has gone unmatched for
+    /// [`MISSES_ALLOWED`] listings. Its notices join [`Self::feedback`].
+    fn resolve_declarations(&mut self, tasks: &TaskSnapshot) {
+        let Some(live) = tasks.live() else {
+            return;
+        };
+        let listed = |id: &str| live.iter().any(|t| t.id.as_deref() == Some(id));
+        let mut notices = Vec::new();
+        let mut merges: Vec<Merge> = Vec::new();
+        let held: Vec<String> = self
+            .attendances
+            .iter()
+            .filter_map(|e| e.task().filter(|id| listed(id)).map(str::to_owned))
+            .collect();
+        let summaries = || live.iter().copied().map(TaskSummary::from).collect();
+        let mut drop = vec![false; self.attendances.len()];
+        for (i, entry) in self.attendances.iter_mut().enumerate() {
+            let Attending::Declared { name, task, misses } = &mut entry.work else {
+                continue;
+            };
+            if let Some(id) = task {
+                drop[i] = !listed(id);
+                continue;
+            }
+            let matches: Vec<&BackgroundTask> = live
+                .iter()
+                .copied()
+                .filter(|t| t.description.as_deref() == Some(name.as_str()))
+                .collect();
+            match matches.as_slice() {
+                [BackgroundTask { id: Some(id), .. }] => {
+                    if held.contains(id) {
+                        merges.push(Merge {
+                            task: id.clone(),
+                            since: entry.since,
+                            expect: entry.expect,
+                            desc: entry.desc.clone(),
+                        });
+                        drop[i] = true;
+                    } else {
+                        *task = Some(id.clone());
+                        *misses = 0;
+                    }
+                }
+                [nameless] => {
+                    notices.push(Notice::Untrackable {
+                        name: name.clone(),
+                        task: TaskSummary::from(*nameless),
+                    });
+                    drop[i] = true;
+                }
+                [] => {
+                    *misses = misses.saturating_add(1);
+                    if *misses >= MISSES_ALLOWED {
+                        notices.push(Notice::NoMatch {
+                            name: name.clone(),
+                            live: summaries(),
+                        });
+                        drop[i] = true;
+                    }
+                }
+                many => {
+                    notices.push(Notice::Ambiguous {
+                        name: name.clone(),
+                        matches: many.iter().copied().map(TaskSummary::from).collect(),
+                    });
+                    drop[i] = true;
+                }
             }
         }
-    }
-
-    /// The agent began a turn: every declaration made before the last turn
-    /// end is over, whatever woke it. clank never claims that work
-    /// finished.
-    ///
-    /// What it quieted is not released: the agent was not choosing to stop
-    /// attending, and re-declaring in the turn it was woken for restores
-    /// the quiet rather than re-presenting work it already has.
-    fn turn_started(&mut self) {
-        self.attendances.retain(|e| !e.outlived());
+        let mut dropping = drop.into_iter();
+        self.retain_entries(|_| !dropping.next().unwrap_or(false));
+        for m in merges {
+            if let Some(held) = self
+                .attendances
+                .iter_mut()
+                .find(|e| e.task() == Some(&m.task))
+            {
+                held.renew(m.since, m.expect, Some(m.desc));
+            }
+        }
+        self.feedback.append(&mut notices);
     }
 
     /// Today's `forget_if_stale`: a count describes one unbroken run of the
@@ -1039,14 +1243,48 @@ impl SessionState {
         if facts.binding != Some(&report.session) || !self.bound(facts) {
             return Verdict::Silent(SilentWhy::StaleBinding);
         }
-        self.turn_ended();
+        self.resolve_declarations(&report.tasks);
         if let Some(gated) = drive_gate(facts) {
             return gated;
         }
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts)
+        let verdict =
+            release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts);
+        self.with_feedback(verdict, facts)
+    }
+
+    /// Grok's native Stop: its listing does for declarations what a Stop's
+    /// does, and the waiter verdict is [`handoff_verdict`]'s alone.
+    fn native_turn_end(&mut self, handoff: Handoff, facts: &Facts<'_>) -> Verdict {
+        if facts.binding == Some(&handoff.session) && self.bound(facts) {
+            self.resolve_declarations(&handoff.tasks);
+        }
+        let verdict = handoff_verdict(&handoff, facts);
+        self.with_feedback(verdict, facts)
+    }
+
+    /// Held feedback joins a verdict that wakes the agent anyway. It turns
+    /// one that would not wake into a wake only where
+    /// [`may_wake_without_work`]; otherwise it is held for a later Stop. A
+    /// turn [`release_for_user_command`] already ended is one such silence.
+    fn with_feedback(&mut self, verdict: Verdict, facts: &Facts<'_>) -> Verdict {
+        if self.feedback.is_empty() {
+            return verdict;
+        }
+        let wakes = match &verdict {
+            Verdict::Deliver { .. } | Verdict::Notify(_) => true,
+            Verdict::Park | Verdict::Silent(SilentWhy::WaitArmed) => may_wake_without_work(facts),
+            Verdict::Silent(
+                SilentWhy::StaleBinding | SilentWhy::AutoOff | SilentWhy::UserCommand,
+            )
+            | Verdict::Failed(_) => false,
+        };
+        if !wakes {
+            return verdict;
+        }
+        with_notices(verdict, std::mem::take(&mut self.feedback))
     }
 
     fn parked(&mut self, report: TurnEndReport, facts: &Facts<'_>) -> Verdict {
@@ -1059,7 +1297,9 @@ impl SessionState {
         if report.tool == Tool::Grok {
             return grok_verdict();
         }
-        release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts)
+        let verdict =
+            release_for_user_command(self.deliver_or_park(facts, Some(&report.place)), facts);
+        self.with_feedback(verdict, facts)
     }
 
     fn session_start(&mut self, session: SessionId, facts: &Facts<'_>) -> Verdict {
@@ -1089,6 +1329,7 @@ impl SessionState {
             identities: p.identities.clone(),
             repeat,
             escalated: repeat >= ESCALATE_AT,
+            notices: Vec::new(),
         };
         self.outstanding = Some(p);
         verdict
@@ -1139,11 +1380,11 @@ impl SessionState {
             AttendRequest::Declare {
                 name, desc, expect, ..
             } => {
-                let at = |e: &Entry| e.name() == name;
-                let work = Attending::Declared {
-                    name: name.clone(),
-                    seen_turn_end: false,
-                };
+                // A declaration already bound to a task is not renewed by
+                // name: which task the name means now is the next listing's
+                // to say, and a same-task match merges into it there.
+                let at = |e: &Entry| e.name() == name && e.task().is_none();
+                let work = Attending::declared(name.clone());
                 let desc = desc.unwrap_or_else(|| name.clone());
                 self.add(at, work, desc, expect, facts.now)
             }
@@ -1211,7 +1452,6 @@ impl SessionState {
         if how == Resolution::Failed {
             return ResultOutcome::Resolved(Vec::new());
         }
-        self.turn_started();
         let owed = owed_identities(facts.owed);
         for identity in p.identities.into_iter().filter(|i| owed.contains(i)) {
             if let Err(at) = self.received.binary_search(&identity) {
@@ -1364,6 +1604,49 @@ fn drive_gate(facts: &Facts<'_>) -> Option<Verdict> {
         .map(|e| Verdict::Failed(e.clone()))
 }
 
+/// `notices` joined to a waking verdict, or alone in place of one that
+/// would not wake. Whether they may wake at all is
+/// [`SessionState::with_feedback`]'s to decide.
+fn with_notices(verdict: Verdict, mut notices: Vec<Notice>) -> Verdict {
+    if notices.is_empty() {
+        return verdict;
+    }
+    match verdict {
+        Verdict::Deliver {
+            presentation,
+            identities,
+            repeat,
+            escalated,
+            notices: mut carried,
+        } => {
+            carried.append(&mut notices);
+            Verdict::Deliver {
+                presentation,
+                identities,
+                repeat,
+                escalated,
+                notices: carried,
+            }
+        }
+        Verdict::Notify(mut carried) => {
+            carried.append(&mut notices);
+            Verdict::Notify(carried)
+        }
+        Verdict::Park | Verdict::Silent(SilentWhy::WaitArmed | SilentWhy::UserCommand) => {
+            Verdict::Notify(notices)
+        }
+        gated @ (Verdict::Silent(SilentWhy::StaleBinding | SilentWhy::AutoOff)
+        | Verdict::Failed(_)) => gated,
+    }
+}
+
+/// Whether clank may wake the agent with something that is not work: every
+/// gate a wake passes ([`wake_gate`]), and no person's command waiting for
+/// the idle prompt that wake would take.
+fn may_wake_without_work(facts: &Facts<'_>) -> bool {
+    wake_gate(facts).is_ok() && !facts.user_command
+}
+
 /// A Stop that would park ends instead while a person's command waits:
 /// the command needs an idle prompt, and a held hook is not one. Work to
 /// deliver still wins, since the command waits for that turn's end too.
@@ -1400,6 +1683,9 @@ pub struct Handoff {
     pub session: SessionId,
     pub wait_registered: bool,
     pub continued: bool,
+    /// Grok's `backgroundTasks`, read only for declarations.
+    #[serde(default)]
+    pub tasks: TaskSnapshot,
 }
 
 /// Grok's native turn-end, with or without a monitor: the drive gate, then

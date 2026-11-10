@@ -199,6 +199,20 @@ pub(crate) fn background_run(tool: Tool) -> &'static str {
     }
 }
 
+/// What ends a `clank attend` declaration on `tool`: the harness's own
+/// task listing where its Stop sends one, else only the agent's clear.
+pub(crate) fn declared_ends(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Claude | Tool::Grok => {
+            "A declaration ends when your harness stops\n  listing that work (named by its \
+             exact description)."
+        }
+        Tool::Codex | Tool::OpenCode => {
+            "Clear a declaration with `clank attend\n  --clear \"<name>\"` once done."
+        }
+    }
+}
+
 /// The loop a (tool, mode) pair teaches. Exhaustive over `Tool`, so a
 /// tool added to the vocabulary must state its own discipline here
 /// rather than inheriting someone else's.
@@ -268,6 +282,7 @@ pub fn compose_skill_with(role: Role, tool: Tool, claude_async: bool) -> String 
             &format!("{}\n{}", teaching.arrival, teaching.prohibition),
         )
         .replace("{{BACKGROUND_RUN}}", background_run(tool))
+        .replace("{{DECLARED_ENDS}}", declared_ends(tool))
 }
 
 /// Per-tool hook timeout we write into the agent's hook config.
@@ -2790,14 +2805,16 @@ mod tests {
         // (a-message-wakes-its-agent-until-it-is-handled) — and by the
         // 450B that every role must be told to mark all background work
         // and how its tool starts a run without blocking
-        // (all-background-work-is-attended).
-        const CEILING: usize = 6_150;
+        // (all-background-work-is-attended), and by the 21B it costs to
+        // say what ends a declaration on each tool
+        // (declared-work-ends-by-the-harness-listing).
+        const CEILING: usize = 6_175;
         let len = compose_skill(Role::Reviewer, Tool::Codex).len();
         assert!(
             len <= CEILING,
             "codex reviewer skill is {len}B, over the {CEILING}B ceiling (5,667B \
              before compression, 5,300B until the inbox, 5,600B until standby, 5,700B \
-             until marking background work) — \
+             until marking background work, 6,150B until per-tool declaration ends) — \
              re-read in full every reviewing turn, so growth here is paid again \
              on every wake"
         );
@@ -2837,8 +2854,9 @@ mod tests {
                     "No exceptions, for any tool",
                     "Never wait for it in a turn",
                     "A run wakes\n  you when its process ends",
-                    "re-declare what still runs",
-                    "Never poll it or",
+                    "messages don't end it",
+                    "Never poll it or start a wait",
+                    declared_ends(tool),
                     "clank detects no background work",
                     "what you don't mark isn't\n  tracked",
                     background_run(tool),
@@ -2852,6 +2870,8 @@ mod tests {
                     "Its completion still wakes you",
                     "live work you don't attend wakes you",
                     "listed running",
+                    "re-declare",
+                    "until your next turn",
                 ] {
                     assert!(
                         !skill.contains(promise),
@@ -2859,6 +2879,17 @@ mod tests {
                     );
                 }
                 assert!(!skill.contains("{{"), "{role:?} {tool:?}");
+                let listed = matches!(tool, Tool::Claude | Tool::Grok);
+                assert_eq!(
+                    skill.contains("listing that work"),
+                    listed,
+                    "{role:?} {tool:?}: only a harness that lists its tasks ends a declaration"
+                );
+                assert_eq!(
+                    skill.contains("Clear a declaration with"),
+                    !listed,
+                    "{role:?} {tool:?}: without a listing the agent clears it"
+                );
             }
         }
     }

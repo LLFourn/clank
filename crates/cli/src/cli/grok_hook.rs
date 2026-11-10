@@ -3,14 +3,16 @@
 //! knows from its own registrations whether the session's `clank wait` is
 //! running and decides whether the agent is asked for one
 //! ([`clank_core::turn_policy::handoff_verdict`]); this adapter frames the
-//! answer. It reads no task list, never rewrites a tool call and never
-//! waits for work itself.
+//! answer. The Stop's `backgroundTasks` go with it, read only to resolve
+//! and end the agent's own declarations. It never rewrites a tool call and
+//! never waits for work itself.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use clank_core::{AgentLabel, SessionId, Tool};
+use clank_core::turn_policy::TaskSnapshot;
+use clank_core::{AgentLabel, BackgroundTask, SessionId, Tool};
 use serde::Deserialize;
 
 use super::turn_wire::{Frame, Report, WireVerdict};
@@ -27,6 +29,8 @@ struct Input {
     subagent_type: Option<String>,
     #[serde(default)]
     stop_hook_active: bool,
+    #[serde(default)]
+    background_tasks: Option<Vec<BackgroundTask>>,
 }
 
 /// Route one native event: bind or release on the session's ends, and for
@@ -73,11 +77,22 @@ fn hook_repo(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
+/// What a routed Stop reports at `now`: an omitted `backgroundTasks` is no
+/// listing, never an empty one.
+fn report(input: Input, now: clank_core::turn_policy::Ms) -> Report {
+    Report::Handoff {
+        session: input.session_id,
+        continued: input.stop_hook_active,
+        tasks: TaskSnapshot::listed(input.background_tasks),
+        deadline: now + HANDOFF_BUDGET.as_millis() as u64,
+    }
+}
+
 /// How long a Stop waits for the monitor's answer.
 const HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
-    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, SessionId, bool)>> {
+    let routed = (|| -> Result<Option<(PathBuf, AgentLabel, Input)>> {
         let mut bytes = Vec::new();
         std::io::stdin()
             .take(1024 * 1024 + 1)
@@ -92,22 +107,17 @@ pub(super) async fn hook(args: super::StopHookArgs) -> Result<()> {
         if !repo.join(".clank").is_dir() {
             return Ok(None);
         }
-        Ok(route(&input, &repo, &Process)?
-            .map(|label| (repo, label, input.session_id, input.stop_hook_active)))
+        Ok(route(&input, &repo, &Process)?.map(|label| (repo, label, input)))
     })();
     let frame = match routed {
         Ok(None) => return Ok(()),
-        Ok(Some((repo, label, session, continued))) => {
-            let bound = session.as_str().to_string();
+        Ok(Some((repo, label, input))) => {
+            let bound = input.session_id.as_str().to_string();
             let asked = super::stop_hook::answer_once(
                 &repo,
                 &label,
                 &bound,
-                Report::Handoff {
-                    session,
-                    continued,
-                    deadline: super::turn_custody::now_ms() + HANDOFF_BUDGET.as_millis() as u64,
-                },
+                report(input, super::turn_custody::now_ms()),
                 HANDOFF_BUDGET,
             );
             still_bound(&repo, &label, &bound, asked).await
